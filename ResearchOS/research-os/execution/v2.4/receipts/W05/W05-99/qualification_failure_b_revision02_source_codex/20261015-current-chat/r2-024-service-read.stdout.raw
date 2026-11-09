@@ -1,0 +1,116 @@
+package domain
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
+	"strconv"
+	"strings"
+	"time"
+	_ "time/tzdata"
+)
+
+type Service struct {
+	DB        *sql.DB
+	Contracts *Contracts
+	Protected protectedstore.Provider
+	// Fixed by a trusted constructor, never by a request or environment selector.
+	projectBindingRoute string
+	// Supplied only by a trusted local Root witness integration; nil fails closed.
+	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
+}
+type Fault struct {
+	Status        int
+	Code, Message string
+	Current       any
+}
+
+func (f *Fault) Error() string { return f.Code + ": " + f.Message }
+func Fail(status int, code, msg string) error {
+	return &Fault{Status: status, Code: code, Message: msg}
+}
+
+// NewCurrentMu is the installed current host's fixed construction policy. New
+// remains the legacy constructor so existing stored projects and fixtures keep
+// their historical binding semantics. Children inherit their stored parent.
+func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+		return nil, err
+	}
+	s, err := New(db, contractsDir, migrationFile)
+	if err != nil {
+		return nil, err
+	}
+	s.projectBindingRoute = "MU_FORK"
+	return s, nil
+}
+
+func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	c, e := LoadContracts(contractsDir)
+	if e != nil {
+		return nil, e
+	}
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
+		return nil, nil, err
+	}
+	manifest, _ := dispatch["manifest"].(map[string]any)
+	if manifest["task_id"] != intent["task_id"] {
+		return nil, nil, Fail(422, "GATE_FAILED", "projection dispatch Task mismatch")
+	}
+	if fact == nil || fact["effect_key"] != intent["key"] {
+		var locator string
+		if err = tx.QueryRow("SELECT journal_locator FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?", project, intent["run_id"], intent["epoch"]).Scan(&locator); err != nil {
+			return nil, nil, err
+		}
+		if filepath.Base(locator) != locator || locator == "." || locator == ".." {
+			return nil, nil, errors.New("runtime journal locator is not local")
+		}
+		path := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "effect-"+strings.TrimPrefix(Digest([]byte(Str(intent, "key"))), "sha256:")+".json")
+		actual, e := filepath.EvalSymlinks(path)
+		if os.IsNotExist(e) {
+			return dispatch, nil, nil
+		}
+		if e != nil || !strings.EqualFold(actual, path) {
+			return nil, nil, errors.New("runtime projection fact reparse rejected")
+		}
+		info, e := os.Stat(path)
+		if os.IsNotExist(e) {
+			return dispatch, nil, nil
+		}
+		if e != nil {
+			return nil, nil, e
+		}
+		if !info.Mode().IsRegular() || info.Size() > runtimeFactMaxBytes {
+			return nil, nil, errors.New("runtime projection fact exceeds bound")
+		}
+		raw, e := os.ReadFile(path)
+		if e != nil {
+			return nil, nil, e
+		}
+		fact, e = Decode(raw)
+		if e != nil {
+			return nil, nil, e
+		}
+	}
+	for key, want := range (Object{"project_id": project, "run_id": intent["run_id"], "effect_key": intent["key"], "epoch": intent["epoch"],
+		"request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "receipt": intent["receipt"]}) {
+		if Hash(fact[key]) != Hash(want) {
+			return nil, nil, Fail(422, "GATE_FAILED", "projection fact does not match canonical effect")
+		}
+	}
+	receipt, _ := intent["receipt"].(map[string]any)
+	if fact["provider_response_hash"] != receipt["receipt_id"] {
+		return nil, nil, Fail(422, "GATE_FAILED", "projection response hash mismatch")
+	}
+	if evidence := fact["host_tool_evidence"]; evidence != nil && (len(Bytes(evidence)) > 4*1024*1024 || Hash(evidence) != fact["host_tool_evidence_hash"]) {
+		return nil, nil, Fail(422, "GATE_FAILED", "projection host evidence mismatch")
+	}
+	return dispatch, fact, nil
+}
+

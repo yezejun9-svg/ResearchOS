@@ -1,0 +1,38 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_independent_review_codex\20261015-current-chat\fixture_e2e_review.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_independent_review_codex\20261015-current-chat\fixture_e2e_malformed_preflight.py
+@@ -20,7 +20,7 @@
+ CASE = ROOT / ("fixture-e2e-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+ CASE.mkdir()
+ MODE=os.environ.get("FIXTURE_E2E_MODE","positive")
+-if MODE not in ("positive","s209","s209_started","s209_unknown","s209_nonmodel","s209_other_run","s209_other_dispatch","s209_control_request","s216","proof_drift","wrong_plan","expired_inspect","expired_preflight","bad_review","concurrent","wrong_native","wrong_parent","wrong_root","wrong_opdir","wrong_expected_sid","wrong_host","wrong_owner","forged_caller_set","bad_exit_missing","bad_wait_missing","crash_claim","crash_begin","crash_intent","crash_postcall","crash_torn_claim","crash_orphan_begin","malformed_grants"):
++if MODE not in ("review_malformed_effect_preflight","positive","s209","s209_started","s209_unknown","s209_nonmodel","s209_other_run","s209_other_dispatch","s209_control_request","s216","proof_drift","wrong_plan","expired_inspect","expired_preflight","bad_review","concurrent","wrong_native","wrong_parent","wrong_root","wrong_opdir","wrong_expected_sid","wrong_host","wrong_owner","forged_caller_set","bad_exit_missing","bad_wait_missing","crash_claim","crash_begin","crash_intent","crash_postcall","crash_torn_claim","crash_orphan_begin","malformed_grants"):
+     raise ValueError("unsupported fixture mode")
+ 
+ def sha(raw): return hashlib.sha256(raw).hexdigest()
+@@ -74,6 +74,11 @@
+         time.sleep(.02)
+     else:raise RuntimeError("fixture Core readiness timeout")
+     core_pid=int(parent_pid_file.read_text(encoding="utf-8"))
++    if MODE=="review_malformed_effect_preflight":
++        db=sqlite3.connect(data/"researchos.sqlite",timeout=5)
++        subject=same_subject()
++        db.execute("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)",(subject["project"],subject["run"],"review-extra-malformed-model",json.dumps({"payload":{"capability":"MODEL"}})))
++        db.commit();db.close()
+     desc=json.loads(run("fixture-describe",[FIXTURE,"--mode","describe","--root",data,"--out",out,"--pid",core_pid]))
+     operation=uuid.uuid4().hex
+     native=grant_native(desc["native"])
+@@ -156,6 +161,14 @@
+         print(CASE)
+         sys.exit(0)
+     pre_out=json.loads(run("cli-real-preflight",[pre_exe,"preflight","--input",proposal_path,"--operation-id",operation,"--out",out]))
++    if MODE=="review_malformed_effect_preflight":
++        plan=json.loads((out/"plan.json").read_text(encoding="utf-8"))
++        unexpected=plan["eligibility"]=="ELIGIBLE_FOR_INDEPENDENT_REVIEW"
++        record={"case":str(CASE),"mode":MODE,"preflight_eligibility":plan["eligibility"],"preflight_missing":plan.get("missing",[]),"preflight_safety":plan["preflight_safety"],"baseline":plan["baseline"],"additional_effect_body":{"payload":{"capability":"MODEL"}},"stop_grant_built":False,"native_signal_count":0,"source_safety_failure_reproduced":unexpected}
++        write_json(CASE/"case-result.json",record)
++        print(json.dumps(record,indent=2),flush=True)
++        if unexpected:raise AssertionError("STOP-R4-F01: actual compiled preflight authorized malformed additional MODEL effect")
++        sys.exit(0)
+     if MODE in ("bad_exit_missing","bad_wait_missing"):
+         plan=json.loads((out/"plan.json").read_text(encoding="utf-8"))
+         if plan["eligibility"]!="STOP_UNAVAILABLE" or not any("captured exact OS wait/exit/handle identity absent" in item for item in plan["missing"]):raise RuntimeError("malformed native proof remained eligible: "+repr(plan.get("missing")))

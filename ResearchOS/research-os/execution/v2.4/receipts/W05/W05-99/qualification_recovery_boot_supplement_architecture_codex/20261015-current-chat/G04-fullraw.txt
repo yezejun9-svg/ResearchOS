@@ -1,0 +1,321 @@
+{
+  "schema": "researchos.C-single-native-lease-exact-scope.v3",
+  "status": "DESIGN_ONLY_REQUIRES_INDEPENDENT_REVIEW_AND_ROOT_SOURCE_CARD",
+  "base_scope_sha256": "02406c117bf68ed346479306901f40a28176ff570eaed5ad592b5ce37d28ffd0",
+  "production_existing": [
+    "apps/control/main.go",
+    "apps/control/prepared_recovery_windows.go",
+    "apps/control/replay_command.go",
+    "adapters/runtime/bridge_windows.go",
+    "adapters/runtime/data_root_windows.go",
+    "internal/host/runtime_verifier_replacement_windows.go",
+    "internal/host/runtime_verifier_replacement_journal_windows.go",
+    "internal/domain/runtime_qualification_failure_windows.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows.go",
+    "internal/store/sqlite.go",
+    "ops/backup/main.go",
+    "internal/domain/backup_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_handoff.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_other.go",
+    "ops/supervisor/release_host/main.go"
+  ],
+  "production_new": [
+    "apps/control/qualification_failure_maintenance_windows.go",
+    "apps/control/qualification_failure_maintenance_other.go",
+    "internal/host/qualification_failure_maintenance_windows.go",
+    "internal/host/maintenance_startup_gate_windows.go",
+    "internal/domain/qualification_failure_maintenance_windows.go",
+    "internal/store/qualification_maintenance_windows.go",
+    "internal/qualificationmaintenancejournal/contract.go",
+    "internal/qualificationmaintenancejournal/journal_windows.go",
+    "internal/qualificationmaintenancejournal/journal_other.go",
+    "ops/backup/maintenance_gate_windows.go",
+    "ops/backup/maintenance_gate_other.go",
+    "internal/domain/backup_source_lease_windows.go",
+    "internal/domain/backup_source_lease_other.go",
+    "ops/supervisor/release_host/maintenance_gate_windows.go",
+    "ops/supervisor/release_host/maintenance_gate_other.go",
+    "internal/qualificationmaintenancejournal/replacement_windows.go"
+  ],
+  "tests_allowed": [
+    "apps/control/qualification_failure_maintenance_windows_test.go",
+    "apps/control/runtime_verifier_replacement_windows_test.go",
+    "apps/control/replay_command_test.go",
+    "internal/host/qualification_failure_maintenance_windows_test.go",
+    "internal/host/maintenance_startup_gate_windows_test.go",
+    "internal/domain/qualification_failure_maintenance_windows_test.go",
+    "internal/domain/runtime_qualification_failure_windows_test.go",
+    "internal/store/qualification_maintenance_windows_test.go",
+    "internal/qualificationmaintenancejournal/journal_windows_test.go",
+    "adapters/runtime/qualification_maintenance_gate_windows_test.go",
+    "ops/backup/maintenance_gate_windows_test.go",
+    "internal/domain/backup_source_lease_windows_test.go",
+    "internal/domain/backup_prepared_abandonment_handoff_test.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows_test.go",
+    "ops/supervisor/release_host/maintenance_gate_windows_test.go",
+    "internal/qualificationmaintenancejournal/replacement_windows_test.go",
+    "internal/domain/backup_configuration_upgrade_test.go",
+    "internal/domain/backup_queue_upgrade_test.go",
+    "internal/domain/backup_upgrade_test.go"
+  ],
+  "reviewer_minimum_additions_adopted": true,
+  "additional_justification": {
+    "shared_replacement_reader_and_test": "Direct domain adapter must check both namespaces without domain-host import cycle or caller callback; strict existing grammar equivalence required",
+    "existing_public_upgrade_tests": "Migrate actual public API positive calls to real guarded native adapters; no always-true fixture seam"
+  },
+  "signatures": "See frozen C-lease-addendum.md",
+  "old_public_APIs": "fail closed UPGRADE_SOURCE_LEASE_REQUIRED",
+  "all_five_upgrade_plans_covered": true,
+  "one_native_handle_owner": "outer CLI or inherited native token; private domain borrower never closes it",
+  "no_other_files": true,
+  "actual_authority": false,
+  "formal_increment": 0
+}
+
+NATIVE_GIT_EXIT=0
+661:	proofValue   Object
+662:	seal         string
+663:}
+664:
+665:func (c qualificationFailureClosure) proofRef() Object                     { return c.proofValue }
+666:func (c qualificationFailureClosure) subject() qualificationFailureSubject { return c.subjectValue }
+667:
+668:func (s *Service) validatedQualificationFailureTx(tx *sql.Tx, project, taskID, runID string, epoch int64) (qualificationFailureClosure, error) {
+669:	var zero qualificationFailureClosure
+670:	unavailable := func() (qualificationFailureClosure, error) {
+671:		return zero, errors.New("QUALIFICATION_FAILURE_PROOF_UNAVAILABLE")
+672:	}
+673:	if tx == nil || project == "" || taskID == "" || runID == "" || epoch < 1 {
+674:		return unavailable()
+675:	}
+676:	rows, err := tx.Query(`SELECT principal,key,request_hash,body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND json_extract(body,'$.subject.task_id')=? AND json_extract(body,'$.subject.run_id')=? AND json_extract(body,'$.subject.epoch')=?`, project, taskID, runID, epoch)
+677:	if err != nil {
+678:		return zero, err
+679:	}
+680:	type stored struct{ author, key, requestHash, raw string }
+681:	var markers []stored
+682:	for rows.Next() {
+683:		var current stored
+684:		if err = rows.Scan(&current.author, &current.key, &current.requestHash, &current.raw); err != nil {
+685:			rows.Close()
+686:			return zero, err
+687:		}
+688:		markers = append(markers, current)
+689:	}
+690:	err = rows.Err()
+691:	rows.Close()
+692:	if err != nil {
+693:		return zero, err
+694:	}
+695:	if len(markers) != 1 {
+696:		return unavailable()
+697:	}
+698:	storedMarker := markers[0]
+699:	marker, err := Decode([]byte(storedMarker.raw))
+700:	if err != nil || marker["schema"] != "researchos.qualification-failure-closure.v1" || marker["kind"] != onlineQualificationDenial || marker["author"] != storedMarker.author || marker["key"] != storedMarker.key || marker["plan_file_sha256"] != storedMarker.requestHash || Str(marker, "denial_digest") == "" {
+701:		return unavailable()
+702:	}
+703:	subject, ok := marker["subject"].(map[string]any)
+704:	if !ok || subject["project_id"] != project || subject["task_id"] != taskID || subject["run_id"] != runID || Hash(subject["epoch"]) != Hash(epoch) || storedMarker.key != qualificationClosureKey(qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, Str(marker, "denial_digest")) {
+705:		return unavailable()
+706:	}
+707:	principal, err := clientAuthenticatedPrincipal(context.Background(), tx, storedMarker.author)
+708:	if err != nil || !principal.HasRole("SCHEDULER") || !principal.Allowed(project, "", "", false) {
+709:		return unavailable()
+710:	}
+711:	ownerRoot, err := currentAuthorityRoot(tx, principal.ID)
+712:	if err != nil || ownerRoot == "" || marker["owner_root"] != ownerRoot {
+713:		return unavailable()
+714:	}
+715:	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, ownerRoot)
+716:	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(project, "", "", false) {
+717:		return unavailable()
+718:	}
+719:	run, err := load(tx, project, "Run", runID)
+720:	if err != nil || run["status"] != "FAILED" || run["task_id"] != taskID || Hash(run["lease_epoch"]) != Hash(epoch) || run["children_stopped"] != true || run["queue_empty"] != true || Hash(Ref(run, "Run")) != Hash(marker["terminal_run_ref"]) {
+721:		return unavailable()
+722:	}
+723:	task, err := load(tx, project, "Task", taskID)
+724:	if err != nil || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID {
+725:		return unavailable()
+726:	}
+727:	plan, planHash, planRoot, err := qualificationPlan(tx, project, taskID, Str(run, "runtime_id"))
+728:	if err != nil || planRoot != ownerRoot || plan["task_hash"] != qualificationTaskHash(task) {
+729:		return unavailable()
+730:	}
+731:	var markerCount int
+732:	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND owner_root=?`, project, taskID, runID, run["runtime_id"], epoch, planHash, ownerRoot).Scan(&markerCount); err != nil || markerCount != 1 {
+733:		return unavailable()
+734:	}
+735:	ref, ok := marker["proof_ref"].(map[string]any)
+736:	if !ok || ref["entity_type"] != "Artifact" {
+737:		return unavailable()
+738:	}
+739:	artifact, err := version(tx, project, ref)
+740:	if err != nil || artifact["kind"] != "MANIFEST" || artifact["evidence_kind"] != "GENERATED" || artifact["measurement_mode"] != "LIVE" || artifact["run_id"] != nil || artifact["access_class"] != "PROJECT" || artifact["produced_by"] != principal.ID || artifact["sealed_at"] == nil || artifact["validity"] != "CURRENT" || artifact["media_type"] != "application/json" || Hash(Ref(artifact, "Artifact")) != Hash(ref) || len(Arr(artifact, "input_refs")) != 1 || Hash(Arr(artifact, "input_refs")[0]) != Hash(plan["profile_ref"]) || len(Arr(artifact, "source_refs")) != 0 {
+741:		return unavailable()
+742:	}
+743:	profileRef, profileOK := plan["profile_ref"].(map[string]any)
+744:	if !profileOK || s.effective(tx, project, Object(profileRef)) != nil {
+745:		return unavailable()
+746:	}
+747:	var raw []byte
+748:	var uploadHash, uploadPrincipal string
+749:	var sealed int
+750:	if err = tx.QueryRow(`SELECT bytes,content_hash,principal,sealed FROM uploaded_content WHERE project=? AND storage_key=?`, project, artifact["storage_key"]).Scan(&raw, &uploadHash, &uploadPrincipal, &sealed); err != nil || sealed != 1 || uploadPrincipal != principal.ID || uploadHash != Digest(raw) || artifact["content_hash"] != uploadHash || Hash(artifact["byte_size"]) != Hash(len(raw)) || len(raw) == 0 || len(raw) > 64*1024 {
+751:		return unavailable()
+752:	}
+753:	proof, err := Decode(raw)
+754:	if err != nil || proof["schema"] != "researchos.qualification-failure-proof.v1" || proof["kind"] != onlineQualificationDenial || proof["author"] != principal.ID || proof["owner_root"] != ownerRoot || Hash(proof["subject"]) != Hash(subject) || proof["rejection_digest"] != marker["denial_digest"] {
+755:		return unavailable()
+756:	}
+757:	core, ok := proof["plan_core"].(map[string]any)
+758:	if !ok || Hash(core) != proof["plan_hash"] || proof["plan_hash"] != marker["plan_hash"] || marker["plan_file_sha256"] != Digest(Bytes(Object{"core": core, "proof": proof})) || core["author"] != principal.ID || core["owner_root"] != ownerRoot || Hash(core["subject"]) != Hash(subject) || core["upload_key"] != artifact["storage_key"] || core["artifact_id"] != artifact["id"] || core["before_dispatch_hash"] != Hash(core["before_dispatch"]) || core["observation_hash"] != marker["observation_hash"] || core["observed_at"] != proof["observed_at"] || run["runtime_settled_at"] != core["observed_at"] || run["ended_at"] != core["observed_at"] {
+759:		return unavailable()
+760:	}
+761:	rejection, ok := proof["rejection"].(map[string]any)
+762:	if !ok || rejection["schema"] != "researchos.qualification-pre-effect-rejection.v1" || rejection["kind"] != onlineQualificationDenial || rejection["stage"] != "BEFORE_PREPARE_EFFECT_TX" || rejection["outcome"] != "NO_EFFECT" || rejection["rule"] != "QUALIFICATION_MODEL_ONLY_V1" || Hash(rejection) != marker["denial_digest"] || rejection["frame_key"] != proof["rejected_effect_key"] || rejection["frame_route"] != proof["model_route"] || rejection["frame_sequence"] == nil || Hash(rejection["frame_sequence"]) != Hash(3) || rejection["plan_hash"] != planHash || rejection["project_id"] != project || rejection["task_id"] != taskID || rejection["run_id"] != runID || Hash(rejection["epoch"]) != Hash(epoch) {
+763:		return unavailable()
+764:	}
+765:	observation, ok := proof["derived_observation"].(map[string]any)
+766:	protocol, protocolOK := observation["protocol"].(map[string]any)
+767:	qf, qfOK := observation["qualification_failure"].(map[string]any)
+768:	if !ok || !protocolOK || !qfOK || observation["state"] != "FAILED" || observation["queue_empty"] != true || observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Hash(protocol["frames"]) != Hash(3) || Hash(protocol["acknowledged"]) != Hash(2) || Hash(protocol["verified_rejected"]) != Hash(1) || qf["denial_digest"] != marker["denial_digest"] || qf["raw_stdout_hash"] == "" || qf["raw_bridge_hash"] == "" || Hash(observation) != marker["observation_hash"] || Hash(run["exit_code"]) != Hash(observation["exit_code"]) {
+769:		return unavailable()
+770:	}
+771:	native, nativeOK := proof["native"].(map[string]any)
+772:	broker, brokerOK := proof["broker"].(map[string]any)
+773:	if !nativeOK || !brokerOK || native["journal_hash"] != qf["raw_bridge_hash"] || native["stdout_hash"] != qf["raw_stdout_hash"] || native["stderr_hash"] != qf["raw_stderr_hash"] || native["ended"] != qf["native_ended"] || Hash(native["exit_code"]) != Hash(run["exit_code"]) || Hash(native["frames"]) != Hash(3) || Hash(native["acknowledged"]) != Hash(2) || native["cancelled"] != true || Hash(broker["accepted"]) != Hash(2) || Hash(broker["completed"]) != Hash(2) || Hash(broker["pending"]) != Hash(0) || Hash(broker["rejected_sequence"]) != Hash(3) {
+774:		return unavailable()
+775:	}
+776:	var observedRaw string
+777:	if err = tx.QueryRow(`SELECT body FROM runtime_observations WHERE project=? AND run=? AND epoch=? AND receipt_hash=?`, project, runID, epoch, marker["observation_hash"]).Scan(&observedRaw); err != nil || observedRaw != string(Bytes(observation)) {
+778:		return unavailable()
+779:	}
+780:	dispatch, err := runtimeDispatch(tx, project, runID, epoch)
+781:	if err != nil || dispatch["state"] != "OBSERVED" || dispatch["observation_hash"] != marker["observation_hash"] || Hash(dispatch["observation_sequence"]) != Hash(core["dispatch_observation_sequence"]) || dispatch["manifest_hash"] != rejection["manifest_hash"] || dispatch["dispatch_key"] != rejection["dispatch_key"] {
+782:		return unavailable()
+783:	}
+784:	beforeDispatch, _ := core["before_dispatch"].(map[string]any)
+785:	if beforeDispatch == nil || beforeDispatch["dispatch_key"] != dispatch["dispatch_key"] || beforeDispatch["manifest_hash"] != dispatch["manifest_hash"] || Hash(beforeDispatch["manifest"]) != Hash(dispatch["manifest"]) || beforeDispatch["worker"] != dispatch["worker"] || Hash(beforeDispatch["identity"]) != Hash(dispatch["identity"]) {
+786:		return unavailable()
+787:	}
+788:	var effectCount, rejectCount int
+789:	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, proof["rejected_effect_key"], project, runID).Scan(&effectCount, &rejectCount); err != nil || effectCount != 1 || rejectCount != 0 {
+790:		return unavailable()
+791:	}
+792:	model, err := latestEffect(tx, project, runID, Str(proof, "model_effect_key"))
+793:	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+794:		return unavailable()
+795:	}
+796:	var ledgerRaw string
+797:	var ledgerCount int
+798:	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, project, runID).Scan(&ledgerCount, &ledgerRaw); err != nil || ledgerCount != 1 {
+799:		return unavailable()
+800:	}
+801:	ledger, err := Decode([]byte(ledgerRaw))
+802:	if err != nil || ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["provider_request_id"] != proof["model_effect_key"] {
+803:		return unavailable()
+804:	}
+805:	link, err := load(tx, project, "ImpactLink", Str(core, "impact_link_id"))
+806:	event, eventErr := load(tx, project, "EventEnvelope", Str(core, "event_id"))
+807:	var snapshotRaw, outboxRaw string
+808:	if err != nil || eventErr != nil || link["relation"] != "DERIVED_FROM" || Hash(link["from_ref"]) != Hash(ref) || Hash(link["to_ref"]) != Hash(plan["profile_ref"]) || event["event_type"] != "RUN_CHANGED" || event["actor_id"] != principal.ID || event["correlation_id"] != core["correlation_id"] || Hash(event["aggregate_ref"]) != Hash(Ref(run, "Run")) || tx.QueryRow(`SELECT body FROM event_state_snapshots WHERE project=? AND event_id=?`, project, event["id"]).Scan(&snapshotRaw) != nil || tx.QueryRow(`SELECT body FROM outbox WHERE project=? AND sequence=? AND id=?`, project, core["event_sequence"], event["id"]).Scan(&outboxRaw) != nil || outboxRaw != string(Bytes(event)) {
+809:		return unavailable()
+810:	}
+811:	state, err := Decode([]byte(snapshotRaw))
+812:	if err != nil || Hash(state["event_sequence"]) != Hash(core["event_sequence"]) {
+813:		return unavailable()
+814:	}
+815:	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": run, "project_state": state, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": core["dispatch_observation_sequence"], "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+816:	if outcomeHash != marker["outcome_hash"] {
+817:		return unavailable()
+818:	}
+819:	return qualificationFailureClosure{subjectValue: qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, proofValue: Object(ref), seal: Hash(marker)}, nil
+820:}
+71:		}
+72:	}
+73:	if adminActions > 1 {
+74:		log.Fatal("choose one local administrative action")
+75:	}
+76:	managedManifest := *verifierManifest
+77:	if *desktopManagement {
+78:		if adminActions != 0 || *qualificationRequest != "" || *coordinatorFile != "" || *trialVault != "" || *verifierManifest == "" {
+79:			log.Fatal("Desktop management requires normal host composition and installed verifier manifest")
+80:		}
+81:		managedManifest = ""
+82:	}
+83:	managedQualification, err := readManagedLocalQualification(*qualificationRequest, managedManifest)
+84:	if err != nil {
+85:		log.Fatal(err)
+86:	}
+87:	if managedQualification != nil && (adminActions != 0 || *coordinatorFile != "" || *trialVault != "") {
+88:		log.Fatal("managed local qualification requires the normal host composition without another administrative action")
+89:	}
+90:	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
+91:	if *trialVault != "" {
+92:		if adminActions != 0 || *coordinatorFile == "" || *trialCredential == "" || *trialProvider == "" ||
+93:			hostboundary.ValidateTrialStorageLayout(dataDir, filepath.Join(dataDir, "host"), *trialVault) != nil {
+94:			log.Fatal("trial readonly vault requires an isolated existing data root and exact coordinator/ref/provider")
+95:		}
+96:	} else if *trialCredential != "" || *trialProvider != "" {
+97:		log.Fatal("partial trial readonly vault configuration")
+98:	}
+99:	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
+100:	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && adminActions == 0 {
+101:		log.Fatalf("web build unavailable: %v", err)
+102:	}
+103:	lease, err := rt.AcquireDataRootLease(dataDir)
+104:	if err != nil {
+105:		if managedQualification != nil {
+106:			log.Fatal("managed qualification request not consumed: control data root is already owned or unavailable; the privileged Desktop host must complete an orderly managed restart, never start a second coordinator")
+107:		}
+108:		log.Fatalf("control data-root lease unavailable: %v", err)
+109:	}
+110:	defer func() {
+111:		if err := lease.Close(); err != nil {
+112:			log.Fatalf("data-root lease close failed: %v", err)
+113:		}
+114:	}()
+115:	dataDir = lease.Root()
+116:	if err := runtimeVerifierReplacementStartupGate(lease); err != nil {
+117:		log.Fatalf("runtime verifier replacement recovery required: %v", err)
+118:	}
+119:	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
+120:	if err != nil {
+121:		log.Fatalf("database unavailable: %v", err)
+122:	}
+123:	defer func() {
+124:		if err := db.Close(); err != nil {
+125:			log.Fatalf("database close failed: %v", err)
+126:		}
+127:	}()
+128:	if err := store.Bootstrap(context.Background(), db, filepath.Join("migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
+129:		log.Fatalf("database bootstrap failed: %v", err)
+130:	}
+131:	service, err := domain.NewCurrentMu(db, filepath.Join("spec", "v2.0", "contracts"), filepath.Join("migrations", "sqlite", "0002_domain.sql"))
+132:	if err != nil {
+133:		log.Fatalf("domain unavailable: %v", err)
+134:	}
+135:	service.Protected = &protectedstore.FrozenProvider{}
+136:	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
+137:	if err != nil {
+138:		log.Fatalf("private drain capability unavailable: %v", err)
+139:	}
+140:	if *desktopManagement && boot != nil {
+141:		log.Fatal("Desktop management cannot share a release supervisor capability")
+142:	}
+143:	if boot != nil && boot.FixtureStore != "" {
+144:		fixture, e := protectedstore.OpenCanary(boot.FixtureStore)
+145:		if e != nil {
+146:			log.Fatalf("private fixture store unavailable: %v", e)
+147:		}
+148:		defer fixture.Close()
+149:		service.Protected = fixture
+150:	}
+151:	if *provision != "" || *issue != "" {
+152:		if e := adminCredential(service, *provision, *issue, *credentialFile); e != nil {
+153:			log.Fatalf("local credential administration failed: %v", e)
+154:		}
+155:		return

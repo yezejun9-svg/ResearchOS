@@ -1,0 +1,163 @@
+{
+  "schema": "researchos.mu-m1-02-independent-review.v1",
+  "verdict": "NEEDS_CHANGES",
+  "source": {
+    "worktree": "C:\\Users\\yqyyds\\.codex\\researchos-build-worktrees\\mu-m1-core-20261014",
+    "base": "60f8c81a7529081eb51d525ab913d63102148a46",
+    "head": "ff5ac2047566a52388188b84f267217d8582c571",
+    "tree": "e5792b72e0380af65fa1cc5f8b122399c1366d9b",
+    "exact_source_paths": 17,
+    "clean": true,
+    "scope": {
+      "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\resume_cp398_codex\\20261014-current-chat\\continuation-cp473\\mu-m1-02-source-scope-v4.json",
+      "sha256": "a3717a29e1b236e790cc5d639adf2603ddb0935c8307164f2fc2af9654b1e1f5",
+      "bytes": 12163
+    }
+  },
+  "author_evidence": {
+    "manifest": {
+      "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W17\\W17-03\\mu_m1_02_author_codex\\20261014-current-chat\\evidence-manifest.json",
+      "sha256": "2734959da15fcb48765ae5d62b6e782a096cb2b930ec37e5b592743eb4af0193",
+      "bytes": 5443
+    },
+    "verified_members": 30,
+    "frozen_dependencies_verified": 9,
+    "attempt_count": 18,
+    "failed_attempts": 7,
+    "build_failures": 1,
+    "test_failures": 6
+  },
+  "independent_attempts": [
+    {
+      "name": "01-domain-pause-boundaries",
+      "exit": 0,
+      "tests": [
+        {
+          "name": "TestRuntimePauseCASAndBackupWitness",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseTaskTransitionRequiresActivation",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseDoesNotGrantGeneralResume",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseFreshActorRevocation",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePausePreparedEffectCutoff",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseRecoveryBoundedFile",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseActivationNeverFallsThroughMissingProof",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseUnstartedActivationFence",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimePauseCanonicalQueueCut",
+          "result": "pass"
+        }
+      ]
+    },
+    {
+      "name": "02-independent-verifier-build",
+      "exit": 1,
+      "tests": []
+    },
+    {
+      "name": "03-native-host",
+      "exit": 0,
+      "tests": [
+        {
+          "name": "TestProductMuPauseResumeNative",
+          "result": "pass"
+        },
+        {
+          "name": "TestProductMuPauseCancelNative",
+          "result": "pass"
+        },
+        {
+          "name": "TestProductMuPausePreparedLeaseRecoveryNative",
+          "result": "pass"
+        }
+      ]
+    },
+    {
+      "name": "04-second-pause-native",
+      "exit": 1,
+      "tests": [
+        {
+          "name": "TestReviewMuSecondPauseNative",
+          "result": "fail"
+        }
+      ]
+    },
+    {
+      "name": "05-native-queue",
+      "exit": 0,
+      "tests": [
+        {
+          "name": "TestRuntimeClientQueueActualMuSameProcess",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimeClientQueueActualMuCancelUnknownEffect",
+          "result": "pass"
+        },
+        {
+          "name": "TestRuntimeClientQueueGoalCancelClaimOrdering",
+          "result": "pass"
+        }
+      ]
+    }
+  ],
+  "independent_failed_attempts": 2,
+  "failure_classification": {
+    "02-independent-verifier-build": "review tooling path error: nonexistent ops/runtime_verifier; no product finding; retained numeric exit1",
+    "04-second-pause-native": "real AppContainer/public HTTP repro of M1-02-R1; retained numeric exit1"
+  },
+  "findings": [
+    {
+      "id": "M1-02-R1",
+      "priority": "P2",
+      "title": "已恢复的 Run 再次 PAUSE 会进入不可恢复的 RECONCILING",
+      "file": "internal/domain/runtime_pause_windows.go",
+      "line_start": 806,
+      "line_end": 807,
+      "related": [
+        "internal/domain/runtime_pause.go:294-300",
+        "internal/domain/runtime_pause_windows.go:143-157",
+        "internal/domain/runtime_coordinator_windows.go:525"
+      ],
+      "trigger": "第一次原生 PAUSE/RESUME 完成、同一 Run 的 epoch2 模型请求正在执行时，当前有效 Owner 从普通 /v1/projects/{project}/tasks/{task}/actions 发送第二次 PAUSE。",
+      "observed": "HTTP 200/Task BLOCKED；epoch2 intent RECONCILING、checkpoint_hash=null；epoch2 dispatch UNKNOWN/protocol not reconciled；模型调用4、Host工具调用1。",
+      "cause": "requestRuntimePause 允许运行中的继任 epoch 并提交 Task BLOCKED，但 pauseCheckpoint 调用通用 dispatchGate，持久 activation 的 pauseActivationGate 仍要求 Task RUNNING，拒绝这一合法暂停阶段。",
+      "fix": "将第二次暂停纳入精确绑定的暂停阶段门禁，并覆盖第二轮 seal/confirm/resume；若该卡仅支持一次周期，则必须在提交任何 pause intent/Task/control 之前明确拒绝二次 PAUSE，保留当前运行状态。不得泛化放宽 Owner/Goal/lease/activation/queue 绑定。",
+      "evidence": "native/TestReviewMuSecondPauseNative/canonical-evidence.json",
+      "raw_test": "04-second-pause-native/stdout.jsonl",
+      "command": "04-second-pause-native/command.json",
+      "observed_vs_inferred": "HTTP/canonical states 是独立原生实测；门禁因果来自冻结源码逐行追踪。"
+    }
+  ],
+  "limitations": [
+    "synthetic local model only; no external live model qualification",
+    "reused independently hash-verified verifier binary; initial independent rebuild path attempt failed",
+    "legacy inline checkpoint failures are known frozen M1-01 debt under a separate compatibility card, not resolved here",
+    "author native attempt017 raw file lacks complete argv/environment; this review supplements full fresh argv/environment/exit/source guards",
+    "no GUI/Desktop launch, no private key/configuration/grant changes, no Main merge, no parent/formal acceptance"
+  ],
+  "formal_increment": 0,
+  "main_merged": false,
+  "production_source_modified": false
+}

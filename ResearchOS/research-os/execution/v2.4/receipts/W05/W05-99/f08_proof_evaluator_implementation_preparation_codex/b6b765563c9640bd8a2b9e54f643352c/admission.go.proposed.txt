@@ -1,0 +1,119 @@
+// Source-derived original request and NO_RUN admission. Native admission is
+// routed to the separately implemented origin checker, never inferred from a
+// stage label or absence of a dispatch row.
+func (v *f08ProofValidator) groupRequest(s *f08Sources,g *f08Group)(f08CancelRequest,error){
+	var zero f08CancelRequest
+	if g.phase!="ADMITTED"{return zero,f08Mode}
+	r:=g.root;binding,e:=f08Object(r["session_binding"],"session_id","accepted_revision","writer_client_id","writer_epoch","lease_expires_at","event_watermark");if e!=nil{return zero,e}
+	target,e:=f08Object(r["target_binding"],"kind","id","version_ref");if e!=nil{return zero,e}
+	id,e:=s.one("identities",[]int{0,1},[]any{g.row[0],g.row[2]});if e!=nil{return zero,e}
+	if id[2]!=ProtocolV2 || id[3]!=g.row[1] || id[4]!="session.control" || id[5]!=g.row[4] || id[6]!=g.row[3]{return zero,f08Binding}
+	header,e:=f08Hex(g.row[5]);if e!=nil{return zero,e}
+	identity:=map[string]any{"format":f08IdentityFormat,"principal":id[0],"project":id[3],"operation":id[5],"key":id[1],"request_hash":id[6],"command_id":id[1],"method":id[4],"client_id":r["client_id"],"session_id":binding["session_id"],"writer_epoch":binding["writer_epoch"],"expected_revision":binding["accepted_revision"],"target_id":target["id"]}
+	b,e:=f08Encode(identity);if e!=nil{return zero,e};req,e:=f08Request(v.protocol,header,b);if e!=nil{return zero,e}
+	if r["private_header_digest"]!=req.headerDigest || binding["writer_client_id"]!=req.client{return zero,f08Binding}
+	return req,nil
+}
+func (v *f08ProofValidator) queueAdmission(s *f08Sources,project,task string)(map[string]any,error){
+	q:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+	sessions:=s.selectRows("sessions",[]int{1,6},[]any{project,task})
+	fences:=s.selectRows("fences",[]int{0,1},[]any{project,task})
+	if len(sessions)==0{if len(fences)!=0{return nil,f08Binding};return q,nil}
+	if len(sessions)!=1{return nil,f08Binding};session:=sessions[0];q["session_id"]=session[0]
+	if len(fences)==0{q["variant"]="REAL_SESSION_NO_ORIGINAL_FENCE";return q,nil}
+	if len(fences)!=1 || fences[0][2]!=session[0]{return nil,f08Binding}
+	f:=fences[0];q["variant"]="ORIGINAL_FENCE"
+	for key,i:=range map[string]int{"generation":3,"revision":13,"state":4,"accepted_through":5,"sealed_through":6,"run_id":7,"runtime_epoch":8,"dispatch_key":9,"manifest_hash":10,"restore_fenced":12}{q[key]=f[i]}
+	// The registry fixes actual fence tuple positions; process_identity is raw
+	// nullable JSON, and revision is the last column (index13 in SQL22).
+	q["revision"]=f[13]
+	if f[11]!=nil{identity,_,e:=f08JSONHex(f[11]);if e!=nil{return nil,e};q["process_identity"]=identity}
+	accepted,e:=f08Integer(f[5],0);if e!=nil{return nil,e};sealed,e:=f08Integer(f[6],0);if e!=nil || sealed>accepted{return nil,f08Binding}
+	for _,entry:=range s.selectRows("queue",[]int{1,4,6},[]any{project,task,f[3]}){
+		seq,e:=f08Integer(entry[7],1);if e!=nil || seq>accepted || entry[3]!=session[0]{return nil,f08Binding}
+		_,contentRaw,e:=f08JSONHex(entry[12]);if e!=nil{return nil,e};if f08RawHash(contentRaw)!=entry[13]{return nil,f08Binding}
+		if entry[16]!=nil{
+			r,e:=s.one("receipts",[]int{0,1,2,3},[]any{entry[16],project,f[3],entry[2]});if e!=nil{return nil,e}
+			_,receiptRaw,e:=f08JSONHex(r[5]);if e!=nil || f08RawHash(receiptRaw)!=r[6]{return nil,f08Binding}
+		}
+	}
+	return q,nil
+}
+func (v *f08ProofValidator) noRun(s *f08Sources,task f08Version)error{
+	if task.body["active_run_id"]!=nil{return f08Binding}
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=task.project || row[1]!="Run"{continue}
+		body,_,e:=f08RawObject(row[4]);if e!=nil{return e};if body["task_id"]==task.id{return f08Binding}
+	}
+	for _,row:=range s.rows["dispatches"]{
+		if row[0]!=task.project{continue};body,_,e:=f08RawObject(row[4]);if e!=nil{return e};if body["task_id"]==task.id{return f08Binding}
+	}
+	// Effects bind a Run, not a Task. Every same-project effect must resolve a
+	// real Run version; an orphan effect cannot be ignored as "not this Task".
+	for _,row:=range s.rows["effects"]{
+		if row[0]!=task.project{continue};runs:=s.selectRows("domain_versions",[]int{0,1,2},[]any{task.project,"Run",row[1]});if len(runs)==0{return f08Binding}
+		for _,run:=range runs{body,_,e:=f08RawObject(run[4]);if e!=nil || body["task_id"]==task.id{return f08Binding}}
+	}
+	return nil
+}
+func (v *f08ProofValidator) admitted(s *f08Sources,row []any,current bool)(*f08Group,error){
+	g,e:=f08ParseGroup("admitted",row);if e!=nil{return nil,e};req,e:=v.groupRequest(s,g);if e!=nil{return nil,e}
+	root:=g.root;binding:=root["session_binding"].(map[string]any);target:=root["target_binding"].(map[string]any)
+	if target["kind"]!="Goal" && target["kind"]!="Run"{return nil,f08Shape}
+	targetVersion,e:=v.version(s,req.project,target["version_ref"]);if e!=nil || targetVersion.kind!=target["kind"] || targetVersion.id!=target["id"]{return nil,f08Binding}
+	if current{
+		if len(s.selectRows("admitted",[]int{0,1,2},row[:3]))!=0 || len(s.selectRows("idempotency",[]int{0,1,2,3},[]any{row[0],row[1],row[4],row[2]}))!=0{return nil,f08Binding}
+		session,e:=s.one("sessions",[]int{0,1},[]any{req.session,req.project});if e!=nil{return nil,e}
+		for key,index:=range map[string]int{"accepted_revision":2,"writer_client_id":9,"writer_epoch":8,"lease_expires_at":10,"event_watermark":11}{if !f08Equal(binding[key],session[index]){return nil,f08Binding}}
+		if session[21]!=nil || session[22]!=nil || session[23]!=ProtocolV2 || binding["lease_expires_at"]==nil{return nil,f08Binding}
+		head,e:=v.head(s,req.project,targetVersion.kind,targetVersion.id);if e!=nil || !f08SameVersion(head,targetVersion){return nil,f08Binding}
+		if targetVersion.kind=="Goal" && session[5]!=targetVersion.id || targetVersion.kind=="Run" && session[7]!=targetVersion.id{return nil,f08Binding}
+	}
+	var wantIDs []any
+	if targetVersion.kind=="Run"{wantIDs=[]any{targetVersion.body["task_id"]}}else if current{
+		for _,o:=range s.rows["domain_objects"]{
+			if o[0]!=req.project || o[1]!="Task"{continue};task,e:=v.head(s,req.project,"Task",o[2].(string));if e!=nil{return nil,e}
+			if task.body["goal_id"]==targetVersion.id{wantIDs=append(wantIDs,task.id)}
+		};sort.Slice(wantIDs,func(i,j int)bool{return wantIDs[i].(string)<wantIDs[j].(string)})
+	}
+	if current && !f08Equal(wantIDs,root["member_task_ids"]){return nil,f08Binding}
+	all:=map[string]any{};targetClosure,targetAnchors,e:=v.referenceClosure(s,[]f08Version{targetVersion});if e!=nil{return nil,e};_ = targetClosure
+	for _,a:=range targetAnchors{k,_:=f08Key(a);all[k]=a}
+	for _,item:=range g.members{
+		m:=item.(map[string]any);task,e:=v.version(s,req.project,m["task_ref"]);if e!=nil || task.kind!="Task"{return nil,f08Binding}
+		if e=f08QueueAdmissionShape(m["queue_admission"]);e!=nil{return nil,e}
+		goal,e:=v.version(s,req.project,m["goal_ref"]);if e!=nil || goal.kind!="Goal" || task.body["goal_id"]!=goal.id{return nil,f08Binding}
+		if targetVersion.kind=="Goal" && goal.id!=targetVersion.id || targetVersion.kind=="Run" && targetVersion.body["task_id"]!=task.id{return nil,f08Binding}
+		if current{head,e:=v.head(s,req.project,"Task",task.id);if e!=nil || !f08SameVersion(task,head){return nil,f08Binding}}
+		roots:=[]f08Version{task,goal}
+		if m["dispatch_stage"]=="NO_RUN"{
+			if !f08NullFields(m,"run_ref","runtime_binding","dispatch_origin_ref") || task.body["active_run_id"]!=nil{return nil,f08Binding}
+			if current{if e=v.noRun(s,task);e!=nil{return nil,e}}
+		}else{
+			// Native/legacy Run authorization needs the complete R2/SDK/ledger
+			// closure. Absence or caller stage never reaches a success here.
+			return nil,f08NativeProofGap
+		}
+		closure,anchors,e:=v.referenceClosure(s,roots);if e!=nil || !f08Equal(m["reference_closure"],closure){return nil,f08Binding}
+		for _,a:=range anchors{k,_:=f08Key(a);all[k]=a}
+		if current{queue,e:=v.queueAdmission(s,req.project,task.id);if e!=nil || !f08Equal(m["queue_admission"],queue){return nil,f08Binding}}
+	}
+	if !f08Equal(g.pins,f08Pins(f08SortedAnchors(all))){return nil,f08Binding}
+	return g,nil
+}
+func f08QueueAdmissionShape(value any)error{
+	q,e:=f08Object(value,"variant","session_id","generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced");if e!=nil{return e}
+	nullKeys:=[]string{"generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced"}
+	if q["variant"]=="NO_SESSION"{if q["session_id"]!=nil || !f08NullFields(q,nullKeys...){return f08Binding};return nil}
+	if _,e=f08String(q["session_id"]);e!=nil{return e}
+	if q["variant"]=="REAL_SESSION_NO_ORIGINAL_FENCE"{if !f08NullFields(q,nullKeys...){return f08Binding};return nil}
+	if q["variant"]!="ORIGINAL_FENCE"{return f08Shape}
+	for _,key:=range []string{"generation","state"}{if _,e=f08String(q[key]);e!=nil{return e}}
+	if _,e=f08Integer(q["revision"],1);e!=nil{return e};accepted,e:=f08Integer(q["accepted_through"],0);if e!=nil{return e};sealed,e:=f08Integer(q["sealed_through"],0);if e!=nil || sealed>accepted{return f08Binding}
+	restored,e:=f08Integer(q["restore_fenced"],0);if e!=nil || restored>1{return f08Shape}
+	if q["runtime_epoch"]!=nil{if _,e=f08Integer(q["runtime_epoch"],1);e!=nil{return e}}
+	for _,key:=range []string{"run_id","dispatch_key"}{if q[key]!=nil{if _,e=f08String(q[key]);e!=nil{return e}}}
+	if q["manifest_hash"]!=nil{if _,e=f08HashString(q["manifest_hash"]);e!=nil{return e}}
+	if q["process_identity"]!=nil{id,ok:=q["process_identity"].(map[string]any);if !ok{return f08Shape};if e=f08BoundIdentity(id);e!=nil{return e}}
+	return nil
+}

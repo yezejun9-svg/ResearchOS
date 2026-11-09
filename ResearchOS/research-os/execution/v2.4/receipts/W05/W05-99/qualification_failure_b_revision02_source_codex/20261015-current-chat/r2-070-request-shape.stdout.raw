@@ -1,0 +1,126 @@
+115: 			if profile["backend"] != runtimeMuBackend || provider.ID != Str(profile["model_config"].(map[string]any), "route") || c.config.RunTool == nil || provider.Endpoint != "" || provider.BearerToken != "" || provider.CredentialRef != "" {
+116: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool requires the frozen host-only route")
+117: 			}
+118: 			amount, err := moneyAmount(provider.UpperBound)
+119: 			if err != nil || amount.Sign() != 0 {
+120: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool route requires an explicit zero monetary bound")
+121: 			}
+122: 			return provider, nil
+123: 		}
+124: 		if provider.Capability == "SOURCE" {
+125: 			if provider.SourceID == "" || provider.SourceToken == "" {
+126: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "host source identity required")
+127: 			}
+128: 			return provider, nil
+129: 		}
+130: 		if provider.Capability == "EXPERIMENT" {
+131: 			return provider, nil
+132: 		}
+133: 		if !providerEndpointAllowed(provider) {
+134: 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider endpoint requires bound TLS or permitted local loopback")
+135: 		}
+136: 		return provider, nil
+137: 	}
+138: 	return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "effect route not permitted for this purpose")
+139: }
+140: 
+141: func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoordinatorRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame) (Object, error) {
+142: 	payload, e := Decode(frame.Payload)
+143: 	if e != nil {
+144: 		return nil, Fail(400, "INVALID_REQUEST", "effect JSON object required")
+145: 	}
+146: 	tx, run, dispatch, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+147: 	if e != nil {
+148: 		return nil, e
+149: 	}
+150: 	rejection, e := c.qualificationFirstGateRejectionTx(tx, route, run, dispatch, bridge, frame, payload)
+151: 	if e != nil {
+152: 		tx.Rollback()
+153: 		return nil, e
+154: 	}
+155: 	if rejection != nil {
+156: 		tx.Rollback()
+157: 		return nil, rejection
+158: 	}
+159: 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
+160: 	if e != nil {
+161: 		tx.Rollback()
+162: 		return nil, e
+163: 	}
+164: 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+165: 	if e != nil {
+166: 		tx.Rollback()
+167: 		return nil, e
+168: 	}
+169: 	goal, e := load(tx, route.ProjectID, "Goal", Str(task, "goal_id"))
+170: 	if e != nil {
+171: 		tx.Rollback()
+172: 		return nil, e
+173: 	}
+174: 	if provider.Capability == "SOURCE" {
+175: 		var work *researchWork
+176: 		if work, _, _, e = c.researchSourceGate(tx, route.ProjectID, task, provider, payload); e != nil {
+177: 			tx.Rollback()
+178: 			return nil, e
+179: 		}
+180: 		if work.SourceReceipt != nil && (work.SourceReceipt["effect_key"] != frame.Key || work.SourceReceipt["run_id"] != runID || Hash(work.SourceReceipt["epoch"]) != Hash(epoch)) {
+181: 			tx.Rollback()
+182: 			return nil, Fail(409, "STATE_CONFLICT", "one source page permits only its original effect replay")
+183: 		}
+184: 	}
+185: 	request := Object{"route": provider.ID, "capability": provider.Capability, "credential_revision": provider.CredentialRevision, "payload": payload}
+186: 	if provider.Capability == "TOOL" {
+187: 		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {
+188: 			tx.Rollback()
+189: 			return nil, e
+190: 		}
+191: 	}
+192: 	if provider.Capability == "MODEL" {
+193: 		e = validateModelEffectBeforePrepare(tx, route.ProjectID, runID, task, dispatch["manifest"].(map[string]any), frame.Key, payload)
+194: 		if e != nil {
+195: 			tx.Rollback()
+196: 			return nil, e
+197: 		}
+198: 	}
+199: 	if provider.Capability == "EXPERIMENT" {
+200: 		if _, _, e = c.researchExperimentGate(tx, route.ProjectID, task, run, frame, payload); e != nil {
+201: 			tx.Rollback()
+202: 			return nil, e
+203: 		}
+204: 	}
+205: 	operation, basis := "RESERVE", "UPPER_BOUND"
+206: 	var money any = provider.UpperBound
+207: 	if provider.UpperBound == nil {
+208: 		operation, basis, money = "UNKNOWN", "UNKNOWN", nil
+209: 	}
+210: 	cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": operation, "money": money, "provider_request_id": frame.Key, "provider_event_id": "prepare/" + frame.Key, "reservation_id": nil, "cost_basis": basis, "occurred_at": run["created_at"]}
+211: 	intent, e := c.service.prepareEffectTx(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, runID, frame.Key, request, cost)
+212: 	if e != nil {
+213: 		tx.Rollback()
+214: 		return nil, e
+215: 	}
+216: 	if e = tx.Commit(); e != nil {
+217: 		return nil, e
+218: 	}
+219: 	c.boundary("effect_prepared", intent)
+220: 	if intent["state"] == "CONFIRMED" || intent["state"] == "NOT_APPLIED" {
+221: 		receipt, _ := intent["receipt"].(map[string]any)
+222: 		return runtimeEffectWireReply(frame, receipt)
+223: 	}
+224: 	if intent["state"] != "PREPARED" {
+225: 		if provider.Capability == "EXPERIMENT" {
+226: 			return c.reconcileResearchExperimentEffect(ctx, route.ProjectID, runID, epoch, frame, intent)
+227: 		}
+228: 		return nil, Fail(409, "STATE_CONFLICT", "effect outcome unknown; retry prohibited")
+229: 	}
+230: 	tx, run, dispatch, e = c.dispatchGate(ctx, route, runID, lease, epoch)
+231: 	if e != nil {
+232: 		return nil, e
+233: 	}
+234: 	if _, e = c.providerRoute(tx, route, run, dispatch, frame); e != nil {
+235: 		tx.Rollback()
+236: 		return nil, e
+237: 	}
+238: 	if provider.Capability == "TOOL" {
+239: 		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {
+240: 			tx.Rollback()

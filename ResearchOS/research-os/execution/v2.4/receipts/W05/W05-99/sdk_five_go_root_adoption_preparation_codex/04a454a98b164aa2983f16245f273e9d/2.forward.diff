@@ -1,0 +1,54 @@
+--- internal/host/host.go
++++ internal_host_host.v5.proposed.go
+@@ -55,6 +55,10 @@
+ type Config struct {
+ 	DB            *sql.DB
+ 	Dir           string
++	// Trial-only read access to one existing DPAPI record; the new DB stays isolated.
++	ReadOnlyModelVaultDir string
++	ReadOnlyModelCredentialRef string
++	ReadOnlyModelProvider string
+ 	ContractsDir  string
+ 	MigrationFile string
+ 	SessionTTL    time.Duration
+@@ -104,6 +108,15 @@
+ 	if cfg.DB == nil || cfg.Dir == "" || cfg.ContractsDir == "" || cfg.MigrationFile == "" || cfg.SchemaDir == "" {
+ 		return nil, fmt.Errorf("%w: db, dir, contracts, migration and schema are required", ErrBadState)
+ 	}
++	if cfg.ReadOnlyModelVaultDir != "" {
++		if cfg.ReadOnlyModelCredentialRef == "" || cfg.ReadOnlyModelProvider == "" ||
++			filepath.Base(cfg.Dir) != "host" ||
++            ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
++			return nil, ErrUnknownCredential
++		}
++	} else if cfg.ReadOnlyModelCredentialRef != "" || cfg.ReadOnlyModelProvider != "" {
++		return nil, ErrUnknownCredential
++	}
+ 	ttl := cfg.SessionTTL
+ 	if ttl <= 0 || ttl > MaxSessionTTL {
+ 		ttl = DefaultSessionTTL
+@@ -121,6 +134,10 @@
+ 	}
+ 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+ 		return nil, err
++	}
++	if cfg.ReadOnlyModelVaultDir != "" &&
++		ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
++		return nil, ErrUnknownCredential
+ 	}
+ 	if err := privateDir(cfg.Dir); err != nil {
+ 		return nil, fmt.Errorf("private host directory refused: %w", err)
+@@ -142,7 +159,12 @@
+ 	if h.protocolVersion == "" {
+ 		h.protocolVersion = nativeProtocolVersion
+ 	}
+-	if h.vault, err = openVault(cfg.Dir); err != nil {
++	if cfg.ReadOnlyModelVaultDir != "" {
++		if h.vault, err = openVaultReadOnly(cfg.ReadOnlyModelVaultDir,
++			cfg.ReadOnlyModelCredentialRef, cfg.ReadOnlyModelProvider); err != nil {
++			return nil, err
++		}
++	} else if h.vault, err = openVault(cfg.Dir); err != nil {
+ 		return nil, err
+ 	}
+ 	if h.roots, err = openRootRegistry(cfg.Dir); err != nil {

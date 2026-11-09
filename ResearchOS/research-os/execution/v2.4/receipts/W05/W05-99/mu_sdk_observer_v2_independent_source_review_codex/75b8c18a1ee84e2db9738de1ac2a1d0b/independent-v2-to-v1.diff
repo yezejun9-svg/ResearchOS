@@ -1,0 +1,142 @@
+--- v2/observer.py
++++ v1/observer.py
+@@ -25,8 +25,6 @@
+ SOURCE_COMMIT = "adc460c2138528f163f7fdab5e8d81dde157b7fb"
+ LIMITS = {"maximum_provider_requests": 3, "requested_output_tokens_total": 8192,
+           "total_wall_seconds": 300}
+-PUBLIC_ENVIRONMENT_KEYS = ("SystemRoot", "WINDIR", "PATH", "USERPROFILE",
+-                           "LOCALAPPDATA", "APPDATA", "TEMP", "TMP")
+ RUNNER_REF = {
+     "path": r"D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\mu_model_sdk_real_trial_v8_source_codex\8251b1ed21754f7cbd6c2f8e7ff574eb\mu_sdk_trial.v8.proposed.py",
+     "sha256": "5b112a0824ab3bbbabb228416a9c2d0aa0be70ac2a45f29720138de350507fde", "bytes": 90096}
+@@ -122,16 +120,6 @@
+             0 < deadline - start <= 300 and start <= now < deadline and
+             deadline == job.get("absolute_deadline_monotonic"), "deadline changed or exhausted")
+     return start, deadline
+-
+-
+-def validate_public_environment(public_environment):
+-    require(isinstance(public_environment, dict) and
+-            set(public_environment) <= set(PUBLIC_ENVIRONMENT_KEYS) and
+-            all(type(k) is str and type(v) is str and "\x00" not in v
+-                for k, v in public_environment.items()), "public worker environment is not closed")
+-    require(public_environment.get("SystemRoot") == "C:/Windows" and
+-            public_environment.get("WINDIR") == "C:/Windows", "public Windows root changed")
+-    return dict(public_environment)
+ 
+ 
+ def phase_projection(doc, runner_raw, public_environment):
+@@ -155,7 +143,11 @@
+                               "--base-url", constants["BASE"], "--config-revision", str(doc["config_revision"]),
+                               "--credential-ref", constants["CREDENTIAL_REF"], "--default"],
+                 "cli-run": [cli, "run", doc["prompt"], "--project", doc["project_id"], "--output", "jsonl"]}
+-    env = validate_public_environment(public_environment)
++    allowed = ("SystemRoot", "WINDIR", "PATH", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP")
++    require(isinstance(public_environment, dict) and
++            all(isinstance(k, str) and isinstance(v, str) for k, v in public_environment.items()),
++            "public worker environment shape")
++    env = {key: public_environment[key] for key in allowed if key in public_environment}
+     env.update(RESEARCHOS_CLI_DISCOVERY=doc["discovery_file"], RESEARCHOS_CLI_CONFIG=doc["cli_config_file"])
+     return {"schema": "researchos.mu-sdk-trial-phase-basis.v1", "phase": mode,
+             "run_uuid": doc["run_uuid"], "source_ref": RUNNER_REF,
+@@ -164,58 +156,16 @@
+ 
+ 
+ def validate_source_review(review, context):
+-    require(review.get("schema") == "researchos.mu-sdk-controller-observer-independent-source-review.v2" and
++    require(review.get("schema") == "researchos.mu-sdk-controller-observer-independent-source-review.v1" and
+             review.get("decision") == "READY_SOURCE_ONLY" and
+             review.get("actor_id") not in (None, "", ROOT_ACTOR, AUTHOR, ACTOR) and
+             review.get("controller_source_ref") == context["controller_source"] and
+             review.get("observer_source_ref") == context["observer_source"] and
+             review.get("hooks_source_ref") == context["hooks_source"] and
+             review.get("runner_source_ref") == RUNNER_REF and
+-            review.get("phase_worker_source_ref") == context["phase_worker_source"] and
+-            review.get("python_binary_ref") == context["python_binary"] and
+             review.get("callback_contract") == "REAL_ASSIGNED_SUSPENDED_FRAME_BEFORE_FIRST_RESUME" and
+             review.get("formal_acceptance") is False,
+             "independent source review missing or wrong source tuple")
+-
+-
+-def validate_launch_inputs(context, basis):
+-    """Use each checked byte buffer directly; no hash-then-second-read source load."""
+-    worker_raw = pin_bytes(context["phase_worker_source"])
+-    python_raw = pin_bytes(context["python_binary"])
+-    worker_path = Path(context["phase_worker_source"]["path"])
+-    python_path = Path(context["python_binary"]["path"])
+-    require(worker_path.suffix == ".py" and python_path.suffix.casefold() == ".exe",
+-            "reviewed worker or Python binary type")
+-    compile(worker_raw, str(worker_path), "exec", dont_inherit=True)
+-    public_env = validate_public_environment(context["public_environment"])
+-    frozen_env = dict(basis["child_environment"])
+-    doc = context["input_doc"]
+-    require(frozen_env.pop("RESEARCHOS_CLI_DISCOVERY", None) == doc["discovery_file"] and
+-            frozen_env.pop("RESEARCHOS_CLI_CONFIG", None) == doc["cli_config_file"] and
+-            frozen_env == public_env, "worker environment differs from complete frozen basis")
+-    phase_dir = Path(context["phase_dir"])
+-    input_path = phase_dir / "input.execute.json"
+-    require(not os.path.lexists(input_path), "phase input was already present before admission")
+-    return {"argv": [str(python_path), "-I", "-S", "-X", "utf8", str(worker_path), str(input_path)],
+-            "cwd": str(Path("D:/作品集/ResearchOS/research-os")), "public_environment": public_env,
+-            "phase_worker_source_ref": context["phase_worker_source"],
+-            "python_binary_ref": context["python_binary"],
+-            "worker_checked_bytes": len(worker_raw), "python_checked_bytes": len(python_raw)}
+-
+-
+-def validate_callback_launch(context, loc, state):
+-    launch = state["launch"]
+-    actual_env = validate_public_environment(loc["env"])
+-    require(type(loc["argv"]) is list and loc["argv"] == launch["argv"],
+-            "actual process argv differs from reviewed Python/worker/input vector")
+-    require(type(loc["cwd"]) is str and loc["cwd"] == launch["cwd"],
+-            "actual process cwd differs from canonical repository root")
+-    require(actual_env == launch["public_environment"] == context["public_environment"],
+-            "actual worker environment differs from frozen phase basis")
+-    return {"argv": list(loc["argv"]), "cwd": loc["cwd"],
+-            "phase_worker_source_ref": launch["phase_worker_source_ref"],
+-            "python_binary_ref": launch["python_binary_ref"],
+-            "public_environment_sha256": hashlib.sha256(json_bytes(actual_env)).hexdigest()}
+ 
+ 
+ def mode_public_pins(doc):
+@@ -233,7 +183,6 @@
+ 
+ def validate_context(context, pid):
+     doc = context["input_doc"]
+-    validate_public_environment(context["public_environment"])
+     require(doc.get("schema") == "researchos.mu-sdk-trial.executable-input.v1" and
+             doc.get("source_commit") == SOURCE_COMMIT, "input schema or commit")
+     uuid = doc.get("run_uuid")
+@@ -309,9 +258,8 @@
+             math.isfinite(heartbeat["monotonic_tick"]) and 0 <= now - heartbeat["monotonic_tick"] <= 5,
+             "heartbeat stale or changed")
+     start, deadline = validate_limits(doc, reg, job, now)
+-    launch = validate_launch_inputs(context, basis)
+     return {"doc": doc, "reg": reg, "job": job, "phase_dir": phase_dir,
+-            "started": start, "deadline": deadline, "heartbeat": heartbeat, "launch": launch}
++            "started": start, "deadline": deadline, "heartbeat": heartbeat}
+ 
+ 
+ def code_identity(code):
+@@ -375,13 +323,11 @@
+                 state["job"].get("actual_creation_time_100ns") == creation_filetime and
+                 loc["env"] == context["public_environment"],
+                 "live owned-process clock does not match grant")
+-        actual_launch = validate_callback_launch(context, loc, state)
+         return {"method": "PINNED_EXECUTABLE_FRAME_AND_WINAPI", "frame_filename": expected.co_filename,
+                 "function": "run_owned", "callback_line": call_line,
+                 "creation_flags": loc["flags"], "assigned_before_resume": True,
+                 "resumed_at_observation": False, "base_source_ref": BASE_REF,
+                 "hooks_source_ref": context["hooks_source"],
+-                "actual_launch": actual_launch,
+                 "limit": "Reviewed synchronous callback position; not an independent OS suspend-count query."}
+     finally:
+         del frame
+@@ -472,7 +418,6 @@
+     common = {"actor_id": ACTOR, "source_author_actor_id": AUTHOR, "actual_executor_actor_id": ROOT_ACTOR,
+               "execution_kind": "AUTOMATED_IN_ROOT_CONTROLLER_PROCESS", "observer_source_ref": context["observer_source"],
+               "independent_source_review_ref": context["independent_source_review"], "run_uuid": doc["run_uuid"],
+-              "phase_worker_source_ref": context["phase_worker_source"], "python_binary_ref": context["python_binary"],
+               "observer_process_id": os.getpid(), "runner_pid": pid,
+               "observed_at_utc": datetime.now(timezone.utc).isoformat(), "formal_acceptance": False,
+               "full_lifecycle_cleanup_verified": False, "provider_requests_from_observer": 0,

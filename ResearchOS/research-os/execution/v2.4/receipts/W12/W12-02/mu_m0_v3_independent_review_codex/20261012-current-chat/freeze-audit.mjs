@@ -1,0 +1,4 @@
+import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
+const out=path.dirname(new URL(import.meta.url).pathname.slice(1)),source='C:/Users/yqyyds/.codex/researchos-build-worktrees/mu-pause-checkpoint-m0-v2-20261012';const sha=b=>createHash('sha256').update(b).digest('hex');
+const original=fs.readFileSync(source+'/.local/v3/v3-source-manifest.json');const m=JSON.parse(original);const files=m.source9.map(f=>{const b=fs.readFileSync(source+'/'+f.path);return{...f,actual_sha256:sha(b),actual_bytes:b.length,matches:sha(b)===f.sha256};});
+const report={at:new Date().toISOString(),manifest_sha256:sha(original),expected_manifest_sha256:'c385e4b5612148cf222c26d959da4f5c543019fe3df7e03695a738ddbc759406',files,qualification_executed:false};fs.writeFileSync(out+'/freeze-audit-01.json',JSON.stringify(report,null,2));fs.writeFileSync(out+'/received-manifest-01.json',original);console.log(JSON.stringify(report));

@@ -1,0 +1,33 @@
+$ErrorActionPreference='Stop'
+$b='C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-backend-author'
+$manifestHash=(Get-FileHash -LiteralPath ($b+'/final-03/source-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+$d=Get-Content -LiteralPath ($b+'/diagnostics-02.json') -Raw|ConvertFrom-Json
+$d.previous_author_diagnostics_sha256='1d4d1e29c270202ad26a9ebfe9614631933dd6e14be937d54a524036d695334b'
+foreach($e in $d.diagnostic_events){if($e.origin_key -eq 'backend-v1-readonly-source-locator'){$e.evidence.tool_chunks+= 'c6c967';$e.detail+=' A guessed QA run-01/result.json was absent; the actual independent-attacks.result.json was then read successfully without modifying QA evidence.'}}
+$d.diagnostic_events+=[ordered]@{origin_key='backend-v1-native-thread-identity';classification='PRODUCTION_SOURCE_INDEPENDENT_REVIEW';candidate_freezes=@(1,2);evidence=[ordered]@{result='C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-backend-independent-qa-20261104/run-01/independent-attacks.result.json';stdout='C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-backend-independent-qa-20261104/run-01/independent-attacks.stdout.raw';reviewer_tool_chunk='84f207';exit_code=1;affected_cases=@('NO_THREAD','CONFLICTING_THREADS')};detail='Native driver delegated thread identity to the legacy parser, which permits missing ID or replaces it with later thread.started. Independent owned-fake-process counterexamples both incorrectly yielded COMPLETED. Parent FAIL is aggregate, not another origin.';fixed_in='source-14.json';fix='New-driver-only identity validator: nonblank bounded/control-free identity before output; consistent immutable ID; duplicate same ID idempotent; invalid identity yields UNKNOWN with no exposed accepted ID. Legacy ParseStreams/Mu source unchanged.';resolved_by_author='attempt-09 fmt/test/vet0, including eight additional real owned-child subcases';independent_resolution='PENDING'}
+$d.diagnostic_events+=[ordered]@{origin_key='backend-v1-control-thread-fixture-escaping';classification='AUTHOR_FIXTURE';attempt_indexes=@(8);evidence='attempt-08/test.jsonl';raw_test_fail_events=2;detail='CONTROL_THREAD fixture emitted two JSON backslashes, producing literal backslash+n rather than a control character. Production correctly accepted that valid bounded ID; one subcase and its aggregate parent failed the incorrect fixture expectation. Corrected only one fixture escape; no production logic or assertion weakened.';fixed_in='source-15.json';resolved_by='attempt-09'}
+foreach($i in @(8,9)){
+ $a='attempt-'+$i.ToString('00');$ev=Get-Content -LiteralPath ($b+'/'+$a+'/test.jsonl')|ForEach-Object{try{$_|ConvertFrom-Json}catch{}}
+ $row=[ordered]@{attempt=$i;kind='THREAD_IDENTITY_REGRESSION';fmt_exit=0;test_exit= $(if($i -eq 8){1}else{0});pass_test_events=@($ev|Where-Object{$_.Action -eq 'pass' -and $_.Test}).Count;pass_top_tests=@($ev|Where-Object{$_.Action -eq 'pass' -and $_.Test -and $_.Test -notlike '*/*'}).Count;pass_subtests=@($ev|Where-Object{$_.Action -eq 'pass' -and $_.Test -like '*/*'}).Count;skip_test_events=@($ev|Where-Object{$_.Action -eq 'skip' -and $_.Test}).Count;fail_test_events=@($ev|Where-Object{$_.Action -eq 'fail' -and $_.Test}).Count;evidence=$a}
+ if($i -eq 8){$row['vet']='NOT_RUN'}else{$row['vet_exit']=0};$d.attempts+=$row
+}
+[IO.File]::WriteAllText(($b+'/diagnostics-03.json'),($d|ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
+$s=Get-Content -LiteralPath ($b+'/final-02/summary.json') -Raw|ConvertFrom-Json
+$s.manifest='final-03/source-manifest.json';$s.manifest_sha256=$manifestHash;$s.diagnostics='diagnostics-03.json'
+$s.validation.final_new_fixtures.attempt=9;$s.validation.final_new_fixtures.pass_events=31;$s.validation.final_new_fixtures.sub=25
+$s.validation.existing_pure_compatibility.source_scope_note='Legacy codex.go/ParseStreams unchanged across the marker and thread fixes. The new driver and full same-DB chain were rerun in attempt09.'
+$s.implemented+='New native driver requires one consistent nonblank/control-free <=256-character thread identity declared before messages/turn facts. Same-ID declarations are idempotent; absent/conflicting/invalid identity cannot become COMPLETED.'
+$s.previous_candidate=[ordered]@{path='final-02/source-manifest.json';sha256='9ddb87647b6b26ee2e1321dcc2079f442d196019da5cf6cdb1e2e9cf7ac9e018';usable_for_integration=$false;reason='Independent thread identity counterexamples remained applicable';preserved=$true}
+$s|Add-Member thread_regression_cases @('NO_THREAD','EMPTY_THREAD','WHITESPACE_THREAD','CONTROL_THREAD','WRONGTYPE_THREAD','CONFLICTING_THREADS','DUPLICATE_THREAD','THREAD_AFTER_MESSAGE')
+[IO.File]::WriteAllText(($b+'/final-03/summary.json'),($s|ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
+$f=[ordered]@{schema='researchos.product-v1-freeze-marker.v1';state='AUTHOR_FROZEN';candidate=3;manifest='source-manifest.json';manifest_sha256=$manifestHash;summary='summary.json';diagnostics='../diagnostics-03.json';source_changes_stopped=$true;source_count=18;previous_candidates_preserved=$true;independent_review='PENDING';product_acceptance_increment=0}
+[IO.File]::WriteAllText(($b+'/final-03/freeze.json'),($f|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+$files=@(Get-ChildItem -LiteralPath $b -File|Where-Object{$_.Extension -in @('.json','.ps1') -and $_.Name -ne 'archive-file-list-03.json'})
+foreach($dir in @('final','final-02','final-03')){$files+=@(Get-ChildItem -LiteralPath ($b+'/'+$dir) -File -Recurse)}
+foreach($i in @(1,2,3,4,5,7,8,9)){$files+=@(Get-ChildItem -LiteralPath ($b+'/attempt-'+$i.ToString('00')) -File)}
+$files+=@(Get-ChildItem -LiteralPath ($b+'/attempt-06-compatibility') -File)
+$rows=@($files|Sort-Object FullName -Unique|ForEach-Object{[ordered]@{relative_path=[IO.Path]::GetRelativePath($b,$_.FullName).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant();bytes=$_.Length}})
+$totalBytes=0L;foreach($row in $rows){$totalBytes+=[int64]$row['bytes']}
+$index=[ordered]@{schema='researchos.product-v1-archive-file-list.v1';candidate=3;base_directory=$b;excluded=@('**/gocache/**','**/tmp/**','module cache','temporary helper executables');original_c_preserved=$true;total_bytes=$totalBytes;files=$rows}
+[IO.File]::WriteAllText(($b+'/archive-file-list-03.json'),($index|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+@('final-03/freeze.json','final-03/summary.json','diagnostics-03.json','final-03/source-manifest.json','archive-file-list-03.json')|ForEach-Object{[ordered]@{path=$_;sha256=(Get-FileHash -LiteralPath ($b+'/'+$_) -Algorithm SHA256).Hash.ToLowerInvariant()}}|ConvertTo-Json -Depth 4

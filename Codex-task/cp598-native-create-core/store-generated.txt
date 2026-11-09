@@ -1,0 +1,18 @@
+const nativeOriginColumns = "origin_schema,schema_version,attestation_ref,witness_hash,principal,authority_root,command_id,request_hash,request_wire_hash,response_hash,project,session_id,writer_epoch,writer_client_id,host_instance_ref,host_generation_ref,connection_instance_ref,os_subject_ref,credential_hash,attested_at,attestation_expires_at,created_at,origin_body,origin_hash"
+func insertNativeOrigin(ctx context.Context,tx *sql.Tx,row nativeOriginRow)error{
+ b:=row.body
+ _,err:=tx.ExecContext(ctx,`INSERT INTO client_native_writer_origins(`+nativeOriginColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,b.OriginSchema, b.SchemaVersion, b.AttestationRef, b.WitnessHash, b.Principal, b.AuthorityRoot, b.CommandID, b.RequestHash, b.RequestWireHash, b.ResponseHash, b.Project, b.SessionID, b.WriterEpoch, b.WriterClientID, b.HostInstanceRef, b.HostGenerationRef, b.ConnectionInstanceRef, b.OSSubjectRef, b.CredentialHash, b.AttestedAt, b.AttestationExpiresAt, b.CreatedAt, row.raw, row.hash)
+ return err
+}
+func readNativeOrigins(ctx context.Context,ex nativeOriginExecutor)([]nativeOriginRow,error){
+ rows,err:=ex.QueryContext(ctx,`SELECT `+nativeOriginColumns+` FROM client_native_writer_origins ORDER BY attestation_ref`);if err!=nil{return nil,err}
+ defer rows.Close();out:=[]nativeOriginRow{}
+ for rows.Next(){
+  var b clientNativeWriterOriginBody;var raw,hash string
+  if err=rows.Scan(&b.OriginSchema, &b.SchemaVersion, &b.AttestationRef, &b.WitnessHash, &b.Principal, &b.AuthorityRoot, &b.CommandID, &b.RequestHash, &b.RequestWireHash, &b.ResponseHash, &b.Project, &b.SessionID, &b.WriterEpoch, &b.WriterClientID, &b.HostInstanceRef, &b.HostGenerationRef, &b.ConnectionInstanceRef, &b.OSSubjectRef, &b.CredentialHash, &b.AttestedAt, &b.AttestationExpiresAt, &b.CreatedAt, &raw, &hash);err!=nil{return nil,err}
+  row,e:=makeNativeOriginRow(b);if e!=nil{return nil,e};stored,e:=decodeNativeOriginRow(raw,hash);if e!=nil{return nil,e}
+  if stored.raw!=row.raw||stored.hash!=row.hash{return nil,fmt.Errorf("NATIVE_ORIGIN_COLUMN_BODY")}
+  out=append(out,stored);if len(out)>10000{return nil,fmt.Errorf("NATIVE_ORIGIN_INVENTORY_LIMIT")}
+ }
+ return out,rows.Err()
+}

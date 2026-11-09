@@ -1,0 +1,223 @@
+
+# V2 gates: read-only Git baseline and actual independent/Root authority.
+AUTHOR = 'codex:/root/attach_restore_independent_review'
+ROOT_ACTOR = 'codex:/root'
+BASE_HELPER = BASE/'public23_to24_composition_helper_source_codex/source-20261010-01/compose_main24.source.py'
+BASE_HELPER_SHA = 'e2e70ce36c9bfd473bb24c5d23aa18e2e9da238cab77f5b98a26e4970854e373'
+AUDIT_RUNTIME = REPO/'execution/v2.4/receipts/W09/W09-99/full_w09_main_native_producer_source_codex/fullw09-20261010-03/full_w09_runtime.source.py'
+AUDIT_RUNTIME_SHA = '1709bc96848fb52fe4ddde8591fe063576515aaabdc63d35630b1023a82ccc08'
+ROOT_THREAD_ID = '01a11007-5233-7ca1-b71f-9e9e5ce84c98'
+ROOT_AUDIT = r'C:\Users\yqyyds\.codex\sessions\2026\10\06\rollout-2026-10-06T15-04-37-01a11007-5233-7ca1-b71f-9e9e5ce84c98.jsonl'
+
+def parse_git_index(raw):
+    import struct
+    need(len(raw)>=32 and len(raw)<=16*1024*1024, 'GIT_INDEX_SIZE')
+    need(raw[:4]==b'DIRC', 'GIT_INDEX_MAGIC')
+    version,count=struct.unpack('>II',raw[4:12])
+    need(version in (2,3) and count<=100000, 'GIT_INDEX_SUPPORTED_VERSION_COUNT')
+    need(hashlib.sha1(raw[:-20]).digest()==raw[-20:], 'GIT_INDEX_CHECKSUM_SHA1')
+    cursor=12;entries=[];seen=set()
+    for _ in range(count):
+        start=cursor
+        need(cursor+62<=len(raw)-20, 'GIT_INDEX_ENTRY_TRUNCATED')
+        mode=int.from_bytes(raw[cursor+24:cursor+28],'big')
+        flags=int.from_bytes(raw[cursor+60:cursor+62],'big')
+        oid=raw[cursor+40:cursor+60].hex()
+        need(flags&0x3000==0 and flags&0x8000==0, 'GIT_INDEX_STAGE_ASSUME_UNCHANGED_UNSUPPORTED')
+        cursor+=62
+        if flags&0x4000:
+            need(version==3 and cursor+2<=len(raw)-20, 'GIT_INDEX_EXTENDED_FLAGS')
+            extended=int.from_bytes(raw[cursor:cursor+2],'big');cursor+=2
+            need(extended==0, 'GIT_INDEX_SKIP_WORKTREE_INTENT_UNSUPPORTED')
+        end=raw.find(b'\0',cursor,len(raw)-20)
+        need(end>=cursor, 'GIT_INDEX_PATH_TERMINATOR')
+        pathname=raw[cursor:end]
+        need((flags&0xFFF)==min(len(pathname),0xFFF), 'GIT_INDEX_NAME_LENGTH')
+        rel=pathname.decode('utf-8','strict')
+        need(rel and '\\' not in rel and ':' not in rel and not rel.startswith('/')
+            and all(x not in ('','.','..') and not x.endswith((' ','.')) for x in rel.split('/')), 'GIT_INDEX_SAFE_TRACKED_PATH')
+        need(rel.casefold() not in seen, 'GIT_INDEX_DUPLICATE_OR_CASE_ALIAS')
+        seen.add(rel.casefold())
+        need(mode in (0o100644,0o100755), 'GIT_INDEX_ONLY_REGULAR_TRACKED_FILES')
+        cursor=start+((end+1-start+7)//8)*8
+        need(cursor<=len(raw)-20 and not any(raw[end:cursor]), 'GIT_INDEX_PADDING')
+        entries.append(dict(path=rel,index_oid=oid,mode=mode))
+    extensions=[]
+    while cursor<len(raw)-20:
+        need(cursor+8<=len(raw)-20, 'GIT_INDEX_EXTENSION_HEADER')
+        signature=raw[cursor:cursor+4]
+        length=int.from_bytes(raw[cursor+4:cursor+8],'big');cursor+=8
+        need(signature==b'TREE' and not extensions, 'GIT_INDEX_EXTENSION_UNSUPPORTED')
+        need(cursor+length<=len(raw)-20, 'GIT_INDEX_EXTENSION_SIZE')
+        extensions.append('TREE');cursor+=length
+    need(cursor==len(raw)-20, 'GIT_INDEX_TRAILING_BYTES')
+    return dict(version=version,entries=entries,extensions=extensions)
+
+def parse_git_head(raw):
+    need(len(raw)<=4096 and raw.endswith(b'\n'), 'GIT_HEAD_BOUNDED_LINE')
+    value=raw.decode('ascii','strict').strip()
+    if value.startswith('ref: '):
+        branch=value[5:]
+        need(branch.startswith('refs/heads/') and all(x not in ('','.','..') for x in branch.split('/'))
+            and re.fullmatch(r'[A-Za-z0-9_./-]+',branch) is not None, 'GIT_HEAD_SAFE_BRANCH')
+        return dict(kind='symbolic',ref=branch)
+    need(re.fullmatch('[0-9a-f]{40}',value) is not None, 'GIT_HEAD_SHA1_ONLY')
+    return dict(kind='detached',commit=value)
+
+def validate_git_config(raw):
+    import configparser
+    need(len(raw)<=1024*1024,'GIT_CONFIG_CAP')
+    config=configparser.RawConfigParser(strict=True,interpolation=None)
+    try:config.read_string(raw.decode('utf-8','strict'))
+    except (ValueError,UnicodeError,configparser.Error):raise Refusal('GIT_CONFIG_UNSUPPORTED_SYNTAX') from None
+    need('core' in config and config['core'].get('bare','false').lower()=='false','GIT_NONBARE_REPO')
+    need('worktree' not in config['core'],'GIT_CONFIG_WORKTREE_OVERRIDE')
+    need(not any(s.lower()=='extensions' or s.lower()=='include' or s.lower().startswith('includeif') for s in config.sections()),'GIT_CONFIG_EXTENSIONS_INCLUDES_UNSUPPORTED')
+
+def git_snapshot():
+    # No git subprocess, config content output, untracked recursion or external worktree.
+    need(not any(os.environ.get(k) for k in ('GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE','GIT_CONFIG','GIT_CONFIG_COUNT')),'GIT_ENV_REDIRECTION')
+    gd=safe_path(REPO/'.git')
+    need(gd.is_dir() and not gd.is_symlink() and not gd.is_junction(),'GIT_FIXED_DIRECTORY')
+    absent=[]
+    for name in ('commondir','gitdir','config.worktree','index.lock','HEAD.lock','config.lock','shallow'):
+        p=safe_path(gd/name);need(not p.exists(),'GIT_UNSUPPORTED_WORKTREE_OR_ACTIVE_LOCK');absent.append(str(p))
+    metadata=[];total=0
+    def read_meta(path,cap):
+        nonlocal total
+        p=safe_path(path,True)
+        need(p.stat().st_size<=cap,'GIT_METADATA_CAP')
+        with p.open('rb') as f:raw=f.read(cap+1)
+        need(len(raw)<=cap,'GIT_METADATA_CAP')
+        total+=len(raw);need(total<=32*1024*1024,'GIT_METADATA_TOTAL_CAP')
+        metadata.append(pin(p,raw));return raw
+    config=read_meta(gd/'config',1024*1024);validate_git_config(config)
+    head=read_meta(gd/'HEAD',4096);head_value=parse_git_head(head)
+    if head_value['kind']=='symbolic':
+        refpath=safe_path(gd/head_value['ref'])
+        if refpath.exists():
+            refraw=read_meta(refpath,4096)
+            need(re.fullmatch(rb'[0-9a-f]{40}\n',refraw) is not None,'GIT_LOOSE_REF_SHA1')
+            head_value['commit']=refraw.decode().strip()
+        else:
+            absent.append(str(refpath))
+            packed=read_meta(gd/'packed-refs',8*1024*1024)
+            matches=[]
+            for line in packed.splitlines():
+                if not line or line.startswith((b'#',b'^')):continue
+                parts=line.split(b' ')
+                need(len(parts)==2 and re.fullmatch(rb'[0-9a-f]{40}',parts[0]) is not None,'GIT_PACKED_REF_SYNTAX')
+                if parts[1].decode('ascii','strict')==head_value['ref']:matches.append(parts[0].decode())
+            need(len(matches)==1,'GIT_PACKED_HEAD_UNIQUE')
+            head_value['commit']=matches[0]
+    index=read_meta(gd/'index',16*1024*1024);parsed=parse_git_index(index)
+    tracked=[];tracked_total=0
+    for entry in parsed['entries']:
+        p=safe_path(REPO/entry['path'])
+        if p.exists():
+            safe_path(p,True);need(p.stat().st_size<=32*1024*1024,'GIT_TRACKED_FILE_CAP')
+            with p.open('rb') as f:raw=f.read(32*1024*1024+1)
+            need(len(raw)<=32*1024*1024,'GIT_TRACKED_FILE_CAP')
+            tracked_total+=len(raw);need(tracked_total<=2*1024*1024*1024,'GIT_TRACKED_TOTAL_CAP')
+            observed=pin(p,raw)
+            blob=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
+            tracked.append(dict(**entry,worktree_ref=observed,absent=False,raw_differs_from_index_blob=blob!=entry['index_oid']))
+        else:tracked.append(dict(**entry,worktree_ref=None,absent=True,raw_differs_from_index_blob=True))
+    return dict(schema='researchos.main24-git-baseline.v1',repo_root=str(REPO),
+        git_dir=str(gd),common_dir=str(gd),worktree_root=str(REPO),dotgit_kind='directory',
+        head=head_value,metadata_refs=metadata,required_absent_paths=absent,
+        index_version=parsed['version'],index_extensions=parsed['extensions'],
+        tracked=tracked,tracked_count=len(tracked),untracked_enumerated=False,
+        dirty_semantics='Raw byte comparison against index blob; no Git clean filters or status process.')
+
+def verify_git_baseline(req,refs=None):
+    _,raw=checked(req['git_baseline_ref']);expected=decode(raw)
+    observed=git_snapshot()
+    need(observed==expected,'EXACT_GIT_IDENTITY_HEAD_CONFIG_INDEX_TRACKED_BASELINE')
+    if refs is not None:
+        add_ref(refs,req['git_baseline_ref'])
+        for ref in expected['metadata_refs']:add_ref(refs,ref)
+        targets={path_key(target(rel)) for rel in PATHS}
+        for row in expected['tracked']:
+            ref=row['worktree_ref']
+            if ref is not None and path_key(Path(ref['path'])) not in targets:add_ref(refs,ref)
+    return observed
+
+def actual_audit_gate(ref,actor,digest,refs):
+    raw=AUDIT_RUNTIME.read_bytes()
+    need(sha(raw)==AUDIT_RUNTIME_SHA,'CANONICAL_ACTUAL_AUDIT_SOURCE_PIN')
+    add_ref(refs,pin(AUDIT_RUNTIME,raw))
+    names={'require','decode','exact_path','raw_pin','read_ref','exact_host_peer_author','actual_audit'}
+    tree=ast.parse(raw)
+    body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+    need(len(body)==len(names),'CANONICAL_ACTUAL_AUDIT_DEFINITIONS')
+    env=dict(Path=Path,json=json,re=re,hashlib=hashlib,MAX=256*1024*1024,
+        ROOT_ACTOR=ROOT_ACTOR,ROOT_THREAD_ID=ROOT_THREAD_ID,ROOT_AUDIT=ROOT_AUDIT)
+    exec(compile(ast.Module(body=body,type_ignores=[]),str(AUDIT_RUNTIME),'exec'),env)
+    returned=env['actual_audit'](ref,actor,digest)
+    need(type(returned) is list and len(returned)==2,'ACTUAL_AUDIT_RETURNS_TWO_REFS')
+    for item in returned:add_ref(refs,item)
+    return returned
+
+def finite_lease(issued_at,expires_at):
+    issued=parse_stamp(issued_at);expires=parse_stamp(expires_at);now=datetime.now(timezone.utc)
+    need(issued<=now<expires and 0<(expires-issued).total_seconds()<=3600,'ACTUAL_AUTHORITY_FINITE_LEASE')
+
+def prepare_scope_expected(req,scope):
+    return dict(schema='researchos.root-main24-prepare-scope.v1',
+        status='ROOT_AUTHORIZED_MAIN24_METADATA_PREPARE',issued_by=ROOT_ACTOR,
+        issued_at=scope['issued_at'],expires_at=scope['expires_at'],
+        request_body={k:v for k,v in req.items() if k not in ('prepare_scope_ref','prepare_audit_ref')},
+        target_paths=list(PATHS),Main_writes=False,Canon_writes=False,product_execution=False)
+
+def verify_prepare_authority(req,refs):
+    scope=decode(add_ref(refs,req['prepare_scope_ref']))
+    need(scope==prepare_scope_expected(req,scope),'PREPARE_ROOT_SCOPE_BINDING')
+    finite_lease(scope['issued_at'],scope['expires_at'])
+    verified_root_observation(req['prepare_audit_ref'],req['prepare_scope_ref'],scope,refs)
+    base=BASE_HELPER.read_bytes();need(sha(base)==BASE_HELPER_SHA,'V1_HELPER_FROZEN')
+    add_ref(refs,pin(BASE_HELPER,base))
+
+def validate_source_review(review,helper_ref):
+    need(review.get('schema')=='researchos.main24-composition-helper-independent-source-decision.v1'
+        and review.get('verdict')=='ACCEPTED_SOURCE_ONLY','INDEPENDENT_SOURCE_ACCEPTED_VERDICT')
+    actor=review.get('review_author')
+    need(type(actor) is str and re.fullmatch(r'codex:/root/[a-z0-9_]+(?:/[a-z0-9_]+)*',actor) is not None
+        and actor!=AUTHOR and review.get('source_author')==AUTHOR
+        and review.get('review_author_backend')==actor.removeprefix('codex:')
+        and review.get('independent_non_author') is True,'NON_AUTHOR_REVIEW_ACTOR')
+    need(review.get('source_ref')==helper_ref,'REVIEW_EXACT_V2_SOURCE')
+    need(review.get('all_guards_closed') is True and review.get('retained_handles_count')==0
+        and review.get('blocking_codes')==[] and review.get('execution_grant') is False
+        and review.get('formal_acceptance') is False,'REVIEW_CLOSED_SOURCE_ONLY')
+    return actor
+
+def apply_scope_expected(grant,req,prepared,prepared_ref):
+    return dict(schema='researchos.root-main24-apply-scope.v2',
+        status='ROOT_AUTHORIZED_MAIN24_COMPOSITION',issued_by=ROOT_ACTOR,executor=ROOT_ACTOR,
+        project_id=PROJECT,lease_id=grant['operation_id'],exclusive_main_writer=True,
+        issued_at=grant['issued_at'],expires_at=grant['expires_at'],
+        source_helper_ref=req['source_helper_ref'],prepared_ref=prepared_ref,
+        source_package_hdf_ref=req['source_package_hdf_ref'],source_package_mf_ref=req['source_package_mf_ref'],
+        source_contract_ref=req['source_contract_ref'],repo_root=str(REPO),Root_thread_id=ROOT_THREAD_ID,
+        project_identity_ref=req['project_identity_ref'],
+        request_ref=prepared['request_ref'],git_baseline_ref=req['git_baseline_ref'],
+        merge_map_ref=req['merge_map_ref'],native_revision=NATIVE,target_paths=list(PATHS),
+        prepared_files_sha256=sha(encoded(prepared['files'])),
+        independent_source_review_ref=grant['independent_source_review_ref'],
+        independent_source_review_hdf_ref=grant['independent_source_review_hdf_ref'],
+        independent_source_review_mf_ref=grant['independent_source_review_mf_ref'],
+        existing_increment_targets=10,new_absent_only_targets=30,
+        Canon_writes=False,product_execution=False,automatic_retry=False,automatic_rollback=False)
+
+def verify_apply_authority(grant,req,prepared,prepared_ref,refs):
+    review=decode(add_ref(refs,grant['independent_source_review_ref']))
+    actor=validate_source_review(review,req['source_helper_ref'])
+    validate_review_package(grant,req,review,refs)
+    actual_audit_gate(grant['source_review_audit_ref'],actor,grant['independent_source_review_ref']['sha256'],refs)
+    scope=decode(add_ref(refs,grant['root_authorization_observation_ref']))
+    need(scope==apply_scope_expected(grant,req,prepared,prepared_ref),'ROOT_APPLY_SCOPE_FULL_BINDING')
+    finite_lease(grant['issued_at'],grant['expires_at'])
+    verified_root_observation(grant['root_authorization_audit_ref'],grant['root_authorization_observation_ref'],scope,refs)
+
+

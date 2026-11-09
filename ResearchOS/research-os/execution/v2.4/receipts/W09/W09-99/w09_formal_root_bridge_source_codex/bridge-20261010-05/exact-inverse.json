@@ -1,0 +1,79 @@
+{
+  "original_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-04\\w09_root_bridge.source.py",
+    "sha256": "de04ff05607caf3d23a5ded416499d04dee28a4305da0ec6aacd37d92b564811",
+    "bytes": 49223
+  },
+  "candidate_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-05\\w09_root_bridge.source.py",
+    "sha256": "e9e6aebaa88eb749576be8b68ebdd4fdeb202213111546437153d1d0739836b3",
+    "bytes": 54789
+  },
+  "replacement_blocks": [
+    {
+      "before": "BRIDGE_GENERATION = \"bridge-20261010-04\"",
+      "after": "BRIDGE_GENERATION = \"bridge-20261010-05\""
+    },
+    {
+      "before": "def snapshot(api, reader, context=None):\n    data = {\"files\": {str(k):v for k,v in reader.read_hashes.items()},",
+      "after": "def snapshot(api, reader, context=None, authority=False):\n    data = {\"files\": {str(k):v for k,v in reader.read_hashes.items()\n                      if authority or canonical_identity(k) not in CANON},"
+    },
+    {
+      "before": "\n\ndef native_inputs(req, eng):",
+      "after": "\n\ndef canonical_identity(path):\n    \"\"\"Identify the fixed Canon files without reading their historical live bytes.\"\"\"\n    value = Path(path)\n    return value if value.is_absolute() else ROOT / value\n\ndef validate_persistent_snapshot(data):\n    need(type(data) is dict and type(data.get(\"files\")) is dict,\n         \"DEPENDENCY_SNAPSHOT_REQUIRED\")\n    need(not any(canonical_identity(path) in CANON for path in data[\"files\"]),\n         \"HISTORICAL_SNAPSHOT_CONTAINS_CANON\")\n    return data\n\ndef freeze_current4(req, out):\n    \"\"\"Called only by propose inside its current4 SourceReadGuard.\"\"\"\n    need(type(req[\"current4\"]) is list and len(req[\"current4\"]) == 4\n         and [canonical_identity(r[\"path\"]) for r in req[\"current4\"]] == CANON,\n         \"ARCHIVE_EXACT_CANON_ORDER\")\n    archives = []\n    for index, ref in enumerate(req[\"current4\"]):\n        need(set(ref) == {\"path\", \"sha256\", \"bytes\"} and type(ref[\"bytes\"]) is int\n             and Path(ref[\"path\"]).is_absolute(), \"ARCHIVE_EXACT_CANON_REF\")\n        raw = checked(ref)\n        archive = save(out / (\"canonical-\" + CANON[index].stem + \".original.json\"), raw, raw=True)\n        need(archive[\"sha256\"] == ref[\"sha256\"] and archive[\"bytes\"] == ref[\"bytes\"],\n             \"ARCHIVE_ORIGINAL_BYTES\")\n        archives.append(archive)\n    return {\"schema\":\"researchos.w09-bridge-historical-current4.v1\",\n            \"meaning\":\"ARCHIVED_HISTORICAL_CURRENT4_NOT_LIVE_AUTHORITY\",\n            \"canonical_refs\":copy.deepcopy(req[\"current4\"]),\"archive_refs\":archives}\n\ndef proposal_archive_refs(proposal, proposal_ref, req):\n    \"\"\"Retain historical identity only with four exact immutable original archives.\"\"\"\n    need(proposal.get(\"schema\") == \"researchos.w09-bridge-proposal.v1\"\n         and proposal.get(\"generation\") == BRIDGE_GENERATION\n         and proposal.get(\"source_ref\") == req[\"bridge_source_ref\"]\n         and proposal.get(\"source_review_ref\") == req[\"source_review_ref\"],\n         \"HISTORICAL_PROPOSAL_IDENTITY\")\n    proof = proposal.get(\"historical_current4\")\n    need(type(proof) is dict and set(proof) == {\"schema\",\"meaning\",\"canonical_refs\",\"archive_refs\"}\n         and proof[\"schema\"] == \"researchos.w09-bridge-historical-current4.v1\"\n         and proof[\"meaning\"] == \"ARCHIVED_HISTORICAL_CURRENT4_NOT_LIVE_AUTHORITY\",\n         \"EXPLICIT_HISTORICAL_CURRENT4_PROOF\")\n    old, archives = proof[\"canonical_refs\"], proof[\"archive_refs\"]\n    need(type(old) is list and type(archives) is list and len(old) == len(archives) == 4\n         and old == proposal.get(\"current4\")\n         and [canonical_identity(ref[\"path\"]) for ref in old] == CANON,\n         \"HISTORICAL_CURRENT4_ORDER_AND_IDENTITY\")\n    need(old[2:] == req[\"current4\"][2:], \"HISTORICAL_SS_CM_DRIFT\")\n    home = physical(proposal_ref[\"path\"]).parent\n    for index, (identity, archive) in enumerate(zip(old, archives)):\n        need(type(identity) is dict and set(identity) == {\"path\",\"sha256\",\"bytes\"}\n             and Path(identity[\"path\"]).is_absolute() and type(identity[\"bytes\"]) is int,\n             \"HISTORICAL_EXACT_CANON_REF\")\n        need(type(archive) is dict and set(archive) == {\"path\",\"sha256\",\"bytes\"}\n             and type(archive[\"bytes\"]) is int\n             and physical(archive[\"path\"]) == home / (\"canonical-\" + CANON[index].stem + \".original.json\")\n             and archive[\"sha256\"] == identity[\"sha256\"] and archive[\"bytes\"] == identity[\"bytes\"],\n             \"HISTORICAL_ARCHIVE_SAME_PROPOSAL_AND_BYTES\")\n        checked(archive)\n    validate_persistent_snapshot(proposal[\"dependency_snapshot\"])\n    return archives\n\ndef historical_dependency_refs(value, ref, req, name):\n    \"\"\"The one archive-covered current4 field is exempt; other Canon refs are refused.\"\"\"\n    cleaned = copy.deepcopy(value)\n    archives = []\n    if name == \"proposal_ref\":\n        archives = proposal_archive_refs(value, ref, req)\n        del cleaned[\"current4\"]\n        del cleaned[\"historical_current4\"]\n    if \"dependency_snapshot\" in cleaned:\n        validate_persistent_snapshot(cleaned[\"dependency_snapshot\"])\n    refs = list(references(cleaned))\n    need(not any(canonical_identity(item[\"path\"]) in CANON for item in refs),\n         \"UNDECLARED_HISTORICAL_CANONICAL_REFERENCE\")\n    return refs + archives\n\ndef request_dependency_refs(req):\n    \"\"\"Every direct request Canon ref must equal the fresh authority vector.\"\"\"\n    refs = list(references(req))\n    authority = {canonical_identity(ref[\"path\"]):ref for ref in req[\"current4\"]}\n    for ref in refs:\n        path = canonical_identity(ref[\"path\"])\n        if path in CANON:\n            need(ref == authority.get(path), \"REQUEST_CANONICAL_AUTHORITY_CONFLICT\")\n    return refs\n\n\ndef native_inputs(req, eng):"
+    },
+    {
+      "before": "    common = {\"issued_by\": ROOT_ACTOR, \"source_actor\": AUTHOR_BACKEND,",
+      "after": "    historical = freeze_current4(req, out)\n    common = {\"issued_by\": ROOT_ACTOR, \"source_actor\": AUTHOR_BACKEND,"
+    },
+    {
+      "before": "    return {\"schema\": \"researchos.w09-bridge-proposal.v1\", \"documents\": docs,",
+      "after": "    return {\"schema\": \"researchos.w09-bridge-proposal.v1\", \"generation\":BRIDGE_GENERATION,\n            \"historical_current4\":historical, \"documents\": docs,"
+    },
+    {
+      "before": "    need(api.recheck_inputs(proposal[\"dependency_snapshot\"])[\"status\"] == \"PASS\", \"PROPOSAL_DRIFT\")",
+      "after": "    proposal_archive_refs(proposal, req[\"proposal_ref\"], req)\n    need(proposal[\"current4\"] == req[\"current4\"], \"ACTIVATION_PROPOSAL_CURRENT4\")\n    need(api.recheck_inputs(proposal[\"dependency_snapshot\"])[\"status\"] == \"PASS\", \"PROPOSAL_DRIFT\")"
+    },
+    {
+      "before": "    proposal = document(ref)\n    need(proposal[\"c19_policy\"] == req[\"c19_policy\"], \"REGISTERED_C19_POLICY\")",
+      "after": "    proposal = document(ref)\n    proposal_archive_refs(proposal, ref, req)\n    need(proposal[\"c19_policy\"] == req[\"c19_policy\"], \"REGISTERED_C19_POLICY\")"
+    },
+    {
+      "before": "    need(api.recheck_inputs(publication[\"dependency_snapshot\"])[\"status\"] == \"PASS\", \"PUBLICATION_CAS\")",
+      "after": "    validate_persistent_snapshot(publication[\"dependency_snapshot\"])\n    need(api.recheck_inputs(publication[\"dependency_snapshot\"])[\"status\"] == \"PASS\", \"PUBLICATION_CAS\")"
+    },
+    {
+      "before": "        for ref in references(req):",
+      "after": "        for ref in request_dependency_refs(req):"
+    },
+    {
+      "before": "        authority_snapshot = snapshot(eng[0],eng[1])",
+      "after": "        authority_snapshot = snapshot(eng[0],eng[1],authority=True)\n        authority_snapshot[\"files\"].update({str(path):ref[\"sha256\"] for path,ref in zip(CANON,req[\"current4\"])})"
+    },
+    {
+      "before": "                for ref in references(document(req[name])):",
+      "after": "                for ref in historical_dependency_refs(document(req[name]),req[name],req,name):"
+    },
+    {
+      "before": "        for path,digest in eng[1].read_hashes.items():\n            raw=Path(path).read_bytes()",
+      "after": "        for path,digest in eng[1].read_hashes.items():\n            if args.stage in {\"activate\",\"publish-registration\"} and canonical_identity(path) in CANON[:2]:\n                need(digest == req[\"current4\"][CANON.index(canonical_identity(path))][\"sha256\"], \"TP_AUTHORITY_DIGEST_CONFLICT\")\n                continue\n            raw=Path(path).read_bytes()"
+    }
+  ],
+  "complete_inverse": true,
+  "changed_existing_functions": [
+    "snapshot",
+    "propose",
+    "registration",
+    "registered",
+    "publish_registration",
+    "main"
+  ],
+  "added_functions": [
+    "canonical_identity",
+    "validate_persistent_snapshot",
+    "freeze_current4",
+    "proposal_archive_refs",
+    "historical_dependency_refs",
+    "request_dependency_refs"
+  ]
+}

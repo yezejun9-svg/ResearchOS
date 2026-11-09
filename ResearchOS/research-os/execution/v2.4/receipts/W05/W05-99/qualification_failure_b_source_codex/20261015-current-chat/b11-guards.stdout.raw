@@ -1,0 +1,260 @@
+internal/domain\orchestration.go:85:func currentAuthorityRoot(tx *sql.Tx, id string) (string, error) {
+internal/domain\runtime.go:72:func (s *Service) observeRuntime(ctx context.Context, project, runID string, epoch int64, observation Object, coordinator bool) error {
+internal/domain\runtime_model.go:100:func qualificationModelEffectAllowed(tx *sql.Tx, project string, task, payload Object) error {
+internal/domain\runtime_qualification.go:14:func qualificationTaskHash(t Object) string {
+internal/domain\runtime_qualification.go:172:func qualificationPlan(tx *sql.Tx, project, taskID, runtimeID string) (Object, string, string, error) {
+				break
+			}
+			info, e := os.Stat(path)
+			if e != nil || !info.Mode().IsRegular() || info.Size() > 64*1024*1024 {
+				err = errors.New("output missing or exceeds bound")
+				break
+			}
+			total += info.Size()
+			if total > 64*1024*1024 {
+				err = errors.New("output total exceeds bound")
+				break
+			}
+			raw, e := os.ReadFile(path)
+			if e != nil {
+				err = e
+				break
+			}
+			w.journal.Artifacts = append(w.journal.Artifacts, Artifact{Path: relative, Hash: Hash(raw), Size: int64(len(raw))})
+		}
+		if err != nil {
+			w.journal.State = "FAILED"
+		}
+	}
+	if err != nil {
+		w.journal.Reason = err.Error()
+	}
+	w.err = errors.Join(err, w.persist())
+}
+
+func (w *Bridge) Frames() <-chan BridgeFrame { return w.frames }
+func (w *Bridge) Done() <-chan struct{}      { return w.done }
+func (w *Bridge) Directory() string          { return w.directory }
+func (w *Bridge) Read() BridgeJournal {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	b, _ := json.Marshal(w.journal)
+	var journal BridgeJournal
+	json.Unmarshal(b, &journal)
+	return journal
+}
+func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	manifest, e := bridgeMap(w.journal.Manifest)
+	if e != nil || epoch != bridgeNumber(manifest, "epoch") || lease <= 0 || lease > LeaseDuration || w.journal.Cancelled || time.Now().After(w.deadline) || time.Now().UTC().After(w.wallDeadline) {
+		return errors.New("expired, cancelled or stale worker lease")
+	}
+	w.deadline = time.Now().Add(lease)
+	w.wallDeadline = time.Now().UTC().Add(lease)
+	return nil
+}
+func (w *Bridge) Cancel(reason string) {
+	w.mu.Lock()
+	w.journal.Cancelled = true
+	w.journal.Reason = reason
+	w.persist()
+	w.mu.Unlock()
+	w.mu.Lock()
+	w.modelNotifyLocked()
+	w.mu.Unlock()
+	w.cancel()
+	if w.process != nil {
+		w.process.Cancel()
+	}
+}
+func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any) error {
+	w.mu.Lock()
+	if sequence != w.journal.Acknowledged+1 || sequence > w.journal.Frames {
+		w.mu.Unlock()
+		return errors.New("protocol acknowledgement out of order")
+	}
+	if sequence == w.journal.CheckpointSequence {
+		raw, e := json.Marshal(response)
+		if e != nil {
+			w.mu.Unlock()
+			return e
+		}
+		var reply struct {
+			Sequence int64          `json:"sequence"`
+			Key      string         `json:"key"`
+			State    string         `json:"state"`
+			Payload  CheckpointSeal `json:"payload"`
+		}
+		if json.Unmarshal(raw, &reply) != nil || reply.Sequence != sequence || reply.Key != "checkpoint.sealed" || reply.State != "CONFIRMED" || w.validateCheckpointSeal(reply.Payload) != nil {
+			w.mu.Unlock()
+			return errors.New("checkpoint requires durable artifact/use/journal seal")
+		}
+		seal := reply.Payload
+		w.journal.CheckpointSeal = &seal
+	}
+	w.journal.Acknowledged = sequence
+	err := w.persist()
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if response != nil {
+		raw, e := json.Marshal(response)
+		if e != nil {
+			return e
+		}
+		if len(raw) > 64*1024 {
+			return errors.New("protocol response exceeds frame limit")
+		}
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
+		if err := w.process.Write(ctx, append(raw, '\n')); err != nil {
+			return err
+		}
+		w.mu.Lock()
+		if sequence == w.journal.QueueInitSequence {
+			w.modelInitDelivered = true
+			w.modelNotifyLocked()
+		}
+		w.mu.Unlock()
+		return nil
+	}
+	return nil
+}
+
+func (w *Bridge) validateControlBinding(binding map[string]any) error {
+	manifest, err := bridgeMap(w.journal.Manifest)
+	identity := map[string]any{"pid": w.journal.Identity.PID, "process_created_ns": strconv.FormatInt(w.journal.Identity.Created, 10), "job": w.journal.Identity.Job, "appcontainer_sid": w.journal.Identity.SID, "profile": w.journal.Identity.Profile, "staging_directory": w.journal.Identity.StagingDirectory}
+	raw, _ := json.Marshal(identity)
+	expected, _ := canonicalHash(raw)
+	actualRaw, _ := json.Marshal(binding["process_identity"])
+	actual, _ := canonicalHash(actualRaw)
+	if err != nil || binding["task_id"] != manifest["task_id"] || binding["run_id"] != manifest["run_id"] || bridgeNumber(binding, "runtime_epoch") != bridgeNumber(manifest, "epoch") || binding["dispatch_key"] != w.journal.DispatchKey || binding["manifest_hash"] != w.journal.ManifestHash || actual != expected || bridgeString(binding, "queue_generation") == "" {
+		return errors.New("control identity mismatch")
+	}
+	if len(w.journal.QueueBinding) > 0 && string(w.journal.QueueBinding) != "null" {
+		expected, e := bridgeMap(w.journal.QueueBinding)
+		if e != nil {
+			return e
+		}
+		for _, key := range []string{"project_id", "session_id", "queue_generation"} {
+			if expected[key] != binding[key] {
+				return errors.New("frozen queue binding mismatch")
+			}
+		}
+	}
+	return nil
+}
+
+// Control shares a single process stdin writer with effect acknowledgements.
+func (w *Bridge) Control(ctx context.Context, frame any) error {
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 64*1024 {
+		return errors.New("control frame exceeds bound")
+	}
+	value, err := bridgeMap(raw)
+	if err != nil {
+		return err
+	}
+	binding, _ := value["binding"].(map[string]any)
+	w.mu.Lock()
+	err = w.validateControlBinding(binding)
+	if err == nil && (!w.journal.QueueRequired || w.journal.ProtocolComplete) {
+		err = errors.New("control on closed worker")
+	}
+	if err == nil && value["type"] == "command.pause" {
+		if w.journal.PauseProtocol != PauseProtocol || value["version"] != PauseProtocol || w.journal.PauseRequested || w.journal.QueueSealed || w.journal.Cancelled || w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence || bridgeString(value, "pause_id") == "" {
+			err = errors.New("pause unsupported or fenced")
+		} else {
+			w.journal.PauseRequested = true
+			w.journal.PauseID = bridgeString(value, "pause_id")
+			err = w.persist()
+		}
+	} else if err == nil && w.journal.PauseRequested {
+		err = errors.New("control blocked during pause")
+	}
+	if err == nil && value["type"] == "command.deliver" && value["initialize"] != true {
+		w.journal.QueueIdle = false
+	}
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return w.process.Write(ctx, append(raw, '\n'))
+}
+func (w *Bridge) Finalize(effectsReconciled bool) (BridgeJournal, error) {
+	select {
+	case <-w.done:
+	default:
+		return BridgeJournal{}, errors.New("process not drained")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.journal, w.err
+	}
+	if w.journal.Acknowledged != w.journal.Frames || !effectsReconciled {
+		return w.journal, errors.New("protocol or effect reconciliation incomplete")
+	}
+	if !w.journal.Cancelled {
+		for _, stream := range w.modelStreams {
+			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+				return w.journal, errors.New("MODEL stream closure not reconciled")
+			}
+		}
+	}
+	if w.journal.State == "EXITED" {
+		w.journal.State = "SETTLED"
+	}
+	if e := w.persist(); e != nil {
+		return w.journal, e
+	}
+	return w.journal, nil
+}
+
+// Observation is host-created. PID creation time is represented as decimal
+// text to retain all 64 bits through canonical JSON, unlike a float64 number.
+func (j BridgeJournal) Observation() (map[string]any, error) {
+	manifest, e := bridgeMap(j.Manifest)
+	if e != nil {
+		return nil, e
+	}
+	admission, _ := manifest["admission"].(map[string]any)
+	profile, _ := admission["profile"].(map[string]any)
+	spec := map[string]any{"run_id": manifest["run_id"], "task_id": manifest["task_id"], "epoch": manifest["epoch"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "capabilities": []any{"start"}}
+	if j.ContextReady {
+		spec["capabilities"] = []any{"start", "context_rebuild"}
+	}
+	for _, key := range []string{"build_hash", "backend", "model", "sandbox", "platform", "adapter", "adapter_revision", "credential_revision"} {
+		spec[key] = profile[key]
+	}
+	state := j.State
+	if state == "EXITED" {
+		state = "UNKNOWN"
+	}
+	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
+		state = "CANCELLED"
+	}
+	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+}
+
+// ReadBridgeTerminal checks the trusted directory and raw hashes. It never
+// creates a process, renews a lease or turns missing PID into success.
+func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+	if e != nil {
+		return BridgeJournal{}, errors.New("worker still owns dispatch")
+	}
+	defer lock.Close()
+	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+	if e != nil {
+		return BridgeJournal{}, e
+	}
+	var j BridgeJournal
+	if e = json.Unmarshal(raw, &j); e != nil {

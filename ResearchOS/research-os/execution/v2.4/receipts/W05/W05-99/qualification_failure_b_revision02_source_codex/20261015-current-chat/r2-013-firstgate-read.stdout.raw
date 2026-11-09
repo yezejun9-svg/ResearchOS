@@ -1,0 +1,189 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+const onlineQualificationDenial = "ONLINE_FIRST_GATE_TOOL_DENIAL"
+
+// A typed rejection is constructed only inside the serialized first dispatch
+// gate. Its existence alone never authorizes terminal closure.
+type qualificationPreEffectRejection struct {
+	receipt Object
+	digest  string
+	cause   error
+}
+
+type qualificationBrokerDrain struct {
+	accepted      int
+	completed     int
+	pending       int
+	closed        bool
+	disqualified  bool
+	rejectedSeq   int64
+	frameHashes   map[int64]string
+	completionSet map[int64]string
+}
+
+type qualificationBrokerRegistry struct {
+	mu           sync.Mutex
+	closed       bool
+	disqualified bool
+	rejectedSeq  int64
+	admitted     map[int64]string
+	completed    map[int64]string
+}
+
+func newQualificationBrokerRegistry() *qualificationBrokerRegistry {
+	return &qualificationBrokerRegistry{admitted: map[int64]string{}, completed: map[int64]string{}}
+}
+
+func (r *qualificationBrokerRegistry) admit(frame rt.BridgeFrame) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.admitted[frame.Sequence] != "" {
+		r.disqualified = true
+		return false
+	}
+	r.admitted[frame.Sequence] = Hash(frame)
+	return true
+}
+
+func (r *qualificationBrokerRegistry) complete(sequence int64, digest string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.admitted[sequence] == "" || r.completed[sequence] != "" {
+		r.disqualified = true
+		return false
+	}
+	r.completed[sequence] = digest
+	return true
+}
+
+func (r *qualificationBrokerRegistry) close(rejectedSeq int64) {
+	r.mu.Lock()
+	r.closed = true
+	if rejectedSeq > 0 && r.rejectedSeq == 0 {
+		r.rejectedSeq = rejectedSeq
+	}
+	r.mu.Unlock()
+}
+
+func (r *qualificationBrokerRegistry) disqualify() {
+	r.mu.Lock()
+	r.disqualified = true
+	r.mu.Unlock()
+}
+
+func (r *qualificationBrokerRegistry) snapshot() qualificationBrokerDrain {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t := qualificationBrokerDrain{accepted: len(r.admitted), completed: len(r.completed), pending: len(r.admitted) - len(r.completed), closed: r.closed, disqualified: r.disqualified, rejectedSeq: r.rejectedSeq, frameHashes: map[int64]string{}, completionSet: map[int64]string{}}
+	for k, v := range r.admitted {
+		t.frameHashes[k] = v
+	}
+	for k, v := range r.completed {
+		t.completionSet[k] = v
+	}
+	return t
+}
+
+func (q *qualificationPreEffectRejection) Error() string {
+	if q == nil || q.cause == nil {
+		return "qualification first-gate rejection unavailable"
+	}
+	return q.cause.Error()
+}
+
+func qualificationDenialUnavailable(reason string) error {
+	return Fail(409, "GATE_FAILED", "qualification failure proof unavailable: "+reason)
+}
+
+func (c *RuntimeCoordinator) qualificationFirstGateRejectionTx(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, bridge *rt.Bridge, frame rt.BridgeFrame, payload Object) (*qualificationPreEffectRejection, error) {
+	if frame.Type != "effect.request" || frame.Capability != "TOOL" {
+		return nil, nil
+	}
+	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+	if err != nil {
+		return nil, err
+	}
+	if task["task_type"] != "runtime_qualification" {
+		return nil, nil
+	}
+	if frame.Sequence != 3 || c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil || frame.Route == "" || len(frame.Payload) == 0 {
+		return nil, qualificationDenialUnavailable("frame identity invalid")
+	}
+	manifest, ok := dispatch["manifest"].(map[string]any)
+	if !ok {
+		return nil, qualificationDenialUnavailable("dispatch manifest missing")
+	}
+	admission, ok := manifest["admission"].(map[string]any)
+	if !ok || admission["qualification_bootstrap"] != true || admission["mode"] == nil {
+		return nil, qualificationDenialUnavailable("qualification admission missing")
+	}
+	profile, ok := admission["profile"].(map[string]any)
+	if !ok || Hash(admission["profile_ref"]) != admission["profile_hash"] {
+		return nil, qualificationDenialUnavailable("profile binding invalid")
+	}
+	epoch, err := Num(run, "lease_epoch")
+	if err != nil || epoch < 1 || manifest["project_id"] != route.ProjectID || manifest["run_id"] != run["id"] || manifest["task_id"] != task["id"] || manifest["runtime_id"] != route.RuntimeID || Hash(manifest["epoch"]) != Hash(epoch) || manifest["dispatch_key"] != dispatch["dispatch_key"] || Hash(manifest) != dispatch["manifest_hash"] {
+		return nil, qualificationDenialUnavailable("run and dispatch differ")
+	}
+	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+	if err != nil {
+		return nil, err
+	}
+	var markerCount int
+	err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=?`, route.ProjectID, task["id"], run["id"], route.RuntimeID, epoch).Scan(&markerCount)
+	if err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || Hash(plan["model_qualification"]) != Hash(profile["model_qualification"]) || runtimeTechnicalHashMust(tx, route.ProjectID, route.RuntimeID) != admission["technical_hash"] {
+		return nil, qualificationDenialUnavailable("qualification marker or plan changed")
+	}
+	var author string
+	if err = tx.QueryRow(`SELECT author FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?`, route.ProjectID, task["id"], route.RuntimeID).Scan(&author); err != nil {
+		return nil, err
+	}
+	currentRoot, err := currentAuthorityRoot(tx, author)
+	if err != nil || currentRoot != root {
+		return nil, qualificationDenialUnavailable("qualification author changed")
+	}
+	modelConfig, ok := profile["model_config"].(map[string]any)
+	permission, permitted := plan["model_qualification"].(map[string]any)
+	if !ok || !permitted || frame.Route != Str(modelConfig, "route") || frame.Route != Str(permission, "route") || profile["backend"] != runtimeMuBackend {
+		return nil, qualificationDenialUnavailable("known model route changed")
+	}
+	if err = validateRuntimeToolArguments(modelConfig, payload); err != nil {
+		return nil, qualificationDenialUnavailable("tool payload invalid")
+	}
+	known := false
+	for _, provider := range c.runtimeProviders() {
+		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != "runtime_qualification" || provider.Capability != "MODEL" || provider.MeasurementMode != admission["mode"] || provider.CredentialRevision != profile["credential_revision"] || Hash(provider.ModelConfig) != Hash(modelConfig) || provider.Endpoint != Str(modelConfig, "endpoint") || !c.liveModelCredentialBound(provider, profile) {
+			continue
+		}
+		for _, entry := range Arr(profile, "effect_routes") {
+			p, ok := entry.(map[string]any)
+			if ok && p["id"] == provider.ID && p["capability"] == "MODEL" && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+				known = true
+			}
+		}
+	}
+	if !known {
+		return nil, qualificationDenialUnavailable("route unknown or no longer frozen")
+	}
+	var effects, ledger, distinct int
+	var modelKey string
+	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),coalesce(min(effect_key),'') FROM resource_effects WHERE project=? AND run=?`, route.ProjectID, run["id"]).Scan(&distinct, &modelKey); err != nil {
+		return nil, err
+	}
+	if err = tx.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND effect_key=?`, route.ProjectID, run["id"], frame.Key).Scan(&effects); err != nil {

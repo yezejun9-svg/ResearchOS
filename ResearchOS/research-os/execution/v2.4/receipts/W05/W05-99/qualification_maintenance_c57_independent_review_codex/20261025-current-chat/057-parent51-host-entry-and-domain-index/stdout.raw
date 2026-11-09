@@ -1,0 +1,403 @@
+
+FILE internal/host/qualification_failure_maintenance_windows.go
+321: func RunQualificationFailureMaintenance(ctx context.Context, input QualificationMaintenanceInput) (out QualificationMaintenanceResult, retErr error) {
+322: 	root := input.DataRoot
+323: 	if ctx.Err() != nil {
+324: 		return out, ctx.Err()
+325: 	}
+326: 	if !filepath.IsAbs(root) || filepath.Clean(root) != root || strings.Contains(root[len(filepath.VolumeName(root)):], ":") {
+327: 		return out, errors.New("qualification data root invalid")
+328: 	}
+329: 	database := filepath.Join(root, "researchos.sqlite")
+330: 	var plan domain.HistoricalQualificationPlan
+331: 	var proposal qualificationProposal
+332: 	var raw []byte
+333: 	var e error
+334: 	if input.Action == "preflight" {
+335: 		if e = qualificationExternalPath(root, input.Proposal); e != nil {
+336: 			return out, e
+337: 		}
+338: 		if e = qualificationExternalPath(root, input.Out); e != nil {
+339: 			return out, e
+340: 		}
+341: 		if _, e = qualificationReadStrict(input.Proposal, 64<<10, &proposal); e != nil {
+342: 			return out, e
+343: 		}
+344: 		if proposal.Schema != qualificationProposalSchema || !qualificationExactSubject(proposal.Subject) {
+345: 			return out, errors.New("qualification proposal invalid")
+346: 		}
+347: 		if _, e = os.Lstat(input.Out); !os.IsNotExist(e) {
+348: 			return out, errors.New("qualification output already exists or unavailable")
+349: 		}
+350: 	} else if input.Action == "commit" || input.Action == "recover" || input.Action == "abort" {
+351: 		if e = qualificationExternalPath(root, input.Plan); e != nil {
+352: 			return out, e
+353: 		}
+354: 		if raw, e = qualificationReadStrict(input.Plan, 256<<10, &plan); e != nil {
+355: 			return out, e
+356: 		}
+357: 		if domain.Digest(raw) != input.PlanSHA256 || input.OperationID != plan.OperationID || plan.DataRoot != root || plan.Database != database ||
+358: 			!qualificationExactSubject(plan.Subject) || plan.Schema != "researchos.qualification-failure-maintenance-full-plan.v1" {
+359: 			return out, errors.New("qualification reviewed plan differs")
+360: 		}
+361: 		pinned := qualificationPinnedSource()
+362: 		pinned.StderrSHA256 = plan.Source.StderrSHA256
+363: 		if pinned != plan.Source {
+364: 			return out, errors.New("qualification source pins differ")
+365: 		}
+366: 	} else {
+367: 		return out, errors.New("qualification action invalid")
+368: 	}
+369: 	operation, boundaryHash := plan.OperationID, plan.BoundaryPlanSHA256
+370: 	if input.Action == "preflight" {
+371: 		operation, boundaryHash = proposal.OperationID, proposal.BoundaryPlanSHA256
+372: 	}
+373: 	boundary, boundaryState, e := recoveryboundary.ReadBoundaryPlan(root, operation, boundaryHash)
+374: 	if e != nil {
+375: 		return out, e
+376: 	}
+377: 	if boundary.DataRoot.Path != root || boundary.Database.Path != database || boundary.BusinessSID == "" ||
+378: 		boundaryState != "BOOT_OBSERVED" && !((input.Action == "recover" || input.Action == "commit") && boundaryState == "C_DURABLE") {
+379: 		return out, errors.New("qualification boundary not boot observed")
+380: 	}
+381: 	subject := plan.Subject
+382: 	if input.Action == "preflight" {
+383: 		subject = proposal.Subject
+384: 	}
+385: 	if boundary.SubjectSHA256 != strings.TrimPrefix(domain.Hash(subject), "sha256:") {
+386: 		return out, errors.New("qualification boundary subject differs")
+387: 	}
+388: 	var journalRaw []byte
+389: 	if input.Action != "preflight" {
+390: 		journalRaw, e = qualificationJournalRaw(plan, raw)
+391: 		if e != nil {
+392: 			return out, e
+393: 		}
+394: 	}
+395: 	journalDigest := domain.Digest(journalRaw)
+396: 	journalPath := filepath.Join(root, "host", qualificationmaintenancejournal.QualificationNamespace, operation)
+397: 	_, journalErr := os.Lstat(journalPath)
+398: 	journalExists := journalErr == nil
+399: 	if journalErr != nil && !os.IsNotExist(journalErr) {
+400: 		return out, journalErr
+401: 	}
+402: 	if input.Action == "preflight" && journalExists {
+403: 		return out, errors.New("qualification operation already exists")
+404: 	}
+405: 	var lease *rt.DataRootLease
+406: 	if input.Action == "recover" || input.Action == "abort" || input.Action == "commit" && journalExists {
+407: 		lease, e = rt.AcquireDataRootLeaseForQualificationRecovery(root, operation, journalDigest)
+408: 	} else {
+409: 		lease, e = rt.AcquireDataRootLease(root)
+410: 	}
+411: 	if e != nil {
+412: 		return out, e
+413: 	}
+414: 	defer func() { retErr = errors.Join(retErr, lease.Close()) }()
+415: 	if boundaryState == "C_DURABLE" {
+416: 		_, status, e := qualificationmaintenancejournal.OpenOwnInspection(root, qualificationmaintenancejournal.QualificationNamespace, operation, journalDigest)
+417: 		if e != nil || status.State != "DURABLE" {
+418: 			return out, errors.New("qualification durable journal unavailable")
+419: 		}
+420: 		db, e := store.OpenQualificationMaintenance(ctx, database)
+421: 		if e != nil {
+422: 			return out, e
+423: 		}
+424: 		defer func() { retErr = errors.Join(retErr, db.Close()) }()
+425: 		business, e := openQualificationBusinessIdentity(root, boundary.BusinessSID, boundary.HostIdentitySHA256)
+426: 		if e != nil {
+427: 			return out, e
+428: 		}
+429: 		defer func() { retErr = errors.Join(retErr, business.Close()) }()
+430: 		ownerRoot, e := business.ValidateOwner(ctx, db)
+431: 		if e != nil {
+432: 			return out, e
+433: 		}
+434: 		if plan.AuthorID != business.ownerID || plan.OwnerRoot != ownerRoot || plan.SID != boundary.BusinessSID {
+435: 			return out, errors.New("qualification replay business Owner differs")
+436: 		}
+437: 		classified, e := domain.ClassifyHistoricalQualification(ctx, db, plan, input.PlanSHA256)
+438: 		if e != nil || classified != "APPLIED" {
+439: 			return out, errors.New("qualification durable replay SQL image differs")
+440: 		}
+441: 		return qualificationResult(input.Action, "DURABLE", operation, input.PlanSHA256, plan.OutcomeHash), nil
+442: 	}
+443: 	q, e := recoveryboundary.OpenCurrentQuiescence(ctx, lease, root, database, operation, boundaryHash)
+444: 	if e != nil {
+445: 		return out, e
+446: 	}
+447: 	defer func() { retErr = errors.Join(retErr, q.Close()) }()
+448: 	if e = q.Check(ctx, lease, root, database, operation, boundaryHash); e != nil {
+449: 		return out, e
+450: 	}
+451: 	db, e := store.OpenQualificationMaintenance(ctx, database)
+452: 	if e != nil {
+453: 		return out, e
+454: 	}
+455: 	defer func() { retErr = errors.Join(retErr, db.Close()) }()
+456: 	business, e := openQualificationBusinessIdentity(root, boundary.BusinessSID, boundary.HostIdentitySHA256)
+457: 	if e != nil {
+458: 		return out, e
+459: 	}
+460: 	defer func() { retErr = errors.Join(retErr, business.Close()) }()
+461: 	ownerRoot, e := business.ValidateOwner(ctx, db)
+462: 	if e != nil {
+463: 		return out, e
+464: 	}
+465: 	if input.Action != "preflight" && (plan.AuthorID != business.ownerID || plan.OwnerRoot != ownerRoot || plan.SID != boundary.BusinessSID) {
+466: 		return out, errors.New("qualification planned business Owner differs")
+467: 	}
+468: 	contracts, e := filepath.Abs(filepath.Join("spec", "v2.0", "contracts"))
+469: 	if e != nil {
+470: 		return out, e
+471: 	}
+472: 	if input.Action == "preflight" {
+473: 		plan, e = domain.PlanHistoricalQualification(ctx, db, contracts, proposal.Subject, qualificationPinnedSource(), business.ownerID, root, operation, boundaryHash, boundary.BusinessSID)
+474: 		if e != nil {
+475: 			return out, e
+476: 		}
+477: 		raw, e = json.MarshalIndent(plan, "", "  ")
+478: 		if e != nil {
+479: 			return out, e
+480: 		}
+481: 		f, e := os.OpenFile(input.Out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+482: 		if e != nil {
+483: 			return out, e
+484: 		}
+485: 		_, writeErr := f.Write(raw)
+486: 		closeErr := f.Close()
+487: 		if e = errors.Join(writeErr, closeErr); e != nil {
+488: 			return out, e
+489: 		}
+490: 		return qualificationResult(input.Action, "PREFLIGHT", operation, domain.Digest(raw)), nil
+491: 	}
+492: 	if input.Action == "commit" {
+493: 		if journalExists {
+494: 			_, existing, e := qualificationmaintenancejournal.OpenOwnInspection(root, qualificationmaintenancejournal.QualificationNamespace, operation, journalDigest)
+495: 			if e != nil {
+496: 				return out, e
+497: 			}
+498: 			if existing.State != "DURABLE" && existing.State != "DB_COMMITTED_OBSERVED" {
+499: 				return out, errors.New("qualification pending or aborted operation requires explicit recover")
+500: 			}
+501: 		} else {
+502: 			if e = business.Check(); e != nil {
+503: 				return out, e
+504: 			}
+505: 			if e = q.Check(ctx, lease, root, database, operation, boundaryHash); e != nil {
+506: 				return out, e
+507: 			}
+508: 			actual, startErr := qualificationmaintenancejournal.StartQualification(root, journalRaw)
+509: 			if startErr != nil || actual != journalDigest {
+510: 				return out, errors.New("qualification BEGIN unavailable")
+511: 			}
+512: 			if _, e = domain.ApplyHistoricalQualification(ctx, db, contracts, plan, input.PlanSHA256, q, lease); e != nil {
+513: 				return out, e
+514: 			}
+515: 			if e = business.Check(); e != nil {
+516: 				return out, e
+517: 			}
+518: 		}
+519: 	}
+520: 	_, status, e := qualificationmaintenancejournal.OpenOwnInspection(root, qualificationmaintenancejournal.QualificationNamespace, operation, journalDigest)
+521: 	if e != nil {
+522: 		return out, e
+523: 	}
+524: 	classification, e := domain.ClassifyHistoricalQualification(ctx, db, plan, input.PlanSHA256)
+525: 	if e != nil {
+526: 		return out, e
+527: 	}
+528: 	if classification == "NOT_APPLIED" {
+529: 		if e = business.Check(); e != nil {
+530: 			return out, e
+531: 		}
+532: 		if status.State == "BEGIN" {
+533: 			if e = qualificationmaintenancejournal.AppendQualification(root, operation, journalDigest, "CLASSIFIED_NOT_APPLIED", ""); e != nil {
+534: 				return out, e
+535: 			}
+536: 			status.State = "CLASSIFIED_NOT_APPLIED"
+537: 		}
+538: 		if input.Action == "abort" && status.State == "CLASSIFIED_NOT_APPLIED" {
+539: 			if e = qualificationmaintenancejournal.AppendQualification(root, operation, journalDigest, "ABORTED", ""); e != nil {
+540: 				return out, e
+541: 			}
+542: 			return qualificationResult(input.Action, "ABORTED", operation, input.PlanSHA256), nil
+543: 		}
+544: 		return qualificationResult(input.Action, status.State, operation, input.PlanSHA256), nil
+545: 	}
+546: 	if input.Action == "abort" || classification != "APPLIED" {
+547: 		return out, errors.New("qualification SQL state unresolved or applied abort denied")
+548: 	}
+549: 	if status.State == "BEGIN" || status.State == "CLASSIFIED_NOT_APPLIED" {
+550: 		if e = qualificationmaintenancejournal.AppendQualification(root, operation, journalDigest, "DB_COMMITTED_OBSERVED", plan.OutcomeHash); e != nil {
+551: 			return out, e
+552: 		}
+553: 		status.State = "DB_COMMITTED_OBSERVED"
+554: 	}
+555: 	if status.State == "DB_COMMITTED_OBSERVED" {
+556: 		if e = qualificationmaintenancejournal.AppendQualification(root, operation, journalDigest, "DURABLE", plan.OutcomeHash); e != nil {
+557: 			return out, e
+558: 		}
+559: 		status.State = "DURABLE"
+560: 	}
+561: 	if status.State != "DURABLE" {
+562: 		return out, errors.New("qualification terminal journal mismatch")
+563: 	}
+564: 	if e = business.Check(); e != nil {
+565: 		return out, e
+566: 	}
+567: 	if e = recoveryboundary.MarkCDurable(ctx, q, lease, root, database, operation, boundaryHash, journalDigest); e != nil {
+568: 		return out, e
+569: 	}
+570: 	return qualificationResult(input.Action, "DURABLE", operation, input.PlanSHA256, plan.OutcomeHash), nil
+571: }
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+33: type historicalQualificationNative struct {
+43: type historicalNativeID struct {
+48: type historicalNativeFile struct {
+59: type historicalQualificationHold struct {
+66: func historicalNativeIdentity(h windows.Handle) (historicalNativeID, error) {
+77: func historicalFinalPath(h windows.Handle) (string, error) {
+86: func openHistoricalNative(path string, directory, requireOwner bool, sid string) (*historicalNativeFile, error) {
+137: func (f *historicalNativeFile) check() error {
+171: func (h *historicalQualificationHold) Check() error {
+188: func (h *historicalQualificationHold) Close() error {
+211: func finishHistoricalQualificationTx(tx *sql.Tx, committed bool, hold *historicalQualificationHold) error {
+219: func (h *historicalQualificationHold) add(path string, directory, requireOwner bool, sid string) (*historicalNativeFile, error) {
+227: func historicalNativeRead(f *historicalNativeFile, limit int64, allowEmpty bool) ([]byte, error) {
+239: func hashHistoricalNative(f *historicalNativeFile, limit int64, expected string) error {
+263: func holdHistoricalQualificationNative(directory, manifestHash, modelKey, sid string,
+432: type historicalQualificationClosure struct {
+437: func (c historicalQualificationClosure) Check() error {
+444: func (c historicalQualificationClosure) Close() error { return c.hold.Close() }
+446: const historicalMaintenanceProofKind = "HISTORICAL_HOST_BROKER_DENIAL_RECONSTRUCTION_V1"
+447: const historicalMaintenanceNativeClass = "HISTORICAL_NATIVE_JOB_ACCOUNTING_CLOSURE_V1"
+448: const historicalMaintenanceRule = "EXACT_QUALIFICATION_MODEL_ONLY_FIRST_GATE_V1"
+450: type HistoricalQualificationSubject struct {
+459: type HistoricalQualificationSource struct {
+477: type verifiedHistoricalQualification struct {
+492: type HistoricalQualificationPlan struct {
+527: func (p HistoricalQualificationPlan) coreHash() string { return Hash(p.Core) }
+529: func (p HistoricalQualificationPlan) beforeHash() string {
+535: func (p HistoricalQualificationPlan) residualSelectors() (store.QualificationResidualSelectors, error) {
+553: func (p HistoricalQualificationPlan) afterHash() string {
+562: func (p HistoricalQualificationPlan) JournalHashes() (plan, before, after, subject, evidence string) {
+567: func (s *Service) buildHistoricalQualificationPlan(ctx context.Context, tx *sql.Tx, verified verifiedHistoricalQualification,
+738: func PlanHistoricalQualification(ctx context.Context, db *sql.DB, contractsDir string,
+797: func historicalMaintenanceMarker(plan HistoricalQualificationPlan, planFileSHA256 string) Object {
+807: func (s *Service) applyHistoricalQualificationTx(ctx context.Context, tx *sql.Tx,
+895: func (s *Service) validatedHistoricalQualificationFailureTx(tx *sql.Tx,
+924: func ApplyHistoricalQualification(ctx context.Context, db *sql.DB, contractsDir string,
+1001: func historicalQualificationRefs(tx *sql.Tx, project, kind, id string, revision int64) ([]any, error) {
+1021: func historicalRefValue(object Object, path string) any {
+1040: func historicalQualificationRefRevisionMatches(tx *sql.Tx, project, kind string, object Object, oldRows, newRows []any) (bool, error) {
+1106: func historicalQualificationExactRows(ctx context.Context, tx *sql.Tx, plan HistoricalQualificationPlan, planFileSHA256 string) (bool, error) {
+1328: func ClassifyHistoricalQualification(ctx context.Context, db *sql.DB, plan HistoricalQualificationPlan, planFileSHA256 string) (_ string, retErr error) {
+1378: func (s *Service) verifyHistoricalQualificationTx(ctx context.Context, tx *sql.Tx,
+
+FILE internal/store/qualification_maintenance_windows.go
+1: //go:build windows
+2: 
+3: package store
+4: 
+5: import (
+6: 	"context"
+7: 	"crypto/sha256"
+8: 	"database/sql"
+9: 	"encoding/hex"
+10: 	"errors"
+11: 	"fmt"
+12: 	"net/url"
+13: 	"os"
+14: 	"path/filepath"
+15: 	"sort"
+16: 	"strings"
+17: 	"time"
+18: )
+19: 
+20: // OpenQualificationMaintenance opens an existing schema-24 database. It never
+21: // creates a file, runs migrations, or changes persistent journal settings.
+22: // The caller must already hold the root's native lease and identity guards.
+23: func OpenQualificationMaintenance(ctx context.Context, path string) (_ *sql.DB, err error) {
+24: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) != "researchos.sqlite" ||
+25: 		strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
+26: 		return nil, errors.New("qualification maintenance database path invalid")
+27: 	}
+28: 	info, err := os.Lstat(path)
+29: 	if err != nil || !info.Mode().IsRegular() {
+30: 		return nil, errors.New("qualification maintenance database absent or nonregular")
+31: 	}
+32: 	real, err := filepath.EvalSymlinks(path)
+33: 	if err != nil || !strings.EqualFold(filepath.Clean(real), path) {
+34: 		return nil, errors.New("qualification maintenance database alias")
+35: 	}
+36: 	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
+37: 	q := u.Query()
+38: 	q.Set("mode", "rw")
+39: 	q.Set("_foreign_keys", "1")
+40: 	q.Set("_synchronous", "FULL")
+41: 	q.Set("_busy_timeout", "5000")
+42: 	u.RawQuery = q.Encode()
+43: 	db, err := sql.Open("sqlite", u.String())
+44: 	if err != nil {
+45: 		return nil, err
+46: 	}
+47: 	db.SetMaxOpenConns(1)
+48: 	db.SetMaxIdleConns(1)
+49: 	defer func() {
+50: 		if err != nil {
+51: 			_ = db.Close()
+52: 		}
+53: 	}()
+54: 	if err = db.PingContext(ctx); err != nil {
+55: 		return nil, err
+56: 	}
+57: 	for pragma, want := range map[string]string{"foreign_keys": "1", "journal_mode": "wal", "synchronous": "2", "busy_timeout": "5000"} {
+58: 		var got string
+59: 		if err = db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil || got != want {
+60: 			return nil, fmt.Errorf("qualification maintenance %s=%s, want %s: %w", pragma, got, want, err)
+61: 		}
+62: 	}
+63: 	var maximum, minimum, count, applicationTables int
+64: 	if err = db.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&maximum, &minimum, &count); err != nil {
+65: 		return nil, err
+66: 	}
+67: 	if maximum != 24 || minimum != 1 || count != 24 {
+68: 		return nil, errors.New("qualification maintenance requires exact schema 24 history")
+69: 	}
+70: 	if err = db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&applicationTables); err != nil {
+71: 		return nil, err
+72: 	}
+73: 	if applicationTables != 87 {
+74: 		return nil, fmt.Errorf("qualification maintenance requires 87 application tables, got %d", applicationTables)
+75: 	}
+76: 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+77: 	defer cancel()
+78: 	var integrity string
+79: 	if err = db.QueryRowContext(verifyCtx, "PRAGMA quick_check").Scan(&integrity); err != nil || integrity != "ok" {
+80: 		return nil, fmt.Errorf("qualification maintenance quick_check=%s: %w", integrity, err)
+81: 	}
+82: 	return db, nil
+83: }
+84: 
+85: // QualificationMaintenanceCensus uses the transaction's own connection so
+86: // the frozen before image and write reservation refer to the same snapshot.
+87: func QualificationMaintenanceCensus(ctx context.Context, tx *sql.Tx) (OwnedStopCensus, error) {
+88: 	if tx == nil {
+89: 		return OwnedStopCensus{}, errors.New("qualification maintenance transaction required")
+90: 	}
+91: 	return ownedStopCensus(ctx, tx)
+92: }
+93: 
+94: // QualificationMaintenanceProtectedCensus binds every row of the 78 tables
+95: // outside the one transaction's nine-table write allowlist. Row cells use the
+96: // same typed, length-delimited framing as the full database census.
+97: func QualificationMaintenanceProtectedCensus(ctx context.Context, tx *sql.Tx) (string, error) {
+98: 	if tx == nil {
+99: 		return "", errors.New("qualification protected census transaction required")
+100: 	}
+101: 	allowed := map[string]bool{
+102: 		"uploaded_content": true, "domain_versions": true, "domain_objects": true,
+103: 		"domain_refs": true, "runtime_observations": true, "runtime_dispatches": true,
+104: 		"outbox": true, "event_state_snapshots": true, "idempotency": true,

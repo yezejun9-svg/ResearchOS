@@ -1,0 +1,688 @@
+diff --git a/adapters/runtime/bridge_windows.go b/adapters/runtime/bridge_windows.go
+index 11aac5fb..a88c3841 100644
+--- a/adapters/runtime/bridge_windows.go
++++ b/adapters/runtime/bridge_windows.go
+@@ -582,7 +582,9 @@ func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+ 		}
+ 	}
+ 	if err != nil {
+-		w.journal.Reason = err.Error()
++		if w.journal.Reason == "" {
++			w.journal.Reason = err.Error()
++		}
+ 	}
+ 	w.err = errors.Join(err, w.persist())
+ }
+@@ -611,8 +613,10 @@ func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
+ }
+ func (w *Bridge) Cancel(reason string) {
+ 	w.mu.Lock()
++	if !w.journal.Cancelled {
++		w.journal.Reason = reason
++	}
+ 	w.journal.Cancelled = true
+-	w.journal.Reason = reason
+ 	w.persist()
+ 	w.mu.Unlock()
+ 	w.mu.Lock()
+diff --git a/internal/domain/runtime_broker_windows.go b/internal/domain/runtime_broker_windows.go
+index 3614ec24..390c930e 100644
+--- a/internal/domain/runtime_broker_windows.go
++++ b/internal/domain/runtime_broker_windows.go
+@@ -147,6 +147,15 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
+ 	if e != nil {
+ 		return nil, e
+ 	}
++	rejection, e := c.qualificationFirstGateRejectionTx(tx, route, run, dispatch, bridge, frame, payload)
++	if e != nil {
++		tx.Rollback()
++		return nil, e
++	}
++	if rejection != nil {
++		tx.Rollback()
++		return nil, rejection
++	}
+ 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
+ 	if e != nil {
+ 		tx.Rollback()
+diff --git a/internal/domain/runtime_command_queue_windows.go b/internal/domain/runtime_command_queue_windows.go
+index dd30a7b0..e8a6edff 100644
+--- a/internal/domain/runtime_command_queue_windows.go
++++ b/internal/domain/runtime_command_queue_windows.go
+@@ -5,6 +5,7 @@ package domain
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
+ 	rt "researchos.local/research-os/adapters/runtime"
+ 	"strings"
+@@ -423,7 +424,7 @@ func (c *RuntimeCoordinator) ingestClientQueueFrame(ctx context.Context, route R
+ 
+ // Effects may block on a model/tool. Only this flow owns ACK order; a bounded
+ // result pump lets the same coordinator receive SDK receipts and send controls.
+-func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) error {
++func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, cancelBroker context.CancelFunc, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) (qualificationBrokerDrain, error) {
+ 	type completion struct {
+ 		seq      int64
+ 		response any
+@@ -431,6 +432,7 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 	}
+ 	results := make(chan completion, 32)
+ 	ready := map[int64]completion{}
++	registry := newQualificationBrokerRegistry()
+ 	inflight := 0
+ 	next := int64(1)
+ 	frames := bridge.Frames()
+@@ -439,24 +441,70 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 	var initialized time.Time
+ 	var cancelSent time.Time
+ 	var deferredError error
++	var firstError error
++	var closing bool
++	ctxDone := ctx.Done()
++	var fence *time.Timer
++	var fenceExpired <-chan time.Time
++	defer func() {
++		if fence != nil {
++			fence.Stop()
++		}
++	}()
++	closeAdmission := func(cause error, rejectedSeq int64) {
++		if firstError == nil {
++			firstError = cause
++		}
++		if closing {
++			if rejectedSeq > 0 {
++				registry.disqualify()
++			}
++			return
++		}
++		closing = true
++		registry.close(rejectedSeq)
++		cancelBroker()
++		if rejectedSeq > 0 {
++			bridge.Cancel("qualification first dispatch gate denied TOOL")
++		} else {
++			bridge.Cancel("protocol reconciliation failed")
++		}
++		fence = time.NewTimer(15 * time.Second)
++		fenceExpired = fence.C
++	}
+ 	for frames != nil || inflight > 0 {
+ 		select {
+ 		case observation := <-bridge.ModelObservations():
++			if closing {
++				registry.disqualify()
++				continue
++			}
+ 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+ 			if err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+ 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+ 		case frame, ok := <-frames:
+ 			if !ok {
+ 				frames = nil
+ 				continue
+ 			}
++			if closing {
++				registry.disqualify()
++				continue
++			}
+ 			if frame.Type == "effect.request" {
+ 				if inflight >= 16 {
+-					return Fail(409, "GATE_FAILED", "effect concurrency exceeds bound")
++					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
++					continue
++				}
++				if !registry.admit(frame) {
++					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
++					continue
+ 				}
+ 				inflight++
+ 				go func(f rt.BridgeFrame) {
+@@ -471,7 +519,8 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 					if err == nil && frame.Type == "command.accepted" {
+ 						payload, e := Decode(frame.Payload)
+ 						if e != nil {
+-							return e
++							closeAdmission(e, 0)
++							continue
+ 						}
+ 						if payload["initialized"] == true {
+ 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+@@ -484,26 +533,57 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 					mutation.Unlock()
+ 				}
+ 				if err != nil {
+-					return err
++					closeAdmission(err, 0)
++					continue
+ 				}
+ 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+ 			}
+ 		case done := <-results:
++			if closing {
++				registry.disqualify()
++			}
++			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
++				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
++				continue
++			}
+ 			inflight--
+ 			if done.err != nil {
++				var rejection *qualificationPreEffectRejection
++				if errors.As(done.err, &rejection) {
++					closeAdmission(done.err, done.seq)
++					continue
++				}
++				if closing {
++					registry.disqualify()
++					continue
++				}
+ 				var fenced int
+ 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+-					return done.err
++					closeAdmission(done.err, 0)
++					continue
+ 				}
+ 				deferredError = done.err
+ 			}
+-			ready[done.seq] = done
++			if !closing {
++				ready[done.seq] = done
++			}
+ 		case <-tick.C:
++			if closing {
++				continue
++			}
+ 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+-		case <-ctx.Done():
+-			return ctx.Err()
++		case <-ctxDone:
++			closeAdmission(ctx.Err(), 0)
++			ctxDone = nil
++		case <-fenceExpired:
++			registry.disqualify()
++			return registry.snapshot(), errors.Join(firstError, Fail(409, "GATE_FAILED", "broker drain timed out"))
++		}
++		if closing {
++			continue
+ 		}
+ 		for {
+ 			done, ok := ready[next]
+@@ -511,19 +591,24 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 				break
+ 			}
+ 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				break
+ 			}
+ 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+ 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+-					return err
++					closeAdmission(err, 0)
++					break
+ 				}
+ 			}
+ 			delete(ready, next)
+ 			next++
+ 		}
+ 	}
++	if closing {
++		return registry.snapshot(), firstError
++	}
+ 	if len(ready) != 0 {
+-		return Fail(409, "GATE_FAILED", "protocol receipt gap")
++		return registry.snapshot(), Fail(409, "GATE_FAILED", "protocol receipt gap")
+ 	}
+-	return deferredError
++	return registry.snapshot(), deferredError
+ }
+diff --git a/internal/domain/runtime_coordinator_windows.go b/internal/domain/runtime_coordinator_windows.go
+index e282ae35..af32e645 100644
+--- a/internal/domain/runtime_coordinator_windows.go
++++ b/internal/domain/runtime_coordinator_windows.go
+@@ -662,11 +662,28 @@ func (c *RuntimeCoordinator) RunAdmitted(ctx context.Context, route RuntimeCoord
+ 			}
+ 		}
+ 	}()
+-	protocolError := c.runCommandBridge(child, brokerContext, route, runID, lease, epoch, locator, bridge, &mutation)
++	drain, protocolError := c.runCommandBridge(child, brokerContext, cancelBroker, route, runID, lease, epoch, locator, bridge, &mutation)
+ 	if protocolError != nil {
+ 		bridge.Cancel("protocol reconciliation failed")
+ 	}
+ 	<-bridge.Done()
++	var qualificationRejection *qualificationPreEffectRejection
++	if errors.As(protocolError, &qualificationRejection) {
++		cancelBroker()
++		cancel()
++		<-heartbeatDone
++		select {
++		case heartbeatFailure := <-heartbeatError:
++			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "heartbeat changed before qualification closure")
++			return errors.Join(protocolError, heartbeatFailure)
++		default:
++		}
++		if e := c.closeOnlineQualificationFailure(context.Background(), route, runID, epoch, locator, bridge, qualificationRejection, drain); e != nil {
++			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "qualification failure proof incomplete")
++			return errors.Join(protocolError, e)
++		}
++		return protocolError
++	}
+ 	if protocolError != nil {
+ 		cancel()
+ 		<-heartbeatDone
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"errors"
+9: 	"fmt"
+10: 	"path/filepath"
+11: 	"strconv"
+12: 	"strings"
+13: 	"sync"
+14: 	"time"
+15: 
+16: 	rt "researchos.local/research-os/adapters/runtime"
+17: )
+18: 
+19: const onlineQualificationDenial = "ONLINE_FIRST_GATE_TOOL_DENIAL"
+20: 
+21: // A typed rejection is constructed only inside the serialized first dispatch
+22: // gate. Its existence alone never authorizes terminal closure.
+23: type qualificationPreEffectRejection struct {
+24: 	receipt Object
+25: 	digest  string
+26: 	cause   error
+27: }
+28: 
+29: type qualificationBrokerDrain struct {
+30: 	accepted      int
+31: 	completed     int
+32: 	pending       int
+33: 	closed        bool
+34: 	disqualified  bool
+35: 	rejectedSeq   int64
+36: 	frameHashes   map[int64]string
+37: 	completionSet map[int64]string
+38: }
+39: 
+40: type qualificationBrokerRegistry struct {
+41: 	mu           sync.Mutex
+42: 	closed       bool
+43: 	disqualified bool
+44: 	rejectedSeq  int64
+45: 	admitted     map[int64]string
+46: 	completed    map[int64]string
+47: }
+48: 
+49: func newQualificationBrokerRegistry() *qualificationBrokerRegistry {
+50: 	return &qualificationBrokerRegistry{admitted: map[int64]string{}, completed: map[int64]string{}}
+51: }
+52: 
+53: func (r *qualificationBrokerRegistry) admit(frame rt.BridgeFrame) bool {
+54: 	r.mu.Lock()
+55: 	defer r.mu.Unlock()
+56: 	if r.closed || r.admitted[frame.Sequence] != "" {
+57: 		r.disqualified = true
+58: 		return false
+59: 	}
+60: 	r.admitted[frame.Sequence] = Hash(frame)
+61: 	return true
+62: }
+63: 
+64: func (r *qualificationBrokerRegistry) complete(sequence int64, digest string) bool {
+65: 	r.mu.Lock()
+66: 	defer r.mu.Unlock()
+67: 	if r.admitted[sequence] == "" || r.completed[sequence] != "" {
+68: 		r.disqualified = true
+69: 		return false
+70: 	}
+71: 	r.completed[sequence] = digest
+72: 	return true
+73: }
+74: 
+75: func (r *qualificationBrokerRegistry) close(rejectedSeq int64) {
+76: 	r.mu.Lock()
+77: 	r.closed = true
+78: 	if rejectedSeq > 0 && r.rejectedSeq == 0 {
+79: 		r.rejectedSeq = rejectedSeq
+80: 	}
+81: 	r.mu.Unlock()
+82: }
+83: 
+84: func (r *qualificationBrokerRegistry) disqualify() {
+85: 	r.mu.Lock()
+86: 	r.disqualified = true
+87: 	r.mu.Unlock()
+88: }
+89: 
+90: func (r *qualificationBrokerRegistry) snapshot() qualificationBrokerDrain {
+91: 	r.mu.Lock()
+92: 	defer r.mu.Unlock()
+93: 	t := qualificationBrokerDrain{accepted: len(r.admitted), completed: len(r.completed), pending: len(r.admitted) - len(r.completed), closed: r.closed, disqualified: r.disqualified, rejectedSeq: r.rejectedSeq, frameHashes: map[int64]string{}, completionSet: map[int64]string{}}
+94: 	for k, v := range r.admitted {
+95: 		t.frameHashes[k] = v
+96: 	}
+97: 	for k, v := range r.completed {
+98: 		t.completionSet[k] = v
+99: 	}
+100: 	return t
+101: }
+102: 
+103: func (q *qualificationPreEffectRejection) Error() string {
+104: 	if q == nil || q.cause == nil {
+105: 		return "qualification first-gate rejection unavailable"
+106: 	}
+107: 	return q.cause.Error()
+108: }
+109: 
+110: func qualificationDenialUnavailable(reason string) error {
+111: 	return Fail(409, "GATE_FAILED", "qualification failure proof unavailable: "+reason)
+112: }
+113: 
+114: func (c *RuntimeCoordinator) qualificationFirstGateRejectionTx(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, bridge *rt.Bridge, frame rt.BridgeFrame, payload Object) (*qualificationPreEffectRejection, error) {
+115: 	if frame.Type != "effect.request" || frame.Capability != "TOOL" {
+116: 		return nil, nil
+117: 	}
+118: 	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+119: 	if err != nil {
+120: 		return nil, err
+121: 	}
+122: 	if task["task_type"] != "runtime_qualification" {
+123: 		return nil, nil
+124: 	}
+125: 	if frame.Sequence != 3 || c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil || frame.Route == "" || len(frame.Payload) == 0 {
+126: 		return nil, qualificationDenialUnavailable("frame identity invalid")
+127: 	}
+128: 	manifest, ok := dispatch["manifest"].(map[string]any)
+129: 	if !ok {
+130: 		return nil, qualificationDenialUnavailable("dispatch manifest missing")
+131: 	}
+132: 	admission, ok := manifest["admission"].(map[string]any)
+133: 	if !ok || admission["qualification_bootstrap"] != true || admission["mode"] == nil {
+134: 		return nil, qualificationDenialUnavailable("qualification admission missing")
+135: 	}
+136: 	profile, ok := admission["profile"].(map[string]any)
+137: 	if !ok || Hash(admission["profile_ref"]) != admission["profile_hash"] {
+138: 		return nil, qualificationDenialUnavailable("profile binding invalid")
+139: 	}
+140: 	epoch, err := Num(run, "lease_epoch")
+141: 	if err != nil || epoch < 1 || manifest["project_id"] != route.ProjectID || manifest["run_id"] != run["id"] || manifest["task_id"] != task["id"] || manifest["runtime_id"] != route.RuntimeID || Hash(manifest["epoch"]) != Hash(epoch) || manifest["dispatch_key"] != dispatch["dispatch_key"] || Hash(manifest) != dispatch["manifest_hash"] {
+142: 		return nil, qualificationDenialUnavailable("run and dispatch differ")
+143: 	}
+144: 	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+145: 	if err != nil {
+146: 		return nil, err
+147: 	}
+148: 	var markerCount int
+149: 	err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=?`, route.ProjectID, task["id"], run["id"], route.RuntimeID, epoch).Scan(&markerCount)
+150: 	if err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || Hash(plan["model_qualification"]) != Hash(profile["model_qualification"]) || runtimeTechnicalHashMust(tx, route.ProjectID, route.RuntimeID) != admission["technical_hash"] {
+151: 		return nil, qualificationDenialUnavailable("qualification marker or plan changed")
+152: 	}
+153: 	var author string
+154: 	if err = tx.QueryRow(`SELECT author FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?`, route.ProjectID, task["id"], route.RuntimeID).Scan(&author); err != nil {
+155: 		return nil, err
+156: 	}
+157: 	currentRoot, err := currentAuthorityRoot(tx, author)
+158: 	if err != nil || currentRoot != root {
+159: 		return nil, qualificationDenialUnavailable("qualification author changed")
+160: 	}
+161: 	modelConfig, ok := profile["model_config"].(map[string]any)
+162: 	permission, permitted := plan["model_qualification"].(map[string]any)
+163: 	if !ok || !permitted || frame.Route != Str(modelConfig, "route") || frame.Route != Str(permission, "route") || profile["backend"] != runtimeMuBackend {
+164: 		return nil, qualificationDenialUnavailable("known model route changed")
+165: 	}
+166: 	if err = validateRuntimeToolArguments(modelConfig, payload); err != nil {
+167: 		return nil, qualificationDenialUnavailable("tool payload invalid")
+168: 	}
+169: 	known := false
+170: 	for _, provider := range c.runtimeProviders() {
+171: 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != "runtime_qualification" || provider.Capability != "MODEL" || provider.MeasurementMode != admission["mode"] || provider.CredentialRevision != profile["credential_revision"] || Hash(provider.ModelConfig) != Hash(modelConfig) || provider.Endpoint != Str(modelConfig, "endpoint") || !c.liveModelCredentialBound(provider, profile) {
+172: 			continue
+173: 		}
+174: 		for _, entry := range Arr(profile, "effect_routes") {
+175: 			p, ok := entry.(map[string]any)
+176: 			if ok && p["id"] == provider.ID && p["capability"] == "MODEL" && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+177: 				known = true
+178: 			}
+179: 		}
+180: 	}
+181: 	if !known {
+182: 		return nil, qualificationDenialUnavailable("route unknown or no longer frozen")
+183: 	}
+184: 	var effects, ledger, distinct int
+185: 	var modelKey string
+186: 	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),coalesce(min(effect_key),'') FROM resource_effects WHERE project=? AND run=?`, route.ProjectID, run["id"]).Scan(&distinct, &modelKey); err != nil {
+187: 		return nil, err
+188: 	}
+189: 	if err = tx.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND effect_key=?`, route.ProjectID, run["id"], frame.Key).Scan(&effects); err != nil {
+190: 		return nil, err
+191: 	}
+192: 	if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=?`, route.ProjectID, frame.Key).Scan(&ledger); err != nil {
+193: 		return nil, err
+194: 	}
+195: 	if effects != 0 || ledger != 0 || distinct != 1 || modelKey == "" || modelKey == frame.Key {
+196: 		return nil, qualificationDenialUnavailable("effect or ledger history exists")
+197: 	}
+198: 	model, err := latestEffect(tx, route.ProjectID, Str(run, "id"), modelKey)
+199: 	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+200: 		return nil, qualificationDenialUnavailable("sole MODEL effect is not confirmed")
+201: 	}
+202: 	modelRequest, _ := model["payload"].(map[string]any)
+203: 	if modelRequest["capability"] != "MODEL" || modelRequest["route"] != frame.Route {
+204: 		return nil, qualificationDenialUnavailable("earlier effect is not known MODEL")
+205: 	}
+206: 	var ledgerRows int
+207: 	var ledgerRaw string
+208: 	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, route.ProjectID, run["id"]).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+209: 		return nil, qualificationDenialUnavailable("monetary history differs")
+210: 	}
+211: 	ledgerBody, err := Decode([]byte(ledgerRaw))
+212: 	if err != nil || ledgerBody["operation"] != "UNKNOWN" || ledgerBody["money"] != nil || ledgerBody["cost_basis"] != "UNKNOWN" || ledgerBody["provider_request_id"] != modelKey {
+213: 		return nil, qualificationDenialUnavailable("known MODEL has no original unknown-cost ledger")
+214: 	}
+215: 	cause := Fail(503, "RESOURCE_UNAVAILABLE", "qualification grants no unplanned effect authority")
+216: 	receipt := Object{
+217: 		"schema": "researchos.qualification-pre-effect-rejection.v1", "kind": onlineQualificationDenial,
+218: 		"project_id": route.ProjectID, "task_id": task["id"], "run_id": run["id"], "runtime_id": route.RuntimeID, "epoch": epoch,
+219: 		"dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "task_hash": qualificationTaskHash(task), "plan_hash": planHash,
+220: 		"profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"],
+221: 		"frame_sequence": frame.Sequence, "frame_type": frame.Type, "frame_capability": frame.Capability, "frame_route": frame.Route, "frame_key": frame.Key,
+222: 		"frame_hash": Hash(frame), "raw_payload_hash": Digest(frame.Payload), "payload_hash": Hash(payload),
+223: 		"stage": "BEFORE_PREPARE_EFFECT_TX", "outcome": "NO_EFFECT", "rule": "QUALIFICATION_MODEL_ONLY_V1",
+224: 		"observed_at": Now(), "first_cause": cause.Error(), "zero_stage_snapshot_hash": Hash(Object{"effect_rows": effects, "ledger_rows": ledger}),
+225: 	}
+226: 	if err = rt.PersistQualificationRejection(bridge.Directory(), Bytes(receipt)); err != nil {
+227: 		return nil, fmt.Errorf("qualification rejection persistence: %w", err)
+228: 	}
+229: 	return &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: cause}, nil
+230: }
+231: 
+232: func runtimeTechnicalHashMust(tx *sql.Tx, project, runtimeID string) string {
+233: 	runtime, err := load(tx, project, "RuntimeRegistration", runtimeID)
+234: 	if err != nil {
+235: 		return ""
+236: 	}
+237: 	return runtimeTechnicalHash(runtime)
+238: }
+239: 
+240: type verifiedQualificationFailure struct {
+241: 	subject     qualificationFailureSubject
+//go:build windows
+
+package runtime
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/windows"
+	"researchos.local/research-os/internal/canonical"
+	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+)
+
+const qualificationRejectionFile = "qualification-rejection-00000000000000000003.json"
+
+// qualificationPrivateDirectory checks an existing dispatch directory. A proof
+// cannot make an already permissive or redirected directory trustworthy.
+func qualificationPrivateDirectory(directory string) error {
+	if !filepath.IsAbs(directory) {
+		return errors.New("absolute qualification dispatch directory required")
+	}
+	clean := filepath.Clean(directory)
+	for path := clean; ; path = filepath.Dir(path) {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || !strings.EqualFold(filepath.Clean(resolved), path) {
+			return errors.New("qualification directory has reparse ancestry")
+		}
+		if next := filepath.Dir(path); next == path {
+			break
+		}
+	}
+	info, err := os.Stat(clean)
+	if err != nil || !info.IsDir() {
+		return errors.New("qualification dispatch directory unavailable")
+	}
+	current, err := user.Current()
+	if err != nil {
+		return err
+	}
+	sd, err := windows.GetNamedSecurityInfo(clean, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return err
+	}
+	acl := sd.String()
+	if !strings.Contains(acl, "D:P") || !strings.Contains(acl, current.Uid) {
+		return errors.New("qualification dispatch directory is not private")
+	}
+	return nil
+}
+
+// PersistQualificationRejection is a create-new durable host fact, not a
+// success flag. The domain gate holds its write reservation until this returns.
+func PersistQualificationRejection(directory string, raw []byte) error {
+	if len(raw) == 0 || len(raw) > 64*1024 {
+		return errors.New("qualification rejection exceeds bound")
+	}
+	if err := qualificationPrivateDirectory(directory); err != nil {
+		return err
+	}
+	path := filepath.Join(directory, qualificationRejectionFile)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	n, writeErr := f.Write(raw)
+	if writeErr == nil && n != len(raw) {
+		writeErr = io.ErrShortWrite
+	}
+	err = errors.Join(writeErr, f.Sync(), f.Close())
+	if err != nil {
+		return err
+	}
+	return qualificationPrivateDirectory(directory)
+}
+
+// QualificationNativeFacts contains bounded source facts only. Callers must
+// still validate the domain subject and effect/transaction history.
+type QualificationNativeFacts struct {
+	Journal        BridgeJournal
+	RawJournalHash string
+	StdoutHash     string
+	StderrHash     string
+	Frames         []BridgeFrame
+	FrameHashes    []string
+	AuxAfterThird  bool
+	Rejection      []byte
+}
+
+func ReadQualificationNativeFacts(directory, manifestHash string) (QualificationNativeFacts, error) {
+	var facts QualificationNativeFacts
+	if err := qualificationPrivateDirectory(directory); err != nil {
+		return facts, err
+	}
+	j, err := ReadBridgeTerminal(directory, manifestHash)
+	if err != nil {
+		return facts, err
+	}
+	if !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
+		return facts, errors.New("native qualification closure incomplete")
+	}
+	journalRaw, err := os.ReadFile(filepath.Join(directory, "bridge.json"))
+	if err != nil || len(journalRaw) > 4*1024*1024 {
+		return facts, errors.New("bounded native journal unavailable")
+	}
+	stdout, err := os.ReadFile(filepath.Join(directory, "stdout.raw"))
+	if err != nil || len(stdout) > sandbox.MaxStreamBytes || Hash(stdout) != j.StdoutHash {
+		return facts, errors.New("qualification stdout changed")
+	}
+	stderr, err := os.ReadFile(filepath.Join(directory, "stderr.raw"))
+	if err != nil || len(stderr) > sandbox.MaxStreamBytes || Hash(stderr) != j.StderrHash {
+		return facts, errors.New("qualification stderr changed")
+	}
+	rejection, err := os.ReadFile(filepath.Join(directory, qualificationRejectionFile))
+	if err != nil || len(rejection) == 0 || len(rejection) > 64*1024 {
+		return facts, errors.New("immutable qualification rejection unavailable")
+	}
+	for _, line := range bytes.Split(stdout, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		if len(line) > 64*1024 {
+			return facts, errors.New("qualification frame exceeds bound")
+		}
+		canonicalLine, err := canonical.JSON(line)
+		if err != nil {
+			return facts, err
+		}
+		var shape map[string]json.RawMessage
+		if err = json.Unmarshal(canonicalLine, &shape); err != nil {
+			return facts, err
+		}
+		if _, auxiliary := shape["version"]; auxiliary {
+			if len(facts.Frames) >= 3 {
+				facts.AuxAfterThird = true
+			}
+			continue
+		}
+		var frame BridgeFrame
+		// Preserve the payload bytes consumed by Bridge. Normalizing the line
+		// changes RawMessage whitespace and breaks first-gate byte lineage.
+		if err = json.Unmarshal(line, &frame); err != nil {
+			return facts, err
+		}
+		facts.Frames = append(facts.Frames, frame)
+		facts.FrameHashes = append(facts.FrameHashes, Hash(line))
+	}
+	facts.Journal = j
+	facts.RawJournalHash = Hash(journalRaw)
+	facts.StdoutHash = Hash(stdout)
+	facts.StderrHash = Hash(stderr)
+	facts.Rejection = rejection
+	return facts, nil
+}
+

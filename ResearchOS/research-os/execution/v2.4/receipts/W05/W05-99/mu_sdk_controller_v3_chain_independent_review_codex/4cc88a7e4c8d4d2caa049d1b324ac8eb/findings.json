@@ -1,0 +1,125 @@
+{
+  "schema": "researchos.controller-v3-independent-findings.v1",
+  "decision": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "V3-R01",
+      "priority": 2,
+      "prior_issue": "CTRL-R02",
+      "title": "部分close后缺少阻止新admission的reconciliation状态",
+      "files": [
+        {
+          "name": "canonical_transactions.py",
+          "lines": [
+            77,
+            99
+          ]
+        },
+        {
+          "name": "controller.py",
+          "lines": [
+            63,
+            78
+          ]
+        },
+        {
+          "name": "controller.py",
+          "lines": [
+            100,
+            111
+          ]
+        }
+      ],
+      "trigger": "已确认旧Job清理后close事务第一个checkpoint写成功，第二个ownership写失败",
+      "observed": "checkpoint active UUID已清空，ownership仍保留ACTIVE_ISOLATED_PHASE；failed.partial.json有原文但activate未消费此阻断事实，用当前两文件pins可接纳新UUID",
+      "impact": "未完成的canonical二文件变更可被下一次admission覆盖，绕过原文要求的Root reconciliation",
+      "requested": "持久记录并在每次update_pair/activate进入前检查未完成事务，或让activate验证checkpoint与ownership的成对lease状态并拒绝不一致；失败close不可留下可直接新admit的空active状态",
+      "control_cases": [
+        "CLOSE_SECOND_WRITE_FAILURE_SHOULD_KEEP_RECONCILIATION_GUARD",
+        "NEW_ADMISSION_AFTER_UNRECONCILED_PARTIAL_CLOSE_SHOULD_REJECT"
+      ],
+      "evidence_limit": "pure Python in-memory filesystem and WinAPI substitutes; second invocation explicit, not proof of automatic retry or actual Windows failure"
+    },
+    {
+      "id": "V3-R02",
+      "priority": 2,
+      "prior_issue": "CTRL-R05",
+      "title": "watchdog线程启动失败使duplicate句柄清理和原始receipt路径中断",
+      "files": [
+        {
+          "name": "job_deadline_watchdog.py",
+          "lines": [
+            33,
+            43
+          ]
+        },
+        {
+          "name": "controller.py",
+          "lines": [
+            180,
+            183
+          ]
+        },
+        {
+          "name": "controller.py",
+          "lines": [
+            242,
+            259
+          ]
+        }
+      ],
+      "trigger": "DuplicateHandle已成功，Thread对象已赋值，但Thread.start()抛出异常",
+      "observed": "stop_and_close无条件join未启动线程又抛RuntimeError，未调用close(self.handle)；controller finally在此处退出，后续phase-launch.invocation.json写入被跳过",
+      "impact": "重复Job句柄泄漏，原始native结果/第一失败可能没有封存；不符合清理边界",
+      "requested": "显式跟踪thread是否成功启动；无论start/join错误都在finally关闭能安全关闭的duplicate，保留错误原文并返回清理状态；controller finally应隔离watchdog cleanup异常以继续封存original result/receipt且保持未确认lease",
+      "control_cases": [
+        "THREAD_START_FAILURE_SHOULD_STILL_CLOSE_DUPLICATE"
+      ],
+      "evidence_limit": "pure selected start/stop AST with synthetic Thread/Event/handles; no real thread or WinAPI invoked"
+    },
+    {
+      "id": "V3-R03",
+      "priority": 1,
+      "prior_issue": "CTRL-R06",
+      "title": "observer已验证worker字节与Resume后的实际文件加载之间仍可漂移",
+      "files": [
+        {
+          "name": "controller.py",
+          "lines": [
+            175,
+            179
+          ]
+        },
+        {
+          "name": "controller.py",
+          "lines": [
+            207,
+            230
+          ]
+        },
+        {
+          "name": "mu_sdk_job_observer.v2.proposed.py",
+          "lines": [
+            179,
+            204
+          ]
+        },
+        {
+          "name": "phase_worker.py",
+          "lines": [
+            16,
+            49
+          ]
+        }
+      ],
+      "trigger": "observer最后一次pin/compile检查后，Root写grant/input并Resume之前或Python打开worker路径之前，worker文件改变",
+      "observed": "observer编译结果被丢弃，返回launch argv/pins；实际CreateProcess参数仍以worker文件路径启动，controller未对该文件保持deny-write/delete所有权，也未让Python消费那个已验证buffer",
+      "impact": "同PID、正确Job、正确argv/cwd并不能证明最终加载的是被审查worker代码",
+      "requested": "在检查到整个加载/执行边界保持实际文件不可变所有权并覆盖相关入口源码，或使用受审查的稳定执行buffer方案；将该机制纳入Source和真正OS probe，不能只补一次hash读取或自报intent",
+      "control_cases": [
+        "integration-controls.json load_boundary static consumption trace"
+      ],
+      "evidence_limit": "static path-consumption analysis and memory timeline only; no real worker mutation, CreateProcess or execution"
+    }
+  ]
+}

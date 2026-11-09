@@ -1,0 +1,2 @@
+from pathlib import Path
+root=Path(__file__).resolve().parent;s=(root/'prepare_qualification_test01_overlay.py').read_text(encoding='utf8');s=s.replace('author-20261105-rev2','author-20261105-rev4').replace('37dcac943c5a8fe694f24d152b4a34fbaf46914d25b0a4942f2aa74a54e5d503','522a562016d0b94ea4576d956106b08068bbf47449b6f9de01683d12b709b2b2').replace('qualification-test01-overlay','qualification-test01-rev4-overlay');p=root/'prepare_qualification_test01_rev4_overlay_actual.py';assert not p.exists();p.write_text(s,encoding='utf8');exec(compile(s,str(p),'exec'))

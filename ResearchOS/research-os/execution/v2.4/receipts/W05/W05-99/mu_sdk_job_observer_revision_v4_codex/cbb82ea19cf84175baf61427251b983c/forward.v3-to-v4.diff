@@ -1,0 +1,60 @@
+--- observer.v3
++++ observer.v4
+@@ -22,6 +22,20 @@
+ AUTHOR = "codex:/root/w05_merge_review"
+ ACTOR = "program:researchos.mu-sdk-job-observer.v1"
+ ROOT_ACTOR = "codex:/root"
++SOURCE_PROVENANCE_SCHEMA = "researchos.mu-sdk-source-author-provenance.v1"
++SOURCE_AUTHOR_POLICY = (
++    ("controller", "controller_source", ("codex:/root/live_resource_lookup",)),
++    ("observer", "observer_source", ("codex:/root/w05_merge_review",)),
++    ("hooks", "hooks_source", ("codex:/root",)),
++    ("phase_worker", "phase_worker_source", ("codex:/root",)),
++    ("runner", None, ("codex:/root",)),
++    ("canonical_transactions", "canonical_transactions_source", ("codex:/root",)),
++    ("job_watchdog", "job_watchdog_source", ("codex:/root",)),
++    ("source_guard", "source_guard_source", ("codex:/root/live_resource_lookup",)),
++    ("base_owned", "base_owned_process_source", ("codex:/root",)),
++    ("cleanup_producer", "cleanup_producer_source", ("codex:/root/live_resource_lookup",)),
++    ("python_binary", "python_binary", ()),
++)
+ SOURCE_COMMIT = "adc460c2138528f163f7fdab5e8d81dde157b7fb"
+ LIMITS = {"maximum_provider_requests": 3, "requested_output_tokens_total": 8192,
+           "total_wall_seconds": 300}
+@@ -163,16 +177,35 @@
+             "cwd": str(Path(doc["repository_root"])), "child_environment": env}
+ 
+ 
++def source_author_provenance(context):
++    """Build provenance from fixed actual-author policy and the locked source context."""
++    sources = {}
++    for role, key, authors in SOURCE_AUTHOR_POLICY:
++        pin = RUNNER_REF if key is None else context[key]
++        require(type(pin) is dict and set(pin) == {"path", "sha256", "bytes"} and
++                type(pin["path"]) is str and bool(pin["path"]) and
++                type(pin["sha256"]) is str and len(pin["sha256"]) == 64 and
++                all(c in "0123456789abcdef" for c in pin["sha256"]) and
++                type(pin["bytes"]) is int and pin["bytes"] >= 0,
++                "source provenance requires an exact three-key pin: " + role)
++        sources[role] = {"source_ref": dict(pin), "authors": list(authors)}
++    return {"schema": SOURCE_PROVENANCE_SCHEMA, "sources": sources}
++
++
+ def validate_source_review(review, context):
++    excluded_authors = {actor for _, _, authors in SOURCE_AUTHOR_POLICY for actor in authors}
+     require(review.get("schema") == "researchos.mu-sdk-controller-observer-independent-source-review.v2" and
+             review.get("decision") == "READY_SOURCE_ONLY" and
+-            review.get("actor_id") not in (None, "", ROOT_ACTOR, AUTHOR, ACTOR) and
++            type(review.get("actor_id")) is str and bool(review["actor_id"]) and
++            review["actor_id"] not in excluded_authors | {ROOT_ACTOR, AUTHOR, ACTOR} and
+             review.get("controller_source_ref") == context["controller_source"] and
+             review.get("observer_source_ref") == context["observer_source"] and
+             review.get("hooks_source_ref") == context["hooks_source"] and
+             review.get("runner_source_ref") == RUNNER_REF and
+             review.get("phase_worker_source_ref") == context["phase_worker_source"] and
+             review.get("python_binary_ref") == context["python_binary"] and
++            review.get("cleanup_producer_source_ref") == context["cleanup_producer_source"] and
++            review.get("source_provenance") == source_author_provenance(context) and
+             review.get("callback_contract") == "REAL_ASSIGNED_SUSPENDED_FRAME_BEFORE_FIRST_RESUME" and
+             review.get("formal_acceptance") is False,
+             "independent source review missing or wrong source tuple")

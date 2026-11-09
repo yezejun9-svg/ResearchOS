@@ -1,0 +1,359 @@
+{
+  "schema": "researchos.f08.readonly-udf-producer-supplement.v1",
+  "status": "PROPOSED_SCOPE_19_MINIMUM_WITH_EXPLICIT_NO_DISPATCH_PROVENANCE_GATE",
+  "at": "2026-10-06T19:42:06.269619+00:00",
+  "author": "codex:/root/command_queue_impl",
+  "main_head_observed": "2cdb0d43d5a600eef13c8f1735946a9adf52d079",
+  "parent_v3": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-command-queue\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_design_revision_codex\\246ac4e22a3c48fe8d86753b44a6cd78\\scope_proposal.json",
+    "sha256": "70dbfcec98e10f6872982daf03588746d3aa1bc90d7096c28f9b1e30ee5d24a6",
+    "bytes": 60003
+  },
+  "parent_v3_untouched": true,
+  "scope_authorization": "Read-only design only. Root and distinct reviewer must choose/authorize after handler full freeze.",
+  "udf_contract": {
+    "direction": "Option B proposed, not authorized; existing17 helpers may carry init+pure callbacks without store.go changes IF connection proof succeeds.",
+    "pinned_api": {
+      "dependency": "modernc.org/sqlite v1.60.1",
+      "api": "RegisterDeterministicScalarFunction(name string, nArg int32, xFunc func(*FunctionContext, []driver.Value)(driver.Value,error)) error",
+      "global_scope": "Default registered sqlite driver only. driver.go states registration before first Open. Every later default-driver Open installs d.udfs; createFunctionInternal failure closes conn and returns error. NewConnector uses default; separately constructed &sqlite.Driver{} has independent registry, not covered.",
+      "no_hot_registration": "Do not register in Service.New or Host startup after store.Open; driver.Open reads registration without mutex, so late registration is not merely missing coverage but violates API lifecycle. Use package init once before any opens. No dynamic retry/replace/fallback/case-insensitive collision bypass.",
+      "failure": "Init loads frozen schemas and registers exact3 names; any error panics with fixed diagnostic before main, process cannot perform business. Partially registered process exits. Runtime per-conn install errors surface from Open/Ping and must retain existing rollback/absence-of-publication behavior. Any callback invalidity returns fixed error; SQL missing function fails; no stored ready bit."
+    },
+    "package_init_implementation": "In new client_cancel_finalization.go only: import named modernc sqlite and database/sql/driver; init constructs private read-only schema instance by loadBackupConfigurationSchema on cloned existing embedded bytes, then captures it in pure callback closures and registers3 functions. No mutable shared validation flag, no Host object, no Service DB, no clock, no environment/files/network. Avoid existing globally shared mutable schema pointer; per-init compiled doc remains private and never exported or mutated after construction. Same arguments have same result. No FunctionContext/args references retained past call.",
+    "schema_source": {
+      "protocol_path": "internal/domain/contracts/client.protocol.schema.json",
+      "protocol_sha256": "8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+      "external_path": "internal/domain/contracts/client.protocol.domain.schema.json",
+      "external_sha256": "b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54",
+      "compiler": "Existing LoadSchemaWithExternals + localOnly loader + AssertFormat + exact pattern neutralization/rechecks. Both embed declarations already in backup_host_configuration.go; same package references them, no new schema/dependency/file required. Never use mutable on-disk schema, Host.Doc, unknown external fetch or relaxed hand-written schema subset."
+    },
+    "functions": [
+      {
+        "name": "researchos_f08_cancel_request_v1",
+        "arity": 2,
+        "parameters": [
+          {
+            "name": "private_header",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1398200
+          },
+          {
+            "name": "original_identity_binding",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1048576
+          }
+        ],
+        "result": "int64(1) only on complete success; invalid input returns error with fixed non-secret code (no input echo). No NULL/false success.",
+        "contract": "Strict private-header exact3 shape and constants after handler freeze; decode standard padded base64 Strict plus byte-for-byte EncodeToString roundtrip; decoded original raw <=1048576 bytes; strict UTF8/JSON/duplicate/numeric validation; DecodeEnvelope and frozen CommandEnvelope+ControlPayload validation; action CANCEL and exact original project/SID/command/client/positive epoch+revision; compare original identity method/operation/principal/command/request_hash tuple. Call Envelope.ContentHash on original decoded envelope and compare original journal/identity hash. Do not infer principal from envelope; SQL separately binds authenticated original journal principal.",
+        "binding_shape": "Closed versioned object format=researchos.f08.cancel-identity/1, principal,project,operation,key,request_hash,command_id,method,client_id,session_id,writer_epoch,expected_revision,target_id. All string fields nonempty except no nullable variant here; epoch/revision exact int64>=1. operation=v2:session.control, method=session.control, key=command_id. This is proposed SQL-built binding, not a new mutable table or authority."
+      },
+      {
+        "name": "researchos_f08_cancel_response_v1",
+        "arity": 5,
+        "parameters": [
+          {
+            "name": "private_header",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1398200
+          },
+          {
+            "name": "original_identity_binding",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1048576
+          },
+          {
+            "name": "old_body",
+            "sqlite_type": "BLOB or NULL only initial modes",
+            "go_type": "[]byte or nil",
+            "max_bytes": 1048576
+          },
+          {
+            "name": "new_body",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1048576
+          },
+          {
+            "name": "mode",
+            "sqlite_type": "INTEGER",
+            "go_type": "int64",
+            "values": {
+              "0": "INITIAL_ACK old_body NULL/new ACKNOWLEDGED",
+              "1": "INITIAL_COMPLETED old_body NULL/new COMPLETED",
+              "2": "ACK_TO_COMPLETED exact old ACK/new COMPLETED"
+            }
+          }
+        ],
+        "result": "int64(1) or fixed error; no automatic NULL propagation. SQL tests IS NOT 1 and RAISE(ABORT); callback error aborts statement and caller must rollback transaction.",
+        "contract": "Revalidate request contract. Parse both present raw bodies strictly before maps/structs lose distinctions. Require exact9 response keys, explicit null error/error_code; full read-direction CommandResponse validation including frozen nested refs, date-time formats, RelativePath semantic checks and writeOnly rejection. DecodeResponse + ValidateResultAgainstMethod using private compiled SchemaDoc. Match method,command,SID to original envelope. ACK exact PendingResult, operation_id=op-command; COMPLETED exact CANCEL ControlResult with true settled/children_stopped/queue_empty, target/control_request_id exact original tuple, snapshot.session_id/project_id exact expected relation. New revision >= original expected revision; ACK->final new revision>=old revision. SQL additionally binds final snapshot revision/watermark to current caller-tx projection and immutable final witness. No-op/reverse/other statuses refuse. Historical completed replay never calls UPDATE.",
+        "limits_are_new_policy": "1MiB response ceiling aligns current CLI typed response reader but is NOT a frozen JSON-schema maximum; MUST be explicitly approved before implementation. Older valid larger retained replies are never deleted or rewritten; unsupported promotion is typed blocked. If preserving unbounded existing producer semantics is required, revise this cap through scope review and prove memory bounds; do not silently claim current API has this cap."
+      },
+      {
+        "name": "researchos_f08_cancel_witness_v1",
+        "arity": 2,
+        "parameters": [
+          {
+            "name": "kind",
+            "sqlite_type": "INTEGER",
+            "go_type": "int64",
+            "values": {
+              "0": "ADMITTED_ROOT",
+              "1": "ADMITTED_MEMBER",
+              "2": "FINALIZED_ROOT",
+              "3": "FINALIZED_MEMBER"
+            }
+          },
+          {
+            "name": "witness_body",
+            "sqlite_type": "BLOB",
+            "go_type": "[]byte",
+            "max_bytes": 1048576,
+            "member_max_bytes": 65536
+          }
+        ],
+        "result": "int64(1) or fixed error",
+        "contract": "Closed versioned pure shape/variant/nullability/hash-reference syntax checker for exact SQL24 witness format. No arbitrary JSON additional keys. Root/member exact principal/project/command/original tuple; complete original VersionRefs; kind-specific fields; genuine NO_RUN null Run/epoch/dispatch and genuine NO_SESSION null generation; QUEUED requires nonnull Run epoch; PREPARED requires original immutable dispatch manifest ref and no process identity; STARTED final requires exact native observation/artifact identity. At ADMITTED there is no unknown future response hash. FINALIZED binds both original/final raw body digests and exact original member refs. Do not claim shape function proves group completeness, cryptographic recomputation of external artifacts or OS/SDK facts. SQL relational guards and producer/current/history validation remain mandatory.",
+        "unfinished_contract": "Exact SQL24 field list/keys and final root/member relational DDL must be reviewed together; no implementation may hide new optional fields behind this type. This function deliberately cannot grant completion from ready/hash/status fields."
+      }
+    ],
+    "byte_transport": "Pinned functionArgs nonvolatile SQLITE_TEXT uses libc.GoString, so embedded NUL can truncate. ALL raw/header/identity text arguments use explicit CAST(original_column AS BLOB) and callback accepts only []byte; native SQL checks original column typeof and exact OLD/NEW bytes separately. BLOB branch copies SQLite exact byte length. Reject string/float/bool/time args; numeric kind must int64. Reject nil unless response old_body explicit initial mode. Do not enable VolatileArgs or unsafe alternative just to avoid this issue.",
+    "strict_pipeline": [
+      "Check argc and exact driver types; original SQL typeof must precede CAST; length byte caps before parse (driver already copied input; SQL outer CASE length gate before callback avoids allocating oversize bodies).",
+      "utf8.Valid + canonical.JSON for strict Unicode/duplicates/trailing JSON; domain.Decode for exact numeric preservation. Duplicate escaped names at any nesting rejected before conventional map/struct decoding.",
+      "Private header required members/missing-vs-null/unknown key checking, base64 StdEncoding.Strict then exact reencode; validate original raw directly, do not replace stored bytes with normalized bytes.",
+      "DecodeEnvelope + SchemaDoc.ValidateDefInput CommandEnvelope and ControlPayload; no schema format drift; positive int64 required, exact integer representation preserved.",
+      "Envelope.ContentHash computes the existing custom canonicalBytes algorithm, not JCS Digest. Call actual approved helper; do not substitute a newly computed JCS hash in old request_hash.",
+      "Read response JSON strict first, then DecodeResponse + complete ValidateDef CommandResponse and ValidateResultAgainstMethod. JSON null errors mandatory; no secret/writeOnly data in nested responses.",
+      "Witness structure validates pure types only. Exact relational group membership, same original Run/epoch, same-tx ledger/queue/process facts validated by SQL predicates and existing trusted producer guards, not callback DB reads."
+    ],
+    "hash_names": {
+      "request_hash": "Existing Envelope.ContentHash prefix sha256:, immutable stored request semantic identity. Current canonicalBytes sorting/encoding is custom; whitespace equivalent commands may share it.",
+      "raw_header_hash_and_raw_body_hash": "Digest of exact retained original bytes, no normalization; compare actual column bytes too.",
+      "witness_canonical_hash": "Digest of RFC8785 canonical.JSON bytes of strict witness only; explicit new versioned format, not reused as old request hash.",
+      "cross_controls": "<>&, Chinese, U+2028/U+2029, nonBMP/BMP ordering, embedded NUL outside JSON versus escaped U+0000, duplicate escaped key names, negative/oversize/non-lossless numbers and missing/null."
+    },
+    "trusted_schema_limit": "Pinned RegisterFunction sets SQLITE_UTF8 and SQLITE_DETERMINISTIC, not SQLITE_INNOCUOUS/DIRECTONLY. Trigger invocation with trusted_schema=OFF may be refused. Do not add custom driver flags or force PRAGMA to weaken protection within17; exact production default and failing hardened connection behavior must be tested. Missing/unsafe-function write refusal is safe, but unexpected startup/backup failure is a blocker until reviewed.",
+    "boundedness": "Proposed request1MiB existing limit, header1398200bytes, identity1MiB, body1MiB each, witness root1MiB/member64KiB. These are admission bounds, not proof that frozen schema caps every array. Callback processes at most about5.6MiB raw aggregate; temporary compiler/JSON expansion measured later. No stored fullGoal membership duplication inside every member; reject oversize without partial journal/Run mutations. Response/witness new bound compatibility remains explicit approval item."
+  },
+  "connection_matrix": [
+    {
+      "entry": "apps/control/main.go:75,87; internal/host/host.go; internal/api/v2.go",
+      "reach": "All import domain transitively; domain init occurs before main and before store.Open/Ping. API reuses service DB; Host cannot supply alternative validator or register lazily.",
+      "gate": "Actual control new24 startup and HTTP same typed CANCEL through existing isolated fixture; two physical new conns via independent sql.Open(default driver), pool replacement and reopened DB all guard invalid raw writes. No real NativeHost/user DB in this design task."
+    },
+    {
+      "entry": "apps/control/replay_command.go:157",
+      "reach": "Same executable domain import; direct replay store.Open covered by init.",
+      "gate": "Actual replay executable with original/invalid private header, same sole journal, no alternate row rewrite."
+    },
+    {
+      "entry": "ops/backup/main.go:137,181; backup.go:377,611,793; backup_upgrade.go:195,216; backup_configuration_upgrade.go:81; backup_migration.go:34",
+      "reach": "ops imports domain and all temporary/default-driver :memory: opens happen after init; pure callbacks independent of Host.",
+      "gate": "New actual program performs source23 snapshot ->24 migration ->validation ->stage reopen ->publication ->ordinary24backup/restore/rebackup; missing function or callbackerror before publication leaves destination absent, original source/snapshot retained. Old source lock held through every publication boundary."
+    },
+    {
+      "entry": "apps/cli/cli_v2.go + Desktop typed API",
+      "reach": "Clients do not open authoritative SQLite in these product paths; UDF is in server/control domain composition. Client import/init alone is not server readiness.",
+      "gate": "Original CLI/desktop protocol behavior preserved; successful full typed completed response from real Host same journal, response cap compatibility explicit. No new CLI/Desktop source paths authorized."
+    },
+    {
+      "entry": "ops/supervisor/control_holdout_windows.go and ops/supervisor/release_host/main.go",
+      "reach": "Source-only inspection shows additional store.Open compositions; freeze imports to prove domain reach. No holdout/private DB read here.",
+      "gate": "Build/link closure must demonstrate domain init on all relevant public compositions; validation may use isolated public synthetic DB only. Never launch real release/privateholdout as convenience."
+    },
+    {
+      "entry": "separately constructed modernc.Driver / external SQLite / bare importer",
+      "reach": "Global default registration does NOT reach constructed driver or other process. Current rg finds no app custom Driver registration; future addition cannot be silently supported.",
+      "gate": "Future isolated negative opens without functions and guarded UPDATE/INSERT must fail; SELECT outcome recorded honestly. Whole-file copy does not invoke triggers and requires existing full authenticated backup validation. No claiming UDF authenticates arbitrary database replacement."
+    },
+    {
+      "entry": "real matching old22 and old23 executables",
+      "reach": "Old binaries have no new UDF. Original old22/23DB remains byte/semantic compatible; future24 business startup refused by existing numbered guard. store.Open may write WAL/header and reads may succeed before later rejection.",
+      "gate": "Real frozen old program hash/source/runtime linkage, not newbinary+oldSQL. Record open/read/guardedwrite independently. During new23->24 upgrade prove old23 writer busy/refused at snapshot/migration/recovery/validation/rename/report/final phases and release afterward; reads may succeed WAL. Old program24 backup/restore must reject unsupported migration/schema/UDF closure, never validate24 by omission. Original private receipts no rerun."
+    }
+  ],
+  "cancel_terminal_producer": {
+    "current_reachability": [
+      {
+        "fact": "createRuntimeRun sets QUEUED and task.active_run_id; claimTaskMode prepares native dispatch in same caller transaction before publishing claim response. beginRuntimeQualification likewise adds dispatch before committing outer BeginRuntimeQualification.",
+        "sources": [
+          "runtime.go:41",
+          "orchestration.go:421-463",
+          "runtime_qualification.go:301-310"
+        ],
+        "implication": "For currently native-admitted claims, observed durable QUEUED generally already has PREPARED dispatch. Native Run with absent dispatch is not automatically a natural prelaunch phase: may be generic fixture/old data/deleted required row. Do not make deletion a positive test or infer never launched from absence."
+      },
+      {
+        "fact": "dispatchGate holds resourceWriteLock and validates real current Run executor/runtime/lease/task, then RunAdmitted changes PREPARED->STARTED with RowsAffected1 and commits before StartBridge. BeforeResume rechecks after process creation.",
+        "sources": [
+          "runtime_coordinator_windows.go:436-553",
+          "resources.go:17"
+        ],
+        "implication": "The shared SQLite writer order, not an in-memory flag, separates proven PREPARED-not-started from committed STARTED without PID. STARTED with empty identity may have a suspended/partly-created process and is UNKNOWN-sensitive."
+      },
+      {
+        "fact": "effectsReconciled currently rejects latest STARTED and UNKNOWN only, not PREPARED. clientQueueSettled can return success for zero matching fences.",
+        "sources": [
+          "durability.go:27",
+          "client_command_queue.go:146"
+        ],
+        "implication": "New F08 strict finalization cannot use either alone as positive complete proof. Must independently require original fence when applicable and inspect all effect keys/history; PREPARED effects do not become NOT_APPLIED by cancelling Run."
+      }
+    ],
+    "proposed_exact_new_source_paths": [
+      {
+        "path": "internal/domain/runtime.go",
+        "function_bounds": [
+          "new private settleNeverLaunchedCancelledRun(tx,*proof,p,cid) error helper near runtimeOperationMode",
+          "no changes to generic runtimeLease or public acknowledgeRunCancellation observation contract",
+          "createRuntimeRun only if new birth/lifecycle contract separately approved"
+        ],
+        "intent": "Caller-Tx genuine authority transition. Accept only immutable new CANCEL ADMITTED membership plus exact original Run/Task/epoch/executor/lease hash and native dispatch proof; acquire resourceWriteLock first before deciding phase. Authoritative owner cancellation is not executor lease renewal; no invented lease token or authentication bypass. Produce CANCELLED original Run via bump+s.put, runtimeTaskTerminal existing helper and Run event, with true children_stopped/queue_empty derived from complete never-launch proof; set actual confirmed/end times, preserve null started_at/exit_code/external_run_id, keep active_run/executor linkage and historical lease hash. Do not fabricate runtime_observations/native Artifact/SDK ACK. Skip releaseQualificationReservation; no cost mutation. Transaction rolls back with journal/witness failure."
+      },
+      {
+        "path": "internal/domain/runtime_coordinator_windows.go",
+        "function_bounds": [
+          "dispatchGate",
+          "RunAdmitted pre-PREPARED->STARTED validation/CAS only",
+          "existing before_launch_fence and dispatch_started hooks preserved"
+        ],
+        "intent": "Explicitly reject original F08 finalized never-launch proof/terminal Run before STARTED CAS; preserve write-lock, current lease/executor checks and no-relaunch condition. At cancellation-wins boundary, return a benign exact cancellation outcome only after rereading canonical same-run finalization, not generic ignorederror; never start worker. At STARTED-wins boundary continue existing cancellation/unknown/realprocess path. No new scheduler/goroutine/retries; no bypass of BeforeResume cleanup, stream/effect/cancel joins."
+      }
+    ],
+    "core17_changes": "client_protocol_queue_control.go invokes private producer AFTER real controlTask CANCEL and admission capture but before constructing final reply; client_cancel_finalization.go validates full original witness and stage; SQL24 guards prevent unproved terminal update/future STARTED on finalized never-launch row; backup closures include new typed facts. All are already proposed17, no source mutation now.",
+    "minimal_counts": "Proposed19=17+runtime.go+runtime_coordinator_windows.go covers reachable native PREPARED-before-dispatch-launch + NO_RUN + already terminal + actual started settlement. It does NOT claim it creates a new durable native Run-without-dispatch phase. If product explicitly requires that new phase or safe generic external-runtime cancellation,19 is insufficient; see extension below.",
+    "settlement_algorithm": [
+      "Acquire original caller transaction writer lock before reading mutable launch phase; authenticate current allowed Owner CANCEL through existing typed service. Read immutable original request/private header, whole Goal task set and exact Run admission before mutation; freeze ADMITTED.",
+      "Apply actual CANCEL control/fence. For absent Session member do not ensure/create fake Session or generation. For real fence bind exact generation+dispatch+accepted watermark; ENQUEUED->DROPPED through existing CANCEL_FENCE receipt. SENDING/SDK_ACCEPTED/DROP_REQUESTED/UNKNOWN require real original worker evidence and cannot enter never-launched path.",
+      "For PREPARED not started: verify original manifest Hash, project/Run/Task/epoch/executor/profile+admission refs; worker and journal locator empty, identity exactly empty, observation sequence0/hash empty. All same original epoch historical Run versions have no started/external/heartbeat/observation/artifacts/uploads indicating execution. Original dispatch entry immutable and same key; SQL24 guards block REPLACE/DELETE/state rewind for protected dispatch; inability to prove its first-ever PREPARED stage is a blocker, not a label.",
+      "Inspect complete effect ledger/reservation obligations. Simplest never-launched fastpath requires zero effects for this epoch (plus no contradictory orphan reservation/effect obligation); nonzero PREPARED is unresolved, STARTED/UNKNOWN always unresolved. Terminal effect histories may be handled only by existing exact proof path; no amount=0 exemption. Never synthesize NOT_APPLIED or release money. Exact original runtime-local-launch reservation from reserveRuntimeLocalLaunch (or qualification-dispatch reservation from its original admitted producer) is a separate non-MODEL dispatch obligation; validate full original typed tuple/body/history and keep unchanged. Prefix or zero money alone never grants this classification. Any extra unexplained MODEL/provider obligation blocks.",
+      "Prove all original queue entries are terminal and exactly accounted, no restore_fenced, no lost generation. Advance sealed_through only for positively never-delivered dropped generation with actual same-Tx CANCEL_FENCE chain. No ordinary ACK interpreted as SDK empty. No Session member uses nonqueue proof variant; no invented PID/generation/SDK counters.",
+      "Append immutable typed NEVER_LAUNCHED final witness with exact old Run revision, original lease ownership refs, PREPARED row/manifest/queue/effect absence vector; relational SQL rechecks current source facts in transaction. Call runtime.go producer for original Run CANCELLED, Task terminal/event. Retain dispatch PREPARED as historical launch intent (do not rewrite to OBSERVED or UNKNOWN); final witness prevents later launch, original Run terminal gate independently prevents it.",
+      "Construct actual SessionSnapshot after actual settlement; strict full response/UDF; finish full root/member FINALIZED and sole journal original completed INSERT or exact ACK->COMPLETED CAS. All SQL/history/queue/Run/event writes commit together; any fault leaves old ACK or no business changes, never partially terminal with original ACK rejected by guard.",
+      "When STARTED CAS won, no fastpath even if no PID observed. Keep original ACK while actual process cleanup/effect/queue proofs pending; once actual existing canonical cancellation producer settles, finalize same immutable membership/Run. Missing proof stays explicit typedblocked/recoverable; supported never-launched path above must actually finish, permanent ACK is not its completion criterion."
+    ],
+    "stages": [
+      {
+        "stage": "NO_RUN",
+        "completion": "Existing true Task-noRun cancellation, immutable Goal member snapshot plus historical absence of Run/dispatch/effect and real optional queue proof; completed in original Tx. No runtime helper called."
+      },
+      {
+        "stage": "QUEUED_WITH_NO_DISPATCH",
+        "completion": "For supported native current claim, not a separate committed phase. Missing row on an admission requiring native dispatch is corruption/provenance blocked. Genuine generic/old fixture Run requires its own trusted executor never-started/stop evidence, not native inference. If actual new lifecycle is desired, implement extension before claiming coverage; no fake process observation."
+      },
+      {
+        "stage": "PREPARED_NOT_STARTED",
+        "completion": "Recommended new actual never-launch producer19; writer serialization distinguishes from STARTED. Final completed outcome mandatory when all proof predicates true."
+      },
+      {
+        "stage": "STARTED_EMPTY_IDENTITY_OR_UNKNOWN",
+        "completion": "Existing native cleanup/reconciliation only. StartBridge may already be creating suspended process. Do not downgrade to PREPARED on timeout/missing PID or clear UNKNOWN cost. Final only actual same-generation cleanup+queue+effects."
+      },
+      {
+        "stage": "STARTED_RUNNING",
+        "completion": "Original cancellation clear/drop, abort_observed and cancelled idle same original generation, actual children cleanup/streams drained, latest effect reconciliation. Preserve original control grouping and existing producer; no new SDK message type."
+      },
+      {
+        "stage": "TERMINAL",
+        "completion": "Immutable exact old Run final proof may settle even if current Task later has a new Run; do not cancel/overwrite new Run. Historical snapshot branch is separate from live caller active ownership check. Legacy original ACK lacks immutable request evidence => typedblocked, no witness backfill."
+      }
+    ],
+    "extension_if_true_new_durable_queued_phase_required": {
+      "status": "SCOPE_NOT_AUTHORIZED; not needed just to complete actual native PREPARED-before-launch, but necessary if requirement really includes new persistent pre-dispatch native stage.",
+      "why": "createRuntimeRun lacks original claim cid/principal/runtime-admission argument; current claim returns lease to caller and currentDispatchedRun intentionally allows no-dispatch generic fixtures. A marker saying neverstarted cannot prove route exclusivity or defeat deleted-dispatch counterexample.",
+      "minimum_extra_beyond19": [
+        {
+          "path": "internal/domain/orchestration.go",
+          "bounds": "claimTaskMode createRun/admission/prepareDispatch call ordering only",
+          "need": "Bind new exact immutable claim locator/principal/runtime revision/admission+Run birth before publishing QUEUED stage. If separating transactions, new state/public claim scheduling consequences need explicit architecture approval; do not silently make a new queue."
+        },
+        {
+          "path": "internal/domain/runtime_dispatch.go",
+          "bounds": "prepareRuntimeDispatch and currentDispatchedRun exact new lifecycle branch",
+          "need": "Require exact native Run-birth/admission proof before adding PREPARED; terminal/cancel-fenced Run never gains launch entry; native missing required dispatch never falls through generic compatibility nil. Legacy generic branch unchanged only positive original compatibility proof."
+        }
+      ],
+      "schema_content": "Additional SQL24 versioned operational birth/launch facts may be required, separate from CANCEL membership and referenced by original claim+journal/version refs. They are not ready flags nor a second response journal. Detailed DDL, insertion order, backing provenance, typed backup inventory and exactold23 compatibility must be independently scoped; no table/name created now.",
+      "other_possible_dependencies": "runtime_qualification.go uses claimTaskMode plus own prepare step; if new signature/order does not remain encapsulated, exact caller amendment required. Generic external runtime cannot be proved never-launched without its own genuine executor proof/lease revocation contract; do not promise existing19/21 solves arbitrary external launches."
+    },
+    "lease_and_history": "Cancellation authority is original authenticated Owner command/member, not possession of executor secret. Verify same exact task.active_run/id/epoch/lease hash/executor for live transition; retain them, no new epoch/no timeout-as-proof/no budget reset. Allow cancellation after execution lease expiry only under exact proven never-launched protocol with restored/LOST/RECONCILING excluded; no general runtimeLease bypass. Already-terminal historical branch never mutates new Task/Run.",
+    "SQL_guard_consistency": "Authentic original dispatch and effect anchors must be immutable/monotonic through new24 BEFORE INSERT collision/DELETE/UPDATE guards and witness relational checks, including recursive_triggers OFF REPLACE/UPSERT. Existing0017 forbids direct delete but permits state updates and replacement concerns; F08 cannot prove neverstarted from current PREPARED without protected original/history. Raw SQL attacks preserving trusted anchors refuse; wholesale trigger/schema/all-history replacement not externally authenticated.",
+    "new24_dispatch_origin_guard": {
+      "requirement": "Recommended SQL24 append-only typed initial-dispatch anchor created by BEFORE/AFTER INSERT guard for actual NEW PREPARED row, alongside one original immutable Run/manifest tuple. This operational provenance belongs the SQL24 witness inventory, not another response journal. No new source path if SQL trigger builds it; its exact table/variant and deferred original claim linkage need independent design approval. Existing17 schema/backup validators must enumerate it explicitly.",
+      "reason": "Current0017 state is mutable: PREPARED with emptyworker can be forged by rewinding a STARTED-before-process record if only current fields checked. New24 requires original insertion anchor plus strict monotonic state/worker/identity guard from insertion onward; never-ready flag is insufficient.",
+      "legacy": "Do not backfill original-first-PREPARED anchor for existing23 records at upgrade. Old record requires exact prior immutable proof or remains typedblocked; missing provenance cannot become legacy exemption. No new24 native claim may omit anchor or use generic fallback.",
+      "closure": "SQL trigger uses full immutable manifest/version refs and checks Run/epoch/executor bindings; authoritative original claim/admission/version/journal closure is validated before commit/backup. Do not claim insertion anchor alone authenticates hostile wholesale DB rewriting. No SQL executed here."
+    }
+  },
+  "exact_test_bounds": [
+    {
+      "path": "internal/domain/client_cancel_finalization_test.go",
+      "new_in17": true,
+      "controls": [
+        "All3 UDF exactarity/type/NULL/BLOBembeddedNUL/UTF8/nested escapedduplicate/RFC8785-vsContentHash vectors",
+        "Actual default-driver multiple new/reopened connections and custom-driver missingfunction subprocess (no shared process late registration)",
+        "InitialACK/immediateCOMPLETED/replay CAS complete frozen nested schema and current-tx snapshot match; rollback every admission/Run/Task/event/fence/final/journal stage",
+        "Owner/executor mismatched epoch/task/lease hash/history/proof missing refuses; generic no-dispatch explicitly blocked, no fixture method used as native positive",
+        "Direct raw DROP/REPLACE/UPSERT row attacks with schema/triggers intact, old STARTED→PREPARED rewind, false lease/terminal flags, latest UNKNOWN and orphan reserve obligations"
+      ]
+    },
+    {
+      "path": "internal/domain/client_protocol_control_windows_test.go",
+      "existing_in17": true,
+      "controls": [
+        "Add barrier controlled actual original native fixture: hold before_launch_fence, issue real typed CANCEL, assert original Run/Task CANCELLED and same command COMPLETED then release coordinator and prove no StartBridge/process identity/effect; no sleep proof",
+        "Race hold dispatch_started after durable STARTED before StartBridge: typed CANCEL cannot fastfinalize; proceed existing real cleanup/unknown path; exact ACK and eventual realsettlement or typedblocked observed, no fake READY",
+        "Native running originalSDK cancellation samegeneration clear/abort/idle and lateststates; preserve all old test assertions and realfixture masks",
+        "GenuineGoal noSession member plus native PREPARED member must complete wholegroup; later newRun historical replay cannot rebind"
+      ]
+    },
+    {
+      "path": "internal/domain/backup_cancel_finalization_test.go",
+      "new_in17": true,
+      "controls": [
+        "Public24 backup/restore/rebackup of neverlaunched CANCELLEDRun retaining PREPARED dispatch; prior newRun/history+currentrestore fences distinct",
+        "Original23 ACK with no immutable request proof stays unchanged typedblocked; no backfilled witnesses",
+        "All affected typedtables/rows/native artifactbytes and ledger obligations exact pre/post allowedrecovery; function missing does not allow archive acceptance"
+      ]
+    },
+    {
+      "path": "internal/domain/backup_cancel_upgrade_test.go",
+      "new_in17": true,
+      "controls": [
+        "Real accepted old22/23 programs have no newUDF; ownDB read/write compatibility; future24 startup/write/backup refusal independent from SELECT availability",
+        "Actual old23 writer at every snapshot/migrate/recovery/validate/rename/report/final barrier busy/refused, source held until publication; WAL reader truthfully reported; original reopens after lockrelease",
+        "Fresh24/23->24 publicplan with pureUDF in every source/stage/:memory:/target connection and corruptionfailure before publication"
+      ]
+    },
+    {
+      "path": "internal/domain/runtime_coordinator_windows_test.go",
+      "not_required_extra": "Existing nativeNormalFixture/boundaryHook unexported same package can be reused from already-in17 control_windows_test.go; no need change this file solely for tests. If unavailable under actual final buildtags, explicitly scope it rather than use unregistered file."
+    }
+  ],
+  "remaining_unknowns": [
+    "Handler final private-header decoder names/raw size/hash path/source not frozen; recapture beforeimplementation. Existing scope sameconstants must be confirmed, no guess used as acceptance.",
+    "UDF full schema uses existing frozen mirrors but exact3 registration/pure closures/sizepolicy and SQL24 witness fields remain independently unapproved.",
+    "No current runtime case executed. Native claim atomicity observed statically; true durable native QUEUED-without-dispatch phase not present in this inspected current flow. Cannot claim permanentACK closes that requirement.",
+    "Protected dispatch state/history monotonic guard compatibility with existing recovery UNKNOWN/OBSERVED paths must be designed/tested; no invented state or generalized triggerexception.",
+    "Generic historical executor no-dispatch cancellation needs its genuine trusted terminal proof; no new lease reset or synthetic observation.",
+    "Package-global init covers inspected default-driver callgraph statically; actual current compilerclosure and allphysical connection/oldprogram outcomes still required. No source acceptance from this report."
+  ],
+  "operations": {
+    "SQL": 0,
+    "tests": 0,
+    "SDK": 0,
+    "Node": 0,
+    "HTTP": 0,
+    "model": 0,
+    "paid": 0,
+    "private_resource_reads": 0,
+    "product_source_changes": 0,
+    "canonical_changes": 0,
+    "formal_increment": 0
+  }
+}

@@ -1,0 +1,75 @@
+540: 			}
+541: 		case done := <-results:
+542: 			if closing {
+543: 				registry.disqualify()
+544: 			}
+545: 			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
+546: 				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
+547: 				continue
+548: 			}
+549: 			inflight--
+550: 			if done.err != nil {
+551: 				var rejection *qualificationPreEffectRejection
+552: 				if errors.As(done.err, &rejection) {
+553: 					closeAdmission(done.err, done.seq)
+554: 					continue
+555: 				}
+556: 				if closing {
+557: 					registry.disqualify()
+558: 					continue
+559: 				}
+560: 				var fenced int
+561: 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+562: 					closeAdmission(done.err, 0)
+563: 					continue
+564: 				}
+565: 				deferredError = done.err
+566: 			}
+567: 			if !closing {
+568: 				ready[done.seq] = done
+569: 			}
+570: 		case <-tick.C:
+571: 			if closing {
+572: 				continue
+573: 			}
+574: 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+575: 				closeAdmission(err, 0)
+576: 				continue
+577: 			}
+578: 		case <-ctxDone:
+579: 			closeAdmission(ctx.Err(), 0)
+580: 			ctxDone = nil
+581: 		case <-fenceExpired:
+582: 			registry.disqualify()
+583: 			return registry.snapshot(), errors.Join(firstError, Fail(409, "GATE_FAILED", "broker drain timed out"))
+584: 		}
+585: 		if closing {
+586: 			continue
+587: 		}
+588: 		for {
+589: 			done, ok := ready[next]
+590: 			if !ok {
+591: 				break
+592: 			}
+593: 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+594: 				closeAdmission(err, 0)
+595: 				break
+596: 			}
+597: 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+598: 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+599: 					closeAdmission(err, 0)
+600: 					break
+601: 				}
+602: 			}
+603: 			delete(ready, next)
+604: 			next++
+605: 		}
+606: 	}
+607: 	if closing {
+608: 		return registry.snapshot(), firstError
+609: 	}
+610: 	if len(ready) != 0 {
+611: 		return registry.snapshot(), Fail(409, "GATE_FAILED", "protocol receipt gap")
+612: 	}
+613: 	return registry.snapshot(), deferredError
+614: }

@@ -1,0 +1,107 @@
+--- archived08
++++ frozen09
+@@ -454,7 +454,7 @@
+     }));
+     // Require two successive stable layout samples after real loading clears.
+     const stableLayout = async () => page.evaluate(() => {
+-      const nodes = ['.workbench-conversation-pane .conversation-canvas', '.workbench-conversation-pane .conversation-transcript',
++      const nodes = ['.workbench-route .main-area', '.workbench-conversation-pane .conversation-canvas', '.workbench-conversation-pane .conversation-transcript',
+         '.workbench-conversation-pane .session-composer', '.workbench-conversation-pane .conversation-welcome h2'];
+       return nodes.map(selector => { const r = document.querySelector(selector)?.getBoundingClientRect();
+         return r ? [r.x,r.y,r.width,r.height].map(x => Math.round(x*10)/10) : null; });
+@@ -478,6 +478,7 @@
+         const sel = s => document.querySelector(s);
+         const rect = e => { if (!e) return null; const r=e.getBoundingClientRect();
+           return {x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:r.width,height:r.height}; };
++        const mainArea=sel('.workbench-route .main-area');
+         const canvas=sel('.workbench-conversation-pane .conversation-canvas');
+         const transcript=sel('.workbench-conversation-pane .conversation-transcript');
+         const composer=sel('.workbench-conversation-pane .session-composer');
+@@ -489,27 +490,49 @@
+           const right=Math.min(a.right,b.right),bottom=Math.min(a.bottom,b.bottom);
+           return {x,y,right,bottom,width:right-x,height:bottom-y};};
+         const viewport={x:0,y:0,right:innerWidth,bottom:innerHeight};
+-        const contentClip=r=>clipRect(clipRect(r,tr),viewport);
+-        const overlapsViewport=(a,b)=>intersects(contentClip(a),clipRect(b,viewport));
++        const clipFor=element=>{
++          const raw=rect(element),chain=[];
++          let clipped=clipRect(raw,viewport);
++          for(let ancestor=element?.parentElement;ancestor;ancestor=ancestor.parentElement){
++            const style=getComputedStyle(ancestor), overflow_x=style.overflowX, overflow_y=style.overflowY;
++            const x_applied=['auto','scroll','hidden','clip','overlay'].includes(overflow_x);
++            const y_applied=['auto','scroll','hidden','clip','overlay'].includes(overflow_y);
++            const outer=rect(ancestor);
++            const bounds={x:outer.x+ancestor.clientLeft,y:outer.y+ancestor.clientTop};
++            bounds.right=bounds.x+ancestor.clientWidth;bounds.bottom=bounds.y+ancestor.clientHeight;
++            if(clipped&&(x_applied||y_applied)){
++              const x=x_applied?Math.max(clipped.x,bounds.x):clipped.x;
++              const right=x_applied?Math.min(clipped.right,bounds.right):clipped.right;
++              const y=y_applied?Math.max(clipped.y,bounds.y):clipped.y;
++              const bottom=y_applied?Math.min(clipped.bottom,bounds.bottom):clipped.bottom;
++              clipped=right>x&&bottom>y?{x,y,right,bottom,width:right-x,height:bottom-y}:null;
++            }
++            chain.push({tag:ancestor.tagName,class_name:String(ancestor.className||'').slice(0,120),
++              overflow_x,overflow_y,x_applied,y_applied,client_bounds:bounds,remaining_rect:clipped});
++          }
++          return {rect:clipped,chain};
++        };
++        const hc=clipFor(heading),ac=actions.map(clipFor),cc=clipFor(composer);
+         const hit=e=>{const r=rect(e); if(!r) return false; const x=(r.x+r.right)/2, y=(r.y+r.bottom)/2;
+           return y>=0&&y<innerHeight&&x>=0&&x<innerWidth&&[e,...e.querySelectorAll('*')].includes(document.elementFromPoint(x,y));};
+         const centerIn=(r,c)=>!!r&&!!c&&(r.x+r.right)/2>=c.x&&(r.x+r.right)/2<c.right&&
+           (r.y+r.bottom)/2>=c.y&&(r.y+r.bottom)/2<c.bottom;
+-        const visible=e=>!!contentClip(rect(e));
+-        const contentCenterInView=e=>centerIn(rect(e),contentClip(rect(e)));
+-        const composerCenterInView=centerIn(cr,clipRect(cr,viewport));
+-        const overlaps=[['heading',hr],...ar.map((r,i)=>['action_'+i,r])].filter(([_,r])=>overlapsViewport(r,cr)).map(([name])=>name);
++        const overlaps=[['heading',hc.rect],...ac.map((c,i)=>['action_'+i,c.rect])]
++          .filter(([_,r])=>intersects(r,cc.rect)).map(([name])=>name);
+         return {phase,requested_theme:requestedTheme,actual_theme:document.documentElement.dataset.theme,
+           viewport:{requested_width:width,requested_height:height,inner_width:innerWidth,inner_height:innerHeight},
+           document:{scroll_width:document.documentElement.scrollWidth,client_width:document.documentElement.clientWidth,
+             scroll_height:document.documentElement.scrollHeight,scroll_y:scrollY},
+           rects:{canvas:rect(canvas),transcript:tr,composer:cr,heading:hr,actions:ar},
+-          clipped_rects:{heading:contentClip(hr),actions:ar.map(contentClip),composer:clipRect(cr,viewport)},
++          clipped_rects:{heading:hc.rect,actions:ac.map(c=>c.rect),composer:cc.rect},
++          clipchain:{heading:hc.chain,actions:ac.map(c=>c.chain),composer:cc.chain},
+           transcript_scroll:{client_height:transcript?.clientHeight,scroll_height:transcript?.scrollHeight,scroll_top:transcript?.scrollTop},
+-          heading_visible:visible(heading),heading_center_in_view:contentCenterInView(heading),heading_center_hit:hit(heading),
+-          actions_visible:actions.map(visible),actions_center_in_view:actions.map(contentCenterInView),
+-          actions_center_hit:actions.map(hit),composer_visible:!!clipRect(cr,viewport),
+-          composer_center_in_view:composerCenterInView,composer_center_hit:hit(composer),
++          main_area_scroll:{scroll_top:mainArea?.scrollTop??null,client_height:mainArea?.clientHeight??null,
++            scroll_height:mainArea?.scrollHeight??null,overflow_y:mainArea?getComputedStyle(mainArea).overflowY:null,rect:rect(mainArea)},
++          heading_visible:!!hc.rect,heading_center_in_view:centerIn(hr,hc.rect),heading_center_hit:hit(heading),
++          actions_visible:ac.map(c=>!!c.rect),actions_center_in_view:ac.map((c,i)=>centerIn(ar[i],c.rect)),
++          actions_center_hit:actions.map(hit),composer_visible:!!cc.rect,
++          composer_center_in_view:centerIn(cr,cc.rect),composer_center_hit:hit(composer),
+           composer_overlaps_content:overlaps,action_index:actionIndex,
+           horizontal_overflow:document.documentElement.scrollWidth>innerWidth+1};
+       }, {phase,width,height,requestedTheme,actionIndex}));
+@@ -523,6 +546,8 @@
+           await bounded(() => page.waitForFunction(t => document.documentElement.dataset.theme===t, theme)); }
+         await observe(() => page.evaluate(() => {
+           window.scrollTo(0,0);
++          const mainArea=document.querySelector('.workbench-route .main-area');
++          if(mainArea) {mainArea.scrollTop=0;mainArea.scrollLeft=0;}
+           document.querySelectorAll('.workbench-conversation-pane *').forEach(el => {
+             if(el.scrollHeight>el.clientHeight) el.scrollTop=0;
+             if(el.scrollWidth>el.clientWidth) el.scrollLeft=0;
+@@ -553,13 +578,16 @@
+         }
+       }
+     }
++    const initialScrollReset = row => row.document.scroll_y===0 && row.transcript_scroll.scroll_top===0 &&
++      row.main_area_scroll?.scroll_top===0;
+     visual.findings=visual.scenarios.flatMap(row => {
+       const label=`${row.viewport.requested_width}x${row.viewport.requested_height}/${row.requested_theme}/${row.phase}/${row.action_index??'initial'}`;
+       const findings=[];
+       if(row.viewport.inner_width!==row.viewport.requested_width || row.viewport.inner_height!==row.viewport.requested_height)
+         findings.push(label+':VIEWPORT_SIZE_MISMATCH');
+-      if(!row.rects.canvas || !row.rects.transcript || !row.rects.composer || !row.rects.heading || row.rects.actions.length!==3)
++      if(!row.main_area_scroll?.rect || !row.rects.canvas || !row.rects.transcript || !row.rects.composer || !row.rects.heading || row.rects.actions.length!==3)
+         findings.push(label+':REQUIRED_GEOMETRY_MISSING');
++      if(row.phase==='INITIAL_VIEWPORT' && !initialScrollReset(row)) findings.push(label+':INITIAL_SCROLL_NOT_RESET');
+       if(row.actual_theme!==row.requested_theme) findings.push(label+':THEME_MISMATCH');
+       if(row.horizontal_overflow) findings.push(label+':HORIZONTAL_OVERFLOW');
+       if(row.composer_overlaps_content.length) findings.push(label+':COMPOSER_OVERLAP:'+row.composer_overlaps_content.join(','));

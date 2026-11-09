@@ -1,0 +1,13 @@
+from pathlib import Path
+source=Path('compatibility-development-build.py').read_text(encoding='utf-8')
+source=source.replace("CONTROL = RECEIPT / 'controller-01'", "CONTROL = RECEIPT / 'controller-02'")
+source=source.replace("BUILD_RECEIPT = RECEIPT / 'build-01'", "BUILD_RECEIPT = RECEIPT / 'build-02'")
+source=source.replace('development-ui-20261104-r3','development-ui-20261104-r4')
+source=source.replace("if current == '3cd8e4ceba16ba6c4890fe2fd5a35324682b44f5':", "if current == 'e0fc197321a92fcb5952e7d112f3f6c356bd309a':")
+source=source.replace("'failure_origin':'compatibility-development-bundle-20261104','attempt_index':1", "'failure_origin':'compatibility-development-bundle-20261104','attempt_index':2")
+source=source.replace("'prior_scope':'workbench-experience-20261104/desktop-build, unchanged'", "'prior_scope':'r2 preserved; same-origin attempt1 r3 and failed raw logs preserved unchanged'")
+target=Path('compatibility-development-build-r2.py');assert not target.exists();compile(source,str(target),'exec');target.write_text(source,encoding='utf-8')
+cli=Path('build_cli_development.py').read_text(encoding='utf-8')
+cli=cli.replace("development-build/controller-01/final.json", "development-build/controller-02/final.json").replace('development-ui-20261104-r3-go-cache','development-ui-20261104-r4-go-cache')
+target=Path('build_cli_development_r2.py');assert not target.exists();compile(cli,str(target),'exec');target.write_text(cli,encoding='utf-8')
+print('Prepared same-origin attempt2 controllers; neither build executed.')

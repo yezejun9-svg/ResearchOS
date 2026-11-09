@@ -1,0 +1,109 @@
+def grant(b,output,scope_ref):
+    global OWNED_GRANT_ROOT, OWNED_GRANT_PREFLIGHT_ROOT
+    scope=doc(scope_ref)
+    need(scope['new_grant_preflight_root']==b['new_grant_preflight_root'],'full-scope preflight path binding')
+    pf=safe(scope['new_grant_preflight_root'],False)
+    root=safe(scope['new_authorization_root'],False)
+    others=[safe(scope[k],False) for k in ('new_output_root','new_wrapper_root','new_export_root')]
+    need(pf.is_relative_to(RECEIPTS) and b['run_uuid'] in pf.name,'bounded preflight leaf/UUID')
+    roots=[pf,root,*others]
+    need(len(set(roots))==5 and all(not x.is_relative_to(y) for x in roots for y in roots if x!=y),'five disjoint leaves')
+    need(pf.parent.is_dir() and root.parent.is_dir() and all(not os.path.lexists(p) for p in roots),'fresh preflight/auth/execution leaves')
+    pf.mkdir()
+    OWNED_GRANT_PREFLIGHT_ROOT=pf
+    save(pf/'preflight.started.json',{'actor':'codex:/root','at':now(),'scope_ref':scope_ref,
+        'authorization_leaf_created':False,'automatic_retry':False,'counter_reset':False})
+    gate=load_module(b['authorization_gate_ref'],'root_cli43_gate_grant')
+    reader=gate.Reader()
+    gate.load_scope(reader,str(safe(scope_ref['path'])),scope_ref['sha256'])
+
+    # These are real preflight point snapshots, not yet grant-directory originals.
+    preliminary=[]
+    for x in CANON:
+        preliminary.append({'canonical_path':x,
+            'ref':write(pf/(Path(x).stem+'.original.json'),(ROOT/x).read_bytes())})
+    rr=gate.registration_refs(reader,scope)
+    ar=gate.validate_authority(reader,scope,scope_ref,preliminary,rr)
+    need(all((ROOT/x['canonical_path']).read_bytes()==verify(x['ref']) for x in preliminary),'sealed-authority live four CAS')
+    save(pf/'sealed-authority.verified.json',{'at':now(),'registration_refs':rr,
+        'authority_review_refs':ar,'canonical_copies':preliminary,'authorization_leaf_created':False})
+
+    def facts(label):
+        started=now(); records=None; observation=None; error=None
+        try:
+            records,observation=git_guard(b,pf,label)
+            return records,observation
+        except BaseException as e:
+            error=repr(e)
+            raise
+        finally:
+            # Individual child invocation/raw/result carries actual native status.
+            # This parent timing record never converts an earlier exit into its own native exit.
+            try:
+                save(pf/(label+'.time-window.json'),{'started_at':started,'ended_at':now(),
+                    'Git_records':records,'runtime_observation_ref':observation,'error':error,
+                    'actual_stage_native_exit':None,'point_in_time_only':True})
+            except BaseException as secondary:
+                if error is None: raise
+                sys.stderr.write(json.dumps({'first_cause':error,'secondary_receipt_error':repr(secondary),
+                    'actual_stage_native_exit':None,'phase':label},ensure_ascii=False)+'\n')
+
+    first_records,first_observed=facts('admission')
+    need(all((ROOT/x['canonical_path']).read_bytes()==verify(x['ref']) for x in preliminary),'post-admission live four CAS')
+    admission=save(pf/'admission.verified.json',{'at':now(),'scope_ref':scope_ref,
+        'sealed_authority_ref':pin(pf/'sealed-authority.verified.json'),
+        'actual_Git_records':first_records,'time_window_ref':pin(pf/'admission.time-window.json'),
+        'canonical_copies':preliminary,'authorization_leaf_created':False})
+    # No authorization directory exists until both sealed authority and actual Git/live-four facts pass.
+    need(all(not os.path.lexists(p) for p in [root,*others]),'auth/execution leaf appeared during preflight')
+    root.mkdir()
+    OWNED_GRANT_ROOT=root
+    save(pf/'authorization-leaf.created.json',{'at':now(),'path':str(root),'admission_ref':admission,
+        'directory_is_not_grant':True,'source_acceptance':False})
+
+    copied={}
+    def copy_fact(source):
+        source=safe(source)
+        need(source.parent==pf,'only direct owned preflight facts copied')
+        original=pin(source); raw=verify(original)
+        dest=root/source.name
+        if source.name in copied:
+            pair=copied[source.name]
+            need(pair['original_ref']==original and verify(pair['copy_ref'])==raw,'copied fact drift')
+            return pair['copy_ref']
+        copied_ref=write(dest,raw)
+        need(copied_ref['sha256']==original['sha256'] and copied_ref['bytes']==original['bytes'],'byte-identical fact copy')
+        copied[source.name]={'original_ref':original,'copy_ref':copied_ref}
+        return copied_ref
+
+    copies=[{'canonical_path':x['canonical_path'],'ref':copy_fact(safe(x['ref']['path']))} for x in preliminary]
+    # Re-evaluate the real registration chain using actual authorization copies before final Git.
+    ar=gate.validate_authority(reader,scope,scope_ref,copies,rr)
+    final_records,final_observed=facts('grant-final')
+    _,_,after_observed=runtime(b,pf,'grant-final.runtime.after')
+    preflight_pre=save(pf/'prelaunch.json',{'runtime_resources_ref':scope['runtime_resources_ref'],
+        'toolchain_lock_ref':b['toolchain_lock_ref'],'git':final_records,
+        'source_round':'grant-final','time_window_ref':pin(pf/'grant-final.time-window.json'),
+        'admission_ref':admission,'point_in_time_only':True,
+        'raw_reference_semantics':'Git records retain original preflight raw paths; all copied bytes are linked separately'})
+    # Copy unchanged original fact bytes. Do not rewrite original argv, time, refs or native result fields.
+    for p in sorted(pf.iterdir()):
+        if p.is_file():copy_fact(p)
+    pre=copy_fact(safe(preflight_pre['path']))
+    observed=[copy_fact(safe(r['path'])) for r in (first_observed,final_observed,after_observed)]
+    save(root/'preflight-copy-map.json',{'preflight_root':str(pf),'entries':list(copied.values()),
+        'time_boundary':'admission before auth mkdir; independent grant-final Git after auth mkdir; live four immediately before grant',
+        'directory_or_copy_is_not_authority':True})
+    need(all((ROOT/x['canonical_path']).read_bytes()==verify(x['ref']) for x in copies),'immediate pre-grant live four CAS')
+    gr=save(root/'authorization.execute.json',{'schema':'researchos.cli43-compiler-authorization.v1','actor':'codex:/root',
+        'status':'ROOT_REGISTERED_EXECUTION_AUTHORIZED','actual_registration_completed':True,'scope_ref':scope_ref,
+        'binding':gate.binding(scope),'canonical_copies':copies,'registration_refs':rr,'authority_review_refs':ar,
+        'prelaunch_evidence_ref':pre,'runtime_observation_refs':observed})
+    gate.validate_grant(str(safe(scope_ref['path'])),scope_ref['sha256'],str(root/'authorization.execute.json'),gr['sha256'])
+    save(root/'grant.completed.json',{'grant_ref':gr,'source_acceptance':False,'formal_increment':0,
+        'launcher_executions':0,'preflight_root':str(pf),'point_in_time_not_lifecycle':True})
+    pf_members=[pin(p) for p in sorted(pf.rglob('*')) if p.is_file()]
+    save(pf/'manifest.json',{'entries':pf_members,'count':len(pf_members),'excluded_only_self':True})
+    members=[pin(p) for p in sorted(root.rglob('*')) if p.is_file()]
+    save(root/'manifest.json',{'entries':members,'count':len(members),'excluded_only_self':True})
+

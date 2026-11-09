@@ -1,0 +1,75 @@
+--- baseline/internal/domain/client_configuration.go
++++ snapshot/internal/domain/client_configuration.go
+@@ -96,6 +96,13 @@
+ // readClientConfiguration (the final semantic/linkage validation) before commit.
+ // Any error here requires rollback of the caller's complete transaction.
+ func stageClientConfiguration(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, owner, principal string, raw []byte, env *Envelope) (clientConfigurationRecord, error) {
++	if env == nil || env.ProjectID != nil || env.SessionID != nil || env.ExpectedRevision != nil || env.WriterEpoch != nil {
++		return clientConfigurationRecord{}, fmt.Errorf("CONFIGURATION_SESSION_INTEGRATION_REQUIRED")
++	}
++	return stageScopedClientConfiguration(ctx, tx, doc, owner, principal, raw, env)
++}
++
++func stageScopedClientConfiguration(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, owner, principal string, raw []byte, env *Envelope) (clientConfigurationRecord, error) {
+ 	var r clientConfigurationRecord
+ 	if tx == nil {
+ 		return r, fmt.Errorf("CONFIGURATION_CALLER_TRANSACTION_REQUIRED")
+@@ -107,7 +114,7 @@
+ 	if err != nil {
+ 		return r, err
+ 	}
+-	if deref(env.Method) != "host.configure" || env.ProjectID != nil || env.SessionID != nil || env.ExpectedRevision != nil || env.WriterEpoch != nil {
++	if deref(env.Method) != "host.configure" || validateClientConfigurationScope(env) != nil {
+ 		return r, fmt.Errorf("CONFIGURATION_SESSION_INTEGRATION_REQUIRED")
+ 	}
+ 	payload, config, err := parseClientConfiguration(doc, env.Payload)
+@@ -118,7 +125,7 @@
+ 	if err = tx.QueryRowContext(ctx, `SELECT request_hash,method,project FROM client_command_identities WHERE principal=? AND command_id=?`, principal, deref(env.CommandID)).Scan(&identityHash, &method, &project); err != nil {
+ 		return r, err
+ 	}
+-	if identityHash != req.hash || method != "host.configure" || project != "" {
++	if identityHash != req.hash || method != "host.configure" || project != deref(env.ProjectID) {
+ 		return r, fmt.Errorf("CONFIGURATION_COMMAND_IDENTITY")
+ 	}
+ 	// A replay must be resolved before reaching a business mutation primitive.
+@@ -199,13 +206,6 @@
+ 			return r, fmt.Errorf("CONFIGURATION_SCOPE")
+ 		}
+ 	}
+-	// Foundation has no settled-session mutation entry point; reject such a row
+-	// rather than letting an invented stored scope authorize session adoption.
+-	for _, key := range []string{"project_id", "session_id", "expected_revision", "writer_epoch"} {
+-		if string(target[key]) != "null" {
+-			return r, fmt.Errorf("CONFIGURATION_SESSION_INTEGRATION_REQUIRED")
+-		}
+-	}
+ 	original := map[string]json.RawMessage{}
+ 	for k, v := range target {
+ 		original[k] = v
+@@ -222,12 +222,15 @@
+ 	if err != nil {
+ 		return r, err
+ 	}
++	if err = validateClientConfigurationScope(env); err != nil {
++		return r, err
++	}
+ 	req, err := validateClientIdentityRequest(doc, raw, env)
+ 	if err != nil || req.hash != r.RequestHash {
+ 		return r, fmt.Errorf("CONFIGURATION_REQUEST_HASH")
+ 	}
+ 	var linked int
+-	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=? AND request_hash=? AND project='' AND method='host.configure'`, principal, r.CommandID, r.RequestHash).Scan(&linked); err != nil {
++	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=? AND request_hash=? AND project=? AND method='host.configure'`, principal, r.CommandID, r.RequestHash, deref(env.ProjectID)).Scan(&linked); err != nil {
+ 		return r, err
+ 	}
+ 	if linked != 1 {
+@@ -239,6 +242,9 @@
+ 	}
+ 	if response == nil || deref(response.Status) != "COMPLETED" {
+ 		return r, fmt.Errorf("CONFIGURATION_ORIGINAL_RECEIPT_REQUIRED")
++	}
++	if env.SessionID != nil && (response.Revision == nil || *response.Revision != *env.ExpectedRevision+1) {
++		return r, fmt.Errorf("CONFIGURATION_ORIGINAL_REVISION")
+ 	}
+ 	r.Payload = p
+ 	projected, _ := canonical.JSON(Bytes(clientConfigurationProjection(r)))

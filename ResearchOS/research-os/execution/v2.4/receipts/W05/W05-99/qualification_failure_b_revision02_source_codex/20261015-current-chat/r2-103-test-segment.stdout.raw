@@ -1,0 +1,100 @@
+611: 			var triggerNames []string
+612: 			for triggerRows.Next() {
+613: 				var name string
+614: 				if scanErr := triggerRows.Scan(&name); scanErr != nil {
+615: 					t.Fatal(scanErr)
+616: 				}
+617: 				triggerNames = append(triggerNames, name)
+618: 			}
+619: 			if rowsErr := triggerRows.Err(); rowsErr != nil {
+620: 				t.Fatal(rowsErr)
+621: 			}
+622: 			triggerRows.Close()
+623: 			for _, name := range triggerNames {
+624: 				if _, dropErr := tx.Exec(`DROP TRIGGER "` + strings.ReplaceAll(name, `"`, `""`) + `"`); dropErr != nil {
+625: 					t.Fatal(dropErr)
+626: 				}
+627: 			}
+628: 			result, execErr := tx.Exec(mutation.sql, mutation.args...)
+629: 			if execErr != nil {
+630: 				t.Fatal(execErr)
+631: 			}
+632: 			rows, rowsErr := result.RowsAffected()
+633: 			if rowsErr != nil || rows == 0 {
+634: 				t.Fatalf("tamper fixture did not alter a row: rows=%d err=%v", rows, rowsErr)
+635: 			}
+636: 			if verifyErr := check(tx); verifyErr == nil {
+637: 				t.Fatal("private consumer accepted forged committed closure")
+638: 			}
+639: 		})
+640: 	}
+641: 	var locator string
+642: 	if err := r.f.db.QueryRow(`SELECT journal_locator FROM runtime_dispatches WHERE project=? AND run=?`, r.f.project, r.run["id"]).Scan(&locator); err != nil {
+643: 		t.Fatal(err)
+644: 	}
+645: 	var modelKey string
+646: 	if err := r.f.db.QueryRow(`SELECT effect_key FROM resource_effects WHERE project=? AND run=? LIMIT 1`, r.f.project, r.run["id"]).Scan(&modelKey); err != nil {
+647: 		t.Fatal(err)
+648: 	}
+649: 	factPath := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "effect-"+strings.TrimPrefix(Digest([]byte(modelKey)), "sha256:")+".json")
+650: 	factRaw, err := os.ReadFile(factPath)
+651: 	if err != nil {
+652: 		t.Fatal(err)
+653: 	}
+654: 	if err := os.WriteFile(factPath, []byte(`{"version":1,"receipt":{"state":"CONFIRMED"}}`), 0600); err != nil {
+655: 		t.Fatal(err)
+656: 	}
+657: 	t.Cleanup(func() { os.WriteFile(factPath, factRaw, 0600) })
+658: 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
+659: 		if err := check(tx); err == nil {
+660: 			t.Fatal("private consumer accepted changed original Host MODEL fact")
+661: 		}
+662: 		return nil
+663: 	})
+664: 	if err := os.WriteFile(factPath, factRaw, 0600); err != nil {
+665: 		t.Fatal(err)
+666: 	}
+667: 	sourceTx(t, r.f.db, check)
+668: 	if err = r.f.s.RevokePrincipal(context.Background(), r.f.owner); err != nil {
+669: 		t.Fatal(err)
+670: 	}
+671: 	tx, err := r.f.db.Begin()
+672: 	if err != nil {
+673: 		t.Fatal(err)
+674: 	}
+675: 	defer tx.Rollback()
+676: 	if err = check(tx); err == nil {
+677: 		t.Fatal("revoked current Owner still authorized closure")
+678: 	}
+679: }
+680: 
+681: func TestQualificationFailureNativeSourceTamperingRefused(t *testing.T) {
+682: 	c, route, r, _ := qualificationFailureLoopbackFixture(t)
+683: 	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err == nil {
+684: 		t.Fatal("expected first-gate denial")
+685: 	}
+686: 	var locator, manifestHash string
+687: 	if err := r.f.db.QueryRow("SELECT journal_locator,manifest_hash FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator, &manifestHash); err != nil {
+688: 		t.Fatal(err)
+689: 	}
+690: 	directory := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+691: 	if _, err := rt.ReadQualificationNativeFacts(directory, manifestHash); err != nil {
+692: 		t.Fatal(err)
+693: 	}
+694: 	for _, name := range []string{"stdout.raw", "stderr.raw", "bridge.json"} {
+695: 		t.Run(name, func(t *testing.T) {
+696: 			path := filepath.Join(directory, name)
+697: 			original, readErr := os.ReadFile(path)
+698: 			if readErr != nil {
+699: 				t.Fatal(readErr)
+700: 			}
+701: 			defer os.WriteFile(path, original, 0600)
+702: 			if writeErr := os.WriteFile(path, append(append([]byte(nil), original...), byte('x')), 0600); writeErr != nil {
+703: 				t.Fatal(writeErr)
+704: 			}
+705: 			if _, verifyErr := rt.ReadQualificationNativeFacts(directory, manifestHash); verifyErr == nil {
+706: 				t.Fatal("damaged native source was accepted")
+707: 			}
+708: 		})
+709: 	}
+710: 	journalPath := filepath.Join(directory, "bridge.json")

@@ -1,0 +1,89 @@
+154: func TestQualificationFailureFirstGateRefusalMatrix(t *testing.T) {
+155: 	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+156: 	epoch, err := Num(r.run, "lease_epoch")
+157: 	if err != nil {
+158: 		t.Fatal(err)
+159: 	}
+160: 	modelKey := fmt.Sprintf("%s:%s:%d:model:1", r.task["id"], r.run["id"], epoch)
+161: 	toolKey := fmt.Sprintf("%s:%s:%d:tool:1", r.task["id"], r.run["id"], epoch)
+162: 	// Negative constructor cuts use a synthetic sole confirmed MODEL row. B01
+163: 	// separately proves the real native/Host path and provider call.
+164: 	modelSeed := Object{"state": "CONFIRMED", "payload": Object{"capability": "MODEL", "route": "model-fixture"}, "receipt": Object{"state": "CONFIRMED"}}
+165: 	if _, err = r.f.db.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)", r.f.project, r.run["id"], modelKey, string(Bytes(modelSeed))); err != nil {
+166: 		t.Fatal(err)
+167: 	}
+168: 	ledgerSeed := Object{"run_id": r.run["id"], "provider_request_id": modelKey, "operation": "UNKNOWN", "cost_basis": "UNKNOWN", "money": nil}
+169: 	if _, err = r.f.db.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES(?,'BudgetLedgerEntry',?,1,?,1)", r.f.project, ID(), string(Bytes(ledgerSeed))); err != nil {
+170: 		t.Fatal(err)
+171: 	}
+172: 	for _, mutation := range []string{"missing_marker", "wrong_epoch", "wrong_runtime", "wrong_profile", "unknown_route", "invalid_key", "malformed_payload", "wrong_capability", "prior_rejected_effect", "prior_rejected_ledger", "second_effect_key"} {
+173: 		t.Run(mutation, func(t *testing.T) {
+174: 			tx, beginErr := r.f.db.Begin()
+175: 			if beginErr != nil {
+176: 				t.Fatal(beginErr)
+177: 			}
+178: 			defer tx.Rollback()
+179: 			if beginErr = resourceWriteLock(tx); beginErr != nil {
+180: 				t.Fatal(beginErr)
+181: 			}
+182: 			run, loadErr := load(tx, r.f.project, "Run", Str(r.run, "id"))
+183: 			if loadErr != nil {
+184: 				t.Fatal(loadErr)
+185: 			}
+186: 			dispatch, loadErr := runtimeDispatch(tx, r.f.project, Str(r.run, "id"), epoch)
+187: 			if loadErr != nil {
+188: 				t.Fatal(loadErr)
+189: 			}
+190: 			routeCopy := route
+191: 			frame := rt.BridgeFrame{Sequence: 3, Type: "effect.request", Key: toolKey, Route: "model-fixture", Capability: "TOOL", Payload: Bytes(Object{"name": "run_check", "arguments": Empty()})}
+192: 			payload := Object{"name": "run_check", "arguments": Empty()}
+193: 			switch mutation {
+194: 			case "missing_marker":
+195: 				_, loadErr = tx.Exec("DELETE FROM runtime_qualification_runs WHERE project=? AND run=?", r.f.project, r.run["id"])
+196: 			case "wrong_epoch":
+197: 				run["lease_epoch"] = epoch + 1
+198: 			case "wrong_runtime":
+199: 				routeCopy.RuntimeID = ID()
+200: 			case "wrong_profile":
+201: 				dispatch["manifest"].(map[string]any)["admission"].(map[string]any)["profile_hash"] = Digest([]byte("wrong"))
+202: 			case "unknown_route":
+203: 				frame.Route = "unbound-route"
+204: 			case "invalid_key":
+205: 				frame.Key = "!"
+206: 			case "malformed_payload":
+207: 				payload["arguments"] = "invalid"
+208: 			case "wrong_capability":
+209: 				frame.Capability = "SOURCE"
+210: 			case "prior_rejected_effect", "second_effect_key":
+211: 				key := toolKey
+212: 				if mutation == "second_effect_key" {
+213: 					key = fmt.Sprintf("%s:%s:%d:tool:0", r.task["id"], r.run["id"], epoch)
+214: 				}
+215: 				_, loadErr = tx.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)", r.f.project, r.run["id"], key, `{"state":"PREPARED"}`)
+216: 			case "prior_rejected_ledger":
+217: 				_, loadErr = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES(?,'BudgetLedgerEntry',?,1,?,1)", r.f.project, ID(), string(Bytes(Object{"run_id": r.run["id"], "provider_request_id": toolKey})))
+218: 			}
+219: 			if loadErr != nil {
+220: 				t.Fatal(loadErr)
+221: 			}
+222: 			typed, gateErr := c.qualificationFirstGateRejectionTx(tx, routeCopy, run, dispatch, nil, frame, payload)
+223: 			if typed != nil {
+224: 				t.Fatal("invalid gate constructed typed proof")
+225: 			}
+226: 			if mutation != "wrong_capability" && gateErr == nil {
+227: 				t.Fatal("invalid gate accepted")
+228: 			}
+229: 			var asTyped *qualificationPreEffectRejection
+230: 			if errors.As(gateErr, &asTyped) {
+231: 				t.Fatalf("generic rejection became typed: %v", gateErr)
+232: 			}
+233: 		})
+234: 	}
+235: 	if calls.Load() != 0 {
+236: 		t.Fatal("refusal matrix reached provider")
+237: 	}
+238: }
+239: 
+240: func TestQualificationFailureControlledLiveFirstGate(t *testing.T) {
+241: 	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+242: 	taskBefore := r.f.read("tasks", Str(r.task, "id"))

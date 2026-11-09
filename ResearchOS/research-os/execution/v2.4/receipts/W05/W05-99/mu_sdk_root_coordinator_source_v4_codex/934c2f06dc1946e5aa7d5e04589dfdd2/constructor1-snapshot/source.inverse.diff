@@ -1,0 +1,170 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\mu_sdk_root_coordinator_source_v4_codex\934c2f06dc1946e5aa7d5e04589dfdd2\root_coordinator.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\mu_sdk_root_coordinator_source_v3_codex\f02d7bbd33534835985bfd5a87f6bd67\root_coordinator.py
+@@ -1,7 +1,7 @@
+ """Review candidate. Import has no I/O; only Root may call run_resident().
+ 
+-NO_PROVIDER validates existing staged bootstrap evidence only. MODEL_TRIAL consumes
+-the prepared Host before one shared 300-second admission/qualification/C7 window.
++NO_PROVIDER validates existing bootstrap evidence only. MODEL_TRIAL prepares
++the trusted Host before one shared 300-second admission/qualification/C7 window.
+ No automatic dispatch retry exists. A retained result requires the same Python
+ parent to remain alive. This module's Source status is not execution authority.
+ """
+@@ -24,7 +24,6 @@
+ SOURCE_COMMIT = 'adc460c2138528f163f7fdab5e8d81dde157b7fb'
+ ANCHOR = '_researchos_root_sdk_coordinator_v1'
+ AUTHORS = {'codex:/root', 'codex:/root/command_queue_impl'}
+-INITIAL_COMPONENT_REVIEW = {'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\actual_cli_bootstrap_v3_component_independent_review_codex\\d391a2e49cf24d559e7d58016b8eb41e\\review.json', 'sha256': 'ce0691c2776d2ab6e95e19a019bb2f424c15b5aafc3b9ff2f20907cfda43cec4', 'bytes': 3194}
+ ENV_KEYS = {'SystemRoot', 'WINDIR', 'PATH', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP'}
+ 
+ def require(ok, text):
+@@ -89,45 +88,21 @@
+         all(proof.get(k) is True for k in ('captured_before_resume', 'held_job_handle', 'held_primary_handle', 'pid_match', 'creation_match', 'primary_exit_confirmed')) and
+         type(proof.get('active_processes')) is int and proof['active_processes'] == 0 and proof.get('errors') == [])
+ 
+-def validate_bootstrap(result, lifecycle, guard_cleanup, initial_review, initial_snapshot):
++def validate_bootstrap(result, lifecycle, guard_cleanup):
+     require(result.get('stage') == 'BOOTSTRAP_ONLY' and result.get('actor_id') == 'codex:/root', 'actual Root bootstrap required')
+     require(type(result.get('provider_requests')) is int and result['provider_requests'] == 0 and result.get('qualification') is None and result.get('formal_acceptance') is None, 'bootstrap is not runtime qualification')
+-    require(lifecycle.get('schema') == 'researchos.actual-cli-staged-continuation-lifecycle.v1' and lifecycle.get('all_owned_jobs_cleanup_confirmed') is True and lifecycle.get('error') is None and type(lifecycle.get('provider_requests')) is int and lifecycle['provider_requests'] == 0, 'continuation lifecycle incomplete')
++    require(lifecycle.get('all_owned_jobs_cleanup_confirmed') is True and lifecycle.get('error') is None and lifecycle.get('provider_requests') == 0, 'bootstrap lifecycle incomplete')
+     jobs = lifecycle.get('jobs')
+-    require(type(jobs) is list and len(jobs) == 2 and {j.get('label') for j in jobs} == {'normal-host', 'cli-goal'} and all(j.get('closed') is True for j in jobs), 'exact continuation cleanup set required')
+-    require(guard_cleanup.get('closed') is True and type(guard_cleanup.get('retained_handles_count')) is int and guard_cleanup['retained_handles_count'] == 0 and guard_cleanup.get('errors') == [], 'bootstrap Source guard cleanup incomplete')
+-    expected = {'Task': 1, 'Run': 0, 'BudgetLedgerEntry': 0, 'resource_effects': 0}
+-    require(type(result.get('db_counts')) is dict and set(result['db_counts']) == set(expected) and all(type(result['db_counts'][k]) is int and result['db_counts'][k] == v for k, v in expected.items()), 'staged bootstrap database count mismatch')
+-    require(type(result.get('qualification_task_id')) is str and result['qualification_task_id'] and result.get('qualification_task_status') == 'DRAFT' and type(result.get('ordinary_goal_tasks')) is int and result['ordinary_goal_tasks'] == 0, 'qualification must be the only DRAFT Task')
+-    require(initial_review.get('schema') == 'researchos.actual-cli-bootstrap-component-independent-review.v1' and initial_review.get('actor_id') == 'codex:/root/command_queue_impl' and initial_review.get('source_author') == 'codex:/root' and initial_review.get('decision') == 'PASS_COMPONENT_EVIDENCE_WITH_GOAL_BLOCKED' and initial_review.get('failed_checks') == [], 'prior actual init independent component review required')
+-    require({'ACTUAL_CLI_INIT_EXIT_ZERO', 'ACTUAL_HOST_OWNED_GUI_PICKER_AND_UNIQUE_DURABLE_BINDING', 'THREE_OWNED_JOBS_AND_DUPLICATES_CONFIRMED_CLOSED_IN_ORIGINAL_RUN', 'SOURCE_GUARD_TEN_ENTRIES_ZERO_RETAINED'} <= set(initial_review.get('verified_scope', [])), 'prior init/workspace/cleanup review scope missing')
+-    require(initial_review['project_id'] == initial_snapshot['project_id'] == result['project_id'] and initial_snapshot['actual_cli_init_exit'] == 0, 'continuation differs from actual initialized project')
+-    require(initial_snapshot['config']['workspace_ref'] == result['workspace_ref'], 'continuation workspace binding differs')
+-    for key in ('data_root', 'workspace', 'discovery_file', 'cli_config_file'):
+-        require(Path(initial_snapshot[key]) == Path(result[key]), 'continuation initial layout differs')
++    require(type(jobs) is list and {j.get('label') for j in jobs} == {'normal-host', 'cli-init', 'cli-goal'} and len(jobs) == 3 and all(j.get('closed') is True for j in jobs), 'exact bootstrap cleanup set required')
++    require(guard_cleanup.get('closed') is True and guard_cleanup.get('retained_handles_count') == 0 and guard_cleanup.get('errors') == [], 'bootstrap Source guard cleanup incomplete')
++    require(result.get('db_counts') and all(type(n) is int and n == 0 for n in result['db_counts'].values()), 'bootstrap database was not provider-free')
++    require(set(result['db_counts']) == {'Task', 'Run', 'BudgetLedgerEntry', 'resource_effects'}, 'bootstrap zero-count scope mismatch')
+     for key in ('project_id', 'goal_id', 'workspace_ref', 'workspace_witness'):
+         require(type(result.get(key)) is str and result[key], 'bootstrap identity missing')
+     data = Path(result['data_root'])
+     require(data.is_absolute() and ROOT / '.local' in data.parents and Path(result['workspace']) == data / 'workspace', 'bootstrap isolation layout')
+     for key in ('discovery_file', 'cli_config_file'):
+         require(data in Path(result[key]).parents, 'bootstrap consumed path outside data root')
+-
+-def validate_staged_preparation(seed, prepared, runtime, bootstrap, doc, binary, runtime_invocation, finalize_invocation):
+-    require(seed.get('draft_goal_id') == '', 'staged seed must precede the ordinary CLI draft')
+-    shared = ('project_id', 'qualification_goal_id', 'qualification_task_id', 'runtime_id', 'profile_artifact_id', 'profile_hash', 'model_ref', 'host_instance_id')
+-    require(all(type(prepared.get(k)) is str and prepared[k] and prepared[k] == runtime.get(k) for k in shared), 'staged preparation tuple mismatch')
+-    require(prepared['project_id'] == bootstrap['project_id'] and prepared['qualification_task_id'] == bootstrap['qualification_task_id'] and prepared.get('draft_goal_id') == bootstrap['goal_id'] and prepared['qualification_goal_id'] != bootstrap['goal_id'], 'staged preparation Goal/Task differs')
+-    require(runtime.get('qualification_task_status') == 'DRAFT', 'runtime preparation Task was admitted')
+-    for obj, fields in ((runtime, {'qualification_goals': 1, 'qualification_tasks': 1, 'ordinary_goals': 0, 'ordinary_tasks': 0, 'runs': 0}), (prepared, {'qualification_tasks': 1, 'ordinary_goal_tasks': 0, 'runs': 0})):
+-        require(all(type(obj.get(k)) is int and obj[k] == v for k, v in fields.items()), 'staged preparation business counts differ')
+-    for receipt, phase, status, ref_key, invocation in ((runtime, 'prepare-runtime', 'RUNTIME_READY', 'runtime_prepare_receipt_ref', runtime_invocation), (prepared, 'finalize-prepare', 'PREPARED', 'prepare_receipt_ref', finalize_invocation)):
+-        require(receipt.get('schema') == 'researchos.trusted-qualification-host.v1' and receipt.get('phase') == phase and receipt.get('status') == status and receipt.get('source_seed_sha256') == doc['host_seed_ref']['sha256'] and type(receipt.get('provider_requests')) is int and receipt['provider_requests'] == 0, 'actual staged receipt differs')
+-        argv = [binary['path'], '-phase', phase, '-seed', doc['host_seed_ref']['path'], '-receipt', doc[ref_key]['path']]
+-        if phase == 'finalize-prepare':
+-            argv.extend(['-draft-goal-id', bootstrap['goal_id']])
+-        require(invocation.get('argv') == argv and Path(invocation.get('cwd', '')) == ROOT, 'staged owned invocation differs')
+-        result = invocation.get('result')
+-        require(native_closed(result) and result.get('error') is None and type(result.get('actual_exit')) is int and result['actual_exit'] == 0 and result.get('timed_out') is False and invocation.get('error') is None, 'staged owned invocation did not close successfully')
+ 
+ class RootResidentCoordinator:
+     """One coordinator per parent, anchored before any native invocation."""
+@@ -162,7 +137,7 @@
+     def open(self):
+         doc = read_json(self.input_ref)
+         review = read_json(self.review_ref)
+-        require(doc.get('schema') == 'researchos.root-sdk-coordinator-input.v2' and doc.get('mode') in ('NO_PROVIDER', 'MODEL_TRIAL'), 'coordinator input schema/mode')
++        require(doc.get('schema') == 'researchos.root-sdk-coordinator-input.v1' and doc.get('mode') in ('NO_PROVIDER', 'MODEL_TRIAL'), 'coordinator input schema/mode')
+         require(review.get('schema') == 'researchos.root-sdk-coordinator-source-review.v1' and review.get('decision') == 'READY_SOURCE_ONLY' and review.get('actor_id') not in AUTHORS | {'', None}, 'independent coordinator Source review required')
+         require(review.get('formal_acceptance') is False and review.get('source_ref') == doc['coordinator_source_ref'] and review.get('fixed_pins_ref') == doc['fixed_pins_ref'], 'reviewed coordinator tuple differs')
+         require(Path(doc['coordinator_source_ref']['path']) == Path(__file__).resolve(), 'coordinator source location differs')
+@@ -170,12 +145,7 @@
+         self.fixed = read_json(doc['fixed_pins_ref'])
+         self.input = doc
+         self.bootstrap = read_json(doc['bootstrap_result_ref'])
+-        require(doc['initial_cli_init_component_review_ref'] == INITIAL_COMPONENT_REVIEW, 'actual initial component review pin differs')
+-        initial_review = read_json(doc['initial_cli_init_component_review_ref'])
+-        initial_handoff = read_json(initial_review['source_handoff_ref'])
+-        initial_snapshot = read_json(initial_handoff['partial_bootstrap_snapshot_ref'])
+-        self.bootstrap_refs = [doc[k] for k in ('bootstrap_result_ref', 'bootstrap_lifecycle_ref', 'bootstrap_guard_cleanup_ref', 'initial_cli_init_component_review_ref')] + [initial_review['source_handoff_ref'], initial_handoff['partial_bootstrap_snapshot_ref']]
+-        validate_bootstrap(self.bootstrap, read_json(doc['bootstrap_lifecycle_ref']), read_json(doc['bootstrap_guard_cleanup_ref']), initial_review, initial_snapshot)
++        validate_bootstrap(self.bootstrap, read_json(doc['bootstrap_lifecycle_ref']), read_json(doc['bootstrap_guard_cleanup_ref']))
+         self.env = closed_environment(doc['public_environment'])
+         self.output = Path(doc['output_dir'])
+         require(self.output.is_absolute() and not self.output.exists() and self.output.parent.is_dir() and ROOT / 'execution/v2.4/receipts/W05/W05-99' in self.output.parents, 'fresh owned output directory required')
+@@ -188,11 +158,11 @@
+             pinned(ref)
+         require(Path(sys.executable) == Path(self.fixed['python_binary']['path']), 'Root parent interpreter differs from fixed Python')
+         self.guard_module = load_module(self.fixed['source_guard'], pinned(self.fixed['source_guard']))
+-        refs = list(self.fixed.values()) + [self.input_ref, self.review_ref, doc['coordinator_source_ref'], doc['fixed_pins_ref']] + self.bootstrap_refs
++        refs = list(self.fixed.values()) + [self.input_ref, self.review_ref, doc['coordinator_source_ref'], doc['fixed_pins_ref'], doc['bootstrap_result_ref'], doc['bootstrap_lifecycle_ref'], doc['bootstrap_guard_cleanup_ref']]
+         self.source_guard = self._guard(refs)
+         self.input = json.loads(self.source_guard.get_buffer(self.input_ref['path']))
+         self.bootstrap = json.loads(self.source_guard.get_buffer(doc['bootstrap_result_ref']['path']))
+-        validate_bootstrap(self.bootstrap, json.loads(self.source_guard.get_buffer(doc['bootstrap_lifecycle_ref']['path'])), json.loads(self.source_guard.get_buffer(doc['bootstrap_guard_cleanup_ref']['path'])), json.loads(self.source_guard.get_buffer(doc['initial_cli_init_component_review_ref']['path'])), json.loads(self.source_guard.get_buffer(initial_handoff['partial_bootstrap_snapshot_ref']['path'])))
++        validate_bootstrap(self.bootstrap, json.loads(self.source_guard.get_buffer(doc['bootstrap_lifecycle_ref']['path'])), json.loads(self.source_guard.get_buffer(doc['bootstrap_guard_cleanup_ref']['path'])))
+         self.controller = self._module('controller')
+         self.c7_owner = self.controller.get_resident_source_owner()
+         self.hooks = self._module('hooks')
+@@ -252,9 +222,9 @@
+         # External caller authority is distinct from the independently reviewed Source.
+         auth = read_json(self.input['root_execution_authority_ref'])
+         require(auth.get('schema') == 'researchos.root-sdk-coordinator-execution-authority.v1' and auth.get('actor_id') == 'codex:/root' and auth.get('approved') is True and auth.get('mode') == 'MODEL_TRIAL' and auth.get('coordinator_source_ref') == self.input['coordinator_source_ref'] and auth.get('input_basis_sha256') == input_basis_hash(self.input) and auth.get('maximum_provider_requests') == 3 and auth.get('requested_output_tokens_total') == 8192 and auth.get('total_wall_seconds') == 300, 'exact Root execution authority required')
+-        self._guard([self.input[k] for k in ('root_execution_authority_ref', 'host_seed_ref', 'intake_review_ref', 'public_route_manifest_ref', 'runtime_prepare_receipt_ref', 'prepare_receipt_ref', 'runtime_prepare_invocation_ref', 'finalize_prepare_invocation_ref')])
++        self._guard([self.input['root_execution_authority_ref'], self.input['host_seed_ref'], self.input['intake_review_ref'], self.input['public_route_manifest_ref']])
+         seed = read_json(self.input['host_seed_ref'])
+-        pairs = {'project_id': 'project_id', 'workspace_ref': 'workspace_ref', 'workspace_dir': 'workspace', 'data_root': 'data_root', 'discovery_file': 'discovery_file', 'cli_config_file': 'cli_config_file'}
++        pairs = {'project_id': 'project_id', 'draft_goal_id': 'goal_id', 'workspace_ref': 'workspace_ref', 'workspace_dir': 'workspace', 'data_root': 'data_root', 'discovery_file': 'discovery_file', 'cli_config_file': 'cli_config_file'}
+         path_keys = {'workspace_dir', 'data_root', 'discovery_file', 'cli_config_file'}
+         require(all((Path(seed[k]) == Path(self.bootstrap[v])) if k in path_keys else (type(seed[k]) is type(self.bootstrap[v]) and seed[k] == self.bootstrap[v]) for k, v in pairs.items()), 'Host seed is not the consumed bootstrap')
+         require(Path(seed['repo_root']) == ROOT and seed['witness_sha256'] == self.bootstrap['workspace_witness_ref']['sha256'] and type(seed['witness_bytes']) is int and seed['witness_bytes'] == self.bootstrap['workspace_witness_ref']['bytes'], 'Host seed workspace evidence differs')
+@@ -269,10 +239,11 @@
+         require(once_dir.is_dir() and not once_dir.is_symlink() and not once_dir.is_junction() and once_dir.resolve() == once_dir, 'canonical isolated once directory required')
+         once_path = once_dir / (self.run_uuid + '.json')
+         require(once_path.parent == once_dir and not once_path.exists() and not once_path.is_symlink(), 'Root once file already consumed or foreign')
+-        self.state = 'PREPARATION_CONSUMPTION_ATTEMPTED'
+-        self.prepared = read_json(self.input['prepare_receipt_ref'])
+-        runtime = read_json(self.input['runtime_prepare_receipt_ref'])
+-        validate_staged_preparation(seed, self.prepared, runtime, self.bootstrap, self.input, self.fixed['trusted_host_binary'], read_json(self.input['runtime_prepare_invocation_ref']), read_json(self.input['finalize_prepare_invocation_ref']))
++        self.state = 'PREPARE_ATTEMPTED'
++        receipt = self.output / 'host.prepare.json'
++        self._host_phase('prepare', receipt, time.monotonic()+90)
++        self.prepared = read_json(pin(receipt))
++        require(self.prepared.get('status') == 'PREPARED' and self.prepared.get('provider_requests') == 0 and self.prepared['project_id'] == self.bootstrap['project_id'], 'Host preparation result mismatch')
+         # Export the exact sealed uploaded_content bytes. A profile template is insufficient.
+         with self._read_db() as db:
+             rows = db.execute("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?", (self.bootstrap['project_id'], self.prepared['profile_artifact_id'])).fetchall()
+@@ -288,31 +259,8 @@
+         with profile.open('xb') as target:
+             target.write(raw)
+         self.profile_ref = pin(profile)
+-        self._guard([self.profile_ref])
+-        self._verify_prepared_database()
++        self._guard([self.profile_ref, pin(receipt)])
+         self.state = 'PREPARED'
+-
+-    def _verify_prepared_database(self):
+-        project = self.bootstrap['project_id']
+-        with self._read_db() as db:
+-            counts = {}
+-            for kind in ('Task', 'Run', 'BudgetLedgerEntry'):
+-                counts[kind] = db.execute('SELECT count(*) FROM domain_objects WHERE project=? AND kind=?', (project, kind)).fetchone()[0]
+-            counts['resource_effects'] = db.execute('SELECT count(*) FROM resource_effects WHERE project=?', (project,)).fetchone()[0]
+-            expected = {'Task': 1, 'Run': 0, 'BudgetLedgerEntry': 0, 'resource_effects': 0}
+-            require(all(type(counts[k]) is int and counts[k] == v for k, v in expected.items()), 'current staged database counts changed')
+-            task = self.engine.object_by_id(db, 'Task', self.prepared['qualification_task_id'], project)
+-            require(task['id'] == self.prepared['qualification_task_id'] and task['project_id'] == project and task['goal_id'] == self.prepared['qualification_goal_id'] and task['status'] == 'DRAFT' and task['task_type'] == 'runtime_qualification' and task.get('active_run_id') is None, 'current qualification Task is not the unique unadmitted DRAFT')
+-            goal = self.engine.object_by_id(db, 'Goal', self.bootstrap['goal_id'], project)
+-            require(goal['id'] == self.bootstrap['goal_id'] and goal['project_id'] == project and goal['status'] == 'DRAFT' and goal['id'] != task['goal_id'], 'ordinary Goal is not the actual independent DRAFT')
+-            ordinary = db.execute("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.goal_id')=?", (project, goal['id'])).fetchone()[0]
+-            require(type(ordinary) is int and ordinary == 0, 'ordinary Goal already has a Task')
+-            runtime = self.engine.object_by_id(db, 'RuntimeRegistration', self.prepared['runtime_id'], project)
+-            actual_ref = self.engine.exact_artifact_ref(db, project, self.prepared['profile_artifact_id'])
+-            bindings = db.execute('SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?', (project, self.prepared['runtime_id'])).fetchall()
+-        require(runtime['id'] == self.prepared['runtime_id'] and runtime['project_id'] == project and actual_ref == self.profile_entity_ref and actual_ref['content_hash'] == self.prepared['profile_hash'], 'prepared runtime or sealed profile changed')
+-        technical = self.engine.go_hash([runtime[k] for k in ('adapter', 'adapter_revision', 'capabilities', 'platform', 'measurement_mode', 'credential_ref')])
+-        require(len(bindings) == 1 and json.loads(bindings[0][0]) == actual_ref and bindings[0][1] == self.engine.go_hash(actual_ref) and bindings[0][2] == technical, 'prepared formal runtime binding changed')
+ 
+     def _wait_receipt(self, path):
+         while time.monotonic() < self.deadline:

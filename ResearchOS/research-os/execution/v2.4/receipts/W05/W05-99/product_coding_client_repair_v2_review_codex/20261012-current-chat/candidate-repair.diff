@@ -1,0 +1,936 @@
+diff --git a/apps/desktop/main/lib/desktop-management.js b/apps/desktop/main/lib/desktop-management.js
+index eb0b7794..6a50d747 100644
+--- a/apps/desktop/main/lib/desktop-management.js
++++ b/apps/desktop/main/lib/desktop-management.js
+@@ -22,6 +22,17 @@ function canonical(value) {
+   if (object(value)) return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+   return value;
+ }
++function frozenCopy(value) {
++  const copy = structuredClone(value);
++  const freeze = item => {
++    if (item && typeof item === 'object') {
++      for (const child of Object.values(item)) freeze(child);
++      Object.freeze(item);
++    }
++    return item;
++  };
++  return freeze(copy);
++}
+ function sameValue(a, b) { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); }
+ function keys(value, required, optional = []) {
+   if (!object(value)) throw failure('PRIVATE_FRAME_INVALID');
+@@ -181,7 +192,8 @@ class DesktopManagement {
+     this.spawn = options.spawn || childProcess.spawn;
+     this.state = 'NOT_STARTED';
+     this.child = null; this.hostId = null; this.identity = null;
+-    this.parentIdentity = null; this.pending = null; this.intent = null; this.codingIntent = null;
++    this.parentIdentity = null; this.pending = null; this.consentPending = false;
++    this.intent = null; this.codingIntent = null;
+     this.retiredIntents = []; this.retiredCodingIntents = [];
+     this.buffer = Buffer.alloc(0); this.ready = null; this.failure = null;
+     this.exitPromise = null; this.resolveExit = null; this.shutdownAccepted = false; this.childExited = true;
+@@ -192,7 +204,11 @@ class DesktopManagement {
+     const base = this.summary();
+     if (!intent) return { available: base.available, state: base.state, reason: base.reason || null };
+     const selected = this.sameSelection(intent.projectId, intent.sessionId);
+-    return { available: base.available && selected, state: !selected ? 'CONTEXT_CHANGED_PENDING' :
++    const sameGeneration = this.sameCodingGeneration(intent);
++    if (!intent.requestId) return { available: false, state: 'CODING_PREPARE_UNRESOLVED',
++      reason: base.reason || 'CODING_ORIGINAL_PREPARE_UNRESOLVED' };
++    return { available: base.available && selected && sameGeneration,
++      state: !selected || !sameGeneration ? 'CONTEXT_CHANGED_PENDING' :
+       !base.available ? base.state : intent.state,
+       reason: base.reason || null,
+       expires_at: intent.expiresAt, consumed: intent.confirmSent,
+@@ -210,12 +226,20 @@ class DesktopManagement {
+         build_hash: check.build_hash, vendor_hash: check.vendor_hash })), model_calls: 0,
+       normal_max_model_calls: 8, qualification_model_calls: 1, qualification_tool_calls: 0,
+       model_config_ref: intent.newModelRef || null, runtime_status: intent.runtimeStatus || null,
+-      profile_ref: intent.profileRef || null, config_revision: intent.configRevision || null };
++      profile_ref: intent.profileRef || null, config_revision: intent.configRevision || null,
++      commit_key: intent.state === 'CODING_CONFIGURED' ? intent.commitKey : null };
+   }
+   sameSelection(projectId, sessionId) {
+     try { const context = JSON.parse(this.options.context()); return context[0] === projectId && context[1] === sessionId; }
+     catch { return false; }
+   }
++  sameCodingGeneration(intent) {
++    try {
++      const before = JSON.parse(intent.context), now = JSON.parse(this.options.context());
++      return Array.isArray(before) && Array.isArray(now) &&
++        before[0] === now[0] && before[1] === now[1] && before[6] === now[6];
++    } catch { return false; }
++  }
+   summary() {
+     const intent = this.intent;
+     let hostFailure = null;
+@@ -224,11 +248,11 @@ class DesktopManagement {
+       catch (error) { hostFailure = error.code || 'HOST_IDENTITY_UNAVAILABLE'; }
+     }
+     if (hostFailure && intent) intent.needsRecheck = true;
+-    const available = this.state === 'READY' && !hostFailure && !this.pending;
++    const available = this.state === 'READY' && !hostFailure && !this.pending && !this.consentPending;
+     const pendingState = this.pending?.timedOut ? 'PRIVATE_COMMAND_UNCERTAIN' :
+-      this.pending ? 'PRIVATE_COMMAND_PENDING' : null;
++      this.pending ? 'PRIVATE_COMMAND_PENDING' : this.consentPending ? 'PRIVILEGED_CONFIRM_PENDING' : null;
+     const reason = hostFailure || (this.pending?.timedOut ? 'MANAGEMENT_REPLY_UNCERTAIN' :
+-      this.pending ? 'MANAGEMENT_COMMAND_PENDING' : this.failure);
++      this.pending ? 'MANAGEMENT_COMMAND_PENDING' : this.consentPending ? 'PRIVILEGED_CONFIRM_PENDING' : this.failure);
+     const previous = this.retiredIntents.at(-1);
+     const history = previous ? { previous_request_id: previous.requestId,
+       previous_expires_at: previous.expiresAt, previous_retired_at: previous.retiredAt } : {};
+@@ -249,7 +273,7 @@ class DesktopManagement {
+       ...history };
+   }
+   canRetireExpiredIntent(intent) {
+-    return !!intent?.validated && !intent.confirmSent && !this.pending &&
++    return !!intent?.validated && !intent.confirmSent && !this.pending && !this.consentPending &&
+       ['AWAITING_CONFIRMATION', 'EXPIRED'].includes(intent.state) &&
+       Number.isFinite(Date.parse(intent.expiresAt)) && Date.parse(intent.expiresAt) <= Date.now();
+   }
+@@ -267,6 +291,10 @@ class DesktopManagement {
+     try { return this.options.context() === expected; }
+     catch { return false; }
+   }
++  commandIdle() {
++    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
++    if (this.consentPending) throw failure('PRIVILEGED_CONFIRM_PENDING');
++  }
+   currentHost() {
+     if (!this.child || !this.identity || this.state !== 'READY') throw failure('MANAGEMENT_LINK_UNAVAILABLE');
+     const actual = this.observe(this.child.pid);
+@@ -394,9 +422,9 @@ class DesktopManagement {
+       return this.summary();
+     }
+   }
+-  async exchange(operation, scope, timeoutMs) {
++  async exchange(operation, scope, timeoutMs, postflight = true) {
+     this.currentHost();
+-    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
++    this.commandIdle();
+     const messageId = crypto.randomUUID();
+     const request = { protocol: PROTOCOL, message_id: messageId, operation, host_id: this.hostId, ...scope };
+     const bytes = Buffer.from(JSON.stringify(request) + '\n');
+@@ -411,9 +439,10 @@ class DesktopManagement {
+       }, timeoutMs);
+       try { this.child.stdin.write(bytes, error => { if (error) this.broken('MANAGEMENT_PIPE_ERROR'); }); }
+       catch { this.broken('MANAGEMENT_PIPE_ERROR'); }
+-    }).then(reply => { if (operation !== 'SHUTDOWN') this.currentHost(); return reply; });
++    }).then(reply => { if (postflight && operation !== 'SHUTDOWN') this.currentHost(); return reply; });
+   }
+   async prepare(scope, context) {
++    this.commandIdle();
+     if (this.codingIntent && this.codingIntent.state !== 'CODING_CONFIGURED') throw failure('CODING_INTENT_PENDING');
+     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+     const { projectId, sessionId, modelRef, model } = scope;
+@@ -442,6 +471,7 @@ class DesktopManagement {
+     return this.summary();
+   }
+   async confirm() {
++    this.commandIdle();
+     const intent = this.intent;
+     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CONFIRMATION') throw failure('CONFIRM_NOT_AVAILABLE');
+     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+@@ -458,6 +488,7 @@ class DesktopManagement {
+     } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
+   }
+   async status() {
++    this.commandIdle();
+     const intent = this.intent;
+     if (!intent) throw failure('STATUS_ORIGINAL_REQUEST_REQUIRED');
+     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+@@ -473,12 +504,14 @@ class DesktopManagement {
+     if (value.consumed) intent.confirmSent = true;
+     return this.summary();
+   }
+-  async prepareCoding(scope, context) {
++  async prepareCoding(scope, context, review) {
++    this.commandIdle();
+     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+     if (this.codingIntent) {
+       const old = this.codingIntent;
+-      if (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
+-          Date.parse(old.expiresAt) > Date.now()) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
++      if (old.state !== 'CODING_CONFIGURED' &&
++          (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
++            Date.parse(old.expiresAt) > Date.now())) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
+       this.currentHost();
+       this.retiredCodingIntents.push(Object.freeze({ ...old, retiredAt: new Date().toISOString() }));
+       this.codingIntent = null;
+@@ -489,12 +522,21 @@ class DesktopManagement {
+         !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
+         throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
+     }
+-    const { projectId, sessionId, modelRef, coding } = scope;
++    const { projectId, sessionId, modelRef, model, coding } = scope;
+     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)) || !object(coding))
+       throw failure('CODING_SCOPE_INVALID');
++    // Retain the original operation before sending. A changed UI selection or
++    // a missing reply cannot make another PREPARE appear safe.
++    const originHost = this.currentHost();
++    const operation = { state: 'PREPARE_UNRESOLVED', context, projectId, sessionId, modelRef,
++      model: model ? frozenCopy(model) : null,
++      scope: frozenCopy(coding), review: review ? frozenCopy(review) : null,
++      hostId: this.hostId, dataRoot: originHost.data_dir,
++      controlIdentity: structuredClone(this.identity), parentIdentity: structuredClone(this.parentIdentity),
++      confirmSent: false };
++    this.codingIntent = operation;
+     const reply = await this.exchange('PREPARE_CODING', { project_id: projectId, session_id: sessionId,
+-      model_config_ref: modelRef, coding }, 45000);
+-    if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
++      model_config_ref: modelRef, coding }, 45000, false);
+     if (reply.kind !== 'RESULT') throw failure('CODING_PREPARE_REJECTED');
+     const value = reply.result;
+     if (!object(value) || value.state !== 'AWAITING_CODING_CONFIRMATION' ||
+@@ -518,19 +560,30 @@ class DesktopManagement {
+     const expires = Date.parse(value.expires_at);
+     if (!Number.isFinite(expires) || expires <= Date.now() || expires - Date.now() > 60000)
+       throw failure('CODING_PREPARE_EXPIRED');
+-    this.codingIntent = { state: value.state, context, projectId, sessionId, modelRef,
+-      requestId: value.request_id, requestHash: value.request_hash, expiresAt: value.expires_at,
+-      scope: value.scope, frozenChecks: value.frozen_checks, confirmSent: false };
++    Object.assign(operation, { state: value.state, requestId: value.request_id,
++      requestHash: value.request_hash, expiresAt: value.expires_at,
++      scope: frozenCopy(value.scope), frozenChecks: frozenCopy(value.frozen_checks) });
++    this.currentHost();
+     return this.codingSummary();
+   }
+-  async confirmCoding() {
++  async confirmCoding(askConsent, recheckScope) {
+     const intent = this.codingIntent;
+     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CODING_CONFIRMATION')
+       throw failure('CODING_CONFIRM_NOT_AVAILABLE');
++    this.commandIdle();
+     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+     if (Date.parse(intent.expiresAt) <= Date.now()) { intent.state = 'EXPIRED'; throw failure('CODING_CONFIRM_EXPIRED'); }
+     this.currentHost();
+-    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
++    if (typeof askConsent !== 'function' || typeof recheckScope !== 'function' || !intent.review)
++      throw failure('PRIVILEGED_CONFIRM_UNAVAILABLE');
++    this.consentPending = true;
++    try {
++      await this.recheckCodingConsent(intent, recheckScope);
++      const accepted = await askConsent(this.codingReview(intent));
++      if (accepted !== true) throw failure('PRIVILEGED_CONFIRM_CANCELLED');
++      await this.recheckCodingConsent(intent, recheckScope);
++    } finally { this.consentPending = false; }
++    // No await between the final guard and the consumed write.
+     intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
+     try {
+       const reply = await this.exchange('CONFIRM_CODING', { project_id: intent.projectId,
+@@ -541,6 +594,37 @@ class DesktopManagement {
+       return this.codingSummary();
+     } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
+   }
++  codingReview(intent) {
++    if (!intent.review?.workspace?.display_name || !intent.review.workspace.display_path)
++      throw failure('CODING_WORKSPACE_DESCRIPTION_UNAVAILABLE');
++    return frozenCopy({ host_id: intent.hostId, data_root: intent.dataRoot,
++      control_process: intent.controlIdentity, parent_process: intent.parentIdentity,
++      project_id: intent.projectId,
++      session_id: intent.sessionId, current_model_ref: intent.modelRef,
++      workspace: intent.review.workspace, scope: intent.scope,
++      frozen_checks: intent.frozenChecks, expires_at: intent.expiresAt });
++  }
++  async recheckCodingConsent(intent, recheckScope) {
++    if (this.codingIntent !== intent || this.pending || !this.consentPending ||
++        !this.sameContext(intent.context)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++    const current = this.currentHost();
++    if (this.hostId !== intent.hostId || current.data_dir !== intent.dataRoot ||
++        !sameIdentity(this.identity, intent.controlIdentity) ||
++        !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
++        !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++    const refreshed = await recheckScope();
++    if (this.codingIntent !== intent || this.pending || !this.consentPending ||
++        !this.sameContext(intent.context) ||
++        refreshed?.context !== intent.context ||
++        !sameValue(refreshed?.scope, { projectId: intent.projectId, sessionId: intent.sessionId,
++          modelRef: intent.modelRef, model: intent.model, coding: intent.scope }) ||
++        !sameValue(refreshed?.review, intent.review)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++    const after = this.currentHost();
++    if (this.hostId !== intent.hostId || after.data_dir !== intent.dataRoot ||
++        !sameIdentity(this.identity, intent.controlIdentity) ||
++        !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
++        !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++  }
+   acceptCodingResult(intent, value) {
+     if (!object(value) || value.state !== 'CODING_CONFIGURED' || value.request_id !== intent.requestId ||
+         value.request_hash !== intent.requestHash || value.project_id !== intent.projectId ||
+@@ -556,6 +640,8 @@ class DesktopManagement {
+     intent.state = value.state; intent.newModelRef = value.model_config_ref;
+     intent.runtimeStatus = value.runtime_status; intent.profileRef = value.profile_ref;
+     intent.configRevision = value.config_revision;
++    intent.commitKey = digest(Buffer.from(JSON.stringify([intent.hostId, intent.projectId,
++      intent.sessionId, intent.requestId, value.model_config_ref, value.revision, value.config_revision])));
+   }
+   retireQualificationAfterCodingCommit() {
+     if (this.intent?.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state)) {
+@@ -565,8 +651,10 @@ class DesktopManagement {
+     }
+   }
+   async statusCoding() {
++    this.commandIdle();
+     const intent = this.codingIntent;
+     if (!intent) throw failure('CODING_ORIGINAL_REQUEST_REQUIRED');
++    if (!intent.requestId) throw failure('CODING_PREPARE_ORIGINAL_UNRESOLVED');
+     if (!this.sameSelection(intent.projectId, intent.sessionId)) throw failure('CONTEXT_CHANGED');
+     const reply = await this.exchange('STATUS_CODING', { project_id: intent.projectId,
+       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
+diff --git a/apps/desktop/main/lib/ipc.js b/apps/desktop/main/lib/ipc.js
+index b8968f2d..f0190af8 100644
+--- a/apps/desktop/main/lib/ipc.js
++++ b/apps/desktop/main/lib/ipc.js
+@@ -281,10 +281,15 @@ function registerDesktopCoding(ipcMain, deps) {
+   ipcMain.handle('ros:desktop:coding:pickToolchain', guarded(event => deps.pickCodingDirectory('toolchain', event)));
+   ipcMain.handle('ros:desktop:coding:pickVendor', guarded(event => deps.pickCodingDirectory('vendor', event)));
+   ipcMain.handle('ros:desktop:coding:prepare', guarded(async (_event, body) => {
++    deps.desktopManagement.commandIdle();
+     const scoped = await deps.prepareCodingScope(body);
+-    return deps.desktopManagement.prepareCoding(scoped.scope, scoped.context);
++    return deps.desktopManagement.prepareCoding(scoped.scope, scoped.context, scoped.review);
+   }));
+-  ipcMain.handle('ros:desktop:coding:confirm', guarded(() => deps.desktopManagement.confirmCoding()));
++  ipcMain.handle('ros:desktop:coding:confirm', guarded(event =>
++    deps.desktopManagement.confirmCoding(
++      typeof deps.privilegedCodingConsent === 'function'
++        ? frozen => deps.privilegedCodingConsent(event, frozen) : null,
++      deps.recheckCodingScope)));
+   ipcMain.handle('ros:desktop:coding:status', guarded(() => deps.desktopManagement.statusCoding()));
+ }
+ 
+diff --git a/apps/desktop/main/main.js b/apps/desktop/main/main.js
+index cac0515d..a0833160 100644
+--- a/apps/desktop/main/main.js
++++ b/apps/desktop/main/main.js
+@@ -226,20 +226,23 @@ async function prepareQualificationScope() {
+     model: { provider_id: model.provider_id, model_id: model.model_id } } };
+ }
+ 
+-const codingDirectories = { context: null, toolchain: null, vendor: null };
++const codingDirectories = { context: null, toolchain: null, vendor: null, generation: 0 };
+ async function pickCodingDirectory(kind, event) {
++  desktopManagement.commandIdle();
+   if (!sessionState.projectId || !sessionState.sessionId) throw Object.assign(new Error('SESSION_NOT_SELECTED'), { code: 'SESSION_NOT_SELECTED' });
+   const selected = qualificationContext();
+   const win = BrowserWindow.fromWebContents(event.sender);
+   const picked = await dialog.showOpenDialog(win, { properties: ['openDirectory'],
+     title: kind === 'toolchain' ? '选择已安装的 Go 工具链目录' : '选择离线 vendor 目录' });
+   if (picked.canceled || picked.filePaths.length !== 1) return { cancelled: true };
++  desktopManagement.commandIdle();
+   if (qualificationContext() !== selected) throw Object.assign(new Error('CONTEXT_CHANGED'), { code: 'CONTEXT_CHANGED' });
+   const directory = path.resolve(picked.filePaths[0]);
+   if (codingDirectories.context !== selected) {
+     codingDirectories.context = selected; codingDirectories.toolchain = null; codingDirectories.vendor = null;
+   }
+   codingDirectories[kind] = directory;
++  codingDirectories.generation++;
+   return { selected: true, name: path.basename(directory) };
+ }
+ async function prepareCodingScope(input) {
+@@ -264,7 +267,66 @@ async function prepareCodingScope(input) {
+   if (![coding.expected_revision, coding.writer_epoch, coding.config_revision].every(Number.isSafeInteger) ||
+       !coding.workspace_ref || coding.config_revision < 1)
+     throw Object.assign(new Error('CODING_AUTHORITY_INVALID'), { code: 'CODING_AUTHORITY_INVALID' });
+-  return { context: scoped.context, scope: { ...scoped.scope, coding } };
++  const workspace = scoped.hostStatus.workspaces?.find(item =>
++    item.authorized_workspace_ref === coding.workspace_ref && item.project_id === scoped.scope.projectId &&
++    item.status === 'ACTIVE');
++  if (!workspace || typeof workspace.display_name !== 'string' || !workspace.display_name.trim() ||
++      typeof workspace.display_path !== 'string' || !workspace.display_path.trim() ||
++      !Number.isSafeInteger(workspace.revision))
++    throw Object.assign(new Error('CODING_WORKSPACE_DESCRIPTION_UNAVAILABLE'),
++      { code: 'CODING_WORKSPACE_DESCRIPTION_UNAVAILABLE' });
++  return { context: scoped.context, scope: { ...scoped.scope, coding },
++    review: { resource_generation: codingDirectories.generation,
++      workspace: { authorized_workspace_ref: workspace.authorized_workspace_ref,
++      display_name: workspace.display_name, display_path: workspace.display_path,
++      project_id: workspace.project_id, revision: workspace.revision,
++      access: workspace.access, status: workspace.status } } };
++}
++
++function originalCodingInput() {
++  const coding = desktopManagement.codingIntent?.scope;
++  if (!coding) throw Object.assign(new Error('CODING_ORIGINAL_REQUEST_REQUIRED'),
++    { code: 'CODING_ORIGINAL_REQUEST_REQUIRED' });
++  return { read_paths: coding.read_paths, write_paths: coding.write_paths,
++    max_read_bytes: coding.max_read_bytes, max_write_bytes: coding.max_write_bytes,
++    max_tool_calls: coding.max_tool_calls, max_output_tokens: coding.max_output_tokens,
++    checks: coding.checks.map(({ toolchain_root, vendor_root, ...check }) => check) };
++}
++
++async function privilegedCodingConsent(event, frozen) {
++  const win = BrowserWindow.fromWebContents(event?.sender);
++  if (!win || win.isDestroyed() || typeof dialog.showMessageBox !== 'function')
++    throw Object.assign(new Error('PRIVILEGED_CONFIRM_UNAVAILABLE'), { code: 'PRIVILEGED_CONFIRM_UNAVAILABLE' });
++  const lines = [
++    `主机：${frozen.host_id}`,
++    `主机数据目录：${frozen.data_root}`,
++    `控制进程 PID ${frozen.control_process.PID}；桌面进程 PID ${frozen.parent_process.PID}`,
++    `项目：${frozen.project_id}；会话：${frozen.session_id}；当前模型：${frozen.current_model_ref}`,
++    `工作区：${frozen.workspace.display_name}`,
++    `路径：${frozen.workspace.display_path}`,
++    `工作区引用：${frozen.workspace.authorized_workspace_ref}；修订：${frozen.workspace.revision}；权限：${frozen.workspace.access}`,
++    `可读：${frozen.scope.read_paths.join('、')}`,
++    `可写：${frozen.scope.write_paths.join('、')}`,
++    `单文件读取 ${frozen.scope.max_read_bytes} 字节；单文件写入 ${frozen.scope.max_write_bytes} 字节；工具调用上限 ${frozen.scope.max_tool_calls}；模型输出上限 ${frozen.scope.max_output_tokens} token`,
++    `写入者 epoch ${frozen.scope.writer_epoch}；会话修订 ${frozen.scope.expected_revision}；配置修订 ${frozen.scope.config_revision}；客户端 ${frozen.scope.client_id}`,
++    '普通模型调用上限 8 次；资格验证上限 1 次模型调用、0 次工具调用；当前模型调用 0 次',
++    ...frozen.scope.checks.flatMap(check => [
++      `检查 ${check.id}：${check.package}，${check.test_pattern}；源文件 ${check.source_paths.join('、')}`,
++      `超时 ${check.timeout_seconds} 秒；进程 ${check.process_limit}；内存 ${check.memory_mib} MiB；文本 ${check.max_text_bytes} 字节`,
++      `Go 工具链：${check.toolchain_root}；离线 vendor：${check.vendor_root || '无'}`,
++    ]),
++    ...frozen.frozen_checks.map(check =>
++      `冻结 ${check.id}：源文件 ${check.source_count} 个/${check.source_bytes} 字节；源清单 ${check.source_manifest_hash}；Go ${check.toolchain_hash}；构建 ${check.build_hash}；vendor ${check.vendor_hash || '无'}`),
++    `有效期至：${frozen.expires_at}`,
++    '确认只保存编码配置；不会调用模型或执行检查。',
++  ];
++  const answer = await dialog.showMessageBox(win, { type: 'question',
++    title: '确认冻结的工作区编码配置', message: '确认保存以下冻结范围？',
++    detail: lines.join('\n'), buttons: ['确认保存', '取消'], defaultId: 1, cancelId: 1,
++    noLink: true, normalizeAccessKeys: true });
++  if (win.isDestroyed() || BrowserWindow.fromWebContents(event.sender) !== win)
++    throw Object.assign(new Error('PRIVILEGED_CONFIRM_UNAVAILABLE'), { code: 'PRIVILEGED_CONFIRM_UNAVAILABLE' });
++  return answer?.response === 0;
+ }
+ 
+ // The directory picker answers from the native dialog, so the first-run path never sends the user to a
+@@ -287,6 +349,8 @@ async function boot() {
+   });
+   ipc.registerDesktopCoding(ipcMain, {
+     desktopManagement, prepareCodingScope, pickCodingDirectory,
++    privilegedCodingConsent,
++    recheckCodingScope: () => prepareCodingScope(originalCodingInput()),
+     codingSenderAllowed: event => {
+       const url = event?.sender?.getURL?.() || '';
+       return url === APP_ORIGIN + '/' || url.startsWith(APP_ORIGIN + '/');
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index 74dce308..deb28ba4 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -12,6 +12,9 @@ const sameConfiguration = (value, request) => !!value?.model_config_ref &&
+ // only the public payload and terminal result across route unmounts.
+ const modelConfigurationPending = new Map()
+ const modelConfigurationListeners = new Map()
++// A committed private result can arrive through CONFIRM or original STATUS.
++// Successful V2 adoption survives a component remount; failed reads remain retryable.
++const codingReconciliations = new Map()
+ const modelPending = projectId => modelConfigurationPending.get(projectId) || null
+ function updateModelPending(projectId, value) {
+   if (value) modelConfigurationPending.set(projectId, value)
+@@ -279,6 +282,20 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+   }, [projectId, sessionId])
+   if (!window.researchos?.desktop?.codingCurrent) return null
+   const lines = value => value.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
++  async function reconcile(reply, generation) {
++    if (reply.state !== 'CODING_CONFIGURED' || !reply.available ||
++        !reply.commit_key || !reply.model_config_ref || !onConfigured) return
++    const key = reply.commit_key
++    const existing = codingReconciliations.get(key)
++    if (existing) { await existing; return }
++    const work = (async () => {
++      if (generation !== lifetime.current) throw new Error('编码配置会话已切换，请复核原请求')
++      await onConfigured(reply)
++    })()
++    codingReconciliations.set(key, work)
++    try { await work }
++    catch (cause) { if (codingReconciliations.get(key) === work) codingReconciliations.delete(key); throw cause }
++  }
+   async function action(label, method, body) {
+     if (busy) return
+     const generation = lifetime.current
+@@ -288,9 +305,9 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+       if (generation !== lifetime.current) return
+       if (!reply?.ok) throw new Error(reply?.reason || '编码授权操作失败')
+       setState(reply)
+-      if (method === 'codingConfirm' && reply.state === 'CODING_CONFIGURED') {
++      if (reply.state === 'CODING_CONFIGURED') {
++        await reconcile(reply, generation)
+         setNotice('编码配置已保存；运行时仍是 REGISTERED，模型资格与代码检查均尚未执行。')
+-        await onConfigured?.()
+       } else setNotice(method === 'codingPrepare' ? '冻结完成；配置尚未写入，也未调用模型。请核对摘要后明确确认。' :
+         method === 'codingStatus' ? '已复核原请求；复核不会重试确认。' : '')
+     } catch (cause) {
+@@ -354,9 +371,8 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+     <div className="button-row"><button disabled={!!busy || !state?.available || !sessionId || !toolchain ||
+       (!!state?.scope && !(state?.state === 'EXPIRED' && !state?.consumed))}
+       onClick={() => action('准备', 'codingPrepare', intent())}>准备并冻结</button>
+-      <button className="primary" disabled={!!busy || !state?.available || !prepared} onClick={() => {
+-        if (window.confirm('确认写入上述冻结的编码配置？此操作不会调用模型或执行检查，确认请求只能使用一次。')) action('确认', 'codingConfirm')
+-      }}>明确确认配置</button>
++      <button className="primary" disabled={!!busy || !state?.available || !prepared}
++        onClick={() => action('确认', 'codingConfirm')}>明确确认配置</button>
+       <button disabled={!!busy || !state?.available || !state?.scope} onClick={() => action('复核', 'codingStatus')}>复核原请求</button></div>
+     {busy && <p role="status">{busy}中…</p>}{notice && <p role="status">{notice}</p>}<Failure error={error}/>
+   </Panel>
+@@ -389,6 +405,29 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
+     if (active(generation)) adopt(value)
+     return value
+   }
++  async function reconcileCodingCommit(commit) {
++    const generation = current.current.generation
++    const originalSession = current.current.snapshot?.session_id
++    if (!originalSession || commit.runtime_status !== 'REGISTERED') throw new Error('原会话不可用，请复核编码配置')
++    const before = await window.researchos.desktop.context()
++    if (!active(generation) || before.project_id !== projectId || before.session_id !== originalSession)
++      throw new Error('编码配置会话已切换，请复核原请求')
++    const host = unwrap(await window.researchos.v2['host.status']({}))
++    const snapshot = unwrap(await window.researchos.v2['session.get']({}))
++    const after = await window.researchos.desktop.context()
++    const currentCoding = await window.researchos.desktop.codingCurrent()
++    if (!active(generation) || current.current.snapshot?.session_id !== originalSession ||
++        after.project_id !== projectId || after.session_id !== originalSession ||
++        snapshot.project_id !== projectId || snapshot.session_id !== originalSession ||
++        !currentCoding?.ok || !currentCoding.available || currentCoding.commit_key !== commit.commit_key ||
++        !host.model_configurations?.some(item => item.model_config_ref === commit.model_config_ref &&
++          item.config_revision === commit.config_revision))
++      throw new Error('编码配置已保存，但原会话读取尚未核对；请复核原请求')
++    setState(old => ({ ...old, host, snapshot, error: null }))
++    current.current.snapshot = snapshot
++    setModel(commit.model_config_ref)
++    setNotice(`编码配置已保存（修订 ${commit.config_revision}）；运行时资格仍待验证。`)
++  }
+   async function load() {
+     const generation = ++current.current.generation
+     current.current.projectId = projectId
+@@ -487,7 +526,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
+     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
+     <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
+     <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
+-      sessionId={state.snapshot?.session_id || null} onConfigured={load}/>
++      sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
+     <div className="session-layout">
+       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
+         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
+diff --git a/tests/ui/continuity/coding_authorization_driver.mjs b/tests/ui/continuity/coding_authorization_driver.mjs
+index 20b3ef0a..82a02cec 100644
+--- a/tests/ui/continuity/coding_authorization_driver.mjs
++++ b/tests/ui/continuity/coding_authorization_driver.mjs
+@@ -26,7 +26,9 @@ const frozen = { ok: true, available: true, state: 'AWAITING_CODING_CONFIRMATION
+       vendor_selected: false, timeout_seconds: 90, process_limit: 32, memory_mib: 1024,
+       max_text_bytes: 4096 }] },
+   frozen_checks: [{ id: 'go-check' }] }
+-let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0
++let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0, refreshAttempts = 0
++const statusRecovery = process.env.ROS_STATUS_RECOVERY === '1'
++const refreshFailOnce = process.env.ROS_REFRESH_FAIL_ONCE === '1'
+ let server, browser, page
+ try {
+   fs.writeFileSync(html, `<div id="root"></div><script type="module" src="/${path.basename(entry)}"></script>`, 'utf8')
+@@ -49,7 +51,11 @@ try {
+   browser = await chromium.launch({ headless: true })
+   page = await browser.newPage(); page.setDefaultTimeout(12000)
+   const errors = []; page.on('pageerror', error => errors.push(error.message))
+-  await page.exposeFunction('codingRefresh', () => { refreshes++ })
++  await page.exposeFunction('codingRefresh', () => {
++    refreshAttempts++
++    if (refreshFailOnce && refreshAttempts === 1) throw new Error('V2_READ_FAILED')
++    refreshes++
++  })
+   await page.exposeFunction('codingBridge', async (method, args) => {
+     record.push({ method, args })
+     if (method === 'codingCurrent') return state
+@@ -57,7 +63,9 @@ try {
+     if (method === 'codingPickVendor') return { ok: true, selected: true, name: 'vendor', ...state }
+     if (method === 'codingPrepare') { prepares++; state = frozen; return state }
+     if (method === 'codingConfirm') { confirms++; state = { ...frozen, state: 'CODING_CONFIGURED',
+-      consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED' }; return state }
++      consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED',
++      config_revision: 2, commit_key: 'original-commit-1' };
++      return statusRecovery ? { ok: false, reason: 'MANAGEMENT_REPLY_UNCERTAIN' } : state }
+     if (method === 'codingStatus') return state
+     throw new Error(`unexpected ${method}`)
+   })
+@@ -81,17 +89,32 @@ try {
+   await page.getByText('读取 8192 字节/文件', { exact: false }).waitFor()
+   await page.getByText('最多 32 个进程、1024 MiB 内存', { exact: false }).waitFor()
+   assert.equal(await page.getByRole('button', { name: '准备并冻结' }).isDisabled(), true)
+-  page.on('dialog', dialog => dialog.accept())
+   await page.getByRole('button', { name: '明确确认配置' }).click()
++  if (statusRecovery) {
++    await page.getByRole('alert').getByText('MANAGEMENT_REPLY_UNCERTAIN', { exact: false }).waitFor()
++    assert.equal(confirms, 1); assert.equal(refreshes, 0)
++    await page.getByRole('button', { name: '复核原请求' }).click()
++  }
++  if (refreshFailOnce) {
++    await page.getByRole('alert').getByText('V2_READ_FAILED', { exact: false }).waitFor()
++    assert.equal(refreshes, 0)
++    await page.getByRole('button', { name: '复核原请求' }).click()
++  }
+   await page.getByText('编码配置已保存', { exact: false }).waitFor()
+   assert.equal(confirms, 1); assert.equal(refreshes, 1)
+   assert.equal(await page.getByRole('button', { name: '明确确认配置' }).isDisabled(), true)
+   await page.getByRole('button', { name: '复核原请求' }).click()
+   assert.equal(confirms, 1)
++  assert.equal(refreshes, 1)
++  await page.evaluate(() => window.remount())
++  await page.getByText('编码配置已保存', { exact: false }).waitFor({ state: 'hidden' }).catch(() => {})
++  await page.getByRole('button', { name: '复核原请求' }).click()
++  assert.equal(refreshes, 1)
+   assert.equal(await page.getByText('C:/trusted-go').count(), 0)
+   assert.deepEqual(errors, [])
+-  console.log(JSON.stringify({ status: 'SYNTHETIC_CODING_DOM_PASS', prepares, confirms,
+-    refreshes, actual_model_calls: 0, page_errors: errors }))
++  console.log(JSON.stringify({ status: refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
++    statusRecovery ? 'SYNTHETIC_CODING_STATUS_RECOVERY_PASS' : 'SYNTHETIC_CODING_DOM_PASS',
++    prepares, confirms, refreshes, refresh_attempts: refreshAttempts, actual_model_calls: 0, page_errors: errors }))
+ } finally {
+   await page?.close(); await browser?.close(); await server?.close()
+   for (const file of [html, entry]) if (fs.existsSync(file)) fs.unlinkSync(file)
+diff --git a/tests/ui/desktop/coding-authorization-boundary.test.mjs b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+index 66ab0332..be830274 100644
+--- a/tests/ui/desktop/coding-authorization-boundary.test.mjs
++++ b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+@@ -18,7 +18,8 @@ function fixture() {
+   const discoveryFile = path.join(dir, 'discovery.json')
+   fs.writeFileSync(discoveryFile, JSON.stringify({ url: 'http://127.0.0.1:54321/', pid,
+     data_dir: dir, host_instance_id: hostId }))
+-  let context = JSON.stringify(['project-1', 'session-1', 1, 1]), suppress = false
++  let context = JSON.stringify(['project-1', 'session-1', 1, 1]), suppress = false, expiryMs = 55000
++  const queued = []
+   const log = [], identity = id => ({ PID: id, CreatedNS: String(id) + '000000000', ImageSHA256: 'a'.repeat(64) })
+   const child = new EventEmitter(); child.pid = pid
+   const manager = createDesktopManagement({ fsImpl: fs, discoveryFile, dataRoot: dir,
+@@ -26,7 +27,7 @@ function fixture() {
+   child.stdin = { write(bytes, callback) {
+     const frame = JSON.parse(bytes.toString('utf8')); log.push(frame)
+     const base = { state: 'AWAITING_CODING_CONFIRMATION', request_id: 'coding-1', request_hash: hash,
+-      expires_at: new Date(Date.now() + 55000).toISOString(), project_id: 'project-1',
++      expires_at: new Date(Date.now() + expiryMs).toISOString(), project_id: 'project-1',
+       session_id: 'session-1', old_model_config_ref: 'model-1', scope: coding(),
+       frozen_checks: [{ id: 'value-check', package: './calc', test_pattern: '^TestValue$',
+         source_count: 3, source_bytes: 123, source_manifest_hash: hash, toolchain_hash: hash,
+@@ -39,13 +40,16 @@ function fixture() {
+           revision: 2, config_revision: 2 } : frame.operation === 'STATUS_CODING' &&
+           Date.parse(manager.codingIntent?.expiresAt) <= Date.now()
+             ? { ...base, state: 'EXPIRED' } : base
+-    if (!suppress) setImmediate(() => manager.onLine(Buffer.from(JSON.stringify({ protocol,
+-      message_id: frame.message_id, operation: frame.operation, host_id: hostId, kind: 'RESULT', result }))))
++    const answer = { protocol, message_id: frame.message_id, operation: frame.operation,
++      host_id: hostId, kind: 'RESULT', result }
++    if (suppress) queued.push(answer)
++    else setImmediate(() => manager.onLine(Buffer.from(JSON.stringify(answer))))
+     callback?.(); return true
+   } }
+   manager.state = 'READY'; manager.child = child; manager.childExited = false; manager.hostId = hostId
+   manager.identity = identity(pid); manager.parentIdentity = identity(process.pid)
+   return { manager, log, dir, setContext: value => { context = value }, suppress: value => { suppress = value },
++    expiry: value => { expiryMs = value }, release: () => manager.onLine(Buffer.from(JSON.stringify(queued.shift()))),
+     close: () => fs.rmSync(dir, { recursive: true, force: true }) }
+ }
+ 
+@@ -56,12 +60,20 @@ function coding() { return { client_id: 'desktop-shell', expected_revision: 1, w
+     test_pattern: '^TestValue$', source_paths: ['go.mod', 'calc/value.go', 'calc/value_test.go'],
+     toolchain_root: 'C:/trusted-go', timeout_seconds: 90, process_limit: 32,
+     memory_mib: 1024, max_text_bytes: 4096 }] } }
+-const scope = () => ({ projectId: 'project-1', sessionId: 'session-1', modelRef: 'model-1', coding: coding() })
++const scope = () => ({ projectId: 'project-1', sessionId: 'session-1', modelRef: 'model-1',
++  model: { provider_id: 'local', model_id: 'fixture' }, coding: coding() })
++const review = () => ({ workspace: { authorized_workspace_ref: 'workspace-1',
++  display_name: 'Trusted workspace', display_path: 'C:/trusted-workspace', project_id: 'project-1',
++  revision: 1, access: 'READ_WRITE', status: 'ACTIVE' } })
++const original = JSON.stringify(['project-1', 'session-1', 1, 1])
++const recheck = () => ({ context: original, scope: scope(), review: review() })
++const prepare = f => f.manager.prepareCoding(scope(), original, review())
++const approve = f => f.manager.confirmCoding(async () => true, async () => recheck())
+ 
+ test('coding prepare freezes one original intent, explicit confirm writes configuration once and status never resends it', async () => {
+   const f = fixture()
+   try {
+-    const prepared = await f.manager.prepareCoding(scope(), JSON.stringify(['project-1', 'session-1', 1, 1]))
++    const prepared = await prepare(f)
+     assert.equal(prepared.state, 'AWAITING_CODING_CONFIRMATION')
+     assert.equal(prepared.model_calls, 0)
+     assert(!JSON.stringify(prepared).includes('C:/trusted-go'))
+@@ -70,13 +82,17 @@ test('coding prepare freezes one original intent, explicit confirm writes config
+     for (const key of ['client_id', 'expected_revision', 'writer_epoch', 'config_revision', 'workspace_ref'])
+       assert.equal(Object.hasOwn(prepared.scope, key), false)
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
+-    const settled = await f.manager.confirmCoding()
++    const settled = await approve(f)
+     assert.equal(settled.state, 'CODING_CONFIGURED')
+     assert.equal(settled.runtime_status, 'REGISTERED')
+     assert.equal(settled.model_config_ref, 'model-2')
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'CODING_CONFIRM_NOT_AVAILABLE' })
++    assert.match(settled.commit_key, /^[a-f0-9]{64}$/)
++    assert.notEqual(settled.commit_key, hash)
++    await assert.rejects(approve(f), { code: 'CODING_CONFIRM_NOT_AVAILABLE' })
+     f.setContext(JSON.stringify(['project-1', 'session-1', 2, 1]))
+-    assert.equal((await f.manager.statusCoding()).state, 'CODING_CONFIGURED')
++    const recovered = await f.manager.statusCoding()
++    assert.equal(recovered.state, 'CODING_CONFIGURED')
++    assert.equal(recovered.commit_key, settled.commit_key)
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'CONFIRM_CODING', 'STATUS_CODING'])
+   } finally { f.close() }
+ })
+@@ -84,13 +100,13 @@ test('coding prepare freezes one original intent, explicit confirm writes config
+ test('changed selection or native host blocks coding confirmation without dispatch', async () => {
+   const f = fixture()
+   try {
+-    await f.manager.prepareCoding(scope(), JSON.stringify(['project-1', 'session-1', 1, 1]))
++    await prepare(f)
+     f.setContext(JSON.stringify(['project-1', 'session-2', 1, 1]))
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'CONTEXT_CHANGED' })
++    await assert.rejects(approve(f), { code: 'CONTEXT_CHANGED' })
+     f.setContext(JSON.stringify(['project-1', 'session-1', 1, 1]))
+     fs.writeFileSync(path.join(f.dir, 'discovery.json'), JSON.stringify({ url: 'http://127.0.0.1:54321/',
+       pid: 24680, data_dir: f.dir, host_instance_id: 'host-bbbbbbbbbbbb' }))
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'HOST_CHANGED' })
++    await assert.rejects(approve(f), { code: 'HOST_CHANGED' })
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
+   } finally { f.close() }
+ })
+@@ -99,11 +115,11 @@ test('unconfirmed expiry requires original STATUS before a new preparation', asy
+   const f = fixture()
+   try {
+     const original = JSON.stringify(['project-1', 'session-1', 1, 1])
+-    await f.manager.prepareCoding(scope(), original)
++    await prepare(f)
+     f.manager.codingIntent.expiresAt = new Date(Date.now() - 1000).toISOString()
+-    await assert.rejects(f.manager.prepareCoding(scope(), original), { code: 'CODING_ORIGINAL_REQUEST_PENDING' })
++    await assert.rejects(prepare(f), { code: 'CODING_ORIGINAL_REQUEST_PENDING' })
+     assert.equal((await f.manager.statusCoding()).state, 'EXPIRED')
+-    const next = await f.manager.prepareCoding(scope(), original)
++    const next = await prepare(f)
+     assert.equal(next.state, 'AWAITING_CODING_CONFIRMATION')
+     assert.equal(f.manager.retiredCodingIntents.length, 1)
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'STATUS_CODING', 'PREPARE_CODING'])
+@@ -113,9 +129,9 @@ test('unconfirmed expiry requires original STATUS before a new preparation', asy
+ test('uncertain confirmation keeps original request and cannot send a second confirm', async () => {
+   const f = fixture()
+   try {
+-    await f.manager.prepareCoding(scope(), JSON.stringify(['project-1', 'session-1', 1, 1]))
++    await prepare(f)
+     f.manager.pending = { operation: 'STATUS_CODING', timedOut: true }
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    await assert.rejects(approve(f), { code: 'MANAGEMENT_COMMAND_PENDING' })
+     assert.equal(f.manager.codingSummary().state, 'PRIVATE_COMMAND_UNCERTAIN')
+     f.manager.pending = null
+     const originalExchange = f.manager.exchange.bind(f.manager)
+@@ -124,8 +140,8 @@ test('uncertain confirmation keeps original request and cannot send a second con
+         throw Object.assign(new Error('MANAGEMENT_REPLY_UNCERTAIN'), { code: 'MANAGEMENT_REPLY_UNCERTAIN' }) }
+       return originalExchange(operation, ...args)
+     }
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'MANAGEMENT_REPLY_UNCERTAIN' })
+-    await assert.rejects(f.manager.confirmCoding(), { code: 'CODING_CONFIRM_NOT_AVAILABLE' })
++    await assert.rejects(approve(f), { code: 'MANAGEMENT_REPLY_UNCERTAIN' })
++    await assert.rejects(approve(f), { code: 'CODING_CONFIRM_NOT_AVAILABLE' })
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'CONFIRM_CODING'])
+   } finally { f.close() }
+ })
+@@ -133,7 +149,7 @@ test('uncertain confirmation keeps original request and cannot send a second con
+ test('original STATUS resolving a committed coding request retires only a settled old qualification', async () => {
+   const f = fixture()
+   try {
+-    await f.manager.prepareCoding(scope(), JSON.stringify(['project-1', 'session-1', 1, 1]))
++    await prepare(f)
+     f.manager.intent = { confirmSent: true, state: 'QUALIFIED_PURPOSE_AUTHORIZED',
+       requestId: 'old-qualification', checkedAt: Date.now() }
+     f.log.push({ operation: 'CONFIRM_CODING' }) // Host already committed; reply was lost.
+@@ -147,7 +163,7 @@ test('original STATUS resolving a committed coding request retires only a settle
+ 
+ test('IPC accepts only desktop origin, derives private request identity and does not forward forged fields', async () => {
+   const handlers = new Map(), calls = []
+-  const management = { codingSummary: () => ({ available: true, state: 'READY' }),
++  const management = { commandIdle: () => {}, codingSummary: () => ({ available: true, state: 'READY' }),
+     prepareCoding: (...args) => { calls.push(['PREPARE', args]); return { state: 'AWAITING_CODING_CONFIRMATION' } },
+     confirmCoding: (...args) => { calls.push(['CONFIRM', args]); return { state: 'CODING_CONFIGURED' } },
+     statusCoding: (...args) => { calls.push(['STATUS', args]); return { state: 'CODING_CONFIGURED' } } }
+@@ -155,7 +171,8 @@ test('IPC accepts only desktop origin, derives private request identity and does
+     codingSenderAllowed: event => event?.sender?.getURL() === 'ros-app://desktop/',
+     desktopManagement: management,
+     prepareCodingScope: async body => { assert.deepEqual(body, { read_paths: ['go.mod'] });
+-      return { scope: { projectId: 'trusted' }, context: 'trusted-context' } },
++      return { scope: { projectId: 'trusted' }, context: 'trusted-context', review: review() } },
++    privilegedCodingConsent: async () => true, recheckCodingScope: async () => recheck(),
+     pickCodingDirectory: async kind => ({ selected: true, name: kind }),
+   })
+   const allowed = { sender: { getURL: () => 'ros-app://desktop/' } }
+@@ -163,7 +180,172 @@ test('IPC accepts only desktop origin, derives private request identity and does
+   assert.equal((await handlers.get('ros:desktop:coding:prepare')(allowed, { read_paths: ['go.mod'] })).ok, true)
+   await handlers.get('ros:desktop:coding:confirm')(allowed, forged)
+   await handlers.get('ros:desktop:coding:status')(allowed, forged)
+-  assert.deepEqual(calls, [['PREPARE', [{ projectId: 'trusted' }, 'trusted-context']], ['CONFIRM', []], ['STATUS', []]])
++  assert.deepEqual(calls[0], ['PREPARE', [{ projectId: 'trusted' }, 'trusted-context', review()]])
++  assert.equal(calls[1][0], 'CONFIRM')
++  assert.deepEqual(calls[2], ['STATUS', []])
+   assert.equal((await handlers.get('ros:desktop:coding:confirm')({ sender: { getURL: () => 'https://evil/' } }, forged)).reason,
+     'DESKTOP_ORIGIN_REQUIRED')
+ })
++
++test('direct renderer confirm requires privileged consent; cancel and failure retain original', async () => {
++  const f = fixture()
++  try {
++    await prepare(f)
++    await assert.rejects(f.manager.confirmCoding(), { code: 'PRIVILEGED_CONFIRM_UNAVAILABLE' })
++    await assert.rejects(f.manager.confirmCoding(async frozen => {
++      assert.equal(frozen.workspace.display_path, 'C:/trusted-workspace')
++      assert.equal(frozen.scope.checks[0].toolchain_root, 'C:/trusted-go')
++      assert.equal(frozen.frozen_checks[0].source_manifest_hash, hash)
++      return false
++    }, async () => recheck()), { code: 'PRIVILEGED_CONFIRM_CANCELLED' })
++    await assert.rejects(f.manager.confirmCoding(async () => { throw new Error('dialog failed') },
++      async () => recheck()), /dialog failed/)
++    assert.equal(f.manager.codingIntent.requestId, 'coding-1')
++    assert.equal(f.manager.codingIntent.confirmSent, false)
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++    await approve(f)
++    assert.equal(f.log.filter(item => item.operation === 'CONFIRM_CODING').length, 1)
++  } finally { f.close() }
++})
++
++test('same-origin IPC cannot send CONFIRM when privileged dialog capability is unavailable', async () => {
++  const f = fixture(), handlers = new Map()
++  try {
++    await prepare(f)
++    registerDesktopCoding({ handle(name, fn) { handlers.set(name, fn) } }, {
++      codingSenderAllowed: event => event?.sender?.getURL() === 'ros-app://desktop/',
++      desktopManagement: f.manager, recheckCodingScope: async () => recheck(),
++    })
++    const reply = await handlers.get('ros:desktop:coding:confirm')(
++      { sender: { getURL: () => 'ros-app://desktop/' } }, { accept: true, request_id: 'forged' })
++    assert.equal(reply.ok, false)
++    assert.equal(reply.reason, 'PRIVILEGED_CONFIRM_UNAVAILABLE')
++    assert.equal(f.manager.codingIntent.confirmSent, false)
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('dialog keeps all private operations behind one barrier and rechecks changed authority', async () => {
++  const f = fixture()
++  try {
++    await prepare(f)
++    let release
++    const held = new Promise(resolve => { release = resolve })
++    const pending = f.manager.confirmCoding(async () => held, async () => recheck())
++    await new Promise(resolve => setImmediate(resolve))
++    assert.equal(f.manager.codingSummary().state, 'PRIVILEGED_CONFIRM_PENDING')
++    await assert.rejects(approve(f), { code: 'PRIVILEGED_CONFIRM_PENDING' })
++    await assert.rejects(prepare(f), { code: 'PRIVILEGED_CONFIRM_PENDING' })
++    await assert.rejects(f.manager.statusCoding(), { code: 'PRIVILEGED_CONFIRM_PENDING' })
++    await assert.rejects(f.manager.prepare({ projectId: 'project-1', sessionId: 'session-1',
++      modelRef: 'model-1', model: {} }, original), { code: 'PRIVILEGED_CONFIRM_PENDING' })
++    await assert.rejects(f.manager.shutdown(), { code: 'PRIVILEGED_CONFIRM_PENDING' })
++    f.setContext(JSON.stringify(['project-1', 'session-1', 2, 1]))
++    release(true)
++    await assert.rejects(pending, { code: 'CODING_CONSENT_CONTEXT_CHANGED' })
++    assert.equal(f.manager.codingIntent.confirmSent, false)
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('privileged approval rejects changed writer, model, workspace or resource without consuming request', async () => {
++  for (const change of [
++    fresh => { fresh.scope.coding.writer_epoch++ },
++    fresh => { fresh.scope.modelRef = 'model-new' },
++    fresh => { fresh.review.workspace.display_path = 'C:/other-workspace' },
++    fresh => { fresh.scope.coding.checks[0].toolchain_root = 'C:/other-go' },
++  ]) {
++    const f = fixture()
++    try {
++      await prepare(f)
++      let current = recheck()
++      await assert.rejects(f.manager.confirmCoding(async () => {
++        current = structuredClone(current); change(current); return true
++      }, async () => current), { code: 'CODING_CONSENT_CONTEXT_CHANGED' })
++      assert.equal(f.manager.codingIntent.confirmSent, false)
++      assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++    } finally { f.close() }
++  }
++})
++
++test('expiry during privileged dialog invalidates approval while retaining original request', async () => {
++  const f = fixture()
++  try {
++    f.expiry(400)
++    await prepare(f)
++    await assert.rejects(f.manager.confirmCoding(async () => {
++      await new Promise(resolve => setTimeout(resolve, 450)); return true
++    }, async () => recheck()), { code: 'CODING_CONSENT_CONTEXT_CHANGED' })
++    assert.equal(f.manager.codingIntent.requestId, 'coding-1')
++    assert.equal(f.manager.codingIntent.confirmSent, false)
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('real expiry plus an in-flight original STATUS preserves exact coding identity and audit', async () => {
++  const f = fixture()
++  try {
++    f.expiry(400)
++    await prepare(f)
++    const requestId = f.manager.codingIntent.requestId, requestHash = f.manager.codingIntent.requestHash
++    await new Promise(resolve => setTimeout(resolve, 450))
++    assert.equal((await f.manager.statusCoding()).state, 'EXPIRED')
++    f.suppress(true)
++    const pending = f.manager.statusCoding()
++    await new Promise(resolve => setImmediate(resolve))
++    await assert.rejects(prepare(f), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    assert.equal(f.manager.codingIntent.requestId, requestId)
++    assert.equal(f.manager.codingIntent.requestHash, requestHash)
++    assert.equal(f.manager.retiredCodingIntents.length, 0)
++    f.manager.pending.timedOut = true
++    await assert.rejects(prepare(f), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    assert.equal(f.manager.codingIntent.requestId, requestId)
++    assert.equal(f.manager.retiredCodingIntents.length, 0)
++    f.release(); await pending
++    f.suppress(false); f.expiry(55000)
++    await prepare(f)
++    assert.equal(f.manager.retiredCodingIntents.length, 1)
++    assert.equal(f.manager.retiredCodingIntents[0].requestId, requestId)
++    assert.deepEqual(f.log.map(item => item.operation),
++      ['PREPARE_CODING', 'STATUS_CODING', 'STATUS_CODING', 'PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('late PREPARE result after selection change retains original request for STATUS', async () => {
++  const f = fixture()
++  try {
++    f.suppress(true)
++    const pending = prepare(f)
++    await new Promise(resolve => setImmediate(resolve))
++    assert.equal(f.manager.codingIntent.state, 'PREPARE_UNRESOLVED')
++    f.setContext(JSON.stringify(['project-1', 'session-2', 1, 1]))
++    f.release()
++    const blocked = await pending
++    assert.equal(blocked.state, 'CONTEXT_CHANGED_PENDING')
++    assert.equal(f.manager.codingIntent.requestId, 'coding-1')
++    assert.equal(f.manager.codingIntent.requestHash, hash)
++    await assert.rejects(prepare(f), { code: 'CONTEXT_CHANGED' })
++    f.setContext(original); f.suppress(false)
++    assert.equal((await f.manager.statusCoding()).state, 'AWAITING_CODING_CONFIRMATION')
++    await assert.rejects(prepare(f), { code: 'CODING_ORIGINAL_REQUEST_PENDING' })
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'STATUS_CODING'])
++  } finally { f.close() }
++})
++
++test('returning to same session after selection generation changes permits original STATUS but blocks adoption', async () => {
++  const f = fixture()
++  try {
++    const first = JSON.stringify(['project-1', 'session-1', 1, 1, 'desktop-shell', null, 7])
++    f.setContext(first)
++    await f.manager.prepareCoding(scope(), first, review())
++    const result = await f.manager.confirmCoding(async () => true,
++      async () => ({ context: first, scope: scope(), review: review() }))
++    assert.equal(result.state, 'CODING_CONFIGURED')
++    f.setContext(JSON.stringify(['project-1', 'session-1', 1, 1, 'desktop-shell', null, 9]))
++    const historical = await f.manager.statusCoding()
++    assert.equal(historical.state, 'CONTEXT_CHANGED_PENDING')
++    assert.equal(historical.available, false)
++    assert.equal(f.manager.codingIntent.state, 'CODING_CONFIGURED')
++    assert.equal(f.log.filter(item => item.operation === 'CONFIRM_CODING').length, 1)
++  } finally { f.close() }
++})
+diff --git a/tests/ui/desktop/desktop-management-boundary.test.mjs b/tests/ui/desktop/desktop-management-boundary.test.mjs
+index 9003c497..c1643414 100644
+--- a/tests/ui/desktop/desktop-management-boundary.test.mjs
++++ b/tests/ui/desktop/desktop-management-boundary.test.mjs
+@@ -140,7 +140,7 @@ test('expiry never retires consumed or uncertain private operations', async () =
+     f.manager.pending = { operation: 'STATUS', timedOut: true }
+     assert.equal(f.manager.summary().available, false)
+     assert.equal(f.manager.summary().state, 'PRIVATE_COMMAND_UNCERTAIN')
+-    await assert.rejects(f.manager.prepare(scope, 'session-a'), { code: 'QUALIFICATION_INTENT_PENDING' })
++    await assert.rejects(f.manager.prepare(scope, 'session-a'), { code: 'MANAGEMENT_COMMAND_PENDING' })
+     assert.equal(f.manager.intent.requestId, 'req-1')
+     assert.equal(f.manager.retiredIntents.length, 0)
+     f.manager.pending = null

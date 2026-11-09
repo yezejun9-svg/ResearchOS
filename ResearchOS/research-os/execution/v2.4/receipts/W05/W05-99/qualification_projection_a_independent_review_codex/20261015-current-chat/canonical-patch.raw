@@ -1,0 +1,1187 @@
+diff --git a/adapters/runtime/bridge_program.go b/adapters/runtime/bridge_program.go
+index 15b8f3e6..4e9e684a 100644
+--- a/adapters/runtime/bridge_program.go
++++ b/adapters/runtime/bridge_program.go
+@@ -3,12 +3,19 @@ package runtime
+ import (
+ 	"encoding/json"
+ 	"errors"
++
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ // Mu uses a staged, immutable bundle and configuration. Freezing Node alone
+ // would attest every script which that executable could load.
+-func validateBridgeProgram(profile map[string]any, inputs map[string][]byte) error {
++func validateBridgeProgram(manifest map[string]any, inputs map[string][]byte) error {
++	admission, _ := manifest["admission"].(map[string]any)
++	profile, _ := admission["profile"].(map[string]any)
+ 	if profile["backend"] == "native-offline" && profile["model"] == "none" {
++		if _, exists := manifest[runtimepolicy.ProjectionField]; exists {
++			return errors.New("non-Mu dispatch carries model projection")
++		}
+ 		return nil
+ 	}
+ 	if profile["backend"] != "mu-sdk-broker-v1" || profile["model"] == "" || profile["model"] == "none" {
+@@ -22,9 +29,13 @@ func validateBridgeProgram(profile map[string]any, inputs map[string][]byte) err
+ 	if err := json.Unmarshal(inputs["worker.json"], &config); err != nil || config == nil {
+ 		return errors.New("immutable Mu worker configuration required")
+ 	}
+-	want, err := json.Marshal(profile["model_config"])
++	effective, err := runtimepolicy.Effective(manifest, "")
++	if err != nil {
++		return err
++	}
++	want, err := json.Marshal(effective)
+ 	if err != nil || Hash(inputs["worker.json"]) != Hash(want) {
+-		return errors.New("Mu worker configuration differs from frozen profile")
++		return errors.New("Mu worker configuration differs from immutable projection")
+ 	}
+ 	if config["model"] != profile["model"] || config["api"] != "openai-completions" {
+ 		return errors.New("unsupported Mu model adapter")
+diff --git a/adapters/runtime/bridge_windows.go b/adapters/runtime/bridge_windows.go
+index 5b2661a7..11aac5fb 100644
+--- a/adapters/runtime/bridge_windows.go
++++ b/adapters/runtime/bridge_windows.go
+@@ -193,7 +193,7 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
+ 	}
+ 	admission, _ := manifest["admission"].(map[string]any)
+ 	profile, _ := admission["profile"].(map[string]any)
+-	if e = validateBridgeProgram(profile, request.Inputs); e != nil {
++	if e = validateBridgeProgram(manifest, request.Inputs); e != nil {
+ 		return nil, e
+ 	}
+ 	if request.WorkerID == "" || bridgeString(manifest, "dispatch_key") == "" || bridgeNumber(manifest, "epoch") < 1 || bridgeString(profile, "sandbox") != "appcontainer-zero-capabilities-v1" || bridgeString(profile, "adapter_revision") != BridgeRevision || request.BeforeResume == nil {
+diff --git a/adapters/runtime/qualification_projection_windows_test.go b/adapters/runtime/qualification_projection_windows_test.go
+new file mode 100644
+index 00000000..d346a7da
+--- /dev/null
++++ b/adapters/runtime/qualification_projection_windows_test.go
+@@ -0,0 +1,116 @@
++//go:build windows
++
++package runtime
++
++import (
++	"context"
++	"encoding/json"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"researchos.local/research-os/internal/runtimepolicy"
++)
++
++func qualificationBridgeManifest(t *testing.T) (map[string]any, map[string][]byte) {
++	t.Helper()
++	bundle := []byte("frozen local worker fixture")
++	config := map[string]any{"api": "openai-completions", "model": "fixture-model", "provider": "local", "ref": "fixture-ref", "route": "route-a", "endpoint": "http://127.0.0.1:1234/v1/chat/completions", "max_output_tokens": json.Number("512"), "max_calls": json.Number("8"), "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "run_check", "parameters": map[string]any{"type": "object"}}}}}
++	configHash, err := runtimepolicy.Hash(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ref := map[string]any{"entity_type": "Artifact", "id": "profile-a", "revision": json.Number("1")}
++	refHash, err := runtimepolicy.Hash(ref)
++	if err != nil {
++		t.Fatal(err)
++	}
++	profile := map[string]any{"backend": "mu-sdk-broker-v1", "model": "fixture-model", "bundle_hash": Hash(bundle), "argv": []any{"--preserve-symlinks-main", "--preserve-symlinks", "{bundle}", "{manifest}"}, "model_config": config, "model_qualification": map[string]any{"route": "route-a", "model_config_hash": configHash, "max_calls": json.Number("1")}}
++	manifest := map[string]any{"project_id": "p", "task_id": "t", "run_id": "r", "runtime_id": "rt", "dispatch_key": "d", "epoch": json.Number("1"), "admission": map[string]any{"qualification_bootstrap": true, "profile_ref": ref, "profile_hash": refHash, "permission": map[string]any{"purpose": "runtime_qualification", "plan_hash": "sha256:plan"}, "profile": profile}}
++	if err := runtimepolicy.Prepare(manifest, "runtime_qualification"); err != nil {
++		t.Fatal(err)
++	}
++	effective, err := runtimepolicy.Effective(manifest, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	worker, err := json.Marshal(effective)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return manifest, map[string][]byte{"mu-worker.mjs": bundle, "worker.json": worker}
++}
++
++func TestQualificationProjectionAdapterBeforeLaunch(t *testing.T) {
++	manifest, inputs := qualificationBridgeManifest(t)
++	if err := validateBridgeProgram(manifest, inputs); err != nil {
++		t.Fatal(err)
++	}
++	profile := manifest["admission"].(map[string]any)["profile"].(map[string]any)
++	old, err := json.Marshal(profile["model_config"])
++	if err != nil {
++		t.Fatal(err)
++	}
++	inputs["worker.json"] = old
++	if err := validateBridgeProgram(manifest, inputs); err == nil {
++		t.Fatal("old coding config staged under marker accepted")
++	}
++	raw, err := json.Marshal(manifest)
++	if err != nil {
++		t.Fatal(err)
++	}
++	digest, err := canonicalHash(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = StartBridge(context.Background(), filepath.Join(t.TempDir(), "no-launch"), BridgeRequest{Manifest: raw, ManifestHash: digest, Inputs: inputs}); err == nil || !strings.Contains(err.Error(), "worker configuration") {
++		t.Fatalf("StartBridge did not reject before native launch: %v", err)
++	}
++	effective, err := runtimepolicy.Effective(manifest, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	effective["tools"] = []any{}
++	inputs["worker.json"], _ = json.Marshal(effective)
++	delete(manifest, runtimepolicy.ProjectionField)
++	if err := validateBridgeProgram(manifest, inputs); err == nil {
++		t.Fatal("arbitrary tools=[] without marker accepted")
++	}
++	if err := runtimepolicy.Prepare(manifest, "runtime_qualification"); err != nil {
++		t.Fatal(err)
++	}
++	for _, field := range []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"} {
++		copy := map[string]any{}
++		raw, _ := json.Marshal(manifest)
++		if err := json.Unmarshal(raw, &copy); err != nil {
++			t.Fatal(err)
++		}
++		copy[runtimepolicy.ProjectionField].(map[string]any)[field] = "tampered"
++		if err := validateBridgeProgram(copy, inputs); err == nil {
++			t.Errorf("adapter accepted tampered %s", field)
++		}
++	}
++	inputs["mu-worker.mjs"] = []byte("changed")
++	if err := validateBridgeProgram(manifest, inputs); err == nil {
++		t.Fatal("bundle change accepted")
++	}
++}
++
++func TestQualificationProjectionAdapterCanonicalHash(t *testing.T) {
++	value := map[string]any{"😀": []any{map[string]any{"中": json.Number("1e0"), "n": json.Number("2.500")}}, "tools": []any{}}
++	raw, err := json.Marshal(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	adapter, err := canonicalHash(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	policy, err := runtimepolicy.Hash(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if adapter != policy || policy != "sha256:bcce6b88b4df307036224038610c85590a86b6dc8254202f49f1dfe532131257" {
++		t.Fatalf("adapter/policy hash mismatch: %s %s", adapter, policy)
++	}
++}
+diff --git a/internal/domain/runtime_broker_windows.go b/internal/domain/runtime_broker_windows.go
+index e696ae49..372f3b23 100644
+--- a/internal/domain/runtime_broker_windows.go
++++ b/internal/domain/runtime_broker_windows.go
+@@ -17,6 +17,7 @@ import (
+ 	"time"
+ 
+ 	rt "researchos.local/research-os/adapters/runtime"
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ // RuntimeProviderRoute is host-owned and never included in a task input.
+@@ -180,8 +181,13 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
+ 		}
+ 	}
+ 	if provider.Capability == "MODEL" {
+-		if _, e = validateRuntimeModelRequest(provider.ModelConfig, payload); e == nil {
+-			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, provider.ModelConfig)
++		var effective map[string]any
++		effective, e = runtimepolicy.Effective(dispatch["manifest"].(map[string]any), Str(task, "task_type"))
++		if e == nil {
++			_, e = validateRuntimeModelRequest(effective, payload)
++		}
++		if e == nil {
++			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, effective)
+ 		}
+ 		if e != nil {
+ 			tx.Rollback()
+diff --git a/internal/domain/runtime_dispatch.go b/internal/domain/runtime_dispatch.go
+index a543936d..6a496a04 100644
+--- a/internal/domain/runtime_dispatch.go
++++ b/internal/domain/runtime_dispatch.go
+@@ -4,6 +4,8 @@ import (
+ 	"database/sql"
+ 	"path/filepath"
+ 	"time"
++
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ const runtimeSandboxProfile = "appcontainer-zero-capabilities-v1"
+@@ -104,6 +106,9 @@ func (s *Service) prepareRuntimeDispatch(tx *sql.Tx, project string, task, run,
+ 	manifest := Object{"version": 1, "project_id": project, "run_id": run["id"], "task_id": task["id"], "epoch": run["lease_epoch"], "runtime_id": run["runtime_id"], "executor_principal_id": run["executor_principal_id"], "contract_hash": task["acceptance_contract"].(map[string]any)["contract_hash"], "input_refs": run["input_refs"], "context_bundle_id": run["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "admission": admission}
+ 	key := ID()
+ 	manifest["dispatch_key"] = key
++	if e := runtimepolicy.Prepare(manifest, Str(task, "task_type")); e != nil {
++		return Fail(422, "GATE_FAILED", "qualification projection: "+e.Error())
++	}
+ 	_, e := tx.Exec("INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED',?,?)", project, run["id"], run["lease_epoch"], key, string(Bytes(manifest)), Hash(manifest), Now(), Now())
+ 	return e
+ }
+diff --git a/internal/domain/runtime_drain_windows.go b/internal/domain/runtime_drain_windows.go
+index ab3a29c2..cfa80b20 100644
+--- a/internal/domain/runtime_drain_windows.go
++++ b/internal/domain/runtime_drain_windows.go
+@@ -6,6 +6,8 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"errors"
++
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ // RuntimeDrainSnapshot contains only host-observed counters. It is not a
+@@ -222,6 +224,10 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
+ 	if Hash(frozen) != Hash(profile) {
+ 		return bad("profile bytes")
+ 	}
++	effective, e := runtimepolicy.Effective(manifest, Str(task, "task_type"))
++	if e != nil {
++		return bad("qualification projection")
++	}
+ 	effect, e := latestEffect(tx, project, Str(run, "id"), Str(ledger, "provider_request_id"))
+ 	if e != nil {
+ 		return e
+@@ -233,7 +239,7 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
+ 	if effect["state"] != "CONFIRMED" || effect["project_id"] != project || effect["task_id"] != task["id"] || effect["run_id"] != run["id"] || effect["context_bundle_id"] != run["context_bundle_id"] || Hash(effect["epoch"]) != Hash(run["lease_epoch"]) || request["route"] != config["route"] || receipt["state"] != "CONFIRMED" || receipt["key"] != effect["key"] || receipt["run_id"] != run["id"] || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) || receipt["model_transport"] != true || receipt["actual_cost"] != nil {
+ 		return bad("confirmed effect binding")
+ 	}
+-	if _, e = validateRuntimeModelRequest(config, payload); e != nil {
++	if _, e = validateRuntimeModelRequest(effective, payload); e != nil {
+ 		return e
+ 	}
+ 	bound := 0
+diff --git a/internal/domain/runtime_drain_windows_test.go b/internal/domain/runtime_drain_windows_test.go
+index 6e4e7010..a294c793 100644
+--- a/internal/domain/runtime_drain_windows_test.go
++++ b/internal/domain/runtime_drain_windows_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -111,6 +112,9 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
+ // Disposable source fixture synthesizes durable record shapes; it makes no
+ // native acceptance claim. Actual Host/private-pipe coverage is separate.
+ func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, string) {
++	return desktopExitFixtureTools(t, false)
++}
++func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoordinator, string, string) {
+ 	t.Helper()
+ 	f, c, r, executor := confirmationFixture(t)
+ 	ctx := context.Background()
+@@ -138,6 +142,9 @@ func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, st
+ 			return e
+ 		}
+ 		request := Object{"route": config["route"], "capability": "MODEL", "credential_revision": "none", "payload": Object{"body": Object{"model": config["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}}}}
++		if oldTools {
++			request["payload"].(map[string]any)["body"].(map[string]any)["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
++		}
+ 		cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": "UNKNOWN", "money": nil, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UNKNOWN", "occurred_at": run["created_at"]}
+ 		effect, e := c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
+ 		if e != nil {
+@@ -198,6 +205,25 @@ func TestDesktopExitCompletedLocalUnknownPreservesReleaseGate(t *testing.T) {
+ 		t.Fatal("ordinary abort did not restore intake")
+ 	}
+ }
++
++func TestQualificationProjectionUnknownCostRejectsOldTools(t *testing.T) {
++	f, _, _, _ := desktopExitFixtureTools(t, true)
++	var before string
++	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before); err != nil {
++		t.Fatal(err)
++	}
++	err := f.s.completedLocalUnknownCosts(context.Background())
++	if err == nil || !strings.Contains(err.Error(), "tool schemas") {
++		t.Fatalf("old coding tools accepted or wrong guard: %v", err)
++	}
++	var after string
++	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after); err != nil {
++		t.Fatal(err)
++	}
++	if before != after {
++		t.Fatal("UNKNOWN ledger changed after rejection")
++	}
++}
+ func TestDesktopExitUnknownIncompleteRefused(t *testing.T) {
+ 	for _, name := range []string{"paid_capability", "credential", "request_hash", "receipt_hash", "effect_unknown", "active_run", "queue_not_empty", "missing_observation", "missing_identity", "reservation", "budget_changed", "active_qualification"} {
+ 		t.Run(name, func(t *testing.T) {
+diff --git a/internal/domain/runtime_model_verification.go b/internal/domain/runtime_model_verification.go
+index 642a3bfb..2d1d7a09 100644
+--- a/internal/domain/runtime_model_verification.go
++++ b/internal/domain/runtime_model_verification.go
+@@ -6,6 +6,8 @@ import (
+ 	"sort"
+ 	"strings"
+ 	"unicode/utf8"
++
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ // muTurnSnapshot adds immutable broker history to BOTH acceptance snapshots.
+@@ -405,7 +407,20 @@ func verifyMuTurn(snapshot Object) (string, string) {
+ 	task, _ := snapshot["task"].(map[string]any)
+ 	run, _ := snapshot["run"].(map[string]any)
+ 	profile, _ := mu["profile"].(map[string]any)
+-	config, _ := profile["model_config"].(map[string]any)
++	dispatch, _ := mu["dispatch"].(map[string]any)
++	manifest, _ := dispatch["manifest"].(map[string]any)
++	admission, _ := manifest["admission"].(map[string]any)
++	if profile == nil || manifest == nil || admission == nil || Hash(profile) != Hash(admission["profile"]) {
++		return fail("SDK profile differs from immutable dispatch.")
++	}
++	config, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
++	if err != nil {
++		return fail("Qualification projection binding invalid.")
++	}
++	original, _ := profile["model_config"].(map[string]any)
++	if original == nil || config["route"] != original["route"] || config["ref"] != original["ref"] {
++		return fail("Frozen model identity changed.")
++	}
+ 	artifacts := Arr(snapshot, "artifacts")
+ 	if len(artifacts) != 1 {
+ 		return fail("One sealed SDK result required.")
+diff --git a/internal/domain/runtime_model_verification_test.go b/internal/domain/runtime_model_verification_test.go
+index 08fb8e06..4f4219ee 100644
+--- a/internal/domain/runtime_model_verification_test.go
++++ b/internal/domain/runtime_model_verification_test.go
+@@ -108,6 +108,36 @@ func TestRuntimeMuVerificationRejectsFabrication(t *testing.T) {
+ 		"prompt drift": func(s Object) {
+ 			s["mu_turn"].(map[string]any)["prompt"].(map[string]any)["task_description"] = "changed intent"
+ 		},
++		"projection copied from another dispatch": func(s Object) {
++			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
++			m["model_execution_projection"].(map[string]any)["dispatch_key"] = "foreign-dispatch"
++		},
++		"projection effective hash": func(s Object) {
++			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
++			m["model_execution_projection"].(map[string]any)["effective_model_config_hash"] = "sha256:forged"
++		},
++		"projection source profile": func(s Object) {
++			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
++			m["admission"].(map[string]any)["profile"].(map[string]any)["model"] = "other"
++		},
++		"projection old tools": func(s Object) {
++			m := s["mu_turn"].(map[string]any)
++			effects := Arr(m, "effects")
++			for _, v := range effects {
++				e := v.(map[string]any)
++				request, _ := e["payload"].(map[string]any)
++				p, _ := request["payload"].(map[string]any)
++				body, _ := p["body"].(map[string]any)
++				if body != nil {
++					body["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
++				}
++			}
++		},
++		"projection model excess": func(s Object) {
++			m := s["mu_turn"].(map[string]any)
++			muMutateResult(s, func(o Object) { o["model_calls"] = 2 })
++			m["effects"] = append(Arr(m, "effects"), Object{"key": "forged-second-model"})
++		},
+ 		"effect order": func(s Object) {
+ 			a := Arr(s["mu_turn"].(map[string]any), "effects")
+ 			a[len(a)-1].(map[string]any)["_journal_position"] = 0
+diff --git a/internal/domain/runtime_model_windows.go b/internal/domain/runtime_model_windows.go
+index 9e6f96ad..a30ac5ef 100644
+--- a/internal/domain/runtime_model_windows.go
++++ b/internal/domain/runtime_model_windows.go
+@@ -14,6 +14,7 @@ import (
+ 	"time"
+ 
+ 	rt "researchos.local/research-os/adapters/runtime"
++	"researchos.local/research-os/internal/runtimepolicy"
+ )
+ 
+ func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs map[string][]byte) error {
+@@ -25,6 +26,10 @@ func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs
+ 	if e := validateRuntimeModelConfig(profile); e != nil {
+ 		return e
+ 	}
++	effective, e := runtimepolicy.Effective(manifest, "")
++	if e != nil {
++		return e
++	}
+ 	if !filepath.IsAbs(route.BundleFile) {
+ 		return errors.New("host Mu bundle binding required")
+ 	}
+@@ -41,12 +46,17 @@ func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs
+ 		return errors.New("Mu bundle differs from frozen profile")
+ 	}
+ 	inputs["mu-worker.mjs"] = raw
+-	inputs["worker.json"] = Bytes(profile["model_config"])
++	inputs["worker.json"] = Bytes(effective)
+ 	return nil
+ }
+ 
+ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+-	body, e := validateRuntimeModelRequest(provider.ModelConfig, payload)
++	manifest := dispatch["manifest"].(map[string]any)
++	effective, e := runtimepolicy.Effective(manifest, provider.Purpose)
++	if e != nil {
++		return nil, e
++	}
++	body, e := validateRuntimeModelRequest(effective, payload)
+ 	if e != nil {
+ 		return nil, e
+ 	}
+diff --git a/internal/domain/runtime_model_windows_test.go b/internal/domain/runtime_model_windows_test.go
+index 36bbd926..7ae5508e 100644
+--- a/internal/domain/runtime_model_windows_test.go
++++ b/internal/domain/runtime_model_windows_test.go
+@@ -148,6 +148,104 @@ func TestRuntimeMuQualificationBroker(t *testing.T) {
+ 	t.Log("MU_QUALIFICATION_BROKER real_SDK=true no_network_AppContainer=true provider=loopback_FIXTURE model_calls=1 model_effect=CONFIRMED actual_cost=null task=EXECUTION_REPORTED independent_acceptance=NOT_RUN")
+ }
+ 
++func TestQualificationProjectionFrozenWorkerWire(t *testing.T) {
++	var wire Object
++	tool := func(name string) Object {
++		return Object{"type": "function", "function": Object{"name": name, "description": "fixture", "parameters": Object{"type": "object", "properties": Object{}}}}
++	}
++	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, req *http.Request) {
++		if err := json.NewDecoder(req.Body).Decode(&wire); err != nil {
++			t.Errorf("wire JSON: %v", err)
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"qualified\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
++	}, func(config, profile Object) {
++		config["max_calls"] = 8
++		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
++	})
++	var beforeRaw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&beforeRaw); err != nil {
++		t.Fatal(err)
++	}
++	beforeManifest, err := Decode([]byte(beforeRaw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	inputs := map[string][]byte{}
++	if err := stageRuntimeProgram(route, Object{"manifest": beforeManifest}, inputs); err != nil {
++		t.Fatal(err)
++	}
++	worker, err := Decode(inputs["worker.json"])
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n, _ := Num(worker, "max_calls"); n != 1 || len(Arr(worker, "tools")) != 0 {
++		t.Fatalf("staged worker wrong bounds: %s", inputs["worker.json"])
++	}
++	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err != nil {
++		t.Fatal(err)
++	}
++	if calls.Load() != 1 || wire == nil {
++		t.Fatalf("worker issued %d MODEL requests, wire=%v", calls.Load(), wire)
++	}
++	if tools, ok := wire["tools"].([]any); !ok || len(tools) != 0 {
++		t.Fatalf("worker exposed coding tools: %s", Bytes(wire))
++	}
++	var afterRaw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&afterRaw); err != nil {
++		t.Fatal(err)
++	}
++	if afterRaw != beforeRaw {
++		t.Fatal("immutable dispatch profile changed")
++	}
++	var raw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
++		t.Fatal(err)
++	}
++	manifest, err := Decode([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if manifest["model_execution_projection"] == nil {
++		t.Fatal("new qualification omitted marker")
++	}
++	config := manifest["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
++	if n, _ := Num(config, "max_calls"); n != 8 || len(Arr(config, "tools")) != 4 {
++		t.Fatal("original 8/4 profile changed")
++	}
++	if Hash(c.config.Providers[0].ModelConfig) != Hash(config) {
++		t.Fatal("provider route identity stopped using original model config")
++	}
++	t.Logf("frozen_worker_wire original=8/4 effective=1/0 model_calls=%d provider_tools=%d source_profile_unchanged=true", calls.Load(), len(Arr(wire, "tools")))
++}
++
++func TestQualificationProjectionUnsolicitedProviderToolCalls(t *testing.T) {
++	tool := Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object", "properties": Object{}}}}
++	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, req *http.Request) {
++		var body Object
++		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
++			t.Error(err)
++		}
++		if len(Arr(body, "tools")) != 0 {
++			t.Errorf("worker exposed tools to provider: %s", Bytes(body))
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-malicious\",\"type\":\"function\",\"function\":{\"name\":\"run_check\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
++	}, func(config, profile Object) { config["max_calls"] = 8; config["tools"] = []any{tool} })
++	err := c.RunAdmitted(context.Background(), route, r.run, r.lease)
++	if calls.Load() != 1 {
++		t.Fatalf("unsolicited tool calls triggered %d model requests; err=%v", calls.Load(), err)
++	}
++	var tools int
++	if e := r.f.db.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND json_extract(body,'$.payload.capability')='TOOL'`, r.f.project, r.run["id"]).Scan(&tools); e != nil {
++		t.Fatal(e)
++	}
++	if tools != 0 {
++		t.Fatalf("unsolicited call gained TOOL authority: %d", tools)
++	}
++	t.Logf("unsolicited tool_calls: provider_requests=1 TOOL_effects=0 terminal_status_not_asserted err=%v", err)
++}
++
+ func TestRuntimeMuLocalModelDoesNotForwardSDKOrBrokerHeaders(t *testing.T) {
+ 	t.Setenv("OPENAI_API_KEY", "synthetic-never-forward")
+ 	var expectedHost string
+diff --git a/internal/domain/runtime_qualification_projection_test.go b/internal/domain/runtime_qualification_projection_test.go
+new file mode 100644
+index 00000000..fc8f921d
+--- /dev/null
++++ b/internal/domain/runtime_qualification_projection_test.go
+@@ -0,0 +1,19 @@
++package domain
++
++import (
++	"encoding/json"
++	"testing"
++
++	"researchos.local/research-os/internal/runtimepolicy"
++)
++
++func TestQualificationProjectionDomainCanonicalHash(t *testing.T) {
++	value := Object{"😀": []any{Object{"中": json.Number("1e0"), "n": json.Number("2.500")}}, "tools": Empty()}
++	policy, err := runtimepolicy.Hash(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if policy != Hash(value) || policy != "sha256:bcce6b88b4df307036224038610c85590a86b6dc8254202f49f1dfe532131257" {
++		t.Fatalf("domain/policy hash mismatch: %s %s", Hash(value), policy)
++	}
++}
+diff --git a/internal/domain/runtime_qualification_projection_windows_test.go b/internal/domain/runtime_qualification_projection_windows_test.go
+new file mode 100644
+index 00000000..4634a568
+--- /dev/null
++++ b/internal/domain/runtime_qualification_projection_windows_test.go
+@@ -0,0 +1,168 @@
++//go:build windows
++
++package domain
++
++import (
++	"context"
++	"net/http"
++	"testing"
++
++	rt "researchos.local/research-os/adapters/runtime"
++)
++
++func TestQualificationProjectionStageAndPretransportTamper(t *testing.T) {
++	c, route, r, calls := muBrokerFixture(t, nil)
++	var raw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
++		t.Fatal(err)
++	}
++	manifest, err := Decode([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	provider := c.config.Providers[0]
++	payload := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}}
++	for _, field := range []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "profile_ref", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"} {
++		t.Run(field, func(t *testing.T) {
++			copy, err := Decode(Bytes(manifest))
++			if err != nil {
++				t.Fatal(err)
++			}
++			copy["model_execution_projection"].(map[string]any)[field] = "tampered"
++			inputs := map[string][]byte{}
++			if err := stageRuntimeProgram(route, Object{"manifest": copy}, inputs); err == nil {
++				t.Fatal("staging accepted tampered marker")
++			}
++			_, err = c.brokerModel(context.Background(), route, provider, Str(r.run, "id"), r.lease, 1, nil, rt.BridgeFrame{}, payload, nil, Object{"manifest": copy})
++			if err == nil {
++				t.Fatal("pretransport accepted tampered marker")
++			}
++		})
++	}
++	if calls.Load() != 0 {
++		t.Fatalf("tamper reached provider %d times", calls.Load())
++	}
++}
++
++func TestQualificationProjectionPrepareUsesActualTask(t *testing.T) {
++	_, _, r, _ := muBrokerFixture(t, nil)
++	var raw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
++		t.Fatal(err)
++	}
++	manifest, err := Decode([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if manifest["model_execution_projection"] == nil {
++		t.Fatal("eligible production dispatch omitted marker")
++	}
++	admission := manifest["admission"].(map[string]any)
++	task := Merge(r.task, Object{"task_type": "mu_turn"})
++	tx, err := r.f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer tx.Rollback()
++	if err := r.f.s.prepareRuntimeDispatch(tx, r.f.project, task, r.run, admission); err == nil {
++		t.Fatal("actual Task type contradiction accepted")
++	}
++	copyAdmission, err := Decode(Bytes(admission))
++	if err != nil {
++		t.Fatal(err)
++	}
++	copyAdmission["profile"].(map[string]any)["model_qualification"].(map[string]any)["max_calls"] = 2
++	if err := r.f.s.prepareRuntimeDispatch(tx, r.f.project, r.task, r.run, copyAdmission); err == nil {
++		t.Fatal("qualification max_calls=2 accepted")
++	}
++}
++
++func TestQualificationProjectionLegacyAndNormalMuStage(t *testing.T) {
++	_, route, r, _ := muBrokerFixtureProgram(t, nil, func(config, profile Object) {
++		config["max_calls"] = 8
++		config["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
++	})
++	var raw string
++	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
++		t.Fatal(err)
++	}
++	manifest, err := Decode([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	delete(manifest, "model_execution_projection")
++	inputs := map[string][]byte{}
++	if err := stageRuntimeProgram(route, Object{"manifest": manifest}, inputs); err != nil {
++		t.Fatal(err)
++	}
++	worker, err := Decode(inputs["worker.json"])
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 1 {
++		t.Fatal("legacy qualification did not retain original config")
++	}
++	admission := manifest["admission"].(map[string]any)
++	admission["qualification_bootstrap"] = false
++	admission["permission"].(map[string]any)["purpose"] = "mu_turn"
++	inputs = map[string][]byte{}
++	if err := stageRuntimeProgram(route, Object{"manifest": manifest}, inputs); err != nil {
++		t.Fatal(err)
++	}
++	worker, err = Decode(inputs["worker.json"])
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 1 {
++		t.Fatal("normal Mu turn lost original config")
++	}
++	payload := Object{"body": Object{"model": worker["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": worker["tools"]}}
++	if _, err := validateRuntimeModelRequest(worker, payload); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestQualificationProjectionHostPreprepareRejectsOldToolsAndSecondModel(t *testing.T) {
++	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, _ *http.Request) {
++		t.Error("provider reached by rejected request")
++		w.WriteHeader(500)
++	}, func(config, profile Object) {
++		config["max_calls"] = 8
++		config["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
++	})
++	key1 := Str(r.task, "id") + ":" + Str(r.run, "id") + ":1:model:1"
++	old := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}}}
++	frame := rt.BridgeFrame{Key: key1, Route: "model-fixture", Capability: "MODEL", Payload: Bytes(old)}
++	if _, err := c.brokerEffect(context.Background(), route, Str(r.run, "id"), r.lease, 1, nil, frame); err == nil {
++		t.Fatal("old coding tool request prepared")
++	}
++	var effects int
++	if err := r.f.db.QueryRow("SELECT count(*) FROM resource_effects WHERE run=?", r.run["id"]).Scan(&effects); err != nil || effects != 0 {
++		t.Fatalf("rejected request wrote effects: %d %v", effects, err)
++	}
++	if calls.Load() != 0 {
++		t.Fatal("rejected request reached provider")
++	}
++	tx, err := r.f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = effectAppend(tx, r.f.project, Str(r.run, "id"), key1, Object{"state": "CONFIRMED", "payload": Object{"capability": "MODEL"}}); err != nil {
++		tx.Rollback()
++		t.Fatal(err)
++	}
++	if err = tx.Commit(); err != nil {
++		t.Fatal(err)
++	}
++	frame.Key = Str(r.task, "id") + ":" + Str(r.run, "id") + ":1:model:2"
++	frame.Payload = Bytes(Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}})
++	if _, err = c.brokerEffect(context.Background(), route, Str(r.run, "id"), r.lease, 1, nil, frame); err == nil {
++		t.Fatal("second MODEL request prepared")
++	}
++	if err := r.f.db.QueryRow("SELECT count(*) FROM resource_effects WHERE run=?", r.run["id"]).Scan(&effects); err != nil || effects != 1 {
++		t.Fatalf("second request wrote effects: %d %v", effects, err)
++	}
++	if calls.Load() != 0 {
++		t.Fatal("second request reached provider")
++	}
++}
+diff --git a/internal/runtimepolicy/qualification_projection.go b/internal/runtimepolicy/qualification_projection.go
+new file mode 100644
+index 00000000..6c2072e9
+--- /dev/null
++++ b/internal/runtimepolicy/qualification_projection.go
+@@ -0,0 +1,286 @@
++package runtimepolicy
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++
++	"researchos.local/research-os/internal/canonical"
++)
++
++const ProjectionField = "model_execution_projection"
++const ProjectionSchema = "researchos.qualification-model-projection.v1"
++
++var markerFields = []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "task_type", "profile_ref", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"}
++
++// Hash uses the same RFC 8785 bytes and sha256 prefix as dispatch manifests.
++func Hash(value any) (string, error) {
++	raw, err := json.Marshal(value)
++	if err != nil {
++		return "", err
++	}
++	canonicalRaw, err := canonical.JSON(raw)
++	if err != nil {
++		return "", err
++	}
++	sum := sha256.Sum256(canonicalRaw)
++	return "sha256:" + hex.EncodeToString(sum[:]), nil
++}
++
++func ownedMap(value map[string]any) (map[string]any, error) {
++	raw, err := json.Marshal(value)
++	if err != nil {
++		return nil, err
++	}
++	if _, err = canonical.JSON(raw); err != nil {
++		return nil, err
++	}
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.UseNumber()
++	var copy map[string]any
++	if err = decoder.Decode(&copy); err != nil {
++		return nil, err
++	}
++	if copy == nil {
++		return nil, errors.New("object required")
++	}
++	return copy, nil
++}
++
++func exactNumber(value any, expected int64) bool {
++	switch n := value.(type) {
++	case json.Number:
++		i, err := n.Int64()
++		return err == nil && i == expected
++	case int:
++		return int64(n) == expected
++	case int64:
++		return n == expected
++	default:
++		return false
++	}
++}
++
++func projectionInput(manifest map[string]any) (map[string]any, map[string]any, map[string]any, map[string]any, error) {
++	admission, ok := manifest["admission"].(map[string]any)
++	if !ok {
++		return nil, nil, nil, nil, errors.New("projection admission missing")
++	}
++	profile, ok := admission["profile"].(map[string]any)
++	if !ok {
++		return nil, nil, nil, nil, errors.New("projection profile missing")
++	}
++	config, ok := profile["model_config"].(map[string]any)
++	if !ok {
++		return nil, nil, nil, nil, errors.New("projection source config missing")
++	}
++	permission, ok := admission["permission"].(map[string]any)
++	if !ok {
++		return nil, nil, nil, nil, errors.New("projection permission missing")
++	}
++	return admission, profile, config, permission, nil
++}
++
++func eligible(manifest map[string]any, taskType string) (map[string]any, error) {
++	admission, profile, config, permission, err := projectionInput(manifest)
++	if err != nil {
++		return nil, err
++	}
++	if taskType != "runtime_qualification" || admission["qualification_bootstrap"] != true || profile["backend"] != "mu-sdk-broker-v1" || permission["purpose"] != "runtime_qualification" {
++		return nil, errors.New("qualification projection authority incomplete")
++	}
++	if plan, ok := permission["plan_hash"].(string); !ok || plan == "" {
++		return nil, errors.New("qualification plan hash missing")
++	}
++	ref, ok := admission["profile_ref"].(map[string]any)
++	if !ok || len(ref) == 0 {
++		return nil, errors.New("immutable profile ref missing")
++	}
++	refHash, err := Hash(ref)
++	if err != nil || admission["profile_hash"] != refHash {
++		return nil, errors.New("immutable profile ref hash mismatch")
++	}
++	configHash, err := Hash(config)
++	if err != nil {
++		return nil, err
++	}
++	q, ok := profile["model_qualification"].(map[string]any)
++	if !ok || len(q) != 3 || q["route"] != config["route"] || q["model_config_hash"] != configHash || !exactNumber(q["max_calls"], 1) {
++		return nil, errors.New("qualification must bind original route and one call")
++	}
++	for _, field := range []string{"project_id", "task_id", "run_id", "runtime_id", "dispatch_key"} {
++		if value, ok := manifest[field].(string); !ok || value == "" {
++			return nil, fmt.Errorf("projection %s missing", field)
++		}
++	}
++	if !positiveInteger(manifest["epoch"]) {
++		return nil, errors.New("projection epoch invalid")
++	}
++	if _, ok := config["tools"].([]any); !ok || !positiveInteger(config["max_calls"]) {
++		return nil, errors.New("source model bounds invalid")
++	}
++	return config, nil
++}
++
++func positiveInteger(v any) bool {
++	switch n := v.(type) {
++	case json.Number:
++		i, e := n.Int64()
++		return e == nil && i > 0
++	case int:
++		return n > 0
++	case int64:
++		return n > 0
++	default:
++		return false
++	}
++}
++
++func projected(config map[string]any) (map[string]any, error) {
++	copy, err := ownedMap(config)
++	if err != nil {
++		return nil, err
++	}
++	copy["max_calls"] = 1
++	copy["tools"] = []any{}
++	return copy, nil
++}
++
++// Prepare inserts the private marker before the caller hashes or persists the manifest.
++// taskType must come from the loaded Task, never from the worker or manifest.
++func Prepare(manifest map[string]any, taskType string) error {
++	if _, exists := manifest[ProjectionField]; exists {
++		return errors.New("projection marker already present")
++	}
++	admission, profile, config, permission, err := projectionInput(manifest)
++	if err != nil {
++		partialAdmission, _ := manifest["admission"].(map[string]any)
++		partialProfile, _ := partialAdmission["profile"].(map[string]any)
++		if taskType == "runtime_qualification" || partialAdmission["qualification_bootstrap"] == true || partialProfile["backend"] == "mu-sdk-broker-v1" {
++			return err
++		}
++		return nil
++	}
++	wants := taskType == "runtime_qualification" || admission["qualification_bootstrap"] == true || permission["purpose"] == "runtime_qualification"
++	if !wants {
++		return nil
++	}
++	if _, err = eligible(manifest, taskType); err != nil {
++		return err
++	}
++	effective, err := projected(config)
++	if err != nil {
++		return err
++	}
++	profileHash, err := Hash(profile)
++	if err != nil {
++		return err
++	}
++	configHash, err := Hash(config)
++	if err != nil {
++		return err
++	}
++	permissionHash, err := Hash(permission)
++	if err != nil {
++		return err
++	}
++	effectiveHash, err := Hash(effective)
++	if err != nil {
++		return err
++	}
++	ref, err := ownedMap(admission["profile_ref"].(map[string]any))
++	if err != nil {
++		return err
++	}
++	manifest[ProjectionField] = map[string]any{"schema": ProjectionSchema, "project_id": manifest["project_id"], "task_id": manifest["task_id"], "run_id": manifest["run_id"], "epoch": manifest["epoch"], "runtime_id": manifest["runtime_id"], "dispatch_key": manifest["dispatch_key"], "task_type": taskType, "profile_ref": ref, "profile_hash": admission["profile_hash"], "source_profile_body_hash": profileHash, "source_model_config_hash": configHash, "qualification_plan_hash": permission["plan_hash"], "permission_hash": permissionHash, "effective_model_config_hash": effectiveHash, "policy": map[string]any{"max_model_calls": 1, "max_tool_calls": 0}}
++	return nil
++}
++
++// Effective returns an owned configuration. Absence is the explicit legacy path;
++// a present but invalid marker can never silently use the original configuration.
++func Effective(manifest map[string]any, actualTaskType string) (map[string]any, error) {
++	markerValue, exists := manifest[ProjectionField]
++	if !exists {
++		admission, ok := manifest["admission"].(map[string]any)
++		if !ok {
++			return nil, errors.New("legacy admission missing")
++		}
++		profile, ok := admission["profile"].(map[string]any)
++		if !ok {
++			return nil, errors.New("legacy profile missing")
++		}
++		config, ok := profile["model_config"].(map[string]any)
++		if !ok {
++			return nil, errors.New("legacy model config missing")
++		}
++		return ownedMap(config)
++	}
++	admission, profile, config, permission, err := projectionInput(manifest)
++	if err != nil {
++		return nil, err
++	}
++	marker, ok := markerValue.(map[string]any)
++	if !ok || len(marker) != len(markerFields) {
++		return nil, errors.New("projection marker field set invalid")
++	}
++	for _, key := range markerFields {
++		if _, ok = marker[key]; !ok {
++			return nil, fmt.Errorf("projection marker missing %s", key)
++		}
++	}
++	if marker["schema"] != ProjectionSchema || marker["task_type"] != "runtime_qualification" || (actualTaskType != "" && actualTaskType != "runtime_qualification") {
++		return nil, errors.New("projection schema or Task type invalid")
++	}
++	if _, err = eligible(manifest, "runtime_qualification"); err != nil {
++		return nil, err
++	}
++	for _, key := range []string{"project_id", "task_id", "run_id", "runtime_id", "dispatch_key", "epoch"} {
++		h1, e1 := Hash(marker[key])
++		h2, e2 := Hash(manifest[key])
++		if e1 != nil || e2 != nil || h1 != h2 {
++			return nil, fmt.Errorf("projection %s binding mismatch", key)
++		}
++	}
++	refHash, err := Hash(admission["profile_ref"])
++	if err != nil {
++		return nil, err
++	}
++	profileHash, err := Hash(profile)
++	if err != nil {
++		return nil, err
++	}
++	configHash, err := Hash(config)
++	if err != nil {
++		return nil, err
++	}
++	permissionHash, err := Hash(permission)
++	if err != nil {
++		return nil, err
++	}
++	refMarkerHash, err := Hash(marker["profile_ref"])
++	if err != nil {
++		return nil, err
++	}
++	if refMarkerHash != refHash || marker["profile_hash"] != admission["profile_hash"] || marker["source_profile_body_hash"] != profileHash || marker["source_model_config_hash"] != configHash || marker["qualification_plan_hash"] != permission["plan_hash"] || marker["permission_hash"] != permissionHash {
++		return nil, errors.New("projection immutable source binding mismatch")
++	}
++	policy, ok := marker["policy"].(map[string]any)
++	if !ok || len(policy) != 2 || !exactNumber(policy["max_model_calls"], 1) || !exactNumber(policy["max_tool_calls"], 0) {
++		return nil, errors.New("projection policy invalid")
++	}
++	effective, err := projected(config)
++	if err != nil {
++		return nil, err
++	}
++	effectiveHash, err := Hash(effective)
++	if err != nil {
++		return nil, err
++	}
++	if marker["effective_model_config_hash"] != effectiveHash {
++		return nil, errors.New("projection effective config hash mismatch")
++	}
++	return effective, nil
++}
+diff --git a/internal/runtimepolicy/qualification_projection_test.go b/internal/runtimepolicy/qualification_projection_test.go
+new file mode 100644
+index 00000000..e02bc3fe
+--- /dev/null
++++ b/internal/runtimepolicy/qualification_projection_test.go
+@@ -0,0 +1,144 @@
++package runtimepolicy
++
++import (
++	"encoding/json"
++	"reflect"
++	"testing"
++)
++
++func fixtureManifest(t *testing.T) map[string]any {
++	t.Helper()
++	tool := map[string]any{"type": "function", "function": map[string]any{"name": "run_check", "parameters": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}}
++	config := map[string]any{"api": "openai-completions", "model": "模型😀", "provider": "local", "ref": "source-ref", "route": "route-1", "endpoint": "http://127.0.0.1:1234/v1/chat/completions", "max_output_tokens": json.Number("2048"), "max_calls": json.Number("8"), "tools": []any{tool}}
++	configHash, err := Hash(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ref := map[string]any{"entity_type": "Artifact", "id": "profile-a", "revision": json.Number("1")}
++	refHash, err := Hash(ref)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return map[string]any{"project_id": "project-a", "task_id": "task-a", "run_id": "run-a", "runtime_id": "runtime-a", "dispatch_key": "dispatch-a", "epoch": json.Number("2"), "admission": map[string]any{"qualification_bootstrap": true, "profile_ref": ref, "profile_hash": refHash, "permission": map[string]any{"purpose": "runtime_qualification", "plan_hash": "sha256:plan-a"}, "profile": map[string]any{"backend": "mu-sdk-broker-v1", "model_config": config, "model_qualification": map[string]any{"route": "route-1", "model_config_hash": configHash, "max_calls": json.Number("1")}}}}
++}
++
++func TestQualificationProjectionPureAndTamper(t *testing.T) {
++	m := fixtureManifest(t)
++	before, _ := Hash(m)
++	if err := Prepare(m, "runtime_qualification"); err != nil {
++		t.Fatal(err)
++	}
++	effective, err := Effective(m, "runtime_qualification")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !exactNumber(effective["max_calls"], 1) || len(effective["tools"].([]any)) != 0 {
++		t.Fatalf("effective bounds: %v", effective)
++	}
++	original := m["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
++	if !exactNumber(original["max_calls"], 8) || len(original["tools"].([]any)) != 1 {
++		t.Fatal("source changed")
++	}
++	effective["model"] = "changed"
++	effective["tools"] = append(effective["tools"].([]any), map[string]any{"name": "injected"})
++	if original["model"] != "模型😀" || len(original["tools"].([]any)) != 1 {
++		t.Fatal("effective aliases source")
++	}
++	other, err := Effective(m, "")
++	if err != nil || other["model"] != "模型😀" {
++		t.Fatalf("nondeterministic derivation: %v", err)
++	}
++	for _, field := range markerFields {
++		mutated, _ := ownedMap(m)
++		changed := mutated[ProjectionField].(map[string]any)
++		delete(changed, field)
++		if _, err := Effective(mutated, ""); err == nil {
++			t.Errorf("missing %s accepted", field)
++		}
++	}
++	for _, field := range []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "task_type", "profile_ref", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"} {
++		mutated, _ := ownedMap(m)
++		changed := mutated[ProjectionField].(map[string]any)
++		changed[field] = "tampered"
++		if _, err := Effective(mutated, ""); err == nil {
++			t.Errorf("tampered %s accepted", field)
++		}
++	}
++	for _, field := range []string{"max_model_calls", "max_tool_calls"} {
++		mutated, _ := ownedMap(m)
++		changed := mutated[ProjectionField].(map[string]any)["policy"].(map[string]any)
++		changed[field] = json.Number("9")
++		if _, err := Effective(mutated, ""); err == nil {
++			t.Errorf("tampered policy %s accepted", field)
++		}
++	}
++	mutated, _ := ownedMap(m)
++	mutated[ProjectionField].(map[string]any)["extra"] = true
++	if _, err := Effective(mutated, ""); err == nil {
++		t.Fatal("extra marker field accepted")
++	}
++	for name, mutate := range map[string]func(map[string]any){
++		"purpose": func(x map[string]any) {
++			x["admission"].(map[string]any)["permission"].(map[string]any)["purpose"] = "mu_turn"
++		},
++		"bootstrap": func(x map[string]any) { x["admission"].(map[string]any)["qualification_bootstrap"] = false },
++		"config": func(x map[string]any) {
++			x["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)["route"] = "other"
++		},
++		"plan": func(x map[string]any) {
++			x["admission"].(map[string]any)["permission"].(map[string]any)["plan_hash"] = "other"
++		},
++	} {
++		mutated, _ := ownedMap(m)
++		mutate(mutated)
++		if _, err := Effective(mutated, ""); err == nil {
++			t.Errorf("tampered %s accepted", name)
++		}
++	}
++	after, _ := Hash(m)
++	if after == before {
++		t.Fatal("marker was not committed into manifest hash")
++	}
++}
++
++func TestQualificationProjectionLegacyAndCreation(t *testing.T) {
++	legacy := fixtureManifest(t)
++	original := legacy["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
++	got, err := Effective(legacy, "runtime_qualification")
++	if err != nil || !reflect.DeepEqual(got["tools"], original["tools"]) {
++		t.Fatal("legacy config changed", err)
++	}
++	if err := Prepare(legacy, "mu_turn"); err == nil {
++		t.Fatal("contradictory Task type accepted")
++	}
++	bad := fixtureManifest(t)
++	bad["admission"].(map[string]any)["profile"].(map[string]any)["model_qualification"].(map[string]any)["max_calls"] = 2
++	if err := Prepare(bad, "runtime_qualification"); err == nil {
++		t.Fatal("two-call qualification accepted")
++	}
++	normal := fixtureManifest(t)
++	normalAdmission := normal["admission"].(map[string]any)
++	normalAdmission["qualification_bootstrap"] = false
++	normalAdmission["permission"].(map[string]any)["purpose"] = "mu_turn"
++	if err := Prepare(normal, "mu_turn"); err != nil {
++		t.Fatal(err)
++	}
++	if _, exists := normal[ProjectionField]; exists {
++		t.Fatal("normal turn marked")
++	}
++	got, err = Effective(normal, "mu_turn")
++	if err != nil || !reflect.DeepEqual(got["tools"], original["tools"]) {
++		t.Fatal("normal turn schemas changed", err)
++	}
++}
++
++func TestQualificationProjectionHashGolden(t *testing.T) {
++	value := map[string]any{"😀": []any{map[string]any{"中": json.Number("1e0"), "n": json.Number("2.500")}}, "tools": []any{}}
++	got, err := Hash(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got != "sha256:bcce6b88b4df307036224038610c85590a86b6dc8254202f49f1dfe532131257" {
++		t.Fatalf("canonical hash drift: %s", got)
++	}
++}

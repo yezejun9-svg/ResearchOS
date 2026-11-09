@@ -1,0 +1,70 @@
+// Exact complete histories are derived before any settled predicate is used.
+// Each sequence keeps its original epoch. UNKNOWN is accepted as an earlier
+// row only when a genuine later row in the same history closes that outcome.
+type f08EffectHistory struct {key string;rows [][]any;bodies []map[string]any;reservation f08Version;costs []f08Version}
+func (v *f08ProofValidator) effectHistories(s *f08Sources,project,runID string,through int64)([]f08EffectHistory,[]f08Version,error){
+	groups:=map[string][][]any{};for _,row:=range s.selectRows("effects",[]int{0,1},[]any{project,runID}){groups[row[2].(string)]=append(groups[row[2].(string)],row)}
+	ledger:=map[string]f08Version{}
+	for _,r:=range s.rows["domain_versions"]{
+		if r[0]!=project || r[1]!="BudgetLedgerEntry"{continue};b,_,e:=f08RawObject(r[4]);if e!=nil{return nil,nil,e};if b["run_id"]!=runID{continue}
+		o,e:=v.version(s,project,map[string]any{"entity_type":"BudgetLedgerEntry","id":r[2],"revision":r[3],"content_hash":r[5]});if e!=nil{return nil,nil,e};if o.revision!=1{return nil,nil,f08Binding};ledger[o.id]=o
+	}
+	keys:=make([]string,0,len(groups));for key:=range groups{keys=append(keys,key)};sort.Strings(keys)
+	var result []f08EffectHistory;claimed:=map[string]bool{}
+	for _,key:=range keys{
+		rows:=groups[key];sort.Slice(rows,func(i,j int)bool{return f08ScalarCompare(rows[i][3],rows[j][3])<0})
+		history:=f08EffectHistory{key:key,rows:rows};var prior map[string]any
+		for i,row:=range rows{
+			sequence,e:=f08Integer(row[3],1);if e!=nil || sequence!=int64(i+1){return nil,nil,f08Binding}
+			b,_,e:=f08RawObject(row[4]);if e!=nil{return nil,nil,e}
+			if _,e=f08Object(b,"project_id","goal_id","task_id","run_id","key","request_hash","payload","reservation_id","state","epoch","context_bundle_id","checkpoint_artifact_id","receipt","sequence","observed_at");e!=nil{return nil,nil,e}
+			epoch,e:=f08Integer(b["epoch"],1);if e!=nil || epoch>through{return nil,nil,f08Binding}
+			if b["project_id"]!=project || b["run_id"]!=runID || b["key"]!=key || !f08Equal(b["sequence"],row[3]){return nil,nil,f08Binding}
+			if _,e=f08HashString(b["request_hash"]);e!=nil{return nil,nil,e}
+			if i==0{
+				if b["state"]!="PREPARED" || b["receipt"]!=nil{return nil,nil,f08Binding}
+				reserveID,e:=f08String(b["reservation_id"]);if e!=nil{return nil,nil,e};reserve,ok:=ledger[reserveID];if !ok{return nil,nil,f08Binding}
+				if reserve.body["reservation_id"]!=nil || reserve.body["provider_request_id"]!=key || reserve.body["operation"]!="RESERVE" && reserve.body["operation"]!="UNKNOWN"{return nil,nil,f08Binding}
+				cost:=map[string]any{};for _,name:=range []string{"policy_id","run_id","operation","money","provider_request_id","provider_event_id","reservation_id","cost_basis","occurred_at"}{cost[name]=reserve.body[name]}
+				if Hash([]any{b["payload"],cost})!=b["request_hash"]{return nil,nil,f08Binding};history.reservation=reserve;claimed[reserveID]=true
+			}else{
+				for _,name:=range []string{"project_id","goal_id","task_id","run_id","key","request_hash","payload","reservation_id","context_bundle_id","checkpoint_artifact_id"}{if !f08Equal(b[name],prior[name]){return nil,nil,f08Binding}}
+				from,to:=prior["state"],b["state"]
+				if from=="PREPARED"{if to!="STARTED" || b["receipt"]!=nil{return nil,nil,f08Binding}}else{
+					if from!="STARTED" && from!="UNKNOWN" || to!="UNKNOWN" && to!="CONFIRMED" && to!="NOT_APPLIED"{return nil,nil,f08Binding}
+					receipt,ok:=b["receipt"].(map[string]any);if !ok || len(receipt)==0 || !f08Equal(b["epoch"],prior["epoch"]){return nil,nil,f08Binding}
+				}
+			}
+			history.bodies=append(history.bodies,b);prior=b
+		}
+		if prior["state"]!="CONFIRMED" && prior["state"]!="NOT_APPLIED"{return nil,nil,f08Binding}
+		for id,cost:=range ledger{
+			if cost.body["reservation_id"]!=history.reservation.id{continue}
+			if cost.body["provider_request_id"]!=key || cost.body["policy_id"]!=history.reservation.body["policy_id"] || cost.body["operation"]=="RESERVE"{return nil,nil,f08Binding}
+			if cost.body["operation"]=="UNKNOWN" || cost.body["cost_basis"]!="ACTUAL" || cost.body["money"]==nil{return nil,nil,f08Binding}
+			history.costs=append(history.costs,cost);claimed[id]=true
+		}
+		// Selecting "the latest" ledger row by ID/time would invent the missing
+		// SQL rowid ordering. More than one settlement is preserved but blocked
+		// until the exact receipt-to-cost causal policy is implemented.
+		if len(history.costs)!=1{return nil,nil,f08NativeProofGap}
+		if prior["state"]=="CONFIRMED" && history.costs[0].body["operation"]!="COMMIT" && history.costs[0].body["operation"]!="RECONCILE"{return nil,nil,f08Binding}
+		if prior["state"]=="NOT_APPLIED" && history.costs[0].body["operation"]!="RELEASE" && history.costs[0].body["operation"]!="RECONCILE"{return nil,nil,f08Binding}
+		result=append(result,history)
+	}
+	var unclaimed []f08Version;for id,row:=range ledger{if !claimed[id]{unclaimed=append(unclaimed,row)}}
+	sort.Slice(unclaimed,func(i,j int)bool{return unclaimed[i].id<unclaimed[j].id});return result,unclaimed,nil
+}
+func f08EffectRows(histories []f08EffectHistory)[]any{
+	var rows []any
+	for _,h:=range histories{for i,row:=range h.rows{raw,_:=f08Hex(row[4]);rows=append(rows,map[string]any{"effect_key":h.key,"sequence":row[3],"epoch":h.bodies[i]["epoch"],"body_digest":f08RawHash(raw)})}}
+	sort.Slice(rows,func(i,j int)bool{x:=rows[i].(map[string]any);y:=rows[j].(map[string]any);return f08TupleLess([]any{x["epoch"],x["effect_key"],x["sequence"]},[]any{y["epoch"],y["effect_key"],y["sequence"]})});if rows==nil{return []any{}};return rows
+}
+
+// A captured prefix is compared per original key/sequence/raw digest. New
+// legal rows are not mistaken for replacement or silently used as old facts.
+func f08EffectPrefix(captured,current []any)error{
+	lookup:=map[string]any{};for _,row:=range current{m,e:=f08Object(row,"effect_key","sequence","epoch","body_digest");if e!=nil{return e};key,e:=f08Key([]any{m["effect_key"],m["sequence"]});if e!=nil{return e};if _,ok:=lookup[key];ok{return f08Binding};lookup[key]=m}
+	seen:=map[string]bool{};for _,row:=range captured{m,e:=f08Object(row,"effect_key","sequence","epoch","body_digest");if e!=nil{return e};key,e:=f08Key([]any{m["effect_key"],m["sequence"]});if e!=nil || seen[key] || !f08Equal(m,lookup[key]){return f08Binding};seen[key]=true}
+	return nil
+}

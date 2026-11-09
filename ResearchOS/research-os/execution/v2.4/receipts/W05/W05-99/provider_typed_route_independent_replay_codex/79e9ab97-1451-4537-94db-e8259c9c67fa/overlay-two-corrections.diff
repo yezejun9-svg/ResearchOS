@@ -1,0 +1,67 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\provider_typed_route_independent_replay_codex\cc88ef8c-d066-4b10-b6c5-1d9bba89baad\independent_provider_public_boundary_windows_test.go
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\provider_typed_route_independent_replay_codex\79e9ab97-1451-4537-94db-e8259c9c67fa\independent_provider_public_boundary_windows_test.go
+@@ -21,10 +21,11 @@
+ 	records  []any
+ 	restored bool
+ 	root     string
++ expectedDestination string
+ }
+ 
+-func (s *independentWorkspace) SnapshotWorkspace(_ context.Context, b WorkspaceBinding, principal string, _ BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
+-	if Hash(b) != Hash(s.expected) || principal != "fixture-author" || b.AuthorizedRef != "tool-workspace" || b.Access != "READ_ONLY" || b.ProjectID == nil || *b.ProjectID != "00172b0dce9cbf45a78a9625552efd10" {
++func (s *independentWorkspace) SnapshotWorkspace(_ context.Context, b WorkspaceBinding, destination string, _ BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
++	if Hash(b) != Hash(s.expected) || filepath.Clean(destination) != filepath.Clean(s.expectedDestination) || b.PrincipalID != s.expected.PrincipalID || b.AuthorizedRef != "tool-workspace" || b.Access != "READ_ONLY" || b.ProjectID == nil || *b.ProjectID != "00172b0dce9cbf45a78a9625552efd10" {
+ 		return BackupWorkspaceSnapshot{}, fmt.Errorf("SYNTHETIC_WORKSPACE_IDENTITY_MISMATCH")
+ 	}
+ 	witness := []byte("workspace-file-observation-7719")
+@@ -38,7 +39,7 @@
+ 		}
+ 	}
+ 	s.calls++
+-	s.records = append(s.records, Object{"binding": b, "principal": principal, "synthetic": true, "original_filesystem_read": false, "witness_hash": Digest(witness), "witness_bytes": len(witness)})
++	s.records = append(s.records, Object{"binding": b, "principal": b.PrincipalID, "destination": destination, "synthetic": true, "original_filesystem_read": false, "witness_hash": Digest(witness), "witness_bytes": len(witness)})
+ 	return BackupWorkspaceSnapshot{Directories: []string{}, Files: []BackupWorkspaceFile{{Path: "evidence.txt", Data: witness}}}, nil
+ }
+ func independentWrite(t *testing.T, path string, v any) {
+@@ -526,9 +527,12 @@
+ 		refs[n] = Object{"sha256": Digest(b), "bytes": len(b)}
+ 	}
+ 	var idx backupWorkspaceIndex
+-	if e = json.Unmarshal(files["workspace-index.json"], &idx); e != nil {
+-		t.Fatal("workspace index", e)
+-	}
++	if wantWorkspace {
++ if e = json.Unmarshal(files["workspace-index.json"], &idx); e != nil || idx.Format != "RESEARCHOS_WORKSPACE_SNAPSHOT_V1" { t.Fatal("workspace index", e) }
++ } else {
++ for name := range files { if strings.HasPrefix(name,"workspace-") { t.Fatal("unexpected workspace decoded resource",name) } }
++ for _, entry := range m.Files { if strings.HasPrefix(entry.Name,"workspace-") { t.Fatal("unexpected workspace manifest resource",entry.Name) } }
++ }
+ 	if wantWorkspace {
+ 		if len(idx.Roots) != 1 || idx.Roots[0].Ref != "tool-workspace" || len(idx.Roots[0].Files) != 1 || len(idx.Roots[0].Directories) != 0 {
+ 			t.Fatal("workspace root/file bound")
+@@ -634,6 +638,7 @@
+ 		t.Fatal(e)
+ 	}
+ 	hasWorkspace := spec["id"] == "0"
++ if !hasWorkspace { var allBindings int; if e=db.QueryRow(`SELECT count(*) FROM domain_objects WHERE kind='WorkspaceBinding'`).Scan(&allBindings); e!=nil || allBindings!=0 { t.Fatal("original all WorkspaceBinding rows must be zero",allBindings,e) }; result["original_all_workspace_binding_count"]=allBindings }
+ 	var ws *independentWorkspace
+ 	if hasWorkspace {
+ 		if len(bindings) != 1 {
+@@ -643,7 +648,7 @@
+ 		if b.HostPrincipalRef != "fixture-local-user" || b.Revision != 1 || b.Status != "ACTIVE" || b.ClientID != "mu-client" {
+ 			t.Fatal("original fixed workspace metadata")
+ 		}
+-		ws = &independentWorkspace{expected: b}
++		ws = &independentWorkspace{expected: b, expectedDestination: filepath.Join(dir, "archive")}
+ 	} else if len(bindings) != 0 {
+ 		t.Fatal("unexpected workspace")
+ 	}
+@@ -799,7 +804,7 @@
+ 		if er != nil || len(bs) != 1 {
+ 			t.Fatal(er)
+ 		}
+-		rews = &independentWorkspace{expected: bs[0], restored: true, root: BackupWorkspaceDestination(destination, "tool-workspace")}
++		rews = &independentWorkspace{expected: bs[0], restored: true, root: BackupWorkspaceDestination(destination, "tool-workspace"), expectedDestination: again}
+ 		_, e = rsvc.CreateBackupWithWorkspaces(context.Background(), again, key, rews)
+ 	} else {
+ 		_, e = rsvc.CreateBackup(context.Background(), again, key)

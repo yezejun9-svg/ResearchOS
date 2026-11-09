@@ -1,0 +1,151 @@
+# Dedicated CLI_ROOT_CLOSURE.v2 verifier. Q, executor, and launcher still use sealed_manifest().
+CLI_ROOT_CLOSURE_MF = {
+    'path': 'D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W13/W13-03/current58_cli_terminal_closure_codex/8f8e7259f3b8459f8de4ad05ca885c78/root-launch.closed.manifest.json',
+    'sha256': 'fcc7ce41a76ca517ff607453e3bd9244b0881b186b74a45bafa6d2375aba036e',
+    'bytes': 53626,
+}
+CLI_ROOT_CLOSURE_PRODUCER = {
+    'path': 'D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W13/W13-03/current58_cli_terminal_closure_revision_preparation_codex/f7d6a38fd86e45af951cf022cf7514b5/close-root-launch.current58.v2.proposed.py',
+    'sha256': 'cf88fcddb16fae72407fb23e3bfa32f0d802413d4986616d60d6a12103c6091c',
+    'bytes': 14239,
+}
+CLI_ROOT_CLOSURE_COMPLETION = {
+    'path': 'D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W13/W13-03/current58_cli_terminal_closure_codex/8f8e7259f3b8459f8de4ad05ca885c78/root-launch.outer-completion.json',
+    'sha256': '8361296d8ce72579d5ed07ec0c1829df104b76934ef03b043d9d15a48d60ee5f',
+    'bytes': 10490429,
+}
+CLI_ROOT_REQUEST_KEYS = (
+    'scope_ref', 'grant_ref', 'caller_ref', 'caller_intent_ref',
+    'caller_invocation_ref', 'tool_observation_ref',
+    'terminal_action_input_ref', 'terminal_tool_result_ref',
+    'executor_manifest_ref', 'launcher_manifest_ref',
+)
+
+
+def sealed_cli_root_closure(reader, manifest_ref, completion_ref, scope_ref,
+                            grant_ref, executor_manifest_ref, launcher_manifest_ref,
+                            executor_members, launcher_members, run_uuid):
+    """Validate exactly the pinned Root producer READS union; no generic multi-root rule."""
+    same_ref(reader, manifest_ref, CLI_ROOT_CLOSURE_MF)
+    same_ref(reader, completion_ref, CLI_ROOT_CLOSURE_COMPLETION)
+    doc = reader.doc(manifest_ref)
+    require(set(doc) == {'schema','actor','members',
+                         'original_registration_manifests_unchanged',
+                         'source_acceptance','formal_increment'} and
+            doc['schema'] == 'researchos.root-launch-closure-manifest.v2' and
+            doc['actor'] == 'codex:/root' and
+            doc['original_registration_manifests_unchanged'] is True and
+            doc['source_acceptance'] is False and doc['formal_increment'] == 0,
+            'Unknown or promoted CLI Root closure manifest')
+    rows = doc['members']
+    require(type(rows) is list and len(rows) == 169, 'CLI Root READS cardinality')
+    members = {}
+    manifest_path = bounded_path(manifest_ref['path'])
+    ordered = []
+    for row in rows:
+        require(type(row) is dict and set(row) == {'path','sha256','bytes'},
+                'CLI Root member ref shape')
+        path = bounded_path(row['path'])
+        key = str(path)
+        require(path != manifest_path and key not in members,
+                'CLI Root duplicate/self/alias')
+        reader.verify(row)
+        members[key] = row
+        ordered.append(key)
+    require(ordered == sorted(ordered), 'CLI Root producer sorted READS')
+    completion = member(reader, members, completion_ref)
+    require(completion['schema'] == 'researchos.root-actual-launch-completion.v2' and
+            completion['actor'] == 'codex:/root' and
+            completion['run_uuid'] == run_uuid and completion['source_commit'] == SOURCE and
+            completion['closure_kind'] == 'TERMINAL_EVIDENCE_RECORDED_NOT_QUALIFICATION' and
+            completion['source_acceptance'] is False and completion['formal_increment'] == 0 and
+            completion['fresh_compile_qualification'] is False and
+            completion['complete_current58_source_validation'] is False and
+            completion['case_qualification'] is False and
+            completion['caller_OS_lifecycle_qualification'] is False and
+            completion['completion_live_canonical_observed'] is False and
+            completion['independent_qualification'] == 'PENDING' and
+            completion['executor_manifest_all_members_verified'] is True and
+            completion['launcher_manifest_all_members_verified'] is True,
+            'CLI Root terminal record must not become qualification')
+    request_ref = completion['closure_request_ref']
+    request = member(reader, members, request_ref)
+    require(request['schema'] == 'researchos.current58-root-terminal-closure-request.v1' and
+            request['run_uuid'] == run_uuid and request['source_commit'] == SOURCE and
+            bounded_path(request['new_closure_output_root']) == manifest_path.parent,
+            'CLI Root request identity/output')
+    for left, right in ((request['scope_ref'], scope_ref),
+                        (request['grant_ref'], grant_ref),
+                        (request['executor_manifest_ref'], executor_manifest_ref),
+                        (request['launcher_manifest_ref'], launcher_manifest_ref),
+                        (completion['source_scope_ref'], scope_ref),
+                        (completion['grant_ref'], grant_ref),
+                        (completion['executor_manifest_ref'], executor_manifest_ref),
+                        (completion['launcher_manifest_ref'], launcher_manifest_ref)):
+        same_ref(reader, left, right)
+    for key in CLI_ROOT_REQUEST_KEYS:
+        require(key in request, 'Missing CLI Root request input: ' + key)
+    for key in ('caller_ref','caller_invocation_ref','tool_observation_ref',
+                'terminal_action_input_ref','terminal_tool_result_ref'):
+        same_ref(reader, completion[key], request[key])
+    cli_scope = reader.doc(scope_ref)
+    require(cli_scope['run_uuid'] == run_uuid and cli_scope['source_commit'] == SOURCE and
+            bounded_path(request['caller_output_root']).is_relative_to(ROOT) and
+            bounded_path(request['executor_manifest_ref']['path']).parent ==
+                bounded_path(cli_scope['new_output_root']) and
+            bounded_path(request['launcher_manifest_ref']['path']).parent ==
+                bounded_path(cli_scope['new_wrapper_root']),
+            'CLI Root execution roots differ')
+    grant = reader.doc(grant_ref)
+    require(grant['binding']['run_uuid'] == run_uuid and
+            grant['binding']['source_commit'] == SOURCE and
+            type(grant['canonical_copies']) is list and len(grant['canonical_copies']) == 4,
+            'CLI Root grant original copies')
+    same_ref(reader, grant['scope_ref'], scope_ref)
+    caller = reader.doc(request['caller_invocation_ref'])
+    intent = reader.doc(request['caller_intent_ref'])
+    require(caller['scope_ref'] == request['scope_ref'] and
+            caller['grant_ref'] == request['grant_ref'] and
+            intent['scope_ref'] == request['scope_ref'] and
+            intent['grant_ref'] == request['grant_ref'] and
+            bounded_path(request['caller_invocation_ref']['path']).parent ==
+                bounded_path(request['caller_output_root']) and
+            bounded_path(request['caller_intent_ref']['path']).parent ==
+                bounded_path(request['caller_output_root']) and
+            caller['caller_OS_lifecycle_qualification'] is False and
+            caller['automatic_retry'] is False and caller['counter_reset'] is False and
+            intent['caller_OS_lifecycle_qualification'] is False and
+            intent['automatic_retry'] is False and intent['counter_reset'] is False,
+            'CLI Root caller origin or OS qualification')
+    require(type(request['additional_sealed_refs']) is list and
+            len(request['additional_sealed_refs']) == 19,
+            'CLI Root added source/review facts')
+    expected = {}
+    def add(ref):
+        normalized = absolute_ref(reader, ref)
+        key = str(bounded_path(normalized['path']))
+        prior = expected.get(key)
+        require(prior is None or prior == normalized, 'Conflicting CLI Root READS pin')
+        expected[key] = normalized
+    add(request_ref)
+    add(completion_ref)
+    add(CLI_ROOT_CLOSURE_PRODUCER)
+    for key in CLI_ROOT_REQUEST_KEYS:
+        add(request[key])
+    for ref in request['additional_sealed_refs']:
+        add(ref)
+    for row in executor_members.values():
+        add(row)
+    for row in launcher_members.values():
+        add(row)
+    for row in grant['canonical_copies']:
+        add(row['ref'])
+    for key in ('stdout_ref','stderr_ref'):
+        if caller[key] is not None:
+            add(caller[key])
+    require(set(expected) == set(members), 'CLI Root READS exact union differs')
+    for key, expected_ref in expected.items():
+        same_ref(reader, members[key], expected_ref)
+    return members
+
+

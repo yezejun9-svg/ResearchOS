@@ -1,0 +1,134 @@
+730: 	go func() { done <- c.RunAdmitted(context.Background(), route, r.run, r.lease) }()
+731: 	select {
+732: 	case <-entered:
+733: 	case <-time.After(10 * time.Second):
+734: 		t.Fatal("MODEL broker did not reach provider")
+735: 	}
+736: 	deadline := time.Now().Add(10 * time.Second)
+737: 	for {
+738: 		var locator string
+739: 		_ = r.f.db.QueryRow("SELECT journal_locator FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator)
+740: 		if locator != "" {
+741: 			raw, _ := os.ReadFile(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "bridge.json"))
+742: 			j, _ := Decode(raw)
+743: 			frames, _ := Num(j, "frames")
+744: 			if frames == 3 {
+745: 				break
+746: 			}
+747: 		}
+748: 		if time.Now().After(deadline) {
+749: 			t.Fatal("blocked MODEL did not overlap third frame")
+750: 		}
+751: 		time.Sleep(10 * time.Millisecond)
+752: 	}
+753: 	close(release)
+754: 	var result error
+755: 	select {
+756: 	case result = <-done:
+757: 	case <-time.After(10 * time.Second):
+758: 		t.Fatal("broker admission fence did not join admitted goroutine")
+759: 	}
+760: 	var typed *qualificationPreEffectRejection
+761: 	if result == nil || errors.As(result, &typed) || calls.Load() != 1 {
+762: 		t.Fatalf("blocked MODEL imported typed failure: %v calls=%d", result, calls.Load())
+763: 	}
+764: 	var status, dispatchState string
+765: 	if err := r.f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE kind='Run' AND id=?", r.run["id"]).Scan(&status); err != nil {
+766: 		t.Fatal(err)
+767: 	}
+768: 	if err := r.f.db.QueryRow("SELECT state FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&dispatchState); err != nil {
+769: 		t.Fatal(err)
+770: 	}
+771: 	var closure int
+772: 	if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&closure); err != nil {
+773: 		t.Fatal(err)
+774: 	}
+775: 	if status != "RUNNING" || dispatchState != "UNKNOWN" || closure != 0 {
+776: 		t.Fatalf("blocked MODEL broker closed: run=%s dispatch=%s closure=%d", status, dispatchState, closure)
+777: 	}
+778: }
+779: 
+780: func TestQualificationFailureClosureAtomicFaultMatrix(t *testing.T) {
+781: 	third := "emit({sequence:3,type:'effect.request',key:subject+':tool:1',route,capability:'TOOL',payload:{name:'run_check',arguments:{}}});"
+782: 	delayedChild := strings.Replace(qualificationDenialChild, third, "setTimeout(() => { "+third+" }, 1500);", 1)
+783: 	if delayedChild == qualificationDenialChild {
+784: 		t.Fatal("test child delay replacement missed")
+785: 	}
+786: 	for _, fault := range []struct{ name, table, timing, predicate string }{
+787: 		{"upload_insert", "uploaded_content", "BEFORE INSERT", "NEW.sealed=0"},
+788: 		{"artifact_version", "domain_versions", "BEFORE INSERT", "NEW.kind='Artifact'"},
+789: 		{"artifact_object", "domain_objects", "BEFORE INSERT", "NEW.kind='Artifact'"},
+790: 		{"upload_seal", "uploaded_content", "BEFORE UPDATE", "OLD.sealed=0 AND NEW.sealed=1"},
+791: 		{"link_version", "domain_versions", "BEFORE INSERT", "NEW.kind='ImpactLink'"},
+792: 		{"observation", "runtime_observations", "BEFORE INSERT", "1=1"},
+793: 		{"dispatch", "runtime_dispatches", "BEFORE UPDATE", "NEW.state='OBSERVED'"},
+794: 		{"run_version", "domain_versions", "BEFORE INSERT", "NEW.kind='Run' AND json_extract(NEW.body,'$.status')='FAILED'"},
+795: 		{"run_object", "domain_objects", "BEFORE UPDATE", "NEW.kind='Run' AND json_extract(NEW.body,'$.status')='FAILED'"},
+796: 		{"state_version", "domain_versions", "BEFORE INSERT", "NEW.kind='ProjectState'"},
+797: 		{"state_object", "domain_objects", "BEFORE UPDATE", "NEW.kind='ProjectState'"},
+798: 		{"event_version", "domain_versions", "BEFORE INSERT", "NEW.kind='EventEnvelope'"},
+799: 		{"event_object", "domain_objects", "BEFORE INSERT", "NEW.kind='EventEnvelope'"},
+800: 		{"outbox", "outbox", "BEFORE INSERT", "1=1"},
+801: 		{"snapshot", "event_state_snapshots", "BEFORE INSERT", "1=1"},
+802: 		{"marker", "idempotency", "BEFORE INSERT", "NEW.operation='host:qualification-failure-closure'"},
+803: 	} {
+804: 		t.Run(fault.name, func(t *testing.T) {
+805: 			c, route, r, calls := qualificationFailureLoopbackFixtureChild(t, delayedChild)
+806: 			epoch, err := Num(r.run, "lease_epoch")
+807: 			if err != nil {
+808: 				t.Fatal(err)
+809: 			}
+810: 			modelKey := fmt.Sprintf("%s:%s:%d:model:1", r.task["id"], r.run["id"], epoch)
+811: 			done := make(chan error, 1)
+812: 			go func() { done <- c.RunAdmitted(context.Background(), route, r.run, r.lease) }()
+813: 			deadline := time.Now().Add(12 * time.Second)
+814: 			for {
+815: 				var state string
+816: 				_ = r.f.db.QueryRow("SELECT json_extract(body,'$.state') FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence DESC LIMIT 1", r.f.project, r.run["id"], modelKey).Scan(&state)
+817: 				if state == "CONFIRMED" {
+818: 					break
+819: 				}
+820: 				select {
+821: 				case early := <-done:
+822: 					t.Fatalf("worker ended before MODEL confirmation: %v", early)
+823: 				default:
+824: 				}
+825: 				if time.Now().After(deadline) {
+826: 					t.Fatal("MODEL confirmation did not arrive")
+827: 				}
+828: 				time.Sleep(10 * time.Millisecond)
+829: 			}
+830: 			trigger := fmt.Sprintf("CREATE TRIGGER b_closure_fault %s ON %s WHEN %s BEGIN SELECT RAISE(ABORT,'b-closure-injected'); END", fault.timing, fault.table, fault.predicate)
+831: 			if _, err := r.f.db.Exec(trigger); err != nil {
+832: 				t.Fatal(err)
+833: 			}
+834: 			result := <-done
+835: 			if result == nil || !strings.Contains(result.Error(), "qualification grants no unplanned effect authority") || !strings.Contains(result.Error(), "b-closure-injected") || calls.Load() != 1 {
+836: 				t.Fatalf("fault did not cut actual closure after MODEL: %v calls=%d", result, calls.Load())
+837: 			}
+838: 			var status, dispatchState string
+839: 			if err := r.f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE kind='Run' AND id=?", r.run["id"]).Scan(&status); err != nil {
+840: 				t.Fatal(err)
+841: 			}
+842: 			if err := r.f.db.QueryRow("SELECT state FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&dispatchState); err != nil {
+843: 				t.Fatal(err)
+844: 			}
+845: 			if status != "RUNNING" || dispatchState != "UNKNOWN" {
+846: 				t.Fatalf("fault did not preserve unclosed UNKNOWN: run=%s dispatch=%s", status, dispatchState)
+847: 			}
+848: 			var closure, obs, proofArtifacts int
+849: 			if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&closure); err != nil {
+850: 				t.Fatal(err)
+851: 			}
+852: 			if err := r.f.db.QueryRow("SELECT count(*) FROM runtime_observations WHERE run=?", r.run["id"]).Scan(&obs); err != nil {
+853: 				t.Fatal(err)
+854: 			}
+855: 			if err := r.f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.produced_by') LIKE 'local-scheduler-%'", r.f.project).Scan(&proofArtifacts); err != nil {
+856: 				t.Fatal(err)
+857: 			}
+858: 			if closure != 0 || obs != 0 || proofArtifacts != 0 {
+859: 				t.Fatalf("transaction partially committed: closure=%d obs=%d proof=%d", closure, obs, proofArtifacts)
+860: 			}
+861: 		})
+862: 	}
+863: }

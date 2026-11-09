@@ -1,0 +1,469 @@
+apps/desktop/build-development.py
+245: def mu_compiled_closure(common, worktree, metadata, node, stage, receipts, env, run):
+246:     script = stage / "mu-metafile.mjs"
+247:     script.write_text(MU_META_SCRIPT, encoding="utf-8", newline="\n")
+248:     raw = run(receipts, "mu-compiled-inputs", [node, script, worktree, common, stage / "mu-worker.mjs"], worktree, env)
+249:     compiled = json.loads(raw)
+250:     if compiled.get("output_sha256") != metadata["bundle_sha256"] or compiled.get("esbuild_version") != "0.28.2":
+251:         raise RuntimeError("Mu independent compiled-input closure differs from producer output")
+252:     paths = [Path(name) for name in compiled["inputs"]]
+253:     for dependency in [common / "third_party/mu/node_modules/esbuild", common / "third_party/mu/node_modules/@esbuild/win32-x64"]:
+254:         if not dependency.is_dir() or dependency.is_symlink():
+255:             raise RuntimeError("Mu esbuild package/tool unavailable")
+256:         paths.extend(path for path in dependency.rglob("*") if path.is_file())
+257:     return {"compiled_input_count": len(compiled["inputs"]), "files": file_rows(paths)}
+258: 
+259: 
+260: def run_command(receipts, name, argv, cwd, env):
+261:     location = receipts / "commands" / name
+262:     location.mkdir(parents=True, exist_ok=False)
+263:     invocation = {"argv": [str(item) for item in argv], "cwd": str(cwd),
+264:                   "environment": {key: env.get(key) for key in ["GOENV", "GOTOOLCHAIN", "GOPATH", "GOMODCACHE", "GOCACHE", "GOTMPDIR", "GOPROXY", "GOSUMDB", "TEMP", "TMP"]}}
+265:     put(location / "recipe.json", invocation)
+266:     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+267:     with (location / "stdout.raw").open("xb") as stdout, (location / "stderr.raw").open("xb") as stderr:
+268:         process = subprocess.Popen([str(item) for item in argv], cwd=cwd, env=env,
+269:                                    stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
+270:         code = process.wait()
+271:     ended = datetime.datetime.now(datetime.timezone.utc).isoformat()
+272:     put(location / "result.json", {"started_at": started, "ended_at": ended, "pid": process.pid,
+273:                                    "native_exit": code, "stdout_sha256": sha256(location / "stdout.raw"),
+274:                                    "stderr_sha256": sha256(location / "stderr.raw")})
+275:     if code:
+276:         raise RuntimeError(f"{name} exited {code}; retained {location}")
+277:     return (location / "stdout.raw").read_bytes()
+278: 
+279: 
+280: def build(args):
+281:     output, receipts = Path(args.output).resolve(), Path(args.receipts).resolve()
+282:     allowed_output = ROOT / ".local"
+283:     if not output.is_relative_to(allowed_output) or output.exists() or receipts.exists():
+284:         raise RuntimeError("output and receipts must be new approved locations")
+285:     if not (ROOT / "apps/desktop/build-validator.py").is_file():
+286:         raise RuntimeError("baseline client-wire builder missing")
+287:     lock = json.loads((ROOT / "execution/toolchains/locked.json").read_bytes())
+288:     tools = {"go": Path(args.go).resolve(), "node": Path(args.node).resolve(),
+289:              "python": Path(sys.executable).resolve(), "electron": Path(args.electron_dist).resolve() / "electron.exe"}
+290:     for name, path in tools.items():
+291:         expected = lock["tools"].get(name, {}).get("sha256") if name != "electron" else "8d205e25b40da3ada4a08c92f32bfbd8e8d38edb4bfe443deea77fc9de685bac"
+292:         if not regular(path) or sha256(path) != expected:
+293:             raise RuntimeError(f"locked {name} unavailable or changed")
+294:     if not Path(args.module_cache).is_dir() or not Path(args.web_modules).is_dir():
+295:         raise RuntimeError("offline module cache unavailable")
+296:     migrations = validate_migrations(ROOT)
+297:     required_contracts = ["spec/v2.0/contracts/domain.schema.json", "spec/v2.0/contracts/openapi.json",
+298:                           "internal/api/contracts/client.protocol.schema.json", "internal/api/contracts/domain.schema.json"]
+299:     for relative in required_contracts:
+300:         if not regular(ROOT / relative):
+301:             raise RuntimeError(f"Core cwd contract missing: {relative}")
+302:     mu_common = Path(args.mu_common).resolve()
+303:     common_raw = git("rev-parse", "--git-common-dir").decode("utf-8").strip()
+304:     common_dir = Path(common_raw)
+305:     if not common_dir.is_absolute():
+306:         common_dir = (ROOT / common_dir).resolve()
+307:     if mu_common != common_dir.parent.resolve():
+308:         raise RuntimeError("Mu common Main differs from build.mjs git-common-dir selection")
+309:     mu_public = {relative: mu_common / relative for relative in ["execution/v2.4/component_lock.json",
+310:                  "third_party/VENDORED_FROM.md", "third_party/mu.MANIFEST.json",
+311:                  "third_party/mu/node_modules/esbuild/package.json"]}
+312:     if any(not regular(path) for path in mu_public.values()):
+313:         raise RuntimeError("public Main Mu vendor or esbuild inputs unavailable")
+314:     if not (ROOT / ".git").exists():
+315:         raise RuntimeError("source must remain a registered worktree")
+316:     source_before = source_snapshot()
+317:     receipts.mkdir(parents=True, exist_ok=False)
+318:     output.parent.mkdir(parents=True, exist_ok=True)
+319:     put(receipts / "source.before.json", source_before)
+320:     vendor_before = mu_vendor_closure(mu_common)
+321:     put(receipts / "mu-vendor-5083.before.json", vendor_before)
+322:     public_before = {name: {"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
+323:                      for name, path in mu_public.items()}
+324:     put(receipts / "external-public.before.json", public_before)
+325:     go_cache = output.with_name(output.name + "-go-cache")
+326:     go_tmp = output.with_name(output.name + "-go-tmp")
+327:     temp = output.with_name(output.name + "-temp")
+328:     mu_stage = output.with_name(output.name + "-mu-stage")
+329:     client_stage = output.with_name(output.name + "-client-stage")
+330:     client_receipts = output.with_name(output.name + "-client-receipts")
+331:     for location in [go_cache, go_tmp, temp, mu_stage, client_stage, client_receipts]:
+332:         if location.exists():
+333:             raise RuntimeError(f"fresh build scratch already exists: {location}")
+334:     for location in [go_cache, go_tmp, temp]:
+335:         location.mkdir()
+336:     env = os.environ.copy()
+337:     env.update({"GOENV": "off", "GOTOOLCHAIN": "local", "GOROOT": str(tools["go"].parent.parent),
+338:                 "GOPATH": str(Path(args.module_cache).resolve().parent.parent),
+339:                 "GOMODCACHE": str(Path(args.module_cache).resolve()), "GOCACHE": str(go_cache),
+340:                 "GOTMPDIR": str(go_tmp), "GOPROXY": "off", "GOSUMDB": "off",
+341:                 "TEMP": str(temp), "TMP": str(temp), "PYTHONDONTWRITEBYTECODE": "1"})
+342:     core_go_list = run_command(receipts, "core-go-list", [tools["go"], "list", "-deps", "-compiled", "-json", "./apps/control"], ROOT, env)
+343:     verifier_go_list = run_command(receipts, "verifier-go-list", [tools["go"], "list", "-deps", "-compiled", "-json", "./apps/runtime-verifier"], ROOT, env)
+344:     go_before = go_compiled_closure([core_go_list, verifier_go_list], tools["go"].parent.parent)
+345:     put(receipts / "core-verifier-go-inputs.before.json", go_before)
+346:     mu_output = mu_stage / "mu-worker.mjs"
+347:     mu_raw = run_command(receipts, "mu-source-build",
+348:                          [tools["node"], ROOT / "adapters/runtime/mu/build.mjs", mu_output], ROOT, env)
+349:     mu_meta = json.loads((Path(str(mu_output) + ".build.json")).read_bytes())
+350:     if mu_meta.get("mu_commit") != MU_COMMIT or mu_meta.get("vendored_files_verified") != 5083 or \
+351:        mu_meta.get("source_sha256") != sha256(ROOT / "adapters/runtime/mu/worker.mjs") or \
+352:        mu_meta.get("bundle_sha256") != sha256(mu_output) or mu_meta.get("bundle_bytes") != mu_output.stat().st_size:
+353:         raise RuntimeError("current source Mu producer outcome mismatch")
+354:     producer_stdout = json.loads(mu_raw.decode("utf-8").strip())
+355:     if producer_stdout != mu_meta:
+356:         raise RuntimeError("Mu producer stdout and metadata differ")
+357:     mu_compiled_before = mu_compiled_closure(mu_common, ROOT, mu_meta, tools["node"], mu_stage, receipts, env, run_command)
+358:     put(receipts / "mu-compiled-inputs.before.json", mu_compiled_before)
+359:     run_command(receipts, "client-wire-source-build",
+360:                 [tools["python"], "-B", "-X", "utf8", ROOT / "apps/desktop/build-validator.py",
+361:                  "--go", tools["go"], "--node", tools["node"], "--electron", tools["electron"],
+362:                  "--module-cache", Path(args.module_cache).resolve(), "--web-modules", Path(args.web_modules).resolve(),
+363:                  "--output", client_stage, "--receipts", client_receipts], ROOT, env)
+364:     copy_tree(client_receipts, receipts / "client-wire-builder")
+365:     client_result = json.loads((client_receipts / "result.json").read_bytes())
+366:     if client_result.get("status") != "BUILT_NOT_TESTED" or client_result.get("drift") != []:
+367:         raise RuntimeError("client-wire source build not clean")
+368:     if source_snapshot() != source_before:
+369:         raise RuntimeError("source changed during client-wire module digest build")
+370:     output.mkdir(parents=True, exist_ok=False)
+371:     exact_copy(ROOT / "apps/desktop/launch-development.mjs", output / "launch-development.mjs")
+372:     exact_copy(ROOT / "apps/desktop/build-development.py", output / "tools/build-development.py")
+373:     for relative in ["apps/desktop/main", "apps/desktop/preload", "apps/web/dist"]:
+374:         copy_tree(client_stage / relative, output / relative)
+375:     exact_copy(client_stage / "apps/desktop/package.json", output / "apps/desktop/package.json")
+376:     copy_tree(client_stage / "apps/desktop/resources/client-wire", output / "apps/desktop/resources/client-wire")
+377:     for relative in required_contracts:
+378:         exact_copy(ROOT / relative, output / relative)
+379:     for source in migrations:
+380:         exact_copy(source, output / "migrations/sqlite" / source.name)
+381:     control = output / "apps/desktop/resources/control"
+382:     control.mkdir(parents=True)
+383:     run_command(receipts, "core-go-build", [tools["go"], "build", "-mod=readonly", "-trimpath", "-o", control / "researchos-control.exe", "./apps/control"], ROOT, env)
+384:     run_command(receipts, "verifier-go-build", [tools["go"], "build", "-mod=readonly", "-trimpath", "-o", control / "runtime-verifier.exe", "./apps/runtime-verifier"], ROOT, env)
+385:     verifier_hash = sha256(control / "runtime-verifier.exe")
+386:     put(control / "runtime-verifier-installation.json", {
+387:         "schema": "researchos.runtime-verifier-installation.v1",
+388:         "service_id": "researchos.runtime-qualification-verifier.v1",
+389:         "protocol": "researchos.runtime-verifier/1",
+390:         "executable": str(control / "runtime-verifier.exe"),
+391:         "executable_hash": "sha256:" + verifier_hash,
+392:         "source_commit": source_before["head"],
+393:         "arguments": [],
+394:     })
+395:     runtime = control / "runtime"
+396:     exact_copy(mu_output, runtime / "mu-worker.mjs")
+397:     exact_copy(Path(str(mu_output) + ".build.json"), runtime / "mu-worker.mjs.build.json")
+398:     exact_copy(tools["node"], runtime / "node.exe")
+399:     electron_count = copy_tree(Path(args.electron_dist).resolve(), output / "runtime/electron")
+400:     if electron_count < 50 or sha256(output / "runtime/electron/electron.exe") != sha256(tools["electron"]):
+401:         raise RuntimeError("full pinned Electron runtime closure incomplete")
+402:     source_after = source_snapshot()
+403:     put(receipts / "source.after.json", source_after)
+404:     if source_after != source_before:
+405:         raise RuntimeError("source changed during complete development build")
+406:     go_after = {**go_before, "files": file_rows(row["path"] for row in go_before["files"])}
+407:     put(receipts / "core-verifier-go-inputs.after.json", go_after)
+408:     if go_after != go_before:
+409:         raise RuntimeError("Core or verifier compiled input/toolchain drift")
+410:     vendor_after = mu_vendor_closure(mu_common)
+411:     put(receipts / "mu-vendor-5083.after.json", vendor_after)
+412:     if vendor_after != vendor_before:
+413:         raise RuntimeError("Mu public vendored source drift")
+414:     mu_compiled_after = {**mu_compiled_before, "files": file_rows(row["path"] for row in mu_compiled_before["files"])}
+415:     put(receipts / "mu-compiled-inputs.after.json", mu_compiled_after)
+416:     if mu_compiled_after != mu_compiled_before:
+417:         raise RuntimeError("Mu compiled dist/module/tool drift")
+418:     public_after = {name: {"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
+419:                     for name, path in mu_public.items()}
+420:     put(receipts / "external-public.after.json", public_after)
+421:     if public_after != public_before:
+422:         raise RuntimeError("external public Mu producer inputs changed")
+423:     files = inventory(output)
+424:     manifest = {
+425:         "schema": SCHEMA,
+426:         "mode": "DEVELOPMENT_ONLY_BUILT_NOT_NATIVE_TESTED",
+427:         "bundle_root": str(output),
+428:         "source": {"head": source_before["head"], "tree": source_before["tree"],
+429:                    "digest": source_before["digest"], "candidate_delta": source_before["candidate_delta"],
+430:                    "seven_scoped_source_sha256": {row["path"]: row["sha256"] for row in source_before["files"] if row["candidate_delta"]}},
+431:         "tools": {name: {"path": str(path), "sha256": sha256(path)} for name, path in tools.items()},
+432:         "client_wire": {"build_input_digest": client_result["build_input_digest"],
+433:                         "binary_sha256": client_result["binary_sha256"],
+434:                         "descriptor_sha256": sha256(output / "apps/desktop/resources/client-wire/descriptor.json")},
+435:         "mu": {"producer": "adapters/runtime/mu/build.mjs", "producer_sha256": sha256(ROOT / "adapters/runtime/mu/build.mjs"),
+436:                "worker_sha256": sha256(ROOT / "adapters/runtime/mu/worker.mjs"),
+437:                "metadata_sha256": sha256(runtime / "mu-worker.mjs.build.json"),
+438:                "bundle_sha256": sha256(runtime / "mu-worker.mjs"),
+439:                "vendored_files_verified": 5083, "public_main_vendor_inputs": public_before,
+440:                "vendor_5083_manifest_sha256": sha256(receipts / "mu-vendor-5083.before.json"),
+441:                "compiled_input_manifest_sha256": sha256(receipts / "mu-compiled-inputs.before.json"),
+442:                "compiled_input_count": mu_compiled_before["compiled_input_count"]},
+443:         "core": {"sha256": sha256(control / "researchos-control.exe"),
+444:                  "verifier_sha256": verifier_hash,
+445:                  "migration_count": len(migrations), "cwd_contracts": required_contracts,
+446:                  "compiled_input_manifest_sha256": sha256(receipts / "core-verifier-go-inputs.before.json"),
+447:                  "go_package_count": go_before["package_count"]},
+448:         "electron": {"file_count": electron_count, "source_dist": str(Path(args.electron_dist).resolve())},
+449:         "files": files,
+450:     }
+451:     put(output / "development-manifest.json", manifest)
+452:     exact_copy(output / "development-manifest.json", receipts / "development-manifest.json")
+453:     put(receipts / "result.json", {"status": "BUILT_NOT_NATIVE_TESTED", "source_acceptance": False,
+454:                                    "source_drift": False, "public_vendor_drift": False,
+455:                                    "output": str(output), "manifest_sha256": sha256(output / "development-manifest.json"),
+456:                                    "files": len(files), "electron_files": electron_count,
+457:                                    "client_wire_build_input_digest": client_result["build_input_digest"],
+458:                                    "mu_bundle_sha256": manifest["mu"]["bundle_sha256"]})
+459:     print(json.dumps({"status": "BUILT_NOT_NATIVE_TESTED", "output": str(output),
+460:                       "manifest_sha256": sha256(output / "development-manifest.json"),
+461:                       "files": len(files)}, ensure_ascii=False))
+462: 
+463: 
+464: def main():
+465:     parser = argparse.ArgumentParser()
+466:     for flag in ["go", "node", "electron-dist", "module-cache", "web-modules", "mu-common", "output", "receipts"]:
+467:         parser.add_argument("--" + flag, required=True)
+468:     args = parser.parse_args()
+469:     try:
+470:         build(args)
+471:     except Exception as error:
+472:         receipts = Path(args.receipts)
+473:         if receipts.is_dir() and not (receipts / "failed.json").exists():
+474:             put(receipts / "failed.json", {"error_type": type(error).__name__, "error": str(error),
+475:                                            "status": "FIRST_FAILURE_RETAINED_NO_RETRY"})
+476:         print(f"development build failed: {error}", file=sys.stderr)
+477:         raise SystemExit(1)
+478: 
+479: 
+480: if __name__ == "__main__":
+481:     main()
+tests/ui/desktop/development-launcher.test.mjs
+1: import assert from 'node:assert/strict';
+2: import crypto from 'node:crypto';
+3: import { EventEmitter } from 'node:events';
+4: import fs from 'node:fs';
+5: import os from 'node:os';
+6: import path from 'node:path';
+7: import test from 'node:test';
+8: import { fileURLToPath } from 'node:url';
+9: import { buildChildEnv, executeDevelopmentLaunch, prepareDevelopmentLaunch,
+10:   validateBundle, validateSmokeReports } from '../../../apps/desktop/launch-development.mjs';
+11: 
+12: const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+13: const fixtureRoot = () => fs.mkdtempSync(path.join(os.tmpdir(), 'ros-desktop-development-mock-'));
+14: function removeFixture(root) {
+15:   const resolved = path.resolve(root), temp = path.resolve(os.tmpdir());
+16:   assert.ok(resolved.startsWith(temp + path.sep) && path.basename(resolved).startsWith('ros-desktop-development-mock-'));
+17:   fs.rmSync(resolved, { recursive: true, force: true });
+18: }
+19: function write(root, relative, content) {
+20:   const target = path.join(root, relative);
+21:   fs.mkdirSync(path.dirname(target), { recursive: true });
+22:   fs.writeFileSync(target, content);
+23: }
+24: function fixture(root) {
+25:   const bundle = path.join(root, 'bundle'); fs.mkdirSync(bundle);
+26:   const files = [
+27:     'apps/desktop/main/main.js', 'apps/desktop/preload/preload.js',
+28:     'apps/desktop/resources/client-wire/researchos-client-wire-validator.exe',
+29:     'apps/desktop/resources/control/researchos-control.exe',
+30:     'apps/desktop/resources/control/runtime-verifier.exe',
+31:     'apps/desktop/resources/control/runtime/mu-worker.mjs',
+32:     'apps/desktop/resources/control/runtime/node.exe',
+33:     'apps/web/dist/index.html', 'apps/web/dist/assets/index.js', 'apps/web/dist/assets/index.css',
+34:     'runtime/electron/electron.exe', 'spec/v2.0/contracts/domain.schema.json',
+35:     'spec/v2.0/contracts/openapi.json', 'internal/api/contracts/client.protocol.schema.json',
+36:     'internal/api/contracts/domain.schema.json', 'migrations/sqlite/0001_bootstrap.sql',
+37:     'migrations/sqlite/0002_domain.sql', 'migrations/sqlite/next_v24_sessions.sql',
+38:   ];
+39:   for (const name of files) write(bundle, name, name.endsWith('.exe') ? Buffer.from('MZ-mock') : Buffer.from(name));
+40:   const verifier = path.join(bundle, 'apps/desktop/resources/control/runtime-verifier.exe');
+41:   write(bundle, 'apps/desktop/resources/control/runtime-verifier-installation.json', JSON.stringify({
+42:     schema: 'researchos.runtime-verifier-installation.v1', service_id: 'researchos.runtime-qualification-verifier.v1',
+43:     protocol: 'researchos.runtime-verifier/1', executable: verifier,
+44:     executable_hash: 'sha256:' + sha(fs.readFileSync(verifier)), source_commit: 'a'.repeat(40), arguments: [],
+45:   }));
+46:   const mu = path.join(bundle, 'apps/desktop/resources/control/runtime/mu-worker.mjs');
+47:   write(bundle, 'apps/desktop/resources/control/runtime/mu-worker.mjs.build.json', JSON.stringify({
+48:     mu_commit: '8dfebe36508ac0c2508735bb866756dab9283e74', vendored_files_verified: 5083,
+49:     bundle_sha256: sha(fs.readFileSync(mu)), bundle_bytes: fs.statSync(mu).size,
+50:   }));
+51:   write(bundle, 'apps/desktop/resources/client-wire/descriptor.json', JSON.stringify({
+52:     build_input_digest: 'b'.repeat(64),
+53:     binary_sha256: sha(fs.readFileSync(path.join(bundle, 'apps/desktop/resources/client-wire/researchos-client-wire-validator.exe'))),
+54:   }));
+55:   const inventory = [];
+56:   function walk(directory) {
+57:     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+58:       const target = path.join(directory, entry.name);
+59:       if (entry.isDirectory()) walk(target);
+60:       else inventory.push({ path: path.relative(bundle, target).split(path.sep).join('/'),
+61:         sha256: sha(fs.readFileSync(target)), bytes: fs.statSync(target).size });
+62:     }
+63:   }
+64:   walk(bundle); inventory.sort((a, b) => a.path.localeCompare(b.path, 'en'));
+65:   // The runtime contract sorts by UTF-16 codepoint order, which these ASCII
+66:   // fixture paths share with ordinary JavaScript lexical order.
+67:   inventory.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+68:   write(bundle, 'development-manifest.json', JSON.stringify({
+69:     schema: 'researchos.desktop-development-tree/1', mode: 'DEVELOPMENT_ONLY_BUILT_NOT_NATIVE_TESTED',
+70:     bundle_root: bundle, client_wire: { build_input_digest: 'b'.repeat(64) }, files: inventory,
+71:   }));
+72:   return { bundle, state: path.join(root, 'fresh-state') };
+73: }
+74: 
+75: test('mock complete tree dry-run validates every hash and does not create state or spawn', async () => {
+76:   const root = fixtureRoot();
+77:   try {
+78:     const { bundle, state } = fixture(root);
+79:     const ambient = { SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+80:       node_options: '--require evil', researchos_project_id: 'foreign', ROS_DESKTOP_LEGACY_WORKBENCH: '1' };
+81:     let spawns = 0;
+82:     const result = await executeDevelopmentLaunch({ bundle, state, ambient, dryRun: true, smoke: true },
+83:       () => { spawns++; throw Error('must not spawn'); });
+84:     assert.equal(result.mode, 'DRY_RUN_NO_STATE_NO_SPAWN');
+85:     assert.equal(spawns, 0);
+86:     assert.equal(fs.existsSync(state), false);
+87:     const prepared = prepareDevelopmentLaunch({ bundle, state, ambient, smoke: true });
+88:     assert.equal(prepared.env.ROS_DESKTOP_SMOKE, '1');
+89:     assert.equal(prepared.env.ROS_DESKTOP_NATIVE_SMOKE, '1');
+90:     assert.equal(prepared.env.RESEARCHOS_DATA_DIR, path.join(state, 'data'));
+91:     assert.equal(prepared.env.node_options, undefined);
+92:     assert.equal(prepared.env.researchos_project_id, undefined);
+93:     assert.equal(prepared.env.ROS_DESKTOP_LEGACY_WORKBENCH, undefined);
+94:     assert.deepEqual(prepared.argv, [path.join(bundle, 'apps/desktop')]);
+95:   } finally { removeFixture(root); }
+96: });
+97: 
+98: test('mock launcher rejects changed, missing, alias and pre-existing state before spawn', async t => {
+99:   const root = fixtureRoot();
+100:   try {
+101:     const { bundle, state } = fixture(root);
+102:     const options = { bundle, state, ambient: { SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, dryRun: true };
+103:     fs.mkdirSync(state);
+104:     assert.throws(() => prepareDevelopmentLaunch(options), /STATE_NOT_FRESH/);
+105:     fs.rmdirSync(state);
+106:     const target = path.join(bundle, 'apps/web/dist/index.html');
+107:     fs.appendFileSync(target, 'tamper');
+108:     assert.throws(() => validateBundle(bundle), /BUNDLE_FILE_CHANGED/);
+109:     fs.writeFileSync(target, 'apps/web/dist/index.html');
+110:     const control = path.join(bundle, 'apps/desktop/resources/control/researchos-control.exe');
+111:     fs.unlinkSync(control);
+112:     assert.throws(() => validateBundle(bundle), /PATH_UNAVAILABLE|BUNDLE_RESOURCE_MISSING/);
+113:     write(bundle, 'apps/desktop/resources/control/researchos-control.exe', Buffer.from('MZ-mock'));
+114:     const alias = path.join(root, 'state-alias');
+115:     try {
+116:       fs.symlinkSync(bundle, alias, 'junction');
+117:       assert.throws(() => prepareDevelopmentLaunch({ ...options, state: path.join(alias, 'new-state') }), /PATH_ALIAS_REFUSED/);
+118:     } catch (error) {
+119:       if (error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
+120:       t.diagnostic('Windows did not allow this junction fixture');
+121:     }
+122:   } finally { removeFixture(root); }
+123: });
+124: 
+125: test('Windows env case collisions and lowercase injection cannot become child variables', () => {
+126:   const root = fixtureRoot();
+127:   try {
+128:     const { bundle, state } = fixture(root);
+129:     assert.throws(() => buildChildEnv({ SystemRoot: 'C:\\Windows', systemroot: 'C:\\Windows' }, bundle, state), /ENV_CASE_COLLISION/);
+130:     assert.throws(() => buildChildEnv({ SystemRoot: 'C:\\Windows', NODE_OPTIONS: 'x', node_options: 'y' }, bundle, state), /ENV_CASE_COLLISION/);
+131:     const env = buildChildEnv({ SystemRoot: 'C:\\Windows', node_options: 'x', researchos_data_dir: 'foreign',
+132:       ros_desktop_smoke: '0', ELECTRON_RUN_AS_NODE: '1' }, bundle, state, true);
+133:     assert.equal(env.NODE_OPTIONS, undefined);
+134:     assert.equal(env.ELECTRON_RUN_AS_NODE, undefined);
+135:     assert.equal(env.RESEARCHOS_DATA_DIR, path.join(state, 'data'));
+136:     assert.equal(env.ROS_DESKTOP_SMOKE, '1');
+137:   } finally { removeFixture(root); }
+138: });
+139: 
+140: test('mock launch creates only a fresh state and report verifier demands same owned exit', async () => {
+141:   const root = fixtureRoot();
+142:   try {
+143:     const { bundle, state } = fixture(root);
+144:     const owned = { pid: 121, created_ns: '1792057406096619100', image_sha256: 'a'.repeat(64), host_id: 'host-aaaaaaaaaaaa' };
+145:     const ready = { event: 'ready_to_show', management_state: 'READY', host_health: 'UP',
+146:       native_probe: { ok: true }, renderer: { bridge: true, react_root: true, mounted_title: 'ResearchOS', navigation: 3 },
+147:       owned_core_identity: owned };
+148:     const stopped = { event: 'shutdown_confirmed', process_exit_confirmed: true, owned_core_identity: owned };
+149:     assert.deepEqual(validateSmokeReports([ready, stopped], 0), { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: owned });
+150:     assert.throws(() => validateSmokeReports([ready, { ...stopped, owned_core_identity: { ...owned, created_ns: '1' } }], 0), /SMOKE_OUTCOME_UNCONFIRMED/);
+151:     assert.throws(() => validateSmokeReports([{ ...ready, native_probe: null }, stopped], 0), /SMOKE_OUTCOME_UNCONFIRMED/);
+152:     assert.throws(() => validateSmokeReports([ready, stopped], 2), /SMOKE_OUTCOME_UNCONFIRMED/);
+153:     let observed;
+154:     const mockSpawn = (exe, argv, opts) => {
+155:       observed = { exe, argv, opts };
+156:       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+157:       process.nextTick(() => {
+158:         child.stdout.emit('data', Buffer.from('ROS_DESKTOP_REPORT ' + JSON.stringify(ready) + '\n' +
+159:           'ROS_DESKTOP_REPORT ' + JSON.stringify(stopped) + '\n'));
+160:         child.emit('close', 0, null);
+161:       });
+162:       return child;
+163:     };
+164:     const result = await executeDevelopmentLaunch({ bundle, state, ambient: { SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, smoke: true }, mockSpawn);
+165:     assert.equal(result.status, 'NATIVE_SMOKE_CONFIRMED');
+166:     assert.ok(fs.statSync(path.join(state, 'data')).isDirectory());
+167:     assert.equal(observed.exe, path.join(bundle, 'runtime/electron/electron.exe'));
+168:     assert.equal(observed.opts.env.RESEARCHOS_CLI_DISCOVERY, path.join(state, 'discovery.json'));
+169:   } finally { removeFixture(root); }
+170: });
+tests/ui/desktop/development-smoke.test.mjs
+1: import assert from 'node:assert/strict';
+2: import crypto from 'node:crypto';
+3: import fs from 'node:fs';
+4: import path from 'node:path';
+5: import test from 'node:test';
+6: import { fileURLToPath } from 'node:url';
+7: 
+8: // Evaluate the exact pure functions in the production main without loading
+9: // Electron or starting Core. These are mock verdict tests, not native proof.
+10: const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+11: const source = fs.readFileSync(path.join(root, 'apps/desktop/main/main.js'), 'utf8');
+12: const begin = source.indexOf('function ownedCoreIdentity(machine) {');
+13: const end = source.indexOf('\nconst deps = {', begin);
+14: assert.ok(begin >= 0 && end > begin);
+15: const code = source.slice(begin, end);
+16: const { ownedCoreIdentity, smokeReadyEvidence, smokeShutdownConfirmation } =
+17:   Function(code + '\nreturn { ownedCoreIdentity, smokeReadyEvidence, smokeShutdownConfirmation };')();
+18: 
+19: const identity = { PID: 12345, CreatedNS: '1792057406096619100', ImageSHA256: 'a'.repeat(64) };
+20: const machine = () => ({ state: 'READY', identity: { ...identity }, hostId: 'host-aaaaaaaaaaaa',
+21:   currentHost: () => ({ pid: 12345 }), hasUnconfirmedChild: () => false });
+22: const renderer = { bridge: true, react_root: true, mounted_title: 'ResearchOS', navigation: 3 };
+23: const nativeProbe = { ok: true, protocol_status: 'COMPLETED' };
+24: const started = { health: 'UP', discovery: { pid: 12345 } };
+25: 
+26: test('exact main smoke verdict binds READY, native probe, React and owned identity', () => {
+27:   const owned = ownedCoreIdentity(machine());
+28:   assert.deepEqual(owned, { pid: 12345, created_ns: identity.CreatedNS,
+29:     image_sha256: identity.ImageSHA256, host_id: 'host-aaaaaaaaaaaa' });
+30:   assert.equal(smokeReadyEvidence(renderer, nativeProbe, { state: 'READY' }, started, owned), true);
+31:   assert.equal(smokeReadyEvidence(renderer, null, { state: 'READY' }, started, owned), false);
+32:   assert.equal(smokeReadyEvidence(renderer, { ok: false }, { state: 'READY' }, started, owned), false);
+33:   assert.equal(smokeReadyEvidence(renderer, nativeProbe, { state: 'BROKEN' }, started, owned), false);
+34:   assert.equal(smokeReadyEvidence({ ...renderer, react_root: false }, nativeProbe, { state: 'READY' }, started, owned), false);
+35:   assert.equal(smokeReadyEvidence(renderer, nativeProbe, { state: 'READY' }, { ...started, discovery: { pid: 9 } }, owned), false);
+36:   const changed = machine(); changed.currentHost = () => ({ pid: 9 });
+37:   assert.equal(ownedCoreIdentity(changed), null);
+38:   assert.match(crypto.createHash('sha256').update(code).digest('hex'), /^[a-f0-9]{64}$/);
+39: });
+40: 
+41: test('exact main shutdown verdict requires returned exit and original PID, creation, image and host ID', () => {
+42:   const m = machine(), owned = ownedCoreIdentity(m);
+43:   m.state = 'STOPPED';
+44:   const stopped = { state: 'STOPPED', process_exit_confirmed: true };
+45:   assert.deepEqual(smokeShutdownConfirmation(stopped, m, owned),
+46:     { process_exit_confirmed: true, owned_core_identity: owned });
+47:   assert.equal(smokeShutdownConfirmation({ ...stopped, process_exit_confirmed: false }, m, owned), null);
+48:   assert.equal(smokeShutdownConfirmation({ state: 'SHUTDOWN_ACCEPTED', process_exit_confirmed: true }, m, owned), null);
+49:   m.hasUnconfirmedChild = () => true;
+50:   assert.equal(smokeShutdownConfirmation(stopped, m, owned), null);
+51:   m.hasUnconfirmedChild = () => false;
+52:   for (const [field, replacement] of [['PID', 999], ['CreatedNS', '1'], ['ImageSHA256', 'b'.repeat(64)]]) {
+53:     const original = m.identity[field]; m.identity[field] = replacement;
+54:     assert.equal(smokeShutdownConfirmation(stopped, m, owned), null, field);
+55:     m.identity[field] = original;
+56:   }
+57:   m.hostId = 'host-bbbbbbbbbbbb';
+58:   assert.equal(smokeShutdownConfirmation(stopped, m, owned), null);
+59: });

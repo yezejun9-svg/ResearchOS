@@ -1,0 +1,130 @@
+--- freeze04/choose-owned-folder.ps1
++++ revision05/choose-owned-folder.ps1
+@@ -50,21 +50,36 @@
+   if ($Identity.thread_id -le 0 -or $Identity.process_id -le 0) {throw 'WINDOW_THREAD_PID_UNAVAILABLE_NO_TARGET'}
+   if ($Identity.process_id -ne $ExpectedPid) {throw 'FOREIGN_WINDOW_PID'}
+ }
+-function Select-UniqueWarningIdOk($Rows,[int]$ExpectedPid,[long]$WarningHwnd,[bool]$Truncated,[long]$DirectLookupHwnd) {
++function Assert-WarningDismissSelector($Selector) {
++  if (($Selector.expected_control_id -isnot [int] -and $Selector.expected_control_id -isnot [long]) -or
++    $Selector.expected_control_id -ne 2 -or
++    ($Selector.expected_button_count -isnot [int] -and $Selector.expected_button_count -isnot [long]) -or $Selector.expected_button_count -ne 1 -or
++    $Selector.basis -cne 'ACTUAL03_OBSERVED_SINGLE_BUTTON_CONTROL_ID_2' -or
++    $Selector.message_box_result_is_control_id -isnot [bool] -or $Selector.message_box_result_is_control_id -ne $false -or
++    $Selector.evidence_event -cne 'WARNING_IDOK_CHILD_METADATA' -or
++    ($Selector.evidence_event_sequence -isnot [int] -and $Selector.evidence_event_sequence -isnot [long]) -or $Selector.evidence_event_sequence -ne 36 -or
++    $Selector.evidence_sha256 -cne '392cd6f17926114f890b74dc28952dc1696d4b20a3444dfd2821b52ddb826423' -or
++    [IO.Path]::GetFullPath($Selector.evidence_path) -ine [IO.Path]::GetFullPath('C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-native-path-entry-中文-run-03/receipts/native-folder-automation.json')) {
++    throw 'ACTUAL03_WARNING_DISMISS_SELECTOR_PIN_REQUIRED'
++  }
++}
++function Select-UniqueWarningDismissButton($Rows,[int]$ExpectedPid,[long]$WarningHwnd,[bool]$Truncated,[long]$DirectLookupHwnd,[int]$ExpectedControlId) {
++  if ($ExpectedControlId -ne 2) {throw 'WARNING_DISMISS_EXPECTED_CONTROL_ID_MUST_BE_PINNED_2'}
+   if ($Truncated) {throw 'WARNING_CHILD_ENUMERATION_TRUNCATED_NO_POST'}
+   foreach ($row in $Rows) {
+     if ($row.hwnd -le 0 -or $row.process_id -ne $ExpectedPid -or $row.is_child -ne $true -or
+       $row.root_dialog -ne $WarningHwnd) {throw 'WARNING_CHILD_OWNERSHIP_OR_RELATION_UNCONFIRMED_NO_POST'}
+   }
+-  # Control ID, never localized text, identifies IDOK. Even an invisible or
+-  # non-Button duplicate ID 1 makes this set ambiguous and must block.
+-  $matches=@($Rows | Where-Object {$_.control_id -eq 1})
+-  if ($matches.Count -ne 1) {throw 'WARNING_IDOK_NOT_UNIQUE_NO_POST'}
+-  $candidate=$matches[0]
+-  if ($candidate.class_name -cne 'Button' -or $candidate.visible -ne $true -or $candidate.enabled -ne $true) {
+-    throw 'WARNING_IDOK_CLASS_OR_STATE_UNCONFIRMED_NO_POST'
+-  }
+-  if ($DirectLookupHwnd -ne 0 -and $candidate.hwnd -ne $DirectLookupHwnd) {throw 'WARNING_IDOK_LOOKUP_CHANGED_NO_POST'}
++  # MessageBox's return IDOK is not a child-control ID contract. The pinned
++  # actual03 metadata showed one Button, control ID 2. Count every Button,
++  # including hidden/disabled/different-ID Buttons; no arbitrary-ID fallback.
++  $buttons=@($Rows | Where-Object {$_.class_name -ceq 'Button'})
++  if ($buttons.Count -ne 1) {throw 'WARNING_DISMISS_BUTTON_NOT_UNIQUE_NO_POST'}
++  $candidate=$buttons[0]
++  if ($candidate.control_id -ne $ExpectedControlId -or $candidate.visible -ne $true -or $candidate.enabled -ne $true) {
++    throw 'WARNING_DISMISS_CONTROL_ID_OR_STATE_UNCONFIRMED_NO_POST'
++  }
++  if ($DirectLookupHwnd -ne 0 -and $candidate.hwnd -ne $DirectLookupHwnd) {throw 'WARNING_DISMISS_LOOKUP_CHANGED_NO_POST'}
+   return $candidate
+ }
+ function Assert-DialogThreadFacts($Snapshot,[int]$ExpectedPid,[long]$ExpectedDialog) {
+@@ -92,6 +107,10 @@
+     $scope.native_picker.validation_warning.source_sha256 -cmatch '^[a-f0-9]{64}$') 'FROZEN_PRODUCTION_WARNING_PINS_REQUIRED'
+   Require (@($scope.source.pins | Where-Object {$_.path -ceq 'internal/host/native_folder_windows.go' -and
+     $_.sha256 -ceq $scope.native_picker.validation_warning.source_sha256}).Count -eq 1) 'WARNING_NATIVE_SOURCE_BINDING'
++  $warningDismissSelector=$scope.native_picker.validation_warning.dismiss_selector
++  Assert-WarningDismissSelector $warningDismissSelector
++  Require ((Get-FileHash -LiteralPath $warningDismissSelector.evidence_path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $warningDismissSelector.evidence_sha256) 'ACTUAL03_WARNING_SELECTOR_EVIDENCE_FILE_PIN'
++  $warningControlId=[int]$warningDismissSelector.expected_control_id
+   $runRoot=[IO.Path]::GetFullPath($scope.run_root)
+   $fixture=[IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
+   $invalid=[IO.Path]::GetFullPath((Join-Path $runRoot ('invalid-nonexistent-'+$ScopeNonce)))
+@@ -310,29 +329,29 @@
+     Record 'DIALOG_THREAD_ACTIVE_SNAPSHOT' $snapshot
+     Assert-DialogThreadFacts $snapshot $coreId $Dialog.ToInt64()
+   }
+-  function Get-OwnedWarningIdOk([IntPtr]$Warning) {
++  function Get-OwnedWarningDismissButton([IntPtr]$Warning) {
+     Assert-Warning $Warning
+-    $direct=[OwnedPathWin32]::GetDlgItem($Warning,1)
+-    Record 'WARNING_IDOK_DIRECT_LOOKUP' @{dialog=$Warning.ToInt64();control_id=1;hwnd=$direct.ToInt64();is_zero=($direct -eq [IntPtr]::Zero)}
++    $direct=[OwnedPathWin32]::GetDlgItem($Warning,$warningControlId)
++    Record 'WARNING_DISMISS_DIRECT_LOOKUP' @{dialog=$Warning.ToInt64();control_id=$warningControlId;hwnd=$direct.ToInt64();is_zero=($direct -eq [IntPtr]::Zero)}
+     if ($direct -ne [IntPtr]::Zero) {
+       $lookup=Facts $direct
+       $lookup.is_child=[OwnedPathWin32]::IsChild($Warning,$direct)
+       $lookup.control_id=$null
+       if ($lookup.is_child) {$lookup.control_id=[OwnedPathWin32]::GetDlgCtrlID($direct)}
+-      Record 'WARNING_IDOK_DIRECT_LOOKUP_FACTS' $lookup
+-      if (-not $lookup.is_child -or $lookup.control_id -ne 1 -or $lookup.class_name -cne 'Button' -or
+-        -not $lookup.visible -or -not $lookup.enabled) {throw 'WARNING_DIRECT_IDOK_LOOKUP_INVALID_NO_POST'}
++      Record 'WARNING_DISMISS_DIRECT_LOOKUP_FACTS' $lookup
++      if (-not $lookup.is_child -or $lookup.control_id -ne $warningControlId -or $lookup.class_name -cne 'Button' -or
++        -not $lookup.visible -or -not $lookup.enabled) {throw 'WARNING_DIRECT_DISMISS_LOOKUP_INVALID_NO_POST'}
+     }
+     $rows=@()
+     try {$rows=@(ChildFacts $Warning)}
+     catch {
+-      Record 'WARNING_IDOK_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
++      Record 'WARNING_DISMISS_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
+         rows=$script:children.ToArray();enumeration_error=$_.Exception.Message;window_text_read=$false}
+       throw
+     }
+-    Record 'WARNING_IDOK_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
++    Record 'WARNING_DISMISS_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
+       rows=$rows;enumeration_error=$null;window_text_read=$false}
+-    $candidate=Select-UniqueWarningIdOk $rows $coreId $Warning.ToInt64() $script:truncated $direct.ToInt64()
++    $candidate=Select-UniqueWarningDismissButton $rows $coreId $Warning.ToInt64() $script:truncated $direct.ToInt64() $warningControlId
+     return [IntPtr]$candidate.hwnd
+   }
+   function Post-OwnedButton([IntPtr]$Dialog,[int]$Id,[string]$Purpose,[switch]$Warning,[switch]$ForCleanup) {
+@@ -340,8 +359,8 @@
+     if ($Warning) {Assert-Warning $Dialog}
+     Assert-DialogThreadState $Dialog -ForCleanup:$ForCleanup
+     if ($Warning) {
+-      if ($Id -ne 1 -or $Purpose -cne 'WARNING_DISMISS') {throw 'WARNING_ONLY_IDOK_DISMISS_ALLOWED'}
+-      $button=Get-OwnedWarningIdOk $Dialog
++      if ($Id -ne $warningControlId -or $Purpose -cne 'WARNING_DISMISS') {throw 'WARNING_ONLY_PINNED_DISMISS_CONTROL_ALLOWED'}
++      $button=Get-OwnedWarningDismissButton $Dialog
+     } else {
+       $button=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$row=Facts $button
+       if ($row.parent -ne $Dialog.ToInt64() -or $row.class_name -cne 'Button' -or -not $row.visible -or -not $row.enabled) {throw 'OWNED_BUTTON_IDENTITY_OR_STATE'}
+@@ -351,8 +370,8 @@
+     # validation callback. Queue acceptance alone never establishes its result.
+     Assert-Core -ForCleanup:$ForCleanup
+     if ($Warning) {
+-      $fresh=Get-OwnedWarningIdOk $Dialog
+-      if ($fresh -ne $button) {throw 'WARNING_IDOK_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++      $fresh=Get-OwnedWarningDismissButton $Dialog
++      if ($fresh -ne $button) {throw 'WARNING_DISMISS_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
+     } else {
+       $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
+       if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
+@@ -409,7 +428,7 @@
+   $result.invalid_warning=@{hwnd=$warning.ToInt64();owner=$chooser.ToInt64();owner_pid=$coreId
+     caption=$scope.native_picker.validation_warning.caption;text=$scope.native_picker.validation_warning.text;observed=$true}
+   Record 'INVALID_WARNING_VERIFIED' $result.invalid_warning
+-  Post-OwnedButton $warning 1 'WARNING_DISMISS' -Warning
++  Post-OwnedButton $warning $warningControlId 'WARNING_DISMISS' -Warning
+   $waitUntil=[DateTime]::UtcNow.AddSeconds(5)
+   do {$rows=@(OwnedDialogs);if ($rows.Count -eq 1 -and $rows[0].hwnd -eq $chooser.ToInt64() -and $rows[0].enabled) {break};Start-Sleep -Milliseconds 100}
+   while ([DateTime]::UtcNow -lt $waitUntil)

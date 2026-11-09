@@ -1,0 +1,13 @@
+# Root schema25 R2 independent review
+
+Storage findings from R1 are resolved in the reviewed R2 source. Final source/fixture acceptance is pending a small test-name correction and repeatable clean test execution.
+
+Candidate manifest SHA256: `98eba551f5bad00c2abb492316ed864d1d8109536c6d892d8e94d1fe2d856589`. All nine listed source-file hashes matched before and after independent execution. R1 evidence is unchanged.
+
+Independent Go overlay checks passed: cancellation-requested insertion is rejected; nonexistent activation actor is rejected even when carry actor matches it; eight independent mutations of carry actor/artifact/hash/upload/reason/receipt/from-epoch/to-epoch are rejected; no-receipt pause is rejected; a complete six-revision witnessed pause/seal/confirm/prepare/resume/cancel history is accepted. Changing the current Run executor or requesting cancellation after the activation does not invalidate historical provenance. Fixtures directly exercise the new `validateBackupPause` boundary, not a full production backup or Core lifecycle.
+
+The combined run passed 16 top-level tests and failed one author top-level test, `TestPauseStorageActivationAndCarryProvenance`, specifically its unnamed `#00` subtest. The failure occurs while building its fixture: duplicate `schema_migrations.version`. The prior author run left a SQLite file named `.local/go-tmp/TestPauseStorageActivationAndCarryProvenance` (1,032,192 bytes, created 01:46:14 local), outside the intended complete `t.TempDir` path. The existing `store.Open` uses a file URL's Opaque field without escaping `#`; the generated `#00` name is interpreted as a URL fragment and truncates the actual database path. The failed independent run reuses that prior file. `escaped-fixture-path.json` records the exact file hash and metadata; raw failure is preserved in `tests-01.jsonl`.
+
+Minimal scoped correction: give the successful no-mutation subtest an explicit name such as `valid`, while preserving the empty mutation value used by its switch. Avoid broadening this storage change into a store.Open refactor. The existing URI-path behavior is a separate debt item. Do not erase this failure or report that all R2 tests passed. Later acceptance should refer to the corrected candidate and fresh test evidence.
+
+Receipt verification now certifies a current state/revision/full-row witness plus the existing receipt sequence/hash chain. It does not certify every historical revision transition or caller-side expected-revision CAS. Those remain obligations for the later Core writer; backup validation is not native process-stop proof. There is no product/GUI/provider/production-upgrade acceptance, and formal increment remains 0.

@@ -1,0 +1,402 @@
+
+FILE internal/domain/qualification_failure_maintenance_windows_test.go
+28: func qualificationClassifierFixture(t *testing.T) (*sql.DB, HistoricalQualificationPlan, string) {
+29: 	t.Helper()
+30: 	root := t.TempDir()
+31: 	path := filepath.Join(root, "researchos.sqlite")
+32: 	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
+33: 	q := u.Query()
+34: 	q.Set("mode", "rwc")
+35: 	u.RawQuery = q.Encode()
+36: 	initial, e := sql.Open("sqlite", u.String())
+37: 	if e != nil {
+38: 		t.Fatal(e)
+39: 	}
+40: 	if _, e = initial.Exec("PRAGMA journal_mode=WAL"); e != nil {
+41: 		t.Fatal(e)
+42: 	}
+43: 	files, e := filepath.Glob(filepath.Join("..", "..", "migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
+44: 	if e != nil || len(files) != 24 {
+45: 		t.Fatalf("migration inventory %d: %v", len(files), e)
+46: 	}
+47: 	sort.Strings(files)
+48: 	for i, file := range files {
+49: 		raw, err := os.ReadFile(file)
+50: 		if err != nil {
+51: 			t.Fatal(err)
+52: 		}
+53: 		if _, err = initial.Exec(string(raw)); err != nil {
+54: 			t.Fatalf("migration %s: %v", file, err)
+55: 		}
+56: 		if _, err = initial.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); err != nil {
+57: 			t.Fatal(err)
+58: 		}
+59: 	}
+60: 	extra, e := os.ReadFile(filepath.Join("..", "..", "migrations", "sqlite", "next_v24_sessions.sql"))
+61: 	if e != nil {
+62: 		t.Fatal(e)
+63: 	}
+64: 	if _, e = initial.Exec(string(extra)); e != nil {
+65: 		t.Fatal(e)
+66: 	}
+67: 	if _, e = initial.Exec(`CREATE TABLE IF NOT EXISTS backup_restore_barriers(project TEXT NOT NULL,run TEXT NOT NULL,restored_at TEXT NOT NULL,PRIMARY KEY(project,run))`); e != nil {
+68: 		t.Fatal(e)
+69: 	}
+70: 	if e = initial.Close(); e != nil {
+71: 		t.Fatal(e)
+72: 	}
+73: 	db, e := store.OpenQualificationMaintenance(context.Background(), path)
+74: 	if e != nil {
+75: 		t.Fatal(e)
+76: 	}
+77: 	t.Cleanup(func() { _ = db.Close() })
+78: 	if _, e = db.Exec(`INSERT INTO auth_principals(id,roles) VALUES('owner','["OWNER"]')`); e != nil {
+79: 		t.Fatal(e)
+80: 	}
+81: 	project := "project"
+82: 	profile := Object{"id": "profile", "project_id": project, "revision": int64(1)}
+83: 	runBefore := Object{"id": "run", "project_id": project, "revision": int64(1), "status": "RUNNING"}
+84: 	stateBefore := Object{"id": "state", "project_id": project, "revision": int64(1)}
+85: 	for _, entry := range []struct {
+86: 		kind   string
+87: 		object Object
+88: 	}{{"ProjectProfile", profile}, {"Run", runBefore}, {"ProjectState", stateBefore}} {
+89: 		raw := string(Bytes(entry.object))
+90: 		if _, e = db.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body) VALUES(?,?,?,?,?)`, project, entry.kind, entry.object["id"], 1, raw); e != nil {
+91: 			t.Fatal(e)
+92: 		}
+93: 		if _, e = db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES(?,?,?,?,?)`, project, entry.kind, entry.object["id"], 1, raw); e != nil {
+94: 			t.Fatal(e)
+95: 		}
+96: 	}
+97: 	if _, e = db.Exec(`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at)
+98: 		VALUES('project','run',1,'dispatch','{}','manifest','STARTED','2026-10-25T00:00:00Z','2026-10-25T00:00:00Z')`); e != nil {
+99: 		t.Fatal(e)
+100: 	}
+101: 	profileRef := Object{"entity_type": "ProjectProfile", "id": "profile", "revision": int64(1)}
+102: 	proofBytes := []byte("historical fixture proof")
+103: 	artifact := Object{"id": "artifact", "project_id": project, "revision": int64(1), "content_hash": Digest(proofBytes)}
+104: 	link := Object{"id": "link", "project_id": project, "revision": int64(1)}
+105: 	run := Object{"id": "run", "project_id": project, "revision": int64(2), "status": "FAILED"}
+106: 	state := Object{"id": "state", "project_id": project, "revision": int64(2)}
+107: 	event := Object{"id": "event", "project_id": project, "revision": int64(1)}
+108: 	event["receipt_hash"] = Receipt(event)
+109: 	plan := HistoricalQualificationPlan{
+110: 		Schema:      "researchos.qualification-failure-maintenance-full-plan.v1",
+111: 		OperationID: "00112233445566778899aabbccddeeff",
+112: 		Subject:     HistoricalQualificationSubject{ProjectID: project, RunID: "run", Epoch: 1, DispatchKey: "dispatch"},
+113: 		AuthorID:    "owner", UploadKey: "upload", EventSequence: 1, DispatchSequence: 1,
+114: 		Core: Object{"profile_ref": profileRef}, Artifact: artifact, ImpactLink: link, Run: run,
+115: 		ProjectState: state, Event: event, Observation: Object{"state": "FAILED"},
+116: 		ProofBytes: proofBytes, ObservedAt: "2026-10-25T00:00:01Z", ExpiresAt: "2026-10-25T01:00:00Z",
+117: 		BeforeRun: runBefore, BeforeState: stateBefore, BeforeDispatch: Object{"manifest_hash": "manifest"},
+118: 		OutcomeHash: Hash(Object{"outcome": "fixture"}),
+119: 	}
+120: 	tx, e := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+121: 	if e != nil {
+122: 		t.Fatal(e)
+123: 	}
+124: 	plan.BeforeCensus, e = store.QualificationMaintenanceCensus(context.Background(), tx)
+125: 	if e != nil {
+126: 		t.Fatal(e)
+127: 	}
+128: 	plan.BeforeProtectedSHA256, e = store.QualificationMaintenanceProtectedCensus(context.Background(), tx)
+129: 	if e != nil {
+130: 		t.Fatal(e)
+131: 	}
+132: 	selectors, e := plan.residualSelectors()
+133: 	if e != nil {
+134: 		t.Fatal(e)
+135: 	}
+136: 	plan.BeforeResidualSHA256, e = store.QualificationMaintenanceResidualCensus(context.Background(), tx, selectors)
+137: 	if e != nil {
+138: 		t.Fatal(e)
+139: 	}
+140: 	if e = tx.Rollback(); e != nil {
+141: 		t.Fatal(e)
+142: 	}
+143: 	return db, plan, "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+144: }
+145: 
+
+FILE internal/domain/qualification_failure_maintenance_windows_test.go
+690: func TestHistoricalQualificationRecoveryClassificationNineTables(t *testing.T) {
+691: 	db, plan, planFileSHA256 := qualificationClassifierFixture(t)
+692: 	ctx := context.Background()
+693: 	state, e := ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+694: 	if e != nil || state != "NOT_APPLIED" {
+695: 		t.Fatalf("before: %s %v", state, e)
+696: 	}
+697: 	tx, e := db.BeginTx(ctx, nil)
+698: 	if e != nil {
+699: 		t.Fatal(e)
+700: 	}
+701: 	for _, entry := range []struct {
+702: 		kind   string
+703: 		object Object
+704: 	}{{"Artifact", plan.Artifact}, {"ImpactLink", plan.ImpactLink},
+705: 		{"Run", plan.Run}, {"ProjectState", plan.ProjectState}, {"EventEnvelope", plan.Event}} {
+706: 		rev, _ := Num(entry.object, "revision")
+707: 		var content any
+708: 		immutable := 0
+709: 		if entry.kind == "Artifact" {
+710: 			content = entry.object["content_hash"]
+711: 		}
+712: 		if entry.kind == "EventEnvelope" {
+713: 			content = entry.object["receipt_hash"]
+714: 			immutable = 1
+715: 		}
+716: 		body := string(Bytes(entry.object))
+717: 		if _, e = tx.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)`,
+718: 			plan.Subject.ProjectID, entry.kind, entry.object["id"], rev, body, content); e != nil {
+719: 			t.Fatal(e)
+720: 		}
+721: 		if _, e = tx.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?)
+722: 			ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body,content_hash=excluded.content_hash`,
+723: 			plan.Subject.ProjectID, entry.kind, entry.object["id"], rev, body, content, immutable); e != nil {
+724: 			t.Fatal(e)
+725: 		}
+726: 	}
+727: 	for _, ref := range []struct {
+728: 		kind, id, field, targetKind, targetID string
+729: 		targetRevision                        int
+730: 	}{
+731: 		{"Artifact", "artifact", "/input_refs/0", "ProjectProfile", "profile", 1},
+732: 		{"ImpactLink", "link", "/from_ref", "Artifact", "artifact", 1},
+733: 		{"ImpactLink", "link", "/to_ref", "ProjectProfile", "profile", 1},
+734: 		{"EventEnvelope", "event", "/aggregate_ref", "Run", "run", 2},
+735: 	} {
+736: 		if _, e = tx.Exec(`INSERT INTO domain_refs(project,kind,id,revision,field,target_project,target_kind,target_id,target_revision)
+737: 			VALUES(?,?,?,?,?,?,?,?,?)`, plan.Subject.ProjectID, ref.kind, ref.id, 1, ref.field, plan.Subject.ProjectID,
+738: 			ref.targetKind, ref.targetID, ref.targetRevision); e != nil {
+739: 			t.Fatal(e)
+740: 		}
+741: 	}
+742: 	if _, e = tx.Exec(`INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,?,?,?,?,?,1)`,
+743: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID, plan.ProofBytes, Digest(plan.ProofBytes), plan.ExpiresAt); e != nil {
+744: 		t.Fatal(e)
+745: 	}
+746: 	if _, e = tx.Exec(`INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)`,
+747: 		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch, Hash(plan.Observation), string(Bytes(plan.Observation)), plan.ObservedAt); e != nil {
+748: 		t.Fatal(e)
+749: 	}
+750: 	if _, e = tx.Exec(`UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,updated_at=?,reason=?
+751: 		WHERE project=? AND run=? AND epoch=?`, plan.DispatchSequence, Hash(plan.Observation), plan.ObservedAt,
+752: 		"historical qualification first-gate TOOL reconstruction "+plan.OperationID, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
+753: 		t.Fatal(e)
+754: 	}
+755: 	if _, e = tx.Exec(`INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)`,
+756: 		plan.Subject.ProjectID, plan.EventSequence, plan.Event["id"], string(Bytes(plan.Event))); e != nil {
+757: 		t.Fatal(e)
+758: 	}
+759: 	if _, e = tx.Exec(`INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)`,
+760: 		plan.Subject.ProjectID, plan.Event["id"], 2, string(Bytes(plan.ProjectState))); e != nil {
+761: 		t.Fatal(e)
+762: 	}
+763: 	if _, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at)
+764: 		VALUES(?,?,'host:qualification-failure-maintenance',?,?,200,?,'{}',?)`, plan.AuthorID, plan.Subject.ProjectID,
+765: 		plan.OperationID, planFileSHA256, Bytes(historicalMaintenanceMarker(plan, planFileSHA256)), plan.ObservedAt); e != nil {
+766: 		t.Fatal(e)
+767: 	}
+768: 	if e = tx.Commit(); e != nil {
+769: 		t.Fatal(e)
+770: 	}
+771: 	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+772: 	if e != nil || state != "APPLIED" {
+773: 		probe, probeErr := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+774: 		if probeErr == nil {
+775: 			full, _ := store.QualificationMaintenanceCensus(ctx, probe)
+776: 			p, _ := store.QualificationMaintenanceProtectedCensus(ctx, probe)
+777: 			sel, _ := plan.residualSelectors()
+778: 			r, _ := store.QualificationMaintenanceResidualCensus(ctx, probe, sel)
+779: 			exact, exactErr := historicalQualificationExactRows(ctx, probe, plan, planFileSHA256)
+780: 			t.Logf("debug full=%t schema=%t protected=%t residual=%t exact=%t exactErr=%v", Hash(full) == Hash(plan.BeforeCensus), full.SchemaSHA256 == plan.BeforeCensus.SchemaSHA256, p == plan.BeforeProtectedSHA256, r == plan.BeforeResidualSHA256, exact, exactErr)
+781: 			_ = probe.Rollback()
+782: 		}
+783: 		t.Fatalf("applied: %s %v", state, e)
+784: 	}
+785: 	if _, e = db.Exec(`INSERT INTO outbox(project,sequence,id,body) VALUES('project',2,'unrelated','{}')`); e != nil {
+786: 		t.Fatal(e)
+787: 	}
+788: 	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+789: 	if e != nil || state != "UNKNOWN" {
+790: 		t.Fatalf("unrelated row: %s %v", state, e)
+791: 	}
+792: }
+
+FILE internal/qualificationmaintenancejournal/journal_windows.go
+52: func qualificationFullPlanMatches(plan JournalPlan) error {
+53: 	decoder := json.NewDecoder(bytes.NewReader(plan.FullPlan))
+54: 	decoder.UseNumber()
+55: 	var f map[string]any
+56: 	if err := decoder.Decode(&f); err != nil {
+57: 		return err
+58: 	}
+59: 	var trailing any
+60: 	if decoder.Decode(&trailing) != io.EOF {
+61: 		return errors.New("qualification full plan trailing data")
+62: 	}
+63: 	get := func(key string) any { return f[key] }
+64: 	if get("schema") != "researchos.qualification-failure-maintenance-full-plan.v1" ||
+65: 		get("operation_id") != plan.OperationID || get("data_root") != plan.DataRoot || get("database") != plan.Database {
+66: 		return errors.New("qualification full plan identity mismatch")
+67: 	}
+68: 	outcome, _ := get("outcome_hash").(string)
+69: 	if !validDigest(outcome) {
+70: 		return errors.New("qualification full outcome invalid")
+71: 	}
+72: 	core, ok := get("core").(map[string]any)
+73: 	if !ok {
+74: 		return errors.New("qualification full core absent")
+75: 	}
+76: 	if value, err := hash(core); err != nil || value != plan.PlanHash {
+77: 		return errors.New("qualification full core hash mismatch")
+78: 	}
+79: 	before := map[string]any{
+80: 		"census": get("before_census"), "run": get("before_run"), "state": get("before_state"),
+81: 		"dispatch": get("before_dispatch"), "protected": get("before_protected_sha256"),
+82: 		"residual": get("before_residual_sha256"),
+83: 	}
+84: 	if value, err := hash(before); err != nil || value != plan.BeforeHash {
+85: 		return errors.New("qualification before hash mismatch")
+86: 	}
+87: 	proofBytesText, ok := get("proof_bytes").(string)
+88: 	if !ok {
+89: 		return errors.New("qualification proof bytes absent")
+90: 	}
+91: 	proofBytes, err := base64.StdEncoding.DecodeString(proofBytesText)
+92: 	if err != nil || len(proofBytes) == 0 || len(proofBytes) > 64<<10 {
+93: 		return errors.New("qualification proof bytes invalid")
+94: 	}
+95: 	after := map[string]any{
+96: 		"artifact": get("artifact"), "impact_link": get("impact_link"), "run": get("run"),
+97: 		"state": get("project_state"), "event": get("event"), "observation": get("observation"),
+98: 		"dispatch_sequence": get("dispatch_sequence"), "upload_hash": digest(proofBytes),
+99: 		"outcome_hash": get("outcome_hash"),
+100: 	}
+101: 	if value, err := hash(after); err != nil || value != plan.AfterHash {
+102: 		return errors.New("qualification after hash mismatch")
+103: 	}
+104: 	if value, err := hash(get("subject")); err != nil || value != plan.SubjectHash {
+105: 		return errors.New("qualification subject hash mismatch")
+106: 	}
+107: 	proof, ok := get("proof").(map[string]any)
+108: 	if !ok {
+109: 		return errors.New("qualification proof absent")
+110: 	}
+111: 	evidence := map[string]any{"source": get("source"), "native": proof["native"], "model": proof["model_binding"]}
+112: 	if value, err := hash(evidence); err != nil || value != plan.EvidenceHash {
+113: 		return errors.New("qualification evidence hash mismatch")
+114: 	}
+115: 	return nil
+116: }
+117: 
+118: func qualificationTransition(previous, next string) bool {
+119: 	switch previous {
+120: 	case "":
+121: 		return next == "BEGIN"
+122: 	case "BEGIN":
+123: 		return next == "CLASSIFIED_NOT_APPLIED" || next == "DB_COMMITTED_OBSERVED"
+124: 	case "CLASSIFIED_NOT_APPLIED":
+125: 		return next == "ABORTED" || next == "DB_COMMITTED_OBSERVED"
+126: 	case "DB_COMMITTED_OBSERVED":
+127: 		return next == "DURABLE"
+128: 	}
+129: 	return false
+130: }
+131: 
+132: func readQualification(root, operation string) (JournalPlan, string, []QualificationEvent, error) {
+
+FILE internal/qualificationmaintenancejournal/journal_windows.go
+544: // CheckOrdinary is a pure read under the caller's native coordinator lock.
+545: // Both namespaces must be complete and current before any startup side effect.
+546: func CheckOrdinary(root string) error {
+547: 	if err := checkQualificationOrdinary(root); err != nil {
+548: 		return err
+549: 	}
+550: 	return checkReplacementOrdinary(root)
+551: }
+552: 
+553: // OpenOwnInspection makes only the exact matching pending transition visible.
+554: // Callers must still establish all separate owner, evidence and write authority.
+555: func OpenOwnInspection(root, namespace, operation, planDigest string) (InspectionPermit, HistoryStatus, error) {
+556: 	var zero InspectionPermit
+557: 	var status HistoryStatus
+558: 	if !validOperation(operation) || !validDigest(planDigest) {
+559: 		return zero, status, errors.New("own operation identity invalid")
+560: 	}
+561: 	switch namespace {
+562: 	case ReplacementNamespace:
+563: 		if err := checkQualificationOrdinary(root); err != nil {
+564: 			return zero, status, err
+565: 		}
+566: 		var err error
+567: 		status, err = inspectReplacement(root, operation, planDigest, nil)
+568: 		if err != nil {
+569: 			return zero, status, err
+570: 		}
+571: 	case QualificationNamespace:
+572: 		if err := checkReplacementOrdinary(root); err != nil {
+573: 			return zero, status, err
+574: 		}
+575: 		var err error
+576: 		status, err = inspectQualification(root, operation, planDigest)
+577: 		if err != nil {
+578: 			return zero, status, err
+579: 		}
+580: 	default:
+581: 		return zero, status, errors.New("own namespace invalid")
+582: 	}
+583: 	return InspectionPermit{root: root, namespace: namespace, operation: operation, planDigest: planDigest}, status, nil
+584: }
+585: 
+586: func OpenOwnReplacementInspection(root, operation, planDigest string, planBytes []byte) (InspectionPermit, HistoryStatus, error) {
+587: 	var zero InspectionPermit
+588: 	var status HistoryStatus
+589: 	if !validOperation(operation) || !validDigest(planDigest) || digest(planBytes) != planDigest {
+590: 		return zero, status, errors.New("own replacement plan identity invalid")
+591: 	}
+592: 	if err := checkQualificationOrdinary(root); err != nil {
+593: 		return zero, status, err
+594: 	}
+595: 	var err error
+596: 	status, err = inspectReplacement(root, operation, planDigest, planBytes)
+597: 	if err != nil {
+598: 		return zero, status, err
+599: 	}
+600: 	return InspectionPermit{root: root, namespace: ReplacementNamespace, operation: operation,
+601: 		planDigest: planDigest, replacementPlan: append([]byte(nil), planBytes...)}, status, nil
+602: }
+603: 
+604: func (p InspectionPermit) Check(root string) (HistoryStatus, error) {
+605: 	if p.root == "" || p.root != root {
+606: 		return HistoryStatus{}, errors.New("own inspection root mismatch")
+607: 	}
+608: 	if p.namespace == ReplacementNamespace && p.replacementPlan != nil {
+609: 		if err := checkQualificationOrdinary(root); err != nil {
+610: 			return HistoryStatus{}, err
+611: 		}
+612: 		return inspectReplacement(root, p.operation, p.planDigest, p.replacementPlan)
+613: 	}
+614: 	_, status, err := OpenOwnInspection(root, p.namespace, p.operation, p.planDigest)
+615: 	return status, err
+616: }
+internal/domain/qualification_failure_maintenance_windows.go:518:	BeforeDispatch        Object                         `json:"before_dispatch"`
+internal/domain/qualification_failure_maintenance_windows.go:531:		"state": p.BeforeState, "dispatch": p.BeforeDispatch,
+internal/domain/qualification_failure_maintenance_windows.go:638:		"observation_hash": Hash(observation)}
+internal/domain/qualification_failure_maintenance_windows.go:717:		BeforeRun: verified.run, BeforeState: verified.state, BeforeDispatch: verified.dispatch,
+internal/domain/qualification_failure_maintenance_windows.go:765:	if err := tx.QueryRowContext(ctx, `SELECT manifest_hash FROM runtime_dispatches WHERE project=? AND run=? AND epoch=? AND dispatch_key=?`,
+internal/domain/qualification_failure_maintenance_windows.go:803:		"observation_hash": Hash(plan.Observation),
+internal/domain/qualification_failure_maintenance_windows.go:858:	result, err = tx.ExecContext(ctx, `UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,reason=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state=? AND observation_sequence=? AND dispatch_key=? AND manifest_hash=?`,
+internal/domain/qualification_failure_maintenance_windows.go:861:		plan.BeforeDispatch["state"], plan.BeforeDispatch["observation_sequence"],
+internal/domain/qualification_failure_maintenance_windows.go:862:		plan.BeforeDispatch["dispatch_key"], plan.BeforeDispatch["manifest_hash"])
+internal/domain/qualification_failure_maintenance_windows.go:902:		Hash(verified.dispatch) != Hash(plan.BeforeDispatch) ||
+internal/domain/qualification_failure_maintenance_windows.go:942:		Str(plan.BeforeDispatch, "manifest_hash"), "", plan.SID, plan.Source)
+internal/domain/qualification_failure_maintenance_windows.go:1263:	err = tx.QueryRowContext(ctx, `SELECT state,observation_sequence,observation_hash,dispatch_key,manifest_hash,updated_at,reason
+internal/domain/qualification_failure_maintenance_windows.go:1264:		FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch).
+internal/domain/qualification_failure_maintenance_windows.go:1273:		dispatchKey != plan.Subject.DispatchKey || manifestHash != Str(plan.BeforeDispatch, "manifest_hash") ||
+internal/domain/qualification_failure_maintenance_windows.go:1429:	manifest, manifestOK := dispatch["manifest"].(map[string]any)
+internal/domain/qualification_failure_maintenance_windows.go:1437:		dispatch["state"] != "STARTED" && dispatch["state"] != "UNKNOWN" ||
+internal/domain/qualification_failure_maintenance_windows.go:1438:		dispatch["dispatch_key"] != subject.DispatchKey || dispatch["journal_locator"] != subject.DispatchKey ||
+internal/domain/qualification_failure_maintenance_windows.go:1439:		dispatch["manifest_hash"] != j.ManifestHash || dispatch["worker"] != j.Worker ||
+internal/domain/qualification_failure_maintenance_windows.go:1440:		Hash(dispatch["identity"]) != Hash(runtimeNativeIdentity(j.Identity)) ||

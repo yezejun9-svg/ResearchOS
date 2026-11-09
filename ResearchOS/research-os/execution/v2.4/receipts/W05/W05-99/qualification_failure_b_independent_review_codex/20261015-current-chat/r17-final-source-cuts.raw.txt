@@ -1,0 +1,207 @@
+D:\作品集\ResearchOS\research-os\.local\worktrees\qualification-failure-b-20261015\internal\domain\store.go:142:func Empty() []any { return []any{} }
+817: 		return unavailable()
+818: 	}
+819: 	return qualificationFailureClosure{subjectValue: qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, proofValue: Object(ref), seal: Hash(marker)}, nil
+820: }
+821: 
+822: 
+823: 
+824: 
+825: 
+826: 
+827: 
+828: 
+829: 
+830: 
+831: 
+832: 
+833: 
+834: 
+835: 
+836: 
+837: 
+838: 
+839: 
+840: 
+841: 
+842: 
+843: 
+844: 
+845: 
+846: 
+847: 
+848: 
+849: 
+850: 
+851: 
+852: 
+510: 		}
+511: 	}
+512: 	admission, e := c.service.currentDispatchAdmission(tx, route.ProjectID, task, run, dispatch, "dispatch")
+513: 	if e != nil {
+514: 		return fail(e)
+515: 	}
+516: 	profile := admission["profile"].(map[string]any)
+517: 	if profile["command_id"] != route.CommandID {
+518: 		return fail(Fail(422, "GATE_FAILED", "host command binding differs from profile"))
+519: 	}
+520: 	return tx, run, dispatch, nil
+521: }
+522: 
+523: func (c *RuntimeCoordinator) RunAdmitted(ctx context.Context, route RuntimeCoordinatorRoute, run Object, lease string) error {
+524: 	c.boundary("before_launch_fence", run)
+525: 	epoch, e := Num(run, "lease_epoch")
+526: 	if e != nil {
+527: 		return e
+528: 	}
+529: 	runID := Str(run, "id")
+530: 	tx, current, dispatch, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+531: 	if e != nil {
+532: 		return e
+533: 	}
+534: 	manifest := dispatch["manifest"].(map[string]any)
+535: 	inputs, e := c.inputs(tx, route.ProjectID, current, manifest["admission"].(map[string]any))
+294: 	for _, query := range []struct {
+295: 		sql  string
+296: 		args []any
+297: 		out  *int
+298: 	}{
+299: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.produced_by') LIKE 'local-scheduler-%'", []any{r.f.project}, &proofArtifacts},
+300: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.relation')='DERIVED_FROM'", []any{r.f.project}, &links},
+301: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='EventEnvelope' AND json_extract(body,'$.event_type')='RUN_CHANGED' AND json_extract(body,'$.aggregate_ref.id')=? AND json_extract(body,'$.aggregate_ref.revision')=3", []any{r.f.project, r.run["id"]}, &events},
+302: 		{"SELECT count(*) FROM uploaded_content u JOIN domain_objects a ON a.project=u.project AND a.kind='Artifact' AND json_extract(a.body,'$.storage_key')=u.storage_key WHERE u.project=? AND u.sealed=1 AND json_extract(a.body,'$.produced_by') LIKE 'local-scheduler-%'", []any{r.f.project}, &sealedUploads},
+303: 		{"SELECT count(*) FROM runtime_uploads WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &runtimeUploads},
+304: 		{"SELECT count(*) FROM artifact_uses WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &uses},
+305: 		{"SELECT count(*) FROM artifact_use_proofs WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &useProofs},
+306: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='NoProgressRecord'", []any{r.f.project}, &noProgressAfter},
+307: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='AcceptanceReceipt'", []any{r.f.project}, &acceptance},
+308: 	} {
+309: 		if queryErr := r.f.db.QueryRow(query.sql, query.args...).Scan(query.out); queryErr != nil {
+310: 			t.Fatal(queryErr)
+311: 		}
+312: 	}
+313: 	if proofArtifacts != 1 || links != 1 || events != 1 || sealedUploads != 1 || runtimeUploads != 0 || uses != 0 || useProofs != 0 || noProgressAfter != noProgressBefore || acceptance != 0 {
+314: 		t.Fatalf("FAILED-only delta wrong: proof=%d link=%d event=%d sealed=%d runtimeUpload=%d use=%d useProof=%d noProgress=%d/%d acceptance=%d", proofArtifacts, links, events, sealedUploads, runtimeUploads, uses, useProofs, noProgressBefore, noProgressAfter, acceptance)
+315: 	}
+316: 	var money, operation string
+317: 	if scanErr := r.f.db.QueryRow("SELECT coalesce(json_extract(body,'$.money'),'null'),json_extract(body,'$.operation') FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", r.run["id"]).Scan(&money, &operation); scanErr != nil || money != "null" || operation != "UNKNOWN" {
+318: 		t.Fatalf("unknown cost changed: money=%s operation=%s err=%v", money, operation, scanErr)
+319: 	}
+320: 	epoch, err := Num(r.run, "lease_epoch")
+321: 	if err != nil {
+322: 		t.Fatal(err)
+323: 	}
+324: 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
+325: 		_, verifyErr := r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch)
+326: 		return verifyErr
+327: 	})
+328: 	if duplicateErr := c.RunAdmitted(context.Background(), route, r.run, r.lease); duplicateErr == nil {
+329: 		t.Fatal("duplicate dispatch admitted")
+330: 	}
+331: 	var replayClosure, replayObservation, replayProof int
+332: 	if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&replayClosure); err != nil {
+333: 		t.Fatal(err)
+334: 	}
+335: 	if err := r.f.db.QueryRow("SELECT count(*) FROM runtime_observations WHERE project=? AND run=?", r.f.project, r.run["id"]).Scan(&replayObservation); err != nil {
+336: 		t.Fatal(err)
+337: 	}
+338: 	if err := r.f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.produced_by') LIKE 'local-scheduler-%'", r.f.project).Scan(&replayProof); err != nil {
+339: 		t.Fatal(err)
+340: 	}
+341: 	if replayClosure != 1 || replayObservation != 1 || replayProof != 1 || calls.Load() != 1 || Hash(run) != Hash(r.f.read("runs", Str(r.run, "id"))) {
+342: 		t.Fatal("duplicate request changed completed failure closure")
+343: 	}
+344: 	t.Log("CONTROLLED_LIVE_LOOPBACK first-gate TOOL denied; native raw3 ACK2 rejected1; Host proof closure committed; not a Mu bundle success or independent acceptance")
+345: }
+346: 
+[
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_b_source_codex/20261015-current-chat/FINAL.json",
+    "sha256": "e9048b3966ea5272775eb3026060c19c0a73175ee7916427d8bc743683ad7638",
+    "bytes": 2995,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_b_source_codex/20261015-current-chat/B-evidence-manifest.json",
+    "sha256": "111b9e46f84fbb9161b6c589c482e19d6e3cd464d42e7e7a197ab57cc8f844e7",
+    "bytes": 51784,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_b_source_codex/20261015-current-chat/B-author-report.md",
+    "sha256": "1054720214715adbbdfcd59abccf3161f0153e21325b077afcb4985aed9712e0",
+    "bytes": 5951,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_b_source_codex/20261015-current-chat/B-diagnostic-ledger.md",
+    "sha256": "0fc0db2f719d212bfc95c3774355653708441d41556d669dfaba1087678b9c8e",
+    "bytes": 2762,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261015-current-chat/continuation-cp512/qualification-failure-B-source-scope.json",
+    "sha256": "1d889baf12735bca50fb81773ab75fade95dbc8ba6d390e3106f4eb1469ffbc9",
+    "bytes": 9415,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/git_automatic_gc_incident_codex/20261015-current-chat/COLLECTION-manifest.json",
+    "sha256": "562e1893fcc36e6e0f5443b2ff02cb5cb823267738d0d5ebf53c8ee269dd3e3a",
+    "bytes": 14602,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_projection_a_revision02_independent_review_codex/20261015-current-chat/evidence-manifest.json",
+    "sha256": "319c2c8a86585ea5daa587fbdbb7df75ba321c367f8b172fc32f49cb3944f1fe",
+    "bytes": 22725,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision02_architecture_codex/20261015-current-chat/B-ARCHITECTURE.md",
+    "sha256": "db4d9bc604429b8e326a724f5d51a719332fa16359b1eda3b4313868b79f9324",
+    "bytes": 11192,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision02_architecture_codex/20261015-current-chat/B-exact-scope.json",
+    "sha256": "45fdb7a350cdc620fc7520c969092484438fe7ab0a53782563655c18b379547b",
+    "bytes": 1502,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision02_architecture_codex/20261015-current-chat/B-test-cuts.json",
+    "sha256": "0a6edc0873e6f5fac8cebbf73e2c79a9b4461f628625e5d35abf74ec536f48b0",
+    "bytes": 2520,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision02_independent_review_codex/20261015-current-chat/FINAL-manifest.json",
+    "sha256": "42acdbcd1121edd010699df1f609d56c2e7e1ccf495a06dcacb60ed7108126bd",
+    "bytes": 23198,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision02_architecture_codex/20261015-current-chat/C-ARCHITECTURE.md",
+    "sha256": "96256d1b33fac0a809efa3e0110ef6335c98b3c301241fcd8bc02262cfdc9185",
+    "bytes": 19104,
+    "matches": true
+  },
+  {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_independent_review_codex/20261015-current-chat/FINAL-manifest.json",
+    "sha256": "c1f517f80da18e29a3b2f27c278ac65828372513552d35e3c7fc75ad5eb7b807",
+    "bytes": 17101,
+    "matches": true
+  }
+]
+
+=== RUN   TestRuntimeCoordinatorBrokerFailure
+=== RUN   TestRuntimeCoordinatorBrokerFailure/provider_unavailable
+    runtime_coordinator_windows_test.go:590: RUNTIME_BROKER_FAILURE mode=provider_unavailable provider_calls=1 effect=UNKNOWN no_fallback=true no_retry=true
+=== RUN   TestRuntimeCoordinatorBrokerFailure/purpose_expired_after_prepare
+    runtime_coordinator_windows_test.go:590: RUNTIME_BROKER_FAILURE mode=purpose_expired_after_prepare provider_calls=0 effect=PREPARED no_fallback=true no_retry=true
+--- PASS: TestRuntimeCoordinatorBrokerFailure (9.44s)
+    --- PASS: TestRuntimeCoordinatorBrokerFailure/provider_unavailable (4.80s)
+    --- PASS: TestRuntimeCoordinatorBrokerFailure/purpose_expired_after_prepare (4.64s)
+PASS
+ok  	researchos.local/research-os/internal/domain	25.724s

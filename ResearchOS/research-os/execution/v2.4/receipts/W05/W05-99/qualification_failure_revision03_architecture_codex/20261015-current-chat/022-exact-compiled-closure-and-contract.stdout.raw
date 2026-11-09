@@ -1,0 +1,557 @@
+FILE ops/experiment_sandbox/sandbox_windows.go
+130: 		}
+131: 	}
+132: 	rel, e := filepath.Rel(c.InputDirectory, c.Executable)
+133: 	if e != nil || strings.HasPrefix(rel, "..") || strings.EqualFold(c.InputDirectory, c.OutputDirectory) {
+134: 		return r, errors.New("executable must be under distinct read-only input root")
+135: 	}
+136: 	name := fmt.Sprintf("ResearchOS.W10.%d", time.Now().UnixNano())
+137: 	var sid *windows.SID
+138: 	hr, _, _ := userenv.NewProc("CreateAppContainerProfile").Call(uintptr(unsafe.Pointer(utf(name))), uintptr(unsafe.Pointer(utf(name))), uintptr(unsafe.Pointer(utf("bounded development evaluation"))), 0, 0, uintptr(unsafe.Pointer(&sid)))
+139: 	if int32(hr) < 0 {
+140: 		return r, fmt.Errorf("CreateAppContainerProfile HRESULT 0x%x", hr)
+141: 	}
+142: 	defer userenv.NewProc("DeleteAppContainerProfile").Call(uintptr(unsafe.Pointer(utf(name))))
+143: 	defer windows.FreeSid(sid)
+144: 	r.SID = sid.String()
+145: 	r.Profile = name
+146: 	r.Capabilities = []string{}
+147: 
+148: 	// A fresh copied tree inherits one known DACL; source ACLs and reparse points
+149: 	// never cross the boundary. AppContainer, not the copy, enforces isolation.
+150: 	staging, e := os.MkdirTemp("", "researchos-w10-staging-")
+151: 	if e != nil {
+152: 		return r, e
+153: 	}
+154: 	defer func() {
+155: 		cleanupErr := os.RemoveAll(staging)
+156: 		r.CleanupComplete = cleanupErr == nil
+157: 		err = errors.Join(err, cleanupErr)
+158: 	}()
+159: 	originalInput, originalOutput := c.InputDirectory, c.OutputDirectory
+160: 	c.InputDirectory = filepath.Join(staging, "input")
+161: 	c.OutputDirectory = filepath.Join(staging, "output")
+162: 	for root, rights := range map[string]string{c.InputDirectory: "GRGX", c.OutputDirectory: "FA"} {
+163: 		if e = os.Mkdir(root, 0700); e != nil {
+164: 			return r, e
+288: 	}
+289: 	envValues := []string{"SystemRoot=" + os.Getenv("SystemRoot"), "TEMP=" + c.OutputDirectory, "TMP=" + c.OutputDirectory, "USERPROFILE=" + c.OutputDirectory, "LOCALAPPDATA=" + c.OutputDirectory, "APPDATA=" + c.OutputDirectory}
+290: 	keys := make([]string, 0, len(goEnv))
+291: 	for k := range goEnv {
+292: 		keys = append(keys, k)
+293: 	}
+294: 	sort.Strings(keys)
+295: 	for _, k := range keys {
+296: 		envValues = append(envValues, k+"="+goEnv[k])
+297: 	}
+298: 	env := utf16.Encode([]rune(strings.Join(envValues, "\x00") + "\x00\x00"))
+299: 	var pi windows.ProcessInformation
+300: 	r.Started = time.Now().UTC().Format(time.RFC3339Nano)
+301: 	if e = windows.CreateProcess(utf(c.Executable), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED, &env[0], utf(c.OutputDirectory), &si.StartupInfo, &pi); e != nil {
+302: 		return r, fmt.Errorf("CreateProcess: %w", e)
+303: 	}
+304: 	defer windows.CloseHandle(pi.Process)
+305: 	defer windows.CloseHandle(pi.Thread)
+306: 	// The parent must release its copies of the child write ends for true EOF.
+307: 	stdout.Close()
+308: 	stderr.Close()
+309: 	stdin.Close()
+310: 	r.PID = pi.ProcessId
+311: 	var created, exited, kernel, user windows.Filetime
+312: 	if e = windows.GetProcessTimes(pi.Process, &created, &exited, &kernel, &user); e != nil {
+313: 		windows.TerminateJobObject(job, 125)
+314: 		windows.WaitForSingleObject(pi.Process, 5000)
+315: 		return r, e
+316: 	}
+317: 	r.Created = created.Nanoseconds()
+318: 	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile, StagingDirectory: staging}
+319: 	if options.BeforeResume != nil {
+320: 		if e = options.BeforeResume(identity); e != nil {
+321: 			windows.TerminateJobObject(job, 125)
+322: 			windows.WaitForSingleObject(pi.Process, 5000)
+323: 			return r, fmt.Errorf("beforeResume: %w", e)
+324: 		}
+325: 	}
+326: 	if ctx.Err() != nil {
+327: 		windows.TerminateJobObject(job, 125)
+328: 		windows.WaitForSingleObject(pi.Process, 5000)
+329: 		return r, ctx.Err()
+330: 	}
+331: 	if _, e = windows.ResumeThread(pi.Thread); e != nil {
+332: 		windows.TerminateJobObject(job, 125)
+333: 		windows.WaitForSingleObject(pi.Process, 5000)
+334: 		return r, e
+335: 	}
+336: 	process.ready <- nil
+337: 	deadline := time.Now().Add(c.Timeout)
+338: 	for {
+339: 		state, x := windows.WaitForSingleObject(pi.Process, 20)
+340: 		if x != nil {
+341: 			return r, x
+342: 		}
+343: 		if state == windows.WAIT_OBJECT_0 {
+344: 			break
+345: 		}
+346: 		if ctx.Err() != nil || time.Now().After(deadline) {
+347: 			r.TimedOut = true
+348: 			if e = windows.TerminateJobObject(job, 124); e != nil {
+349: 				return r, e
+350: 			}
+351: 			windows.WaitForSingleObject(pi.Process, 5000)
+352: 			break
+353: 		}
+354: 	}
+355: 	var code uint32
+356: 	if e = windows.GetExitCodeProcess(pi.Process, &code); e != nil {
+357: 		return r, e
+358: 	}
+359: 	r.ExitCode = int(code)
+360: 	r.Finished = time.Now().UTC().Format(time.RFC3339Nano)
+361: 	var accounting struct {
+362: 		User, Kernel, PeriodUser, PeriodKernel              int64
+363: 		Faults, TotalProcesses, ActiveProcesses, Terminated uint32
+364: 	}
+365: 	if e = windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); e != nil {
+366: 		return r, e
+367: 	}
+368: 	for n := 0; n < 50 && accounting.ActiveProcesses != 0; n++ {
+369: 		time.Sleep(10 * time.Millisecond)
+370: 		if e = windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); e != nil {
+371: 			return r, e
+372: 		}
+373: 	}
+374: 	r.Stopped = accounting.ActiveProcesses == 0
+375: 	r.JobProcesses = accounting.TotalProcesses
+376: 	outResult, errResult := <-outDone, <-errDone
+377: 	r.Stdout, r.Stderr = outResult.bytes, errResult.bytes
+378: 	r.StreamsDrained = outResult.err == nil && errResult.err == nil
+379: 	return r, errors.Join(outResult.err, errResult.err)
+380: }
+381: 
+382: // goEnvironment permits only offline, deterministic Go configuration. Writable
+383: // paths stay in the output root; GOROOT is read-only staged input. No PATH or
+384: // host environment is inherited by the AppContainer.
+385: func goEnvironment(values map[string]string, input, output string, remap func(string) string) (map[string]string, error) {
+386: 	result := make(map[string]string, len(values))
+387: 	within := func(root, path string) bool {
+388: 		if !filepath.IsAbs(path) {
+389: 			return false
+390: 		}
+391: 		rel, err := filepath.Rel(root, path)
+392: 		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+393: 	}
+394: 	for key, value := range values {
+395: 		if key != strings.ToUpper(key) || strings.ContainsAny(key+value, "=\x00") || value == "" {
+396: 			return nil, fmt.Errorf("invalid Go environment %q", key)
+397: 		}
+398: 		switch key {
+399: 		case "GOROOT":
+400: 			if !within(input, value) {
+401: 				return nil, fmt.Errorf("GOROOT must be in staged input")
+402: 			}
+403: 		case "GOPATH", "GOCACHE", "GOTMPDIR":
+404: 			if !within(output, value) {
+405: 				return nil, fmt.Errorf("%s must be in staged output", key)
+406: 			}
+407: 		case "GOTOOLCHAIN":
+408: 			if value != "local" {
+409: 				return nil, fmt.Errorf("GOTOOLCHAIN must be local")
+410: 			}
+FILE internal/domain/runtime_coordinator_windows.go
+615: 		tick := time.NewTicker(200 * time.Millisecond)
+616: 		defer tick.Stop()
+617: 		for {
+618: 			select {
+619: 			case <-child.Done():
+620: 				return
+621: 			case <-bridge.Done():
+622: 				return
+623: 			case <-tick.C:
+624: 				var status string
+625: 				var currentEpoch int64
+626: 				err := c.service.DB.QueryRowContext(child, "SELECT json_extract(body,'$.status'),json_extract(body,'$.lease_epoch') FROM domain_objects WHERE project=? AND kind='Run' AND id=?", route.ProjectID, runID).Scan(&status, &currentEpoch)
+627: 				if err != nil || status == "CANCEL_REQUESTED" || currentEpoch != epoch {
+628: 					cancelBroker()
+629: 					if !bridge.Read().QueueRequired || err != nil || currentEpoch != epoch {
+630: 						bridge.Cancel("canonical run cancellation or epoch ended")
+631: 					}
+632: 					return
+633: 				}
+634: 			}
+635: 		}
+636: 	}()
+637: 	var mutation sync.Mutex
+638: 	go func() {
+639: 		defer close(heartbeatDone)
+640: 		tick := time.NewTicker(15 * time.Second)
+641: 		defer tick.Stop()
+642: 		for {
+643: 			mutation.Lock()
+644: 			e := c.heartbeat(child, route, runID, lease, epoch, locator, "")
+645: 			mutation.Unlock()
+646: 			if e != nil {
+647: 				heartbeatError <- e
+648: 				cancel()
+649: 				bridge.Cancel("control lease or authority unavailable")
+650: 				return
+651: 			}
+652: 			if e := bridge.Renew(epoch, 90*time.Second); e != nil {
+653: 				heartbeatError <- e
+654: 				cancel()
+655: 				bridge.Cancel("worker lease expired")
+656: 				return
+657: 			}
+658: 			select {
+659: 			case <-child.Done():
+660: 				return
+661: 			case <-tick.C:
+662: 			}
+663: 		}
+664: 	}()
+665: 	protocolError := c.runCommandBridge(child, brokerContext, route, runID, lease, epoch, locator, bridge, &mutation)
+666: 	if protocolError != nil {
+667: 		bridge.Cancel("protocol reconciliation failed")
+668: 	}
+669: 	<-bridge.Done()
+670: 	if protocolError != nil {
+671: 		cancel()
+672: 		<-heartbeatDone
+673: 		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "protocol not reconciled")
+674: 		return protocolError
+675: 	}
+676: 	tx, e = c.service.DB.BeginTx(ctx, nil)
+677: 	if e == nil {
+678: 		e = effectsReconciled(tx, route.ProjectID, runID)
+679: 		tx.Rollback()
+680: 	}
+681: 	if e != nil {
+682: 		cancel()
+683: 		<-heartbeatDone
+684: 		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "effect reconciliation incomplete")
+685: 		return e
+686: 	}
+687: 	j, e := bridge.Finalize(true)
+688: 	if e != nil {
+689: 		cancel()
+690: 		<-heartbeatDone
+691: 		return e
+692: 	}
+693: 	c.boundary("terminal_durable", run)
+694: 	if e = c.ingestObservation(ctx, route.ProjectID, runID, epoch, j); e != nil {
+695: 		cancel()
+696: 		<-heartbeatDone
+697: 		return e
+698: 	}
+699: 	if j.State == "CANCELLED" {
+700: 		cancel()
+FILE internal/domain/runtime_qualification_execution_windows.go
+328: // LocalQualificationReview locates the exact observed LOG and current frozen
+329: // references. The separate verifier must re-read them through its own API grant.
+330: func (s *Service) LocalQualificationReview(ctx context.Context, token string, request LocalRuntimeQualificationRequest, runID string) (Object, error) {
+331: 	tx, e := s.DB.BeginTx(ctx, nil)
+332: 	if e != nil {
+333: 		return nil, e
+334: 	}
+335: 	defer tx.Rollback()
+336: 	if _, e = resourcePrincipal(tx, token, request.ProjectID, "OWNER"); e != nil {
+337: 		return nil, e
+338: 	}
+339: 	run, e := load(tx, request.ProjectID, "Run", runID)
+340: 	if e != nil {
+341: 		return nil, e
+342: 	}
+343: 	task, e := load(tx, request.ProjectID, "Task", request.TaskID)
+344: 	if e != nil {
+345: 		return nil, e
+346: 	}
+347: 	if run["task_id"] != request.TaskID || run["runtime_id"] != request.RuntimeID || run["status"] != "SETTLED" || task["status"] != "EXECUTION_REPORTED" || task["active_run_id"] != runID {
+348: 		return nil, Fail(409, "STATE_CONFLICT", "current settled qualification output required")
+349: 	}
+350: 	plan, hash, _, e := qualificationPlan(tx, request.ProjectID, request.TaskID, request.RuntimeID)
+351: 	if e != nil || hash != request.PlanHash || Hash(plan["profile_ref"]) != request.ProfileHash {
+352: 		return nil, Fail(412, "STALE_INPUT", "qualification review plan changed")
+353: 	}
+354: 	obs, e := runtimeObservation(tx, request.ProjectID, run)
+355: 	if e != nil {
+356: 		return nil, e
+357: 	}
+358: 	rows, e := tx.Query(`SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.kind')='LOG'`, request.ProjectID, runID)
+359: 	if e != nil {
+360: 		return nil, e
+361: 	}
+362: 	logs := []Object{}
+363: 	for rows.Next() {
+364: 		var raw string
+365: 		if e = rows.Scan(&raw); e != nil {
+366: 			rows.Close()
+367: 			return nil, e
+368: 		}
+369: 		o, err := Decode([]byte(raw))
+370: 		if err != nil {
+371: 			rows.Close()
+372: 			return nil, err
+373: 		}
+374: 		logs = append(logs, o)
+375: 	}
+376: 	e = rows.Err()
+377: 	rows.Close()
+378: 	if e != nil {
+379: 		return nil, e
+380: 	}
+381: 	var logRef Object
+382: 	for _, log := range logs {
+383: 		ref := Ref(log, "Artifact")
+384: 		if s.runtimeReceipt(tx, request.ProjectID, run, ref, obs) == nil {
+385: 			if logRef != nil {
+FILE internal/domain/runtime_broker_windows.go
+50: 	return provider.CredentialRef != "" && provider.CredentialRef == provider.CredentialRevision && c.config.ModelCredential != nil && provider.BearerToken == ""
+51: }
+52: 
+53: func providerEndpointAllowed(provider RuntimeProviderRoute) bool {
+54: 	u, err := url.Parse(provider.Endpoint)
+55: 	if err != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" {
+56: 		return false
+57: 	}
+58: 	if u.Scheme == "https" {
+59: 		return true
+60: 	}
+61: 	if u.Scheme != "http" {
+62: 		return false
+63: 	}
+64: 	if provider.Capability == "MODEL" && provider.MeasurementMode == "LIVE" {
+65: 		return clientConfigurationLoopbackModelEndpoint(provider.Endpoint)
+66: 	}
+67: 	ip := net.ParseIP(u.Hostname())
+68: 	return provider.MeasurementMode == "FIXTURE" && ip != nil && ip.IsLoopback()
+69: }
+70: 
+71: func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, frame rt.BridgeFrame) (RuntimeProviderRoute, error) {
+72: 	manifest := dispatch["manifest"].(map[string]any)
+73: 	admission := manifest["admission"].(map[string]any)
+74: 	profile := admission["profile"].(map[string]any)
+75: 	if c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil {
+76: 		return RuntimeProviderRoute{}, Fail(400, "INVALID_REQUEST", "stable effect key required")
+77: 	}
+78: 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+79: 	if e != nil {
+80: 		return RuntimeProviderRoute{}, e
+81: 	}
+82: 	if admission["qualification_bootstrap"] == true {
+83: 		if e = qualificationModelEffectAllowed(tx, route.ProjectID, task, Object{"capability": frame.Capability, "route": frame.Route}); e != nil {
+84: 			return RuntimeProviderRoute{}, e
+85: 		}
+86: 		permission := profile["model_qualification"].(map[string]any)
+87: 		if e = runtimeModelCallGate(tx, route.ProjectID, Str(run, "id"), frame.Key, permission); e != nil {
+88: 			return RuntimeProviderRoute{}, e
+89: 		}
+90: 	}
+91: 	for _, provider := range c.runtimeProviders() {
+92: 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != task["task_type"] || provider.Capability != frame.Capability || provider.MeasurementMode != admission["mode"] {
+93: 			continue
+94: 		}
+95: 		bound := false
+96: 		for _, v := range Arr(profile, "effect_routes") {
+97: 			p, ok := v.(map[string]any)
+98: 			if ok && p["id"] == provider.ID && p["capability"] == provider.Capability && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+99: 				bound = true
+100: 			}
+101: 		}
+102: 		if !bound {
+103: 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider differs from frozen route permission")
+104: 		}
+105: 		if provider.Capability == "MODEL" {
+106: 			if profile["backend"] != runtimeMuBackend || Hash(provider.ModelConfig) != Hash(profile["model_config"]) || provider.Endpoint != Str(provider.ModelConfig, "endpoint") || provider.ID != Str(provider.ModelConfig, "route") {
+107: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "model route differs from frozen profile")
+108: 			}
+109: 			if !c.liveModelCredentialBound(provider, profile) {
+110: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model credential differs from bound endpoint")
+111: 			}
+112: 		}
+113: 		if provider.Capability == "TOOL" {
+114: 			if profile["backend"] != runtimeMuBackend || provider.ID != Str(profile["model_config"].(map[string]any), "route") || c.config.RunTool == nil || provider.Endpoint != "" || provider.BearerToken != "" || provider.CredentialRef != "" {
+115: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool requires the frozen host-only route")
+116: 			}
+117: 			amount, err := moneyAmount(provider.UpperBound)
+118: 			if err != nil || amount.Sign() != 0 {
+119: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool route requires an explicit zero monetary bound")
+120: 			}
+121: 			return provider, nil
+122: 		}
+123: 		if provider.Capability == "SOURCE" {
+124: 			if provider.SourceID == "" || provider.SourceToken == "" {
+125: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "host source identity required")
+FILE internal/host/runtime_qualification_windows.go
+150: 	}
+151: 	return root, child, nil
+152: }
+153: 
+154: // QualifyLocalRuntime performs an explicitly requested managed operation. The
+155: // coordinator remains the sole launcher; this administrative host has no model
+156: // client. Separate verifier credentials never enter the coordinator or worker.
+157: func (h *Host) QualifyLocalRuntime(ctx context.Context, service *domain.Service, coordinator *domain.RuntimeCoordinator, apiURL string, request domain.LocalRuntimeQualificationRequest, install RuntimeVerifierInstallation) (domain.Object, error) {
+158: 	if e := coordinator.BeginLocalQualificationWindow(ctx, request.RequestID); e != nil {
+159: 		return nil, e
+160: 	}
+161: 	defer coordinator.EndLocalQualificationWindow(context.Background())
+162: 	if _, e := h.reverify(); e != nil {
+163: 		return nil, e
+164: 	}
+165: 	owner := h.boundPrincipal()
+166: 	if owner == "" {
+167: 		return nil, errors.New("managed qualification requires existing OS-bound Owner")
+168: 	}
+169: 	if _, e := h.ConfigurationMetadata(ctx, owner, "", nil); e != nil {
+170: 		return nil, e
+171: 	}
+172: 	ownerToken, e := service.IssueCredential(ctx, owner, 5*time.Minute)
+173: 	if e != nil {
+174: 		return nil, e
+175: 	}
+176: 	defer h.revokeCredentialByHash(context.Background(), owner, domain.Digest([]byte(ownerToken)))
+177: 	if e = coordinator.ValidateLocalQualification(ctx, ownerToken, request); e != nil {
+178: 		return nil, e
+179: 	}
+180: 	process, e := startRuntimeVerifier(ctx, install)
+181: 	if e != nil {
+182: 		return nil, e
+183: 	}
+184: 	defer process.close()
+185: 	root, principal, e := h.ensureRuntimeVerifier(ctx, owner, request.ProjectID, install)
+186: 	if e != nil {
+187: 		return nil, e
+188: 	}
+189: 	provenance := domain.Object{"schema": "researchos.local-runtime-administration.v1", "action": "EXPLICIT_QUALIFICATION_REQUEST", "request": request, "request_hash": domain.Hash(request), "installation": install, "installation_hash": domain.Hash(install), "service_root": root, "verifier_principal": principal, "process_identity": process.identity, "handshake_nonce": process.nonce, "owner": owner, "owner_host": h.InstanceID(), "os_principal_ref": h.identity.Ref, "application_separation": true, "protected_holdout": false}
+190: 	proof, e := service.RecordLocalRuntimeAdministration(ctx, ownerToken, request.ProjectID, provenance)
+191: 	if e != nil {
+192: 		return nil, e
+193: 	}
+194: 	run, e := coordinator.ExecuteLocalQualification(ctx, ownerToken, request)
+195: 	if e != nil {
+196: 		return domain.Object{"administration_ref": domain.Ref(proof, "Artifact"), "run": run, "state": "QUALIFICATION_NOT_ACCEPTED"}, e
+197: 	}
+198: 	review, e := service.LocalQualificationReview(ctx, ownerToken, request, domain.Str(run, "id"))
+199: 	if e != nil {
+200: 		return nil, e
+201: 	}
+202: 	// Issue only after execution is settled. The child process is still the same
+203: 	// verified PID/image/creation identity; it alone receives the short token.
+204: 	token, e := service.IssueCredential(ctx, principal, 2*time.Minute)
+205: 	if e != nil {
+206: 		return nil, e
+207: 	}
+208: 	defer h.revokeCredentialByHash(context.Background(), principal, domain.Digest([]byte(token)))
+209: 	epoch, _ := domain.Num(review, "epoch")
+210: 	job := verifier.Job{APIURL: apiURL, Token: token, PrincipalID: principal, ServiceRoot: root, ProjectID: request.ProjectID, RuntimeID: request.RuntimeID, TaskRef: review["task_ref"].(map[string]any), RunRef: review["run_ref"].(map[string]any), ProfileRef: review["profile_ref"].(map[string]any), ObservationRef: review["observation_ref"].(map[string]any), PlanHash: domain.Str(review, "plan_hash"), ExecutorID: domain.Str(review, "executor_id"), Epoch: epoch}
+211: 	job.VerificationSnapshot = review["verification_snapshot"].(map[string]any)
+212: 	job.VerificationSnapshotHash = domain.Str(review, "verification_snapshot_hash")
+213: 	result, e := process.verify(ctx, job)
+214: 	job.Token = ""
+215: 	if e != nil {
+216: 		return domain.Object{"state": "QUALIFICATION_NOT_ACCEPTED", "check_status": review["diagnostic_status"], "check_reason": review["diagnostic_reason"], "administration_ref": domain.Ref(proof, "Artifact")}, e
+217: 	}
+218: 	if domain.Str(result.RuntimeRef, "id") != request.RuntimeID {
+219: 		return nil, errors.New("verified runtime differs from Owner request")
+ARGV ['rg', '-n', 'ResourceEffect|NO_EFFECT|resource_effect|UNKNOWN|副作用', 'spec/v2.0/02_TECHNICAL_DESIGN.md', 'spec/v2.0/04_API_CONTRACTS.md', 'spec/v2.0/contracts/domain.schema.json'] EXIT 0
+spec/v2.0/02_TECHNICAL_DESIGN.md:105:MilestoneRelease、对应 outbox 与业务接受在同一个提交路径中登记；通知按 `release_id + recipient + channel` 唯一。SSE/WebSocket 只运输状态，前端重放不得产生副作用。事件投影失败不回滚已经成功的权威事务，重放后应收敛。
+spec/v2.0/02_TECHNICAL_DESIGN.md:113:所有 heartbeat、产物提交、报告、取消确认、费用结算都携带身份与当前 epoch。失效 epoch 不可改变任务当前结果；费用和已发生外部动作仍保存为迟到观察，用于对账。Worker 租约失效后停止新工具调用并尝试终止当前进程树；控制面在终止未确认时保留未决运行，不能仅因超时立刻重新执行有副作用的动作。
+spec/v2.0/04_API_CONTRACTS.md:25:- 所有POST/PUT带至少16字符的`Idempotency-Key`。初次合法执行保存主体、项目、operationId、key、规范化业务请求hash、目标及响应；至少保留7天，不可变成果创建映射随成果保留。客户端每个逻辑动作只生成一个key，传输重试复用原key。配对/refresh响应含秘密，是例外：响应仅加密保留至多5分钟且标no-store，长期只留消费/重放指纹；过期后拒绝重做发凭据副作用。
+spec/v2.0/04_API_CONTRACTS.md:31:- 对外网调用不能与本地数据库形成真正单事务。先写持久意图/预算预留/outbox，再以供应商支持的幂等键调用；若供应商不支持幂等且结果未知，必须对账/阻塞该支路，不能盲重试非幂等副作用。
+spec/v2.0/04_API_CONTRACTS.md:199:- 暂停Goal不会让不可取消在途费用消失；预算和停止状态分别展示。UNKNOWN副作用不因同输入重试上限尚有余额而盲重发。
+spec/v2.0/contracts/domain.schema.json:2067:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:2147:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:2181:            "UNKNOWN",
+spec/v2.0/contracts/domain.schema.json:4718:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:4755:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:4784:                "const": "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:4797:                "const": "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:5704:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:5823:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:5900:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:5934:            "UNKNOWN",
+spec/v2.0/contracts/domain.schema.json:7614:            "UNKNOWN"
+spec/v2.0/contracts/domain.schema.json:7651:            "UNKNOWN"
+
+
+ARGV ['rg', '--files', 'adapters'] EXIT 0
+adapters\sources\x_test.go
+adapters\sources\x_partial_test.go
+adapters\sources\x.go
+adapters\sources\sources.go
+adapters\sources\health_test.go
+adapters\sources\health.go
+adapters\sources\github_test.go
+adapters\sources\github_readme_test.go
+adapters\sources\github_readme.go
+adapters\sources\github_pr_test.go
+adapters\sources\github_pr.go
+adapters\sources\github.go
+adapters\sources\arxiv_test.go
+adapters\sources\arxiv.go
+adapters\local_workspace\reparse_windows.go
+adapters\local_workspace\reparse_other.go
+adapters\local_workspace\inventory.go
+adapters\local_workspace\authority.go
+adapters\protectedstore\provider.go
+adapters\protectedstore\frozen_summary.go
+adapters\protectedstore\frozen_provider_windows.go
+adapters\protectedstore\frozen_provider_other.go
+adapters\protectedstore\frozen_generator_windows.go
+adapters\protectedstore\frozen_engine_windows_test.go
+adapters\protectedstore\frozen_engine_windows.go
+adapters\protectedstore\frozen_development.json
+adapters\protectedstore\frozen_development.go
+adapters\protectedstore\credential_windows.go
+adapters\protectedstore\config_pipe_windows.go
+adapters\decision\qualification_audit_test.go
+adapters\decision\qualification_audit.go
+adapters\decision\jev_test.go
+adapters\decision\jev.go
+adapters\protectedstore\broker_windows_test.go
+adapters\protectedstore\broker_windows.go
+adapters\protectedstore\canary_other.go
+adapters\protectedstore\canary_windows.go
+adapters\knowledge\manifest.go
+adapters\evaluation\native_test.go
+adapters\evaluation\native.go
+adapters\evaluation\evaluation_test.go
+adapters\evaluation\evaluation.go
+adapters\retrieval\local_test.go
+adapters\retrieval\local.go
+adapters\retrieval\identity_windows.go
+adapters\retrieval\identity_unix.go
+adapters\evaluation\skillup_test.go
+adapters\evaluation\skillup.go
+adapters\evaluation\w03_current_summary_test.go
+adapters\runtime\bridge_control_windows_test.go
+adapters\runtime\runtime_windows_test.go
+adapters\runtime\runtime_windows.go
+adapters\runtime\process_windows.go
+adapters\evaluation\testdata\skillup-native-result.json
+adapters\evaluation\testdata\skillup-eval.yaml
+adapters\runtime\bridge_windows.go
+adapters\runtime\bridge_stream_windows_test.go
+adapters\runtime\bridge_stream_windows.go
+adapters\runtime\bridge_program.go
+adapters\runtime\codex.go
+adapters\runtime\cancel_windows.go
+adapters\runtime\data_root_windows.go
+adapters\evaluation\cmd\main.go
+adapters\runtime\mu\build-candidate.mjs
+adapters\runtime\mu\worker.mjs
+adapters\runtime\mu\worker-stream.test.mjs
+adapters\runtime\mu\worker-pause.test.mjs
+adapters\runtime\mu\worker-control.test.mjs
+adapters\runtime\mu\package.json
+adapters\runtime\mu\build.mjs
+adapters\runtime\mu\build-candidate.test.mjs
+adapters\protectedstore\cmd\canary-broker\main_windows.go
+
+
+ARGV ['rg', '-n', 'owner.lock|ownerLock|OwnerLock', 'adapters/runtime'] EXIT 0
+adapters/runtime\bridge_windows.go:226:	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\bridge_windows.go:805:	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\bridge_windows.go:893:	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\runtime_windows.go:147:	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\runtime_windows.go:468:	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+
+

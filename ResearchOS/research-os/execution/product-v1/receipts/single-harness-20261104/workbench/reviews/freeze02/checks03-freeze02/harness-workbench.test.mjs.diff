@@ -1,0 +1,81 @@
+--- freeze01/tests/ui/desktop/harness-workbench.test.mjs
++++ freeze02/tests/ui/desktop/harness-workbench.test.mjs
+@@ -1,5 +1,7 @@
+ import test from 'node:test'
+ import assert from 'node:assert/strict'
++import fs from 'node:fs'
++import vm from 'node:vm'
+ import { decimal, canSubmitHarness, hasHarnessCapability, applyHarnessPage, cancelIntent, createHarnessController, harnessStatusLabel } from '../../../apps/web/src/harness.js'
+ import { composerSubmitKey, harnessActivityRows } from '../../../apps/web/src/activity.js'
+ 
+@@ -106,3 +108,70 @@
+   assert.equal(composerSubmitKey({ key: 'Enter', shiftKey: true }), false)
+   assert.equal(composerSubmitKey({ key: 'Enter' }), true)
+ })
++
++// Exercise the real React handler and textarea callback with a controlled
++// bridge promise; do not replace send() with a hand-written draft simulation.
++const workbench = fs.readFileSync(new URL('../../../apps/web/src/workbench.jsx', import.meta.url), 'utf8')
++const codexBlock = workbench.slice(workbench.indexOf('function NativeHarnessWorkbench('), workbench.indexOf('function NativeMuWorkbench('))
++const sendSource = /async function send\(event\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
++const editSource = /function editDraft\(value\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
++const textareaSource = /<textarea[^>]*onChange=\{(event => \w+\(event.target.value\))\}/.exec(codexBlock)?.[1]
++const scopeSource = /  if \(draftScope.current.projectId[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
++const cleanupSource = /return \(\) => \{ stopped = true; draftVersion[^\n]*/.exec(codexBlock)?.[0]?.replace(/^return /, '')
++assert.ok(sendSource && editSource && textareaSource && scopeSource && cleanupSource, 'actual draft handlers and view cleanup must be isolated')
++function pendingDraftSend() {
++  let resolve, currentDraft = 'submitted text'
++  const notices = [], submissions = []
++  const accepted = new Promise(done => { resolve = done })
++  const control = { submit: value => { submissions.push(value); return accepted }, dispose() {} }
++  const context = vm.createContext({ canSend: true, draft: 'submitted text', workspace: 'fixture-workspace', projectId: ref.project_id,
++    draftVersion: { current: 0 }, draftScope: { current: { projectId: ref.project_id, workspace: 'fixture-workspace' } },
++    controller: { current: control }, control, setDraft: value => { currentDraft = typeof value === 'function' ? value(currentDraft) : value },
++    setNotice: value => notices.push(value), stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
++  context.editDraft = vm.runInContext('(' + editSource + ')', context)
++  const send = vm.runInContext('(' + sendSource + ')', context)
++  const onChange = vm.runInContext('(' + textareaSource + ')', context)
++  const pending = send({ preventDefault() {} })
++  return { context, pending, resolve, notices, submissions, value: () => currentDraft,
++    edit: text => onChange({ target: { value: text } }),
++    scope: workspace => { context.workspace = workspace; vm.runInContext(scopeSource, context) },
++    cleanup: () => vm.runInContext('(' + cleanupSource + ')', context)() }
++}
++for (const editBack of [false, true]) test('actual send preserves unsent draft edits before late success; editBack=' + editBack, async () => {
++  const run = pendingDraftSend()
++  run.edit('new unsent text')
++  if (editBack) run.edit('submitted text')
++  const expected = run.value()
++  run.resolve(true); await run.pending
++  assert.equal(run.value(), expected)
++  assert.equal(run.submissions.length, 1)
++  assert.equal(run.context.draftVersion.current, editBack ? 2 : 1)
++})
++test('actual send still clears an unchanged successfully submitted draft', async () => {
++  const run = pendingDraftSend()
++  run.resolve(true); await run.pending
++  assert.equal(run.value(), '')
++  assert.equal(run.submissions[0].prompt, 'submitted text')
++})
++test('actual send keeps draft after view cleanup while its promise is pending', async () => {
++  const run = pendingDraftSend()
++  run.cleanup()
++  run.resolve(true); await run.pending
++  assert.equal(run.value(), 'submitted text')
++  assert.equal(run.context.controller.current, null)
++  assert.equal(run.notices.length, 1, 'unmounted view cannot publish the late success notice')
++})
++test('actual scope generations preserve draft after workspace changes away and back', async () => {
++  const run = pendingDraftSend()
++  run.scope('other-workspace'); run.scope('fixture-workspace')
++  run.resolve(true); await run.pending
++  assert.equal(run.value(), 'submitted text')
++  assert.equal(run.context.draftVersion.current, 2)
++})
++test('actual send cannot clear a draft owned by a replacement controller', async () => {
++  const run = pendingDraftSend()
++  run.context.controller.current = { submit() { throw Error('unexpected resubmit') } }
++  run.resolve(true); await run.pending
++  assert.equal(run.value(), 'submitted text')
++  assert.equal(run.notices.length, 1)
++})

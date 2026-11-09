@@ -1,0 +1,502 @@
+{
+  "authority": "NONE",
+  "review": "# Legacy migration fixture independent Source review\n\n**Verdict: REQUEST CHANGES**\n\n本审查仅覆盖冻结 Source、资源指纹、静态调用链及合同映射；authority=NONE，formal_acceptance=false。发现一个会阻止回滚用例到达其断言的 Important 问题。ordinary 历史升级仍然 BLOCKED，Source 审查没有把 restore 子例或 SQL9 组件提升为产品升级接受。\n\n## Critical Issues\n\n未发现新的 Critical 问题。\n\n## Important Issues\n\n- **LEGACY-ROLLBACK-001 — rollback fixture 缺少 Project，提前终止。** candidate-root/internal/domain/client_session_bootstrap_test.go:117 使用 `f := setup(t)`，随后 :119 调用 `useLegacyTranscriptFixture`。固定 T5 的 internal/domain/domain_test.go:141–167 只初始化服务和 principal/token，返回 fixture 时没有赋值 project；项目创建发生在 :205–208 的 `createProject`，而该用例没有调用它。新的 helper legacy_migration_fixture_test.go:121–140 按空的 `f.project` 查 Project/Profile，并在 copied==0 时返回 `historical transcript fixture lacks Project identity`。因此该用例在 bootstrap_test.go:119–120 停止，无法到达 :122 的 Begin、:127 的 fence 安装及 :134 的 rollback。这里是确定的静态前置条件冲突，未伪称已执行失败。**建议修复：**该用例直接用 `legacyTranscriptFixtureDatabase(t)` 创建所需 schema，然后继续原事务/列可见性/回滚断言；或者显式创建 Project 后才调用复制 helper。在新不可变 Source namespace 修正，并重新进行独立审阅；通过后由 Root 在授权集成环境中运行该组件。\n\n## Suggestions\n\n无额外建议；当前应先解除回滚测试的前置条件错误。\n\n## What's Done Well\n\n- 真正的历史 pre-transcript DDL 保留原始字节；独立重算 Git blob 为 `9efc768f8f4cfb6ac31e1f88a78ad095877328af`，20 numbered SQL 均匹配冻结历史对象。\n- migration helper 先核对实际 ledger，再在同一事务应用真实 SQL 与记录版本；原 gap 输入作为单独拒绝测试保留，未关闭 production safety gate。\n- 两个旧测试文件的 12 个原测试名、126 个原 t 断言调用都保留；9 个无关测试函数体完全相同。ordinary 原 New 正向调用也保持，且作者明确承认它仍被安全门拒绝。\n\n## Verification Story\n\n- Tests reviewed: yes。先读测试及 fixture helper，再沿 setup/contextFixture/New/safety gate 核查；词法检查是独立 Python 静态检查，不是 Go AST 或编译认证。\n- Build verified: no。没有运行 Go、gofmt、compiler、native product、SQL 或 model。\n- Security checked: yes，静态范围。没有 production Source 修改或弱化迁移/身份/ledger gate；测试资源均为明确的 fixture。没有处理 private credentials。\n- 作者 MANIFEST 的 28 members 及 Source refs 去重后共 63 个 pinned refs 均匹配，另 pin 2 个发现问题必需的 setup/contextFixture Source 文件。静态核验总记录 65 条。\n- 历史 commit 的 40 selected Git entries 与作者保留的原始 ls-tree 输出一致；独立计算当前资源 Git blob 匹配。没有在此审查重新执行 Git，也没有据此声称 historical installed program、完整编译依赖闭合或 release authority。\n- 作者 postseal-tool-io 明确排除于作者 manifest；本审查单独复制并 pin。其 seal_revision 原始工具输出 exit_code=0，输出中的 HANDOFF/MANIFEST refs 在封装时另与实际文件核对。这只证明 Python Source 封装返回，不证明候选 Go/SQL 行为。\n- 作者失败 833 的原始命令/失败脚本/输出保留；本独立审查没有新 mechanical failure，旧 826 与 FULL 1261 PASS/25 FAIL/4 SKIP 不 reset。\n\n## Remaining boundary\n\nordinary 用例使用 populated historical20 时，当前 CheckMigrationSafety 正确返回 MIGRATION_PREBACKUP_REQUIRED。它需要匹配历史程序、真实 backup/isolated restore，以及明确支持的升级路径；本包未完成这些资源。restore、caller rollback 和 frozen SQL9 只能获得各自组件证据，不能让整个原 parent 获得 PASS。Main/T5/T6/T7、canonical 没有被本审查写入；所有新写入限定于此独立审查 namespace 和已归档后移除的自建临时脚本。\n\n",
+  "finding": {
+    "authority": "NONE",
+    "formal_acceptance": false,
+    "verdict": "REQUEST_CHANGES",
+    "critical": [],
+    "important": [
+      {
+        "id": "LEGACY-ROLLBACK-001",
+        "file": "candidate-root/internal/domain/client_session_bootstrap_test.go",
+        "line": 119,
+        "cause": "setup does not create project; useLegacyTranscriptFixture requires at least one matching Project/Profile row",
+        "impact": "rollback assertions unreachable after helper returns missing Project identity",
+        "recommendation": "use legacyTranscriptFixtureDatabase directly for schema-only rollback, or explicitly create Project before copy helper",
+        "evidence": [
+          "inputs/author/candidate-root/internal/domain/client_session_bootstrap_test.go:117",
+          "inputs/author/candidate-root/internal/domain/legacy_migration_fixture_test.go:121",
+          "inputs/dependencies/domain_test.go:167",
+          "inputs/dependencies/domain_test.go:205"
+        ],
+        "verification": "STATIC_CALL_PATH_ONLY"
+      }
+    ],
+    "ordinary": "BLOCKED_HISTORICAL20_MATCHING_PROGRAM_BACKUP_RESTORE_UPGRADE",
+    "candidate_execution": "NOT_RUN"
+  },
+  "rollback_and_helper_callsite_lines": [
+    {
+      "line": 115,
+      "text": ""
+    },
+    {
+      "line": 116,
+      "text": "func TestClientTranscriptIndexUpgradeRollsBackWithCallerTransaction(t *testing.T) {"
+    },
+    {
+      "line": 117,
+      "text": "\tf := setup(t)"
+    },
+    {
+      "line": 118,
+      "text": "\tctx := context.Background()"
+    },
+    {
+      "line": 119,
+      "text": "\tif err := useLegacyTranscriptFixture(t, f); err != nil {"
+    },
+    {
+      "line": 120,
+      "text": "\t\tt.Fatal(err)"
+    },
+    {
+      "line": 121,
+      "text": "\t}"
+    },
+    {
+      "line": 122,
+      "text": "\ttx, err := f.db.Begin()"
+    },
+    {
+      "line": 123,
+      "text": "\tif err != nil {"
+    },
+    {
+      "line": 124,
+      "text": "\t\tt.Fatal(err)"
+    },
+    {
+      "line": 125,
+      "text": "\t}"
+    },
+    {
+      "line": 126,
+      "text": "\tdefer tx.Rollback()"
+    },
+    {
+      "line": 127,
+      "text": "\tif err = installClientSessionFence(ctx, tx, false); err != nil {"
+    },
+    {
+      "line": 128,
+      "text": "\t\tt.Fatal(err)"
+    },
+    {
+      "line": 129,
+      "text": "\t}"
+    },
+    {
+      "line": 130,
+      "text": "\tvar count int"
+    },
+    {
+      "line": 131,
+      "text": "\tif err = tx.QueryRow(`SELECT count(*) FROM pragma_table_info('client_sessions') WHERE name='transcript_artifact_id'`).Scan(&count); err != nil || count != 1 {"
+    },
+    {
+      "line": 132,
+      "text": "\t\tt.Fatalf(\"transaction did not install column: %d %v\", count, err)"
+    },
+    {
+      "line": 133,
+      "text": "\t}"
+    },
+    {
+      "line": 134,
+      "text": "\tif err = tx.Rollback(); err != nil {"
+    },
+    {
+      "line": 135,
+      "text": "\t\tt.Fatal(err)"
+    },
+    {
+      "line": 136,
+      "text": "\t}"
+    },
+    {
+      "line": 137,
+      "text": "\tif err = f.db.QueryRow(`SELECT count(*) FROM pragma_table_info('client_sessions') WHERE name='transcript_artifact_id'`).Scan(&count); err != nil || count != 0 {"
+    },
+    {
+      "line": 138,
+      "text": "\t\tt.Fatalf(\"rollback kept column: %d %v\", count, err)"
+    },
+    {
+      "line": 139,
+      "text": "\t}"
+    },
+    {
+      "line": 140,
+      "text": "}"
+    },
+    {
+      "line": 141,
+      "text": ""
+    },
+    {
+      "line": 142,
+      "text": ""
+    },
+    {
+      "line": 143,
+      "text": "// This is explicitly current-schema corruption, not a historical upgrade fixture."
+    },
+    {
+      "line": 144,
+      "text": "func TestClientTranscriptInstalledColumnRemovalRequiresPrebackup(t *testing.T) {"
+    },
+    {
+      "line": 145,
+      "text": "    f := contextFixture(t)"
+    },
+    {
+      "line": 146,
+      "text": "    if _, err := f.db.Exec(\"ALTER TABLE client_sessions DROP COLUMN transcript_artifact_id\"); err != nil {"
+    },
+    {
+      "line": 147,
+      "text": "        t.Fatal(err)"
+    },
+    {
+      "line": 148,
+      "text": "    }"
+    }
+  ],
+  "helper_source": "package domain\n\n// Synthetic migration primitive fixtures. These are not matching-program backup,\n// isolated restore, historical release authority, or product upgrade acceptance.\nimport (\n    \"context\"\n    \"database/sql\"\n    _ \"embed\"\n    \"fmt\"\n    \"os\"\n    \"path/filepath\"\n    \"strings\"\n    \"testing\"\n    \"researchos.local/research-os/internal/store\"\n)\n\n// Exact Git 3225a31fd25969c6a5e071a2fc686cb4a835e162 blob\n// 9efc768f8f4cfb6ac31e1f88a78ad095877328af; never derived by dropping a current column.\n//go:embed testdata/pretranscript-3225a31f.sql\nvar legacyTranscriptDDL3225 []byte\n\nvar legacyFixtureMigrationSources = []struct { filename, digest string }{\n    {\"0001_bootstrap.sql\",\"sha256:bb87c889e31fd5412b49743d106679f783b6dd21d874fe29d82d18a729ce3dbc\"},\n    {\"0002_domain.sql\",\"sha256:90d6c36100cbfaddf85c23f603b686336d161e43eeeed47c034ab85415b25db4\"},\n    {\"0003_context.sql\",\"sha256:50aa1579e4233cbb64ac30777e27c55cba29bab7ee0cc221a677f9a420a7159a\"},\n    {\"0004_sources.sql\",\"sha256:d40152642778d8ea4e21148fd6517bdc8bf4c2582a8d6212b8cfdf7a470dea06\"},\n    {\"0005_runtime.sql\",\"sha256:f3b9cd4c03f101c22c47a4fd7ad72593babe69de9abcd8a1ee3056fa6c23ade5\"},\n    {\"0006_orchestration.sql\",\"sha256:cbc9ede2d2e46e1e68ac7120d2a99b29627f2e13b1fc82937e3ed13ac9b2317b\"},\n    {\"0007_retrieval.sql\",\"sha256:eaa3963a3acdfcc1791982432c42dea9d4dd8f0baf7de51d278fce70bcd626bb\"},\n    {\"0008_artifact_uses.sql\",\"sha256:adf17ad69203f0e700897a426f2d596496081bd5f3a964cbea8e3db9fc561ee7\"},\n    {\"0009_retrieval_root_identity.sql\",\"sha256:48219da409abc3f9d353e8d91a71a387ea342e5c13aae711a36c28410b22fb4f\"},\n    {\"0010_experiments.sql\",\"sha256:c197ff792f62a1be5903bb6967175512cb53bdb09ff276e06fa8542822024287\"},\n    {\"0011_resources.sql\",\"sha256:45c082ae0980af14f5b0be2d5aae02622dcc15c8c566b442077b4c1fb0c9942b\"},\n    {\"0012_experiment_execution.sql\",\"sha256:c81411769ef2bd3ec1d101f311ce37722036485b8e9d99d45ae9c9be48f088c0\"},\n    {\"0013_research_cycles.sql\",\"sha256:188e0d6fbcffd3901d36109dcd421a21f7ef704574f62cd5c0f8af862c191d1e\"},\n    {\"0014_remote_access.sql\",\"sha256:687b01552260301a8f3f39e92422f16d0b2e310b38f77d1b025566f9a9cfa4d7\"},\n    {\"0015_evolution_fixture.sql\",\"sha256:d70dd0580e89e2a7940c90ee771b2bd94551a42d8cda7fadfe83b60509852fe9\"},\n    {\"0016_runtime_qualification.sql\",\"sha256:7fd44c42be4c0753c367fc8361e9990b56e4f9a001a5f443ef62d0d87d05a03f\"},\n    {\"0017_runtime_dispatch.sql\",\"sha256:e5a2671c25725205bb5306c7fcbab254d53e3ef7a0448a163a41c5ac24a7b558\"},\n    {\"0018_intent_planning.sql\",\"sha256:7592b2b47d2e305f9ec26937830b5c0606c7d90622401a0b6b80a8c8a67db4e0\"},\n    {\"0019_evolution_release_operations.sql\",\"sha256:54ff6eb7a7ca588df738f5bd68b6f6851d86916cef435abaac15d1f8bd6e131e\"},\n    {\"0020_research_cycle_work.sql\",\"sha256:3f90bdb0e828cec90bc370f34abed0cf0629dc78dcc01dda250c18cda49e528a\"},\n}\n\nfunc legacyFixtureMigrationSQL(version int) ([]byte, error) {\n    if version < 1 || version > len(legacyFixtureMigrationSources) {\n        return nil, fmt.Errorf(\"legacy fixture migration version unavailable\")\n    }\n    source := legacyFixtureMigrationSources[version-1]\n    raw, err := os.ReadFile(filepath.Join(\"../../migrations/sqlite\", source.filename))\n    if err != nil { return nil, err }\n    if Digest(raw) != source.digest {\n        return nil, fmt.Errorf(\"legacy fixture migration source pin differs\")\n    }\n    return raw, nil\n}\n\nfunc legacyFixtureMigrationFiles() []string {\n    files := make([]string, 0, len(legacyFixtureMigrationSources))\n    for _, source := range legacyFixtureMigrationSources {\n        files = append(files, filepath.Join(\"../../migrations/sqlite\", source.filename))\n    }\n    return files\n}\n\n// The actual historical SQL and its version row commit in the same transaction.\n// No hole is filled by relabelling a current database or recording unexecuted SQL.\nfunc applyLegacyFixtureMigration(ctx context.Context, db *sql.DB, version int, raw []byte) (sql.Result, error) {\n    if version < 2 || version > len(legacyFixtureMigrationSources) || Digest(raw) != legacyFixtureMigrationSources[version-1].digest {\n        return nil, fmt.Errorf(\"legacy fixture migration source pin differs\")\n    }\n    applied, err := checkMigrationInventory(db, legacyFixtureMigrationFiles())\n    if err != nil { return nil, err }\n    if applied != version-1 {\n        return nil, fmt.Errorf(\"legacy fixture migration is not the next contiguous version\")\n    }\n    tx, err := db.BeginTx(ctx, nil)\n    if err != nil { return nil, err }\n    defer tx.Rollback()\n    result, err := tx.ExecContext(ctx, string(raw))\n    if err != nil { return nil, err }\n    if _, err = tx.ExecContext(ctx, \"INSERT INTO schema_migrations(version) VALUES(?)\", version); err != nil { return nil, err }\n    if err = tx.Commit(); err != nil { return nil, err }\n    return result, nil\n}\n\nfunc applyLegacyFixtureMigrationRange(ctx context.Context, db *sql.DB, first, last int) error {\n    if first < 2 || first > last || last > len(legacyFixtureMigrationSources) {\n        return fmt.Errorf(\"legacy fixture migration range unavailable\")\n    }\n    for version := first; version <= last; version++ {\n        raw, err := legacyFixtureMigrationSQL(version)\n        if err != nil { return err }\n        if _, err = applyLegacyFixtureMigration(ctx, db, version, raw); err != nil { return err }\n    }\n    return nil\n}\n\nfunc legacyTranscriptFixtureDatabase(t *testing.T) (*sql.DB, error) {\n    t.Helper()\n    db, err := store.Open(filepath.Join(t.TempDir(), \"historical20-transcript.sqlite\"))\n    if err != nil { return nil, err }\n    t.Cleanup(func() { _ = db.Close() })\n    if _, err = legacyFixtureMigrationSQL(1); err != nil { return nil, err }\n    if err = store.Bootstrap(context.Background(), db, \"../../migrations/sqlite/0001_bootstrap.sql\"); err != nil { return nil, err }\n    if err = applyLegacyFixtureMigrationRange(context.Background(), db, 2, 20); err != nil { return nil, err }\n    if Digest(legacyTranscriptDDL3225) != \"sha256:3b00677902c3be1dbffb8f7505293bae7242dc976e8017562ab86254ac212f2a\" {\n        return nil, fmt.Errorf(\"historical transcript DDL pin differs\")\n    }\n    if _, err = db.Exec(string(legacyTranscriptDDL3225)); err != nil { return nil, err }\n    var column int\n    if err = db.QueryRow(\"SELECT count(*) FROM pragma_table_info('client_sessions') WHERE name='transcript_artifact_id'\").Scan(&column); err != nil { return nil, err }\n    if column != 0 { return nil, fmt.Errorf(\"historical transcript DDL already has current column\") }\n    return db, nil\n}\n\n// The project index is synthetic fixture data copied from the existing Project\n// fixture, while all schema bytes and version rows are the genuine historical\n// prefix. No authentication, credential, model, Run or runtime state is copied.\n// This test uses only f.db/f.project afterward; it does not run f.s on this DB.\nfunc useLegacyTranscriptFixture(t *testing.T, f *fixture) error {\n    t.Helper()\n    db, err := legacyTranscriptFixtureDatabase(t)\n    if err != nil { return err }\n    rows, err := f.db.Query(\"SELECT project,kind,id,revision,body,content_hash,immutable FROM domain_objects WHERE kind IN ('Project','ProjectProfile') AND id=? ORDER BY project,kind,id\", f.project)\n    if err != nil { return err }\n    defer rows.Close()\n    copied := 0\n    for rows.Next() {\n        var project, kind, id, body string\n        var revision, immutable int64\n        var contentHash sql.NullString\n        if err = rows.Scan(&project, &kind, &id, &revision, &body, &contentHash, &immutable); err != nil { return err }\n        if _, err = db.Exec(\"INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?)\", project, kind, id, revision, body, contentHash, immutable); err != nil { return err }\n        copied++\n    }\n    if err = rows.Err(); err != nil { return err }\n    if copied == 0 { return fmt.Errorf(\"historical transcript fixture lacks Project identity\") }\n    f.db = db\n    return nil\n}\n\n// Hash all schema definitions and public synthetic fixture table values to prove\n// rejected New performs no additional DDL or data mutation. Values are never logged.\nfunc legacyFixtureFingerprint(t *testing.T, db *sql.DB) string {\n    t.Helper()\n    rows, err := db.Query(\"SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name\")\n    if err != nil { t.Fatal(err) }\n    var schema []any\n    var tables []string\n    for rows.Next() {\n        var typ, name, table string\n        var ddl sql.NullString\n        if err = rows.Scan(&typ,&name,&table,&ddl); err != nil { rows.Close(); t.Fatal(err) }\n        schema = append(schema, Object{\"type\":typ,\"name\":name,\"table\":table,\"sql\":ddl})\n        if typ == \"table\" { tables = append(tables,name) }\n    }\n    err = rows.Err()\n    rows.Close()\n    if err != nil { t.Fatal(err) }\n    data := Object{}\n    for _, name := range tables {\n        quoted := strings.ReplaceAll(name, \"\\\"\", \"\\\"\\\"\")\n        records, e := db.Query(\"SELECT * FROM \\\"\"+quoted+\"\\\"\")\n        if e != nil { t.Fatal(e) }\n        columns, e := records.Columns()\n        if e != nil { records.Close(); t.Fatal(e) }\n        values := []any{}\n        for records.Next() {\n            row := make([]any,len(columns))\n            refs := make([]any,len(columns))\n            for i := range refs { refs[i] = &row[i] }\n            if e = records.Scan(refs...); e != nil { records.Close(); t.Fatal(e) }\n            values = append(values,row)\n        }\n        e = records.Err()\n        records.Close()\n        if e != nil { t.Fatal(e) }\n        data[name] = Object{\"columns\":columns,\"rows\":values}\n    }\n    return Hash(Object{\"schema\":schema,\"data\":data})\n}\n\nfunc legacyFixtureExpectNewRefusal(t *testing.T, db *sql.DB, code string) {\n    t.Helper()\n    before := legacyFixtureFingerprint(t,db)\n    _, err := New(db,\"../../spec/v2.0/contracts\",\"../../migrations/sqlite/0002_domain.sql\")\n    if err == nil || !(err.Error() == code || strings.HasPrefix(err.Error(),code+\":\")) {\n        t.Fatalf(\"ordinary startup did not preserve %s refusal: %v\",code,err)\n    }\n    if after := legacyFixtureFingerprint(t,db); after != before {\n        t.Fatal(\"rejected startup changed fixture schema or data\")\n    }\n}\n",
+  "setup_lines": [
+    {
+      "line": 140,
+      "text": ""
+    },
+    {
+      "line": 141,
+      "text": "func setup(t *testing.T) *fixture {"
+    },
+    {
+      "line": 142,
+      "text": "\treturn setupWithConstructor(t, New)"
+    },
+    {
+      "line": 143,
+      "text": "}"
+    },
+    {
+      "line": 144,
+      "text": ""
+    },
+    {
+      "line": 145,
+      "text": "func setupWithConstructor(t *testing.T, construct func(*sql.DB, string, string) (*Service, error)) *fixture {"
+    },
+    {
+      "line": 146,
+      "text": "\tt.Helper()"
+    },
+    {
+      "line": 147,
+      "text": "\tdb, e := store.Open(filepath.Join(t.TempDir(), \"domain.sqlite\"))"
+    },
+    {
+      "line": 148,
+      "text": "\tif e != nil {"
+    },
+    {
+      "line": 149,
+      "text": "\t\tt.Fatal(e)"
+    },
+    {
+      "line": 150,
+      "text": "\t}"
+    },
+    {
+      "line": 151,
+      "text": "\tt.Cleanup(func() { db.Close() })"
+    },
+    {
+      "line": 152,
+      "text": "\tif e = store.Bootstrap(context.Background(), db, \"../../migrations/sqlite/0001_bootstrap.sql\"); e != nil {"
+    },
+    {
+      "line": 153,
+      "text": "\t\tt.Fatal(e)"
+    },
+    {
+      "line": 154,
+      "text": "\t}"
+    },
+    {
+      "line": 155,
+      "text": "\ts, e := construct(db, \"../../spec/v2.0/contracts\", \"../../migrations/sqlite/0002_domain.sql\")"
+    },
+    {
+      "line": 156,
+      "text": "\tif e != nil {"
+    },
+    {
+      "line": 157,
+      "text": "\t\tt.Fatal(e)"
+    },
+    {
+      "line": 158,
+      "text": "\t}"
+    },
+    {
+      "line": 159,
+      "text": "\tp := Principal{ID: \"fixture-owner\", Roles: []string{\"OWNER\"}, CanCreateProject: true}"
+    },
+    {
+      "line": 160,
+      "text": "\tif e = s.ProvisionPrincipal(context.Background(), p); e != nil {"
+    },
+    {
+      "line": 161,
+      "text": "\t\tt.Fatal(e)"
+    },
+    {
+      "line": 162,
+      "text": "\t}"
+    },
+    {
+      "line": 163,
+      "text": "\ttoken, e := s.IssueCredential(context.Background(), p.ID, time.Minute)"
+    },
+    {
+      "line": 164,
+      "text": "\tif e != nil {"
+    },
+    {
+      "line": 165,
+      "text": "\t\tt.Fatal(e)"
+    },
+    {
+      "line": 166,
+      "text": "\t}"
+    },
+    {
+      "line": 167,
+      "text": "\treturn &fixture{s: s, h: s.Handler(), token: token, owner: p.ID, db: db, t: t}"
+    },
+    {
+      "line": 168,
+      "text": "}"
+    },
+    {
+      "line": 169,
+      "text": "func (f *fixture) request(method, path, key, etag string, body any) (int, Object, http.Header) {"
+    },
+    {
+      "line": 170,
+      "text": "\tf.t.Helper()"
+    },
+    {
+      "line": 171,
+      "text": "\tvar raw []byte"
+    },
+    {
+      "line": 172,
+      "text": "\tif body != nil {"
+    },
+    {
+      "line": 173,
+      "text": "\t\tswitch v := body.(type) {"
+    },
+    {
+      "line": 174,
+      "text": "\t\tcase []byte:"
+    },
+    {
+      "line": 175,
+      "text": "\t\t\traw = v"
+    },
+    {
+      "line": 176,
+      "text": "\t\tdefault:"
+    },
+    {
+      "line": 177,
+      "text": "\t\t\traw = Bytes(v)"
+    },
+    {
+      "line": 178,
+      "text": "\t\t}"
+    },
+    {
+      "line": 179,
+      "text": "\t}"
+    },
+    {
+      "line": 180,
+      "text": "\tr := httptest.NewRequest(method, path, bytes.NewReader(raw))"
+    },
+    {
+      "line": 181,
+      "text": "\tr.Header.Set(\"Authorization\", \"Bearer \"+f.token)"
+    },
+    {
+      "line": 182,
+      "text": "\tif key != \"\" {"
+    },
+    {
+      "line": 183,
+      "text": "\t\tr.Header.Set(\"Idempotency-Key\", key)"
+    },
+    {
+      "line": 184,
+      "text": "\t}"
+    },
+    {
+      "line": 185,
+      "text": "\tif etag != \"\" {"
+    },
+    {
+      "line": 186,
+      "text": "\t\tr.Header.Set(\"If-Match\", etag)"
+    },
+    {
+      "line": 187,
+      "text": "\t}"
+    },
+    {
+      "line": 188,
+      "text": "\tw := httptest.NewRecorder()"
+    },
+    {
+      "line": 189,
+      "text": "\tf.h.ServeHTTP(w, r)"
+    },
+    {
+      "line": 190,
+      "text": "\tvar o Object"
+    },
+    {
+      "line": 191,
+      "text": "\tjson.Unmarshal(w.Body.Bytes(), &o)"
+    },
+    {
+      "line": 192,
+      "text": "\treturn w.Code, o, w.Header()"
+    },
+    {
+      "line": 193,
+      "text": "}"
+    },
+    {
+      "line": 194,
+      "text": "func (f *fixture) expect(status int, method, path, key, etag string, b any) Object {"
+    },
+    {
+      "line": 195,
+      "text": "\tf.t.Helper()"
+    },
+    {
+      "line": 196,
+      "text": "\tgot, o, _ := f.request(method, path, key, etag, b)"
+    },
+    {
+      "line": 197,
+      "text": "\tif got != status {"
+    },
+    {
+      "line": 198,
+      "text": "\t\tf.t.Fatalf(\"%s %s: status %d want %d body %s\", method, path, got, status, Bytes(o))"
+    },
+    {
+      "line": 199,
+      "text": "\t}"
+    }
+  ],
+  "contextFixture_lines": [
+    {
+      "line": 15,
+      "text": ""
+    },
+    {
+      "line": 16,
+      "text": "func contextFixture(t *testing.T) *fixture {"
+    },
+    {
+      "line": 17,
+      "text": "\treturn contextFixtureFrom(setup(t))"
+    },
+    {
+      "line": 18,
+      "text": "}"
+    },
+    {
+      "line": 19,
+      "text": ""
+    },
+    {
+      "line": 20,
+      "text": "func contextFixtureFrom(f *fixture) *fixture {"
+    },
+    {
+      "line": 21,
+      "text": "\tf.createProject()"
+    },
+    {
+      "line": 22,
+      "text": "\tf.owner = \"fixture-author\""
+    },
+    {
+      "line": 23,
+      "text": "\tf.switchPrincipal(f.owner, []string{\"OWNER\", \"PLANNER\", \"EXECUTOR\", \"SCHEDULER\"})"
+    },
+    {
+      "line": 24,
+      "text": "\treturn f"
+    },
+    {
+      "line": 25,
+      "text": "}"
+    },
+    {
+      "line": 26,
+      "text": "func (f *fixture) switchPrincipal(id string, roles []string) {"
+    },
+    {
+      "line": 27,
+      "text": "\tf.t.Helper()"
+    },
+    {
+      "line": 28,
+      "text": "\tvar exists int"
+    },
+    {
+      "line": 29,
+      "text": "\tf.db.QueryRow(\"SELECT count(*) FROM auth_principals WHERE id=?\", id).Scan(&exists)"
+    },
+    {
+      "line": 30,
+      "text": "\tif exists == 0 {"
+    },
+    {
+      "line": 31,
+      "text": "\t\tif e := f.s.ProvisionPrincipal(context.Background(), Principal{ID: id, Roles: roles, CanCreateProject: id == f.owner, Grants: []Grant{{ProjectID: f.project}}}); e != nil {"
+    },
+    {
+      "line": 32,
+      "text": "\t\t\tf.t.Fatal(e)"
+    },
+    {
+      "line": 33,
+      "text": "\t\t}"
+    },
+    {
+      "line": 34,
+      "text": "\t}"
+    },
+    {
+      "line": 35,
+      "text": "\ttoken, e := f.s.IssueCredential(context.Background(), id, time.Minute)"
+    },
+    {
+      "line": 36,
+      "text": "\tif e != nil {"
+    }
+  ],
+  "verified_review_members": 42,
+  "verified_previous_members": 28
+}

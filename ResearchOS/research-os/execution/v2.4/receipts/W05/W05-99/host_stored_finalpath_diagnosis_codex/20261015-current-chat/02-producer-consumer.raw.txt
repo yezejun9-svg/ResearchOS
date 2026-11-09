@@ -1,0 +1,594 @@
+4f4023c956f84d65743f39ce77d6c8899a21ada1
+AGENTS.md
+go.mod
+internal\host\roots_windows.go
+internal\host\roots_other.go
+internal\host\roots.go
+internal\host\backup_windows.go
+third_party\mu\AGENTS.md
+internal\domain\evolution_release_backup_windows.go
+third_party\mu\desktop\AGENTS.md
+.\adapters\protectedstore\canary_windows.go:141:	n, e := windows.GetFinalPathNameByHandle(h, &buffer[0], uint32(len(buffer)), 0)
+.\adapters\runtime\bridge_windows.go:990:	count, e := windows.GetFinalPathNameByHandle(handle, &finalPath[0], uint32(len(finalPath)), 0)
+.\internal\recoveryauthority\history_test.go:34:    guardRef:=ref("clock"); guardRef["verified"]=true; guardRef["final_path_match"]=true; guardRef["closed"]=true
+.\internal\recoveryauthority\history.go:50:        for _,value:=range entries { ref,ok:=value.(map[string]any); if !ok || !yes(ref,"verified") || !yes(ref,"final_path_match") || !yes(ref,"closed") || !checkRef(ref) { return fail() } }
+.\internal\host\roots_windows.go:35:	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+.\internal\host\roots.go:31:	FinalPath    string `json:"final_path"`
+.\internal\host\roots.go:123:		VolumeID: vol, FileID: id, FinalPath: final, RegisteredAt: now.UTC().Format(time.RFC3339Nano)}
+.\internal\host\backup_windows.go:14:// SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+.\internal\host\backup_windows.go:17:func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+.\internal\host\backup_other.go:12:func (h *Host) SnapshotWorkspace(context.Context, domain.WorkspaceBinding, string, domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+.\internal\host\backup_integration_windows_test.go:433:	if _, err := restoredHost.SnapshotWorkspace(ctx, *otherBinding, filepath.Join(root, "outside-backup"),
+.\internal\domain\backup_host_configuration_test.go:277:func (w handlerBackupWorkspace) SnapshotWorkspace(_ context.Context, b WorkspaceBinding, _ string, _ BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
+.\internal\domain\backup_queue_upgrade_test.go:27:func (w queueUpgradeWorkspace) SnapshotWorkspace(_ context.Context, binding WorkspaceBinding, _ string, _ BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
+.\ops\supervisor\release_journal_windows.go:333:	n, err := windows.GetFinalPathNameByHandle(h, &buffer[0], uint32(len(buffer)), 0)
+.\tests\security\check\phases.go:341:			pinned = r.VolumeID != "" && r.FileID != 0 && r.FinalPath != ""
+.\internal\domain\backup_workspace.go:46:	SnapshotWorkspace(context.Context, WorkspaceBinding, string, BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error)
+.\internal\domain\backup_workspace.go:190:		snapshot, err := source.SnapshotWorkspace(ctx, b, destination, BackupWorkspaceLimits{MaxFiles: remainingFiles, MaxDirs: remainingDirs, MaxBytes: remainingBytes, MaxFileBytes: BackupWorkspaceMaxFileBytes})
+.\internal\domain\backup_w1802_windows_test.go:22:func (f backupW1802Source) SnapshotWorkspace(_ context.Context, binding WorkspaceBinding, _ string, limits BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
+.\internal\domain\backup_upgrade_path_windows.go:28:	n, e := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
+SOURCE=internal/host/roots_windows.go
+1: //go:build windows
+2: 
+3: package host
+4: 
+5: import (
+6: 	"fmt"
+7: 	"path/filepath"
+8: 	"strings"
+9: 
+10: 	"golang.org/x/sys/windows"
+11: )
+12: 
+13: const fileAttributeReparsePoint = 0x400
+14: 
+15: // fileIdentity pins a directory by volume serial plus file index and reports the resolved
+16: // final path, which is how a junction or symlink substitution is detected later.
+17: func fileIdentity(path string) (volume string, fileID uint64, final string, err error) {
+18: 	wide, err := windows.UTF16PtrFromString(path)
+19: 	if err != nil {
+20: 		return "", 0, "", err
+21: 	}
+22: 	h, err := windows.CreateFile(wide, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+23: 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+24: 	if err != nil {
+25: 		return "", 0, "", fmt.Errorf("open %s: %w", path, err)
+26: 	}
+27: 	defer windows.CloseHandle(h)
+28: 	var info windows.ByHandleFileInformation
+29: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+30: 		return "", 0, "", err
+31: 	}
+32: 	vol := fmt.Sprintf("%08x", info.VolumeSerialNumber)
+33: 	id := uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+34: 	buf := make([]uint16, 4096)
+35: 	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+36: 	if err != nil || n == 0 {
+37: 		return vol, id, "", fmt.Errorf("final path unavailable for %s: %v", path, err)
+38: 	}
+39: 	final = windows.UTF16PtrToString(&buf[0])
+40: 	if l := int(n); len(final) > l {
+41: 		final = final[:l]
+42: 	}
+43: 	final = strings.TrimPrefix(final, `\\?\`)
+44: 	return vol, id, final, nil
+45: }
+46: 
+47: // chainHasReparsePoint walks every prefix of the path, so a junction anywhere above the target
+48: // is caught even when the final component is an ordinary file.
+49: func chainHasReparsePoint(path string) (bool, error) {
+50: 	abs, err := filepath.Abs(path)
+51: 	if err != nil {
+52: 		return false, err
+53: 	}
+54: 	parts := strings.Split(abs, string(filepath.Separator))
+55: 	var cur string
+56: 	for _, p := range parts {
+57: 		if p == "" {
+58: 			cur = abs[:1] + string(filepath.Separator)
+59: 			continue
+60: 		}
+61: 		if cur == "" {
+62: 			cur = p + string(filepath.Separator)
+63: 			continue
+64: 		}
+65: 		cur = filepath.Join(cur, p)
+66: 		reparse, err := isReparsePoint(cur)
+67: 		if err != nil {
+68: 			// Not existing yet is normal for a write target; only existing components can be
+69: 			// reparse points.
+70: 			continue
+71: 		}
+72: 		if reparse {
+73: 			return true, nil
+74: 		}
+75: 	}
+76: 	return false, nil
+77: }
+78: 
+79: func isReparsePoint(path string) (bool, error) {
+80: 	wide, err := windows.UTF16PtrFromString(path)
+81: 	if err != nil {
+82: 		return false, err
+83: 	}
+84: 	h, err := windows.CreateFile(wide, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+85: 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+86: 	if err != nil {
+87: 		return false, err
+88: 	}
+89: 	defer windows.CloseHandle(h)
+90: 	var info windows.ByHandleFileInformation
+91: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+92: 		return false, err
+93: 	}
+94: 	return info.FileAttributes&fileAttributeReparsePoint != 0, nil
+95: }
+SOURCE=internal/host/roots.go
+1: package host
+2: 
+3: // Workspace root binding (22 §workspace binding, 04 §鉴权). A root is registered once from a
+4: // user-chosen directory, pinned by volume serial plus file index so a later junction or symlink
+5: // swap of the same path is detectable, and revoked rather than "appearing empty" when access is
+6: // withdrawn - an inaccessible directory must never be presented as an empty one.
+7: 
+8: import (
+9: 	"errors"
+10: 	"fmt"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"sort"
+14: 	"strings"
+15: 	"sync"
+16: 	"time"
+17: )
+18: 
+19: const (
+20: 	AccessReadOnly  = "READ_ONLY"
+21: 	AccessReadWrite = "READ_WRITE"
+22: )
+23: 
+24: type RootBinding struct {
+25: 	Ref          string `json:"ref"`
+26: 	DisplayPath  string `json:"display_path"`
+27: 	RealPath     string `json:"real_path"`
+28: 	Access       string `json:"access"`
+29: 	VolumeID     string `json:"volume_id"`
+30: 	FileID       uint64 `json:"file_id"`
+31: 	FinalPath    string `json:"final_path"`
+32: 	RegisteredAt string `json:"registered_at"`
+33: 	Revoked      bool   `json:"revoked"`
+34: }
+35: 
+36: type rootIndex struct {
+37: 	Version int            `json:"version"`
+38: 	Roots   []*RootBinding `json:"roots"`
+39: }
+40: 
+41: type RootRegistry struct {
+42: 	dir   string
+43: 	mu    sync.RWMutex
+44: 	roots map[string]*RootBinding
+45: }
+46: 
+47: func openRootRegistry(dir string) (*RootRegistry, error) {
+48: 	d := filepath.Join(dir, "workspaces")
+49: 	if err := os.MkdirAll(d, 0o700); err != nil {
+50: 		return nil, err
+51: 	}
+52: 	if err := privateDir(d); err != nil {
+53: 		return nil, err
+54: 	}
+55: 	r := &RootRegistry{dir: d, roots: map[string]*RootBinding{}}
+56: 	var idx rootIndex
+57: 	if err := readPrivate(d, "roots.json", &idx); err != nil {
+58: 		return nil, err
+59: 	}
+60: 	for _, b := range idx.Roots {
+61: 		if b != nil && b.Ref != "" {
+62: 			r.roots[b.Ref] = b
+63: 		}
+64: 	}
+65: 	return r, nil
+66: }
+67: 
+68: func (r *RootRegistry) save() error {
+69: 	idx := rootIndex{Version: 1}
+70: 	for _, ref := range sortedRefs(r.roots) {
+71: 		idx.Roots = append(idx.Roots, r.roots[ref])
+72: 	}
+73: 	if idx.Roots == nil {
+74: 		idx.Roots = []*RootBinding{}
+75: 	}
+76: 	return writePrivate(r.dir, "roots.json", &idx)
+77: }
+78: 
+79: func sortedRefs(m map[string]*RootBinding) []string {
+80: 	out := make([]string, 0, len(m))
+81: 	for k := range m {
+82: 		out = append(out, k)
+83: 	}
+84: 	sort.Strings(out)
+85: 	return out
+86: }
+87: 
+88: // Register pins the chosen directory. A path that is itself a reparse point, or whose parent
+89: // chain contains one, is refused: the binding must describe the real directory the user picked.
+90: func (r *RootRegistry) Register(ref, displayPath, access string, now time.Time) (*RootBinding, error) {
+91: 	if ref == "" || displayPath == "" {
+92: 		return nil, fmt.Errorf("%w: root ref and path are required", ErrBadState)
+93: 	}
+94: 	if access != AccessReadOnly && access != AccessReadWrite {
+95: 		return nil, fmt.Errorf("%w: unknown workspace access", ErrRootDenied)
+96: 	}
+97: 	abs, err := filepath.Abs(displayPath)
+98: 	if err != nil {
+99: 		return nil, err
+100: 	}
+101: 	real, err := filepath.EvalSymlinks(abs)
+102: 	if err != nil {
+103: 		return nil, err
+104: 	}
+105: 	if cleanReal := filepath.Clean(real); cleanReal != filepath.Clean(abs) {
+106: 		return nil, fmt.Errorf("%w: chosen path resolves through a link", ErrPathReparsePoint)
+107: 	}
+108: 	if reparse, err := chainHasReparsePoint(clean(real)); err != nil {
+109: 		return nil, err
+110: 	} else if reparse {
+111: 		return nil, ErrPathReparsePoint
+112: 	}
+113: 	vol, id, final, err := fileIdentity(clean(real))
+114: 	if err != nil {
+115: 		return nil, err
+116: 	}
+117: 	r.mu.Lock()
+118: 	defer r.mu.Unlock()
+119: 	if existing, ok := r.roots[ref]; ok && !existing.Revoked {
+120: 		return nil, fmt.Errorf("%w: root ref already registered", ErrBadState)
+121: 	}
+122: 	b := &RootBinding{Ref: ref, DisplayPath: displayPath, RealPath: clean(real), Access: access,
+123: 		VolumeID: vol, FileID: id, FinalPath: final, RegisteredAt: now.UTC().Format(time.RFC3339Nano)}
+124: 	r.roots[ref] = b
+125: 	if err := r.save(); err != nil {
+126: 		delete(r.roots, ref)
+127: 		return nil, err
+128: 	}
+129: 	return b, nil
+130: }
+131: 
+132: // Resolve validates one published relative path against a bound root and returns the absolute
+133: // path to use. Every check is re-done per access: registration time correctness does not grant
+134: // later immunity, because links and permissions can change underneath.
+135: func (r *RootRegistry) Resolve(ref, rel, wantAccess string) (string, error) {
+136: 	r.mu.RLock()
+137: 	b, ok := r.roots[ref]
+138: 	r.mu.RUnlock()
+139: 	if !ok || b == nil {
+140: 		return "", ErrRootUnknown
+141: 	}
+142: 	if b.Revoked {
+143: 		return "", ErrRootRevoked
+144: 	}
+145: 	if wantAccess == AccessReadWrite && b.Access == AccessReadOnly {
+146: 		return "", ErrRootDenied
+147: 	}
+148: 	if err := CheckRelativePath(rel); err != nil {
+149: 		return "", err
+150: 	}
+151: 	if err := r.verifyStillPinned(b); err != nil {
+152: 		return "", err
+153: 	}
+154: 	vol, id, _, err := fileIdentity(b.RealPath)
+155: 	if err != nil {
+156: 		return "", ErrRootRevoked
+157: 	}
+158: 	if vol != b.VolumeID || id != b.FileID {
+159: 		// Same path, different object: the authorised root was replaced under us.
+160: 		return "", ErrPathReparsePoint
+161: 	}
+162: 	abs := filepath.Join(b.RealPath, filepath.FromSlash(NormalizeRelative(rel)))
+163: 	inside, err := filepath.Rel(b.RealPath, abs)
+164: 	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+165: 		return "", ErrPathEscape
+166: 	}
+167: 	if reparse, err := chainHasReparsePoint(abs); err != nil {
+168: 		return "", err
+169: 	} else if reparse {
+170: 		return "", ErrPathReparsePoint
+171: 	}
+172: 	return abs, nil
+173: }
+174: 
+175: // List returns the live bindings for the host's own diagnostics. A revoked root is reported as
+176: // revoked (never silently as "no files"), which is what the contract demands.
+177: // nextRef derives an unambiguous binding reference from the current count plus nanoseconds, so a
+178: // revoked root's reference can never be silently reused.
+179: func (r *RootRegistry) nextRef() (string, error) {
+180: 	r.mu.RLock()
+181: 	n := len(r.roots)
+182: 	r.mu.RUnlock()
+183: 	return hostRef("ws", n), nil
+184: }
+185: 
+186: func (r *RootRegistry) List() []*RootBinding {
+187: 	r.mu.RLock()
+188: 	defer r.mu.RUnlock()
+189: 	out := make([]*RootBinding, 0, len(r.roots))
+190: 	for _, ref := range sortedRefs(r.roots) {
+191: 		b := *r.roots[ref]
+192: 		out = append(out, &b)
+193: 	}
+194: 	return out
+195: }
+196: 
+197: func (r *RootRegistry) Status(ref string) string {
+198: 	r.mu.RLock()
+199: 	defer r.mu.RUnlock()
+200: 	b, ok := r.roots[ref]
+201: 	if !ok || b == nil {
+202: 		return StatusMissing
+203: 	}
+204: 	if b.Revoked {
+205: 		return StatusRevoked
+206: 	}
+207: 	return StatusAvailable
+208: }
+209: 
+210: func (r *RootRegistry) Revoke(ref string) error {
+211: 	r.mu.Lock()
+212: 	defer r.mu.Unlock()
+213: 	b, ok := r.roots[ref]
+214: 	if !ok || b == nil {
+215: 		return ErrRootUnknown
+216: 	}
+217: 	b.Revoked = true
+218: 	return r.save()
+219: }
+220: 
+221: var errPinnedRootLost = errors.New("pinned workspace root is unavailable")
+222: 
+223: func (r *RootRegistry) verifyStillPinned(b *RootBinding) error {
+224: 	if _, err := os.Stat(b.RealPath); err != nil {
+225: 		return errPinnedRootLost
+226: 	}
+227: 	return nil
+228: }
+229: 
+230: func clean(p string) string { return filepath.Clean(p) }
+SOURCE=internal/host/backup_windows.go
+1: package host
+2: 
+3: import (
+4: 	"context"
+5: 	"fmt"
+6: 	"io"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"strings"
+10: 
+11: 	"researchos.local/research-os/internal/domain"
+12: )
+13: 
+14: // SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+15: // current OS principal originally authorized. It rejects, rather than skips,
+16: // links, special files and any item outside the explicit resource bounds.
+17: func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+18: 	var out domain.BackupWorkspaceSnapshot
+19: 	if _, err := h.reverify(); err != nil {
+20: 		return out, err
+21: 	}
+22: 	if h.boundPrincipal() == "" || h.boundPrincipal() != binding.PrincipalID || binding.Status != domain.WorkspaceActive {
+23: 		return out, fmt.Errorf("BACKUP_WORKSPACE_OWNER_DENIED")
+24: 	}
+25: 	if limits.MaxFiles < 0 || limits.MaxDirs < 0 || limits.MaxBytes < 0 || limits.MaxFileBytes < 1 || limits.MaxFileBytes > domain.BackupWorkspaceMaxFileBytes {
+26: 		return out, fmt.Errorf("BACKUP_WORKSPACE_LIMIT_INVALID")
+27: 	}
+28: 	var pinned *RootBinding
+29: 	for _, root := range h.roots.List() {
+30: 		if root.Revoked || !strings.EqualFold(filepath.Clean(root.RealPath), filepath.Clean(binding.RealPath)) {
+31: 			continue
+32: 		}
+33: 		if binding.Access == AccessReadWrite && root.Access != AccessReadWrite {
+34: 			return out, fmt.Errorf("BACKUP_WORKSPACE_ACCESS_MISMATCH")
+35: 		}
+36: 		if pinned != nil {
+37: 			return out, fmt.Errorf("BACKUP_WORKSPACE_AMBIGUOUS_ROOT")
+38: 		}
+39: 		pinned = root
+40: 	}
+41: 	if pinned == nil {
+42: 		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_NOT_PINNED")
+43: 	}
+44: 	// A restored workspace lives under its new data root by design. Allow only
+45: 	// that exact, currently pinned ref and path; every other data-root overlap
+46: 	// remains recursive/unsafe, as does any backup output inside the workspace.
+47: 	dataRoot := filepath.Dir(h.dir)
+48: 	if backupPathsOverlap(binding.RealPath, destination) ||
+49: 		(backupPathsOverlap(binding.RealPath, dataRoot) && !backupRestoredWorkspacePath(dataRoot, binding.AuthorizedRef, pinned)) {
+50: 		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
+51: 	}
+52: 	vol, id, _, err := fileIdentity(pinned.RealPath)
+53: 	if err != nil || vol != pinned.VolumeID || id != pinned.FileID {
+54: 		return out, fmt.Errorf("BACKUP_WORKSPACE_PIN_CHANGED")
+55: 	}
+56: 	if reparse, err := chainHasReparsePoint(pinned.RealPath); err != nil || reparse {
+57: 		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_REPARSE")
+58: 	}
+59: 	root, err := os.OpenRoot(pinned.RealPath)
+60: 	if err != nil {
+61: 		return out, err
+62: 	}
+63: 	defer root.Close()
+64: 	out.Directories = []string{}
+65: 	out.Files = []domain.BackupWorkspaceFile{}
+66: 	var total int64
+67: 	err = filepath.WalkDir(pinned.RealPath, func(path string, entry os.DirEntry, walkErr error) error {
+68: 		if walkErr != nil {
+69: 			return walkErr
+70: 		}
+71: 		if err := ctx.Err(); err != nil {
+72: 			return err
+73: 		}
+74: 		if path == pinned.RealPath {
+75: 			return nil
+76: 		}
+77: 		rel, err := filepath.Rel(pinned.RealPath, path)
+78: 		if err != nil {
+79: 			return err
+80: 		}
+81: 		rel = filepath.ToSlash(rel)
+82: 		if len(rel) > domain.BackupWorkspaceMaxPathBytes || CheckRelativePath(rel) != nil || rel != NormalizeRelative(rel) {
+83: 			return fmt.Errorf("BACKUP_WORKSPACE_PATH_INVALID: %s", rel)
+84: 		}
+85: 		if _, err := h.roots.Resolve(pinned.Ref, rel, AccessReadOnly); err != nil {
+86: 			return fmt.Errorf("BACKUP_WORKSPACE_PATH_CHANGED %s: %w", rel, err)
+87: 		}
+88: 		if reparse, err := chainHasReparsePoint(path); err != nil || reparse {
+89: 			return fmt.Errorf("BACKUP_WORKSPACE_REPARSE: %s", rel)
+90: 		}
+91: 		info, err := entry.Info()
+92: 		if err != nil {
+93: 			return err
+94: 		}
+95: 		if info.IsDir() {
+96: 			if len(out.Directories) >= limits.MaxDirs {
+97: 				return fmt.Errorf("BACKUP_WORKSPACE_DIRECTORY_LIMIT: unbacked item %s", rel)
+98: 			}
+99: 			out.Directories = append(out.Directories, rel)
+100: 			return nil
+101: 		}
+102: 		if !info.Mode().IsRegular() {
+103: 			return fmt.Errorf("BACKUP_WORKSPACE_SPECIAL_FILE: %s", rel)
+104: 		}
+105: 		if len(out.Files) >= limits.MaxFiles || info.Size() > limits.MaxFileBytes || info.Size() > limits.MaxBytes-total {
+106: 			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+107: 		}
+108: 		if err := runtimeToolPlainPath(root, rel, false); err != nil {
+109: 			return err
+110: 		}
+111: 		file, err := root.Open(rel)
+112: 		if err != nil {
+113: 			return err
+114: 		}
+115: 		before, err := file.Stat()
+116: 		if err != nil {
+117: 			file.Close()
+118: 			return err
+119: 		}
+120: 		data, readErr := io.ReadAll(io.LimitReader(file, limits.MaxFileBytes+1))
+121: 		after, statErr := file.Stat()
+122: 		closeErr := file.Close()
+123: 		if readErr != nil || statErr != nil || closeErr != nil {
+124: 			return fmt.Errorf("BACKUP_WORKSPACE_READ_FAILED: %s", rel)
+125: 		}
+126: 		current, err := root.Lstat(rel)
+127: 		if err != nil || !current.Mode().IsRegular() || !os.SameFile(before, after) || !os.SameFile(after, current) ||
+128: 			before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != after.Size() {
+129: 			return fmt.Errorf("BACKUP_WORKSPACE_FILE_CHANGED: %s", rel)
+130: 		}
+131: 		if len(data) > int(limits.MaxFileBytes) || int64(len(data)) > limits.MaxBytes-total {
+132: 			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+133: 		}
+134: 		total += int64(len(data))
+135: 		out.Files = append(out.Files, domain.BackupWorkspaceFile{Path: rel, Data: data})
+136: 		return nil
+137: 	})
+138: 	if err != nil {
+139: 		return domain.BackupWorkspaceSnapshot{}, err
+140: 	}
+141: 	return out, nil
+142: }
+143: 
+144: func backupRestoredWorkspacePath(dataRoot, authorizedRef string, pinned *RootBinding) bool {
+145: 	if pinned == nil || pinned.Ref == "" || pinned.Ref != authorizedRef {
+146: 		return false
+147: 	}
+148: 	actual, err := filepath.Abs(pinned.RealPath)
+149: 	if err != nil {
+150: 		return false
+151: 	}
+152: 	expected, err := filepath.Abs(domain.BackupWorkspaceDestination(dataRoot, pinned.Ref))
+153: 	return err == nil && strings.EqualFold(filepath.Clean(actual), filepath.Clean(expected))
+154: }
+155: 
+156: func backupPathsOverlap(left, right string) bool {
+157: 	a, ea := filepath.Abs(left)
+158: 	b, eb := filepath.Abs(right)
+159: 	if ea != nil || eb != nil {
+160: 		return true
+161: 	}
+162: 	a, b = filepath.Clean(a), filepath.Clean(b)
+163: 	if strings.EqualFold(a, b) {
+164: 		return true
+165: 	}
+166: 	for _, pair := range [][2]string{{a, b}, {b, a}} {
+167: 		rel, err := filepath.Rel(pair[0], pair[1])
+168: 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+169: 			return true
+170: 		}
+171: 	}
+172: 	return false
+173: }
+174: 
+175: // PinRestoredWorkspace creates a new Host root record after the data root has
+176: // reached its final path. It does not inherit the old host's private roots file.
+177: func (h *Host) PinRestoredWorkspace(ctx context.Context, request domain.WorkspaceRestoreRequest) (domain.WorkspaceRestorePin, error) {
+178: 	var pin domain.WorkspaceRestorePin
+179: 	if _, err := h.reverify(); err != nil {
+180: 		return pin, err
+181: 	}
+182: 	if h.boundPrincipal() == "" || request.PrincipalID != h.boundPrincipal() {
+183: 		return pin, fmt.Errorf("RESTORE_WORKSPACE_OWNER_DENIED")
+184: 	}
+185: 	dataRoot := filepath.Dir(h.dir)
+186: 	expected := domain.BackupWorkspaceDestination(dataRoot, request.AuthorizedRef)
+187: 	if request.AuthorizedRef == "" || request.RealPath != expected || (request.Access != AccessReadOnly && request.Access != AccessReadWrite) {
+188: 		return pin, fmt.Errorf("RESTORE_WORKSPACE_PATH_DENIED")
+189: 	}
+190: 	if reparse, err := chainHasReparsePoint(request.RealPath); err != nil || reparse {
+191: 		return pin, fmt.Errorf("RESTORE_WORKSPACE_REPARSE")
+192: 	}
+193: 	root, err := h.roots.Register(request.AuthorizedRef, request.RealPath, request.Access, h.nowUTC())
+194: 	if err != nil {
+195: 		return pin, err
+196: 	}
+197: 	if _, err := h.roots.Resolve(root.Ref, "__researchos_pin_probe__", AccessReadOnly); err != nil {
+198: 		// Resolve checks the pin; it need not open the absent probe path.
+199: 		_ = h.roots.Revoke(root.Ref)
+200: 		return pin, err
+201: 	}
+202: 	if err := ctx.Err(); err != nil {
+203: 		_ = h.roots.Revoke(root.Ref)
+204: 		return pin, err
+205: 	}
+206: 	return domain.WorkspaceRestorePin{AuthorizedRef: request.AuthorizedRef,
+207: 		RealPath: root.RealPath, HostPrincipalRef: h.identity.Ref}, nil
+208: }
+SOURCE=go.mod
+1: module researchos.local/research-os
+2: 
+3: go 1.27.1
+4: 
+5: require (
+6: 	github.com/pdfcpu/pdfcpu v0.16.0
+7: 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
+8: 	golang.org/x/sys v0.48.0
+9: 	modernc.org/sqlite v1.60.1
+10: )
+11: 
+12: require (
+13: 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+14: 	github.com/dustin/go-humanize v1.0.1 // indirect
+15: 	github.com/google/uuid v1.6.0 // indirect
+16: 	github.com/hhrutter/tiff v1.0.6 // indirect
+17: 	github.com/mattn/go-isatty v0.0.24 // indirect
+18: 	github.com/mattn/go-runewidth v0.0.30 // indirect
+19: 	github.com/ncruces/go-strftime v1.0.0 // indirect
+20: 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+21: 	go.yaml.in/yaml/v3 v3.0.5 // indirect
+22: 	golang.org/x/crypto v0.57.0 // indirect
+23: 	golang.org/x/image v0.46.0 // indirect
+24: 	golang.org/x/text v0.42.0 // indirect
+25: 	modernc.org/libc v1.77.1 // indirect
+26: 	modernc.org/mathutil v1.7.1 // indirect
+27: 	modernc.org/memory v1.12.1 // indirect
+28: )

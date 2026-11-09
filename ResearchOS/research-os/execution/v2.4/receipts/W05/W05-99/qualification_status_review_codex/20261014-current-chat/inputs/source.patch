@@ -1,0 +1,510 @@
+diff --git a/apps/desktop/main/lib/desktop-management.js b/apps/desktop/main/lib/desktop-management.js
+index 59685423af5f41560e1a56bd78c24076c86e2ee4..581a88049db3a1e9d69df7eca335d9cb9f941bee 100644
+--- a/apps/desktop/main/lib/desktop-management.js
++++ b/apps/desktop/main/lib/desktop-management.js
+@@ -243,11 +243,29 @@ class DesktopManagement {
+         before[0] === now[0] && before[1] === now[1] && before[6] === now[6];
+     } catch { return false; }
+   }
++  sameQualificationSelection(intent) {
++    if (this.sameContext(intent.context)) return true;
++    try {
++      const before = JSON.parse(intent.context), now = JSON.parse(this.options.context());
++      // Only the native eight-field context can relax writer/lease revisions.
++      return Array.isArray(before) && Array.isArray(now) && before.length === 8 && now.length === 8 &&
++        before[0] === intent.projectId && before[1] === intent.sessionId &&
++        before[0] === now[0] && before[1] === now[1] &&
++        Number.isSafeInteger(before[6]) && before[6] === now[6];
++    } catch { return false; }
++  }
++  qualificationOrigin(intent) {
++    const current = this.currentHost();
++    if (this.hostId !== intent.hostId || current.data_dir !== intent.dataRoot ||
++        !sameIdentity(this.identity, intent.controlIdentity) ||
++        !sameIdentity(this.parentIdentity, intent.parentIdentity))
++      throw failure('QUALIFICATION_ORIGIN_CHANGED');
++  }
+   summary() {
+     const intent = this.intent;
+     let hostFailure = null;
+     if (this.state === 'READY') {
+-      try { this.currentHost(); }
++      try { if (intent) this.qualificationOrigin(intent); else this.currentHost(); }
+       catch (error) { hostFailure = error.code || 'HOST_IDENTITY_UNAVAILABLE'; }
+     }
+     if (hostFailure && intent) intent.needsRecheck = true;
+@@ -262,17 +280,24 @@ class DesktopManagement {
+     if (!intent) return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState || this.state,
+       reason, ...history };
+     const same = this.sameContext(intent.context);
++    const selected = this.sameQualificationSelection(intent);
++    const historical = !same && selected;
+     const canRetire = this.canRetireExpiredIntent(intent);
+     return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState ? pendingState :
+-      canRetire ? 'EXPIRED' : same ? intent.state : 'CONTEXT_CHANGED_PENDING',
++      canRetire ? 'EXPIRED' : same ? intent.state : historical ? 'ORIGINAL_REQUEST_HISTORY' : 'CONTEXT_CHANGED_PENDING',
+       reason, model: available && same ? intent.model : null,
+       request_id: intent.requestId, expires_at: intent.expiresAt,
+       model_calls: 1, tools: [], cost_basis: 'UNKNOWN', money: null,
+       purpose: 'mu_turn', purpose_seconds: 600, consumed: !!intent.confirmSent,
++      status_scope: historical ? 'ORIGINAL_REQUEST_HISTORY' : same ? 'CURRENT_CONTEXT' : 'OTHER_SELECTION',
++      original_state: intent.state,
++      original_checked_at: available && selected && !intent.needsRecheck && intent.checkedAt ?
++        new Date(intent.checkedAt).toISOString() : null,
+       // A historical RESULT never proves that the current purpose is still valid.
+-      authorized: available && same && !intent.needsRecheck &&
++      authorized: available && same && intent.checkedContext === intent.context && !intent.needsRecheck &&
+         intent.state === 'QUALIFIED_PURPOSE_AUTHORIZED' && Date.now() - intent.checkedAt < 10000,
+-      checked_at: available && same && intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null,
++      checked_at: available && same && intent.checkedContext === intent.context && !intent.needsRecheck &&
++        intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null,
+       ...history };
+   }
+   canRetireExpiredIntent(intent) {
+@@ -461,9 +486,13 @@ class DesktopManagement {
+     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)))
+       throw failure('QUALIFICATION_SCOPE_INVALID');
+     if (this.intent) this.retireExpiredIntent();
++    const originHost = this.currentHost();
++    const origin = { hostId: this.hostId, dataRoot: originHost.data_dir,
++      controlIdentity: structuredClone(this.identity), parentIdentity: structuredClone(this.parentIdentity) };
+     const reply = await this.exchange('PREPARE', { project_id: projectId, session_id: sessionId,
+       model_config_ref: modelRef }, 30000);
+     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
++    this.qualificationOrigin(origin);
+     if (reply.kind !== 'RESULT') throw failure('PREPARE_REJECTED');
+     const value = reply.result, request = value?.request;
+     if (!object(value) || value.state !== 'AWAITING_CONFIRMATION' || value.model_calls !== 1 ||
+@@ -477,7 +506,7 @@ class DesktopManagement {
+     const issued = Date.parse(request.issued_at), expires = Date.parse(request.expires_at), now = Date.now();
+     if (!Number.isFinite(issued) || !Number.isFinite(expires) || issued > now || expires <= now ||
+         expires <= issued || expires - issued > 60000) throw failure('PREPARE_EXPIRED');
+-    this.intent = { state: 'AWAITING_CONFIRMATION', validated: true, context, projectId, sessionId, modelRef, model,
++    this.intent = { state: 'AWAITING_CONFIRMATION', validated: true, context, projectId, sessionId, modelRef, model, ...origin,
+       requestId: request.request_id, requestHash: value.request_hash, expiresAt: request.expires_at,
+       confirmedAt: null, checkedAt: 0, confirmSent: false, needsRecheck: false };
+     return this.summary();
+@@ -488,7 +517,7 @@ class DesktopManagement {
+     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CONFIRMATION') throw failure('CONFIRM_NOT_AVAILABLE');
+     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+     if (!(Date.parse(intent.expiresAt) > Date.now())) { intent.state = 'EXPIRED'; throw failure('CONFIRM_EXPIRED'); }
+-    this.currentHost();
++    this.qualificationOrigin(intent);
+     intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
+     try {
+       const reply = await this.exchange('CONFIRM', { project_id: intent.projectId, request_id: intent.requestId,
+@@ -503,16 +532,22 @@ class DesktopManagement {
+     this.commandIdle();
+     const intent = this.intent;
+     if (!intent) throw failure('STATUS_ORIGINAL_REQUEST_REQUIRED');
+-    if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
++    intent.needsRecheck = true;
++    if (!this.sameQualificationSelection(intent)) throw failure('CONTEXT_CHANGED');
++    this.qualificationOrigin(intent);
++    const checkedContext = this.options.context();
+     const reply = await this.exchange('STATUS', { project_id: intent.projectId,
+       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
+-    if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
++    if (this.intent !== intent || !this.sameQualificationSelection(intent)) throw failure('CONTEXT_CHANGED');
++    this.qualificationOrigin(intent);
+     if (reply.kind !== 'RESULT') throw failure('STATUS_REJECTED');
+     const value = reply.result;
+     if (!object(value) || value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
+         !['AWAITING_CONFIRMATION', 'EXPIRED', 'UNRESOLVED', 'EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(value.state) ||
+         typeof value.consumed !== 'boolean') throw failure('STATUS_RESULT_INVALID');
+     intent.state = value.state; intent.checkedAt = Date.now(); intent.needsRecheck = false;
++    // History can clear the settled-operation barrier, never grant current authority.
++    intent.checkedContext = checkedContext === intent.context && this.sameContext(intent.context) ? intent.context : null;
+     if (value.consumed) intent.confirmSent = true;
+     return this.summary();
+   }
+@@ -543,9 +578,12 @@ class DesktopManagement {
+     }
+     if (this.intent) {
+       if (!this.intent.confirmSent && this.canRetireExpiredIntent(this.intent)) this.retireExpiredIntent();
+-      else if (!(this.intent.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state) &&
+-        !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
++      else if (!(this.sameQualificationSelection(this.intent) && this.intent.confirmSent &&
++        ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state) &&
++        !this.intent.needsRecheck && this.intent.checkedAt > 0 &&
++        Date.now() >= this.intent.checkedAt && Date.now() - this.intent.checkedAt < 10000))
+         throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
++      else this.qualificationOrigin(this.intent);
+     }
+     // Retain the original operation before sending. A changed UI selection or
+     // a missing reply cannot make another PREPARE appear safe.
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index deb28ba4ac1c047ca0ec1848c76141a9f111fa2e..cb9fe41dc778a288b9c176c93fad0632a16d63f1 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -212,6 +212,7 @@ export function DesktopQualification({ projectId, sessionId }) {
+       if (!reply?.ok) throw new Error(reply?.reason || '托管资格操作失败')
+       setState(reply)
+       setNotice(!reply.available ? '操作后本机主机身份无法确认；原请求仅保留为历史，请恢复主机后复核。' :
++        reply.status_scope === 'ORIGINAL_REQUEST_HISTORY' ? '已复核原请求历史状态；该结果不代表当前模型或写入权已获用途授权。' :
+         method === 'qualificationPrepare' ? '准备完成；模型调用尚未开始。请核对后明确确认。' :
+         method === 'qualificationConfirm' ? '确认调用已结束；下方状态来自原请求的当前复核。' : '已复核原请求的当前状态。')
+     } catch (cause) {
+@@ -234,8 +235,11 @@ export function DesktopQualification({ projectId, sessionId }) {
+     {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
+     {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
+     {state?.previous_request_id && <p className="break-all small-muted">已退役的过期原请求：{state.previous_request_id}；过期于 {state.previous_expires_at || '未知'}。该记录仅供审计，不代表当前资格。</p>}
+-    <p role="status">{state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ?
++    <p role="status">{state?.status_scope === 'ORIGINAL_REQUEST_HISTORY' ?
++      `原请求历史状态：${state.original_state}；${state.original_checked_at ? `复核于 ${state.original_checked_at}` : '尚需复核'}。当前模型或写入权的用途授权须另行核对。` :
++      state?.authorized ?
+       '最近一次复核显示用途授权；实际使用时服务端再次检查，请按需复核原请求。' :
++      state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ? '保留上次用途授权结果；当前授权尚未确认，请复核原请求。' :
+       state?.state === 'HOST_UNAVAILABLE' ? '本机主机身份已变化或无法确认；旧请求仅作历史记录，当前不可用。' :
+       state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
+       state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
+diff --git a/tests/ui/desktop/coding-authorization-boundary.test.mjs b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+index caab9b91b7202df3e9437564b50a3203f0294b0d..d969c9362df631fbbbeadd74c958eef9cc6d3e41 100644
+--- a/tests/ui/desktop/coding-authorization-boundary.test.mjs
++++ b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+@@ -8,7 +8,7 @@ import { createRequire } from 'node:module'
+ 
+ const require = createRequire(import.meta.url)
+ const { createDesktopManagement } = require('../../../apps/desktop/main/lib/desktop-management.js')
+-const { registerDesktopCoding } = require('../../../apps/desktop/main/lib/ipc.js')
++const { registerDesktopCoding, registerDesktopQualification } = require('../../../apps/desktop/main/lib/ipc.js')
+ const protocol = 'researchos-desktop-management/1'
+ const hash = 'sha256:' + 'b'.repeat(64)
+ 
+@@ -20,6 +20,7 @@ function fixture() {
+     data_dir: dir, host_instance_id: hostId }))
+   let context = JSON.stringify(['project-1', 'session-1', 1, 1]), suppress = false, expiryMs = 55000
+   let resourceGeneration = 0, rejectPrepareOnce = false
++  let qualificationState = 'EXECUTION_SETTLED', qualificationConsumed = true
+   const queued = []
+   const log = [], identity = id => ({ PID: id, CreatedNS: String(id) + '000000000', ImageSHA256: 'a'.repeat(64) })
+   const child = new EventEmitter(); child.pid = pid
+@@ -35,13 +36,22 @@ function fixture() {
+         source_count: 3, source_bytes: 123, source_manifest_hash: hash, toolchain_hash: hash,
+         build_hash: hash, vendor_hash: '' }], normal_max_model_calls: 8,
+       qualification_model_calls: 1, qualification_tool_calls: 0, model_calls: 0 }
+-    const result = frame.operation === 'PREPARE_CODING' ? { ...base, scope: frame.coding } :
++    let result = frame.operation === 'PREPARE_CODING' ? { ...base, scope: frame.coding } :
+       frame.operation === 'CONFIRM_CODING' || (frame.operation === 'STATUS_CODING' && log.some(item => item.operation === 'CONFIRM_CODING'))
+         ? { ...base, state: 'CODING_CONFIGURED', scope: frame.operation === 'CONFIRM_CODING' ? log[0].coding : log[0].coding,
+           model_config_ref: 'model-2', runtime_status: 'REGISTERED', profile_ref: 'profile-1',
+           revision: 2, config_revision: 2 } : frame.operation === 'STATUS_CODING' &&
+           Date.parse(manager.codingIntent?.expiresAt) <= Date.now()
+             ? { ...base, state: 'EXPIRED' } : base
++    if (frame.operation === 'PREPARE') result = { state: 'AWAITING_CONFIRMATION',
++      request: { request_id: 'original-qualification', project_id: frame.project_id, session_id: frame.session_id,
++        model_config_ref: frame.model_config_ref, owner_host: hostId, authorize_purpose: 'mu_turn',
++        issued_at: new Date(Date.now() - 1000).toISOString(), expires_at: new Date(Date.now() + 55000).toISOString() },
++      request_hash: hash, model_calls: 1, tools: [], purpose: 'mu_turn', purpose_seconds: 600,
++      cost_basis: 'UNKNOWN', money: null }
++    if (frame.operation === 'STATUS') result = { request_id: 'original-qualification', request_hash: hash,
++      state: qualificationState, consumed: qualificationConsumed }
++    if (frame.operation === 'CONFIRM') result = { state: 'EXECUTION_SETTLED' }
+     const answer = { protocol, message_id: frame.message_id, operation: frame.operation,
+       host_id: hostId, kind: 'RESULT', result }
+     if (frame.operation === 'PREPARE_CODING' && rejectPrepareOnce) {
+@@ -57,6 +67,7 @@ function fixture() {
+   return { manager, log, dir, setContext: value => { context = value },
+     setResourceGeneration: value => { resourceGeneration = value }, suppress: value => { suppress = value },
+     rejectNextPrepare: () => { rejectPrepareOnce = true }, expiry: value => { expiryMs = value },
++    qualification: (state, consumed = true) => { qualificationState = state; qualificationConsumed = consumed },
+     release: change => { const answer = queued.shift(); manager.onLine(Buffer.from(JSON.stringify(change ? change(answer) : answer))) },
+     close: () => fs.rmSync(dir, { recursive: true, force: true }) }
+ }
+@@ -78,6 +89,95 @@ const recheck = () => ({ context: original, scope: scope(), review: review() })
+ const prepare = f => f.manager.prepareCoding(scope(), original, review())
+ const approve = f => f.manager.confirmCoding(async () => true, async () => recheck())
+ 
++const qualificationContext = (changes = {}) => JSON.stringify(Object.assign(
++  ['project-1', 'session-1', '1', '1', 'desktop-shell', '2026-10-14T01:00:00Z', 2, 4], changes))
++async function settledQualification(f) {
++  f.setContext(qualificationContext())
++  await f.manager.prepare(scope(), qualificationContext())
++  await f.manager.confirm()
++}
++
++test('actual bound STATUS then coding PREPARE uses historical settlement and current model/config authority', async () => {
++  const f = fixture(), handlers = new Map()
++  try {
++    await settledQualification(f)
++    const originalRequest = { ...f.manager.intent }
++    const current = qualificationContext({ 2: '9', 3: '3', 5: '2026-10-14T02:00:00Z', 7: 12 })
++    f.setContext(current)
++    const currentScope = scope()
++    currentScope.modelRef = 'current-model-9'
++    currentScope.coding.expected_revision = 9
++    currentScope.coding.writer_epoch = 3
++    currentScope.coding.config_revision = 10
++    // Mirror the host's current model/config fields without changing production handlers.
++    f.suppress(true)
++    registerDesktopQualification({ handle(name, fn) { handlers.set(name, fn) } }, {
++      qualifierSenderAllowed: () => true, desktopManagement: f.manager,
++    })
++    registerDesktopCoding({ handle(name, fn) { handlers.set(name, fn) } }, {
++      codingSenderAllowed: () => true, desktopManagement: f.manager,
++      prepareCodingScope: async () => ({ context: current, scope: currentScope, review: review() }),
++    })
++    const statusPromise = handlers.get('ros:desktop:qualification:status')({})
++    f.release()
++    const history = await statusPromise
++    assert.equal(history.original_state, 'EXECUTION_SETTLED')
++    assert.equal(history.status_scope, 'ORIGINAL_REQUEST_HISTORY')
++    assert.equal(history.authorized, false)
++    const preparedPromise = handlers.get('ros:desktop:coding:prepare')({}, {})
++    await new Promise(resolve => setImmediate(resolve))
++    f.release(answer => { answer.result.old_model_config_ref = currentScope.modelRef; return answer })
++    const prepared = await preparedPromise
++    assert.equal(prepared.ok, true)
++    assert.equal(prepared.state, 'AWAITING_CODING_CONFIRMATION')
++    assert.equal(prepared.model_calls, 0)
++    assert.equal(f.log.at(-1).model_config_ref, 'current-model-9')
++    assert.equal(f.log.at(-1).coding.expected_revision, 9)
++    assert.equal(f.log.at(-1).coding.writer_epoch, 3)
++    assert.equal(f.log.at(-1).coding.config_revision, 10)
++    for (const key of ['requestId', 'requestHash', 'context', 'modelRef', 'confirmSent'])
++      assert.equal(f.manager.intent[key], originalRequest[key])
++    assert.equal(f.manager.intent.modelRef, 'model-1')
++    assert.equal(f.manager.summary().authorized, false)
++    assert.equal(f.log.filter(item => item.operation === 'CONFIRM').length, 1)
++  } finally { f.close() }
++})
++
++test('coding PREPARE preserves terminal, consumed, freshness, selection and current resource gates after historical STATUS', async () => {
++  for (const scenario of ['nonterminal', 'unconsumed', 'stale', 'future', 'project', 'session', 'generation', 'resource', 'context', 'host', 'pending']) {
++    const f = fixture()
++    try {
++      if (scenario === 'unconsumed') {
++        f.setContext(qualificationContext())
++        await f.manager.prepare(scope(), qualificationContext())
++        f.qualification('EXECUTION_SETTLED', false)
++      } else await settledQualification(f)
++      const current = qualificationContext({ 2: '9', 3: '3', 7: 12 })
++      f.setContext(current)
++      if (scenario === 'nonterminal') f.qualification('UNRESOLVED')
++      await f.manager.status()
++      let context = current, reason = 'QUALIFICATION_ORIGINAL_REQUEST_PENDING'
++      if (scenario === 'stale') f.manager.intent.checkedAt = Date.now() - 10000
++      if (scenario === 'future') f.manager.intent.checkedAt = Date.now() + 10000
++      if (['project', 'session', 'generation'].includes(scenario)) {
++        context = qualificationContext({ [scenario === 'project' ? 0 : scenario === 'session' ? 1 : 6]: scenario === 'generation' ? 4 : 'other' })
++        f.setContext(context)
++      }
++      if (scenario === 'resource') { f.setResourceGeneration(1); reason = 'CODING_RESOURCE_CHANGED' }
++      if (scenario === 'context') { context = qualificationContext(); reason = 'CONTEXT_CHANGED' }
++      if (scenario === 'host') {
++        fs.writeFileSync(path.join(f.dir, 'discovery.json'), JSON.stringify({ url: 'http://127.0.0.1:54321/',
++          pid: 24680, data_dir: f.dir, host_instance_id: 'host-bbbbbbbbbbbb' }))
++        reason = 'HOST_CHANGED'
++      }
++      if (scenario === 'pending') { f.manager.pending = { timedOut: true }; reason = 'MANAGEMENT_COMMAND_PENDING' }
++      await assert.rejects(f.manager.prepareCoding(scope(), context, review()), { code: reason }, scenario)
++      assert.equal(f.log.filter(item => item.operation === 'PREPARE_CODING').length, 0, scenario)
++      f.manager.pending = null
++    } finally { f.close() }
++  }
++})
++
+ test('coding prepare freezes one original intent, explicit confirm writes configuration once and status never resends it', async () => {
+   const f = fixture()
+   try {
+diff --git a/tests/ui/desktop/desktop-management-boundary.test.mjs b/tests/ui/desktop/desktop-management-boundary.test.mjs
+index c16434145b872c13d2499ddb14d3b9097240008b..e215df98e992cfbd50438d1d3a76f5420a005a65 100644
+--- a/tests/ui/desktop/desktop-management-boundary.test.mjs
++++ b/tests/ui/desktop/desktop-management-boundary.test.mjs
+@@ -39,6 +39,8 @@ function fixture() {
+   fs.writeFileSync(discoveryFile, JSON.stringify({ url: 'http://127.0.0.1:54321/',
+     pid, data_dir: dir, host_instance_id: hostId }))
+   let context = 'session-a', confirmCount = 0, prepareCount = 0, operationLog = []
++  let suppress = false, transform = value => value
++  const queued = []
+   const identity = id => ({ PID: id, CreatedNS: String(id) + '000000000', ImageSHA256: 'a'.repeat(64) })
+   const child = new EventEmitter()
+   child.pid = pid
+@@ -57,10 +59,12 @@ function fixture() {
+       : request.operation === 'STATUS' ? { request_id: manager.intent?.requestId, request_hash: 'sha256:' + 'b'.repeat(64),
+         state: 'QUALIFIED_PURPOSE_AUTHORIZED', consumed: true }
+       : { state: request.operation === 'SHUTDOWN' ? 'SHUTDOWN_ACCEPTED' : 'QUALIFIED_PURPOSE_AUTHORIZED' }
+-    setImmediate(() => {
+-      manager.onLine(Buffer.from(JSON.stringify({ protocol: 'researchos-desktop-management/1',
++    const answer = { protocol: 'researchos-desktop-management/1',
+         message_id: request.message_id, operation: request.operation, host_id: hostId,
+-        kind: 'RESULT', result })))
++        kind: 'RESULT', result }
++    if (suppress) queued.push(answer)
++    else setImmediate(() => {
++      manager.onLine(Buffer.from(JSON.stringify(transform(answer))))
+       if (request.operation === 'SHUTDOWN') setImmediate(() => child.emit('exit', 0, null))
+     })
+     callback?.()
+@@ -73,9 +77,171 @@ function fixture() {
+   manager.exitPromise = new Promise(resolve => { manager.resolveExit = resolve })
+   child.on('exit', (code, signal) => manager.onExit(code, signal))
+   return { manager, child, dir, log: operationLog, confirmCount: () => confirmCount,
++    suppress: value => { suppress = value }, transform: value => { transform = value },
++    release: change => { const answer = queued.shift(); manager.onLine(Buffer.from(JSON.stringify(change ? change(answer) : answer))) },
+     setContext: value => { context = value }, close: () => fs.rmSync(dir, { recursive: true, force: true }) }
+ }
+ 
++const nativeContext = (changes = {}) => JSON.stringify(Object.assign(
++  ['project-1', 'session-1', '1', '1', 'desktop-shell', '2026-10-14T01:00:00Z', 2, 4], changes))
++const qualificationScope = { projectId: 'project-1', sessionId: 'session-1', modelRef: 'model-1', model: {} }
++
++test('bound original STATUS survives writer renewal without transferring authorization or rearming confirmation', async () => {
++  const f = fixture(), handlers = new Map()
++  try {
++    f.setContext(nativeContext())
++    await f.manager.prepare(qualificationScope, nativeContext())
++    await f.manager.confirm()
++    const original = { ...f.manager.intent }
++    f.setContext(nativeContext({ 2: '9', 3: '3', 5: '2026-10-14T02:00:00Z', 7: 12 }))
++    registerDesktopQualification({ handle(name, fn) { handlers.set(name, fn) } }, {
++      qualifierSenderAllowed: () => true, desktopManagement: f.manager,
++    })
++    // A server consumed=false reply must never undo the local one-shot barrier.
++    f.transform(answer => { answer.result.consumed = false; return answer })
++    const reply = await handlers.get('ros:desktop:qualification:status')({}, { request_id: 'forged' })
++    assert.equal(reply.ok, true)
++    assert.equal(reply.state, 'ORIGINAL_REQUEST_HISTORY')
++    assert.equal(reply.status_scope, 'ORIGINAL_REQUEST_HISTORY')
++    assert.equal(reply.original_state, 'QUALIFIED_PURPOSE_AUTHORIZED')
++    assert(reply.original_checked_at)
++    assert.equal(reply.authorized, false)
++    assert.equal(reply.checked_at, null)
++    assert.equal(reply.consumed, true)
++    for (const key of ['requestId', 'requestHash', 'context', 'modelRef'])
++      assert.equal(f.manager.intent[key], original[key])
++    assert.equal(f.log.at(-1).request_id, original.requestId)
++    assert.equal(f.log.at(-1).request_hash, original.requestHash)
++    await assert.rejects(f.manager.confirm(), { code: 'CONFIRM_NOT_AVAILABLE' })
++    f.setContext(nativeContext())
++    assert.equal(f.manager.summary().authorized, false)
++    assert.equal((await f.manager.status()).authorized, true)
++    assert.equal(f.confirmCount(), 1)
++  } finally { f.close() }
++})
++
++test('historical unconsumed STATUS keeps original confirmation context strict', async () => {
++  const f = fixture()
++  try {
++    f.setContext(nativeContext())
++    await f.manager.prepare(qualificationScope, nativeContext())
++    f.setContext(nativeContext({ 2: '2', 7: 5 }))
++    f.transform(answer => { answer.result.state = 'AWAITING_CONFIRMATION'; answer.result.consumed = false; return answer })
++    const result = await f.manager.status()
++    assert.equal(result.authorized, false)
++    assert.equal(result.consumed, false)
++    await assert.rejects(f.manager.confirm(), { code: 'CONTEXT_CHANGED' })
++    assert.equal(f.confirmCount(), 0)
++  } finally { f.close() }
++})
++
++test('writer changes while STATUS is in flight return history without claiming current authorization', async () => {
++  const f = fixture()
++  try {
++    f.setContext(nativeContext())
++    await f.manager.prepare(qualificationScope, nativeContext())
++    await f.manager.confirm()
++    f.suppress(true)
++    const pending = f.manager.status()
++    f.setContext(nativeContext({ 2: '9', 3: '3', 7: 12 }))
++    f.release()
++    const result = await pending
++    assert.equal(result.status_scope, 'ORIGINAL_REQUEST_HISTORY')
++    assert.equal(result.authorized, false)
++    assert(result.original_checked_at)
++    assert.equal(f.manager.intent.checkedContext, null)
++    assert.equal(f.confirmCount(), 1)
++  } finally { f.close() }
++})
++
++test('original STATUS blocks project, session, selection generation changes before and after async dispatch', async () => {
++  for (const changed of [{ 0: 'project-2' }, { 1: 'session-2' }, { 6: 4 }]) {
++    const f = fixture()
++    try {
++      f.setContext(nativeContext())
++      await f.manager.prepare(qualificationScope, nativeContext())
++      await f.manager.confirm()
++      const count = f.log.length, checkedAt = f.manager.intent.checkedAt
++      f.setContext(nativeContext(changed))
++      await assert.rejects(f.manager.status(), { code: 'CONTEXT_CHANGED' })
++      assert.equal(f.log.length, count)
++      f.setContext(nativeContext({ 7: 5 }))
++      f.suppress(true)
++      const pending = f.manager.status()
++      f.setContext(nativeContext(changed))
++      f.release()
++      await assert.rejects(pending, { code: 'CONTEXT_CHANGED' })
++      assert.equal(f.manager.intent.checkedAt, checkedAt)
++      assert.equal(f.manager.intent.needsRecheck, true)
++      assert.equal(f.manager.summary().authorized, false)
++    } finally { f.close() }
++  }
++})
++
++test('historical STATUS validates original native identity before and after async reply', async () => {
++  for (const during of [false, true]) {
++    const f = fixture()
++    try {
++      f.setContext(nativeContext())
++      await f.manager.prepare(qualificationScope, nativeContext())
++      await f.manager.confirm()
++      f.setContext(nativeContext({ 7: 5 }))
++      f.suppress(true)
++      const before = f.log.length
++      const pending = during ? f.manager.status() : null
++      // Even a self-consistent replacement manager/native identity is not this request's origin.
++      f.manager.identity = { ...f.manager.identity, CreatedNS: '999999999' }
++      f.manager.observe = id => id === f.child.pid ? f.manager.identity : f.manager.parentIdentity
++      if (during) f.release()
++      await assert.rejects(pending || f.manager.status(), { code: 'QUALIFICATION_ORIGIN_CHANGED' })
++      assert.equal(f.log.length, before + Number(during))
++      assert.equal(f.manager.summary().authorized, false)
++    } finally { f.close() }
++  }
++})
++
++test('historical STATUS rejects malformed and replayed results without a fresh timestamp', async () => {
++  for (const mutate of [answer => { answer.result.request_id = 'foreign' },
++    answer => { answer.result.request_hash = 'sha256:' + 'c'.repeat(64) },
++    answer => { answer.result.state = 'UNKNOWN' }, answer => { answer.result.consumed = 'true' },
++    answer => { answer.message_id = 'replayed' }]) {
++    const f = fixture()
++    try {
++      f.setContext(nativeContext())
++      await f.manager.prepare(qualificationScope, nativeContext())
++      await f.manager.confirm()
++      f.setContext(nativeContext({ 7: 5 }))
++      const checkedAt = f.manager.intent.checkedAt
++      f.transform(answer => { mutate(answer); return answer })
++      await assert.rejects(f.manager.status(), error => ['STATUS_RESULT_INVALID', 'PRIVATE_REPLY_MISMATCH'].includes(error.code))
++      assert.equal(f.manager.intent.checkedAt, checkedAt)
++      assert.equal(f.manager.intent.needsRecheck, true)
++      assert.equal(f.manager.summary().authorized, false)
++    } finally { f.close() }
++  }
++})
++
++test('historical STATUS timeout preserves the private pending barrier until the original late reply', async () => {
++  const f = fixture()
++  try {
++    f.setContext(nativeContext())
++    await f.manager.prepare(qualificationScope, nativeContext())
++    await f.manager.confirm()
++    f.setContext(nativeContext({ 7: 5 }))
++    f.suppress(true)
++    const exchange = f.manager.exchange.bind(f.manager)
++    f.manager.exchange = (operation, scope) => exchange(operation, scope, 5)
++    await assert.rejects(f.manager.status(), { code: 'MANAGEMENT_REPLY_UNCERTAIN' })
++    assert.equal(f.manager.summary().state, 'PRIVATE_COMMAND_UNCERTAIN')
++    await assert.rejects(f.manager.status(), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    await assert.rejects(f.manager.confirm(), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    f.release()
++    assert.equal(f.manager.intent.needsRecheck, true)
++    assert.equal(f.manager.pending, null)
++    assert.equal(f.confirmCount(), 1)
++  } finally { f.close() }
++})
++
+ test('one trusted session intent survives renderer calls and never resends CONFIRM', async () => {
+   const f = fixture()
+   try {

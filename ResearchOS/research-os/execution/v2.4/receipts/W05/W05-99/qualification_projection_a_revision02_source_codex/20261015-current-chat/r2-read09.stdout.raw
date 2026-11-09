@@ -1,0 +1,309 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
+	f := setup(t)
+	var seq int
+	var name, path string
+	if e := f.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); e != nil {
+		t.Fatal(e)
+	}
+	root := filepath.Dir(path)
+	lease, e := rt.AcquireDataRootLease(root)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer lease.Close()
+	config := RuntimeCoordinatorConfig{DataRoot: root, APIURL: "http://127.0.0.1:1"}
+	bad := config
+	bad.Routes = []RuntimeCoordinatorRoute{{CommandID: "fixture", Executable: "relative.exe"}}
+	if _, e = f.s.NewRuntimeCoordinatorWithLease(context.Background(), bad, lease); e == nil {
+		t.Fatal("invalid constructor accepted")
+	}
+	c, e := f.s.NewRuntimeCoordinatorWithLease(context.Background(), config, lease)
+	if e != nil {
+		t.Fatalf("failed constructor retained borrow: %v", e)
+	}
+	if _, e = f.s.NewRuntimeCoordinatorWithLease(context.Background(), config, lease); e == nil {
+		t.Fatal("second coordinator borrowed same lease")
+	}
+	if e = lease.Close(); e == nil {
+		t.Fatal("owner closed lease while coordinator borrowed")
+	}
+	c.scanMu.Lock()
+	result := make(chan error, 1)
+	go func() { _, err := c.QuiesceForRelease(context.Background()); result <- err }()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("busy scan quiesced")
+		}
+	case <-time.After(200 * time.Millisecond):
+		c.scanMu.Unlock()
+		t.Fatal("quiesce waited for scan mutex")
+	}
+	c.scanMu.Unlock()
+	if _, e = c.QuiesceForRelease(context.Background()); e == nil || c.quiesced {
+		t.Fatal("startup recovery was not complete but drain installed a fence")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Serve(ctx, nil) }()
+	defer cancel()
+	deadline := time.Now().Add(time.Second)
+	for !c.StartupReady() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !c.StartupReady() {
+		t.Fatal("busy pre-start drain stopped normal recovery")
+	}
+	if _, e = c.QuiesceForRelease(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	if !c.quiesced {
+		t.Fatal("scan fence missing")
+	}
+	c.ResumeAfterReleaseAbort()
+	if c.quiesced {
+		t.Fatal("abort failed to resume scans")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("busy/abort stopped coordinator: %v", err)
+	default:
+	}
+	cancel()
+	if e = <-done; e != nil {
+		t.Fatal(e)
+	}
+	if e = c.Close(); e != nil {
+		t.Fatal(e)
+	}
+	if l, e := rt.AcquireDataRootLease(root); e == nil {
+		l.Close()
+		t.Fatal("coordinator Close released owner OS lock before database close")
+	}
+	if e = f.db.Close(); e != nil {
+		t.Fatal(e)
+	}
+	if e = lease.Close(); e != nil {
+		t.Fatal(e)
+	}
+	l, e := rt.AcquireDataRootLease(root)
+	if e != nil {
+		t.Fatal("lease remained after DB and owner close", e)
+	}
+	l.Close()
+	t.Log("single borrower; busy scan/startup drain refusal; recovery completes before quiesce; abort keeps Serve alive; coordinator close retains DB owner lock")
+}
+
+// Disposable source fixture synthesizes durable record shapes; it makes no
+// native acceptance claim. Actual Host/private-pipe coverage is separate.
+func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, string) {
+	return desktopExitFixtureTools(t, false)
+}
+func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoordinator, string, string) {
+	t.Helper()
+	f, c, r, executor := confirmationFixture(t)
+	ctx := context.Background()
+	run, _, e := c.beginManagedLocalQualification(ctx, f.token, r, executor)
+	if e != nil {
+		t.Fatal(e)
+	}
+	runID := Str(run, "id")
+	key := r.TaskID + ":" + runID + ":1:model:1"
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		task, e := load(tx, f.project, "Task", r.TaskID)
+		if e != nil {
+			return e
+		}
+		dispatch, e := runtimeDispatch(tx, f.project, runID, 1)
+		if e != nil {
+			return e
+		}
+		manifest := dispatch["manifest"].(map[string]any)
+		admission := manifest["admission"].(map[string]any)
+		profile := admission["profile"].(map[string]any)
+		config := profile["model_config"].(map[string]any)
+		goal, e := load(tx, f.project, "Goal", Str(task, "goal_id"))
+		if e != nil {
+			return e
+		}
+		request := Object{"route": config["route"], "capability": "MODEL", "credential_revision": "none", "payload": Object{"body": Object{"model": config["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}}}}
+		if oldTools {
+			request["payload"].(map[string]any)["body"].(map[string]any)["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+		}
+		cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": "UNKNOWN", "money": nil, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UNKNOWN", "occurred_at": run["created_at"]}
+		effect, e := c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
+		if e != nil {
+			return e
+		}
+		effect, e = c.service.beginEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key)
+		if e != nil {
+			return e
+		}
+		raw := []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		receipt := Object{"key": key, "epoch": 1, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": Object{"status": 200, "content_type": "text/event-stream", "body": string(raw)}}
+		effect["state"], effect["receipt"] = "CONFIRMED", receipt
+		if e = effectAppend(tx, f.project, runID, key, effect); e != nil {
+			return e
+		}
+		identity := Object{"pid": 12345, "created": 123, "image": "fixture"}
+		observation := Object{"state": "SETTLED", "children_stopped": true, "queue_empty": true, "streams_drained": true, "cleanup_complete": true, "ended": Now(), "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "worker": "fixture-worker", "identity": identity, "observation_sequence": 1, "spec": Object{"profile_hash": admission["profile_hash"], "run_id": runID, "task_id": task["id"], "epoch": 1}}
+		if _, e = tx.Exec(`UPDATE runtime_dispatches SET state='OBSERVED',worker='fixture-worker',journal_locator=dispatch_key,identity=?,observation_sequence=1,observation_hash=? WHERE project=? AND run=?`, Bytes(identity), Hash(observation), f.project, runID); e != nil {
+			return e
+		}
+		if _, e = tx.Exec(`INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,1,?,?,?)`, f.project, runID, Hash(observation), Bytes(observation), Now()); e != nil {
+			return e
+		}
+		run["status"], run["children_stopped"], run["queue_empty"], run["ended_at"], run["runtime_settled_at"] = "SETTLED", true, true, Now(), Now()
+		if e = bump(run); e != nil {
+			return e
+		}
+		if e = f.s.put(tx, "Run", run); e != nil {
+			return e
+		}
+		return f.s.releaseQualificationReservation(tx, f.project, run)
+	})
+	return f, c, runID, key
+}
+func TestDesktopExitCompletedLocalUnknownPreservesReleaseGate(t *testing.T) {
+	f, c, _, _ := desktopExitFixture(t)
+	ctx := context.Background()
+	var before string
+	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before)
+	strict, e := c.QuiesceForRelease(ctx)
+	if e == nil || strict.Reservations != 1 {
+		t.Fatalf("release did not retain unknown: %+v %v", strict, e)
+	}
+	if e = f.s.completedLocalUnknownCosts(ctx); e != nil {
+		t.Fatal(e)
+	}
+	safe, e := c.QuiesceForDesktopExit(ctx)
+	if e != nil || safe.Reservations != 1 || c.ClientIntakeOpen() {
+		t.Fatalf("safe exit %+v %v", safe, e)
+	}
+	var after string
+	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after)
+	if before != after {
+		t.Fatal("UNKNOWN rewritten by exit")
+	}
+	c.ResumeAfterReleaseAbort()
+	if !c.ClientIntakeOpen() {
+		t.Fatal("ordinary abort did not restore intake")
+	}
+}
+
+func TestQualificationProjectionUnknownCostRejectsOldTools(t *testing.T) {
+	f, _, _, _ := desktopExitFixtureTools(t, true)
+package domain
+
+import (
+	"encoding/json"
+	"testing"
+
+	"researchos.local/research-os/internal/runtimepolicy"
+)
+
+func TestQualificationProjectionDomainCanonicalHash(t *testing.T) {
+	value := Object{"馃榾": []any{Object{"涓?: json.Number("1e0"), "n": json.Number("2.500")}}, "tools": Empty()}
+	policy, err := runtimepolicy.Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != Hash(value) || policy != "sha256:bcce6b88b4df307036224038610c85590a86b6dc8254202f49f1dfe532131257" {
+		t.Fatalf("domain/policy hash mismatch: %s %s", Hash(value), policy)
+	}
+}
+
+type qualificationProjectionMutation struct {
+	name  string
+	apply func(Object)
+}
+
+// The same independent attacks are applied at each production consumer. Each
+// caller first proves that its unmodified numeric clone is valid.
+func qualificationProjectionMutations() []qualificationProjectionMutation {
+	cases := []qualificationProjectionMutation{}
+	for _, field := range []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "task_type", "profile_ref", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"} {
+		field := field
+		cases = append(cases, qualificationProjectionMutation{"marker." + field, func(m Object) {
+			m[runtimepolicy.ProjectionField].(map[string]any)[field] = "tampered"
+		}})
+	}
+	cases = append(cases,
+		qualificationProjectionMutation{"marker.policy.max_model_calls", func(m Object) {
+			m[runtimepolicy.ProjectionField].(map[string]any)["policy"].(map[string]any)["max_model_calls"] = json.Number("2")
+		}},
+		qualificationProjectionMutation{"marker.policy.max_tool_calls", func(m Object) {
+			m[runtimepolicy.ProjectionField].(map[string]any)["policy"].(map[string]any)["max_tool_calls"] = json.Number("1")
+		}},
+		qualificationProjectionMutation{"marker.extra_field", func(m Object) { m[runtimepolicy.ProjectionField].(map[string]any)["extra_field"] = true }},
+		qualificationProjectionMutation{"marker.null_marker", func(m Object) { m[runtimepolicy.ProjectionField] = nil }},
+		qualificationProjectionMutation{"marker.partial_marker", func(m Object) { m[runtimepolicy.ProjectionField] = Object{"schema": runtimepolicy.ProjectionSchema} }},
+		qualificationProjectionMutation{"authority.qualification_bootstrap", func(m Object) { m["admission"].(map[string]any)["qualification_bootstrap"] = false }},
+		qualificationProjectionMutation{"authority.permission.purpose", func(m Object) { m["admission"].(map[string]any)["permission"].(map[string]any)["purpose"] = "mu_turn" }},
+		qualificationProjectionMutation{"authority.permission.plan_hash", func(m Object) {
+			m["admission"].(map[string]any)["permission"].(map[string]any)["plan_hash"] = "sha256:other"
+		}},
+		qualificationProjectionMutation{"authority.profile_ref", func(m Object) {
+			m["admission"].(map[string]any)["profile_ref"].(map[string]any)["id"] = "other-profile"
+		}},
+		qualificationProjectionMutation{"authority.profile_hash", func(m Object) { m["admission"].(map[string]any)["profile_hash"] = "sha256:other" }},
+		qualificationProjectionMutation{"authority.profile.model_config", func(m Object) {
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)["max_output_tokens"] = json.Number("513")
+		}},
+		qualificationProjectionMutation{"authority.model_qualification.route", func(m Object) {
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model_qualification"].(map[string]any)["route"] = "other"
+		}},
+		qualificationProjectionMutation{"authority.model_qualification.model_config_hash", func(m Object) {
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model_qualification"].(map[string]any)["model_config_hash"] = "sha256:other"
+		}},
+		qualificationProjectionMutation{"authority.model_qualification.max_calls", func(m Object) {
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model_qualification"].(map[string]any)["max_calls"] = json.Number("2")
+		}},
+	)
+	return cases
+}
+
+func qualificationProjectionClone(t *testing.T, manifest Object) Object {
+	t.Helper()
+	copy, err := Decode(Bytes(manifest))
+	if err != nil || Hash(copy) != Hash(manifest) {
+		t.Fatalf("unmodified numeric clone invalid: %v", err)
+	}
+	effective, err := runtimepolicy.Effective(copy, "runtime_qualification")
+	if err != nil {
+		t.Fatalf("unmodified projected clone invalid: %v", err)
+	}
+	if n, err := Num(effective, "max_calls"); err != nil || n != 1 || len(Arr(effective, "tools")) != 0 {
+		t.Fatalf("unmodified projected bounds invalid: %v %v", effective, err)
+	}
+	return copy
+}
+
+func qualificationProjectionMutant(t *testing.T, manifest Object, mutation qualificationProjectionMutation) Object {
+	t.Helper()
+	copy := qualificationProjectionClone(t, manifest)
+	before := Hash(copy)
+	mutation.apply(copy)
+	if Hash(copy) == before {
+		t.Fatalf("mutation %s made no change", mutation.name)
+	}
+	if _, err := runtimepolicy.Effective(copy, "runtime_qualification"); err == nil {
+		t.Fatalf("mutation %s did not invalidate projection", mutation.name)
+	}
+	return copy
+}

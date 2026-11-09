@@ -1,0 +1,201 @@
+--- old/integrate_desktop15.py
++++ new/integrate_desktop15.v2.py
+@@ -268,31 +268,56 @@
+ 
+ def execute(args):
+     global BASE
+-    raw=read(args.scope);require(hashlib.sha256(raw).hexdigest()==args.scope_sha256,'Scope SHA')
+-    scope=parse(raw);sref=ref(args.scope)
+-    BASE=scope.get('expected_cli43_head')
+-    require(isinstance(scope.get('expected_main_branch'),str) and scope['expected_main_branch'].startswith('refs/heads/') and len(scope['expected_main_branch'])>11,'Explicit Root Main branch identity required')
+-    require(isinstance(BASE,str) and len(BASE)==40 and all(c in '0123456789abcdef' for c in BASE) and BASE not in [SHARED,DESKTOP,ORIGINAL_BASE],'Explicit completed CLI43 source HEAD missing')
+-    raw=read(args.grant);require(hashlib.sha256(raw).hexdigest()==args.grant_sha256,'Grant SHA')
+-    grant=parse(raw);require(bounded(grant['scope_ref']['path'])==bounded(args.scope),'Grant scope path')
+-    sref['path']=grant['scope_ref']['path'];copies=grant_check(scope,sref,grant)
+-    require(bounded(ROOT/'.git').is_dir(),'Main must use its original non-aliased Git directory')
+-    tools=document(scope['toolchain_lock_ref'])['tools']
+-    require(Path(sys.executable).absolute()==Path(tools['python']['path']).absolute(),'Actual Python path')
+-    for name in ['python','git']:
+-        require(hashlib.sha256(read(tools[name]['path'])).hexdigest()==tools[name]['sha256'],'Pinned executable bytes')
+-    exact=document(scope['exact15_ref']);require(len(exact)==15 and len({x['path'] for x in exact})==15,'Exact15')
+-    protected=document(scope['protected_source_vector_ref'])
+-    require(protected and not {str(ROOT/x['path']) for x in exact}&{str(path(x['path'])) for x in protected},
+-            'Protected-source vector overlaps owned8')
+-    out=bounded(scope['new_output_root'],False)
+-    require(out.parent==ROOT/'execution/v2.4/receipts/W13/W13-03/desktop_exact15_integration_executor_codex' and
+-            out.name==scope['operation_uuid'] and len(out.name)==32 and all(c in '0123456789abcdef' for c in out.name) and
+-            not os.path.lexists(out),'New exclusive execution leaf')
+-    out.mkdir();phase='PRE_NATIVE';last=None;applied=False;commit_attempted=False;steps=0
++    out=None;phase='READ_SCOPE_AND_AUTHORITY';last=None;phase_native=None;applied=False;commit_attempted=False;steps=0
++    first=None;secondary=[];exact=[];runtime_after=None;completion=None
++    def attempt(label,fn):
++        nonlocal first
++        try:return fn()
++        except BaseException as error:
++            detail={'phase':label,'error':repr(error),'traceback':traceback.format_exc(),'actual_native_exit':None}
++            if first is None:first=detail
++            else:secondary.append(detail)
++            print(json.dumps({'first_error':first,'secondary_error':detail},ensure_ascii=False),file=sys.stderr)
+     try:
++        raw=read(args.scope);require(hashlib.sha256(raw).hexdigest()==args.scope_sha256,'Scope SHA')
++        scope=parse(raw);sref=ref(args.scope)
++        BASE=scope.get('expected_cli43_head')
++        require(isinstance(scope.get('expected_main_branch'),str) and scope['expected_main_branch'].startswith('refs/heads/') and len(scope['expected_main_branch'])>11,'Explicit Root Main branch identity required')
++        require(isinstance(BASE,str) and len(BASE)==40 and all(c in '0123456789abcdef' for c in BASE) and BASE not in [SHARED,DESKTOP,ORIGINAL_BASE],'Explicit completed CLI43 source HEAD missing')
++        raw=read(args.grant);require(hashlib.sha256(raw).hexdigest()==args.grant_sha256,'Grant SHA')
++        grant=parse(raw);require(bounded(grant['scope_ref']['path'])==bounded(args.scope),'Grant scope path')
++        sref['path']=grant['scope_ref']['path'];copies=grant_check(scope,sref,grant)
++        require(bounded(ROOT/'.git').is_dir(),'Main must use its original non-aliased Git directory')
++        tools=document(scope['toolchain_lock_ref'])['tools']
++        require(Path(sys.executable).absolute()==Path(tools['python']['path']).absolute(),'Actual Python path')
++        for name in ['python','git']:
++            require(hashlib.sha256(read(tools[name]['path'])).hexdigest()==tools[name]['sha256'],'Pinned executable bytes')
++        exact=document(scope['exact15_ref']);require(len(exact)==15 and len({x['path'] for x in exact})==15,'Exact15')
++        protected=document(scope['protected_source_vector_ref'])
++        require(protected and not {str(ROOT/x['path']) for x in exact}&{str(path(x['path'])) for x in protected},
++                'Protected-source vector overlaps owned8')
++        candidate=bounded(scope['new_output_root'],False)
++        require(candidate.parent==ROOT/'execution/v2.4/receipts/W13/W13-03/desktop_exact15_integration_executor_codex' and
++                candidate.name==scope['operation_uuid'] and len(candidate.name)==32 and all(c in '0123456789abcdef' for c in candidate.name) and
++                not os.path.lexists(candidate),'New exclusive execution leaf')
++        candidate.mkdir(exist_ok=False);out=candidate;phase='PRE_NATIVE'
+         hr=scope['owned_process_helper_ref'];require(hr['sha256']=='6a4fa13d7a69bd6dc33b10a667253906193bf105f8370db9f6665cd76837b3ad','Job helper pin')
+-        helper=types.ModuleType('desktop15_owned_job');helper.__file__=str(path(hr['path']))
++        def runtime_expected():
++            expected={str(path(x['path']).absolute()).casefold():x for x in document(scope['runtime_resources_ref'])['files']}
++            for item in [scope['controller_ref'],hr]:expected[str(path(item['path']).absolute()).casefold()]=item
++            return expected
++        Path(__file__).resolve().as_uri()
++        expected=runtime_expected();source_paths={sys.executable}
++        for module in list(sys.modules.values()):
++            for field in ['__file__','__cached__']:
++                p=getattr(module,field,None)
++                if p and Path(p).is_file():source_paths.add(p)
++        observed=[]
++        for p in sorted(source_paths):
++            k=str(Path(p).absolute()).casefold();require(k in expected,'Unpinned Python source before helper load')
++            verify(expected[k]);observed.append(ref(p))
++        save(out,'runtime.source.before_import.json',{'kind':'ACTUAL_POINT_IN_TIME_NOT_LIFECYCLE','files':observed})
++        helper=types.ModuleType('desktop15_owned_job');helper.__file__=str(path(hr['path']));sys.modules[helper.__name__]=helper
+         exec(compile(verify(hr),helper.__file__,'exec'),helper.__dict__)
+         hooks=out/'empty-hooks';hooks.mkdir()
+         env={k:v for k,v in os.environ.items() if k.upper() in ['SYSTEMROOT','WINDIR','COMSPEC','PATHEXT']}
+@@ -303,17 +328,24 @@
+                 '-c','core.untrackedCache=false','-c','core.attributesFile='+os.devnull,'-c','core.autocrlf=false',
+                 '-c','core.eol=lf','-c','gc.auto=0','-c','maintenance.auto=false','-c','submodule.recurse=false']
+         def run(name,argv,timeout=30):
+-            nonlocal phase,last,steps
+-            budget();steps+=1;require(steps<=80,'Git80 step cap');phase=name;last=None;error=None;start=now()
++            nonlocal phase,last,phase_native,steps
++            budget();steps+=1;require(steps<=80,'Git80 step cap');phase=name;last=None;phase_native=None;error=None;start=now()
+             try:
+                 with (out/(name+'.stdout.raw')).open('xb') as so,(out/(name+'.stderr.raw')).open('xb') as se:
+                     last=helper.run_owned(prefix+argv,str(ROOT),env,so,se,timeout)
+-            except BaseException as exc:error=repr(exc)
++                phase_native=last.get('actual_exit') if isinstance(last,dict) else None
++                job_ok(last)
++            except BaseException as exc:error=exc
+             finally:
+-                save(out,name+'.invocation.json',{'argv':prefix+argv,'cwd':str(ROOT),'environment':env,'started_at':start,
+-                     'ended_at':now(),'process_observation':last,'wrapper_error':error,
+-                     'actual_native_exit':last.get('actual_exit') if isinstance(last,dict) else None,'automatic_retry':False})
+-            require(error is None,'Git wrapper failure');job_ok(last);budget()
++                try:
++                    save(out,name+'.invocation.json',{'argv':prefix+argv,'cwd':str(ROOT),'environment':env,'started_at':start,
++                         'ended_at':now(),'process_observation':last,'wrapper_error':repr(error) if error else None,
++                         'actual_native_exit':last.get('actual_exit') if isinstance(last,dict) else None,'automatic_retry':False})
++                except BaseException as seal_error:
++                    if error is None:error=seal_error;phase=name+'-invocation-evidence';phase_native=None
++                    else:secondary.append({'phase':name+'-invocation-evidence','error':repr(seal_error),'actual_native_exit':None})
++            if error is not None:raise error
++            phase='GUARD_AFTER_'+name;phase_native=None;budget()
+             return raw_file(out/(name+'.stdout.raw'))
+         def guards():
+             budget()
+@@ -323,8 +355,7 @@
+             for p in scope['old_deleted_paths']:require(not os.path.lexists(ROOT/p),'Old deletion restored')
+             require(not list(hooks.iterdir()),'Hooks no longer empty')
+         def runtime(name):
+-            expected={str(path(x['path']).absolute()).lower():x for x in document(scope['runtime_resources_ref'])['files']}
+-            for item in [scope['controller_ref'],hr]:expected[str(path(item['path']).absolute()).lower()]=item
++            expected=runtime_expected()
+             paths=set(helper.runtime_resource_paths())|{sys.executable}
+             for module in list(sys.modules.values()):
+                 for field in ['__file__','__cached__']:
+@@ -332,9 +363,10 @@
+                     if p and Path(p).is_file():paths.add(p)
+             actual=[]
+             for p in sorted(paths):
+-                k=str(Path(p).absolute()).lower();require(k in expected,'Unpinned controller runtime')
++                k=str(Path(p).absolute()).casefold();require(k in expected,'Unpinned controller runtime')
+                 verify(expected[k]);actual.append(ref(p))
+-            save(out,name+'.json',actual)
++            save(out,name+'.json',{'kind':'ACTUAL_POINT_IN_TIME_NOT_LIFECYCLE','files':actual})
++        runtime_after=runtime
+         bundle=scope['main_runtime_bundle_ref']
+         require(bundle['sha256']=='2a8e70132a914affc6122c1f1db29cfa315b655c93d4200145852ebbc853d441' and
+                 bundle['path']==str(ROOT/'.local/w0599-main-stream-integration-r268/mu-worker.mjs') and bundle in protected,
+@@ -441,28 +473,45 @@
+                 run('status-after',['status','--porcelain=v1','--untracked-files=no'])==verify(scope['status_ref']), 'Postcommit index/status changed')
+         guards();runtime('runtime.after')
+         save(out,'immutable-inputs.after.json',list(READS.values()))
+-        save(out,'completed.json',{'actor':'codex:/root','status':'DESKTOP_EXACT15_SOURCE_COMMIT_CLOSED_PENDING_FRESH58_VALIDATION',
++        completion={'actor':'codex:/root','status':'DESKTOP_EXACT15_SOURCE_COMMIT_CLOSED_PENDING_FRESH58_VALIDATION',
+              'parent':BASE,'actual_new_commit':head,'source_candidate':DESKTOP,'source_paths':names,'unique_combined_paths':58,
+              'scope_ref':sref,'grant_ref':ref(args.grant),'apply_attempts':1,'commit_attempts':1,'Git_steps':steps,
+-             'hash_read_bytes':HASHED_BYTES,'canonical_writes':0,'compile_SQL_HTTP_models':0,'source_acceptance':False,'formal_increment':0})
++             'hash_read_bytes':HASHED_BYTES,'canonical_writes':0,'compile_SQL_HTTP_models':0,'source_acceptance':False,'formal_increment':0}
+     except BaseException as exc:
+-        save(out,'failure.origin.json',{'phase':phase,'error':repr(exc),'traceback':traceback.format_exc(),
+-             'actual_native_exit':last.get('actual_exit') if isinstance(last,dict) else None,
+-             'apply_attempted':applied,'commit_attempted':commit_attempted,'automatic_retry':False,'rollback':False,'counter_reset':False})
+-        # Preserve own operation raw and index/HEAD byte observations without spawning recovery commands.
+-        evidence=[]
+-        for p in [ROOT/'.git/HEAD',ROOT/'.git/index']+[ROOT/x['path'] for x in exact]:
+-            try:
+-                raw=p.read_bytes();evidence.append({'path':str(p),'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)})
+-            except BaseException as error:evidence.append({'path':str(p),'error':repr(error)})
+-        save(out,'after_failure.readonly_observations.json',evidence)
+-        raise
++        first={'phase':phase,'error':repr(exc),'traceback':traceback.format_exc(),'actual_native_exit':phase_native}
++        print(json.dumps({'first_error':first,'last_child_observation':last,'safe_output':str(out) if out else None,
++             'automatic_retry':False,'rollback':False,'counter_reset':False},ensure_ascii=False),file=sys.stderr)
+     finally:
+-        rows=[]
+-        for p in sorted(out.rglob('*')):
+-            if p.is_file():
+-                b=p.read_bytes();rows.append({'path':str(p),'sha256':hashlib.sha256(b).hexdigest(),'bytes':len(b)})
+-        save(out,'manifest.json',{'count':len(rows),'entries':rows,'excluded_only':str(out/'manifest.json')})
++        if out is not None:
++            if runtime_after is not None and not (out/'runtime.after.json').exists():
++                attempt('runtime.after',lambda:runtime_after('runtime.after'))
++            if first is not None:
++                def observations():
++                    evidence=[]
++                    for p in [ROOT/'.git/HEAD',ROOT/'.git/index']+[ROOT/x['path'] for x in exact]:
++                        try:
++                            raw=raw_file(p);evidence.append({'path':str(p),'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)})
++                        except BaseException as error:evidence.append({'path':str(p),'error':repr(error),'actual_native_exit':None})
++                    save(out,'after_failure.readonly_observations.json',evidence)
++                attempt('after-failure-observation',observations)
++                attempt('inputs-after-failure',lambda:save(out,'immutable-inputs.after_failure.json',list(READS.values())))
++            if first is None and completion is not None:attempt('completed',lambda:save(out,'completed.json',completion))
++            if first is not None:
++                attempt('failure-origin',lambda:save(out,'failure.origin.json',{'first_error':first,'secondary_errors':secondary,
++                     'last_child_observation':last,'current_phase_native_exit':None,'apply_attempted':applied,
++                     'commit_attempted':commit_attempted,'automatic_retry':False,'rollback':False,'counter_reset':False}))
++            def manifest():
++                rows=[]
++                for p in sorted(out.rglob('*')):
++                    bounded(p)
++                    if p.is_file():
++                        b=raw_file(p);rows.append({'path':str(p),'sha256':hashlib.sha256(b).hexdigest(),'bytes':len(b)})
++                save(out,'manifest.json',{'count':len(rows),'entries':rows,'excluded_only':str(out/'manifest.json')})
++            attempt('manifest',manifest)
++        if first is not None:
++            print(json.dumps({'first_error':first,'secondary_errors':secondary,'last_child_observation':last,
++                 'apply_attempted':applied,'commit_attempted':commit_attempted,'automatic_retry':False,'rollback':False,'counter_reset':False},ensure_ascii=False),file=sys.stderr)
++    if first is not None:raise RuntimeError('Desktop integration stopped; first error preserved above')
+ 
+ 
+ def main():

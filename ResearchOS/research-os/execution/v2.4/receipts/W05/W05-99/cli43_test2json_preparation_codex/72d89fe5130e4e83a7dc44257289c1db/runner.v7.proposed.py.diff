@@ -1,0 +1,98 @@
+--- pinned-original
++++ runner.v7.proposed.py
+@@ -432,7 +432,7 @@
+         ledger.add('fresh-export-and-instrumentation',[p for p in files(export) if not p.is_relative_to(build)])
+         ledger.check('before-any-go')
+         images=compiler['compiler_images']
+-        need(images and len(images)<=62,'Finite compiler image list must leave two slots for the new test and CLI')
++        need(images and len(images)<=61,'Finite compiler image list must leave three slots for test2json, test and CLI')
+         for row in images: verify(row)
+         run('go-version',[go,'version'],export,30,True,images,4)
+         run('go-env',[go,'env','-json','GOROOT','GOPATH','GOMODCACHE','GOCACHE','GOTMPDIR','GOOS','GOARCH','GOAMD64',
+@@ -460,6 +460,46 @@
+                     need(str(Path(name).absolute()) in ledger.members,'Uncatalogued module metadata')
+                     graph_files.append(Path(name))
+         save(out/'go-graph.actual.json',{'packages':packages,'all_referenced_files':[pin(p) for p in sorted(set(graph_files))]})
++        # Build the standard-library tool explicitly; never invoke go tool's implicit builder.
++        tool_graph,_=run('go-list-test2json',[go,'list','-buildvcs=false','-mod=readonly','-compiled','-deps',
++             '-json','-work','-x','cmd/test2json'],export,240,True,images,2048)
++        tool_text=tool_graph.decode('utf-8',errors='strict');tool_idx=0;tool_packages=[]
++        while tool_idx<len(tool_text):
++            if tool_text[tool_idx].isspace(): tool_idx+=1;continue
++            obj,tool_idx=decoder.raw_decode(tool_text,tool_idx);tool_packages.append(obj)
++        need(tool_packages and all(p.get('Goroot') is True and not p.get('Error') and not p.get('DepsErrors')
++             for p in tool_packages),'TEST2JSON_GRAPH_OUTSIDE_FROZEN_GOROOT_OR_ERROR')
++        need(sum(p.get('ImportPath')=='cmd/test2json' and p.get('Name')=='main' for p in tool_packages)==1,
++             'TEST2JSON_MAIN_GRAPH_MISSING_OR_AMBIGUOUS')
++        tool_graph_files=[];tool_root=Path(compiler['GOROOT']).absolute()
++        for p in tool_packages:
++            need(not p.get('Module'),'TEST2JSON_UNEXPECTED_MODULE')
++            for field in fields:
++                for name in p.get(field,[]):
++                    q=Path(name) if Path(name).is_absolute() else Path(p['Dir'])/name
++                    q=q.absolute()
++                    need(q.is_file() and q.resolve()==q and q.is_relative_to(tool_root)
++                         and str(q) in ledger.members,'TEST2JSON_UNCATALOGUED_SOURCE: '+str(q))
++                    tool_graph_files.append(q)
++        save(out/'test2json-graph.actual.json',{'packages':tool_packages,
++             'all_referenced_files':[pin(p) for p in sorted(set(tool_graph_files))],
++             'only_existing_frozen_GOROOT_sources':True})
++        ledger.add('test2json-actual-source-graph',tool_graph_files)
++        tool_bin=safe(export/'bin',export)
++        if not tool_bin.exists(): tool_bin.mkdir()
++        need(tool_bin.is_dir(),'TEST2JSON_OUTPUT_PARENT_NOT_DIRECTORY')
++        test2json=safe(tool_bin/'test2json.exe',export,True)
++        save(out/'test2json-build.before.json',{'output_path':str(test2json),'output_absent':True,
++             'WORK':[pin(p) for p in files(build/'gotmp')],'cache':[pin(p) for p in files(build/'gocache')]})
++        ledger.check('test2json-before-build')
++        run('build-test2json',[go,'build','-p=1','-mod=readonly','-buildvcs=false','-work','-x','-o',
++             str(test2json),'cmd/test2json'],export,600,True,images,2048)
++        need(test2json.is_file(),'TEST2JSON_BUILD_OUTPUT_MISSING')
++        ledger.add('fresh-test2json-executable',[test2json])
++        save(out/'test2json-build.after.json',{'test2json':pin(test2json),
++             'WORK':[pin(p) for p in files(build/'gotmp')],'cache':[pin(p) for p in files(build/'gocache')],
++             'fresh_build':True,'installed_or_old_tool_reused':False})
++        ledger.check('test2json-after-build')
+         cli=build/'researchos-cli.exe';test=build/'cli.test.exe'
+         run('build-cli',[go,'build','-p=1','-mod=readonly','-buildvcs=false','-work','-x','-o',str(cli),'./apps/cli'],export,600,True,images,2048)
+         run('build-test',[go,'test','-c','-p=1','-mod=readonly','-buildvcs=false','-work','-x','-o',str(test),'./apps/cli'],export,600,True,images,2048)
+@@ -475,12 +515,13 @@
+                         need(q.is_relative_to(build) or str(q.absolute()) in ledger.members,'Uncatalogued archive')
+                         archives.append(q)
+         need(importcfg and archives,'No importcfg/archive evidence')
+-        ledger.add('allWORK-cache-archives-newexecutables',allwork+allcache+archives+[cli,test])
++        ledger.add('allWORK-cache-archives-newexecutables',allwork+allcache+archives+[cli,test,test2json])
+         save(out/'compiled-closure.json',{'WORK':[pin(p) for p in allwork],'cache':[pin(p) for p in allcache],
+              'importcfg':importcfg,'archives':[pin(p) for p in sorted(set(archives))],
+-             'cli':pin(cli),'testexe':pin(test),'same_round':True,'Main_test_instrumented':True})
++             'cli':pin(cli),'testexe':pin(test),'test2json':pin(test2json),'same_round':True,'Main_test_instrumented':True})
+         run('buildinfo-cli',[go,'version','-m',str(cli)],export,30,True,images,4)
+         run('buildinfo-test',[go,'version','-m',str(test)],export,30,True,images,4)
++        run('buildinfo-test2json',[go,'version','-m',str(test2json)],export,30,True,images,4)
+         ledger.check('compiled-before-first-case')
+         for i,leaf in enumerate(LEAVES):
+             current_case=case_roster[i]
+@@ -491,9 +532,9 @@
+             ee=dict(env);ee.update({'RESEARCHOS_CLI_PROTOCOL_BINARY':str(cli),
+                                     'RESEARCHOS_CLI_PROTOCOL_EVIDENCE_DIR':str(case)})
+             selector='^TestCLIProtocolInteractiveAuthority$/^'+leaf+'$'
+-            argv=[go,'tool','test2json','-t','-p','researchos.local/research-os/apps/cli',str(test),
++            argv=[str(test2json),'-t','-p','researchos.local/research-os/apps/cli',str(test),
+                   '-test.v','-test.count=1','-test.timeout=480s','-test.failfast','-test.run',selector]
+-            stdout,r=run(label,argv,export/'apps/cli',510,True,images+[pin(cli),pin(test)],16,ee)
++            stdout,r=run(label,argv,export/'apps/cli',510,True,images+[pin(cli),pin(test),pin(test2json)],16,ee)
+             current_case['fixture_observation']='STARTED'
+             events=[strict(line) for line in stdout.splitlines() if line.strip()]
+             expected={'TestCLIProtocolInteractiveAuthority','TestCLIProtocolInteractiveAuthority/'+leaf}
+@@ -549,6 +590,11 @@
+             if 'build' in locals():
+                 try: save(out/'build-artifacts.finally.json',{'files':[pin(p) for p in files(build)],'partial_if_failed':first is not None})
+                 except BaseException as e: secondary.append({'stage':'partial-artifact-inventory','error':repr(e)})
++            if 'test2json' in locals():
++                try: save(out/'test2json-artifact.finally.json',{'output_path':str(test2json),
++                    'exists':test2json.exists(),'file':pin(test2json) if test2json.is_file() else None,
++                    'partial_if_failed':first is not None})
++                except BaseException as e: secondary.append({'stage':'test2json-partial-artifact','error':repr(e)})
+             if ledger:
+                 try: ledger.check('after-finally')
+                 except BaseException as e: secondary.append({'stage':'final-vector','error':repr(e)})

@@ -1,0 +1,47 @@
+--- Main43/apps/cli/cli_sessions_test.go
++++ EXPORT_ONLY/apps/cli/cli_sessions_test.go
+@@ -281,7 +281,7 @@
+ 		t.Fatal(err)
+ 	}
+ 	t.Cleanup(func() {
+-		if err := db.Close(); err != nil {
++		if err := cli43CloseEvidence(t, db, evidence); err != nil {
+ 			t.Error(err)
+ 		}
+ 	})
+@@ -307,7 +307,7 @@
+ 		t.Fatal(err)
+ 	}
+ 	var configuredRef string
+-	server := httptest.NewServer(api.HandlerWithConfigurationHost(db, t.TempDir(), svc, cliSessionBindingFixture{configuredRef: &configuredRef}, "", nil, nil, cliConfigurationMetadataFixture{"cli-owner"}))
++	server := httptest.NewServer(cli43RecordingHandler(t, evidence, api.HandlerWithConfigurationHost(db, t.TempDir(), svc, cliSessionBindingFixture{configuredRef: &configuredRef}, "", nil, nil, cliConfigurationMetadataFixture{"cli-owner"})))
+ 	t.Cleanup(server.Close)
+ 	profile := domain.Object{"name": "CLI session fixture", "intent": "one finite message", "facts": domain.Empty(), "accepted_scope": []any{"fixture"}, "constraints": domain.Empty(), "source_configs": domain.Empty(), "source_document_refs": domain.Empty(), "read_snapshot_ids": domain.Empty()}
+ 	req, _ := http.NewRequest("POST", server.URL+"/v1/projects", bytes.NewReader(domain.Bytes(profile)))
+@@ -382,6 +382,7 @@
+ 					defer resp.Body.Close()
+ 					w.WriteHeader(resp.StatusCode)
+ 					responseRaw, _ := io.ReadAll(resp.Body)
++					cli43Wire(t, evidence, "proxy", r.Method, r.URL.RequestURI(), raw, resp.StatusCode, resp.Header.Clone(), responseRaw)
+ 					mu.Lock()
+ 					responses = append(responses, append([]byte(nil), responseRaw...))
+ 					mu.Unlock()
+@@ -397,7 +398,8 @@
+ 					input = "one actual durable message\n"
+ 					expected = 3
+ 				}
+-				code, out, _, _ := cliProtocolProcess(t, proxy.URL, cfg, input)
++				cli43SessionBoundary(t, db, evidence, "before", cfg)
++				code, out, configBefore, configAfter := cliProtocolProcess(t, proxy.URL, cfg, input)
+ 				mu.Lock()
+ 				copyRequests := append([]json.RawMessage(nil), requests...)
+ 				responseEvidence := append([][]byte(nil), responses...)
+@@ -478,6 +480,8 @@
+ 						t.Fatal("create not exactly once", creates)
+ 					}
+ 				}
++				cli43AssertBinding(t, db, evidence, name, cfg, copyRequests, responseEvidence, configBefore, configAfter)
++				if err := cli43Save(evidence, "business-counts.json", map[string]any{"sends":sends,"tasks":tasks,"send_journal":journal,"read_only_attach":readonly,"cli_exit":code}); err != nil { t.Fatal(err) }
+ 				t.Logf("REAL_API synthetic admission only, durable sends=%d tasks=%d journal=%d CLI=%d", sends, tasks, journal, code)
+ 				return
+ 			}

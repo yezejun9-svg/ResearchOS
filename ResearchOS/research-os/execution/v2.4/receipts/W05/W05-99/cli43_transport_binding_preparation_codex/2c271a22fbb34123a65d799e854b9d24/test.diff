@@ -1,0 +1,47 @@
+--- old-export-test
++++ new-export-test
+@@ -366,9 +366,11 @@
+ 				requests := []json.RawMessage{}
+ 				requestBytes := [][]byte{}
+ 				responses := [][]byte{}
++				transport := []cli43TransportFact{}
+ 				proxy := httptest.NewServer(cli43ProxyHandler(t, evidence, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 					raw, _ := io.ReadAll(r.Body)
+ 					mu.Lock()
++					requestIndex := len(requests)
+ 					requests = append(requests, append(json.RawMessage(nil), raw...))
+ 					requestBytes = append(requestBytes, append([]byte(nil), raw...))
+ 					mu.Unlock()
+@@ -385,6 +387,7 @@
+ 					w.WriteHeader(resp.StatusCode)
+ 					responseRaw, _ := io.ReadAll(resp.Body)
+ 					mu.Lock()
++					transport = append(transport, cli43TransportFact{RequestIndex: requestIndex, ResponseIndex: len(responses), Method: r.Method, RequestURI: r.URL.RequestURI(), Status: resp.StatusCode})
+ 					responses = append(responses, append([]byte(nil), responseRaw...))
+ 					mu.Unlock()
+ 					w.Write(responseRaw)
+@@ -406,6 +409,7 @@
+ 				copyRequests := append([]json.RawMessage(nil), requests...)
+ 				responseEvidence := append([][]byte(nil), responses...)
+ 				requestEvidence := append([][]byte(nil), requestBytes...)
++				transportEvidence := append([]cli43TransportFact(nil), transport...)
+ 				mu.Unlock()
+ 				encoded, _ := json.MarshalIndent(copyRequests, "", "  ")
+ 				os.WriteFile(filepath.Join(evidence, "requests.json"), encoded, 0600)
+@@ -417,6 +421,7 @@
+ 				}
+ 				rawRequests, _ := json.MarshalIndent(wireRequests, "", "  ")
+ 				os.WriteFile(filepath.Join(evidence, "requests.exact.json"), rawRequests, 0600)
++				if err := cli43Save(evidence, "transport.exact.json", transportEvidence); err != nil { t.Fatal(err) }
+ 				if code != expected {
+ 					t.Fatalf("real API exit=%d expected=%d out=%s", code, expected, out)
+ 				}
+@@ -482,7 +487,7 @@
+ 						t.Fatal("create not exactly once", creates)
+ 					}
+ 				}
+-				cli43AssertBinding(t, db, evidence, name, cfg, copyRequests, responseEvidence, configBefore, configAfter)
++				cli43AssertBinding(t, db, evidence, name, cfg, copyRequests, responseEvidence, transportEvidence, configBefore, configAfter)
+ 				if err := cli43Save(evidence, "business-counts.json", map[string]any{"sends":sends,"tasks":tasks,"send_journal":journal,"read_only_attach":readonly,"cli_exit":code}); err != nil { t.Fatal(err) }
+ 				t.Logf("REAL_API synthetic admission only, durable sends=%d tasks=%d journal=%d CLI=%d", sends, tasks, journal, code)
+ 				return

@@ -1,0 +1,289 @@
+--- frozen-original-debug-v2
++++ proposed-debug-tree
+@@ -1,3 +1,6 @@
++# W09 RECEIPT-ONLY PROPOSAL. Not imported/executed in preparation.
++# Derived from pinned b60c8826 debug helper. New tree mode requires independent review.
++# Captures all debug descendants only after actual membership in this created Job.
+ """PROPOSED, NOT EXECUTED: receipt-only Windows debug-event child runner; importing this module starts no process.
+ 
+ The caller owns stdout/stderr, raw receipts, tool pins and the decision to stop.
+@@ -58,7 +61,7 @@
+     raise RuntimeError('Windows module inventory changed repeatedly; no stable bounded inventory')
+ 
+ 
+-def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, stdin=None, creation_flags=0):
++def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, allowed_images, allowed_module_files, process_cap, stdin=None, creation_flags=0):
+     """Return JSON-safe observations, including on preparation/launch failure.
+ 
+     timeout covers preparation through the primary process AND Job becoming idle.
+@@ -84,9 +87,9 @@
+         },
+     }
+     result['debug_capture'] = {
+-        'mode': 'CREATE_OWN_CHILD_DEBUG_ONLY_THIS_PROCESS',
++        'mode': 'CREATE_OWN_JOB_DEBUG_PROCESS_TREE',
+         'events': [], 'modules': [], 'exit_event_observed': False,
+-        'bounded_events': 4096, 'bounded_module_files': 256,
++        'bounded_events': 131072, 'bounded_module_files': 32768,
+         'actual_loaded_file_handles_only': True, 'complete': False,
+     }
+     debug = result['debug_capture']
+@@ -94,6 +97,16 @@
+                  exit_event_code=None, total_processes_last_observed=None,
+                  debugger_thread_process_handles='OS debug-engine lifetime until matching exit continuation; not explicitly owned duplicates')
+     loaded_files = []
++    def image_key(value):
++        value = str(value)
++        if value.startswith("\\\\?\\UNC\\"):
++            value = "\\\\" + value[8:]
++        elif value.startswith("\\\\?\\"):
++            value = value[4:]
++        return str(Path(value).resolve()).casefold()
++
++    processes = {}
++    generations = []
+     cleanup = result['job_cleanup']
+     started = time.monotonic()
+     capture_deadline = None
+@@ -145,6 +158,24 @@
+             folded.add(key.upper())
+         if not isinstance(expected_image, dict) or set(expected_image) != {'sha256', 'bytes'}:
+             raise ValueError('Pinned executable digest and byte size required')
++        if type(process_cap) is not int or not 1 <= process_cap <= 2048:
++            raise ValueError('process_cap outside reviewed bound')
++        if not isinstance(allowed_images, list) or not allowed_images or len(allowed_images) > 64:
++            raise ValueError('explicit finite executable image set required')
++        image_pins = {}
++        for row in allowed_images:
++            if set(row) != {'path','sha256','bytes'}:
++                raise ValueError('exact image pin fields required')
++            key = image_key(row['path'])
++            if key in image_pins:
++                raise ValueError('duplicate executable path pin')
++            image_pins[key] = {'sha256':row['sha256'],'bytes':row['bytes']}
++        if image_pins.get(image_key(argv[0])) != expected_image:
++            raise ValueError('primary executable not exactly included in allowed set')
++        if not isinstance(allowed_module_files,list) or not allowed_module_files or len(allowed_module_files)>200000:
++            raise ValueError('Explicit module/runtime file universe required')
++        module_pins = {image_key(r['path']): {'sha256':r['sha256'],'bytes':r['bytes']} for r in allowed_module_files}
++        module_pins.update(image_pins)
+         capture_deadline = started + timeout
+         import msvcrt
+ 
+@@ -224,6 +255,7 @@
+         set_job = bind('SetInformationJobObject', [HANDLE, ctypes.c_int, ctypes.c_void_p, DWORD], wintypes.BOOL)
+         query_job = bind('QueryInformationJobObject', [HANDLE, ctypes.c_int, ctypes.c_void_p, DWORD, ctypes.c_void_p], wintypes.BOOL)
+         assign = bind('AssignProcessToJobObject', [HANDLE, HANDLE], wintypes.BOOL)
++        in_job = bind('IsProcessInJob', [HANDLE, HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL)
+         terminate_job = bind('TerminateJobObject', [HANDLE, wintypes.UINT], wintypes.BOOL)
+         terminate_process = bind('TerminateProcess', [HANDLE, wintypes.UINT], wintypes.BOOL)
+         initialize_attrs = bind('InitializeProcThreadAttributeList', [ctypes.c_void_p, DWORD, DWORD, ctypes.POINTER(SIZE_T)], wintypes.BOOL)
+@@ -263,12 +295,12 @@
+                 deadline_check(deadline, 'module hash')
+             return {'sha256': digest.hexdigest(), 'bytes': total}
+ 
+-        def capture_file(raw_handle, event_code, image_base):
++        def capture_file(raw_handle, event_code, image_base, process_id):
+             if not raw_handle or raw_handle == 0xFFFFFFFFFFFFFFFF:
+                 raise RuntimeError('Actual load event has no readable file handle; capture is incomplete')
+             original = HANDLE(raw_handle)
+             try:
+-                if len(loaded_files) >= 256:
++                if len(loaded_files) >= 32768:
+                     raise RuntimeError('Loaded-module capture limit exceeded')
+                 path_buffer = ctypes.create_unicode_buffer(32768)
+                 n = file_name(original, path_buffer, len(path_buffer), 0)
+@@ -277,14 +309,22 @@
+                 retained = HANDLE()
+                 require(duplicate(current(), original, current(), ctypes.byref(retained), 0, False, 2))
+                 handles.append(retained.value)
+-                fact = {'event_code':event_code, 'image_base':image_base,
++                fact = {'event_code':event_code, 'image_base':image_base, 'pid':process_id,
++                        'creation_time_100ns':processes[process_id]['creation_time_100ns'],
+                         'path_from_actual_file_handle':path_buffer.value,
+                         'before':hash_loaded_file(retained, capture_deadline)}
+-                if event_code == 3 and fact['before'] != expected_image:
+-                    raise RuntimeError('Actual CREATE_PROCESS file differs from pinned test executable')
++                if module_pins.get(image_key(path_buffer.value)) != fact['before']:
++                    raise RuntimeError('Actual loaded module outside frozen runtime universe')
++                if event_code == 3:
++                    loaded_image_key = image_key(path_buffer.value)
++                    if image_pins.get(loaded_image_key) != fact['before']:
++                        raise RuntimeError('Actual CREATE_PROCESS file path/bytes outside pinned executable set')
++                    processes[process_id]['image'] = fact
++                    if process_id == pi.dwProcessId and fact['before'] != expected_image:
++                        raise RuntimeError('Primary image mismatch')
+                 loaded_files.append((retained.value, fact))
+                 debug['modules'].append(fact)
+-                if sum(row['before']['bytes'] for row in debug['modules']) > 1024 * 1024 * 1024:
++                if sum(row['before']['bytes'] for row in debug['modules']) > 128 * 1024 * 1024 * 1024:
+                     raise RuntimeError('Aggregate loaded module byte limit exceeded')
+             finally:
+                 require(close(original))
+@@ -301,20 +341,36 @@
+             raw = bytes(event.u)
+             event_file = struct.unpack_from('<Q', raw, 0)[0] if event.code in (3, 6) else 0
+             try:
+-                if event.pid != pi.dwProcessId:
+-                    raise RuntimeError('Foreign debug event in own-child-only session')
+                 if event.code not in (1, 2, 3, 4, 5, 6, 7, 8):
+                     raise RuntimeError('RIP or unsupported debug event: ' + str(event.code))
+-                if debug['exit_event_observed']:
+-                    raise RuntimeError('Notification after primary EXIT_PROCESS')
+-                if event.code != 3 and debug['create_process_count'] != 1:
+-                    raise RuntimeError('Event before unique CREATE_PROCESS')
+                 if event.code == 3:
++                    if event.pid in processes and not processes[event.pid]['exit_continued']:
++                        raise RuntimeError('Duplicate live CREATE_PROCESS')
++                    if len(generations) >= process_cap:
++                        raise RuntimeError('Executable process budget exhausted')
++                    ph = HANDLE(struct.unpack_from('<Q',raw,8)[0])
++                    membership = wintypes.BOOL()
++                    require(in_job(ph, job, ctypes.byref(membership)))
++                    if not membership.value:
++                        raise RuntimeError('Debug child not a member of the actual exclusive Job')
++                    retained_process = HANDLE()
++                    require(duplicate(current(), ph, current(), ctypes.byref(retained_process), 0, False, 2))
++                    handles.append(retained_process.value)
++                    c, e, k, u = (wintypes.FILETIME() for _ in range(4))
++                    require(times(retained_process, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)))
++                    identity = (int(c.dwHighDateTime)<<32)|int(c.dwLowDateTime)
++                    if event.pid == pi.dwProcessId and identity != result['creation_time_100ns']:
++                        raise RuntimeError('Primary creation identity mismatch')
++                    proc = {'pid':int(event.pid),'primary_tid':int(event.tid),'creation_time_100ns':identity,
++                            'held_process_handle':retained_process.value,'job_membership_observed':True,
++                            'initial_breakpoint_count':0,'exit_event_code':None,'exit_continued':False,'independent_exit':None}
++                    processes[event.pid] = proc
++                    generations.append(proc)
+                     debug['create_process_count'] += 1
+-                    if debug['create_process_count'] != 1 or event.tid != pi.dwThreadId:
+-                        raise RuntimeError('Duplicate CREATE_PROCESS or wrong primary thread')
+-                    event_fact['debug_process_handle'] = struct.unpack_from('<Q',raw,8)[0]
+-                    event_fact['debug_thread_handle'] = struct.unpack_from('<Q',raw,16)[0]
++                    event_fact['process_generation'] = len(generations)
++                elif event.pid not in processes or processes[event.pid]['exit_continued']:
++                    raise RuntimeError('Unknown process generation or event after EXIT continuation')
++                proc = processes[event.pid]
+                 if event.code == 2:
+                     event_fact['debug_thread_handle'] = struct.unpack_from('<Q',raw,0)[0]
+                     # These debug-engine handles are closed by Windows on matching EXIT
+@@ -329,8 +385,9 @@
+                     # The first first-chance breakpoint on the primary thread after
+                     # CREATE_PROCESS is treated as the loader handshake. Record the
+                     # address; this is an explicit debug-mode assumption, not attestation.
+-                    if code == 0x80000003 and first == 1 and event.tid == pi.dwThreadId and debug['initial_breakpoint_count'] == 0:
+-                        debug['initial_breakpoint_count'] = 1
++                    if code == 0x80000003 and first == 1 and event.tid == proc['primary_tid'] and proc['initial_breakpoint_count'] == 0:
++                        proc['initial_breakpoint_count'] = 1
++                        debug['initial_breakpoint_count'] += 1
+                         event_fact['initial_breakpoint'] = True
+                     else:
+                         status = 0x80010001
+@@ -341,12 +398,14 @@
+                     else:
+                         owned_file = event_file
+                         event_file = 0  # capture_file finally owns this handle from here.
+-                        capture_file(owned_file, int(event.code), image_base)
++                        capture_file(owned_file, int(event.code), image_base, int(event.pid))
+                 elif event.code == 5:
+                     debug['exit_process_count'] += 1
+-                    debug['exit_event_observed'] = True
+-                    debug['exit_event_code'] = struct.unpack_from('<I', raw, 0)[0]
+-                    event_fact['actual_exit_event_code'] = debug['exit_event_code']
++                    proc['exit_event_code'] = struct.unpack_from('<I', raw, 0)[0]
++                    event_fact['actual_exit_event_code'] = proc['exit_event_code']
++                    if event.pid == pi.dwProcessId:
++                        debug['exit_event_observed'] = True
++                        debug['exit_event_code'] = proc['exit_event_code']
+             except BaseException as exc:
+                 record_error(exc)
+             finally:
+@@ -356,7 +415,9 @@
+                 finally:
+                     # Always release the received notification, even after capture failure.
+                     require(continue_debug(event.pid, event.tid, status))
+-                    if len(debug['events']) < 4096:
++                    if event.code == 5 and event.pid in processes:
++                        processes[event.pid]['exit_continued'] = True
++                    if len(debug['events']) < 131072:
+                         debug['events'].append(event_fact)
+                     else:
+                         record_error(RuntimeError('Debug event bound exceeded'))
+@@ -374,8 +435,8 @@
+                 info = ACCOUNTING()
+                 require(query_job(job, 1, ctypes.byref(info), ctypes.sizeof(info), None))
+                 debug['total_processes_last_observed'] = int(info.TotalProcesses)
+-                if info.TotalProcesses != 1:
+-                    record_error(RuntimeError('Unexpected descendant: DEBUG_ONLY_THIS_PROCESS cannot capture it'))
++                if info.TotalProcesses > process_cap:
++                    record_error(RuntimeError('Actual Job total processes exceeds reviewed cap'))
+                 cleanup['active_processes_last_observed'] = int(info.ActiveProcesses)
+                 cleanup['job_idle_confirmed'] = info.ActiveProcesses == 0
+             return cleanup['primary_exit_confirmed'] and (not assigned or cleanup['job_idle_confirmed']) and debug['exit_event_observed']
+@@ -385,7 +446,8 @@
+         require(job)
+         handles.append(job)
+         limits = EXTENDED_LIMIT()
+-        limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE; no breakaway.
++        limits.BasicLimitInformation.LimitFlags = 0x00002000  | 0x00000008  # KILL_ON_JOB_CLOSE plus ACTIVE_PROCESS; no breakaway.
++        limits.BasicLimitInformation.ActiveProcessLimit = min(process_cap, 16)
+         require(set_job(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)))
+         cleanup['kill_on_job_close_configured'] = True
+ 
+@@ -422,7 +484,7 @@
+         stage = 'CREATE_SUSPENDED'
+         # EXTENDED_STARTUPINFO_PRESENT is required for the explicit HANDLE_LIST.
+         # No default NO_WINDOW, DETACHED_PROCESS or NEW_PROCESS_GROUP flag.
+-        flags = creation_flags | 0x00000004 | 0x00000400 | 0x00080000 | 0x00000002  # Fixed DEBUG_ONLY_THIS_PROCESS; no attach
++        flags = creation_flags | 0x00000004 | 0x00000400 | 0x00080000 | 0x00000001  # Fixed DEBUG_PROCESS tree; no attach/breakaway
+         require(create(argv[0], command, None, None, True, flags, environment, str(cwd), ctypes.byref(startup), ctypes.byref(pi)))
+         process = pi.hProcess
+         handles.extend([pi.hProcess, pi.hThread])
+@@ -493,9 +555,20 @@
+                     fact['after'] = hash_loaded_file(HANDLE(retained), finalization_deadline)
+                     if fact['after'] != fact['before']:
+                         raise RuntimeError('Loaded module bytes changed on the retained file handle')
+-                debug['complete'] = (bool(debug['modules']) and debug['create_process_count'] == 1
+-                    and debug['exit_process_count'] == 1 and debug['initial_breakpoint_count'] == 1
+-                    and debug['total_processes_last_observed'] == 1
++                for proc in generations:
++                    ph = HANDLE(proc['held_process_handle'])
++                    if wait(ph, 0) != 0:
++                        raise RuntimeError('Process generation exit not independently signaled')
++                    code = DWORD()
++                    require(exit_code(ph, ctypes.byref(code)))
++                    proc['independent_exit'] = int(code.value)
++                    if proc['independent_exit'] != proc['exit_event_code'] or not proc['exit_continued']:
++                        raise RuntimeError('Process generation exit/continuation disagreement')
++                    if proc['initial_breakpoint_count'] != 1:
++                        raise RuntimeError('Missing initial loader handshake')
++                debug['process_generations'] = generations
++                debug['complete'] = (bool(debug['modules']) and len(generations) == debug['create_process_count']
++                    == debug['exit_process_count'] == debug['total_processes_last_observed']
+                     and debug['exit_event_code'] == result['actual_exit'] and result['error'] is None
+                     and not result['timed_out'])
+             except BaseException as exc:
+@@ -508,10 +581,13 @@
+                 cleanup['errors'].append(error_text(exc))
+                 record_error(exc)
+         close_failed = False
++        closed_owned = 0
++        cleanup['explicit_owned_handle_count'] = len(handles)
+         for handle in reversed(handles):
+             try:
+                 if not close(handle):
+                     raise ctypes.WinError(ctypes.get_last_error())
++                closed_owned += 1
+             except BaseException as exc:
+                 close_failed = True
+                 cleanup['errors'].append(error_text(exc))
+@@ -523,6 +599,8 @@
+                 close_failed = True
+                 cleanup['errors'].append(error_text(exc))
+                 record_error(exc)
+-        cleanup['handles_closed'] = not close_failed
++        cleanup['explicit_owned_handles_remaining'] = len(handles)-closed_owned
++        cleanup['explicit_owned_handle_close_successes'] = closed_owned
++        cleanup['handles_closed'] = not close_failed and len(handles)==closed_owned
+         result['elapsed_seconds'] = time.monotonic() - started
+     return result

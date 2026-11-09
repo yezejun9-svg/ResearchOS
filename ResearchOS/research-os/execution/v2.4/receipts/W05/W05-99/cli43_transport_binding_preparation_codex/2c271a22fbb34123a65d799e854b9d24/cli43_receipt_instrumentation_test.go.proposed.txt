@@ -1,0 +1,306 @@
+// EXPORT-ONLY INSTRUMENTATION. Not a Main source file or unmodified Main test.
+package main
+
+import (
+ "bytes"
+ "context"
+ "crypto/sha256"
+ "database/sql"
+ "encoding/base64"
+ "encoding/json"
+ "fmt"
+ "io"
+ "net/http"
+ "net/http/httptest"
+ "net/url"
+ "os"
+ "path/filepath"
+ "reflect"
+ "sort"
+ "strconv"
+ "strings"
+ "sync"
+ "testing"
+
+ "github.com/santhosh-tekuri/jsonschema/v6"
+ "researchos.local/research-os/internal/domain"
+ "researchos.local/research-os/internal/api"
+ "researchos.local/research-os/internal/canonical"
+)
+
+func cli43Save(dir,name string,value any) error {
+ b,e:=json.MarshalIndent(value,"","  ");if e!=nil{return e}
+ f,e:=os.OpenFile(filepath.Join(dir,name),os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if e!=nil{return e}
+ _,w:=f.Write(append(b,'\n'));c:=f.Close();if w!=nil{return w};return c
+}
+func cli43Bytes(b []byte) map[string]any{b=bytes.Clone(b);return map[string]any{"raw_base64":b,"bytes":len(b),"sha256":fmt.Sprintf("%x",sha256.Sum256(b))}}
+
+// Export-only test observations. HTTP budget is not product authorization.
+type cli43HTTPCounts struct {
+ Attempt int `json:"attempt"`; Admitted int `json:"admitted"`; Dispatched int `json:"dispatched"`
+ Completed int `json:"completed"`; Rejected int `json:"rejected"`; Outstanding int `json:"outstanding"`
+ Received int `json:"received"`; Responses int `json:"responses"`; BodyClosed int `json:"body_closed"`
+}
+type cli43HTTPBook struct {
+ mu sync.Mutex; t *testing.T; dir,origin string; sequence int; stopped bool
+ upstream,proxy cli43HTTPCounts; ingress int; stop []func()map[string]any; pending map[string][]int
+ records map[int]map[string]any; firstOverflow any
+}
+var cli43HTTPRegistryMu sync.Mutex
+var cli43HTTPRegistry=map[string]*cli43HTTPBook{}
+type cli43ProxyKey struct{}
+func cli43Book(dir string)*cli43HTTPBook{cli43HTTPRegistryMu.Lock();defer cli43HTTPRegistryMu.Unlock();return cli43HTTPRegistry[dir]}
+func cli43Error(e error)any{if e==nil{return nil};return e.Error()}
+func (b *cli43HTTPBook) issue(suffix string,record any){if e:=cli43Save(b.dir,suffix,record);e!=nil{b.t.Errorf("HTTP evidence: %v",e)}}
+func cli43RequestKey(r *http.Request,raw []byte)string{return r.Method+" "+r.URL.RequestURI()+" "+fmt.Sprintf("%x",sha256.Sum256(raw))}
+func (b *cli43HTTPBook) reserve(layer string,r *http.Request,raw []byte)(int,bool){
+ b.mu.Lock();b.sequence++;seq:=b.sequence;c:=&b.upstream;if layer=="proxy"{c=&b.proxy;c.Received++};c.Attempt++
+ admitted:=!b.stopped&&c.Admitted<32
+ if admitted{c.Admitted++;c.Outstanding++}else{c.Rejected++;b.stopped=true}
+ rec:=map[string]any{"sequence":seq,"layer":layer,"request_method":r.Method,"request_uri":r.URL.RequestURI(),"request":cli43Bytes(raw),"request_authorization":"OMITTED_EPHEMERAL_FIXTURE_CREDENTIAL","admitted":admitted,"dispatched":false,"response_observed":false,"completed":false,"request_key":cli43RequestKey(r,raw),"proxy_sequence":r.Context().Value(cli43ProxyKey{})}
+ if layer=="proxy"{rec["already_received_network_attempt"]=true;rec["client_outbound_before_ingress"]=nil}
+ b.records[seq]=rec
+ b.issue(fmt.Sprintf("http-attempt-%04d.json",seq),rec) // Raw bytes persist before business decode/dispatch.
+ first:=false
+ if !admitted&&b.firstOverflow==nil{first=true;b.firstOverflow=map[string]any{"sequence":seq,"layer":layer,"reason":"ADMISSION_OR_DISPATCH_LIMIT_OR_STOPPED","already_received_network_attempt":layer=="proxy"};b.issue("http-first-overflow.json",b.firstOverflow)}
+ stops:=append([]func()map[string]any{},b.stop...);b.mu.Unlock()
+ if !admitted{b.t.Errorf("HTTP %s admission denied at attempt %d; no upstream dispatch",layer,seq);if first{for i,stop:=range stops{b.issue(fmt.Sprintf("http-stop-%02d.json",i),stop())}}}
+ return seq,admitted
+}
+func (b *cli43HTTPBook) finish(seq int,fields map[string]any){
+ b.mu.Lock();defer b.mu.Unlock();rec:=b.records[seq]
+ for k,v:=range fields{rec[k]=v};if rec["completed"]==true{b.t.Error("duplicate HTTP completion");return}
+ rec["completed"]=true;c:=&b.upstream;if rec["layer"]=="proxy"{c=&b.proxy};c.Completed++;if rec["admitted"]==true{c.Outstanding--}
+ b.issue(fmt.Sprintf("http-completed-%04d.json",seq),rec)
+}
+func cli43PairProxy(req,received *http.Request)*http.Request{return req.WithContext(context.WithValue(req.Context(),cli43ProxyKey{},received.Context().Value(cli43ProxyKey{})))}
+type cli43BudgetTransport struct{base http.RoundTripper;book *cli43HTTPBook}
+func (p *cli43BudgetTransport) RoundTrip(r *http.Request)(*http.Response,error){
+ b:=p.book;var raw []byte;var readErr,closeErr error
+ if r.Body!=nil{
+  if r.GetBody==nil{readErr=fmt.Errorf("fixture transport cannot preserve non-replayable request")}else{
+   body,e:=r.GetBody();if e!=nil{readErr=e}else{raw,readErr=io.ReadAll(body);closeErr=body.Close()}
+  }
+ }
+ seq,ok:=b.reserve("upstream",r,raw)
+ if !ok{b.finish(seq,map[string]any{"pre_dispatch_rejected":true});return nil,fmt.Errorf("fixture upstream dispatch budget rejected")}
+ if readErr!=nil||closeErr!=nil||r.URL.Scheme+"://"+r.URL.Host!=b.origin{
+  e:=fmt.Errorf("fixture request read/close/origin: read=%v close=%v origin=%s",readErr,closeErr,r.URL.Host);b.finish(seq,map[string]any{"pre_dispatch_error":e.Error()});return nil,e
+ }
+ key:=cli43RequestKey(r,raw);b.mu.Lock();b.upstream.Dispatched++;b.records[seq]["dispatched"]=true;b.pending[key]=append(b.pending[key],seq);b.issue(fmt.Sprintf("http-dispatch-%04d.json",seq),b.records[seq]);b.mu.Unlock()
+ resp,e:=p.base.RoundTrip(r)
+ if e!=nil{b.finish(seq,map[string]any{"transport_error":e.Error(),"actual_upstream_response":nil});return resp,e}
+ b.mu.Lock();b.upstream.Responses++;b.records[seq]["response_observed"]=true;b.mu.Unlock()
+ resp.Body=&cli43ObservedBody{ReadCloser:resp.Body,book:b,seq:seq,status:resp.StatusCode,headers:resp.Header.Clone(),contentLength:resp.ContentLength}
+ return resp,nil
+}
+type cli43ObservedBody struct{io.ReadCloser;book *cli43HTTPBook;seq,status int;headers http.Header;contentLength int64;raw bytes.Buffer;reads []map[string]any;eof,closed bool}
+func (b *cli43ObservedBody) Read(p []byte)(int,error){n,e:=b.ReadCloser.Read(p);if n>0{b.raw.Write(p[:n])};b.reads=append(b.reads,map[string]any{"n":n,"error":cli43Error(e)});if e==io.EOF{b.eof=true};return n,e}
+func (b *cli43ObservedBody) Close()error{
+ e:=b.ReadCloser.Close();if b.closed{return e};b.closed=true;b.book.mu.Lock();b.book.upstream.BodyClosed++;b.book.mu.Unlock()
+ b.book.finish(b.seq,map[string]any{"upstream_received_boundary":"http.RoundTripper response and consumed Body","status":b.status,"response_headers":b.headers,"response":cli43Bytes(b.raw.Bytes()),"response_content_length":b.contentLength,"read_calls":b.reads,"read_EOF_observed":b.eof,"response_close_error":cli43Error(e),"whole_response_transmitted_to_CLI_claim":false})
+ return e
+}
+type cli43HTTPWriter struct{http.ResponseWriter;status int;headers http.Header;writes []map[string]any;body bytes.Buffer;headerCalls []map[string]any}
+func (w *cli43HTTPWriter) WriteHeader(code int){
+ h:=w.Header().Clone();w.headerCalls=append(w.headerCalls,map[string]any{"code":code,"handler_headers":h});if w.status==0&&code>=200{w.status=code;w.headers=h};w.ResponseWriter.WriteHeader(code)
+}
+func (w *cli43HTTPWriter) Write(p []byte)(int,error){
+ if w.status==0{w.status=200;w.headers=w.Header().Clone()} // Do not force an extra underlying WriteHeader.
+ n,e:=w.ResponseWriter.Write(p);accepted:=[]byte{};if n>=0&&n<=len(p){accepted=append(accepted,p[:n]...);w.body.Write(accepted)}
+ w.writes=append(w.writes,map[string]any{"requested":cli43Bytes(p),"actual_n":n,"error":cli43Error(e),"accepted":cli43Bytes(accepted)});return n,e
+}
+func (w *cli43HTTPWriter) facts()map[string]any{return map[string]any{"boundary":"ResponseWriter handler commitment/accepted writes; NOT socket or CLI-client observation","status":w.status,"handler_committed_headers":w.headers,"write_header_calls":w.headerCalls,"write_calls":w.writes,"accepted_body":cli43Bytes(w.body.Bytes()),"automatic_transport_headers":nil,"actual_client_received_headers":nil,"actual_client_received_body":nil,"unobserved_socket_delivery":true}}
+func cli43RecordingHandler(t *testing.T,dir string,next http.Handler)http.Handler{
+ return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  b:=cli43Book(dir);raw,e:=io.ReadAll(r.Body);ce:=r.Body.Close();r.Body=io.NopCloser(bytes.NewReader(raw));key:=cli43RequestKey(r,raw)
+  b.mu.Lock();b.ingress++;b.upstream.Received++;received:=b.ingress;seqs:=append([]int{},b.pending[key]...);delete(b.pending,key);b.mu.Unlock()
+  observed:=&cli43HTTPWriter{ResponseWriter:w};var seq any
+  if len(seqs)==1{seq=seqs[0]}else{t.Errorf("unpaired upstream ingress count=%d",len(seqs))}
+  b.issue(fmt.Sprintf("upstream-received-%04d.json",received),map[string]any{"received_sequence":received,"dispatch_sequence":seq,"request":cli43Bytes(raw),"read_error":cli43Error(e),"close_error":cli43Error(ce)})
+  if e!=nil||ce!=nil||len(seqs)!=1{http.Error(observed,"fixture observation error",503)}else{next.ServeHTTP(observed,r)}
+  facts:=observed.facts();facts["received_sequence"]=received;facts["dispatch_sequence"]=seq;facts["request_key"]=key
+  b.issue(fmt.Sprintf("upstream-handler-%04d.json",received),facts)
+ })
+}
+func cli43ProxyHandler(t *testing.T,dir string,next http.Handler)http.Handler{
+ return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  b:=cli43Book(dir);raw,e:=io.ReadAll(r.Body);ce:=r.Body.Close();r.Body=io.NopCloser(bytes.NewReader(raw));seq,ok:=b.reserve("proxy",r,raw)
+  observed:=&cli43HTTPWriter{ResponseWriter:w}
+  if !ok{http.Error(observed,"fixture admission budget",503)}else if e!=nil||ce!=nil{t.Errorf("proxy body capture: %v/%v",e,ce);http.Error(observed,"fixture request read",503)}else{
+   next.ServeHTTP(observed,r.WithContext(context.WithValue(r.Context(),cli43ProxyKey{},seq)))
+  }
+  fields:=observed.facts();fields["request_read_error"]=cli43Error(e);fields["request_close_error"]=cli43Error(ce);fields["CLI_facing_handler_boundary"]=true
+  b.finish(seq,fields)
+ })
+}
+func cli43InstallHTTP(t *testing.T,dir string,server *httptest.Server){
+ b:=&cli43HTTPBook{t:t,dir:dir,origin:server.URL,pending:map[string][]int{},records:map[int]map[string]any{}}
+ b.stop=append(b.stop,func()map[string]any{e:=server.Listener.Close();server.CloseClientConnections();return map[string]any{"owned":"upstream","listener_close_error":cli43Error(e),"close_client_connections_returned":true}})
+ cli43HTTPRegistryMu.Lock();if cli43HTTPRegistry[dir]!=nil{cli43HTTPRegistryMu.Unlock();t.Fatal("duplicate fixture registry")};cli43HTTPRegistry[dir]=b;cli43HTTPRegistryMu.Unlock()
+ old:=http.DefaultTransport;http.DefaultTransport=&cli43BudgetTransport{base:old,book:b}
+ base:=server.Client().Transport;if base==nil{base=old};server.Client().Transport=&cli43BudgetTransport{base:base,book:b}
+ t.Cleanup(func(){http.DefaultTransport=old}) // No parallel tests; one selected leaf per fresh process.
+}
+func cli43RegisterProxy(dir string,proxy *httptest.Server){b:=cli43Book(dir);b.mu.Lock();defer b.mu.Unlock();b.stop=append(b.stop,func()map[string]any{e:=proxy.Listener.Close();proxy.CloseClientConnections();return map[string]any{"owned":"proxy","listener_close_error":cli43Error(e),"close_client_connections_returned":true}})}
+func cli43HTTPFinish(t *testing.T,dir string)error{
+ b:=cli43Book(dir);if b==nil{return fmt.Errorf("missing HTTP book")};b.mu.Lock();defer b.mu.Unlock()
+ summary:=map[string]any{"upstream":b.upstream,"proxy":b.proxy,"upstream_received":b.ingress,"records":b.records,"first_overflow":b.firstOverflow,"stopped":b.stopped,"actual_received_HTTP_legs":b.ingress+b.proxy.Received,"qualifying_max_received_legs_per_case":64,"unobserved_client_outbound_attempts":nil,"setup_included_in_upstream":true,"pending":b.pending,"cap_boundary":"upstream outbound dispatch <=32; proxy business admission <=32; all observed ingress includes denied attempts"}
+ if e:=cli43Save(dir,"http-summary.json",summary);e!=nil{return e}
+ if b.stopped||b.upstream.Outstanding!=0||b.proxy.Outstanding!=0||b.upstream.Dispatched>32||b.proxy.Admitted>32||b.ingress+b.proxy.Received>64{return fmt.Errorf("HTTP budget/cleanup qualification failed")}
+ if b.upstream.Attempt!=b.upstream.Completed||b.proxy.Attempt!=b.proxy.Completed||b.upstream.Dispatched!=b.ingress||len(b.pending)!=0{return fmt.Errorf("HTTP observation accounting mismatch")}
+ return nil
+}
+
+func cli43SessionBoundary(t *testing.T,db *sql.DB,dir,label string,cfg cliConfig) {
+ t.Helper();var sid,project,writer string;var epoch,revision int64
+ if e:=db.QueryRow("SELECT id,project_id,writer_client_id,writer_epoch,revision FROM client_sessions WHERE id=?",cfg.SessionID).Scan(&sid,&project,&writer,&epoch,&revision);e!=nil{t.Fatal(e)}
+ if sid!=cfg.SessionID||project!=cfg.ProjectID||writer!="cli-client"||epoch!=1 {t.Fatal("export instrumentation original Session binding",sid,project,writer,epoch)}
+ if e:=cli43Save(dir,"session-"+label+".json",map[string]any{"session_id":sid,"project_id":project,"writer_client_id":writer,"writer_epoch":epoch,"revision":revision});e!=nil{t.Fatal(e)}
+}
+type cli43TransportFact struct {
+ RequestIndex int `json:"request_index"`
+ ResponseIndex int `json:"response_index"`
+ Method string `json:"method"`
+ RequestURI string `json:"request_uri"`
+ Status int `json:"status"`
+}
+type cli43LocalSchemaOnly struct{}
+func (cli43LocalSchemaOnly) Load(uri string)(any,error){return nil,fmt.Errorf("export-only unregistered schema resource: %s",uri)}
+func cli43EntityContracts(t *testing.T)*domain.Contracts{
+ t.Helper()
+ raw,e:=os.ReadFile(filepath.Join("..","..","internal","api","contracts","domain.schema.json"));if e!=nil{t.Fatal(e)}
+ if fmt.Sprintf("%x",sha256.Sum256(raw))!="b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54"{t.Fatal("export-only domain schema pin")}
+ body,e:=domain.Decode(raw);if e!=nil{t.Fatal(e)}
+ compiler:=jsonschema.NewCompiler();compiler.UseLoader(cli43LocalSchemaOnly{});compiler.AssertFormat();compiler.DefaultDraft(jsonschema.Draft2020)
+ const location="https://researchos.invalid/domain.schema.json"
+ if e=compiler.AddResource(location,body);e!=nil{t.Fatal(e)}
+ contracts:=&domain.Contracts{Schemas:map[string]*jsonschema.Schema{}}
+ for _,kind:=range []string{"Goal","Task"}{
+  compiled,e:=compiler.Compile(location+"#/$defs/"+kind);if e!=nil{t.Fatal(e)};contracts.Schemas[kind]=compiled
+ }
+ return contracts // Fixed fixture THIN_CORE route only; no V24/general route qualification.
+}
+
+func cli43AssertBinding(t *testing.T,db *sql.DB,dir,name string,cfg cliConfig,requests []json.RawMessage,responses [][]byte,transport []cli43TransportFact,before,after []byte) {
+ t.Helper();var a,b cliConfig
+ if json.Unmarshal(before,&a)!=nil||json.Unmarshal(after,&b)!=nil||a.SessionID!=cfg.SessionID||b.SessionID!=cfg.SessionID||b.WriterEpoch!=1{t.Fatal("original SID/epoch changed")}
+ if len(requests)!=len(responses)||len(requests)!=len(transport){t.Fatal("request/response/transport pairing")}
+ doc,e:=api.ClientProtocolDocument();if e!=nil{t.Fatal(e)}
+ entities:=cli43EntityContracts(t)
+ sendGoal:="";completedSends:=0;goals:=[]map[string]any{};tasks:=[]map[string]any{}
+ for i,raw:=range requests{
+  fact:=transport[i]
+  if fact.RequestIndex!=i||fact.ResponseIndex!=i||fact.Status!=http.StatusOK{t.Fatal("exact transport index/status mismatch",i,fact)}
+  uri,e:=url.ParseRequestURI(fact.RequestURI);if e!=nil{t.Fatal(e)}
+  if uri.Scheme!=""||uri.Host!=""||uri.Opaque!=""||uri.RawPath!=""||uri.RawQuery!=""||uri.ForceQuery||uri.Fragment!=""||uri.String()!=fact.RequestURI{t.Fatal("noncanonical fixture request URI",fact.RequestURI)}
+  if fact.Method==http.MethodGet{
+   if len(raw)!=0||len(responses[i])==0||completedSends!=1{t.Fatal("REST exact empty request/nonempty response/send binding",i)}
+   parts:=strings.Split(strings.TrimPrefix(uri.Path,"/"),"/")
+   if len(parts)!=5||parts[0]!="v1"||parts[1]!="projects"||parts[2]!=cfg.ProjectID||parts[4]==""{t.Fatal("REST fixture project/path mismatch",fact.RequestURI)}
+   kind:="";switch parts[3]{case "goals":kind="Goal";case "tasks":kind="Task";default:t.Fatal("unexpected REST fixture entity",fact.RequestURI)}
+   reply,e:=domain.Decode(responses[i]);if e!=nil{t.Fatal(e)}
+   binding,ok:=reply["binding"].(map[string]any);if !ok||binding["route"]!="THIN_CORE"{t.Fatal("fixed REST fixture route must be THIN_CORE",kind)}
+   if e=entities.Validate(kind,reply);e!=nil{t.Fatal(e)}
+   if reply["id"]!=parts[4]||reply["project_id"]!=cfg.ProjectID{t.Fatal("REST entity exact path identity",kind)}
+   if kind=="Goal"{
+    if reply["id"]!=sendGoal{t.Fatal("REST Goal differs from completed send snapshot")};goals=append(goals,reply)
+   }else{
+    if reply["goal_id"]!=sendGoal{t.Fatal("REST Task differs from completed send Goal")};tasks=append(tasks,reply)
+   }
+   continue
+  }
+  if fact.Method!=http.MethodPost||uri.Path!="/v2/command"||len(raw)==0{t.Fatal("unexpected fixture transport method/path/body",i,fact)}
+  canonicalRequest,e:=canonical.JSON(raw);if e!=nil{t.Fatal(e)}
+  var env map[string]any;if e=json.Unmarshal(canonicalRequest,&env);e!=nil{t.Fatal(e)}
+  body,e:=canonical.JSON(responses[i]);if e!=nil{t.Fatal(e)}
+  var reply map[string]any;if e=json.Unmarshal(body,&reply);e!=nil{t.Fatal(e)}
+  if e=doc.ValidateDef("CommandResponse",reply);e!=nil{t.Fatal(e)}
+  method,_:=env["method"].(string)
+  if method=="session.create"{t.Fatal("existing Session fixture unexpectedly created a Session")}
+  if reply["session_id"]!=env["session_id"]||reply["command_id"]!=env["command_id"]||reply["method"]!=method{t.Fatal("request/reply identity mismatch",method)}
+  if strings.HasPrefix(method,"session.")&&env["session_id"]!=cfg.SessionID{t.Fatal("Session request original SID mismatch",method)}
+  if strings.HasPrefix(method,"session.")&&env["project_id"]!=cfg.ProjectID{t.Fatal("Session request project mismatch")}
+  if method=="session.attach"&&reply["status"]!="COMPLETED"{t.Fatal("readonly attach completion not proven")}
+  if reply["status"]=="COMPLETED"&&(method=="session.get"||method=="session.attach"||method=="session.send"){
+   result,ok:=reply["result"].(map[string]any);if !ok{t.Fatal("completed result missing")}
+   snapshot:=result
+   if method!="session.get"{snapshot,ok=result["snapshot"].(map[string]any);if !ok{t.Fatal("completed nested snapshot missing")}}
+   if snapshot["session_id"]!=cfg.SessionID||snapshot["project_id"]!=cfg.ProjectID{t.Fatal("snapshot original SID/project mismatch")}
+   if method=="session.attach"&&result["write_owner_acquired"]!=false{t.Fatal("readonly attach acquired writer")}
+   if method=="session.send"{completedSends++;sendGoal,ok=snapshot["goal_id"].(string);if !ok||sendGoal==""||completedSends!=1{t.Fatal("completed send Goal identity missing or repeated")}}
+  }
+ }
+ if completedSends==0{
+  if len(goals)!=0||len(tasks)!=0{t.Fatal("readonly fixture unexpectedly read Goal/Task")}
+ }else{
+  if completedSends!=1||len(goals)!=1||len(tasks)!=1{t.Fatal("completed send exact Goal/Task pairing")}
+  ids,ok:=goals[0]["task_ids"].([]any);if !ok{t.Fatal("REST Goal task_ids missing")}
+  matches:=0;for _,id:=range ids{if id==tasks[0]["id"]{matches++}};if matches!=1{t.Fatal("REST Goal does not uniquely link actual Task")}
+ }
+ cli43SessionBoundary(t,db,dir,"after",cfg)
+ if e=cli43Save(dir,"identity-proof.json",map[string]any{"fixture":name,"before_sid":a.SessionID,"after_sid":b.SessionID,"db_sid":cfg.SessionID,"epoch":b.WriterEpoch,"all_command_reply_sid_mirror_request":true,"transport_entries":len(transport),"REST_goal_count":len(goals),"REST_task_count":len(tasks),"completed_send_goal_id":sendGoal,"REST_send_goal_task_links_validated":completedSends==1,"session_request_sid_original":true,"SDK_MODEL_external_paid":0});e!=nil{t.Fatal(e)}
+}
+
+type cli43Rows struct {Schema []string `json:"schema"`;Columns map[string][]string `json:"columns"`;Tables map[string][]string `json:"tables"`}
+func cli43Quote(s string)string{return `"`+strings.ReplaceAll(s,`"`,`""`)+`"`}
+func cli43Query(db *sql.DB,q string)(out []string,err error){
+ rows,e:=db.Query(q);if e!=nil{return nil,e};defer func(){if e:=rows.Close();err==nil{err=e}}()
+ cols,e:=rows.Columns();if e!=nil{return nil,e};out=[]string{}
+ for rows.Next(){v:=make([]any,len(cols));p:=make([]any,len(v));for i:=range v{p[i]=&v[i]};if e=rows.Scan(p...);e!=nil{return nil,e};b,e:=json.Marshal(v);if e!=nil{return nil,e};out=append(out,string(b))}
+ if e=rows.Err();e!=nil{return nil,e};sort.Strings(out);return out,nil
+}
+func cli43Capture(db *sql.DB)(v cli43Rows,err error){
+ v.Columns=map[string][]string{};v.Tables=map[string][]string{}
+ v.Schema,err=cli43Query(db,"SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");if err!=nil{return v,err}
+ rs,e:=db.Query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name");if e!=nil{return v,e};names:=[]string{}
+ for rs.Next(){var n string;if e=rs.Scan(&n);e!=nil{rs.Close();return v,e};names=append(names,n)}
+ e=rs.Err();ce:=rs.Close();if e!=nil{return v,e};if ce!=nil{return v,ce}
+ for _,n:=range names{
+  v.Columns[n],e=cli43Query(db,"PRAGMA table_xinfo("+cli43Quote(n)+")");if e!=nil{return v,e}
+  sort.Slice(v.Columns[n],func(i,j int)bool{var a,b []any;json.Unmarshal([]byte(v.Columns[n][i]),&a);json.Unmarshal([]byte(v.Columns[n][j]),&b);return a[0].(float64)<b[0].(float64)})
+  expr:=[]string{}
+  for _,r:=range v.Columns[n]{var row []any;if e=json.Unmarshal([]byte(r),&row);e!=nil{return v,e};name,ok:=row[1].(string);if !ok{return v,fmt.Errorf("column shape")};q:=cli43Quote(name);expr=append(expr,"typeof("+q+")",q)}
+  rows,e:=db.Query("SELECT "+strings.Join(expr,",")+" FROM "+cli43Quote(n));if e!=nil{return v,e};values:=[]string{}
+  for rows.Next(){a:=make([]any,len(expr));p:=make([]any,len(a));for i:=range a{p[i]=&a[i]};if e=rows.Scan(p...);e!=nil{rows.Close();return v,e};cells:=[][2]string{}
+   for i:=0;i<len(a);i+=2{typ:=fmt.Sprint(a[i]);s:="";switch x:=a[i+1].(type){case nil:case string:s=base64.StdEncoding.EncodeToString([]byte(x));case []byte:s=base64.StdEncoding.EncodeToString(x);case int64:s=strconv.FormatInt(x,10);case float64:s=strconv.FormatFloat(x,'g',-1,64);default:rows.Close();return v,fmt.Errorf("unhandled driver value %T",x)};cells=append(cells,[2]string{typ,s})}
+   b,e:=json.Marshal(cells);if e!=nil{rows.Close();return v,e};values=append(values,string(b))
+  };e=rows.Err();ce=rows.Close();if e!=nil{return v,e};if ce!=nil{return v,ce};sort.Strings(values);v.Tables[n]=values
+ };return v,nil
+}
+func cli43Files(path string)(map[string]any,error){
+ out:=map[string]any{}
+ for _,s:=range []string{"","-wal","-shm"}{b,e:=os.ReadFile(path+s);if os.IsNotExist(e){out[s]=nil}else if e!=nil{return out,e}else{out[s]=map[string]any{"bytes":len(b),"sha256":fmt.Sprintf("%x",sha256.Sum256(b))}}};return out,nil
+}
+func cli43NoSidecars(path string)error{for _,s:=range []string{"-wal","-shm"}{_,e:=os.Lstat(path+s);if !os.IsNotExist(e){return fmt.Errorf("sidecar observation %s: %v",path+s,e)}};return nil}
+func cli43CloseEvidence(t *testing.T,db *sql.DB,dir string)error {
+ path:=filepath.Join(dir,"session.sqlite")
+ first:=cli43HTTPFinish(t,dir)
+ opened,snapshotErr:=cli43Capture(db);if first==nil{first=snapshotErr}
+ before,e:=cli43Files(path);if first==nil{first=e}
+ if e=cli43Save(dir,"db-before-close.files.json",before);first==nil{first=e}
+ closeErr:=db.Close() // Always close original, including failed snapshots.
+ if first==nil{first=closeErr}
+ if e=cli43Save(dir,"db-close-result.json",map[string]any{"original_close_error":fmt.Sprint(closeErr),"snapshot_error":fmt.Sprint(first)});first==nil{first=e}
+ if first!=nil{return first}
+ if e=cli43Save(dir,"db-post-open.rows.json",opened);e!=nil{return e}
+ closed,e:=cli43Files(path);if e!=nil{return e};if e=cli43Save(dir,"db-closed-original.files.json",closed);e!=nil{return e}
+ if e=cli43NoSidecars(path);e!=nil{return e}
+ original,e:=os.ReadFile(path);if e!=nil{return e}
+ copyPath:=filepath.Join(dir,"closed-copy.sqlite");f,e:=os.OpenFile(copyPath,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if e!=nil{return e};_,we:=f.Write(original);ce:=f.Close();if we!=nil{return we};if ce!=nil{return ce}
+ copyBefore,e:=cli43Files(copyPath);if e!=nil{return e};if e=cli43Save(dir,"db-copy-before-read.files.json",copyBefore);e!=nil{return e}
+ if e=cli43NoSidecars(copyPath);e!=nil{return e};absolute,e:=filepath.Abs(copyPath);if e!=nil{return e};up:=filepath.ToSlash(absolute);if !strings.HasPrefix(up,"/"){up="/"+up}
+ u:=url.URL{Scheme:"file",Path:up};u.RawQuery=url.Values{"mode":{"ro"},"immutable":{"1"}}.Encode()
+ copyDB,e:=sql.Open("sqlite",u.String());if e!=nil{return e};copyDB.SetMaxOpenConns(1)
+ copied,readErr:=cli43Capture(copyDB);copyCloseErr:=copyDB.Close()
+ if e=cli43Save(dir,"db-copy-read-result.json",map[string]any{"read_error":fmt.Sprint(readErr),"close_error":fmt.Sprint(copyCloseErr),"uri":u.String(),"original_reopened":false});e!=nil{return e}
+ copyAfterFacts,af:=cli43Files(copyPath);if af!=nil{return af};if e=cli43Save(dir,"db-copy-after-close.files.json",copyAfterFacts);e!=nil{return e}
+ if readErr!=nil{return readErr};if copyCloseErr!=nil{return copyCloseErr}
+ if e=cli43NoSidecars(copyPath);e!=nil{return e};after,e:=os.ReadFile(copyPath);if e!=nil{return e};originalAfter,e:=os.ReadFile(path);if e!=nil{return e}
+ originalAfterFacts,e:=cli43Files(path);if e!=nil{return e};if e=cli43Save(dir,"db-original-after-copy.files.json",originalAfterFacts);e!=nil{return e}
+ if e=cli43NoSidecars(path);e!=nil{return e}
+ if e=cli43Save(dir,"db-closed-copy.rows.json",copied);e!=nil{return e}
+ equal:=reflect.DeepEqual(opened,copied);byteEqual:=bytes.Equal(original,after)&&bytes.Equal(original,originalAfter)
+ if e=cli43Save(dir,"closed-proof.json",map[string]any{"all_schema_column_typed_row_multisets_equal":equal,"original_after_close_sha256":fmt.Sprintf("%x",sha256.Sum256(original)),"copy_before_sha256":fmt.Sprintf("%x",sha256.Sum256(original)),"copy_after_sha256":fmt.Sprintf("%x",sha256.Sum256(after)),"original_after_read_sha256":fmt.Sprintf("%x",sha256.Sum256(originalAfter)),"closed_bytes_equal":byteEqual,"original_and_copy_WAL_SHM_absent":true,"original_reopened":false,"case_failed":t.Failed(),"measurement":"EXPORT_ONLY_INSTRUMENTATION"});e!=nil{return e}
+ if !equal||!byteEqual{return fmt.Errorf("closed-copy proof mismatch")};return nil
+}

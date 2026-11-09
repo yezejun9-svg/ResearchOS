@@ -1,0 +1,37 @@
+--- base/internal/domain/client_protocol_attach_contract_windows_test.go
++++ candidate/internal/domain/client_protocol_attach_contract_windows_test.go
+@@ -96,7 +96,16 @@
+ 			client := "attach-source"
+ 			switch mode {
+ 			case "unowned":
+-				if _, err := f.db.Exec("UPDATE client_sessions SET writer_client_id='',lease_expires_at=NULL WHERE id=?", sid); err != nil { t.Fatal(err) }
++				// No current lease: retain the required historical writer attribution.
++				if _, err := f.db.Exec("UPDATE client_sessions SET lease_expires_at=NULL WHERE id=?", sid); err != nil { t.Fatal(err) }
++				snapshot, _ := handlerCommand(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2),
++					CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: &sid,
++					Method: strptr("session.get"), Payload: Bytes(Object{})})
++				writer, present := snapshot.Result["writer"]
++				if deref(snapshot.Status) != "COMPLETED" || !present || writer != nil {
++					t.Fatalf("unowned fixture has a public writer lease: %s", Bytes(snapshot))
++				}
++				if err := ValidateResultAgainstMethod("session.get", snapshot, service.Doc); err != nil { t.Fatal(err) }
+ 			case "expired-same-owner":
+ 				if _, err := f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), sid); err != nil { t.Fatal(err) }
+ 			case "other-client":
+@@ -137,7 +146,15 @@
+ 		want := "VERSION_CONFLICT"
+ 		switch mode {
+ 		case "stale-revision": env.ExpectedRevision = revPtr(before.revision + 1)
+-		case "claimed-epoch": env.WriterEpoch = revPtr(before.epoch); want = "INVALID_REQUEST"
++		case "claimed-epoch":
++			env.WriterEpoch = revPtr(before.epoch)
++			// The public decoder rejects this before Execute; HTTP maps it to INVALID_REQUEST.
++			decoded, err := DecodeEnvelope(Bytes(env))
++			if decoded != nil || err == nil || err.Error() != "ATTACKER_CLAIMED_EPOCH" ||
++				attachContractRead(t, f, sid) != before || attachContractEventCount(t, f, sid, deref(env.CommandID)) != 0 {
++				t.Fatalf("claimed epoch reached a command or changed state: decoded=%v err=%v", decoded, err)
++			}
++			continue
+ 		case "wrong-project": env.ProjectID = strptr("wrong-project"); want = "FORBIDDEN"
+ 		}
+ 		response, _ := handlerCommand(t, f, service, env)

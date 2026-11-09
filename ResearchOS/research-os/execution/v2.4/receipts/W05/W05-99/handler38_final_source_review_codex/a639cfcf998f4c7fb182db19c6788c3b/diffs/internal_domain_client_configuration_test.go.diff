@@ -1,0 +1,56 @@
+diff --git a/internal/domain/client_configuration_test.go b/internal/domain/client_configuration_test.go
+index 8056fb9e..5228e07e 100644
+--- a/internal/domain/client_configuration_test.go
++++ b/internal/domain/client_configuration_test.go
+@@ -113,7 +113,36 @@ func configurationReceipt(tx *sql.Tx, principal string, env *Envelope, response
+ 	if e != nil {
+ 		return e
+ 	}
+-	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,200,?,'{}',?)`, principal, deref(env.ProjectID), "v2:"+deref(env.Method), deref(env.CommandID), h, Bytes(response), Now())
++	headers := "{}"
++	var tables int
++	if e = tx.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='client_command_identities'`).Scan(&tables); e != nil {
++		return e
++	}
++	if tables == 0 {
++		var version int
++		if e = tx.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); e != nil {
++			return e
++		}
++		if version != 22 {
++			return fmt.Errorf("missing command identity table outside original schema22")
++		}
++	} else {
++		var identities int
++		if e = tx.QueryRow(`SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=?`, principal, deref(env.CommandID)).Scan(&identities); e != nil {
++			return e
++		}
++		if identities != 0 {
++			doc, err := backupConfigurationSchema()
++			if err != nil {
++				return err
++			}
++			headers, e = writeClientCommandEnvelope(doc, env)
++			if e != nil {
++				return e
++			}
++		}
++	}
++	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,200,?,?,?)`, principal, deref(env.ProjectID), "v2:"+deref(env.Method), deref(env.CommandID), h, Bytes(response), headers, Now())
+ 	return e
+ }
+ 
+@@ -606,10 +635,10 @@ func TestClientConfigurationStrictPayloadAndUnwiredSession(t *testing.T) {
+ 	if _, e = stageClientConfiguration(context.Background(), tx, doc, configurationFixtureOwner, configurationFixturePrincipal, raw, env); e == nil || !strings.Contains(e.Error(), "SESSION_INTEGRATION_REQUIRED") {
+ 		t.Fatalf("%v", e)
+ 	}
+-	// The new private primitives do not change the existing public envelope gate.
++	// Valid default scope is decoded; trusted Host authority is checked by Execute.
+ 	hostRaw, _ := configurationEnvelope(t, doc, "public-unwired", 1)
+-	if _, e = DecodeEnvelope(hostRaw); e == nil {
+-		t.Fatal("public host configure unexpectedly wired")
++	if _, e = DecodeEnvelope(hostRaw); e != nil {
++		t.Fatalf("public default configure decode: %v",e)
+ 	}
+ }
+ 

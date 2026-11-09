@@ -1,0 +1,59 @@
+diff --git a/apps/desktop/main/main.js b/apps/desktop/main/main.js
+index bcc3e88f..4954b5c4 100644
+--- a/apps/desktop/main/main.js
++++ b/apps/desktop/main/main.js
+@@ -9,6 +9,7 @@ const childProcess = require('node:child_process');
+ const crypto = require('node:crypto');
+ const http = require('node:http');
+ const fs = require('node:fs');
++const physicalFs = require('original-fs');
+ const path = require('node:path');
+ const { TextDecoder } = require('node:util');
+ const host = require('./lib/host.js');
+@@ -27,7 +28,7 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'ros-app', privileges: {
+ } }]);
+ const ROOT = path.resolve(__dirname, '..');
+ const REPO = path.resolve(ROOT, '..', '..');
+-const productLayout = loadProductLayout(REPO);
++const productLayout = loadProductLayout(REPO, physicalFs);
+ if (productLayout) {
+   // The lock and Chromium profile must be identical for CLI-started and
+   // Start-menu-started Electron before either can launch Core.
+diff --git a/tests/ui/desktop/product-host.test.mjs b/tests/ui/desktop/product-host.test.mjs
+index a93a051a..193ffa7f 100644
+--- a/tests/ui/desktop/product-host.test.mjs
++++ b/tests/ui/desktop/product-host.test.mjs
+@@ -60,6 +60,33 @@ test('location-bound inventory and installation identity fail closed', t => {
+   assert.throws(() => product.loadProductLayout(f.root), /PRODUCT_MANIFEST_INVALID/);
+ });
+ 
++test('physical inventory treats an ASAR archive as a file and still detects tampering', t => {
++  const f = fixture(t);
++  const relative = 'runtime/electron/resources/default_app.asar';
++  const archive = path.join(f.root, ...relative.split('/'));
++  const bytes = Buffer.from('physical ASAR fixture bytes');
++  fs.mkdirSync(path.dirname(archive), { recursive: true });
++  fs.writeFileSync(archive, bytes);
++  f.marker.files.push({ path: relative, bytes: bytes.length, sha256: hash(bytes) });
++  f.marker.files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
++  f.marker.inventory_digest = product.inventoryIdentity(f.marker.files);
++  f.marker.installation_id = product.installationIdentity(f.marker);
++  fs.writeFileSync(path.join(f.root, 'installed-product.json'), JSON.stringify(f.marker));
++
++  const virtualFs = Object.create(fs);
++  virtualFs.lstatSync = file => file === archive
++    ? { isSymbolicLink: () => false, isFile: () => false, isDirectory: () => true }
++    : fs.lstatSync(file);
++  assert.throws(() => product.loadProductLayout(f.root, virtualFs), /PRODUCT_PATH_TYPE/);
++  assert.equal(product.loadProductLayout(f.root, fs).installID, f.marker.installation_id);
++  fs.writeFileSync(archive, 'tampered archive');
++  assert.throws(() => product.loadProductLayout(f.root, fs), /PRODUCT_FILE_CHANGED/);
++  fs.unlinkSync(archive);
++  assert.equal(fs.existsSync(archive), false);
++  fs.mkdirSync(archive);
++  assert.throws(() => product.loadProductLayout(f.root, fs), /PRODUCT_PATH_TYPE/);
++});
++
+ test('generated tree refuses a removed marker while a development tree remains unmarked', t => {
+   const f = fixture(t);
+   fs.mkdirSync(path.join(f.root, 'runtime', 'electron'));

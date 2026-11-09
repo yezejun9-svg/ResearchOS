@@ -1,0 +1,105 @@
+FILE internal/domain/runtime_command_queue_windows.go
+426: func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) error {
+427: 	type completion struct {
+428: 		seq      int64
+429: 		response any
+430: 		err      error
+431: 	}
+432: 	results := make(chan completion, 32)
+433: 	ready := map[int64]completion{}
+434: 	inflight := 0
+435: 	next := int64(1)
+436: 	frames := bridge.Frames()
+437: 	tick := time.NewTicker(40 * time.Millisecond)
+438: 	defer tick.Stop()
+439: 	var initialized time.Time
+440: 	var cancelSent time.Time
+441: 	var deferredError error
+442: 	for frames != nil || inflight > 0 {
+443: 		select {
+444: 		case observation := <-bridge.ModelObservations():
+445: 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+446: 			if err != nil {
+447: 				return err
+448: 			}
+449: 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+450: 				return err
+451: 			}
+452: 		case frame, ok := <-frames:
+453: 			if !ok {
+454: 				frames = nil
+455: 				continue
+456: 			}
+457: 			if frame.Type == "effect.request" {
+458: 				if inflight >= 16 {
+459: 					return Fail(409, "GATE_FAILED", "effect concurrency exceeds bound")
+460: 				}
+461: 				inflight++
+462: 				go func(f rt.BridgeFrame) {
+463: 					r, e := c.brokerEffect(brokerCtx, route, run, lease, epoch, bridge, f)
+464: 					results <- completion{f.Sequence, r, e}
+465: 				}(frame)
+466: 			} else {
+467: 				var response any
+468: 				var err error
+469: 				if strings.HasPrefix(frame.Type, "command.") {
+470: 					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+471: 					if err == nil && frame.Type == "command.accepted" {
+472: 						payload, e := Decode(frame.Payload)
+473: 						if e != nil {
+474: 							return e
+475: 						}
+476: 						if payload["initialized"] == true {
+477: 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+478: 						}
+479: 					}
+480: 				}
+481: 				if frame.Type == "checkpoint" {
+482: 					mutation.Lock()
+483: 					response, err = c.checkpoint(ctx, route, run, lease, epoch, locator, bridge, frame)
+484: 					mutation.Unlock()
+485: 				}
+486: 				if err != nil {
+487: 					return err
+488: 				}
+489: 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+490: 			}
+491: 		case done := <-results:
+492: 			inflight--
+493: 			if done.err != nil {
+494: 				var fenced int
+495: 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+496: 					return done.err
+497: 				}
+498: 				deferredError = done.err
+499: 			}
+500: 			ready[done.seq] = done
+501: 		case <-tick.C:
+502: 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+503: 				return err
+504: 			}
+505: 		case <-ctx.Done():
+506: 			return ctx.Err()
+507: 		}
+508: 		for {
+509: 			done, ok := ready[next]
+510: 			if !ok {
+511: 				break
+512: 			}
+513: 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+514: 				return err
+515: 			}
+516: 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+517: 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+518: 					return err
+519: 				}
+520: 			}
+521: 			delete(ready, next)
+522: 			next++
+523: 		}
+524: 	}
+525: 	if len(ready) != 0 {
+526: 		return Fail(409, "GATE_FAILED", "protocol receipt gap")
+527: 	}
+528: 	return deferredError
+529: }

@@ -1,0 +1,113 @@
+# C51+6 启动补充独立设计审查
+
+结论：**CONDITIONAL_IMPLEMENTABLE_SOURCE_PROPOSAL**。在 B-r2 独立接受并由 Root 冻结组合基线后，现有 57 路径可以形成具体 Source 卡；必须纳入本报告的最小修订。现有机制不是技术上不可实现，也没有已经具备实际部署资源。当前 Source authority、Source acceptance、actual authority、actual acceptance、formal acceptance 均为 false；formal increment=0。本结论只解决有限设计判定，不签发 Source 或部署权限。
+
+唯一方案仍是 OFFICIAL_ENTRY_FILE_DACL_FENCE_V1 + POST_RESTART_CURRENT_QUIESCENCE_V1。当前原根、旧 Core/Desktop/Canary、ACL、DB/API、密钥、provider/model 和启动停止重启均未操作。所有原 Wait 缺失、raw frames=3、ACK=2、raw queue_empty=false、Run/费用 UNKNOWN 和失败次数保持原状。审查使用 gpt-6-astra/high（父任务配置），无再委派。
+
+## 一、独立判定与关键修订
+
+| ID | 结论与必须修改之处 | Source 可解决部分 | 尚缺的实际资源 |
+|---|---|---|---|
+| F01 | 单文件 read/execute deny 不封闭祖先替换和 owner 权限；当前 ACL 不能直接接受 | 在 boot_windows.go 实现逐对象/父边有效权限判定、同句柄 identity/hash/SD/非 reparse 检查和精确计划 | 有权限的恢复主体、完整实际 SD preimage、选定共享祖先变更授权与读回 |
+| F02 | C 用户 home 的 operator FullControl 包含 DELETE_CHILD；子包 deny 不足。D 根 AU Modify 没有该位，不能扩大成整盘 ACL reset | 逐父子边区分 DELETE、DELETE_CHILD、WRITE_DAC、WRITE_OWNER、directory add/write/reparse 权限；继承和 owner 单列 | 下述精确共享范围的可审查部署差量，当前未获授权 |
+| F03 | 无 first-party RestartApps 调用不证明运行时无登记；静态扫描不完成入口覆盖 | 精确进程句柄 GetApplicationRestartSettings reader、返回码/长度/flags/重启 argv 必经文件校验；退出/访问拒绝为 UNKNOWN | 在未来获批观察范围内读取实际注册状态，或针对完全相同 runtime/argv 的已接受 native 重启夹具；普通运行窗口内登记变化仍需封闭 |
+| F04 | C BEGIN pending 时恢复旧未升级入口会绕过 journal gate；BOUNDARY_ABORTED 标签不能修复此问题 | disarm 状态机禁止在 C 未确定终态时恢复旧包 read/execute；恢复不自动 launch、不删 journal | 独立于围栏的管理恢复路径；pending C 的明确恢复责任 |
+| F05 | 同业务 SID 提升后仍带被拒 SID，不能假定“管理员”自然越过 deny；owner 也不能靠普通 deny 自动消除隐式控制权 | 恢复 principal 与业务 principal 分离验证；选定对象 owner 迁至可信恢复主体或经独立测试的 OWNER RIGHTS 策略 | 首选不同 SID 的已提升恢复管理员；替代特权恢复路径须单独验证，不能默认现账户可恢复 |
+| F06 | ONLINE backup 生产接口可识别，但含 workspace 的 Host.New 有真实初始化副作用 | online prephase 只消费另行接受的备份清单；不 Acquire 被 Core 持有的根 lease，不调用普通 Host 构造 | Root 未改 Source 的在线备份夹具接受；之后真实 key、workspace 条件、恢复可用性和副作用明确许可 |
+| F07 | B75/B-r2 仅 ONLINE 私有证明，不是 C 历史授权；STOP-r4 未接受 | C 私有历史 variant、marker namespace、currentOwner、raw/model/receipt/census 校验保持独立 | B-r2 独立接受与确切 API/源码 hash；当前没有这些接受 |
+| F08 | CP511 的 current STOP 前提不能被 boot JSON 偷换 | Source 卡明确新增且只用于 C 的 current-quiescence alternative；绝不扩充旧 STOP 七类或伪造旧 verifier Wait | Root 明确采纳本补充的精确替代边界；未来真实 Restart 与当前围栏/lease/census 证据 |
+| F09 | 目录保护不能破坏仍在线 Core 或后续 C 的必要 DB/WAL/lease 写入；恢复管理员不能冒充业务 Owner | 分离入口文件、命名空间祖先与可写业务数据的 ACL 策略；真实 SQLite/lease 正反夹具验证 | 若最小目录限制与原身份业务写入不可兼容，actual plan 拒绝；不得临时广泛解锁绕过 |
+
+这是一项可实施性判断：尚未实现的 helper、reader、入口 guard 应成为 Source 工作内容。无需先有部署或 native 实现证明才能编写 Source；但尚未独立接受的能力也不能当成 arm 已满足。
+
+## 二、ACL 的精确判断与未来 shared scope
+
+R07/R09 验证了冻结完整 file-ancestor-metadata.json SHA f4c58e80940d0dc81ce9c0bac70a1131030238c27cfe7e9347e749ac33d71cc5，并查看具体 D 根/作品集/C home 完整 SDDL。compact 只是定位摘要，不作为完整 AccessCheck。当前 token 是 Medium、Administrators deny-only，不能执行下述管理部署。
+
+D:\\ 的 owner 是 SYSTEM；AU 的有效 mask 0x001301bf 包含 DELETE，但不含 0x40 DELETE_CHILD、0x40000 WRITE_DAC、0x80000 WRITE_OWNER。其 inherit-only ACE 不能当成本对象有效授权。因此本 proposal **不要求修改 D:\\ ACL**，也不要求修改 C:\\、C:\\Users 的合法 OS owner/ACL。FILE_DELETE_CHILD 和文件执行/脚本读取的定义来自 [Microsoft 文件权限常量](https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants)。
+
+仍须保护以下精确路径分支：D:\\作品集 → ResearchOS → research-os，再分别到实际 Electron 链、repo main.js 链与 .local/live/current-chat-normal-desktop-first-use-20261012/data 链；C:\\Users\\yqyyds → .codex → researchos-resource-cache → 两个已冻结包 → 各必经目标。不是递归锁整棵目录：计划逐个列出选中祖先和目标的 exact native ID、原 SD、拟装 SD、继承标记及恢复策略；不涉及无关兄弟树的递归 ACE 改动。
+
+D:\\作品集、ResearchOS 和 repo 本身当前可被 operator 删除/改名，且 operator 是 owner。只保护更深层不能阻止整个祖先移动。需要在这些选中目录自身关闭普通主体的 DELETE、WRITE_DAC/WRITE_OWNER 及用于替换/reparse 的写权限，并处理 owner 隐式权限；AU 广泛写权不能只按当前 operator 过滤后忽略其他非可信主体。可保留普通读取、遍历与不影响固定路径的权利，但最小 native fixture 若无法证明允许 directory add/write 安全，采用明确的临时禁止创建/改目录策略，并把影响写入部署差量，不谎称零影响。
+
+这项保守目录限制不得机械地施加给业务 data 根及 DB/WAL/lock：原 Core 在线期间和 C_HELD 的必要写入必须持续合法。对需要可写的非空 data 目录，应在已阻止删除子项/改名/改 owner/DACL、固定关键文件身份的前提下，用 native fixture 证明所保留的创建权限不能替换受保护命名空间或设置 reparse；无法证明则该实际计划拒绝。不得为让测试通过暂时移除 fence，不得把不同 OS SID 的管理员执行结果冒充原业务主体。Source 要同时测试 namespace 攻击拒绝与真实 SQLite/lease 工作的正例。
+
+C:\\Users\\yqyyds 是 SYSTEM owner，但授予 operator FullControl。至少需要对该目录自身取消普通 operator 的 DELETE、DELETE_CHILD、WRITE_DAC、WRITE_OWNER 及经实际测试判定可改其路径身份的写权；后续 .codex/cache/package 链同理，operator-owned 对象另处理 owner。home 级非继承 DELETE_CHILD 限制会影响删除其直接子项；目录写限制可能影响创建新文件/子目录；.codex/cache 的更新、替换会暂时受限。这是实质 shared scope，**必须未来逐项明确授权**。当前没有该授权；不能悄悄施加。
+
+优先将需要保护的 operator-owned 精确对象临时设为不同 SID 的可信恢复管理员所有，保存原 owner/group/DACL/SACL可读部分/保护与继承控制位及 binary SD。合法 SYSTEM/TrustedInstaller owner 保留。OWNER RIGHTS 是可选替代，仅在相同 Win11/NTFS 真实夹具证明后采用；此报告不把它当现成能力。对象 owner 的隐式 WRITE_DAC 由 [Microsoft 官方 owner 文档](https://github.com/MicrosoftDocs/win32/blob/docs/desktop-src/SecAuthZ/owner-of-a-new-object.md)说明。
+
+C 链现有大量隔离 deny（示例 .codex/package 208 ACE）须按字节/语义保留，不能构造“干净 allowlist”覆盖。只能追加精确非继承限制或有明确前后差量的局部变化；拒绝未知 ACE 或无法解释的继承传播。全 SD 保真、ACE 次序、最终有效权限和兄弟对象不受新增继承影响均需 native 验证。父目录并不替代对子文件的访问检查，见 [Microsoft 文件安全说明](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights)。
+
+真实部署若不能接受上述共享影响、不能提供独立恢复主体、或无法在实际 inherited/dense deny 上完成精确读回，则该实际分支是有限 NO_IMPLEMENTABLE_ACTUAL_CARD；不继续找新机制。本 Source 可在受控夹具实现并独立接受，二者不得混淆。
+
+## 三、冻结的 supported-set 决策
+
+这里冻结的是本 proposal 的支持策略，供 Root 原样纳入卡；不是凭此更改用户日常支持合同。
+
+| 资源编号 | 本 proposal 的边界 |
+|---|---|
+| S01/S02 | 当前 replacement 包与仍存在的 profile 包均覆盖；不以“旧包没在运行”排除正常直启。完整 package→main→Core 链纳入，main.js 拒绝读取，Core 拒绝执行。 |
+| S03/S04 | 两包 Core 所有 early/admin/replay/replacement/inherited mode，以及 packaged verifier/node/worker 必经文件全部纳入；不能只 deny launcher。共享 Electron 不撤执行权，只验证其可信字节和祖先。 |
+| S05 | repo Desktop 和已支持 env override 属于普通官方可能路径，不能叫恶意绕过。repo main.js 是候选固定门；任何绕过此 main 或指向未映射新 Core/runtime 的普通支持分支保持 UNKNOWN，阻塞 actual arm，直至 exact 映像登记并围栏。 |
+| S06 | CLI 是官方客户入口，安装映像尚未映射。不能只凭 main.go 注释宣布无副作用：coding_task.go:69-86 有 CommandChecker。host-bound 请求在 post 无普通 listener 且持有根租约下须失败；任何本地检查/开发执行必须经过同一冻结映像。actual 仍须精确 CLI 映像与配置合同，否则阻塞该集合闭合。57 路径不偷加 CLI patch。 |
+| S07 | 备份是正式维护入口。ONLINE create 作为独立先行授权任务；APPLYING/ARMED 之后一切普通 backup/restore/upgrade 原根入口均需 gate/精确映像围栏。未知部署映像不能默认为不存在。 |
+| S08/S09 | release_host、ops/release build/start 按 docs/installation/README.md:3,18,33 的 fresh disposable fixture 合同排除“现行原根部署”；仍在 C51 中加来源与 gate 防御。若将来允许原根，须新 exact deployment 登记，当前不是可穿透的例外。 |
+| S10 | ResearchOSVerifierCanary 保留为独立 virtual-account protected evaluator。公开 source 固定 ProgramData 根并核验 service SID，没有本次原根启动链证据。不得停服务、读私有 config、假设 user deny 覆盖 service SID，或把它充作 packaged verifier closure。其 protected evaluator 接受本身不被本审查重签。 |
+| S11/S12 | 已查注册范围零匹配只提供有限佐证。 |
+| S13 | RestartApps UNKNOWN 为 actual arm 阻塞。reader 或精确 native fixture 可补 Source 能力与特定运行时证据；first-party 搜索不能补。 |
+| S14/H01 | ARMED 窗口冻结官方更新、重建后部署和新 override 登记；需要正常更新就先安全结束该 operation。历史 H01 非现行包，不枚举任意用户复制二进制；若恢复支持须登记。 |
+
+GetApplicationRestartSettings 读取指定进程注册信息，未注册与错误分开；它不是全机自动启动清单。[Microsoft API](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getapplicationrestartsettings)。reader 绑定 exact image/creation/SID/handle，限制可收集 argv 字段并脱敏，退出或读取拒绝不能当未注册。注册可变，必须在 pre/post 与冻结入口策略共同使用；一次 NONE 不足以证明整个重启窗口。
+
+## 四、57 路径内最小 Source 责任与 API
+
+完整原 51+6 路径逐项保存在 design-review.json 的 source_paths，唯一依据 C-boot-exact-scope.json SHA 4d8aeacb387f4b1f697a755d9107c4081a9725e5438fa145ae246e2c70b2cedf。原 16 existing +16 new +19 tests，加 4 boot production+2 tests，合计36 production/21 tests，不加路径。
+
+1. internal/recoveryboundary/contract.go 定义版本化 EntryFencePlan、pre/post witness 和带私有字段的 CurrentQuiescence；保留 operation/host/businessSID/native root+DB IDs/helper+plan digest/expiry/generation/held-lease identity。普通 JSON、bool、PID、裸 handle 无法创建 permit。该包不得依赖 host/domain/store，避免 host→recoveryboundary→host 环。
+2. boot_windows.go 在同一文件实现精确 handle identity、hash/SD/volume/fileID/最终路径/祖先保持、native ACE policy、精确 RestartApps reader、native uptime、受保护外部 operation 状态与 CAS restore。不得复用未接受的 STOP/B helper 当可信原语。当前无 accepted helper 是 Source 待做项。一般原祖先写权限不合格应拒绝 plan，不自动修“脏路径”。
+3. ops/qualification_recovery_boundary/main_windows.go 实现 plan/arm/observe/status/disarm-request 窄状态机及两种身份角色。online 绝不 Acquire 原 Core lease/store.Open/Host.New；post 只走 C 专用 Host 入口，无普通 listener/worker/provider。main_nonwindows.go 明确 unsupported。
+4. apps/control/main.go classifier 必须在现有第34行三个 early branch 之前；普通分支在任何数据库/Host/key/provider副作用前检查外部 fence + 双 journal，取得真实 lease 后再次验证。prepared_recovery/replay/backup/release_host/store 全部按原 C51 接线，不能只改正常分支。
+5. qualificationmaintenancejournal 三类 reader 保持 ordinary 与 exact-own inspection 两个不同纯谓词；pending C 与 replacement 互不豁免。boot ARMED 不是 C BEGIN；唯有 post 取得真实 held lease、owner lock、当前 census 与已核验 plan 后才能开 C BEGIN。C-LD03 的 PUBLISHING-before/after applied 恢复分类保留。
+6. adapters/runtime 两文件以单 heap owner-state/generation 保留 lease；borrow 的 inner Close 不得释放 outer；所有五种 upgrade 先 normalization，再 native root/source identity，再进入 side effects；无释放后重取。C-LD01/02 原条件不变。
+7. apps/control 与 internal/host 的 C maintenance Windows 入口只接受窄 typed current-quiescence，并在实际事务边界重验 operation/held generation/native root。业务 Owner 仍是原 Owner，不能用管理员代替。无普通 Host.New 前置初始化。
+8. internal/domain/runtime_qualification_failure_windows.go 保持 validatedQualificationFailureTx 私有返回类型；严分 online namespace host:qualification-failure-closure 与 C namespace host:qualification-failure-maintenance，跨 namespace 重复/歧义拒绝。历史 validator 放既定 qualification_failure_maintenance_windows.go；只有 currentOwner/root/历史 source+raw/model request+receipt/精确五version与 ancillary/census 全验后构造同私有 closure。不得伪造 B denial/drain/join，D 仍只消费独立接受后的私有结果。
+9. 其余既列 C51 生产路径按原完整责任保留；测试接线覆盖真实 entry、五 upgrade、双 journal、事务、借用及跨平台。若确需第58路径，停止该卡并明确精确新增需求，不私增文件。
+
+B75 frozen raw 直接核对了 private tx、online marker、SCHEDULER author/currentAuthorityRoot、request_hash/full plan、native/broker 和原始 receipt 约束；它只是历史候选。B-r2 正在修 owner/ACL、原 queue 测试及 MODEL request/receipt/history 绑定，最终接口必须以其独立接受快照重核。这是冻结前一次 compatibility gate，不是另开架构循环。STOP-r4 也未接受；本卡不依赖其安全结论，旧 STOP 消费器继续拒绝 boot-only proof。
+
+## 五、Source/native/privileged 测试与实际门槛
+
+Source 与普通 native 夹具必须包括：有效基线逐项单变异；所有 early 入口在 forbidden store/Host/key/provider sentinel 前拒绝；两 namespace other-pending 拒绝与 exact-own applied/unapplied；五 upgrade normalization 与真实 lease borrow；lost generation/borrow Close/CAS/COMMIT失败；完整 five-version+全表 census，禁止表零增量；online/C marker 交叉、currentOwner撤销、MODEL request/receipt/route/key/history/source/raw tamper；真实完成 marker replay 0delta。
+
+boot_windows_test 与 helper CLI test 必须用 fresh、非原根 Windows NTFS fixtures 验证同句柄 ID/hash、hardlink/reparse/祖先改名、父 DELETE_CHILD、继承/INHERIT_ONLY、未知 ACE、dense deny 保真、owner 隐式权限、final image/script denial、exact RestartApps registered/unregistered/error/changed argv、same-boot/hibernate/uptime边界/过期/replay/partial apply/disarm。纯 mock 不能声称真实 OS 拒绝。
+
+独立 privileged fixture 是另一层：不同 SID 恢复管理员与普通 operator；保护重启后 namespace，普通创建/改名/reparse/WRITE_DAC/WRITE_OWNER 路径拒绝；合法 C:/Users/系统 owner 保留；预期 shared 影响与兄弟对象检查；恢复管理员能读 preimage 并按 current==installed 恢复。真实 fixture FullRestart 才证明跨 boot 保持；本次零测试、零 native 探针。没有 privileged 资源只阻塞此资格层和 actual，不假称普通 token 已代测。
+
+ONLINE backup 接口消费 Root SOURCE-MAP：现有 backup create 不先获取独占根 lease，候选可实现。先等 Root unchanged-Source 的持 lease 且双分支恢复夹具独立接受；包含 workspace 时 Host.New 正常初始化权限/文件变化须真实列出，不能藏为只读。实际备份须 schema24/所有历史/内容/队列/原身份可恢复，key 分离保存、凭证与 RootBinding 重建步骤可行。只复制 DB 或 map 静态描述不是 usable backup。备份后 Core 的合法变化由 post census 重新冻结；绝不回灌旧 backup 抹去后续事实。
+
+post witness 固定在受支持 Win11 x64/NTFS，包含 pre/post native uptime、LastBoot corroboration、UTC、host/businessSID、root/DB同句柄ID、祖先、backup/helper/plan/fence digests、operation/sequence。30分钟 pre→post、post uptime≤10分钟且<pre、pre≥10分钟可作为本卡保守策略；越界拒绝，不调整时钟。可信本机时钟和无 VM/checkpoint/磁盘整体回滚是明确前提，hash链/nonce不是 boot attestation。FullRestart 完成、围栏连续、没有普通支持入口在新boot先行运行，加上真实 held root lease/dispatch lock/完整当前 census 才可产生 CurrentQuiescence。它只证明当前边界，不证明历史无副作用或原 Wait。
+
+## 六、可审查实际部署提纲与有限剩余
+
+PREPARED：接受 Source/native/privileged fixture；Root 冻结 exact source/build/helper/官方映像/祖先 SD 差量和恢复主体；可用在线备份独立接受。所有 UNKNOWN 入口均应关闭。新 ProgramData recovery 目录是拟建设资源，须验证它自身父链，不能假定已可信。
+
+APPLYING：先建立受保护外部 operation/preimage，再逐对象 retain→compare→write→flush→readback；拒绝自动 broad ACL reset。普通 SID deny 与 admin recovery 角色独立验证。部分失败保留事实；未完成全覆盖不得 ARMED。已有 Core 仍可能运行，不能把 ACL 应用称为停机。
+
+ARMED：全覆盖真实读回与独立接受后，才可另外请求用户 full Restart；本轮不问不执行。过期不自动撤围栏。post 确认当前边界再进入 C_HELD；五版本事务与 durable marker 完成后可按计划 DISARMING。
+
+恢复修订：没有 C BEGIN 且已证明无 C 应用的 pre-C失败，可由恢复主体按 exact preimage/installed 比对恢复。C BEGIN pending/UNKNOWN、部分提交或无法分类时，旧 ungated entry 的执行/读取 fence 必须保留；恢复程序可恢复自身访问，但不能放开旧 Core。C 已 durable terminal 或 exact NOT_APPLIED/ABORTED 且完整分类明确后才逐项撤旧 fence。恢复途中漂移/冲突拒绝覆盖，失败不会删除 C/boot journal 或重置历史；恢复可用性不是 C/formal 成功。
+
+未来用户资源请求的精确内容（仅文本，未发送）：
+- 提供并授权一个与业务 SID 分离的已提升恢复管理员，用于本 operation 的精确 SD/owner 变更、读回与还原；或已独立验证的等价特权恢复能力。
+- 审阅并批准所列 D:\\作品集/ResearchOS/repo 及 C:\\Users\\yqyyds/.codex/cache 等选定祖先的逐对象权限差量、临时创建/删除/更新影响、完整 preimage、恢复负责人和恢复路径；不包含 D:\\、C:\\ 整盘重置。
+- 冻结此原根允许的 CLI/backup/dev override/update 映像与配置集合；任何仍被普通使用的未知映像必须给出 exact 路径/版本，不能以本报告排除。
+- 在独立资格完成后，授权确切在线备份及其 Host 初始化副作用，并准备可用恢复 key/目的地/工作区恢复步骤。密钥不交聊天。
+- 仅在 Source、实际 backup、fence 与恢复全部独立接受后，再请求一个满足窗口的完整 Restart；这与上述部署授权分开。
+
+剩余是有限条件：B接受/Root精确接线、Source/native/privileged测试、actual入口闭合、恢复主体与shared scope授权、usable backup、Restart及post事实。任一真实资源拒绝或缺失只阻塞相应 actual/资格支路；不得再把“尚无 helper 实现”当新架构循环起点。
+
+## 七、证据等级与日志
+
+12 个 scope inputs 的 bytes/SHA 全部匹配。读取限定项目规则、冻结报告/公开 metadata 与精确源码位置；未复读原系统。after-intake 共11组：R03-R10 八组，W01-W03 三组；R01失败与R02 intake另记。上限12未用完即停止外部查询。
+
+R01 Get-FileHash 缺失失败保留；R02 .NET替代成功。R07 Python 正则字符串 SyntaxWarning 保留，不影响执行但不改写成无诊断。R04/R05/R07/R08/R10 UI 输出截断，完整 stdout/stderr 都在 ownE，关键结论通过窄读回核对；未阅读的尾部不宣称已逐字审查。网页仅使用 Microsoft primary 文档，搜索返回其他站点未作为证据。没有执行产品测试或实际环境探针，所有 native/actual 结论仍是待验证设计。command-index、ledger 和 FINAL-manifest 一并封存。

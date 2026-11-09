@@ -1,0 +1,47 @@
+--- execution\v2.4\receipts\W09\W09-99\w09_evidence_implementation_source_proposal_codex\9bc40daa1dba4b628892ebb7188b70b4\w09_evidence_export_test.proposed.go
++++ internal/domain/w09_evidence_export_test.go
+@@ -74,7 +74,18 @@
+ func w09ExportEvent(t *testing.T, label string, value any) map[string]any {
+     t.Helper()
+     if os.Getenv("RESEARCHOS_W09_EVIDENCE_DIR") == "" { return nil }
+-    raw, err := json.Marshal(value)
++    // Every structured event belongs to this Go test and this runner invocation.
++    var object map[string]any
++    switch item := value.(type) {
++    case map[string]any: object = item
++    case []map[string]any: object = map[string]any{"rows": item}
++    default: t.Fatal("W09 event must be a map or origin rows")
++    }
++    closed := make(map[string]any, len(object)+2)
++    for key, item := range object { closed[key] = item }
++    closed["_run_id"] = os.Getenv("RESEARCHOS_W09_RUN_ID")
++    closed["_test_name"] = t.Name()
++    raw, err := json.Marshal(closed)
+     if err != nil { t.Fatal(err) }
+     return w09ExportRaw(t, label, raw)
+ }
+@@ -171,12 +182,24 @@
+     }
+     if err := index.Err(); err != nil { index.Close();t.Fatal(err) }
+     index.Close()
++    snapshots, err := f.db.Query("SELECT artifact_id,root_id,relative_path,content_hash,root_revision,status FROM retrieval_snapshots WHERE project=? ORDER BY artifact_id",f.project)
++    if err != nil { t.Fatal(err) }
++    actualSnapshots := []map[string]any{}
++    for snapshots.Next() {
++        var artifact, root, relative, hash, status string
++        var rootRevision int
++        if err := snapshots.Scan(&artifact,&root,&relative,&hash,&rootRevision,&status); err != nil { snapshots.Close();t.Fatal(err) }
++        actualSnapshots=append(actualSnapshots,map[string]any{"artifact_id":artifact,"root_id":root,"relative_path":relative,"content_hash":hash,"root_revision":rootRevision,"status":status})
++    }
++    if err := snapshots.Err(); err != nil { snapshots.Close();t.Fatal(err) }
++    snapshots.Close()
+     return w09ExportEvent(t, "state-"+label, map[string]any{
+         "project": f.project, "principal": f.owner, "root_id": rootID,
+         "root_path": path, "root_identity": identity, "root_revision": revision,
+         "root_revoked": revoked, "principal_revoked": principalRevoked,
+         "grant_count": grants, "current_snapshots": current, "stale_snapshots": stale,
+         "roles_json": roles, "actual_grants": actualGrants, "actual_index": actualIndex,
++        "actual_snapshots": actualSnapshots,
+         "revoked_snapshots": rejected, "index_rows": indexRows,
+         "max_index_revision": maxIndexRev, "origin_rows": origins,
+         "dedupe_rows": dedupe, "project_state": f.state(),

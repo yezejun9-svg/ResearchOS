@@ -1,0 +1,47 @@
+// Independent revision04 delta checks. No candidate import/entrypoint or SDK/Win32.
+import fs from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
+import crypto from 'node:crypto';
+const root=new URL('../',import.meta.url);
+const read=(dir,file)=>fs.readFileSync(new URL(dir+'/'+file,root),'utf8');
+const sha=s=>crypto.createHash('sha256').update(s).digest('hex');
+const check=(v,m)=>{if(!v)throw Error(m)};
+const dir='product-v1-real-electron-single-task-prepare-04',old='product-v1-real-electron-single-task-prepare-03',native='product-v1-native-path-entry-prepare-05';
+const src=read(dir,'real-electron-flow.mjs'),before=read(old,'real-electron-flow.mjs'),helper=read(dir,'choose-owned-folder.ps1'),nativeHelper=read(native,'choose-owned-folder.ps1');
+check(sha(src)==='e14f9d287398b432f6e3a55918fb73be747b8b446d1e7f032ddfdfd925627a5b','RUNNER_PIN');
+check(sha(before)==='9a2b27c35f4e17626bc9c1511d8d53b3e83927dc5330151c3a549c7c22b4280a','PREDECESSOR_PIN');
+check(sha(helper)==='a1680c3e1c1960ceb7969c19e7e5bd2903af170d497ede0e18e32b6315c68f89','HELPER_PIN');
+check(sha(nativeHelper)==='c0f1bf7c83fbf4efe5a9eabe2667866a622c0bcb220eb3d128f60c895644edd8','NATIVE05_PIN');
+const start=src.indexOf('function requireWarningDismissSelector(scope) {'),end=src.indexOf('function requirePathEntryScope(scope) {',start);
+check(start>=0&&end>start,'SELECTOR_EXTRACTION');
+const predicate=src.slice(start,end);
+const call='  requireWarningDismissSelector(scope);\n';
+const pin='  pin(scope.native_picker.validation_warning.dismiss_selector.evidence_path, scope.native_picker.validation_warning.dismiss_selector.evidence_sha256);\n';
+check(src.replace(predicate,'').replace(call,'').replace(pin,'')===before,'UNEXPECTED_RUNNER_DELTA');
+const guard=s=>{const a=s.indexOf('  Require ($scope.budget.task_submissions'),b=s.indexOf('  Require ($scope.native_picker.validation_warning.caption',a);check(a>=0&&b>a,'GUARD_EXTRACTION');return s.slice(a,b)};
+check(guard(helper)===guard(read(old,'choose-owned-folder.ps1')),'TASK_STAGE_BUDGET_CHANGED');
+check(nativeHelper.replace(guard(nativeHelper),guard(helper))===helper,'NATIVE_DELTA_EXCEEDS_BUDGET_GUARD');
+const template=JSON.parse(read(dir,'scope.template.json'));
+const expected=template.native_picker.validation_warning.dismiss_selector;
+const box=vm.createContext({folded:v=>path.resolve(v).toLowerCase(),requireThat:check});
+vm.runInContext(predicate+'\nthis.verify=requireWarningDismissSelector;',box);
+const verify=s=>box.verify({native_picker:{validation_warning:{dismiss_selector:s}}});
+verify(expected);
+const changes=[['expected_control_id',1],['expected_control_id','2'],['expected_button_count',0],['expected_button_count',2],['expected_button_count','1'],['basis','GUESSED'],['message_box_result_is_control_id',true],['message_box_result_is_control_id','false'],['evidence_event','OTHER'],['evidence_event_sequence',35],['evidence_event_sequence','36'],['evidence_sha256','0'.repeat(64)],['evidence_path','C:/other/receipt.json']];
+const outcomes=[];
+for(const [field,value] of changes){let error;try{verify({...expected,[field]:value})}catch(e){error=e}check(error?.message==='ACTUAL03_WARNING_DISMISS_SELECTOR_PIN_REQUIRED','UNEXPECTED_ACCEPT:'+field);outcomes.push({field,value,rejected:true})}
+let missingRejected=false;try{verify(null)}catch(e){missingRejected=e.message==='ACTUAL03_WARNING_DISMISS_SELECTOR_PIN_REQUIRED'}check(missingRejected,'MISSING_SELECTOR_ACCEPTED');
+const bytes=fs.readFileSync(expected.evidence_path);check(sha(bytes)===expected.evidence_sha256,'ACTUAL_RECEIPT_PIN');
+const receipt=JSON.parse(bytes),reply=JSON.parse(receipt.stdout);
+const matches=reply.history.filter(e=>e.event===expected.evidence_event&&e.sequence===expected.evidence_event_sequence);
+check(matches.length===1,'ACTUAL_EVENT_NOT_UNIQUE');const evidence=matches[0].evidence;
+check(!evidence.truncated&&evidence.enumeration_error===null,'ACTUAL_METADATA_INCOMPLETE');
+const buttons=evidence.rows.filter(r=>r.class_name==='Button');check(buttons.length===1,'ACTUAL_BUTTON_COUNT');
+const button=buttons[0];check(button.control_id===2&&button.hwnd>0&&button.visible&&button.enabled&&button.is_child&&button.parent===evidence.dialog&&button.root_dialog===evidence.dialog,'ACTUAL_SELECTOR_NOT_SUPPORTED');
+const mutated=structuredClone(template),prior=JSON.parse(read(old,'scope.template.json'));
+delete mutated.native_picker.validation_warning.dismiss_selector;
+check(JSON.stringify(mutated)===JSON.stringify(prior),'UNEXPECTED_TEMPLATE_DELTA');
+const freeze=JSON.parse(read(dir,'FROZEN.json')),files=[];
+for(const [file,hash] of Object.entries(freeze.files)){const actual=sha(fs.readFileSync(new URL(dir+'/'+file,root)));check(actual===hash,'FREEZE_DRIFT:'+file);files.push({file,sha256:actual})}
+console.log(JSON.stringify({status:'INDEPENDENT_SELECTOR_DELTA_CHECKS_PASS',new_negative_selector_cases:changes.length+1,positive_selector_case:true,negative_cases:outcomes,missing_selector_rejected:missingRejected,runner_delta:'ONLY_SELECTOR_FUNCTION_CALL_AND_PIN',helper_delta:'ONLY_APPROVED_STAGE_ZERO_GLOBAL_ONE_GUARD_FROM_NATIVE05',template_delta:'ONLY_DISMISS_SELECTOR',inherited_task_and_identity_logic:'BYTE_IDENTICAL_TO_APPROVED03',actual_receipt:{sha256:expected.evidence_sha256,exit:receipt.exit,event:matches[0].event,sequence:matches[0].sequence,button_count:buttons.length,control_id:button.control_id,does_not_prove_native_success:true},frozen_files:files,app_launches:0,model_calls:0,helper_entrypoint:0,win32_calls:0,runner_imports:0},null,2));

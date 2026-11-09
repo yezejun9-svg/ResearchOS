@@ -1,0 +1,75 @@
+import hashlib
+import os
+from pathlib import Path, PureWindowsPath
+from contextlib import contextmanager
+import uuid
+
+BASE = "execution/v2.4/receipts/W04/W04-99/"
+SCOPE_DIR = BASE + "integration_codex/revalidation-82783db86d8a4a49a287c371c72f156d/"
+STATE = "execution/v2.4/step_state.json"
+
+class Refusal(ValueError):
+    def __init__(self, code, detail):
+        self.code = code
+        super().__init__(code + ": " + str(detail))
+
+
+def need(condition, code, detail):
+    if not condition:
+        raise Refusal(code, detail)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def exclusive(path, raw):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def path_in(repo, relative):
+    raw_parts = str(relative).replace("\\", "/").split("/")
+    need(all(part not in {"", ".", ".."} for part in raw_parts), "PATH_SCOPE", relative)
+    p = Path(relative)
+    need(not p.is_absolute() and not PureWindowsPath(str(relative)).drive and ".." not in p.parts,
+         "PATH_SCOPE", relative)
+    p = repo / p
+    need(p.resolve().is_relative_to(repo), "PATH_SCOPE", relative)
+    cursor = p
+    while cursor != repo:
+        need(not cursor.is_symlink() and not cursor.is_junction(), "PATH_LINK", cursor)
+        cursor = cursor.parent
+    return p
+
+
+def atomic_state(repo, expected_hash, raw, out):
+    target = path_in(repo, STATE)
+    temporary = out / ("atomic-payload-" + uuid.uuid4().hex + ".tmp")
+    exclusive(temporary, raw)
+    need(sha(target.read_bytes()) == expected_hash, "FULL_STATE_CAS", "immediately before atomic replacement")
+    os.replace(temporary, target)
+    need(sha(target.read_bytes()) == sha(raw), "READBACK_HASH", STATE)
+
+
+@contextmanager
+def writer_lock(repo):
+    need(os.name == "nt", "PLATFORM", "Windows Root serial writer only")
+    import msvcrt
+    path = path_in(repo, SCOPE_DIR + "transition-writer.lock")
+    try:
+        exclusive(path, b"0")
+    except FileExistsError:
+        pass
+    with path.open("r+b") as stream:
+        need(stream.read(1) == b"0", "LOCK_FORMAT", path)
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)

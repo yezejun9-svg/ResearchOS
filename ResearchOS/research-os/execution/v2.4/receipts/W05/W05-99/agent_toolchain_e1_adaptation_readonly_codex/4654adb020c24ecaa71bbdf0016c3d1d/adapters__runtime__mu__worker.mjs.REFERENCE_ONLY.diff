@@ -1,0 +1,105 @@
+--- sealed-Main/adapters/runtime/mu/worker.mjs
++++ sealed-6fb/adapters/runtime/mu/worker.mjs
+@@ -399,7 +399,7 @@
+   return transport;
+ }
+ 
+-function parseConfig(raw) {
++export function parseConfig(raw) {
+   const config = JSON.parse(raw);
+   if (!object(config)) throw new Error("worker.json must be an object");
+   for (const field of ["ref", "api", "provider", "model", "endpoint", "route"]) {
+@@ -409,6 +409,15 @@
+   const endpoint = new URL(config.endpoint);
+   if (!["https:", "http:"].includes(endpoint.protocol) || endpoint.username || endpoint.password) {
+     throw new Error("model endpoint must be an HTTP(S) URL without embedded credentials");
++  }
++  if (Object.hasOwn(config, "provider_policy")) {
++    const local = ["127.0.0.1", "[::1]"].includes(endpoint.hostname);
++    if (config.provider_policy !== "opencode-go-deepseek-v1" || config.provider !== "opencode-go" ||
++        config.model !== "deepseek-v4.1-flash" || endpoint.search || endpoint.hash ||
++        (config.endpoint !== "https://opencode.ai/zen/go/v1/chat/completions" &&
++         !(local && endpoint.port && endpoint.pathname === "/zen/go/v1/chat/completions"))) {
++      throw new Error("frozen provider policy tuple differs");
++    }
+   }
+   requireInteger(config.max_output_tokens, "worker.max_output_tokens", 8192);
+   requireInteger(config.max_calls, "worker.max_calls", MAX_CALLS);
+@@ -425,10 +434,39 @@
+       throw new Error(`tool ${fn.name} requires an object parameters schema`);
+     }
+     if (fn.strict !== undefined && typeof fn.strict !== "boolean") throw new Error(`tool ${fn.name} strict must be boolean`);
++    if (config.provider_policy && fn.strict === true) throw new Error("provider policy does not permit strict tools");
+     if (names.has(fn.name)) throw new Error(`duplicate tool ${fn.name}`);
+     names.add(fn.name);
+   }
+   return config;
++}
++
++export function providerModel(config) {
++  const model = {
++    id: config.model, name: config.model, provider: config.provider, api: config.api,
++    baseUrl: config.endpoint, reasoning: false, input: ["text"],
++    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++    contextWindow: 1_000_000, maxTokens: config.max_output_tokens,
++    compat: { supportsStore: false, supportsStrictMode: true },
++  };
++  if (config.provider_policy) Object.assign(model, {
++    baseUrl: config.endpoint.slice(0, -"/chat/completions".length), reasoning: true,
++    thinkingLevelMap: { high: "high" },
++    compat: { thinkingFormat: "deepseek", supportsReasoningEffort: true, maxTokensField: "max_tokens",
++      requiresReasoningContentOnAssistantMessages: true, requiresThinkingAsText: false,
++      supportsStore: false, supportsStrictMode: false },
++  });
++  return model;
++}
++
++export function validateProviderRequest(config, url, body) {
++  if (!object(body) || Object.keys(body).some(key => !MODEL_BODY_KEYS.has(key) && !(config.provider_policy && key === "thinking")) ||
++      body.model !== config.model || body.stream !== true || !Array.isArray(body.messages) ||
++      JSON.stringify(body.tools) !== JSON.stringify(config.tools)) throw new Error("SDK model request differs from frozen configuration");
++  if (config.provider_policy && (url !== config.endpoint || canonicalJSON(body.thinking) !== '{"type":"enabled"}' ||
++      body.reasoning_effort !== "high" || body.max_tokens !== config.max_output_tokens || Object.hasOwn(body, "max_completion_tokens"))) {
++    throw new Error("SDK provider URL or high thinking policy differs");
++  }
+ }
+ 
+ function parseRequest(raw) {
+@@ -725,13 +763,7 @@
+   const config = parseConfig(configRaw);
+   const protocol = createProtocol(config, request, sha256(requestRaw));
+ 
+-  const model = {
+-    id: config.model, name: config.model, provider: config.provider, api: config.api,
+-    baseUrl: config.endpoint, reasoning: false, input: ["text"],
+-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+-    contextWindow: 1_000_000, maxTokens: config.max_output_tokens,
+-    compat: { supportsStore: false, supportsStrictMode: true },
+-  };
++  const model = providerModel(config);
+   const settingsManager = SettingsManager.inMemory({
+     cacheWarming: "off", compaction: { enabled: false }, retry: { enabled: false },
+     providerRetry: { maxRetries: 0 },
+@@ -767,12 +799,7 @@
+             const raw = await requestObject.text();
+             let body;
+             try { body = JSON.parse(raw); } catch { throw new Error("SDK model request is not JSON"); }
+-            if (!object(body) || Object.keys(body).some((key) => !MODEL_BODY_KEYS.has(key)) ||
+-                body.model !== config.model || body.stream !== true ||
+-                !Array.isArray(body.messages) ||
+-                JSON.stringify(body.tools) !== JSON.stringify(config.tools)) {
+-              throw new Error("SDK model request differs from frozen model configuration or broker body schema");
+-            }
++            validateProviderRequest(config, requestObject.url, body);
+             const modelReply = await protocol.model({ body }, sdkOptions?.signal);
+             if (modelReply.response) return modelReply.response;
+             const reply = modelReply.legacy;
+@@ -795,7 +822,7 @@
+   const customTools = makeTools(config, protocol);
+   const { session, extensionsResult } = await createAgentSession({
+     cwd, agentDir: cwd, sessionManager, settingsManager, resourceLoader,
+-    modelRuntime, model, thinkingLevel: "off", noTools: "builtin",
++    modelRuntime, model, thinkingLevel: config.provider_policy ? "high" : "off", noTools: "builtin",
+     tools: customTools.map((tool) => tool.name), customTools,
+   });
+   if (extensionsResult.extensions.length !== 0) throw new Error("extensions unexpectedly loaded");

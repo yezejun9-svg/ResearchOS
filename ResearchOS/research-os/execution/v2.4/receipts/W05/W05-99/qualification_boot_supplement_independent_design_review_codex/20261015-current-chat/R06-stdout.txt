@@ -1,0 +1,405 @@
+VERIFIED B-API-compatibility.md c5a76bc7611a27acdb90819a4b6a211bd04cf2865a909cb806a7efc57e703e39
+# B75 与 C+boot 的精确兼容边界
+
+证据：G04-B75-full-source.raw（git show candidate75），G03 B-author-report；不是B独立接受。B75基于f48fca0e4013bda19913a34d91da0cd23157a08b，tree ba3f9d4c101df39ab17856158d5fc72a9f0600ce。Root须先采用独立B审查结论再冻结C施工基线。
+
+| 真实B75位置 | 现状 | C最小接线 |
+|---|---|---|
+| :668 validatedQualificationFailureTx(tx *sql.Tx, project,taskID,runID string,epoch int64) -> qualificationFailureClosure | 私有Service方法；无D production调用 | 保持签名/私有返回type。只在该方法内以严格kind+namespace分支调用新的私有historical validator；不得导出“通过”bool或通用SQL入口。 |
+| :676–700 | 查询host:qualification-failure-closure，恰好1 marker；ONLINE_FIRST_GATE_TOOL_DENIAL | C使用host:qualification-failure-maintenance + operationID；精确检查两个namespace中subject歧义/重复后拒绝，不能宽OR后随便取一条。原online解析逻辑独立保留。 |
+| :707–717 | SCHEDULER作者与currentAuthorityRoot到OWNER | C作者当前未撤销OWNER，run_id=null；historical branch重验原Owner/Host/root，不假装在线Scheduler作者。 |
+| :754–762 | proof kind在线，包含真实rejection_digest及BEFORE_PREPARE_EFFECT_TX rejection | C不能制造typed online denial/rejection digest。独立HOST_TOOL_EFFECT_NOT_DISPATCHED版本化历史重构及raw/source绑定；boot proof只作current-quiescence premise。 |
+| :758 | B full plan digest = Digest(Bytes({core,proof})) | C FullPlan为既定PlanCore+exact proof bytes+planned rows，request_hash=plan_file_sha256；两种canonicalization不能互换。历史分支分别重算C所有hash。 |
+| :765–774 | 原生native、online broker accepted/completed2、pending0、第三帧rejected | C不能制造B drain ticket、broker join或ACK3；原3/2和raw queue_empty=false保留；独立历史分类须验证所有C premises。 |
+| :788–803 | effect1、rejected0、CONFIRMED model且ledger UNKNOWN/null money | C完整effect/queue/cursor/control census仍要求无额外UNKNOWN；CONFIRMED模型与UNKNOWN金额保持原账，不变成0。 |
+| :805–819 | artifact/link/event/outbox/snapshot/outcome hash组成私有closure | C分支验证自身五version delta、封存MANIFEST/profile、marker、全census/outcome，成功才构造同private closure；D只消费接受后的结果。 |
+
+不得从boot helper调用online denial构造器或用fixture ticket跨入C。historical validator放在已列internal/domain/qualification_failure_maintenance_windows.go，runtime_qualification_failure_windows.go只做私有分流与共同不变量；其测试加在既有同名windows_test和C维护test，范围不增加。没有接受B时这些都是提案，不是实施。B独立审查如改变API/语义，Root按具体变更复核兼容点；禁止忽略新审查结论硬套本稿。
+
+
+VERIFIED actual-deployment-plan-reviewable.md 960b47d3ed45c8e1f8acb3acd1bfb297a7c297fb6d11fe7e8edd46214a696d6b
+# 未来部署审查矩阵（非执行单）
+
+状态NOT_IMPLEMENTED_NOT_ACCEPTED。实际目标清单尚缺，因此本文件不能当可执行部署计划；finiteblockeddecision.md是当前决策。没有执行ACL/registry/native probe/DB/API/launch/stop/Restart操作。
+
+| 阶段 | 精确动作与输入 | 成功条件 | 失败/撤除 |
+|---|---|---|---|
+| PREPARED | 接受的57路径候选build/helper hash；完整入口图每条exact target file ID+hash+descriptor；原root/DB identity；另行accepted online backup manifest；管理员恢复主体 | schema/platform/token/ancestor等无UNKNOWN；恢复副本在root之外受保护且可用 | 无改动，拒绝arm |
+| APPLYING | 先保护外部operation控制目录；逐目标open retain no-delete metadata；比较expected original descriptor/hash/ID；持久写before记录并flush；只写冻结精确FILE_EXECUTE或FILE_READ_DATA围栏；读回 | 每个target的读回完全匹配expected installed descriptor且普通token不能修改 | 部分成功保持APPLYING；逐条仅对current==installed且ID未变的目标恢复original；冲突不覆盖，交同operation管理员恢复，边界UNPROVEN |
+| ARMED | 封存全目标applied/readback、pre witness和backup digest；禁止普通更新/新副本注册 | 全覆盖，独立接受；此状态仍未静默，旧Core可ONLINE | expiry/取消不自动unfence；受保护记录失效，管理员按原descriptor恢复；不停止旧Core |
+| 用户未来FullRestart | 只有部署/backup/Source/fixture/独立接受后，另行用户明确窗口 | post uptime严格下降，LastBoot与明确完成证据相容；所有围栏跨boot存在 | 不要求用户现在重启；取消/休眠/同boot/延迟越界拒绝，无伪boot receipt |
+| BOOT_OBSERVED | 先重读全目标ID/hash/ACL/祖先、fence inventory及无普通新boot启动证据；再native root lease与dispatch owner lock | 同host/SID/root/DB；完整census，无UNKNOWN/permissions gap；lease retained | 任何中断拒绝；不能以新PID快照补历史Wait |
+| C_HELD | 冻结当前C计划，双journal own permit、schema24 write reservation、Host/effect/B private variant和CAS全部验证 | 全前提成立；5version精确事务；外部UNKNOWN无遗漏 | 保留journal/原证据；precommit未应用按NOT_APPLIED，已commit只recover terminal receipt |
+| C_DURABLE | 精确marker+delta/census、C durable terminal、所有lease/guard仍held | 独立operation核验，不自动D/qualification | marker/状态冲突UNKNOWN；不重放、不恢复backup覆盖root |
+| DISARMING | 独立撤除授权记录绑定operation/终态；仍holding root lease；目标current descriptor==installed逐一恢复original并readback | 完整恢复清单；ordinary新gate可见durable C journal | partial restore停止进一步动作，记录哪些已恢复；仍保留root lease至安全退出。进程崩溃导致lease丢失时不能保证已恢复旧入口不启动，因此boundary作废且不得继续C；保留已提交事实/失败，不以重跑修复 |
+| CLOSED | 完整restore后封存consumed generation再释放lease；无自动launch | 无pending未知项；新ordinary启动仍经原产品门禁 | 离线管理恢复只能撤除基础设施阻断；C/UNKNOWN状态不被宣告成功 |
+
+DACL操作不是多文件原子事务。partial apply在preboot不能推出无新启动；只有全部armed并经过FullRestart后才可能建current boundary。撤除只发生C已durable之后；撤除中crash不能支持持续current-quiescence或随后同permit维护。所有恢复动作留append-only记录，不删before/failed记录。
+
+重放：同op相同plan允许status/只补终态读回，不重复DB mutation；同op不同plan拒绝；consumed op不重新arm；过期后需要新op但必须先分类旧op，不通过新目录跳过旧pending。换hash/file ID/owner/ancestor就不能restore覆盖；管理员恢复必须具体审查漂移，不能给出takeown/icacls-reset通配符。
+
+不锁死前提：管理恢复程序与控制记录不处于被围栏阻断的目标集合，备份原descriptor在root外；已证明能在普通产品SID被拒绝时恢复。无法提供该主体/路径就不得开始APPLYING。恶意管理员、同SID任意绕过程序、VM回滚不在可信操作假设，但正常官方launch/update必须覆盖。
+
+
+VERIFIED file-ancestor-compact.json bcdde661f9f5514807e2148daa752a11f0c66cd39e1d1ded000a9cfd73fb4a22
+COMPACT_TYPE list
+COMPACT_FIRST [{"sha256": null, "fsutil_file_id": "File ID is 0x00000000000000000005000000000005\r\n", "owner": "NT SERVICE\\TrustedInstaller", "relevant_aces": [{"flags": "None", "qualifier": "AccessAllowed", "sid": "S-1-5-11", "mask": "0x00000004"}, {"flags": "ObjectInherit, ContainerInherit, InheritOnly", "qualifier": "AccessAllowed", "sid": "S-1-5-11", "mask": "0xe0010000"}, {"flags": "ObjectInherit, ContainerInherit", "qualifier": "AccessAllowed", "sid": "S-1-5-18", "mask": "0x001f01ff"}, {"flags": "ObjectInherit, ContainerInherit", "qualifier": "AccessAllowed", "sid": "S-1-5-32-544", "mask": "0x001f01ff"}, {"flags": "ObjectInherit, ContainerInherit", "qualifier": "AccessAllowed", "sid": "S-1-5-32-545", "mask": "0x001200a9"}], "canonical": true, "kind": "EXACT_ANCESTOR", "ace_count": 6, "fileid_exit": 0, "path": "C:\\", "reparse": false}, {"sha256": null, "fsutil_file_id": "File ID is 0x000000000000000000010000000002c7\r\n", "owner": "NT AUTHORITY\\SYSTEM", "relevant_aces": [{"flags": "ObjectInherit, ContainerInherit, InheritOnly", "qualifier": "AccessAllowed", "sid": "S-1-1-0", "mask": "0xa0000000"}, {"flags": "None", "qualifier": "AccessAllowed", "sid": "S-1-1-0", "mask": "0x001200a9"}, {"flags": "ObjectInherit, ContainerInherit", "qualifier": "AccessAllowed", "sid": "S-1-5-18", "mask": "0x001f01ff"}, {"flags": "ObjectInherit, ContainerInherit", "qualifier": "AccessAllowed", "sid": "S-1-5-32-544", "mask": "0x001f01ff"}, {"flags": "None", "qualifier": "AccessAllowed", "sid": "S-1-5-32-545", "mask": "0x001200a9"}, {"flags": "ObjectInherit, ContainerInherit, InheritOnly", "qualifier": "AccessAllowed", "sid": "S-1-5-32-545", "mask": "0xa0000000"}], "canonical": true, "kind": "EXACT_ANCESTOR", "ace_count": 7, "fileid_exit": 0, "path": "C:\\Users", "reparse": false}]
+SOURCE apps/cli/main.go 8dfcb1ed5a170aba90a8acd1e600bd5dad2c63dd978e972bb7203ab184b3dba9
+1: // Command researchos is the ResearchOS-owned CLI entry (W02-03 thin launcher).
+2: // It reuses the upstream Mu/Pi starter for the interactive worker (attached later);
+3: // this entry provides real version/help/doctor behavior and explicit NOT_IMPLEMENTED
+4: // for capabilities owned by later cards. It never starts a second business scheduler.
+5: // W05-03 extended it: non-interactive stdout is JSONL only, an empty argv is the contract's
+6: // interactive command, and the host-bound verbs send client-protocol commands through
+7: // apps/cli/cli_v2.go instead of reporting a health probe as a result.
+8: package main
+9: 
+10: import (
+11: 	"os"
+12: 	"strings"
+13: )
+14: 
+15: const (
+16: 	productName    = "researchos"
+17: 	buildVersion   = "0.2.4-w0203"
+18: 	clientProtocol = "researchos-client/2"
+19: 	discoveryPath  = ".local/v24_host.json"
+20: )
+21: 
+22: type discovery struct {
+23: 	URL       string `json:"url"`
+24: 	PID       int    `json:"pid"`
+25: 	DataDir   string `json:"data_dir"`
+26: 	StartedAt string `json:"started_at"`
+27: }
+28: 
+29: func main() {
+30: 	args := os.Args[1:]
+31: 	cmd := ""
+32: 	if len(args) > 0 {
+33: 		cmd = args[0]
+34: 	}
+35: 	// The contract writes the interactive entry as `researchos [--project <path-or-id>]`, so an empty argv and a
+36: 	// leading flag are the interactive command, not a help page. `chat` is not a contract command at all.
+37: 	if cmd == "" || (strings.HasPrefix(cmd, "--") && cmd != "--version" && cmd != "--help") {
+38: 		cliInteractive(args)
+39: 		return
+40: 	}
+41: 	switch cmd {
+42: 	case "version", "--version":
+43: 		// W05-03 output contract: non-interactive stdout is JSONL only, so the human-readable line is a diagnostic.
+44: 		diag("%s %s protocol=%s", productName, buildVersion, clientProtocol)
+45: 		outJSON(map[string]any{"command": "version", "status": "COMPLETED", "exit_code": 0,
+46: 			"product": productName, "version": buildVersion, "protocol": clientProtocol})
+47: 	case "help", "--help":
+48: 		cliHelpSurface(true)
+49: 	case "doctor":
+50: 		cliDoctor()
+51: 	case "task":
+52: 		runCodingTask(args[1:])
+53: 	default:
+54: 		if h, registered := commandHandlers[cmd]; registered {
+55: 			h(args[1:])
+56: 			return
+57: 		}
+58: 		diag("%s: NOT_IMPLEMENTED (%s is registered to a later card; no silent success)", cmd, cmd)
+59: 		outJSON(map[string]any{"command": cmd, "status": "REJECTED", "exit_code": 3,
+60: 			"reason": "NOT_IMPLEMENTED", "detail": cmd + " is registered to a later card; no silent success"})
+61: 		os.Exit(3)
+62: 	}
+63: }
+SOURCE apps/control/main.go e2590cf34de926ef1a87e00b88f970ae5519c4fddc62988db61d247f04031e48
+45: 			log.Fatal(err)
+46: 		}
+47: 		return
+48: 	}
+49: 	bootstrapOwner := flag.Bool("bootstrap-owner", false, "initialize the local Owner and write a private credential file")
+50: 	credentialFile := flag.String("credential-file", "", "private local output path")
+51: 	importSpec := flag.String("import-spec", "", "import a pinned specification directory as the initial ResearchOS goal")
+52: 	manifestHash := flag.String("manifest-sha256", "", "trusted sha256 digest of the complete package manifest")
+53: 	importJev := flag.String("import-jev", "", "register the completed frozen evaluation in this project; independent acceptance remains required")
+54: 	developmentFile := flag.String("development-file", "evaluation/development/jev-v2/dataset.json", "hash-pinned public development corpus")
+55: 	provision := flag.String("provision-principal", "", "trusted local administration: principal JSON to provision")
+56: 	issue := flag.String("issue-credential", "", "trusted local administration: existing principal ID")
+57: 	coordinatorFile := flag.String("runtime-coordinator-config", "", "private host configuration for the single runtime coordinator")
+58: 	runtimeAssetsDir := flag.String("runtime-assets-dir", "", "local runtime assets directory; defaults to runtime beside the installed control executable")
+59: 	qualificationRequest := flag.String("runtime-qualification-request", "", "trusted managed startup request for one bounded local runtime qualification")
+60: 	verifierManifest := flag.String("runtime-verifier-manifest", "", "trusted installed deterministic verifier manifest for the managed qualification request")
+61: 	desktopManagement := flag.Bool("desktop-management-stdio", false, "private inherited Desktop management pipes; never HTTP or Native3")
+62: 	trialVault := flag.String("trial-readonly-model-vault-dir", "", "trial-only exact existing sealed host vault directory")
+63: 	trialCredential := flag.String("trial-readonly-credential-ref", "", "trial-only single protected credential reference")
+64: 	trialProvider := flag.String("trial-readonly-provider", "", "trial-only provider identity")
+65: 	discoveryFile := flag.String("discovery-file", "", "local host discovery output; defaults to data-root/discovery.json")
+66: 	flag.Parse()
+67: 	adminActions := 0
+68: 	for _, active := range []bool{*bootstrapOwner, *importSpec != "", *importJev != "", *provision != "", *issue != ""} {
+69: 		if active {
+70: 			adminActions++
+71: 		}
+72: 	}
+73: 	if adminActions > 1 {
+74: 		log.Fatal("choose one local administrative action")
+75: 	}
+76: 	managedManifest := *verifierManifest
+77: 	if *desktopManagement {
+78: 		if adminActions != 0 || *qualificationRequest != "" || *coordinatorFile != "" || *trialVault != "" || *verifierManifest == "" {
+79: 			log.Fatal("Desktop management requires normal host composition and installed verifier manifest")
+80: 		}
+81: 		managedManifest = ""
+82: 	}
+83: 	managedQualification, err := readManagedLocalQualification(*qualificationRequest, managedManifest)
+84: 	if err != nil {
+85: 		log.Fatal(err)
+86: 	}
+87: 	if managedQualification != nil && (adminActions != 0 || *coordinatorFile != "" || *trialVault != "") {
+88: 		log.Fatal("managed local qualification requires the normal host composition without another administrative action")
+89: 	}
+90: 	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
+91: 	if *trialVault != "" {
+92: 		if adminActions != 0 || *coordinatorFile == "" || *trialCredential == "" || *trialProvider == "" ||
+93: 			hostboundary.ValidateTrialStorageLayout(dataDir, filepath.Join(dataDir, "host"), *trialVault) != nil {
+94: 			log.Fatal("trial readonly vault requires an isolated existing data root and exact coordinator/ref/provider")
+95: 		}
+96: 	} else if *trialCredential != "" || *trialProvider != "" {
+97: 		log.Fatal("partial trial readonly vault configuration")
+98: 	}
+99: 	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
+100: 	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && adminActions == 0 {
+101: 		log.Fatalf("web build unavailable: %v", err)
+102: 	}
+103: 	lease, err := rt.AcquireDataRootLease(dataDir)
+104: 	if err != nil {
+105: 		if managedQualification != nil {
+106: 			log.Fatal("managed qualification request not consumed: control data root is already owned or unavailable; the privileged Desktop host must complete an orderly managed restart, never start a second coordinator")
+107: 		}
+108: 		log.Fatalf("control data-root lease unavailable: %v", err)
+109: 	}
+110: 	defer func() {
+111: 		if err := lease.Close(); err != nil {
+112: 			log.Fatalf("data-root lease close failed: %v", err)
+113: 		}
+114: 	}()
+115: 	dataDir = lease.Root()
+116: 	if err := runtimeVerifierReplacementStartupGate(lease); err != nil {
+117: 		log.Fatalf("runtime verifier replacement recovery required: %v", err)
+118: 	}
+119: 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
+120: 	if err != nil {
+121: 		log.Fatalf("database unavailable: %v", err)
+122: 	}
+123: 	defer func() {
+124: 		if err := db.Close(); err != nil {
+125: 			log.Fatalf("database close failed: %v", err)
+126: 		}
+127: 	}()
+128: 	if err := store.Bootstrap(context.Background(), db, filepath.Join("migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
+129: 		log.Fatalf("database bootstrap failed: %v", err)
+130: 	}
+131: 	service, err := domain.NewCurrentMu(db, filepath.Join("spec", "v2.0", "contracts"), filepath.Join("migrations", "sqlite", "0002_domain.sql"))
+132: 	if err != nil {
+133: 		log.Fatalf("domain unavailable: %v", err)
+134: 	}
+135: 	service.Protected = &protectedstore.FrozenProvider{}
+136: 	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
+137: 	if err != nil {
+138: 		log.Fatalf("private drain capability unavailable: %v", err)
+139: 	}
+140: 	if *desktopManagement && boot != nil {
+141: 		log.Fatal("Desktop management cannot share a release supervisor capability")
+142: 	}
+143: 	if boot != nil && boot.FixtureStore != "" {
+144: 		fixture, e := protectedstore.OpenCanary(boot.FixtureStore)
+145: 		if e != nil {
+SOURCE ops/backup/main.go 3b362964eb7eda92bcfaee65870ddd0b26e4ba05a8c8f8ecba506ad983d6bd2f
+175: 			options.WorkspaceTarget = target
+176: 			options.DatabaseName = "researchos.sqlite"
+177: 		}
+178: 		r, e := domain.RestoreBackup(ctx, *backup, *out, options)
+179: 		if e != nil {
+180: 			return e
+181: 		}
+182: 		return json.NewEncoder(os.Stdout).Encode(r)
+183: 	}
+184: 	if *source == "" {
+185: 		return fmt.Errorf("--db required")
+186: 	}
+187: 	st, e := os.Stat(*source)
+188: 	if e != nil || !st.Mode().IsRegular() {
+189: 		return fmt.Errorf("existing regular source database required")
+190: 	}
+191: 	// Refuse ambiguous URI DSNs; --db is an ordinary local file path.
+192: 	if strings.Contains(*source, "?") {
+193: 		return fmt.Errorf("SQLite URI parameters prohibited")
+194: 	}
+195: 	db, e := store.Open(*source)
+196: 	if e != nil {
+197: 		return e
+198: 	}
+199: 	defer db.Close()
+200: 	s := &domain.Service{DB: db, Contracts: contracts}
+201: 	var active int
+202: 	if e := db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.status')=?`,
+203: 		domain.KindWorkspaceBinding, domain.WorkspaceActive).Scan(&active); e != nil {
+204: 		return e
+205: 	}
+206: 	var m domain.BackupManifest
+207: 	if active == 0 {
+208: 		m, e = s.CreateBackup(ctx, *out, key)
+209: 	} else {
+210: 		h, hostErr := hostboundary.New(hostConfig(db, filepath.Dir(*source)))
+211: 		if hostErr != nil {
+212: 			return hostErr
+213: 		}
+214: 		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+215: 	}
+216: 	if e != nil {
+217: 		return e
+218: 	}
+219: 	return json.NewEncoder(os.Stdout).Encode(m)
+220: }
+SOURCE adapters/protectedstore/broker_windows.go 0f7a9d4bd97430feff311d3f552e7a34a86088d93460e20c3d81c0d6a26bf8e1
+1: //go:build windows
+2: 
+3: package protectedstore
+4: 
+5: import (
+6: 	"context"
+7: 	"encoding/json"
+8: 	"errors"
+9: 	"os"
+10: 	"path/filepath"
+11: 	"strings"
+12: 	"time"
+13: 	"unsafe"
+14: 
+15: 	"golang.org/x/sys/windows"
+16: 	"golang.org/x/sys/windows/svc"
+17: 	"golang.org/x/sys/windows/svc/mgr"
+18: )
+19: 
+20: const CanaryServiceName = "ResearchOSVerifierCanary"
+21: const canaryPipe = `\\.\pipe\ResearchOSVerifierCanary-v1`
+22: const pipeClientRights = windows.FILE_READ_DATA | windows.FILE_WRITE_DATA | windows.SYNCHRONIZE
+23: 
+24: // Windows also checks FILE_READ_ATTRIBUTES when opening the client endpoint.
+25: // Do not grant FILE_CREATE_PIPE_INSTANCE (0x4) through generic write access.
+26: const pipeClientACL = "0x100083"
+27: 
+28: var brokerFiles = []string{"input.canary", "label.canary", "detail.canary", "log.canary"}
+29: 
+30: // CanaryInstallRoot is fixed, not accepted from an IPC request or environment.
+31: func CanaryInstallRoot() (string, error) {
+32: 	root, e := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
+33: 	if e != nil {
+34: 		return "", ErrUnavailable
+35: 	}
+36: 	return filepath.Join(root, CanaryServiceName), nil
+37: }
+38: 
+39: func brokerSummary() (SafeSummary, *CanaryStore, error) {
+40: 	root, e := CanaryInstallRoot()
+41: 	if e != nil {
+42: 		return SafeSummary{}, nil, e
+43: 	}
+44: 	private := filepath.Join(root, "data", "private")
+45: 	store, e := OpenCanary(private)
+46: 	if e != nil {
+47: 		if _, stat := os.Stat(private); !os.IsNotExist(stat) {
+48: 			return SafeSummary{}, nil, ErrBoundary
+49: 		}
+50: 		store, e = NewCanary(private)
+51: 		if e != nil {
+52: 			return SafeSummary{}, nil, e
+53: 		}
+54: 		for _, name := range brokerFiles {
+55: 			if e = store.createFile(name, []byte("SYNTHETIC_SERVICE_CANARY_"+name)); e != nil {
+56: 				store.Close()
+57: 				return SafeSummary{}, nil, e
+58: 			}
+59: 		}
+60: 	}
+61: 	for _, name := range brokerFiles {
+62: 		body, err := store.readFile(name, 1024)
+63: 		if err != nil || string(body) != "SYNTHETIC_SERVICE_CANARY_"+name {
+64: 			store.Close()
+65: 			return SafeSummary{}, nil, ErrIntegrity
+66: 		}
+67: 	}
+68: 	return SafeSummary{Schema: "researchos.protected-summary.v1", Status: "EXECUTION_REPORTED", Total: 4, Correct: 4, MaximumMode: "ADVISORY"}, store, nil
+69: }
+70: 
+71: // RunCanaryService is the fixed installed verifier service. Its public pipe
+72: // accepts no filename, provider URL, credential, threshold or evaluation case.
+73: func RunCanaryService(readerSID string) error {
+74: 	interactive, e := svc.IsWindowsService()
+75: 	if e != nil || !interactive {
+76: 		return ErrIsolation
+77: 	}
+78: 	account, _, _, e := windows.LookupSID("", `NT SERVICE\`+CanaryServiceName)
+79: 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+80: 	if e != nil || err != nil || user.User.Sid.String() != account.String() {
+81: 		return ErrIsolation
+82: 	}
+83: 	reader, e := windows.StringToSid(readerSID)
+84: 	if e != nil || !reader.IsValid() || readerSID == account.String() || !strings.HasPrefix(readerSID, "S-1-5-21-") {
+85: 		return ErrBoundary
+86: 	}
+87: 	root, e := CanaryInstallRoot()
+88: 	exe, err := os.Executable()
+89: 	if e != nil || err != nil || !strings.EqualFold(exe, filepath.Join(root, "broker.exe")) {
+90: 		return ErrBoundary
+91: 	}
+92: 	return svc.Run(CanaryServiceName, &canaryService{readerSID: readerSID})
+93: }
+94: 
+95: type canaryService struct{ readerSID string }
+96: 
+97: func (s *canaryService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+98: 	changes <- svc.Status{State: svc.StartPending}
+99: 	summary, store, e := brokerSummary()
+100: 	if e != nil {
+101: 		return true, 1
+102: 	}
+103: 	defer store.Close()
+104: 	boundary, e := store.Boundary(context.Background())
+105: 	if e != nil || summary.Validate() != nil {
+106: 		return true, 2
+107: 	}
+108: 	// Explicit data read/write permissions avoid FILE_CREATE_PIPE_INSTANCE. A
+109: 	// different server instance cannot be created with the reader's pipe rights.
+110: 	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + boundary.OwnerSID + ")(A;;" + pipeClientACL + ";;;" + s.readerSID + ")")
+111: 	if e != nil {
+112: 		return true, 3
+113: 	}
+114: 	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+115: 	name, _ := windows.UTF16PtrFromString(canaryPipe)
+116: 	h, e := windows.CreateNamedPipe(name, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE, windows.PIPE_TYPE_MESSAGE|windows.PIPE_READMODE_MESSAGE|windows.PIPE_NOWAIT|windows.PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 64, 0, &sa)
+117: 	if e != nil {
+118: 		return true, 4
+119: 	}
+120: 	defer windows.CloseHandle(h)
+121: 	ctx, cancel := context.WithCancel(context.Background())
+122: 	defer cancel()
+123: 	engine := newFrozenEngine(ctx, store, protectedGenerator(), serviceCallFactory(store))
+124: 	configuration, e := newConfigPipe(boundary.OwnerSID)
+125: 	if e != nil {
+126: 		return true, 8
+127: 	}
+128: 	defer windows.CloseHandle(configuration)
+129: 	done := make(chan struct{})
+130: 	configured := make(chan struct{})
+131: 	go func() { defer close(done); serveCanaryPipe(ctx, h, summary, store, engine) }()
+132: 	go func() { defer close(configured); serveConfigPipe(ctx, configuration, engine) }()
+133: 	stop := func() { cancel(); <-done; <-configured; engine.wait() }
+134: 	defer stop()
+135: 	current := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+136: 	changes <- current
+137: 	for request := range requests {
+138: 		switch request.Cmd {
+139: 		case svc.Interrogate:
+140: 			changes <- current
+141: 		case svc.Stop, svc.Shutdown:
+142: 			changes <- svc.Status{State: svc.StopPending}
+143: 			return false, 0
+144: 		case svc.Cmd(128):
+145: 			// Only the installer administrator receives SERVICE_USER_DEFINED_CONTROL.

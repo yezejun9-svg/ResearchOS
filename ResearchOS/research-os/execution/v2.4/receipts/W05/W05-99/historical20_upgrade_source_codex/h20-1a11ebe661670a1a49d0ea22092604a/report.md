@@ -1,0 +1,19 @@
+# History20 fixed-plan Source submission
+
+Status: SOURCE_IMPLEMENTED_PENDING_INDEPENDENT_REVIEW_AND_ROOT_RUNTIME. Overall historical20→24 acceptance remains OPEN.
+
+Five candidate files: a new production history20 handler, existing local upgrade dispatch, one plan-specific restore workspace policy, CLI help, and five test parents. Candidates live only below `candidate-root`. The current repository, T9, historical SQL, 21/22/23 templates, Root checkpoints, and private keys were not written.
+
+The handler accepts only the exact numbered historical20 base and produces an isolated numbered21 candidate. It uses the existing full encrypted backup, protected-reference validation, same-host workspace identity, snapshot row inventory, source exclusive lock, staged restore, rollback, and final publication framework. The workspace policy verifies the exact new plan ID; it cannot impersonate the queue plan. Snapshot recovery and numbered migration row constraints are evaluated separately. 0021 executes before its ledger insertion, both within one transaction. It adds no fabricated ledger-only shortcut.
+
+The new recovery invariant is an isolated derivation of the existing queue invariant: pre-migration requires an unchanged20 ledger and allows only restore barriers as new tables; final requires exactly version21 and an empty pending-window table. No prior invariant or historical template is altered. A nullable transcript field, session installer, or current session fence is not injected into the source. Base B and other drift fail the exact schema check.
+
+Local administration is not Product Owner authentication. The inherited API has no Principal/credential input. Test Owner records are generated through real domain provisioning methods on a public SQL fixture; neither their existence nor successful fixture execution proves historical program/Owner provenance. Program file hashes establish stable inputs only, not a cryptographic binding of binaries to release manifests. Native qualification with preserved historical program and real Owner is still required.
+
+Source checks: Python construction and immutable input pins, exact inverse of dispatch/policy patches, delimiter-aware lexical checks, precise production function dependency checks, test inventory, and no legacy template/SQL writes. These checks do not claim Go parsing, gofmt, compilation, SQLite behavior, Windows/native boundaries, model execution, or production success. All runtime tests are pending Root; no tests were run here.
+
+Test Source covers public UpgradeLocal dispatch, unchanged source and Owner rows, restored credential revocation, absence of additive sessions, wrong-key failure, release SQL/hash/count drift, foreign table and additive-session drift, DDL rollback after ledger insert failure, unpublished restore failure preserving source and backup, and implicit startup refusal. Active-Run/effect/workspace runtime scenarios remain acceptance coverage gaps beyond these five parents, despite inherited production checks.
+
+The original two mechanical failures are retained as 900 and901. Both were nonexistent-file rg reads. Outer exit was1 then0; the individual rg exit was not captured (2 is inferred), Python and product-native exits are NULL. A later search returned ordinary no-match exit1 for a nonexistent function name; it was a successful absence query, not a product/test failure. Draft review corrected that test to the actual RestoreOptions.Migration API before execution.
+
+Independent reviewer must assess production correctness and source scope. Root must compile and run the scoped tests in isolation before making any runtime claim. Full20→24, legal session installation, qualified intermediate releases, real historical Owner flow, and single-writer cutover remain explicit unresolved work; this package must not be used to mark the original Goal complete.

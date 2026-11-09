@@ -1,0 +1,100 @@
+--- v4/mu_sdk_trial
++++ v5/mu_sdk_trial
+@@ -207,6 +207,65 @@
+     doc["_pre_child_config_json"] = (strict_consumed_json(config[1], "CLI config")
+                                      if config[0]["exists"] else None)
+     doc["_pre_child_config_raw"] = config[1]
++
++
++def verified_cli_context_transition(label, old, parsed, post_raw):
++    """One original CLI JSONL record + final validated snapshot + saved bytes."""
++    require(label in ("cli-goal", "cli-run") and isinstance(old, dict),
++            "CONTEXT_PREIMAGE_INVALID")
++    name = "goal" if label == "cli-goal" else "run"
++    rows = [row for row in parsed if row.get("command") == name]
++    require(len(rows) == len(parsed) == 1, "CLI_CONTEXT_JSONL_NOT_UNIQUE")
++    row = rows[0]
++    require(row.get("exit_code") == 0 and "context_save_error" not in row,
++            "CLI_CONTEXT_SAVE_NOT_SUCCESSFUL")
++    ops = row.get("operations")
++    require(isinstance(ops, list), "CLI_CONTEXT_OPERATIONS_ABSENT")
++    methods = [op.get("method") if isinstance(op, dict) else None for op in ops]
++    expected_methods = ((["goal.start"], ["session.get", "goal.start"])
++                        if label == "cli-goal" else
++                        (["session.create", "session.send"],
++                         ["session.get", "session.send"]))
++    require(methods in expected_methods and all(
++        op.get("status") == "COMPLETED" and type(op.get("exit_code")) is int
++        and op["exit_code"] == 0 for op in ops),
++        "CLI_CONTEXT_OPERATION_SEQUENCE_CHANGED")
++    final_result = ops[-1].get("result")
++    require(isinstance(final_result, dict), "CLI_CONTEXT_OPERATION_RESULT_ABSENT")
++    admitted = final_result.get("snapshot", final_result)
++    final = row.get("last_verified_session_snapshot")
++    saved = row.get("saved_context")
++    require(isinstance(admitted, dict) and isinstance(final, dict) and
++            isinstance(saved, dict) and set(saved) == {
++                "project_id", "session_id", "session_revision", "writer_epoch", "updated_by"},
++            "CLI_CONTEXT_WITNESSES_ABSENT")
++    writer = final.get("writer")
++    require(isinstance(writer, dict) and type(saved["session_revision"]) is int and
++            type(saved["writer_epoch"]) is int and
++            saved["session_revision"] >= 1 and saved["writer_epoch"] >= 1 and
++            type(final.get("revision")) is int and type(writer.get("epoch")) is int,
++            "CLI_CONTEXT_WRITER_INVALID")
++    require(saved["project_id"] == old.get("project_id") == admitted.get("project_id")
++            == final.get("project_id") and
++            saved["session_id"] == row.get("session_id") == admitted.get("session_id")
++            == final.get("session_id") and
++            (old.get("session_id") in ("", saved["session_id"])) and
++            isinstance(saved["session_id"], str) and saved["session_id"] and
++            saved["session_revision"] == final["revision"] and
++            saved["session_revision"] >= admitted.get("revision", 0) and
++            saved["writer_epoch"] == writer["epoch"] and
++            saved["updated_by"] == row.get("client_id") == writer.get("client_id") and
++            admitted.get("writer", {}).get("client_id") == saved["updated_by"],
++            "CLI_CONTEXT_ORIGINAL_RESPONSE_MISMATCH")
++    require(label != "cli-run" or (methods[0] != "session.create" or
++            old.get("session_id") == ""), "CLI_RUN_CREATE_NOT_FRESH")
++    expected = dict(old)
++    expected.update(saved)
++    post = strict_consumed_json(post_raw, "CLI context postimage")
++    require(post == expected, "CLI_CONTEXT_POSTIMAGE_NOT_DERIVED")
++    return {"original_jsonl_command": name, "admission_method": methods[-1],
++            "saved_context": saved, "final_snapshot_revision": final["revision"],
++            "postimage_fields": sorted(expected)}
+ 
+ 
+ def after_child_consumed_states(doc, label, parsed):
+@@ -250,11 +309,18 @@
+                 strict_consumed_json(config[1], "CLI configured state") == expected,
+                 "CLI_CONFIG_POSTIMAGE_NOT_DERIVED")
+     else:
+-        require(label in ("cli-goal", "cli-run") and config[0] == prior,
+-                "UNAUTHORIZED_CONFIG_TRANSITION")
++        require(label in ("cli-goal", "cli-run") and prior["exists"] and
++                isinstance(old, dict) and config[0]["exists"],
++                "CLI_CONTEXT_PREIMAGE_CHANGED")
++        context_evidence = verified_cli_context_transition(label, old, parsed, config[1])
++        if config[0] == prior:
++            context_evidence["unchanged_original_bytes"] = True
+     doc["_expected_config_state"] = config[0]
+-    return ({"discovery_state": discovery[0], "config_before_state": prior,
+-             "config_after_state": config[0], "transition_label": label},
++    transition = {"discovery_state": discovery[0], "config_before_state": prior,
++                  "config_after_state": config[0], "transition_label": label}
++    if label in ("cli-goal", "cli-run"):
++        transition["context_evidence"] = context_evidence
++    return (transition,
+             doc["_pre_child_config_raw"], config[1])
+ 
+ 
+@@ -728,7 +794,7 @@
+             require(parsed and all(isinstance(row, dict) for row in parsed), "JSONL_MISSING")
+             transition, before_config_raw, after_config_raw = (
+                 after_child_consumed_states(doc, label, parsed))
+-            if label in ("cli-init", "cli-config"):
++            if label in ("cli-init", "cli-config", "cli-goal", "cli-run"):
+                 if before_config_raw is not None:
+                     before_path = directory / (label + ".config.before.raw")
+                     with before_path.open("xb") as original:

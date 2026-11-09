@@ -1,0 +1,99 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\sdk_five_go_root_adoption_preparation_codex\04a454a98b164aa2983f16245f273e9d\actual-cli-bootstrap-ef1d9bf73bea42d8972dfb12c6774093\bootstrap_actual_cli.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\sdk_five_go_root_adoption_preparation_codex\04a454a98b164aa2983f16245f273e9d\actual-cli-bootstrap-v2-d873bd7f77ab4d0a927d93c28a636dac\bootstrap_actual_cli.v2.py
+@@ -59,9 +59,64 @@
+  assert safe_native(result),"actual owned child cleanup incomplete"
+  if expect_zero:assert result["actual_exit"]==0 and result["timed_out"] is False,"CLI command did not succeed"
+  return [json.loads(line) for line in (O/(label+".stdout.raw")).read_text(encoding="utf-8").splitlines()] if expect_zero else result
++picker_stop=threading.Event();picker_thread=None;picker_observation={"mode":"ACTUAL_HOST_SHELL_DIALOG_AUTOMATION","requested_workspace":str(workspace),"observations":[],"clicked_once":False,"confirmed_by_native_cli_result":False}
++def confirm_owned_shell_dialog():
++ import ctypes
++ from ctypes import wintypes
++ u=ctypes.WinDLL("user32",use_last_error=True)
++ callback=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
++ u.EnumWindows.argtypes=[callback,wintypes.LPARAM];u.EnumWindows.restype=wintypes.BOOL
++ u.EnumChildWindows.argtypes=[wintypes.HWND,callback,wintypes.LPARAM];u.EnumChildWindows.restype=wintypes.BOOL
++ u.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)];u.GetWindowThreadProcessId.restype=wintypes.DWORD
++ u.GetClassNameW.argtypes=[wintypes.HWND,wintypes.LPWSTR,ctypes.c_int];u.GetClassNameW.restype=ctypes.c_int
++ u.GetWindowTextW.argtypes=[wintypes.HWND,wintypes.LPWSTR,ctypes.c_int];u.GetWindowTextW.restype=ctypes.c_int
++ u.GetDlgItem.argtypes=[wintypes.HWND,ctypes.c_int];u.GetDlgItem.restype=wintypes.HWND
++ u.IsWindowVisible.argtypes=[wintypes.HWND];u.IsWindowVisible.restype=wintypes.BOOL
++ u.IsWindowEnabled.argtypes=[wintypes.HWND];u.IsWindowEnabled.restype=wintypes.BOOL
++ u.IsWindow.argtypes=[wintypes.HWND];u.IsWindow.restype=wintypes.BOOL
++ u.SendMessageTimeoutW.argtypes=[wintypes.HWND,wintypes.UINT,wintypes.WPARAM,wintypes.LPARAM,wintypes.UINT,wintypes.UINT,ctypes.POINTER(ctypes.c_size_t)];u.SendMessageTimeoutW.restype=ctypes.c_size_t
++ def wc(hwnd):
++  b=ctypes.create_unicode_buffer(2048);u.GetClassNameW(hwnd,b,len(b));return b.value
++ def wt(hwnd):
++  b=ctypes.create_unicode_buffer(2048);u.GetWindowTextW(hwnd,b,len(b));return b.value
++ def pid(hwnd):
++  p=wintypes.DWORD();u.GetWindowThreadProcessId(hwnd,ctypes.byref(p));return int(p.value)
++ deadline=time.monotonic()+15
++ try:
++  while not picker_stop.is_set() and time.monotonic()<deadline:
++   matches=[];expected_pid=jobs["normal-host"]["identity"]["runner_pid"]
++   @callback
++   def enum_top(hwnd,_):
++    if pid(hwnd)==expected_pid and wc(hwnd)=="#32770" and u.IsWindowVisible(hwnd):
++     children=[]
++     @callback
++     def enum_child(child,_):children.append({"hwnd":int(child),"class":wc(child),"text":wt(child),"pid":pid(child)});return True
++     u.EnumChildWindows(hwnd,enum_child,0)
++     if any(c["class"]=="Static" and c["text"]=="Select a ResearchOS workspace folder" for c in children):
++      matches.append((int(hwnd),children))
++    return True
++   assert u.EnumWindows(enum_top,0),"EnumWindows failed"
++   if matches:
++    assert len(matches)==1,"ambiguous owned Host folder dialogs"
++    hwnd,children=matches[0];button=u.GetDlgItem(hwnd,1)
++    assert button and pid(button)==expected_pid and wc(button)=="Button" and u.IsWindowEnabled(button),"owned folder dialog IDOK unavailable"
++    identity=jobs["normal-host"]["producer"].observe_current()
++    assert identity["pid_match"] and identity["creation_match"] and not identity["primary_exit_confirmed"] and not identity["errors"],"Host identity changed before actual picker click"
++    assert not picker_observation["clicked_once"]
++    picker_observation["observations"].append({"dialog_hwnd":hwnd,"dialog_class":wc(hwnd),"host_pid":expected_pid,"host_creation_time_100ns":identity["creation_time_100ns"],"actual_held_host_identity":identity,"children":children,"idok_hwnd":int(button),"idok_text":wt(button),"workspace_preselection":"UNCHANGED_HOST_SAME_PROCESS_CALLBACK","cross_process_custom_pointer_message_sent":False})
++    result=ctypes.c_size_t();ctypes.set_last_error(0)
++    sent=bool(u.SendMessageTimeoutW(button,0x00F5,0,0,0x0002,1000,ctypes.byref(result)))
++    picker_observation.update({"clicked_once":True,"actual_BM_CLICK_send_completed":sent,"send_winerror":ctypes.get_last_error(),"message_result_not_success_evidence":int(result.value)})
++    assert sent,"actual IDOK button message timed out"
++    while u.IsWindow(hwnd) and not picker_stop.is_set() and time.monotonic()<deadline:time.sleep(0.03)
++    picker_observation["actual_dialog_closed"]=not bool(u.IsWindow(hwnd));return
++   picker_stop.wait(0.03)
++  if not picker_stop.is_set():picker_observation["error"]="owned Shell workspace chooser unavailable before finite UI deadline"
++ except BaseException as exc:picker_observation["error"]=repr(exc)
++
+ def start_host():
+  global error
+- try:invoke("normal-host",[str(HOST),"--discovery-file",str(discovery)],host_env,30,False)
++ try:invoke("normal-host",[str(HOST),"--discovery-file",str(discovery)],host_env,60,False)
+  except BaseException as exc:error=repr(exc)
+ try:
+  host_thread=threading.Thread(target=start_host);host_thread.start()
+@@ -73,7 +128,12 @@
+  discovered=json.loads(discovery.read_bytes());assert discovered["pid"]==jobs["normal-host"]["identity"]["runner_pid"]
+  assert Path(discovered["data_dir"])==data and discovered["url"].startswith("http://127.0.0.1:")
+  assert not config.exists()
+- init_rows=invoke("cli-init",[str(CLI),"init",str(workspace)],cli_env,10)
++ picker_thread=threading.Thread(target=confirm_owned_shell_dialog);picker_thread.start()
++ init_rows=invoke("cli-init",[str(CLI),"init",str(workspace)],cli_env,20)
++ picker_stop.set();picker_thread.join(2)
++ assert not picker_thread.is_alive() and picker_observation.get("error") is None and picker_observation["clicked_once"] is True and picker_observation.get("actual_dialog_closed") is True,"actual Shell chooser confirmation incomplete"
++ picker_observation["confirmed_by_native_cli_result"]=True
++ write("workspace-picker.actual.json",picker_observation)
+  projects={row["project_id"] for row in init_rows if row.get("project_id")};assert len(projects)==1
+  project_id=projects.pop();initial_config=config.read_bytes();before_config=json.loads(initial_config);assert before_config["project_id"]==project_id and before_config["session_id"]==""
+  with (O/"cli-init.config.after.raw").open("xb") as f:f.write(initial_config)
+@@ -98,12 +158,15 @@
+  error=error or repr(exc)
+  raise
+ finally:
++ picker_stop.set()
++ if picker_thread is not None:picker_thread.join(2)
++ if not (O/"workspace-picker.actual.json").exists():write("workspace-picker.actual.json",picker_observation)
+  host=jobs.get("normal-host");wd=host.get("watchdog") if host else None
+  if wd is not None and host_thread is not None and host_thread.is_alive():
+   code=0xE0000508;ok=bool(wd.terminate(wd.handle,code));host_stop={"planned_pre_trial_host_teardown":True,"requested_exit_code":code,"actual_TerminateJobObject_return":ok,"at_monotonic":time.monotonic()}
+   if not ok:error=error or "Root explicit Host teardown failed"
+  if host_thread is not None:host_thread.join(35)
+- cleanup_records=[];unconfirmed=False
++ cleanup_records=[];unconfirmed=picker_thread is not None and picker_thread.is_alive()
+  for label,record in jobs.items():
+   result=record["result"];producer=record["producer"];watchdog=record["watchdog"]
+   try:observation=producer.observe_current() if producer is not None else None

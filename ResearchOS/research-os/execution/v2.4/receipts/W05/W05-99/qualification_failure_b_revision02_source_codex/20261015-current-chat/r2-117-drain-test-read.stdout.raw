@@ -1,0 +1,100 @@
+931: 	result := c.RunAdmitted(context.Background(), route, r.run, r.lease)
+932: 	if hookErr != nil || hookCount != 1 || result == nil || !strings.Contains(result.Error(), "planned qualification facts changed") || calls.Load() != 1 {
+933: 		t.Fatalf("heartbeat race was not fenced: hook=%d hookErr=%v result=%v calls=%d", hookCount, hookErr, result, calls.Load())
+934: 	}
+935: 	var state, locator string
+936: 	if err = r.f.db.QueryRow("SELECT state,journal_locator FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&state, &locator); err != nil {
+937: 		t.Fatal(err)
+938: 	}
+939: 	var status string
+940: 	if err = r.f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE kind='Run' AND id=?", r.run["id"]).Scan(&status); err != nil {
+941: 		t.Fatal(err)
+942: 	}
+943: 	if status != "RUNNING" || state != "UNKNOWN" {
+944: 		t.Fatalf("stale frozen plan terminalized: run=%s dispatch=%s", status, state)
+945: 	}
+946: 	dir := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+947: 	journal, _ := os.ReadFile(filepath.Join(dir, "bridge.json"))
+948: 	stdout, _ := os.ReadFile(filepath.Join(dir, "stdout.raw"))
+949: 	stderr, _ := os.ReadFile(filepath.Join(dir, "stderr.raw"))
+950: 	if Hash(beforeNative) != Hash(Object{"journal": Digest(journal), "stdout": Digest(stdout), "stderr": Digest(stderr)}) {
+951: 		t.Fatal("heartbeat race changed immutable native cause")
+952: 	}
+953: }
+954: 
+955: func TestQualificationFailureBlockedModelBrokerCannotClose(t *testing.T) {
+956: 	third := "emit({sequence:3,type:'effect.request',key:subject+':tool:1',route,capability:'TOOL',payload:{name:'run_check',arguments:{}}});"
+957: 	child := strings.Replace(qualificationDenialChild, "process.stdin.setEncoding('utf8');", "setTimeout(() => { "+third+" }, 500);\nprocess.stdin.setEncoding('utf8');", 1)
+958: 	if child == qualificationDenialChild {
+959: 		t.Fatal("blocked child fixture mutation missed")
+960: 	}
+961: 	entered, release := make(chan struct{}), make(chan struct{})
+962: 	defer func() {
+963: 		select {
+964: 		case <-release:
+965: 		default:
+966: 			close(release)
+967: 		}
+968: 	}()
+969: 	provider := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+970: 		close(entered)
+971: 		<-release
+972: 		w.Header().Set("Content-Type", "text/event-stream")
+973: 		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+974: 	})
+975: 	c, route, r, calls := qualificationFailureLoopbackFixtureChildProvider(t, child, provider)
+976: 	done := make(chan error, 1)
+977: 	go func() { done <- c.RunAdmitted(context.Background(), route, r.run, r.lease) }()
+978: 	select {
+979: 	case <-entered:
+980: 	case <-time.After(10 * time.Second):
+981: 		t.Fatal("MODEL broker did not reach provider")
+982: 	}
+983: 	deadline := time.Now().Add(10 * time.Second)
+984: 	for {
+985: 		var locator string
+986: 		_ = r.f.db.QueryRow("SELECT journal_locator FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator)
+987: 		if locator != "" {
+988: 			raw, _ := os.ReadFile(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "bridge.json"))
+989: 			j, _ := Decode(raw)
+990: 			frames, _ := Num(j, "frames")
+991: 			if frames == 3 {
+992: 				break
+993: 			}
+994: 		}
+995: 		if time.Now().After(deadline) {
+996: 			t.Fatal("blocked MODEL did not overlap third frame")
+997: 		}
+998: 		time.Sleep(10 * time.Millisecond)
+999: 	}
+1000: 	close(release)
+1001: 	var result error
+1002: 	select {
+1003: 	case result = <-done:
+1004: 	case <-time.After(10 * time.Second):
+1005: 		t.Fatal("broker admission fence did not join admitted goroutine")
+1006: 	}
+1007: 	var typed *qualificationPreEffectRejection
+1008: 	if result == nil || errors.As(result, &typed) || calls.Load() != 1 {
+1009: 		t.Fatalf("blocked MODEL imported typed failure: %v calls=%d", result, calls.Load())
+1010: 	}
+1011: 	var status, dispatchState string
+1012: 	if err := r.f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE kind='Run' AND id=?", r.run["id"]).Scan(&status); err != nil {
+1013: 		t.Fatal(err)
+1014: 	}
+1015: 	if err := r.f.db.QueryRow("SELECT state FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&dispatchState); err != nil {
+1016: 		t.Fatal(err)
+1017: 	}
+1018: 	var closure int
+1019: 	if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&closure); err != nil {
+1020: 		t.Fatal(err)
+1021: 	}
+1022: 	if status != "RUNNING" || dispatchState != "UNKNOWN" || closure != 0 {
+1023: 		t.Fatalf("blocked MODEL broker closed: run=%s dispatch=%s closure=%d", status, dispatchState, closure)
+1024: 	}
+1025: }
+1026: 
+1027: func TestQualificationFailureClosureAtomicFaultMatrix(t *testing.T) {
+1028: 	third := "emit({sequence:3,type:'effect.request',key:subject+':tool:1',route,capability:'TOOL',payload:{name:'run_check',arguments:{}}});"
+1029: 	delayedChild := strings.Replace(qualificationDenialChild, third, "setTimeout(() => { "+third+" }, 1500);", 1)
+1030: 	if delayedChild == qualificationDenialChild {

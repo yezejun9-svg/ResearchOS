@@ -1,0 +1,62 @@
+// All identities are synthetic. These tests open only fresh fixture files;
+// none calls executeRuntimeCheck, sandbox.Start/Run/Wait, Native, SQL or HTTP.
+func TestIndependentCandidateCaptureFixedHardlinksAndLiteralNames(t *testing.T) {
+    for _, name:=range []string{"go.mod","pkg/solution_test.go"} {t.Run(name,func(t *testing.T){
+        f:=newCandidateFixture(t)
+        if err:=os.Link(filepath.Join(f.source,filepath.FromSlash(name)),filepath.Join(f.id.StagingDirectory,"fixed-alias"));err!=nil {t.Fatal(err)}
+        captureRejected(t,f)
+    })}
+    for _, name:=range []string{"",".","..","../pkg","pkg/solution.go","pkg\\solution.go","solution.go:stream","solution.go.","solution.go ","Input","C:\\temp","\\\\server\\share","NUL","input\x00suffix"} {t.Run("literal-"+domain.Digest([]byte(name))[7:15],func(t *testing.T){
+        file,err:=runtimeCaptureOpen(nil,name,false)
+        if err==nil||file!=nil {t.Fatal("nonliteral name reached parent handle")}
+    })}
+}
+func TestIndependentCandidateCaptureHeldFileDeniesWriteAndDelete(t *testing.T) {
+    f:=newCandidateFixture(t)
+    parent,err:=os.Open(filepath.Join(f.source,"pkg"));if err!=nil {t.Fatal(err)};defer parent.Close()
+    file,err:=runtimeCaptureOpen(parent,"solution.go",false);if err!=nil {t.Fatal(err)};defer file.Close()
+    original:=filepath.Join(f.source,"pkg","solution.go")
+    if err:=os.WriteFile(original,[]byte("forbidden mutation"),0600);err==nil {t.Fatal("held file did not refuse write")}
+    if err:=os.Rename(original,filepath.Join(f.source,"pkg","renamed.go"));err==nil {t.Fatal("held file did not refuse rename/delete")}
+    raw,hash,size,err:=runtimeCaptureRead(context.Background(),file,16384,true)
+    if err!=nil||!bytes.Equal(raw,[]byte(captureFixtureSource))||hash!=domain.Digest([]byte(captureFixtureSource))||size!=int64(len(captureFixtureSource)) {t.Fatal("held bytes changed",err)}
+}
+func TestIndependentCandidateCaptureLargeCreatedAndOutcome(t *testing.T) {
+    f:=newCandidateFixture(t);f.id.Created=9007199254740993
+    capture,err:=f.capture(context.Background());if err!=nil {t.Fatal(err)}
+    receipt:=f.receipt();receipt.ExitCode=125;receipt.TimedOut=true
+    evidence,err:=capture.evidence(receipt);if err!=nil {t.Fatal(err)}
+    identity:=evidence["native_identity"].(domain.Object)
+    outcome:=evidence["execution_outcome"].(domain.Object)
+    if identity["process_created_ns"]!="9007199254740993"||outcome["exit_code"]!=125||outcome["timed_out"]!=true||evidence["structural_witness"].(domain.Object)["semantic_acceptance"]!=false {t.Fatal("identity rounded or outcome promoted")}
+    receipt.Created=9007199254740992
+    if _,err:=capture.evidence(receipt);err==nil {t.Fatal("one-unit Created mismatch accepted")}
+}
+func TestIndependentCandidateCaptureEncodedEvidenceBudget(t *testing.T) {
+    f:=newCandidateFixture(t);capture,err:=f.capture(context.Background());if err!=nil {t.Fatal(err)}
+    evidence,err:=capture.evidence(f.receipt());if err!=nil {t.Fatal(err)}
+    for _, mode:=range []string{"base64","escaped"} {t.Run(mode,func(t *testing.T){
+        full:=domain.Object{}
+        if mode=="base64" {full["raw"]=make([]byte,(3<<20)-128)}else{full["raw"]=strings.Repeat("\x00",(4<<20)/6-80)}
+        if len(domain.Bytes(full))>4<<20||runtimeCheckEvidenceBound(full)!=nil {t.Fatal("independent encoded control should fit")}
+        full["candidate_capture"]=evidence
+        if len(domain.Bytes(full))<=4<<20||runtimeCheckEvidenceBound(full)==nil {t.Fatal("encoded candidate overhead was not bounded")}
+    })}
+}
+func TestIndependentCandidateCaptureFrozenPolicyAndNoFixedEncodingLeak(t *testing.T) {
+    f:=newCandidateFixture(t)
+    frozenPolicyHash:=f.policyHash
+    f.view.PolicyHash=domain.Digest([]byte("independent mutation only on actual view"))
+    if f.policyHash!=frozenPolicyHash {t.Fatal("harness changed expected value")}
+    captureRejected(t,f)
+    f=newCandidateFixture(t)
+    capture,err:=f.capture(context.Background());if err!=nil {t.Fatal(err)}
+    evidence,err:=capture.evidence(f.receipt());if err!=nil {t.Fatal(err)}
+    encoded:=domain.Bytes(evidence)
+    for _, secret:=range []string{captureFixtureMod,captureFixtureTest} {
+        if bytes.Contains(encoded,[]byte(base64.StdEncoding.EncodeToString([]byte(secret)))) {t.Fatal("fixed source leaked as base64")}
+    }
+    for _, sentinel:=range []string{"MOD_SENTINEL","FIXED_TEST_SENTINEL_NEVER_SERIALIZE"} {if bytes.Contains(encoded,[]byte(sentinel)) {t.Fatal("fixed source sentinel leaked")}}
+    captureWrite(t,filepath.Join(f.source,"go.mod"),"module fixture.invalid/NEW_FIXED_SENTINEL_MUST_NOT_LEAK\n")
+    if _,err=f.capture(context.Background());err==nil||strings.Contains(err.Error(),"NEW_FIXED_SENTINEL_MUST_NOT_LEAK") {t.Fatal("fixed drift accepted or error exposed source",err)}
+}

@@ -1,0 +1,173 @@
+func holdHistoricalQualificationNative(directory, manifestHash, modelKey, sid string,
+	source HistoricalQualificationSource) (facts historicalQualificationNative, hold *historicalQualificationHold, err error) {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory || sid == "" {
+		return facts, nil, errors.New("historical source identity required")
+	}
+	ownerPath := filepath.Join(directory, "owner.lock")
+	ownerInfo, statErr := os.Lstat(ownerPath)
+	if statErr != nil || !ownerInfo.Mode().IsRegular() {
+		return facts, nil, errors.New("historical owner lock must already exist")
+	}
+	// ReadBridgeTerminal performs the existing native terminal and process check
+	// before the durable owner lock is retained. The bytes are then reopened and
+	// compared under that lock so a race cannot authorize a different source.
+	terminal, err := rt.ReadBridgeTerminal(directory, manifestHash)
+	if err != nil {
+		return facts, nil, err
+	}
+	if modelKey == "" {
+		// Discovery does not authorize anything. The selected fact is reopened,
+		// held and checked against the complete three-frame census below.
+		stdout, readErr := os.ReadFile(filepath.Join(directory, "stdout.raw"))
+		if readErr != nil || len(stdout) == 0 || len(stdout) > 16<<20 {
+			return facts, nil, errors.New("historical model key discovery unavailable")
+		}
+		for _, line := range bytes.Split(stdout, []byte{'\n'}) {
+			var candidate rt.BridgeFrame
+			if json.Unmarshal(line, &candidate) == nil && candidate.Sequence == 2 && candidate.Type == "effect.request" && candidate.Capability == "MODEL" {
+				if modelKey != "" {
+					return facts, nil, errors.New("historical duplicate MODEL frame")
+				}
+				modelKey = candidate.Key
+			}
+		}
+		if modelKey == "" {
+			return facts, nil, errors.New("historical MODEL frame missing")
+		}
+	}
+	wide, err := windows.UTF16PtrFromString(ownerPath)
+	if err != nil {
+		return facts, nil, err
+	}
+	ownerHandle, err := windows.CreateFile(wide, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return facts, nil, errors.New("historical dispatch owner lock unavailable")
+	}
+	hold = &historicalQualificationHold{owner: os.NewFile(uintptr(ownerHandle), ownerPath)}
+	defer func() {
+		if err != nil {
+			_ = hold.Close()
+			hold = nil
+		}
+	}()
+	var ancestors []string
+	for p := directory; ; p = filepath.Dir(p) {
+		ancestors = append(ancestors, p)
+		if filepath.Dir(p) == p {
+			break
+		}
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		if _, err = hold.add(ancestors[i], true, i == 0, sid); err != nil {
+			return facts, hold, err
+		}
+	}
+	modelName := "effect-" + strings.TrimPrefix(Digest([]byte(modelKey)), "sha256:") + ".json"
+	names := []string{"bridge.json", "stdout.raw", "stderr.raw", modelName}
+	var raw [4][]byte
+	for i, name := range names {
+		f, openErr := hold.add(filepath.Join(directory, name), false, true, sid)
+		if openErr != nil {
+			err = openErr
+			return facts, hold, err
+		}
+		limit := int64(4 << 20)
+		if i == 1 || i == 2 {
+			limit = 16 << 20
+		}
+		raw[i], err = historicalNativeRead(f, limit, i == 2)
+		if err != nil {
+			return facts, hold, err
+		}
+	}
+	if err = json.Unmarshal(raw[0], &facts.journal); err != nil {
+		return facts, hold, err
+	}
+	if Hash(facts.journal) != Hash(terminal) {
+		err = errors.New("historical terminal journal raced")
+		return facts, hold, err
+	}
+	facts.bridgeHash, facts.stdoutHash, facts.stderrHash, facts.modelHash = Digest(raw[0]), Digest(raw[1]), Digest(raw[2]), Digest(raw[3])
+	facts.modelRaw = append([]byte(nil), raw[3]...)
+	if facts.bridgeHash != source.BridgeSHA256 ||
+		(source.StdoutSHA256 != "" && facts.stdoutHash != source.StdoutSHA256) ||
+		(source.StderrSHA256 != "" && facts.stderrHash != source.StderrSHA256) ||
+		manifestHash != source.ManifestHash {
+		err = errors.New("historical frozen raw hash differs")
+		return facts, hold, err
+	}
+	if _, err = hold.add(filepath.Join(directory, "input"), true, true, sid); err != nil {
+		return facts, hold, err
+	}
+	for _, input := range []struct {
+		name, expected string
+		size           int64
+	}{
+		{"worker.exe", source.WorkerSHA256, 128 << 20},
+		{"mu-worker.mjs", source.BundleSHA256, 32 << 20},
+		{"worker.json", source.WorkerConfigSHA256, 64 << 10},
+		{"request.json", source.RequestSHA256, 64 << 10},
+	} {
+		f, openErr := hold.add(filepath.Join(directory, "input", input.name), false, true, sid)
+		if openErr != nil {
+			err = openErr
+			return facts, hold, err
+		}
+		if err = hashHistoricalNative(f, input.size, input.expected); err != nil {
+			return facts, hold, err
+		}
+	}
+	if facts.stdoutHash != terminal.StdoutHash || facts.stderrHash != terminal.StderrHash || terminal.Frames != 3 || terminal.Acknowledged != 2 || terminal.QueueRequired || terminal.QueueInitSequence != 0 || len(terminal.CommandReceipts) != 0 || terminal.Checkpoint != nil || terminal.CheckpointSequence != 0 || terminal.Paused || terminal.ProtocolComplete || !terminal.Receipt.Stopped || !terminal.Receipt.StreamsDrained || !terminal.Receipt.CleanupComplete || !terminal.Receipt.OutputCopied || len(terminal.Artifacts) != 0 {
+		err = errors.New("historical raw terminal classification differs")
+		return facts, hold, err
+	}
+	var lines [][]byte
+	for _, line := range bytes.Split(raw[1], []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		if len(line) > 64<<10 {
+			err = errors.New("historical frame too large")
+			return facts, hold, err
+		}
+		canonicalLine, canonErr := canonical.JSON(line)
+		if canonErr != nil {
+			err = canonErr
+			return facts, hold, err
+		}
+		var shape map[string]json.RawMessage
+		if json.Unmarshal(canonicalLine, &shape) != nil || shape["version"] != nil {
+			err = errors.New("historical auxiliary or invalid stdout frame")
+			return facts, hold, err
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) != 3 {
+		err = fmt.Errorf("historical frame count %d", len(lines))
+		return facts, hold, err
+	}
+	for i, line := range lines {
+		if err = json.Unmarshal(line, &facts.frames[i]); err != nil || facts.frames[i].Sequence != int64(i+1) {
+			return facts, hold, errors.New("historical frame order invalid")
+		}
+	}
+	if facts.frames[0].Type != "context.ready" || facts.frames[1].Type != "effect.request" || facts.frames[1].Capability != "MODEL" || facts.frames[2].Type != "effect.request" || facts.frames[2].Capability != "TOOL" || facts.frames[1].Key == "" || facts.frames[2].Key == "" || facts.frames[1].Key == facts.frames[2].Key || facts.frames[1].Route != facts.frames[2].Route {
+		err = errors.New("historical first-gate frame grammar invalid")
+		return facts, hold, err
+	}
+	if facts.frames[1].Key != modelKey {
+		err = errors.New("historical model fact key differs")
+		return facts, hold, err
+	}
+	if err = hold.Check(); err != nil {
+		return facts, hold, err
+	}
+	return facts, hold, nil
+}
+
+// A source-derived historical closure has its own marker namespace and holds
+// all original bytes through the caller's actual Commit or Rollback return.
+type historicalQualificationClosure struct {
+	proof Object
+	hold  *historicalQualificationHold
+}

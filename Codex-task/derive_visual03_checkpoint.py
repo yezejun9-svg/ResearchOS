@@ -1,0 +1,11 @@
+from pathlib import Path
+p=Path(__file__).resolve().parent/'record_product_v1_visual03_registration.py';assert not p.exists();b=p.with_name('record_product_v1_visual02_registration.py').read_bytes()
+for x,y in [(b'cp657',b'cp662'),(b'revision=657',b'revision=662'),(b'previous_revision=656',b'previous_revision=661'),(b"cp['revision']==656",b"cp['revision']==661"),(b"len(cp['failure_counters'])==2561",b"len(cp['failure_counters'])>=2567"),(b'visual-02',b'visual-03'),(b'visual02',b'visual03'),(b'BUILD09',b'BUILD10'),(b'VISUAL02',b'VISUAL03'),(b'CP657',b'CP662')]:
+ assert x in b,x;b=b.replace(x,y)
+x=b"Separately Root may register one corrected MXC no-model local echo attempt2 under same original diagnostic origin, changing only target CMD path separators after independent source review; preserve consumed04 failure. No model replay, permission relaxation/admin/setup/saved config change."
+y=b"Record initial main-area/document/transcript all scroll0 and real ancestor overflow clips; do not waive any old geometry, visibility or after-scroll hit/focus gate. No fake banners or DOM. MXC startup-only diagnosis is already complete2/2; no further echo/model replay, permission relaxation/admin/setup/saved config change.";assert x in b;b=b.replace(x,y)
+x=b"MXC no-model path-only diagnostic correction may be registered separately after review, same-origin attempt2; original04/model failure history intact."
+y=b"MXC fixed local startup diagnosis complete2/2, fine-grained permissions/model remain unverified; no additional echo or model replay. Original04/model failure history intact.";assert x in b;b=b.replace(x,y)
+x=b"OUT.mkdir();(OUT/'checkpoint.before.json').write_bytes(raw);(OUT/'visual03.scope.json').write_bytes(scope.read_bytes());now=datetime.now(timezone.utc).isoformat()"
+y=x+b"\nold_records=list(cp['failure_counters']);known={e.get('origin_key') for e in old_records}\nfor e in rv.get('diagnostic_events',[]):\n assert e.get('origin_key') and e.get('classification')\n if e['origin_key'] not in known:cp['failure_counters'].append({'at':now,'attempts':1,'counter_reset':False,**e});known.add(e['origin_key'])\nassert cp['failure_counters'][:len(old_records)]==old_records";assert x in b;b=b.replace(x,y)
+p.write_bytes(b);compile(b,str(p),'exec');print(p)

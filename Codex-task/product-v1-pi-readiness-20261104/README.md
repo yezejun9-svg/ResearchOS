@@ -1,0 +1,15 @@
+# Pi0.99.2 readonly preparation
+
+This is public-package/source readiness only. No ResearchOS Pi adapter is implemented or authorized here. Root must finish the single-Harness real loop, then register the later S07/S08 scope and shared contract. UI freeze02 stays unchanged. Product/formal increment0.
+
+The actual global package is @earendil-works/pi-coding-agent0.99.2. Its CLI shim points to dist/bundle/cli.js. All22 direct dependency package metadata files exist;71 public bundle JavaScript files total9,319,400 bytes. Six existing project Pi source pins match. The package and README declare MIT. No top-level LICENSE/NOTICE/COPYING file was present; complete distribution notices and transitive licensing have not been verified.
+
+No Pi --help/--version/auth/RPC command was run. Public installed help/source were read instead: main creates SettingsManager and performs cleanup before --version exits, while --help is reached after runtime/extension loading. An auth check --no-refresh status command exists and defaults to non-secret output, but it still accesses native model/auth configuration. No provider or zero-side-effect status execution was established in this read-only preparation, so authentication stays UNVERIFIED. Credential-printing commands and --credentials are forbidden.
+
+RPC uses LF-delimited JSON responses and asynchronous events. A prompt response started/queued/handled describes disposition, not completion. A handled prompt may produce no Run. agent_end can precede more automatic work; agent_settled is the native session-level idle boundary, not owned Windows process/stream cleanup proof. Full stop clears queues before abort, then verifies native idle and the Host's exact owned cleanup. Do not project thinking events or unredacted native configuration.
+
+The read tool explicitly accepts absolute paths and home expansion. A read/grep/find/ls allowlist therefore does not prove a filesystem/secret boundary. A first review could use no tools over Host-bound fixed candidate/check text, subject to Root's platform-policy and startup-state review. No-session only changes conversation persistence. RPC auto-retry/compaction setters save SettingsManager/global settings; they are not an assumed harmless handshake.
+
+interface-draft.json gives the source-derived internal mapping, not a new frozen outer API. The current /harness/v1 revision2 has harness_id const=codex and needs a Root-owned versioned change before Pi. acceptance-recipes.json separates static metadata, a conditional future auth-status command, proposed future launch flags, pure fixture cases and separately authorized real J10/J11/Windows checks. No multi-model Pi SDK or ResearchOS vendor0.87.1 is counted as a second Harness.
+
+readiness.json is the machine summary; public-inventory.json and public-source-excerpts.json bind the local sources. EVIDENCE_MANIFEST.json pins the small C deliverable. No user auth/config secrets were read or copied, no D source changed, no Qoder/new session/install/model/API or old probe was used.

@@ -1,0 +1,728 @@
+diff --git a/internal/ownedcorestop/journal_windows_test.go b/internal/ownedcorestop/journal_windows_test.go
+index 815655b6..a04cfa96 100644
+--- a/internal/ownedcorestop/journal_windows_test.go
++++ b/internal/ownedcorestop/journal_windows_test.go
+@@ -3,10 +3,12 @@
+ package ownedcorestop
+ 
+ import (
++	"context"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"researchos.local/research-os/internal/host"
+ 	"researchos.local/research-os/internal/store"
+@@ -136,6 +138,18 @@ func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	check("UNKNOWN") // before/after native call without durable wait proof
++	boundaryGrant := operationGrant{AllowedActions: []string{"commit"}, notBefore: time.Now().Add(-time.Minute), expires: time.Now().Add(time.Minute)}
++	canceled, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := checkCommitSignalBoundary(canceled, boundaryGrant); err != context.Canceled {
++		t.Fatalf("cancellation after durable intent was ignored: %v", err)
++	}
++	check("UNKNOWN") // consumed intent remains, including after cancellation
++	boundaryGrant.expires = time.Now().Add(-time.Second)
++	if err := checkCommitSignalBoundary(context.Background(), boundaryGrant); err == nil {
++		t.Fatal("grant expiry after durable intent was ignored")
++	}
++	check("UNKNOWN") // expired grant cannot refund consumed intent
+ 	nativeExit := supervisor.OwnedCoreNativeExit{TerminateCalls: 1, ExitObserved: true, ExitCode: supervisor.OwnedCoreMaintenanceExitCode}
+ 	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{Schema: "researchos.owned-core-stop-native-exit.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: nativeExit}); err != nil {
+ 		t.Fatal(err)
+diff --git a/internal/ownedcorestop/proof_windows.go b/internal/ownedcorestop/proof_windows.go
+index b0f40a34..b94b5e00 100644
+--- a/internal/ownedcorestop/proof_windows.go
++++ b/internal/ownedcorestop/proof_windows.go
+@@ -155,9 +155,9 @@ type historicalEvidence struct {
+ 	RawSHA256                map[string]string      `json:"raw_sha256"`
+ 	NativePID                uint32                 `json:"native_pid,omitempty"`
+ 	NativeCreatedNS          int64                  `json:"native_created_ns,omitempty"`
+-	NativeExitCode           uint32                 `json:"native_exit_code,omitempty"`
++	NativeExitCode           *uint32                `json:"native_exit_code,omitempty"`
+ 	NativeWaitAPI            string                 `json:"native_wait_api,omitempty"`
+-	NativeWaitResult         uint32                 `json:"native_wait_result,omitempty"`
++	NativeWaitResult         *uint32                `json:"native_wait_result,omitempty"`
+ 	NativeExitAPI            string                 `json:"native_exit_api,omitempty"`
+ 	NativeHandleRecordSHA256 string                 `json:"native_handle_record_sha256,omitempty"`
+ 	BaselineSHA256           string                 `json:"baseline_sha256,omitempty"`
+@@ -237,6 +237,13 @@ func proofNeeds(kind string) []string {
+ 	}
+ }
+ 
++func nativeExitEvidenceComplete(receipt historicalEvidence, corePID uint32) bool {
++	return receipt.NativePID != 0 && receipt.NativePID != corePID && receipt.NativeCreatedNS != 0 &&
++		receipt.NativeWaitAPI == "WaitForSingleObject" && receipt.NativeWaitResult != nil && *receipt.NativeWaitResult == 0 &&
++		receipt.NativeExitAPI == "GetExitCodeProcess" && receipt.NativeExitCode != nil &&
++		validSHA(receipt.NativeHandleRecordSHA256)
++}
++
+ func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []string) {
+ 	missing := []string{}
+ 	refs := map[string]EvidenceRef{}
+@@ -283,7 +290,7 @@ func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []st
+ 		if kind == "worker_native_exit" || kind == "verifier_native_exit" {
+ 			// An ignored cmd.Wait error, a PID-list absence, or an assumed exit 0
+ 			// cannot satisfy this typed original OS wait and numeric-exit receipt.
+-			if receipt.NativePID == 0 || receipt.NativePID == plan.Native.PID || receipt.NativeCreatedNS == 0 || receipt.NativeWaitAPI != "WaitForSingleObject" || receipt.NativeWaitResult != 0 || receipt.NativeExitAPI != "GetExitCodeProcess" || !validSHA(receipt.NativeHandleRecordSHA256) {
++			if !nativeExitEvidenceComplete(receipt, plan.Native.PID) {
+ 				missing = append(missing, kind+": captured exact OS wait/exit/handle identity absent")
+ 			}
+ 		}
+diff --git a/internal/ownedcorestop/proof_windows_test.go b/internal/ownedcorestop/proof_windows_test.go
+index 69863638..d3e3c405 100644
+--- a/internal/ownedcorestop/proof_windows_test.go
++++ b/internal/ownedcorestop/proof_windows_test.go
+@@ -103,3 +103,55 @@ func TestOwnedCoreStopCallerReviewCannotOmitExactScope(t *testing.T) {
+ 		t.Fatal("non-independent review path accepted")
+ 	}
+ }
++
++func TestNativeExitProofRequiresExplicitNumericCapturePerClass(t *testing.T) {
++	sha := strings.Repeat("a", 64)
++	for _, kind := range []string{"worker_native_exit", "verifier_native_exit"} {
++		for _, tc := range []struct {
++			name  string
++			field string
++			value any
++			omit  bool
++			want  bool
++		}{
++			{"explicit exit zero", "native_exit_code", 0, false, true},
++			{"explicit exit nonzero", "native_exit_code", 137, false, true},
++			{"missing exit", "native_exit_code", nil, true, false},
++			{"null exit", "native_exit_code", nil, false, false},
++			{"negative exit", "native_exit_code", -1, false, false},
++			{"overflow exit", "native_exit_code", int64(1) << 32, false, false},
++			{"fractional exit", "native_exit_code", 0.5, false, false},
++			{"explicit wait zero", "native_wait_result", 0, false, true},
++			{"missing wait", "native_wait_result", nil, true, false},
++			{"null wait", "native_wait_result", nil, false, false},
++			{"nonzero wait", "native_wait_result", 258, false, false},
++			{"negative wait", "native_wait_result", -1, false, false},
++			{"overflow wait", "native_wait_result", int64(1) << 32, false, false},
++			{"fractional wait", "native_wait_result", 0.5, false, false},
++		} {
++			t.Run(kind+"/"+tc.name, func(t *testing.T) {
++				fields := map[string]any{
++					"kind": kind, "native_pid": 8, "native_created_ns": 123,
++					"native_wait_api": "WaitForSingleObject", "native_wait_result": 0,
++					"native_exit_api": "GetExitCodeProcess", "native_exit_code": 0,
++					"native_handle_record_sha256": sha,
++				}
++				if tc.omit {
++					delete(fields, tc.field)
++				} else {
++					fields[tc.field] = tc.value
++				}
++				raw, err := json.Marshal(fields)
++				if err != nil {
++					t.Fatal(err)
++				}
++				var proof historicalEvidence
++				err = decodeCanonicalAuthority(raw, &proof)
++				got := err == nil && nativeExitEvidenceComplete(proof, 9)
++				if got != tc.want {
++					t.Fatalf("native proof %s accepted=%v want=%v decode=%v: %s", tc.name, got, tc.want, err, raw)
++				}
++			})
++		}
++	}
++}
+diff --git a/internal/ownedcorestop/stop_windows.go b/internal/ownedcorestop/stop_windows.go
+index 80b91450..a5d2afe0 100644
+--- a/internal/ownedcorestop/stop_windows.go
++++ b/internal/ownedcorestop/stop_windows.go
+@@ -175,6 +175,16 @@ func persistStopResult(plan Plan, result Result) (Result, error) {
+ 	return result, err
+ }
+ 
++func checkCommitSignalBoundary(ctx context.Context, g operationGrant) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if _, err := g.checkAction("commit", true); err != nil {
++		return err
++	}
++	return ctx.Err()
++}
++
+ // Commit has no force flag. An exact independent evidence review and a later
+ // exact root operation plan review must already exist in the verifier namespace.
+ // This card does not produce either review and grants no current-Core action.
+@@ -192,6 +202,11 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
+ 	}
+ 	ctx, cancel := context.WithDeadline(ctx, deadline)
+ 	defer cancel()
++	// WithDeadline retains an earlier caller deadline. Keep this original
++	// monotonic boundary through all waits and the final native signal.
++	if earlier, ok := ctx.Deadline(); ok && earlier.Before(deadline) {
++		deadline = earlier
++	}
+ 	lock, err := acquireOperationLock(g, false)
+ 	if err != nil {
+ 		return Result{}, err
+@@ -282,8 +297,8 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
+ 	if err != nil || authority != p.Host {
+ 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current Host/Owner/database identity differs"))
+ 	}
+-	if _, err = g.checkAction("commit", true); err != nil {
+-		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "grant expired before native intent"))
++	if err = checkCommitSignalBoundary(ctx, g); err != nil {
++		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "caller/grant unavailable before native intent: "+err.Error()))
+ 	}
+ 	if _, err = writeOwnedJournal(p.OutputDir, "TERMINATE_INTENT.json", struct {
+ 		Schema, OperationID, PlanSHA256, GrantSHA256 string
+@@ -291,10 +306,10 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
+ 	}{"researchos.owned-core-stop-terminate-intent.v1", p.OperationID, planSHA, g.digest, p.Native}); err != nil {
+ 		return Result{}, err
+ 	}
+-	if _, err = g.checkAction("commit", true); err != nil {
+-		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "grant expired after durable intent; zero signal"))
++	if err = checkCommitSignalBoundary(ctx, g); err != nil {
++		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "caller/grant unavailable after durable intent; zero signal: "+err.Error()))
+ 	}
+-	exit, nativeErr := h.TerminateOnceAndWaitUntil(15*time.Second, deadline, g.expires)
++	exit, nativeErr := h.TerminateOnceAndWaitUntilContext(ctx, 15*time.Second, deadline, g.expires)
+ 	if nativeErr != nil {
+ 		result := stopResult(p, planSHA, "UNKNOWN", fmt.Sprintf("single native attempt or wait unknown: %v", nativeErr))
+ 		result.Native = &exit
+diff --git a/internal/ownedcorestop/stop_windows_test.go b/internal/ownedcorestop/stop_windows_test.go
+index 2459d33a..f2bc096c 100644
+--- a/internal/ownedcorestop/stop_windows_test.go
++++ b/internal/ownedcorestop/stop_windows_test.go
+@@ -144,3 +144,21 @@ func TestOwnedCoreStopInvalidPreflightNeverCreatesOutput(t *testing.T) {
+ 		t.Fatalf("invalid preflight created output: %v", err)
+ 	}
+ }
++
++func TestCommitSignalBoundaryHonorsCallerCancellationAndEarlierDeadline(t *testing.T) {
++	now := time.Now()
++	g := operationGrant{AllowedActions: []string{"commit"}, notBefore: now.Add(-time.Minute), expires: now.Add(time.Minute)}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := checkCommitSignalBoundary(ctx, g); err != context.Canceled {
++		t.Fatalf("canceled caller reached intent: %v", err)
++	}
++	ctx, cancel = context.WithDeadline(context.Background(), now.Add(-time.Second))
++	defer cancel()
++	if err := checkCommitSignalBoundary(ctx, g); err != context.DeadlineExceeded {
++		t.Fatalf("earlier caller deadline reached intent: %v", err)
++	}
++	if err := checkCommitSignalBoundary(context.Background(), g); err != nil {
++		t.Fatalf("valid caller/grant denied: %v", err)
++	}
++}
+diff --git a/ops/supervisor/owned_core_handle_windows.go b/ops/supervisor/owned_core_handle_windows.go
+index 634de4e7..abfbde25 100644
+--- a/ops/supervisor/owned_core_handle_windows.go
++++ b/ops/supervisor/owned_core_handle_windows.go
+@@ -3,6 +3,7 @@
+ package supervisor
+ 
+ import (
++	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"errors"
+@@ -39,7 +40,7 @@ type OwnedCoreNativeIdentity struct {
+ 
+ type ownedNativeProcess struct {
+ 	handle  windows.Handle
+-	image   *os.File
++	image   *ownedImageFile
+ 	path    string
+ 	created int64
+ 	sid     string
+@@ -48,9 +49,37 @@ type ownedNativeProcess struct {
+ 	index   uint64
+ }
+ 
++type ownedImageAnchor struct {
++	handle   windows.Handle
++	volume   uint32
++	index    uint64
++	security string
++}
++
++type ownedImageFile struct {
++	file      *os.File
++	ancestors []ownedImageAnchor
++	final     ownedImageAnchor
++	sha       string
++}
++
++func (im *ownedImageFile) Close() {
++	if im == nil {
++		return
++	}
++	if im.file != nil {
++		_ = im.file.Close()
++		im.file = nil
++	}
++	for i := len(im.ancestors) - 1; i >= 0; i-- {
++		_ = windows.CloseHandle(im.ancestors[i].handle)
++	}
++	im.ancestors = nil
++}
++
+ func (p *ownedNativeProcess) close() {
+ 	if p.image != nil {
+-		_ = p.image.Close()
++		p.image.Close()
+ 		p.image = nil
+ 	}
+ 	if p.handle != 0 {
+@@ -66,51 +95,104 @@ func ownedNativePath(h windows.Handle) (string, error) {
+ 		return "", err
+ 	}
+ 	path := windows.UTF16ToString(buf[:size])
+-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") || !strings.EqualFold(filepath.Ext(path), ".exe") {
+ 		return "", errors.New("canonical executable path required")
+ 	}
+-	actual, err := filepath.EvalSymlinks(path)
+-	if err != nil || !strings.EqualFold(actual, path) {
+-		return "", errors.New("executable path reparse rejected")
+-	}
+ 	return path, nil
+ }
+ 
+-func ownedNativeImage(path string) (*os.File, string, uint32, uint64, error) {
+-	wide, err := windows.UTF16PtrFromString(path)
+-	if err != nil {
+-		return nil, "", 0, 0, err
++func observeOwnedImageAnchor(h windows.Handle, directory bool) (ownedImageAnchor, windows.ByHandleFileInformation, error) {
++	var info windows.ByHandleFileInformation
++	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
++		return ownedImageAnchor{}, info, err
+ 	}
+-	h, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+-	if err != nil {
+-		return nil, "", 0, 0, err
++	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory || info.VolumeSerialNumber == 0 || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) == 0 || (!directory && info.NumberOfLinks != 1) {
++		return ownedImageAnchor{}, info, errors.New("image ancestor reparse/alias/native identity rejected")
+ 	}
+-	f := os.NewFile(uintptr(h), path)
+-	var before windows.ByHandleFileInformation
+-	if err = windows.GetFileInformationByHandle(h, &before); err != nil {
+-		f.Close()
+-		return nil, "", 0, 0, err
++	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
++	if err != nil || sd == nil || !sd.IsValid() {
++		return ownedImageAnchor{}, info, errors.New("image native security descriptor unavailable")
+ 	}
+-	if before.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || before.NumberOfLinks != 1 || before.FileSizeHigh != 0 || before.FileSizeLow > 256<<20 {
+-		f.Close()
+-		return nil, "", 0, 0, errors.New("image reparse/alias/size rejected")
++	owner, _, err := sd.Owner()
++	if err != nil || owner == nil || !owner.IsValid() {
++		return ownedImageAnchor{}, info, errors.New("image ancestor owner unavailable")
+ 	}
+-	hash := sha256.New()
+-	n, err := io.Copy(hash, io.LimitReader(f, 256<<20+1))
+-	if err != nil {
+-		f.Close()
+-		return nil, "", 0, 0, err
++	acl, _, err := sd.DACL()
++	if err != nil || acl == nil || acl.AceCount == 0 {
++		return ownedImageAnchor{}, info, errors.New("image ancestor DACL unavailable")
+ 	}
+-	var after windows.ByHandleFileInformation
+-	if err = windows.GetFileInformationByHandle(h, &after); err != nil {
+-		f.Close()
+-		return nil, "", 0, 0, err
++	security := sd.String()
++	if security == "" {
++		return ownedImageAnchor{}, info, errors.New("image ancestor owner/DACL serialization unavailable")
+ 	}
+-	if n != int64(before.FileSizeLow) || before.VolumeSerialNumber != after.VolumeSerialNumber || before.FileIndexHigh != after.FileIndexHigh || before.FileIndexLow != after.FileIndexLow || before.FileSizeLow != after.FileSizeLow || before.LastWriteTime != after.LastWriteTime {
+-		f.Close()
+-		return nil, "", 0, 0, errors.New("image changed during retained read")
++	return ownedImageAnchor{handle: h, volume: info.VolumeSerialNumber, index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), security: security}, info, nil
++}
++
++func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
++	image := &ownedImageFile{}
++	defer func() {
++		if err != nil {
++			image.Close()
++		}
++	}()
++	volume := filepath.VolumeName(path)
++	current := volume + string(filepath.Separator)
++	parts := strings.Split(strings.TrimPrefix(path[len(volume):], string(filepath.Separator)), string(filepath.Separator))
++	paths := []string{current}
++	for _, part := range parts {
++		if part == "" || part == "." || part == ".." {
++			return nil, errors.New("noncanonical image path component")
++		}
++		current = filepath.Join(current, part)
++		paths = append(paths, current)
++	}
++	for i, name := range paths {
++		last := i == len(paths)-1
++		wide, e := windows.UTF16PtrFromString(name)
++		if e != nil {
++			return nil, e
++		}
++		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
++		share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
++		if last {
++			access = windows.GENERIC_READ | windows.READ_CONTROL
++			share = windows.FILE_SHARE_READ
++		}
++		h, e := windows.CreateFile(wide, access, share, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
++		if e != nil {
++			return nil, e
++		}
++		anchor, info, e := observeOwnedImageAnchor(h, !last)
++		if e != nil {
++			_ = windows.CloseHandle(h)
++			return nil, e
++		}
++		if last {
++			if info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > 256<<20 {
++				_ = windows.CloseHandle(h)
++				return nil, errors.New("bounded image size required")
++			}
++			image.final = anchor
++			image.file = os.NewFile(uintptr(h), name)
++			hash := sha256.New()
++			var n int64
++			n, err = io.Copy(hash, io.LimitReader(image.file, 256<<20+1))
++			if err != nil {
++				return nil, err
++			}
++			var after windows.ByHandleFileInformation
++			if err = windows.GetFileInformationByHandle(h, &after); err != nil {
++				return nil, err
++			}
++			if n != int64(info.FileSizeLow) || info.VolumeSerialNumber != after.VolumeSerialNumber || info.FileIndexHigh != after.FileIndexHigh || info.FileIndexLow != after.FileIndexLow || info.FileSizeLow != after.FileSizeLow || info.LastWriteTime != after.LastWriteTime {
++				return nil, errors.New("image changed during retained read")
++			}
++			image.sha = hex.EncodeToString(hash.Sum(nil))
++		} else {
++			image.ancestors = append(image.ancestors, anchor)
++		}
+ 	}
+-	return f, hex.EncodeToString(hash.Sum(nil)), before.VolumeSerialNumber, uint64(before.FileIndexHigh)<<32 | uint64(before.FileIndexLow), nil
++	return image, nil
+ }
+ 
+ func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err error) {
+@@ -138,7 +220,10 @@ func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err e
+ 	if p.path, err = ownedNativePath(h); err != nil {
+ 		return p, err
+ 	}
+-	p.image, p.sha, p.volume, p.index, err = ownedNativeImage(p.path)
++	p.image, err = ownedNativeImage(p.path)
++	if err == nil {
++		p.sha, p.volume, p.index = p.image.sha, p.image.final.volume, p.image.final.index
++	}
+ 	return p, err
+ }
+ 
+@@ -277,6 +362,23 @@ func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
+ 	return h.identity
+ }
+ 
++func verifyOwnedImageFile(image *ownedImageFile, volume uint32, index uint64) error {
++	if image == nil || image.file == nil || image.final.volume != volume || image.final.index != index {
++		return errors.New("retained image identity absent")
++	}
++	for _, original := range image.ancestors {
++		current, _, err := observeOwnedImageAnchor(original.handle, true)
++		if err != nil || current.volume != original.volume || current.index != original.index || current.security != original.security {
++			return errors.New("retained image ancestor identity/ACL changed")
++		}
++	}
++	current, _, err := observeOwnedImageAnchor(windows.Handle(image.file.Fd()), false)
++	if err != nil || current.volume != image.final.volume || current.index != image.final.index || current.security != image.final.security {
++		return errors.New("retained image file identity/ACL changed")
++	}
++	return nil
++}
++
+ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+ 	if h == nil || h.closed || h.core.handle == 0 {
+ 		return errors.New("native handle closed")
+@@ -289,10 +391,10 @@ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+ 	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
+ 		return errors.New("retained process creation changed")
+ 	}
+-	// File share mode prevents replacement while the retained image is open.
+-	var info windows.ByHandleFileInformation
+-	if err = windows.GetFileInformationByHandle(windows.Handle(h.core.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ImageIndex {
+-		return errors.New("retained image file changed")
++	// Every path component remains open without delete sharing. The final image
++	// also denies write sharing; identity and security are rechecked by handle.
++	if err = verifyOwnedImageFile(h.core.image, h.identity.ImageVolume, h.identity.ImageIndex); err != nil {
++		return err
+ 	}
+ 	parentPID, err := windows.GetProcessId(h.parent.handle)
+ 	if err != nil || parentPID != h.identity.ParentPID {
+@@ -305,8 +407,8 @@ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+ 	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+ 		return errors.New("retained parent no longer live")
+ 	}
+-	if err = windows.GetFileInformationByHandle(windows.Handle(h.parent.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ParentImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ParentImageIndex {
+-		return errors.New("retained parent image changed")
++	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
++		return err
+ 	}
+ 	return nil
+ }
+@@ -335,10 +437,23 @@ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (O
+ // A failed deadline check returns with zero TerminateProcess calls; the caller's
+ // already-durable intent remains consumed.
+ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
++	return h.TerminateOnceAndWaitUntilContext(context.Background(), timeout, invocationDeadline, wallExpiry)
++}
++
++func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntilContext(ctx context.Context, timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+ 	var out OwnedCoreNativeExit
++	if ctx == nil {
++		return out, errors.New("caller context required")
++	}
+ 	if timeout <= 0 || timeout > 30*time.Second {
+ 		return out, errors.New("bounded native wait required")
+ 	}
++	if earlier, ok := ctx.Deadline(); ok && earlier.Before(invocationDeadline) {
++		invocationDeadline = earlier
++	}
++	if err := ctx.Err(); err != nil {
++		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
++	}
+ 	if err := h.verifyRetained(); err != nil {
+ 		return out, err
+ 	}
+@@ -360,8 +475,14 @@ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duratio
+ 	if status != uint32(windows.WAIT_TIMEOUT) {
+ 		return out, fmt.Errorf("unexpected native wait status %d", status)
+ 	}
++	if err := ctx.Err(); err != nil {
++		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
++	}
+ 	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+-		return out, errors.New("grant expired before native signal")
++		return out, errors.New("invocation or grant expired before native signal")
++	}
++	if err := ctx.Err(); err != nil {
++		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+ 	}
+ 	h.terminateCalls = 1
+ 	out.TerminateCalls = 1
+diff --git a/ops/supervisor/owned_core_handle_windows_test.go b/ops/supervisor/owned_core_handle_windows_test.go
+index dfecc2d7..4002e4b2 100644
+--- a/ops/supervisor/owned_core_handle_windows_test.go
++++ b/ops/supervisor/owned_core_handle_windows_test.go
+@@ -3,9 +3,13 @@
+ package supervisor
+ 
+ import (
++	"context"
+ 	"errors"
++	"io"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -20,6 +24,132 @@ func TestOwnedCoreFixtureChild(t *testing.T) {
+ 	time.Sleep(12 * time.Second)
+ }
+ 
++func TestOwnedCoreFixtureParent(t *testing.T) {
++	if os.Getenv("RESEARCHOS_OWNED_PARENT_CHILD") != "yes" {
++		return
++	}
++	cmd := exec.Command(os.Args[0], "-test.run=^TestOwnedCoreFixtureChild$")
++	cmd.Env = append(os.Environ(), "RESEARCHOS_OWNED_CORE_CHILD=yes")
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
++	if err := os.WriteFile(os.Getenv("RESEARCHOS_OWNED_CHILD_PID_FILE"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(12 * time.Second)
++}
++
++func TestOwnedCoreAndParentImageAncestorsRetained(t *testing.T) {
++	base := t.TempDir()
++	imageDir := filepath.Join(base, "image", "nested")
++	if err := os.MkdirAll(imageDir, 0700); err != nil {
++		t.Fatal(err)
++	}
++	source, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	input, err := os.Open(source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer input.Close()
++	copyPath := filepath.Join(imageDir, "parent.exe")
++	output, err := os.Create(copyPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = io.Copy(output, input); err != nil {
++		output.Close()
++		t.Fatal(err)
++	}
++	if err = output.Close(); err != nil {
++		t.Fatal(err)
++	}
++	alias := filepath.Join(imageDir, "alias.exe")
++	if err = os.Link(copyPath, alias); err != nil {
++		t.Fatalf("new fixture hardlink cut unavailable: %v", err)
++	}
++	if image, e := ownedNativeImage(copyPath); e == nil {
++		image.Close()
++		t.Fatal("hardlink image alias accepted")
++	}
++	if err = os.Remove(alias); err != nil {
++		t.Fatal(err)
++	}
++	linkDir := filepath.Join(base, "image-link")
++	if err = os.Symlink(imageDir, linkDir); err != nil {
++		if output, e := exec.Command("cmd", "/c", "mklink", "/J", linkDir, imageDir).CombinedOutput(); e != nil {
++			t.Logf("REPARSE_CUT_UNAVAILABLE symlink=%v junction=%v output=%q", err, e, output)
++		} else {
++			err = nil
++		}
++	}
++	if err == nil {
++		if image, e := ownedNativeImage(filepath.Join(linkDir, "parent.exe")); e == nil {
++			image.Close()
++			t.Fatal("reparse image ancestor accepted")
++		}
++	}
++	pidFile := filepath.Join(base, "child.pid")
++	parent := exec.Command(copyPath, "-test.run=^TestOwnedCoreFixtureParent$")
++	parent.Env = append(os.Environ(), "RESEARCHOS_OWNED_PARENT_CHILD=yes", "RESEARCHOS_OWNED_CHILD_PID_FILE="+pidFile)
++	if err = parent.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = parent.Process.Kill(); _ = parent.Wait() }()
++	var childPID uint64
++	for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
++		if raw, e := os.ReadFile(pidFile); e == nil {
++			childPID, err = strconv.ParseUint(string(raw), 10, 32)
++			if err != nil {
++				t.Fatal(err)
++			}
++			break
++		}
++	}
++	if childPID == 0 {
++		t.Fatal("owned fixture child PID unavailable")
++	}
++	childProcess, err := os.FindProcess(int(childPID))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer childProcess.Kill()
++	id, err := ObserveOwnedCoreReadOnly(uint32(childPID))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if id.ParentPID != uint32(parent.Process.Pid) || id.ImagePath != copyPath || id.ParentImagePath != copyPath {
++		t.Fatalf("actual Core/parent fixture images differ: %+v", id)
++	}
++	h, err := OpenOwnedCoreRetained(id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++	if len(h.core.image.ancestors) < 2 || len(h.parent.image.ancestors) < 2 || h.core.image.final.index != id.ImageIndex || h.parent.image.final.index != id.ParentImageIndex {
++		t.Fatal("Core and parent image ancestors were not retained")
++	}
++	if err = os.Rename(imageDir, filepath.Join(base, "swapped")); err == nil {
++		t.Fatal("retained image ancestor allowed directory swap")
++	}
++	if file, e := os.OpenFile(copyPath, os.O_WRONLY, 0); e == nil {
++		file.Close()
++		t.Fatal("retained image allowed write-sharing")
++	}
++	wrong := id
++	wrong.ParentCreatedNS++
++	if other, e := OpenOwnedCoreRetained(wrong); e == nil {
++		other.Close()
++		t.Fatal("wrong parent identity accepted")
++	}
++	if err = h.verifyRetained(); err != nil {
++		t.Fatal(err)
++	}
++}
++
+ func TestOwnedCoreTerminateFailureIsSingleUnknownAttempt(t *testing.T) {
+ 	core := ownedCoreChild(t)
+ 	defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+@@ -99,6 +229,57 @@ func TestOwnedCoreExpiredGrantBoundaryMakesZeroNativeCalls(t *testing.T) {
+ 	}
+ }
+ 
++func TestOwnedCoreCallerCancellationAtFinalNativeBoundary(t *testing.T) {
++	for _, mode := range []string{"already canceled", "earlier caller deadline", "canceled by prewait"} {
++		t.Run(mode, func(t *testing.T) {
++			core := ownedCoreChild(t)
++			defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
++			id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
++			if err != nil {
++				t.Fatal(err)
++			}
++			h, err := OpenOwnedCoreRetained(id)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer h.Close()
++			ctx, cancel := context.WithCancel(context.Background())
++			if mode == "earlier caller deadline" {
++				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(10*time.Millisecond))
++			}
++			defer cancel()
++			if mode == "already canceled" {
++				cancel()
++			}
++			if mode == "canceled by prewait" {
++				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
++					if ms == 0 {
++						cancel()
++					}
++					return windows.WaitForSingleObject(handle, ms)
++				}
++			}
++			if mode == "earlier caller deadline" {
++				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
++					if ms == 0 {
++						time.Sleep(20 * time.Millisecond)
++					}
++					return windows.WaitForSingleObject(handle, ms)
++				}
++			}
++			calls := 0
++			h.terminate = func(windows.Handle, uint32) error { calls++; return nil }
++			exit, err := h.TerminateOnceAndWaitUntilContext(ctx, time.Second, time.Now().Add(time.Minute), time.Now().Add(time.Minute))
++			if err == nil || exit.TerminateCalls != 0 || calls != 0 || h.terminateCalls != 0 {
++				t.Fatalf("canceled/deadline native signal occurred: %+v calls=%d err=%v", exit, calls, err)
++			}
++			if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
++				t.Fatalf("zero-call Core disappeared: %v", err)
++			}
++		})
++	}
++}
++
+ func ownedCoreChild(t *testing.T) *exec.Cmd {
+ 	t.Helper()
+ 	exe, err := os.Executable()

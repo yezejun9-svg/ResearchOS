@@ -1,0 +1,9 @@
+# Direct diagnostic owner 顺序修订四
+
+仅C源码修复，旧freeze03及独立P2反例/raw不改；prior-review保留五文件及原SHA。未运行helper入口、SDK、Add-Type、UIA、GUI或模型，不探测CLI。
+
+Project-TreeDiagnostic内部只取一次Current，先且只读一次ProcessId，与传入的verified coreId匹配后才读Name/AutomationId/rect等其它属性；metadata PID复用已核数值。foreign只返回固定status/pid；Current/PID不可读也仅固定不可用状态，不吐getter异常消息。root及selected两处都传coreId，selected不依赖之前Read-PublicPatterns的外部检查。
+
+三个针对性纯case及完整helper AST syntax通过：foreign其它getter0次；allowed Name/AutomationId各1次且PID/Current各1次；模拟selected先通过外部检查后Current变foreign，内部仍拒且其它getter0次。没有扩矩阵或复跑旧suite。runner、noOK/0budget/fresh native tree/UTC/env/cwd/Job全部不变。
+
+SOURCE_PURE_ONLY_NOT_RUN。先等独立复核及Root新scope；若实际provider仍无可靠路径，转真实Native BIF_EDITBOX产品slice，不继续猜selector。此包不授予运行或产品接受。

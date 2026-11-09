@@ -1,0 +1,78 @@
+--- base/internal/domain/client_protocol_control_windows_test.go
++++ candidate/internal/domain/client_protocol_control_windows_test.go
+@@ -46,18 +46,43 @@
+ func TestClientSameWriterRenewsExpiredLease(t *testing.T) {
+ 	f := contextFixture(t)
+ 	sid := mixedSessionEvents(t, f, 0)
+-	if _, err := f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++	if _, err := f.db.Exec("UPDATE client_sessions SET workspace_ref='fixture-workspace',model_config_ref='fixture-model',core_build_id='mixed-fixture',lease_expires_at=? WHERE id=?", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	svc := &ClientService{Doc: clientHistoryDoc(t), Domain: f.s, Host: ClientHostInfo{CoreBuildID: "mixed-fixture", LeaseTTL: time.Minute}}
+ 	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("mixed-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})}
++	var attachedSnapshot map[string]any
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+ 		res, _, err := svc.Execute(context.Background(), tx, handlerDecode(t, env), f.owner)
+ 		if err != nil {
+ 			return err
+ 		}
+-		if deref(res.Status) != "ACKNOWLEDGED" {
++		if deref(res.Status) != "COMPLETED" {
+ 			t.Fatalf("renewal refused: %s", Bytes(res))
++		}
++		if err := ValidateResultAgainstMethod("session.attach", res, svc.Doc); err != nil {
++			t.Fatal(err)
++		}
++		if deref(res.CommandID) != deref(env.CommandID) || deref(res.Method) != "session.attach" ||
++			deref(res.ProtocolVersion) != ProtocolV2 || deref(res.SessionID) != sid ||
++			res.Error != nil || res.ErrorCode != nil || res.Revision == nil || *res.Revision != 3 {
++			t.Fatalf("renewal terminal identity or revision differs: %s", Bytes(res))
++		}
++		acquired, ok := res.Result["write_owner_acquired"].(bool)
++		if !ok || !acquired {
++			t.Fatalf("renewal did not acquire writer ownership: %s", Bytes(res))
++		}
++		attachedSnapshot, ok = res.Result["snapshot"].(map[string]any)
++		if !ok || Str(attachedSnapshot, "session_id") != sid || Str(attachedSnapshot, "project_id") != f.project {
++			t.Fatalf("renewal snapshot identity differs: %s", Bytes(res))
++		}
++		revision, revisionErr := Num(attachedSnapshot, "revision")
++		writer, writerOK := attachedSnapshot["writer"].(map[string]any)
++		writerEpoch, writerErr := Num(writer, "epoch")
++		expiresAt, expiresErr := time.Parse(time.RFC3339Nano, Str(writer, "expires_at"))
++		if revisionErr != nil || revision != 3 || !writerOK || writerErr != nil || writerEpoch != 2 ||
++			Str(writer, "client_id") != "mixed-client" || expiresErr != nil || !expiresAt.After(time.Now()) {
++			t.Fatalf("renewal snapshot writer generation differs: %s", Bytes(res))
+ 		}
+ 		return nil
+ 	})
+@@ -70,6 +95,29 @@
+ 	if err != nil || !deadline.After(time.Now()) || epoch != 2 {
+ 		t.Fatalf("new writer generation missing: epoch=%d until=%s %v", epoch, until, err)
+ 	}
++	getEnv := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: env.ClientID,
++		ProjectID: &f.project, SessionID: &sid, Method: strptr("session.get"), Payload: Bytes(Object{})}
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		res, _, err := svc.Execute(context.Background(), tx, handlerDecode(t, getEnv), f.owner)
++		if err != nil {
++			return err
++		}
++		if deref(res.Status) != "COMPLETED" || deref(res.CommandID) != deref(getEnv.CommandID) ||
++			deref(res.SessionID) != sid || res.Revision == nil || *res.Revision != 3 {
++			t.Fatalf("public Session read differs: %s", Bytes(res))
++		}
++		if err := ValidateResultAgainstMethod("session.get", res, svc.Doc); err != nil {
++			t.Fatal(err)
++		}
++		if Hash(res.Result) != Hash(attachedSnapshot) {
++			t.Fatalf("attach terminal differs from public Session: attach=%s get=%s", Bytes(attachedSnapshot), Bytes(res.Result))
++		}
++		writer, ok := res.Result["writer"].(map[string]any)
++		if !ok || Str(writer, "expires_at") != until {
++			t.Fatalf("public Session lease differs from committed lease: %s", Bytes(res))
++		}
++		return nil
++	})
+ 	env.CommandID = strptr(ID())
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+ 		res, _, err := svc.Execute(context.Background(), tx, handlerDecode(t, env), f.owner)

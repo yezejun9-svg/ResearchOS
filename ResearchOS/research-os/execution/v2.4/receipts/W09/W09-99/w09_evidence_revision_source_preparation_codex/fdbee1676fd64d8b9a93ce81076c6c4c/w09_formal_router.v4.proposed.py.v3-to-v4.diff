@@ -1,0 +1,135 @@
+--- execution\v2.4\receipts\W09\W09-99\w09_evidence_implementation_source_proposal_codex\9bc40daa1dba4b628892ebb7188b70b4\w09_formal_router.v3.proposed.py
++++ ops/ci/w09_formal_router.py
+@@ -12,6 +12,7 @@
+ from pathlib import Path
+ import subprocess
+ import sys
++from w09_evidence_closure import verify_native, verify_owned, verify_c19, verify_a06, verify_mode
+ 
+ ROOT = Path.cwd().resolve()
+ NATIVE = {
+@@ -41,8 +42,8 @@
+     ("test.retrieval", "W09", "W09-G02", ""): "LIVE_WINDOWS_LOCAL",
+     ("test.research.fixture", "W09", "", "C19"): "FIXTURE_IMPLEMENTED_SERVICE",
+     ("test.retrieval", "W09", "", "C19"): "FIXTURE_IMPLEMENTED_SERVICE",
+-    ("test.retrieval", "W09", "", "A06"): "LIVE_WINDOWS_LOCAL",
+-    ("test.security", "W09", "", "A06"): "LIVE_WINDOWS_LOCAL",
++    ("test.retrieval", "W09", "", "A06"): "FIXTURE_IMPLEMENTED_SERVICE",
++    ("test.security", "W09", "", "A06"): "FIXTURE_IMPLEMENTED_SERVICE",
+ }
+ SELECTED = {
+     ("test.retrieval", "W09", "W09-G01", ""): ("TestW09C19ExplicitOriginAndUnknown", "TestW09C19ChainInvalidation", "TestW09A06HTTPInvalidationAndContext", "TestW09A06FTSFallbackAndDuplicatePath", "TestW09RootReadRejectsEscape"),
+@@ -117,7 +118,7 @@
+         raise ValueError("NATIVE_ROSTER_OR_SCOPE_MISMATCH")
+     pins = [_pin(ref) for ref in [*source["raw_evidence_references"], source["report_reference"]]]
+     report = json.loads(_inside_repo(source["report_reference"]).read_bytes())
+-    for key in ("status", "task_id", "check_id", "case_id", "scope", "exit_code",
++    for key in ("status", "task_id", "check_id", "case_id", "scope", "exit_code", "run_id", "go_executable",
+                 "timed_out", "assertions", "assertion_ids", "expected_assertion_ids",
+                 "selected_tests", "passed_tests", "raw_evidence_references"):
+         if report.get(key) != source.get(key):
+@@ -129,7 +130,8 @@
+                    record.get("raw_evidence_reference") != source["raw_evidence_references"][0]
+                    for record in records)):
+         raise ValueError("SOURCE_ASSERTION_RESULTS_INCOMPLETE")
+-    return pins, report
++    native = verify_native(ROOT, source, report, expected, selected)
++    return pins, report, native
+ 
+ 
+ def _owned_exact(source, report, route):
+@@ -160,6 +162,8 @@
+     events = {}
+     for path in member_map:
+         label = path.name.split("-", 1)[-1].removesuffix(".raw")
++        if label.startswith(("http-request", "http-response", "file-body-", "simulated-opinion-", "g02-junction-stdout")):
++            continue
+         if label.startswith(("assertion-", "c19-", "chain-", "a06-", "g02-", "http-", "origins-", "state-", "file-")):
+             try:
+                 events.setdefault(label, []).append(json.loads(path.read_bytes()))
+@@ -230,7 +234,7 @@
+         if (len({row.get("evidence_id") for row in records}) != 27
+                 or sum(row.get("evidence_kind") == "SIMULATED" for row in records) != 20
+                 or sum(row.get("evidence_kind") == "OBSERVED" and row.get("origin_relation") == "UNKNOWN" for row in records) != 1
+-                or len(events["origins-c19-before"][0]) != 6):
++                or len(events["origins-c19-before"][0].get("rows", [])) != 6):
+             raise ValueError("C19_GRAPH_RELATIONS_MISMATCH")
+         if len([label for label in events if label.startswith("file-c19-before-")]) != 7:
+             raise ValueError("C19_INPUT_SNAPSHOTS_MISSING")
+@@ -263,52 +267,18 @@
+                 or any(hit.get("backend") != "sqlite-fts5" for hit in indexed)
+                 or any(hit.get("backend") != "bounded-scan" for hit in fallback)):
+             raise ValueError("A06_FTS_OBSERVATION_MISMATCH")
+-    return {"members": members, "events": events}
+-
+-
+-def _mode_review(source, route, events):
+-    value = os.getenv("RESEARCHOS_W09_MODE_DECISION_REF", "")
+-    expected_sha = os.getenv("RESEARCHOS_W09_MODE_DECISION_SHA256", "")
+-    if not value or len(expected_sha) != 64:
+-        raise ValueError("REVIEWED_MODE_DECISION_MISSING")
+-    path = _inside_repo(value)
+-    raw = path.read_bytes()
+-    if hashlib.sha256(raw).hexdigest() != expected_sha:
+-        raise ValueError("MODE_DECISION_PIN_DRIFT")
+-    decision = json.loads(raw)
+-    mode = "LIVE_WINDOWS" if route[2] == "W09-G02" else "FIXTURE"
+-    if (decision.get("schema") != "researchos.w09-mode-decision.v1"
+-            or decision.get("route") != list(route)
+-            or decision.get("mode") != mode
+-            or decision.get("source_scope") != source["scope"]
+-            or decision.get("reviewer_id") in (None, "", decision.get("producer_id"))
+-            or decision.get("source_binding_sha256") != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()):
+-        raise ValueError("MODE_DECISION_NOT_BOUND_OR_INDEPENDENT")
+-    if mode == "FIXTURE":
+-        if decision.get("input_origin") != "OWNED_TEMP_DIR" or decision.get("http_delivery") != "IN_PROCESS_HTTptest_RECORDER":
+-            raise ValueError("FIXTURE_MODE_INPUT_MISMATCH")
+-    else:
+-        branch = events.get("g02-os-branch", [])
+-        try:
+-            windows_build = int(platform.version().split(".")[-1])
+-        except ValueError:
+-            windows_build = 0
+-        if (os.name != "nt" or decision.get("host_os") != "Windows 11"
+-                or decision.get("architecture") != "x64"
+-                or platform.machine().lower() not in ("amd64", "x86_64")
+-                or windows_build < 22000
+-                or not decision.get("locked_go_sha256")
+-                or not decision.get("actual_host_receipt_ref")
+-                or not decision.get("actual_junction_receipt_ref")
+-                or len(branch) != 1 or branch[0].get("goos") != "windows"
+-                or branch[0].get("goarch") != "amd64"
+-                or branch[0].get("junction_branch") is not True):
+-            raise ValueError("LIVE_WINDOWS_HOST_EVIDENCE_MISSING")
+-        for field in ("actual_host_receipt_ref", "actual_junction_receipt_ref"):
+-            claim = decision[field]
+-            if not isinstance(claim, dict) or _pin(claim["path"]) != claim:
+-                raise ValueError("LIVE_WINDOWS_HOST_PIN_DRIFT")
+-    return {"mode": mode, "decision_ref": _pin(value), "formal_authority": False}
++    closed = verify_owned(ROOT, source, report, SELECTED[route], ASSERTION_OWNER)
++    if route[3] == "C19" or route[2] == "W09-G01":
++        verify_c19(closed)
++    if route[3] == "A06" or route[2] in ("W09-G01", "W09-G02"):
++        verify_a06(closed)
++    return closed
++
++
++def _mode_review(source, report, route, owned, native):
++    return verify_mode(ROOT, source, report, route, owned, native,
++                       os.getenv("RESEARCHOS_W09_MODE_DECISION_REF", ""),
++                       os.getenv("RESEARCHOS_W09_MODE_DECISION_SHA256", ""))
+ 
+ 
+ def main():
+@@ -341,9 +311,9 @@
+         return child.returncode
+     try:
+         source = json.loads(child.stdout.decode("utf-8").strip().splitlines()[-1])
+-        pins, report = _native_exact(source, route)
++        pins, report, native = _native_exact(source, route)
+         owned = _owned_exact(source, report, route)
+-        mode = _mode_review(source, route, owned["events"])
++        mode = _mode_review(source, report, route, owned, native)
+     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+         sys.stdout.buffer.write(child.stdout)
+         return _failure("SOURCE_REPORT_NOT_EXACT_OR_INCOMPLETE", type(exc).__name__)

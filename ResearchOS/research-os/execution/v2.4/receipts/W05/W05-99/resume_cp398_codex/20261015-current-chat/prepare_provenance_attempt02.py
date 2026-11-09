@@ -1,0 +1,9 @@
+import hashlib,json
+from pathlib import Path
+B=Path(__file__).parent;R=Path('D:/作品集/ResearchOS/research-os');E=R/'execution/v2.4/receipts/W05/W05-99/historical_qualification_public_provenance_codex/20261015-current-chat';p=B/'collect_historical_public_provenance.py';s=p.read_text(encoding='utf8')
+before="O=E/'historical_qualification_public_provenance_codex/20261015-current-chat';O.mkdir(parents=True,exist_ok=False)";after="O=E/'historical_qualification_public_provenance_codex/20261015-current-chat/attempt02';O.mkdir(parents=True,exist_ok=False)";assert s.count(before)==1;s=s.replace(before,after)
+before="assert digest(read(dispatch/'input/request.json'))==j['manifest_hash']";after="assert 'sha256:'+sr['request.json']['sha256']==j['input_hash']; wr=read(dispatch/'input/request.json'); assert all(wr[k]==m[k] for k in ['task_id','run_id','epoch'])";assert s.count(before)==1;s=s.replace(before,after)
+with (B/'collect_historical_public_provenance_attempt02.py').open('x',encoding='utf8') as f:f.write(s)
+diagnostic={'origin_key':'20261015|root-public-provenance-request-manifest-confusion-01','native_exit':1,'tool_chunk_id':'6d47a6','failed_helper_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'error':'Incorrect collector assertion treated staged request.json worker input as dispatch manifest; actual worker input has its own bridge input_hash. Core build/native identity files written before failure remain unchanged.','correction':'New attempt02 output only: bind request.json raw SHA to journal.input_hash and task/run/epoch to manifest; preserve first helper and partial output','source_or_product_writes':False}
+with (E/'attempt01.failure.json').open('x',encoding='utf8') as f:json.dump(diagnostic,f,ensure_ascii=False,indent=2);f.write('\n')
+print(json.dumps({'prepared':str(B/'collect_historical_public_provenance_attempt02.py'),'first_failure':str(E/'attempt01.failure.json')}))

@@ -1,0 +1,709 @@
+--- a/adapters/runtime/codex_qualification_windows.go
++++ b/adapters/runtime/codex_qualification_windows.go
+@@ -691,7 +691,7 @@
+ 	receipt.RenderedArgvHash = obs.RenderedArgvHash
+ 	receipt.RenderedArgv = append([]string(nil), args...)
+ 	obs.PreflightNoChild = false
+-	obs.Capture = collectQualification(ctx, q.rpc.options.Executable, args, Environment(""), working, qualificationJobName(in.RunID, in.Epoch, nonce), receiptPath)
++	obs.Capture = collectQualification(ctx, q.rpc.options.Executable, args, Environment(""), working, qualificationJobName(in.RunID, in.Epoch, nonce), receiptPath, receipt)
+ 	reason := ""
+ 	record := func(next string) {
+ 		if next == "" {
+--- a/adapters/runtime/codex_qualification_capture_windows.go
++++ b/adapters/runtime/codex_qualification_capture_windows.go
+@@ -11,11 +11,15 @@
+ 	"errors"
+ 	"io"
+ 	"os"
++	"path/filepath"
++	"slices"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 	"unsafe"
+ 
+ 	"golang.org/x/sys/windows"
++	"researchos.local/research-os/internal/qualificationprobe"
+ )
+ 
+ const qualificationStreamCap = 1 << 20
+@@ -43,7 +47,25 @@
+ 	ExitCode                                         int
+ 	Exited, JobZero, StreamsDrained, CleanupComplete bool
+ 	TimedOut, LimitExceeded                          bool
++	PrelaunchIntentPath, PrelaunchIntentSHA256       string
+ 	Err                                              error
++}
++
++// The production collector always uses the original Job and launch function.
++// Package-private hooks allow supervised Go fixtures to inject I/O faults and
++// a test-binary child without exposing a product selector or a receipt loader.
++type qualificationIntentWriter interface {
++	Write([]byte) (int, error)
++	Sync() error
++	Close() error
++}
++type qualificationCollectorHooks struct {
++	marshalIntent    func(qualificationPrelaunchIntent) ([]byte, error)
++	openIntent       func(string) (qualificationIntentWriter, error)
++	readIntent       func(string) ([]byte, error)
++	launch           func(windows.Handle, Command, []string, *os.File, *os.File, *os.File) (*process, error)
++	afterJobQueried  func(windows.Handle, qualificationJobLimits)
++	afterIntentReady func()
+ }
+ 
+ type qualificationSyncCloser interface {
+@@ -158,14 +180,150 @@
+ 		return 0, qualificationJobLimits{}, err
+ 	}
+ 	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
+-	if actual.BasicLimitInformation.LimitFlags&flags != flags || actual.BasicLimitInformation.ActiveProcessLimit != qualificationProcessLimit || actual.JobMemoryLimit != qualificationJobMemory {
++	if actual.BasicLimitInformation.LimitFlags != flags || actual.BasicLimitInformation.ActiveProcessLimit != qualificationProcessLimit || actual.JobMemoryLimit != qualificationJobMemory {
+ 		closeJob(job)
+ 		return 0, qualificationJobLimits{}, errors.New("QUALIFICATION_JOB_LIMIT_UNVERIFIED")
+ 	}
+ 	return job, qualificationJobLimits{Flags: actual.BasicLimitInformation.LimitFlags, Processes: actual.BasicLimitInformation.ActiveProcessLimit, Memory: uint64(actual.JobMemoryLimit)}, nil
+ }
+ 
+-func collectQualification(ctx context.Context, executable string, args, env []string, cwd, jobName, receiptBase string) qualificationCapture {
++const qualificationIntentMaxBytes = 32768
++
++type qualificationPrelaunchIntent struct {
++	Schema           string                      `json:"schema"`
++	Phase            string                      `json:"phase"`
++	Context          qualificationReceiptContext `json:"context"`
++	Executable       string                      `json:"executable"`
++	WorkingDirectory string                      `json:"working_directory"`
++	JobName          string                      `json:"job_name"`
++	JobLimitFlags    uint32                      `json:"job_limit_flags"`
++	JobProcessLimit  uint32                      `json:"job_process_limit"`
++	JobMemoryLimit   uint64                      `json:"job_memory_limit"`
++}
++
++// Only the wrapper's typed, in-memory context can reach this function. Every
++// dynamic value is matched against the collector's actual launch inputs.
++func qualificationIntentRecord(executable string, args, env []string, cwd, jobName, receiptBase string, context qualificationReceiptContext, limits qualificationJobLimits) (qualificationPrelaunchIntent, error) {
++	var zero qualificationPrelaunchIntent
++	bad := errors.New("QUALIFICATION_PRELAUNCH_IDENTITY_INVALID")
++	if context.TaskID == "" || context.RunID == "" || context.HostBoot == "" ||
++		limits.Flags != uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS|windows.JOB_OBJECT_LIMIT_JOB_MEMORY) ||
++		limits.Processes != qualificationProcessLimit || limits.Memory != uint64(qualificationJobMemory) ||
++		strings.ContainsAny(context.TaskID+context.RunID+context.HostBoot, "\x00\r\n") ||
++		!qualificationSHA(context.SourceBindingHash) || !qualificationSHA(context.NativeHash) ||
++		!qualificationSHA(context.HelperHash) || !qualificationSHA(context.HostBuildHash) ||
++		!qualificationSHA(context.TemplateHash) || !qualificationSHA(context.EnvironmentHash) ||
++		!qualificationSHA(context.RenderedArgvHash) || !qualificationSHA(context.PlanHash) ||
++		context.TemplateHash != CodexRPCPolicyIdentity(context.NativeHash).RequestedConfigSHA256 ||
++		context.EnvironmentHash != Hash(mustJSON(env)) ||
++		context.RenderedArgvHash != Hash(mustJSON(args)) || !slices.Equal(context.RenderedArgv, args) ||
++		!slices.Equal(context.ExpectedCases, qualificationprobe.FixedCases()) ||
++		!context.PreControlsComplete || context.PostControlsComplete || context.ObservedCaseBitmap != 0 ||
++		len(context.CaseResults) != 0 || len(context.FindingCodes) != 0 {
++		return zero, bad
++	}
++	epoch, err := strconv.ParseInt(context.Epoch, 10, 64)
++	if err != nil || epoch <= 0 || strconv.FormatInt(epoch, 10) != context.Epoch {
++		return zero, bad
++	}
++	if len(context.HostBoot) != 32 {
++		return zero, bad
++	}
++	if _, err = hex.DecodeString(context.HostBoot); err != nil {
++		return zero, bad
++	}
++	plan, err := qualificationprobe.Decode(context.PlanEncoded)
++	if err != nil || context.PlanHash != Hash([]byte(context.PlanEncoded)) ||
++		plan.Source != context.Source || plan.Working != context.Working || plan.Denied != context.Denied ||
++		plan.Nonce != context.Nonce || plan.Port != context.LoopbackPort || !slices.Equal(plan.Cases, context.ExpectedCases) {
++		return zero, bad
++	}
++	root := filepath.Dir(context.Source)
++	helper := filepath.Join(context.Source, "qualification-helper.exe")
++	expectedArgs, err := qualificationArguments(context.Nonce, context.Source, context.Working, helper, context.PlanEncoded)
++	if err != nil || !slices.Equal(args, expectedArgs) || !filepath.IsAbs(executable) ||
++		cwd != context.Working || jobName != qualificationJobName(context.RunID, context.Epoch, context.Nonce) ||
++		filepath.Clean(executable) != executable || context.NormalHome == "" || !filepath.IsAbs(context.NormalHome) ||
++		!strings.EqualFold(context.NormalHome, os.Getenv("USERPROFILE")) ||
++		!strings.EqualFold(filepath.Dir(context.Working), root) || !strings.EqualFold(filepath.Dir(context.Denied), root) ||
++		!strings.EqualFold(filepath.Dir(receiptBase), filepath.Join(root, "receipts")) ||
++		filepath.Base(receiptBase) != strings.TrimPrefix(Hash([]byte(context.RunID+"/"+context.Epoch)), "sha256:")+".json" {
++		return zero, bad
++	}
++	if actual, e := fileDigest(executable); e != nil || actual != context.NativeHash {
++		return zero, bad
++	}
++	if actual, e := fileDigest(helper); e != nil || actual != context.HelperHash {
++		return zero, bad
++	}
++	if err = exactReal(filepath.Dir(receiptBase)); err != nil {
++		return zero, bad
++	}
++	context.RenderedArgv = slices.Clone(context.RenderedArgv)
++	context.ExpectedCases = slices.Clone(context.ExpectedCases)
++	return qualificationPrelaunchIntent{Schema: "researchos.native-qualification-prelaunch.v1", Phase: "PREPARED_INTENT_ONLY",
++		Context: context, Executable: executable, WorkingDirectory: cwd, JobName: jobName,
++		JobLimitFlags: limits.Flags, JobProcessLimit: limits.Processes, JobMemoryLimit: limits.Memory}, nil
++}
++
++func persistQualificationPrelaunchIntent(ctx context.Context, path string, record qualificationPrelaunchIntent, hooks qualificationCollectorHooks) (string, error) {
++	if ctx.Err() != nil {
++		return "", ctx.Err()
++	}
++	marshal := hooks.marshalIntent
++	if marshal == nil {
++		marshal = func(value qualificationPrelaunchIntent) ([]byte, error) { return json.Marshal(value) }
++	}
++	raw, err := marshal(record)
++	if err != nil || len(raw) == 0 || len(raw)+1 > qualificationIntentMaxBytes {
++		return "", errors.New("QUALIFICATION_PRELAUNCH_TOO_LARGE_OR_INVALID")
++	}
++	raw = append(raw, '\n')
++	open := hooks.openIntent
++	if open == nil {
++		open = func(name string) (qualificationIntentWriter, error) {
++			return os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++		}
++	}
++	f, err := open(path)
++	if err != nil {
++		return "", err
++	}
++	n, writeErr := f.Write(raw)
++	if writeErr == nil && n != len(raw) {
++		writeErr = io.ErrShortWrite
++	}
++	syncErr := f.Sync()
++	closeErr := f.Close()
++	if err = errors.Join(writeErr, syncErr, closeErr); err != nil {
++		return "", err
++	}
++	read := hooks.readIntent
++	if read == nil {
++		read = func(name string) ([]byte, error) {
++			file, err := os.Open(name)
++			if err != nil {
++				return nil, err
++			}
++			got, readErr := io.ReadAll(io.LimitReader(file, qualificationIntentMaxBytes+1))
++			return got, errors.Join(readErr, file.Close())
++		}
++	}
++	got, err := read(path)
++	if err != nil || len(got) > qualificationIntentMaxBytes || !bytes.Equal(got, raw) {
++		return "", errors.New("QUALIFICATION_PRELAUNCH_READBACK_UNCERTAIN")
++	}
++	if ctx.Err() != nil {
++		return "", ctx.Err()
++	}
++	return Hash(raw), nil
++}
++
++func collectQualification(ctx context.Context, executable string, args, env []string, cwd, jobName, receiptBase string, receipt qualificationReceiptContext) qualificationCapture {
++	return collectQualificationWithHooks(ctx, executable, args, env, cwd, jobName, receiptBase, receipt, qualificationCollectorHooks{})
++}
++
++func collectQualificationWithHooks(ctx context.Context, executable string, args, env []string, cwd, jobName, receiptBase string, receipt qualificationReceiptContext, hooks qualificationCollectorHooks) qualificationCapture {
+ 	var out qualificationCapture
+ 	if ctx.Err() != nil {
+ 		out.Err = ctx.Err()
+@@ -208,7 +366,36 @@
+ 	out.JobMemoryLimit = jobLimits.Memory
+ 	out.JobLimitFlags = jobLimits.Flags
+ 	out.JobLimitsVerified = true
+-	p, err := launch(job, Command{Executable: executable, Args: args, Directory: cwd}, env, stdinR, stdoutW, stderrW)
++	if hooks.afterJobQueried != nil {
++		hooks.afterJobQueried(job, jobLimits)
++	}
++	record, err := qualificationIntentRecord(executable, args, env, cwd, jobName, receiptBase, receipt, jobLimits)
++	if err != nil {
++		closeAll()
++		out.Err = err
++		return out
++	}
++	intentPath := receiptBase + ".prelaunch.json"
++	intentHash, err := persistQualificationPrelaunchIntent(ctx, intentPath, record, hooks)
++	if err != nil {
++		closeAll()
++		out.Err = err
++		return out
++	}
++	out.PrelaunchIntentPath, out.PrelaunchIntentSHA256 = intentPath, intentHash
++	if hooks.afterIntentReady != nil {
++		hooks.afterIntentReady()
++	}
++	if err = ctx.Err(); err != nil {
++		closeAll()
++		out.Err = err
++		return out
++	}
++	start := hooks.launch
++	if start == nil {
++		start = launch
++	}
++	p, err := start(job, Command{Executable: executable, Args: args, Directory: cwd}, env, stdinR, stdoutW, stderrW)
+ 	stdinR.Close()
+ 	stdinW.Close()
+ 	stdoutW.Close()
+@@ -384,42 +571,92 @@
+ 	Bytes  int    `json:"bytes"`
+ }
+ 
++func sameQualificationPrelaunchContext(a, b qualificationReceiptContext) bool {
++	a.CaseResults, b.CaseResults = nil, nil
++	a.FindingCodes, b.FindingCodes = nil, nil
++	a.ObservedCaseBitmap, b.ObservedCaseBitmap = 0, 0
++	a.PostControlsComplete, b.PostControlsComplete = false, false
++	return bytes.Equal(mustJSON(a), mustJSON(b))
++}
++
++func verifyQualificationFinalIntent(path string, capture qualificationCapture, receipt qualificationReceiptContext) error {
++	if capture.PrelaunchIntentPath == "" || capture.PrelaunchIntentSHA256 == "" ||
++		capture.PrelaunchIntentPath != path+".prelaunch.json" || !qualificationSHA(capture.PrelaunchIntentSHA256) {
++		return errors.New("QUALIFICATION_PRELAUNCH_LINK_MISSING")
++	}
++	if err := exactReal(capture.PrelaunchIntentPath); err != nil {
++		return err
++	}
++	file, err := os.Open(capture.PrelaunchIntentPath)
++	if err != nil {
++		return err
++	}
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > qualificationIntentMaxBytes {
++		file.Close()
++		return errors.New("QUALIFICATION_PRELAUNCH_LINK_UNCERTAIN")
++	}
++	raw, readErr := io.ReadAll(io.LimitReader(file, qualificationIntentMaxBytes+1))
++	closeErr := file.Close()
++	if readErr != nil || closeErr != nil || len(raw) == 0 || len(raw) > qualificationIntentMaxBytes || Hash(raw) != capture.PrelaunchIntentSHA256 {
++		return errors.New("QUALIFICATION_PRELAUNCH_LINK_UNCERTAIN")
++	}
++	var intent qualificationPrelaunchIntent
++	if json.Unmarshal(raw, &intent) != nil || intent.Schema != "researchos.native-qualification-prelaunch.v1" || intent.Phase != "PREPARED_INTENT_ONLY" ||
++		!sameQualificationPrelaunchContext(intent.Context, receipt) || !bytes.Equal(raw, append(mustJSON(intent), '\n')) {
++		return errors.New("QUALIFICATION_PRELAUNCH_LINK_CHANGED")
++	}
++	return nil
++}
++
+ func persistQualificationCapture(path string, c qualificationCapture, reason string, context ...qualificationReceiptContext) error {
+ 	if path == "" {
+ 		return errors.New("QUALIFICATION_RECEIPT_PATH_REQUIRED")
+ 	}
++	if len(context) > 1 || c.PID != 0 && len(context) != 1 ||
++		(c.PrelaunchIntentPath == "") != (c.PrelaunchIntentSHA256 == "") {
++		return errors.New("QUALIFICATION_RECEIPT_CONTEXT_AMBIGUOUS")
++	}
++	if c.PID != 0 || c.PrelaunchIntentPath != "" {
++		if len(context) != 1 {
++			return errors.New("QUALIFICATION_PRELAUNCH_LINK_MISSING")
++		}
++		if err := verifyQualificationFinalIntent(path, c, context[0]); err != nil {
++			return err
++		}
++	}
+ 	data := struct {
+-		Schema            string                      `json:"schema"`
+-		Reason            string                      `json:"reason"`
+-		PID               uint32                      `json:"pid"`
+-		Created           int64                       `json:"created"`
+-		Job               string                      `json:"job"`
+-		ExitCode          int                         `json:"exit_code"`
+-		Exited            bool                        `json:"exited"`
+-		JobZero           bool                        `json:"job_zero"`
+-		StreamsDrained    bool                        `json:"streams_drained"`
+-		CleanupComplete   bool                        `json:"cleanup_complete"`
+-		TimedOut          bool                        `json:"timed_out"`
+-		LimitExceeded     bool                        `json:"limit_exceeded"`
+-		CaptureError      string                      `json:"capture_error"`
+-		StdoutError       string                      `json:"stdout_error"`
+-		StderrError       string                      `json:"stderr_error"`
+-		JobProcessLimit   uint32                      `json:"job_process_limit"`
+-		JobMemoryLimit    uint64                      `json:"job_memory_limit"`
+-		JobLimitFlags     uint32                      `json:"job_limit_flags"`
+-		JobLimitsVerified bool                        `json:"job_limits_verified"`
+-		Context           qualificationReceiptContext `json:"context"`
+-		StdoutPartial     string                      `json:"stdout_partial"`
+-		StderrPartial     string                      `json:"stderr_partial"`
+-		StdoutPrefix      []byte                      `json:"stdout_prefix"`
+-		StderrPrefix      []byte                      `json:"stderr_prefix"`
+-		StdoutHash        string                      `json:"stdout_hash"`
+-		StderrHash        string                      `json:"stderr_hash"`
+-	}{Schema: "researchos.native-qualification-capture.v1", Reason: reason, PID: c.PID, Created: c.Created, Job: c.JobName, ExitCode: c.ExitCode, Exited: c.Exited, JobZero: c.JobZero, StreamsDrained: c.StreamsDrained, CleanupComplete: c.CleanupComplete, TimedOut: c.TimedOut, LimitExceeded: c.LimitExceeded, JobProcessLimit: c.JobProcessLimit, JobMemoryLimit: c.JobMemoryLimit, JobLimitFlags: c.JobLimitFlags, JobLimitsVerified: c.JobLimitsVerified, StdoutPartial: path + ".stdout.partial", StderrPartial: path + ".stderr.partial", StdoutPrefix: c.Stdout.prefix, StderrPrefix: c.Stderr.prefix, StdoutHash: c.Stdout.hash, StderrHash: c.Stderr.hash}
++		Schema                string                      `json:"schema"`
++		Reason                string                      `json:"reason"`
++		PID                   uint32                      `json:"pid"`
++		Created               int64                       `json:"created"`
++		Job                   string                      `json:"job"`
++		ExitCode              int                         `json:"exit_code"`
++		Exited                bool                        `json:"exited"`
++		JobZero               bool                        `json:"job_zero"`
++		StreamsDrained        bool                        `json:"streams_drained"`
++		CleanupComplete       bool                        `json:"cleanup_complete"`
++		TimedOut              bool                        `json:"timed_out"`
++		LimitExceeded         bool                        `json:"limit_exceeded"`
++		CaptureError          string                      `json:"capture_error"`
++		StdoutError           string                      `json:"stdout_error"`
++		StderrError           string                      `json:"stderr_error"`
++		JobProcessLimit       uint32                      `json:"job_process_limit"`
++		JobMemoryLimit        uint64                      `json:"job_memory_limit"`
++		JobLimitFlags         uint32                      `json:"job_limit_flags"`
++		JobLimitsVerified     bool                        `json:"job_limits_verified"`
++		PrelaunchIntentPath   string                      `json:"prelaunch_intent_path"`
++		PrelaunchIntentSHA256 string                      `json:"prelaunch_intent_sha256"`
++		Context               qualificationReceiptContext `json:"context"`
++		StdoutPartial         string                      `json:"stdout_partial"`
++		StderrPartial         string                      `json:"stderr_partial"`
++		StdoutPrefix          []byte                      `json:"stdout_prefix"`
++		StderrPrefix          []byte                      `json:"stderr_prefix"`
++		StdoutHash            string                      `json:"stdout_hash"`
++		StderrHash            string                      `json:"stderr_hash"`
++	}{Schema: "researchos.native-qualification-capture.v1", Reason: reason, PID: c.PID, Created: c.Created, Job: c.JobName, ExitCode: c.ExitCode, Exited: c.Exited, JobZero: c.JobZero, StreamsDrained: c.StreamsDrained, CleanupComplete: c.CleanupComplete, TimedOut: c.TimedOut, LimitExceeded: c.LimitExceeded, JobProcessLimit: c.JobProcessLimit, JobMemoryLimit: c.JobMemoryLimit, JobLimitFlags: c.JobLimitFlags, JobLimitsVerified: c.JobLimitsVerified, PrelaunchIntentPath: c.PrelaunchIntentPath, PrelaunchIntentSHA256: c.PrelaunchIntentSHA256, StdoutPartial: path + ".stdout.partial", StderrPartial: path + ".stderr.partial", StdoutPrefix: c.Stdout.prefix, StderrPrefix: c.Stderr.prefix, StdoutHash: c.Stdout.hash, StderrHash: c.Stderr.hash}
+ 	if len(context) == 1 {
+ 		data.Context = context[0]
+-	} else if len(context) > 1 {
+-		return errors.New("QUALIFICATION_RECEIPT_CONTEXT_AMBIGUOUS")
+ 	}
+ 	if c.Err != nil {
+ 		data.CaptureError = c.Err.Error()
+--- a/adapters/runtime/codex_qualification_capture_windows_test.go
++++ b/adapters/runtime/codex_qualification_capture_windows_test.go
+@@ -9,6 +9,9 @@
+ 	"errors"
+ 	"os"
+ 	"path/filepath"
++	"researchos.local/research-os/internal/qualificationprobe"
++	"slices"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -44,7 +47,7 @@
+ 	}
+ 	path := filepath.Join(t.TempDir(), "capture.json")
+ 	context := qualificationReceiptContext{TaskID: "task", RunID: "run", Epoch: "1", SourceBindingHash: "sha256:source", NativeHash: "sha256:native", HelperHash: "sha256:helper", HostBuildHash: "sha256:build", TemplateHash: "sha256:template", Nonce: "researchos-readonly-fixed", ExpectedCases: []string{"source_read"}, FindingCodes: []string{"QUALIFICATION_INCOMPLETE"}}
+-	firstCapture := qualificationCapture{PID: 42, JobZero: true, Exited: true, StreamsDrained: true, CleanupComplete: true, JobLimitsVerified: true, JobProcessLimit: 16, JobMemoryLimit: 2048 << 20, Stdout: qualificationStream{prefix: []byte("out"), hash: "sha256:out"}, Stderr: qualificationStream{prefix: []byte("err"), hash: "sha256:err"}}
++	firstCapture := qualificationCapture{JobZero: true, Exited: true, StreamsDrained: true, CleanupComplete: true, JobLimitsVerified: true, JobProcessLimit: 16, JobMemoryLimit: 2048 << 20, Stdout: qualificationStream{prefix: []byte("out"), hash: "sha256:out"}, Stderr: qualificationStream{prefix: []byte("err"), hash: "sha256:err"}}
+ 	if err := persistQualificationCapture(path, firstCapture, "QUALIFICATION_INCOMPLETE", context); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -104,7 +107,8 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if limits.Processes != qualificationProcessLimit || limits.Memory != uint64(qualificationJobMemory) || limits.Flags == 0 {
++	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
++	if limits.Processes != qualificationProcessLimit || limits.Memory != uint64(qualificationJobMemory) || limits.Flags != flags {
+ 		t.Fatal("queried Job limits missing", limits)
+ 	}
+ 	defer closeJob(job)
+@@ -128,26 +132,303 @@
+ 		return
+ 	}
+ }
++func qualificationFakeCollectorInputs(t *testing.T, mode string) (string, []string, []string, string, string, string, qualificationReceiptContext) {
++	t.Helper()
++	root := t.TempDir()
++	source, working, denied := filepath.Join(root, "S"), filepath.Join(root, "QW"), filepath.Join(root, "D")
++	for _, dir := range []string{source, working, denied, filepath.Join(root, "receipts")} {
++		if err := os.Mkdir(dir, 0700); err != nil {
++			t.Fatal(err)
++		}
++	}
++	helper := filepath.Join(source, "qualification-helper.exe")
++	if err := os.WriteFile(helper, []byte("inert helper fixture"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	exe, err = filepath.Abs(exe)
++	if err != nil {
++		t.Fatal(err)
++	}
++	nativeHash, err := fileDigest(exe)
++	if err != nil {
++		t.Fatal(err)
++	}
++	helperHash, err := fileDigest(helper)
++	if err != nil {
++		t.Fatal(err)
++	}
++	nonce := "researchos-readonly-0123456789abcdef0123456789abcdef"
++	plan := qualificationprobe.Plan{Schema: qualificationprobe.Schema, Source: source, Working: working, Denied: denied, Nonce: nonce, Port: 18888, Cases: qualificationprobe.FixedCases()}
++	encoded, err := qualificationprobe.Encode(plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	args, err := qualificationArguments(nonce, source, working, helper, encoded)
++	if err != nil {
++		t.Fatal(err)
++	}
++	env := append(Environment(""), "RESEARCHOS_QUALIFICATION_FAKE_CHILD="+mode)
++	run, epoch := "run-"+mode+"-"+time.Now().Format("150405.000000000"), "1"
++	base := filepath.Join(root, "receipts", strings.TrimPrefix(Hash([]byte(run+"/"+epoch)), "sha256:")+".json")
++	receipt := qualificationReceiptContext{TaskID: "task-" + mode, RunID: run, Epoch: epoch, SourceBindingHash: Hash([]byte("inert source binding")), Source: source, Working: working, Denied: denied,
++		NativeHash: nativeHash, HelperHash: helperHash, HostBuildHash: Hash([]byte("inert Host build")), TemplateHash: CodexRPCPolicyIdentity(nativeHash).RequestedConfigSHA256,
++		EnvironmentHash: Hash(mustJSON(env)), NormalHome: os.Getenv("USERPROFILE"), HostBoot: "0123456789abcdef0123456789abcdef", RenderedArgvHash: Hash(mustJSON(args)), RenderedArgv: append([]string(nil), args...),
++		PlanHash: Hash([]byte(encoded)), PlanEncoded: encoded, Nonce: nonce, LoopbackPort: plan.Port, ExpectedCases: qualificationprobe.FixedCases(), PreControlsComplete: true}
++	return exe, args, env, working, qualificationJobName(run, epoch, nonce), base, receipt
++}
++
+ func TestQualificationCollectorOwnedFakeChild(t *testing.T) {
+-	exe, err := os.Executable()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+ 	for _, mode := range []string{"small", "overflow"} {
+ 		t.Run(mode, func(t *testing.T) {
++			exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, mode)
+ 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+ 			defer cancel()
+-			env := append(Environment(""), "RESEARCHOS_QUALIFICATION_FAKE_CHILD="+mode)
+-			capture := collectQualification(ctx, exe, []string{"-test.run=^TestQualificationFakeChild$"}, env, t.TempDir(), "researchos-qualification-fake-"+mode+"-"+time.Now().Format("150405.000000000"), filepath.Join(t.TempDir(), "receipt"))
++			capture := collectQualificationWithHooks(ctx, exe, args, env, cwd, jobName, base, receipt, qualificationCollectorHooks{
++				launch: func(job windows.Handle, original Command, childEnv []string, stdin, stdout, stderr *os.File) (*process, error) {
++					if original.Executable != exe || !slices.Equal(original.Args, args) {
++						t.Fatal("collector lost original ordered argv")
++					}
++					return launch(job, Command{Executable: exe, Args: []string{"-test.run=^TestQualificationFakeChild$"}, Directory: original.Directory}, childEnv, stdin, stdout, stderr)
++				},
++			})
+ 			if capture.PID == 0 || !capture.JobZero || !capture.Exited {
+ 				t.Fatal("owned fake child cleanup not proved", capture.PID, capture.JobZero, capture.Exited, capture.Err)
+ 			}
++			if capture.PrelaunchIntentPath != base+".prelaunch.json" || !qualificationSHA(capture.PrelaunchIntentSHA256) {
++				t.Fatal("owned child launched without durable intent", capture.PrelaunchIntentPath, capture.PrelaunchIntentSHA256)
++			}
+ 			if mode == "small" && (!capture.StreamsDrained || capture.LimitExceeded || capture.Stdout.hash == "") {
+ 				t.Fatal("small fake stream incomplete", capture)
+ 			}
+ 			if mode == "overflow" && (!capture.LimitExceeded || qualificationCaptureReason(capture) == "") {
+ 				t.Fatal("overflow fake child qualified", capture)
+ 			}
++			if err := persistQualificationCapture(base, capture, "QUALIFICATION_INCOMPLETE", receipt); err != nil {
++				t.Fatal("final intent linkage", err)
++			}
++			var final struct {
++				PrelaunchIntentSHA256 string `json:"prelaunch_intent_sha256"`
++				PrelaunchIntentPath   string `json:"prelaunch_intent_path"`
++			}
++			raw, err := os.ReadFile(base)
++			if err != nil || json.Unmarshal(raw, &final) != nil || final.PrelaunchIntentSHA256 != capture.PrelaunchIntentSHA256 || final.PrelaunchIntentPath != capture.PrelaunchIntentPath {
++				t.Fatal("final capture did not link intent", err)
++			}
+ 		})
+ 	}
+ }
++
++type qualificationFaultWriter struct {
++	file              *os.File
++	short             bool
++	syncErr, closeErr error
++	order             *[]string
++}
++
++func (w *qualificationFaultWriter) Write(raw []byte) (int, error) {
++	if w.order != nil {
++		*w.order = append(*w.order, "write")
++	}
++	if w.short {
++		return w.file.Write(raw[:min(7, len(raw))])
++	}
++	return w.file.Write(raw)
++}
++func (w *qualificationFaultWriter) Sync() error {
++	if w.order != nil {
++		*w.order = append(*w.order, "sync")
++	}
++	if err := w.file.Sync(); err != nil {
++		return err
++	}
++	return w.syncErr
++}
++func (w *qualificationFaultWriter) Close() error {
++	if w.order != nil {
++		*w.order = append(*w.order, "close")
++	}
++	return errors.Join(w.file.Close(), w.closeErr)
++}
++
++func TestQualificationPrelaunchIntentProvenanceAndMutation(t *testing.T) {
++	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "record")
++	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
++	limits := qualificationJobLimits{Flags: flags, Processes: qualificationProcessLimit, Memory: uint64(qualificationJobMemory)}
++	record, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, receipt, limits)
++	if err != nil || record.Phase != "PREPARED_INTENT_ONLY" || record.Context.HostBuildHash != receipt.HostBuildHash || record.Context.SourceBindingHash != receipt.SourceBindingHash || !slices.Equal(record.Context.RenderedArgv, args) {
++		t.Fatal("typed provenance rejected", record, err)
++	}
++	path := base + ".prelaunch.json"
++	digest, err := persistQualificationPrelaunchIntent(context.Background(), path, record, qualificationCollectorHooks{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	raw, err := os.ReadFile(path)
++	if err != nil || Hash(raw) != digest || bytes.Contains(raw, []byte("RESEARCHOS_QUALIFICATION_FAKE_CHILD")) || bytes.Contains(raw, []byte("user_request")) {
++		t.Fatal("intent leaked raw env/prompt or lost digest", err)
++	}
++	var decoded qualificationPrelaunchIntent
++	if err = json.Unmarshal(raw, &decoded); err != nil || decoded.Schema != "researchos.native-qualification-prelaunch.v1" || decoded.Context.TaskID != receipt.TaskID || decoded.Context.RunID != receipt.RunID || decoded.Context.Epoch != receipt.Epoch || decoded.Context.NativeHash != receipt.NativeHash || decoded.Context.HelperHash != receipt.HelperHash || decoded.Context.TemplateHash != receipt.TemplateHash || decoded.Context.HostBoot != receipt.HostBoot || decoded.Context.Nonce != receipt.Nonce || decoded.Context.LoopbackPort != receipt.LoopbackPort || decoded.Context.PlanHash != receipt.PlanHash || decoded.JobLimitFlags != flags {
++		t.Fatal("intent roundtrip lost provenance", decoded, err)
++	}
++	if _, err = persistQualificationPrelaunchIntent(context.Background(), path, record, qualificationCollectorHooks{}); !errors.Is(err, os.ErrExist) {
++		t.Fatal("existing intent overwritten", err)
++	}
++	second, _ := os.ReadFile(path)
++	if !bytes.Equal(raw, second) {
++		t.Fatal("existing intent bytes changed")
++	}
++	mutations := []struct {
++		name   string
++		change func(*qualificationReceiptContext)
++	}{
++		{"task", func(r *qualificationReceiptContext) { r.TaskID = "" }},
++		{"source binding", func(r *qualificationReceiptContext) { r.SourceBindingHash = Hash([]byte("changed")) }},
++		{"source", func(r *qualificationReceiptContext) { r.Source += "-changed" }},
++		{"native", func(r *qualificationReceiptContext) { r.NativeHash = Hash([]byte("changed")) }},
++		{"helper", func(r *qualificationReceiptContext) { r.HelperHash = Hash([]byte("changed")) }},
++		{"Host build", func(r *qualificationReceiptContext) { r.HostBuildHash = "invalid" }},
++		{"template", func(r *qualificationReceiptContext) { r.TemplateHash = Hash([]byte("changed")) }},
++		{"environment", func(r *qualificationReceiptContext) { r.EnvironmentHash = Hash([]byte("changed")) }},
++		{"Host boot", func(r *qualificationReceiptContext) { r.HostBoot = "changed" }},
++		{"nonce", func(r *qualificationReceiptContext) { r.Nonce = "changed" }},
++		{"port", func(r *qualificationReceiptContext) { r.LoopbackPort++ }},
++		{"plan", func(r *qualificationReceiptContext) { r.PlanHash = Hash([]byte("changed")) }},
++		{"argv order", func(r *qualificationReceiptContext) {
++			r.RenderedArgv[0], r.RenderedArgv[1] = r.RenderedArgv[1], r.RenderedArgv[0]
++		}},
++	}
++	for _, tc := range mutations {
++		t.Run(tc.name, func(t *testing.T) {
++			changed := receipt
++			changed.RenderedArgv = slices.Clone(receipt.RenderedArgv)
++			tc.change(&changed)
++			if _, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, changed, limits); err == nil {
++				t.Fatal("mutated provenance accepted")
++			}
++		})
++	}
++}
++
++func TestQualificationPrelaunchFaultsNeverLaunch(t *testing.T) {
++	for _, mode := range []string{"existing", "short", "sync", "close", "readback", "oversize", "marshal", "cancel"} {
++		t.Run(mode, func(t *testing.T) {
++			exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, mode)
++			path := base + ".prelaunch.json"
++			if mode == "existing" {
++				if err := os.WriteFile(path, []byte("existing consumed intent"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			called := 0
++			hooks := qualificationCollectorHooks{launch: func(windows.Handle, Command, []string, *os.File, *os.File, *os.File) (*process, error) {
++				called++
++				return nil, errors.New("launch spy must not run")
++			}}
++			if mode == "short" || mode == "sync" || mode == "close" {
++				hooks.openIntent = func(name string) (qualificationIntentWriter, error) {
++					f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++					if err != nil {
++						return nil, err
++					}
++					return &qualificationFaultWriter{file: f, short: mode == "short", syncErr: func() error {
++						if mode == "sync" {
++							return errors.New("synthetic sync fault")
++						}
++						return nil
++					}(), closeErr: func() error {
++						if mode == "close" {
++							return errors.New("synthetic close fault")
++						}
++						return nil
++					}()}, nil
++				}
++			}
++			if mode == "readback" {
++				hooks.readIntent = func(string) ([]byte, error) { return []byte("changed readback"), nil }
++			}
++			if mode == "oversize" {
++				hooks.marshalIntent = func(qualificationPrelaunchIntent) ([]byte, error) {
++					return bytes.Repeat([]byte{'x'}, qualificationIntentMaxBytes+1), nil
++				}
++			}
++			if mode == "marshal" {
++				hooks.marshalIntent = func(qualificationPrelaunchIntent) ([]byte, error) { return nil, errors.New("synthetic marshal fault") }
++			}
++			if mode == "cancel" {
++				hooks.afterIntentReady = cancel
++			}
++			capture := collectQualificationWithHooks(ctx, exe, args, env, cwd, jobName, base, receipt, hooks)
++			if called != 0 || capture.PID != 0 || capture.Err == nil {
++				t.Fatal("prelaunch fault called launch or fabricated PID", mode, called, capture.PID, capture.Err)
++			}
++			raw, err := os.ReadFile(path)
++			if mode == "existing" {
++				if err != nil || string(raw) != "existing consumed intent" {
++					t.Fatal("existing evidence overwritten", err, string(raw))
++				}
++			}
++			if mode == "short" || mode == "sync" || mode == "close" || mode == "readback" || mode == "cancel" {
++				if err != nil || len(raw) == 0 {
++					t.Fatal("partial/complete failed intent discarded", mode, err)
++				}
++			}
++			if mode == "oversize" || mode == "marshal" {
++				if !errors.Is(err, os.ErrNotExist) {
++					t.Fatal("invalid intent unexpectedly opened", mode, err)
++				}
++			}
++		})
++	}
++}
++
++func TestQualificationPrelaunchQueriedJobDurableBeforeLaunch(t *testing.T) {
++	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "ordering")
++	var order []string
++	hooks := qualificationCollectorHooks{
++		afterJobQueried: func(job windows.Handle, limits qualificationJobLimits) {
++			ids, err := jobPIDs(job)
++			if err != nil || len(ids) != 0 || limits.Processes != qualificationProcessLimit || limits.Memory != uint64(qualificationJobMemory) {
++				t.Fatal("Job not queried and empty before intent", ids, limits, err)
++			}
++			order = append(order, "job-queried")
++		},
++		openIntent: func(name string) (qualificationIntentWriter, error) {
++			order = append(order, "open-exclusive")
++			f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++			if err != nil {
++				return nil, err
++			}
++			return &qualificationFaultWriter{file: f, order: &order}, nil
++		},
++		readIntent: func(name string) ([]byte, error) { order = append(order, "readback"); return os.ReadFile(name) },
++		launch: func(windows.Handle, Command, []string, *os.File, *os.File, *os.File) (*process, error) {
++			order = append(order, "launch-spy")
++			return nil, errors.New("inert launch spy")
++		},
++	}
++	capture := collectQualificationWithHooks(context.Background(), exe, args, env, cwd, jobName, base, receipt, hooks)
++	want := []string{"job-queried", "open-exclusive", "write", "sync", "close", "readback", "launch-spy"}
++	if !slices.Equal(order, want) || capture.PID != 0 || capture.Err == nil || !qualificationSHA(capture.PrelaunchIntentSHA256) {
++		t.Fatal("same-Job durable order violated", order, capture.PID, capture.Err)
++	}
++	if err := persistQualificationCapture(base, qualificationCapture{PID: 42}, "PASS", receipt); err == nil {
++		t.Fatal("final-only receipt accepted without intent")
++	}
++	if err := verifyQualificationFinalIntent(base, capture, receipt); err != nil {
++		t.Fatal("valid intent link rejected", err)
++	}
++	path := base + ".prelaunch.json"
++	if err := os.WriteFile(path, []byte("tampered"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := verifyQualificationFinalIntent(base, capture, receipt); err == nil {
++		t.Fatal("altered intent still verified")
++	}
++}

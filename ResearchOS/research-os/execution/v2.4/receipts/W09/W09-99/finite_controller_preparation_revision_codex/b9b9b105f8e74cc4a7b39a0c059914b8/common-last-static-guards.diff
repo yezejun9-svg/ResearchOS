@@ -1,0 +1,37 @@
+--- controller_common.v2.final.py
++++ controller_common.v2.sealed.py
+@@ -40,12 +40,22 @@
+  if any(actual[k]!=row[k] for k in ['path','sha256','bytes']):raise Stop('Pin mismatch '+row['path'])
+  return actual
+ 
++def make_owned_parents(parent):
++ parent=Path(parent)
++ if not parent.is_absolute() or '..' in parent.parts:raise Stop('Absolute bounded receipt parent required')
++ missing=[];current=parent
++ while not current.exists():
++  missing.append(current);current=current.parent
++ no_alias(current)
++ for directory in reversed(missing):
++  no_alias(directory.parent);directory.mkdir(exist_ok=False);no_alias(directory)
++
+ def write_json(path,obj):
+- p=Path(path);p.parent.mkdir(parents=True,exist_ok=True);no_alias(p,False)
++ p=Path(path);make_owned_parents(p.parent);no_alias(p,False)
+  with p.open('x',encoding='utf-8',newline='\n') as f:json.dump(obj,f,ensure_ascii=False,indent=2,allow_nan=False);f.write('\n')
+  return file_ref(p)
+ def write_bytes(path,data):
+- p=Path(path);p.parent.mkdir(parents=True,exist_ok=True);no_alias(p,False)
++ p=Path(path);make_owned_parents(p.parent);no_alias(p,False)
+  with p.open('xb') as f:f.write(data)
+  return file_ref(p)
+ def trusted_module(path,expected):
+@@ -110,7 +120,8 @@
+   if pin['path'].casefold() in bypath:raise Stop('Duplicate registration manifest path')
+   read_bound_file(pin);bypath[pin['path'].casefold()]=pin
+  def sealed(pin):
+-  if bypath.get(pin['path'].casefold())!=pin:raise Stop('Required registration object not sealed')
++  bound=bypath.get(pin['path'].casefold())
++  if bound is None or any(bound[k]!=pin[k] for k in ['path','sha256','bytes']):raise Stop('Required registration object not sealed')
+  for key in ['registration_audit_ref','registration_intent_ref','registration_invocation_ref','registration_register_ref','registration_wrapper_ref']:
+   sealed(g[key])
+  audit=read_bound(g['registration_audit_ref']);intent=read_bound(g['registration_intent_ref']);inv=read_bound(g['registration_invocation_ref']);rr=read_bound(g['registration_review_ref'])

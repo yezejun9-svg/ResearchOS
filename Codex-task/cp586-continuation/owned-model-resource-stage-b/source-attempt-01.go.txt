@@ -1,0 +1,947 @@
+//go:build windows
+
+// Preparation artifact only. A reviewed Root invocation with -execute and the
+// exact scope digest is required; author preparation never runs this program.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode/utf16"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+const stageARoot = `C:\Users\yqyyds\Documents\Codex\2026-11-04\task\cp586-continuation\owned-model-resource`
+const stageBRoot = `C:\Users\yqyyds\Documents\Codex\2026-11-04\task\cp586-continuation\owned-model-resource-stage-b`
+const stageASHA = "1ee48d848976e0d1aff869c474516cc6ce90bdc7373fd2735b27b6dc6b61fd24"
+const modelSHA = "0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0"
+const endpoint = "http://127.0.0.1:43861"
+const desiredVersion = "0.30.0-rc31"
+const modelName = "qwen3:4b-instruct"
+const streamBound = 2 << 20
+
+type scope struct {
+	Schema                string   `json:"schema"`
+	Owner                 string   `json:"owner"`
+	Status                string   `json:"status"`
+	BaselineCheckpoint    int      `json:"baseline_checkpoint"`
+	StageAManifestSHA     string   `json:"stage_a_manifest_sha256"`
+	ControllerSHA         string   `json:"controller_sha256"`
+	SourceSHA             string   `json:"source_sha256"`
+	DependencySHA         string   `json:"dependency_manifest_sha256"`
+	Endpoint              string   `json:"endpoint"`
+	RunRoot               string   `json:"run_root"`
+	NativeSeconds         int      `json:"native_seconds"`
+	StartupSeconds        int      `json:"startup_seconds"`
+	CleanupSeconds        int      `json:"cleanup_seconds"`
+	MaxProcesses          int      `json:"max_processes"`
+	GETPaths              []string `json:"get_paths"`
+	InferenceLimit        int      `json:"inference_limit"`
+	OldFailureDisposition string   `json:"old_failure_disposition"`
+}
+type asset struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Relative    string `json:"destination_relative"`
+	Bytes       int64  `json:"bytes"`
+	SourceSHA   string `json:"source_sha256"`
+	TargetSHA   string `json:"destination_sha256"`
+	Verified    bool   `json:"verified"`
+}
+type assetManifest struct {
+	Status string  `json:"status"`
+	Count  int     `json:"verified_asset_file_count"`
+	Bytes  int64   `json:"asset_bytes"`
+	Assets []asset `json:"assets"`
+}
+type journal struct {
+	mu  sync.Mutex
+	f   *os.File
+	seq int
+}
+
+func (j *journal) event(kind string, body any) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.seq++
+	b, e := json.Marshal(map[string]any{"sequence": j.seq, "utc": time.Now().UTC().Format(time.RFC3339Nano), "event": kind, "data": body})
+	if e != nil {
+		return e
+	}
+	if _, e = j.f.Write(append(b, '\n')); e != nil {
+		return e
+	}
+	return j.f.Sync()
+}
+func writeNew(path string, v any) error {
+	b, e := json.MarshalIndent(v, "", "  ")
+	if e != nil {
+		return e
+	}
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return e
+	}
+	defer f.Close()
+	if _, e = f.Write(append(b, '\n')); e != nil {
+		return e
+	}
+	return f.Sync()
+}
+func hashFile(path string) (string, error) {
+	f, e := os.Open(path)
+	if e != nil {
+		return "", e
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, e = io.Copy(h, f); e != nil {
+		return "", e
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+func utf(s string) *uint16 {
+	p, e := windows.UTF16PtrFromString(s)
+	if e != nil {
+		panic(e)
+	}
+	return p
+}
+func plain(path string) error {
+	for p := filepath.Clean(path); p != ""; p = filepath.Dir(p) {
+		a, e := windows.GetFileAttributes(utf(p))
+		if e != nil {
+			return e
+		}
+		if a&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return fmt.Errorf("reparse refused: %s", p)
+		}
+		if filepath.Dir(p) == p {
+			break
+		}
+	}
+	return nil
+}
+func under(root, path string) bool {
+	r, e := filepath.Rel(root, path)
+	return e == nil && r != "." && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) && !filepath.IsAbs(r)
+}
+func verifyAssets() (assetManifest, error) {
+	var m assetManifest
+	p := filepath.Join(stageARoot, "MANIFEST.json")
+	h, e := hashFile(p)
+	if e != nil || h != stageASHA {
+		return m, fmt.Errorf("Stage A manifest pin differs: %w", e)
+	}
+	b, e := os.ReadFile(p)
+	if e != nil {
+		return m, e
+	}
+	if e = json.Unmarshal(b, &m); e != nil {
+		return m, e
+	}
+	if m.Status != "ASSETS_STAGED_NOT_STARTED" || m.Count != 981 || len(m.Assets) != 981 || m.Bytes != 5686303776 {
+		return m, errors.New("Stage A count/status differs")
+	}
+	seen := map[string]bool{}
+	var total int64
+	for _, a := range m.Assets {
+		if !under(stageARoot, a.Destination) || a.SourceSHA != a.TargetSHA || !a.Verified {
+			return m, errors.New("asset identity differs")
+		}
+		k := strings.ToLower(filepath.Clean(a.Destination))
+		if seen[k] {
+			return m, errors.New("duplicate asset")
+		}
+		seen[k] = true
+		if e = plain(a.Destination); e != nil {
+			return m, e
+		}
+		info, e := os.Stat(a.Destination)
+		if e != nil || !info.Mode().IsRegular() || info.Size() != a.Bytes {
+			return m, fmt.Errorf("asset size/type differs: %s", a.Relative)
+		}
+		h, e := hashFile(a.Destination)
+		if e != nil || h != a.TargetSHA {
+			return m, fmt.Errorf("asset SHA differs: %s", a.Relative)
+		}
+		total += a.Bytes
+	}
+	actual := 0
+	for _, dir := range []string{"runtime", "models"} {
+		e = filepath.WalkDir(filepath.Join(stageARoot, dir), func(p string, d os.DirEntry, e error) error {
+			if e != nil {
+				return e
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return errors.New("asset link refused")
+			}
+			if !d.IsDir() {
+				actual++
+				if !seen[strings.ToLower(filepath.Clean(p))] {
+					return errors.New("undeclared asset")
+				}
+			}
+			return nil
+		})
+		if e != nil {
+			return m, e
+		}
+	}
+	if actual != 981 || total != m.Bytes {
+		return m, errors.New("asset roster differs")
+	}
+	for _, p := range []string{"profile/.ollama", "profile/AppData/Local", "profile/AppData/Roaming", "tmp"} {
+		entries, e := os.ReadDir(filepath.Join(stageARoot, p))
+		if e != nil || len(entries) != 0 {
+			return m, errors.New("Stage A empty profile changed")
+		}
+	}
+	return m, nil
+}
+func readScope(path, pin string) (scope, error) {
+	var s scope
+	if !strings.EqualFold(filepath.Clean(path), filepath.Join(stageBRoot, "SCOPE.json")) {
+		return s, errors.New("fixed scope path required")
+	}
+	h, e := hashFile(path)
+	if e != nil || h != pin || len(pin) != 64 {
+		return s, errors.New("Root must supply exact reviewed scope SHA")
+	}
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return s, e
+	}
+	d := json.NewDecoder(strings.NewReader(string(b)))
+	d.DisallowUnknownFields()
+	if e = d.Decode(&s); e != nil {
+		return s, e
+	}
+	if s.Schema != "researchos.owned-ollama-stage-b.v1" || s.Owner != "codex:/root/runtime_readiness" || s.Status != "PREPARED_NOT_EXECUTED" || s.BaselineCheckpoint != 587 || s.StageAManifestSHA != stageASHA || s.Endpoint != endpoint || !strings.EqualFold(filepath.Clean(s.RunRoot), filepath.Join(stageBRoot, "run-01")) || s.NativeSeconds != 60 || s.StartupSeconds != 30 || s.CleanupSeconds != 15 || s.MaxProcesses != 32 || s.InferenceLimit != 0 || strings.Join(s.GETPaths, ",") != "/api/version,/api/tags" || s.OldFailureDisposition != "PRESERVE_ALL_NO_REPLAY_NO_RESET" {
+		return s, errors.New("scope invariants differ")
+	}
+	exe, e := os.Executable()
+	if e != nil {
+		return s, e
+	}
+	h, e = hashFile(exe)
+	if e != nil || h != s.ControllerSHA {
+		return s, errors.New("controller binary pin differs")
+	}
+	for name, pin := range map[string]string{"main_windows.go": s.SourceSHA, "PUBLIC-DEPENDENCY.json": s.DependencySHA} {
+		h, e = hashFile(filepath.Join(stageBRoot, name))
+		if e != nil || h != pin {
+			return s, fmt.Errorf("preparation pin differs: %s", name)
+		}
+	}
+	return s, plain(stageBRoot)
+}
+func childEnvironment(run string) ([]uint16, []string, error) {
+	system := os.Getenv("SystemRoot")
+	if !filepath.IsAbs(system) {
+		return nil, nil, errors.New("absolute SystemRoot required")
+	}
+	profile := filepath.Join(run, "profile")
+	local := filepath.Join(profile, "AppData", "Local")
+	roam := filepath.Join(profile, "AppData", "Roaming")
+	tmp := filepath.Join(run, "tmp")
+	for _, d := range []string{filepath.Join(profile, ".ollama"), local, roam, tmp} {
+		if e := os.MkdirAll(d, 0700); e != nil {
+			return nil, nil, e
+		}
+		if e := plain(d); e != nil {
+			return nil, nil, e
+		}
+	}
+	env := map[string]string{"SystemRoot": system, "WINDIR": system, "USERPROFILE": profile, "LOCALAPPDATA": local, "APPDATA": roam, "TEMP": tmp, "TMP": tmp, "PATH": strings.Join([]string{filepath.Join(stageARoot, "runtime"), filepath.Join(stageARoot, "runtime", "lib", "ollama"), filepath.Join(system, "System32")}, ";"), "OLLAMA_HOST": "127.0.0.1:43861", "OLLAMA_MODELS": filepath.Join(stageARoot, "models"), "OLLAMA_NO_CLOUD": "1", "OLLAMA_NOPRUNE": "1", "OLLAMA_DEBUG": "0", "OLLAMA_NOHISTORY": "1"}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := []string{}
+	for _, k := range keys {
+		pairs = append(pairs, k+"="+env[k])
+	}
+	return utf16.Encode([]rune(strings.Join(pairs, "\x00") + "\x00\x00")), keys, nil
+}
+
+type processRecord struct {
+	PID           uint32 `json:"pid"`
+	CreationTicks string `json:"creation_filetime_decimal"`
+	Image         string `json:"image"`
+	ImageSHA      string `json:"image_sha256"`
+	HandleHeld    bool   `json:"handle_held"`
+	InJob         bool   `json:"in_owned_job"`
+	NewEvent      bool   `json:"new_process_event"`
+	Signaled      bool   `json:"signaled_after_cleanup"`
+	ExitCode      uint32 `json:"exit_code"`
+	h             windows.Handle
+}
+type accounting struct {
+	User, Kernel, PeriodUser, PeriodKernel int64
+	Faults, Total, Active, Terminated      uint32
+}
+type tracker struct {
+	mu        sync.Mutex
+	job, port windows.Handle
+	records   map[uint32]*processRecord
+	fail      []string
+	stop      chan struct{}
+	done      chan struct{}
+	j         *journal
+}
+
+var isInJob = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")
+
+func inJob(h, j windows.Handle) (bool, error) {
+	var v uint32
+	r, _, e := isInJob.Call(uintptr(h), uintptr(j), uintptr(unsafe.Pointer(&v)))
+	if r == 0 {
+		return false, e
+	}
+	return v != 0, nil
+}
+func describe(h windows.Handle, pid uint32, job windows.Handle) (*processRecord, error) {
+	own, e := inJob(h, job)
+	if e != nil || !own {
+		return nil, errors.New("process not in owned job")
+	}
+	var c, x, k, u windows.Filetime
+	if e = windows.GetProcessTimes(h, &c, &x, &k, &u); e != nil {
+		return nil, e
+	}
+	buf := make([]uint16, 32768)
+	n := uint32(len(buf))
+	if e = windows.QueryFullProcessImageName(h, 0, &buf[0], &n); e != nil {
+		return nil, e
+	}
+	path := windows.UTF16ToString(buf[:n])
+	sha, e := hashFile(path)
+	if e != nil {
+		return nil, e
+	}
+	return &processRecord{PID: pid, CreationTicks: strconv.FormatUint(uint64(c.HighDateTime)<<32|uint64(c.LowDateTime), 10), Image: path, ImageSHA: sha, HandleHeld: true, InJob: true, h: h}, nil
+}
+func (t *tracker) failed(s string) {
+	t.mu.Lock()
+	t.fail = append(t.fail, s)
+	t.mu.Unlock()
+	_ = t.j.event("CHILD_TRACKING_FAILED", s)
+}
+func (t *tracker) add(h windows.Handle, pid uint32, event bool, owns bool) error {
+	r, e := describe(h, pid, t.job)
+	if e != nil {
+		if owns {
+			windows.CloseHandle(h)
+		}
+		return e
+	}
+	r.NewEvent = event
+	t.mu.Lock()
+	old := t.records[pid]
+	if old != nil {
+		if old.CreationTicks != r.CreationTicks {
+			t.mu.Unlock()
+			if owns {
+				windows.CloseHandle(h)
+			}
+			return errors.New("PID reused within job")
+		}
+		old.NewEvent = old.NewEvent || event
+		t.mu.Unlock()
+		if owns {
+			windows.CloseHandle(h)
+		}
+		return nil
+	}
+	t.records[pid] = r
+	t.mu.Unlock()
+	return t.j.event("OWNED_PROCESS_HANDLE_HELD", r)
+}
+func (t *tracker) watch() {
+	defer close(t.done)
+	for {
+		select {
+		case <-t.stop:
+			return
+		default:
+		}
+		var msg uint32
+		var key uintptr
+		var over *windows.Overlapped
+		e := windows.GetQueuedCompletionStatus(t.port, &msg, &key, &over, 100)
+		if e != nil {
+			if errors.Is(e, syscall.Errno(258)) {
+				continue
+			}
+			t.failed("completion port: " + e.Error())
+			return
+		}
+		if key != 1 {
+			t.failed("foreign completion key")
+			continue
+		}
+		pid := uint32(uintptr(unsafe.Pointer(over)))
+		if msg == 6 {
+			t.mu.Lock()
+			already := t.records[pid]
+			if already != nil {
+				already.NewEvent = true
+			}
+			t.mu.Unlock()
+			if already != nil {
+				continue
+			}
+			h, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+			if e != nil {
+				t.failed(fmt.Sprintf("OpenProcess child %d: %v", pid, e))
+				continue
+			}
+			if e = t.add(h, pid, true, true); e != nil {
+				t.failed(e.Error())
+			}
+		} else {
+			_ = t.j.event("JOB_NOTIFICATION", map[string]any{"message": msg, "pid": pid})
+		}
+	}
+}
+func (t *tracker) healthy() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.fail) > 0 {
+		return errors.New(strings.Join(t.fail, "; "))
+	}
+	return nil
+}
+func (t *tracker) ownsPID(pid uint32) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r := t.records[pid]
+	if r == nil {
+		return false
+	}
+	v, e := inJob(r.h, t.job)
+	state, se := windows.WaitForSingleObject(r.h, 0)
+	return e == nil && v && se == nil && state == windows.WAIT_TIMEOUT
+}
+func jobCounts(job windows.Handle) (accounting, error) {
+	var a accounting
+	e := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), nil)
+	return a, e
+}
+func (t *tracker) finish(total uint32) ([]processRecord, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := []processRecord{}
+	for _, r := range t.records {
+		state, e := windows.WaitForSingleObject(r.h, 0)
+		r.Signaled = e == nil && state == windows.WAIT_OBJECT_0
+		if e = windows.GetExitCodeProcess(r.h, &r.ExitCode); e != nil {
+			t.fail = append(t.fail, e.Error())
+		}
+		if !r.Signaled || !r.NewEvent {
+			t.fail = append(t.fail, fmt.Sprintf("process %d lacks signaled handle/new event", r.PID))
+		}
+		out = append(out, *r)
+	}
+	if uint32(len(out)) != total {
+		t.fail = append(t.fail, fmt.Sprintf("job total %d differs from held process identities %d", total, len(out)))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
+	if len(t.fail) > 0 {
+		return out, errors.New(strings.Join(t.fail, "; "))
+	}
+	return out, nil
+}
+func (t *tracker) close() {
+	close(t.stop)
+	<-t.done
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, r := range t.records {
+		windows.CloseHandle(r.h)
+	}
+	windows.CloseHandle(t.port)
+}
+
+type boundedLog struct {
+	mu       sync.Mutex
+	f        *os.File
+	count    int64
+	overflow bool
+	tail     []byte
+	done     chan error
+}
+
+func (b *boundedLog) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	b.count += int64(n)
+	if b.count <= streamBound {
+		if _, e := b.f.Write(p); e != nil {
+			return 0, e
+		}
+	} else {
+		b.overflow = true
+	}
+	b.tail = append(b.tail, p...)
+	if len(b.tail) > 65536 {
+		b.tail = b.tail[len(b.tail)-65536:]
+	}
+	return n, nil
+}
+func (b *boundedLog) has(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(string(b.tail), s)
+}
+func (b *boundedLog) exceeded() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.overflow }
+func startLog(read *os.File, path string) (*boundedLog, error) {
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return nil, e
+	}
+	b := &boundedLog{f: f, done: make(chan error, 1)}
+	go func() { _, e := io.Copy(b, read); e = errors.Join(e, f.Sync(), f.Close(), read.Close()); b.done <- e }()
+	return b, nil
+}
+
+var tcpTable = windows.NewLazySystemDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
+
+// A passive OS table read filtered to the one declared endpoint, not a port scan.
+func listenerPID() (uint32, error) {
+	var size uint32
+	r, _, _ := tcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2, 3, 0)
+	if r != 122 {
+		return 0, fmt.Errorf("TCP table sizing: %d", r)
+	}
+	if size < 4 || size > 16<<20 {
+		return 0, errors.New("TCP table bound")
+	}
+	b := make([]byte, size)
+	r, _, _ = tcpTable.Call(uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&size)), 0, 2, 3, 0)
+	if r != 0 {
+		return 0, fmt.Errorf("TCP table read: %d", r)
+	}
+	n := binary.LittleEndian.Uint32(b[:4])
+	if uint64(n)*24+4 > uint64(size) {
+		return 0, errors.New("TCP table truncated")
+	}
+	var found uint32
+	for i := uint32(0); i < n; i++ {
+		row := b[4+i*24 : 4+(i+1)*24]
+		port := binary.BigEndian.Uint16(row[8:10])
+		if port != 43861 {
+			continue
+		}
+		if row[4] != 127 || row[5] != 0 || row[6] != 0 || row[7] != 1 {
+			return 0, errors.New("declared port has a foreign local bind")
+		}
+		if found != 0 {
+			return 0, errors.New("multiple declared listeners")
+		}
+		found = binary.LittleEndian.Uint32(row[20:24])
+	}
+	return found, nil
+}
+func metadataGET(ctx context.Context, run, path string, j *journal, t *tracker, counts map[string]int) ([]byte, error) {
+	if (path != "/api/version" && path != "/api/tags") || counts[path] != 0 {
+		return nil, errors.New("GET path not allowed or already attempted")
+	}
+	pid, e := listenerPID()
+	if e != nil || !t.ownsPID(pid) {
+		return nil, errors.New("endpoint is not held owned-job process")
+	}
+	if e = j.event("GET_ATTEMPT_ONCE", map[string]any{"method": "GET", "url": endpoint + path, "listener_pid": pid, "credentials": false}); e != nil {
+		return nil, e
+	}
+	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, e := http.NewRequestWithContext(ctx, "GET", endpoint+path, nil)
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("Accept", "application/json")
+	counts[path] = 1
+	response, e := client.Do(req)
+	if e != nil {
+		return nil, e
+	}
+	defer response.Body.Close()
+	raw, e := io.ReadAll(io.LimitReader(response.Body, 65537))
+	if e != nil {
+		return nil, e
+	}
+	if len(raw) > 65536 {
+		return nil, errors.New("metadata body too large")
+	}
+	if response.StatusCode != 200 {
+		return nil, fmt.Errorf("metadata HTTP status %d", response.StatusCode)
+	}
+	file := filepath.Join(run, strings.TrimPrefix(path, "/api/")+".response.json")
+	f, e := os.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return nil, e
+	}
+	_, e = f.Write(raw)
+	e = errors.Join(e, f.Sync(), f.Close())
+	return raw, e
+}
+
+func run(s scope) (result map[string]any, finalErr error) {
+	result = map[string]any{"status": "FAILED_OR_BLOCKED", "server_start_attempts": 0, "metadata_get_attempts": map[string]int{"/api/version": 0, "/api/tags": 0}, "inference_calls": 0, "paid_provider_calls": 0, "old_root_writes": 0, "qualification_replayed": false, "counter_reset": false, "resource_ready": false, "formal_increment": 0}
+	if _, e := verifyAssets(); e != nil {
+		return result, e
+	}
+	if e := os.Mkdir(s.RunRoot, 0700); e != nil {
+		return result, fmt.Errorf("exclusive run root: %w", e)
+	}
+	log, e := os.OpenFile(filepath.Join(s.RunRoot, "events.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return result, e
+	}
+	j := &journal{f: log}
+	defer log.Close()
+	defer func() {
+		result["finished_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+		if finalErr != nil {
+			result["error"] = finalErr.Error()
+		}
+		if e := writeNew(filepath.Join(s.RunRoot, "RESULT.json"), result); e != nil {
+			finalErr = errors.Join(finalErr, e)
+		}
+	}()
+	// Exact new port conflict/capability preflight. Any refusal stops before create.
+	listener, e := net.Listen("tcp4", "127.0.0.1:43861")
+	if e != nil {
+		return result, fmt.Errorf("PRELAUNCH_PORT_BLOCKED: %w", e)
+	}
+	if e = listener.Close(); e != nil {
+		return result, e
+	}
+	env, keys, e := childEnvironment(s.RunRoot)
+	if e != nil {
+		return result, e
+	}
+	if e = j.event("ISOLATED_ENVIRONMENT_KEYS_ONLY", keys); e != nil {
+		return result, e
+	}
+	job, e := windows.CreateJobObject(nil, nil)
+	if e != nil {
+		return result, e
+	}
+	defer windows.CloseHandle(job)
+	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+	limits.BasicLimitInformation.ActiveProcessLimit = uint32(s.MaxProcesses)
+	if _, e = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); e != nil {
+		return result, e
+	}
+	port, e := windows.CreateIoCompletionPort(windows.InvalidHandle, 0, 0, 1)
+	if e != nil {
+		return result, e
+	}
+	association := struct {
+		Key  uintptr
+		Port windows.Handle
+	}{1, port}
+	if _, e = windows.SetInformationJobObject(job, 7, uintptr(unsafe.Pointer(&association)), uint32(unsafe.Sizeof(association))); e != nil {
+		windows.CloseHandle(port)
+		return result, e
+	}
+	t := &tracker{job: job, port: port, records: map[uint32]*processRecord{}, stop: make(chan struct{}), done: make(chan struct{}), j: j}
+	go t.watch()
+	defer t.close()
+	stdin, e := os.Open(os.DevNull)
+	if e != nil {
+		return result, e
+	}
+	defer stdin.Close()
+	outR, outW, e := os.Pipe()
+	if e != nil {
+		return result, e
+	}
+	defer outR.Close()
+	defer outW.Close()
+	errR, errW, e := os.Pipe()
+	if e != nil {
+		return result, e
+	}
+	defer errR.Close()
+	defer errW.Close()
+	stdout, e := startLog(outR, filepath.Join(s.RunRoot, "stdout.raw"))
+	if e != nil {
+		return result, e
+	}
+	stderr, e := startLog(errR, filepath.Join(s.RunRoot, "stderr.raw"))
+	if e != nil {
+		return result, e
+	}
+	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(outW.Fd()), windows.Handle(errW.Fd())}
+	for _, h := range handles {
+		if e = windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
+			return result, e
+		}
+		defer windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, 0)
+	}
+	attrs, e := windows.NewProcThreadAttributeList(2)
+	if e != nil {
+		return result, e
+	}
+	defer attrs.Delete()
+	if e = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); e != nil {
+		return result, e
+	}
+	// Atomic job attachment at suspended creation prevents an unassigned orphan
+	// if the controller dies between CreateProcess and a later AssignProcess call.
+	if e = attrs.Update(0x0002000d, unsafe.Pointer(&job), unsafe.Sizeof(job)); e != nil {
+		return result, e
+	}
+	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.Flags = windows.STARTF_USESTDHANDLES
+	si.StdInput = handles[0]
+	si.StdOutput = handles[1]
+	si.StdErr = handles[2]
+	exe := filepath.Join(stageARoot, "runtime", "ollama.exe")
+	line := utf(syscall.EscapeArg(exe) + " serve")
+	var pi windows.ProcessInformation
+	result["server_start_attempts"] = 1
+	e = windows.CreateProcess(utf(exe), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED, &env[0], utf(s.RunRoot), &si.StartupInfo, &pi)
+	runtime.KeepAlive(handles)
+	runtime.KeepAlive(env)
+	if e != nil {
+		return result, fmt.Errorf("suspended CreateProcess: %w", e)
+	}
+	defer windows.CloseHandle(pi.Thread)
+	defer windows.CloseHandle(pi.Process)
+	nativeCtx, cancelNative := context.WithTimeout(context.Background(), time.Duration(s.NativeSeconds)*time.Second)
+	defer cancelNative()
+	watchdogDone := make(chan struct{})
+	defer close(watchdogDone)
+	go func() {
+		select {
+		case <-watchdogDone:
+			return
+		case <-nativeCtx.Done():
+			if errors.Is(nativeCtx.Err(), context.DeadlineExceeded) {
+				_ = windows.TerminateJobObject(job, 124)
+			}
+		}
+	}()
+	// Always stop this owned job and verify terminal evidence, including errors
+	// before ResumeThread. No name/PID-based termination or old-process adoption.
+	defer func() {
+		outW.Close()
+		errW.Close()
+		stdin.Close()
+		own, membershipErr := inJob(pi.Process, job)
+		if membershipErr != nil || !own {
+			result["unassigned_suspended_primary_cleanup"] = fmt.Sprint(windows.TerminateProcess(pi.Process, 125))
+			finalErr = errors.Join(finalErr, errors.New("atomic job membership not proved"))
+		}
+		killErr := windows.TerminateJobObject(job, 125)
+		deadline := time.Now().Add(time.Duration(s.CleanupSeconds) * time.Second)
+		var a accounting
+		var qerr error
+		for {
+			a, qerr = jobCounts(job)
+			if qerr != nil || a.Active == 0 || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		// Allow queued NEW_PROCESS events to drain; omitted/racing children fail.
+		for time.Now().Before(deadline) {
+			t.mu.Lock()
+			complete := uint32(len(t.records)) == a.Total
+			for _, r := range t.records {
+				complete = complete && r.NewEvent
+			}
+			t.mu.Unlock()
+			if complete {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		processes, trackErr := t.finish(a.Total)
+		result["processes"] = processes
+		result["job_total_processes"] = a.Total
+		result["job_active_after_cleanup"] = a.Active
+		result["job_termination_error"] = fmt.Sprint(killErr)
+		drained := true
+		for _, stream := range []*boundedLog{stdout, stderr} {
+			select {
+			case e := <-stream.done:
+				if e != nil {
+					drained = false
+				}
+			case <-time.After(3 * time.Second):
+				drained = false
+			}
+		}
+		result["streams_drained"] = drained
+		result["log_overflow"] = stdout.exceeded() || stderr.exceeded()
+		primaryState, primaryWaitErr := windows.WaitForSingleObject(pi.Process, 0)
+		primarySignaled := primaryWaitErr == nil && primaryState == windows.WAIT_OBJECT_0
+		result["returned_primary_handle_signaled"] = primarySignaled
+		cleaned := qerr == nil && a.Active == 0 && drained && trackErr == nil && primarySignaled
+		result["cleanup_proved"] = cleaned
+		finalErr = errors.Join(finalErr, qerr, trackErr)
+		if !cleaned || stdout.exceeded() || stderr.exceeded() {
+			finalErr = errors.Join(finalErr, errors.New("cleanup/child tracking/stream bound not proved"))
+		}
+		// The process handles remain held during post-stop asset verification.
+		_, assetErr := verifyAssets()
+		result["stage_a_assets_unchanged_after_stop"] = assetErr == nil
+		finalErr = errors.Join(finalErr, assetErr)
+		if finalErr == nil {
+			result["status"] = "METADATA_VERIFIED_AND_OWNED_JOB_STOPPED_ASSETS_UNCHANGED"
+		}
+		_ = j.event("OWNED_JOB_TERMINAL", map[string]any{"active": a.Active, "total": a.Total, "cleanup_proved": cleaned, "assets_unchanged": assetErr == nil})
+	}()
+	// The tracker receives a duplicate, retaining the original returned handle
+	// independently through cleanup even if its NEW_PROCESS event races ahead.
+	var primaryDuplicate windows.Handle
+	if e = windows.DuplicateHandle(windows.CurrentProcess(), pi.Process, windows.CurrentProcess(), &primaryDuplicate, 0, false, windows.DUPLICATE_SAME_ACCESS); e != nil {
+		return result, e
+	}
+	if e = t.add(primaryDuplicate, pi.ProcessId, false, true); e != nil {
+		return result, e
+	}
+	suspended, e := describe(pi.Process, pi.ProcessId, job)
+	if e != nil {
+		return result, e
+	}
+	if !strings.EqualFold(suspended.Image, exe) {
+		return result, errors.New("created image differs")
+	}
+	if e = writeNew(filepath.Join(s.RunRoot, "SUSPENDED-OWNED-IDENTITY.json"), suspended); e != nil {
+		return result, e
+	}
+	if e = j.event("SUSPENDED_ATOMIC_JOB_ASSIGNMENT_PROVED", suspended); e != nil {
+		return result, e
+	}
+	outW.Close()
+	errW.Close()
+	stdin.Close()
+	ctx, stopSignal := signal.NotifyContext(nativeCtx, os.Interrupt)
+	defer stopSignal()
+	previous, e := windows.ResumeThread(pi.Thread)
+	if e != nil || previous != 1 {
+		return result, fmt.Errorf("ResumeThread prior suspend count=%d: %w", previous, e)
+	}
+	if e = j.event("RESUMED_OWNED_JOB", map[string]any{"pid": pi.ProcessId, "gpu_discovery_children_are_native": true}); e != nil {
+		return result, e
+	}
+	deadline := time.Now().Add(time.Duration(s.StartupSeconds) * time.Second)
+	for {
+		if e = t.healthy(); e != nil {
+			return result, e
+		}
+		if stdout.exceeded() || stderr.exceeded() {
+			return result, errors.New("raw log bound exceeded")
+		}
+		state, e := windows.WaitForSingleObject(pi.Process, 0)
+		if e != nil || state == windows.WAIT_OBJECT_0 {
+			return result, errors.New("owned server exited before metadata")
+		}
+		// This pinned version emits this after GPU discovery and immediately before
+		// entering HTTP Serve; it avoids spending the single GET on an early socket.
+		if stderr.has("vram-based default context") && stderr.has("Ollama cloud disabled: true") {
+			pid, e := listenerPID()
+			if e != nil {
+				return result, e
+			}
+			if t.ownsPID(pid) {
+				break
+			}
+			if pid != 0 {
+				return result, errors.New("declared endpoint belongs to a foreign process")
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			return result, errors.New("startup marker/owned listener deadline exceeded")
+		}
+	}
+	counts := result["metadata_get_attempts"].(map[string]int)
+	raw, e := metadataGET(ctx, s.RunRoot, "/api/version", j, t, counts)
+	if e != nil {
+		return result, e
+	}
+	var version struct {
+		Version string `json:"version"`
+	}
+	if e = json.Unmarshal(raw, &version); e != nil || version.Version != desiredVersion {
+		return result, errors.New("version metadata differs")
+	}
+	raw, e = metadataGET(ctx, s.RunRoot, "/api/tags", j, t, counts)
+	if e != nil {
+		return result, e
+	}
+	var tags struct {
+		Models []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+			Size   int64  `json:"size"`
+		} `json:"models"`
+	}
+	if e = json.Unmarshal(raw, &tags); e != nil || len(tags.Models) != 1 || tags.Models[0].Name != modelName || tags.Models[0].Digest != modelSHA || tags.Models[0].Size != 2497293803 {
+		return result, errors.New("selected model metadata differs")
+	}
+	result["version"] = version.Version
+	result["selected_model"] = modelName
+	result["selected_model_manifest_sha256"] = modelSHA
+	return result, t.healthy()
+}
+func main() {
+	execute := flag.Bool("execute", false, "Root only after independent review; never used during author preparation")
+	scopePath := flag.String("scope", filepath.Join(stageBRoot, "SCOPE.json"), "fixed reviewed scope")
+	pin := flag.String("expected-scope-sha256", "", "Root must supply the exact reviewed scope digest")
+	flag.Parse()
+	if !*execute {
+		fmt.Println("PREPARED_NOT_EXECUTED: explicit reviewed -execute invocation required")
+		return
+	}
+	s, e := readScope(*scopePath, *pin)
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "PRELAUNCH_BLOCKED:", e)
+		os.Exit(2)
+	}
+	result, e := run(s)
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "STAGE_B_FAILED_OR_BLOCKED:", e)
+		os.Exit(1)
+	}
+	b, _ := json.Marshal(map[string]any{"status": result["status"], "run_root": s.RunRoot, "inference": 0, "resource_ready": false})
+	fmt.Println(string(b))
+}

@@ -1,0 +1,349 @@
+import pathlib,hashlib,json,difflib
+E=pathlib.Path(__file__).resolve().parent
+src=E/'fixture_e2e_review.py';dst=E/'fixture_e2e_malformed_preflight.py'
+before=src.read_text(encoding='utf-8');after=before.replace('if MODE not in ("positive",','if MODE not in ("review_malformed_effect_preflight","positive",',1)
+needle='    desc=json.loads(run("fixture-describe",[FIXTURE,"--mode","describe","--root",data,"--out",out,"--pid",core_pid]))'
+inject='''    if MODE=="review_malformed_effect_preflight":
+        db=sqlite3.connect(data/"researchos.sqlite",timeout=5)
+        subject=same_subject()
+        db.execute("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)",(subject["project"],subject["run"],"review-extra-malformed-model",json.dumps({"payload":{"capability":"MODEL"}})))
+        db.commit();db.close()
+'''
+assert needle in after;after=after.replace(needle,inject+needle,1)
+needle='    if MODE in ("bad_exit_missing","bad_wait_missing"):'
+inject='''    if MODE=="review_malformed_effect_preflight":
+        plan=json.loads((out/"plan.json").read_text(encoding="utf-8"))
+        unexpected=plan["eligibility"]=="ELIGIBLE_FOR_INDEPENDENT_REVIEW"
+        record={"case":str(CASE),"mode":MODE,"preflight_eligibility":plan["eligibility"],"preflight_missing":plan.get("missing",[]),"preflight_safety":plan["preflight_safety"],"baseline":plan["baseline"],"additional_effect_body":{"payload":{"capability":"MODEL"}},"stop_grant_built":False,"native_signal_count":0,"source_safety_failure_reproduced":unexpected}
+        write_json(CASE/"case-result.json",record)
+        print(json.dumps(record,indent=2),flush=True)
+        if unexpected:raise AssertionError("STOP-R4-F01: actual compiled preflight authorized malformed additional MODEL effect")
+        sys.exit(0)
+'''
+assert needle in after;after=after.replace(needle,inject+needle,1)
+dst.write_text(after,encoding='utf-8',newline='\n')
+(E/'malformed-preflight-harness.patch').write_text(''.join(difflib.unified_diff(before.splitlines(True),after.splitlines(True),fromfile=str(src),tofile=str(dst))),encoding='utf-8')
+record={'source':str(src),'source_sha256':hashlib.sha256(src.read_bytes()).hexdigest(),'copy':str(dst),'copy_sha256':hashlib.sha256(dst.read_bytes()).hexdigest()}
+(E/'malformed-preflight-harness-lineage.json').write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8');print(record)
+import argparse,os,sys
+import reviewer_logger
+p=argparse.ArgumentParser();p.add_argument('--label');p.add_argument('--cwd');p.add_argument('--env',action='append',default=[]);p.add_argument('command',nargs=argparse.REMAINDER)
+a=p.parse_args()
+if a.cwd:os.chdir(a.cwd)
+for pair in a.env:
+    k,v=pair.split('=',1);os.environ[k]=v
+sys.argv=[sys.argv[0]]+(a.command[1:] if a.command[0]=='--' else a.command)
+reviewer_logger.main()
+import json,os,pathlib,subprocess,sys
+E=pathlib.Path(__file__).resolve().parent
+W=pathlib.Path('D:/作品集/ResearchOS/research-os/.local/worktrees/owned-core-stop-authority-r4-20261015')
+GO='D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe'
+extra=E/'independent_store_review_windows_test.go'
+overlay=E/'store-overlay.json'
+overlay.write_text(json.dumps({'Replace':{str(W/'internal/store/independent_store_review_windows_test.go'):str(extra)}},indent=2),encoding='utf-8')
+args=[GO,'test','-count=1','-v','-overlay',str(overlay),'-run','TestReviewMalformedModelEffectMustNotBeSafe|TestNativeExitProofRequiresExplicitNumericCapturePerClass|TestCommitSignalBoundaryHonorsCallerCancellationAndEarlierDeadline|TestOwnedCoreStopInspectJournalCrashBoundaries|TestOwnedStopOnlineBackupWALAndLogicalCAS|TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter|TestOwnedCoreStopPublicIdentitySameSIDOwnerAndSchema','./internal/ownedcorestop','./internal/store','./internal/host']
+raise SystemExit(subprocess.run([sys.executable,'-B','-X','utf8',str(E/'reviewer_logger.py'),*args],cwd=W).returncode)
+diff --git a/internal/store/owned_stop_barrier_windows.go b/internal/store/owned_stop_barrier_windows.go
+index fb715ca9..ea98b922 100644
+--- a/internal/store/owned_stop_barrier_windows.go
++++ b/internal/store/owned_stop_barrier_windows.go
+@@ -153,6 +153,8 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
+ 	if err := source.QueryRowContext(ctx, `SELECT state,dispatch_key FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.Project, subject.Run, subject.Epoch).Scan(&s.DispatchState, &s.DispatchKey); err != nil {
+ 		return s, err
+ 	}
++	// SQLite != yields NULL for a missing/null state. IS NOT makes that
++	// latest effect unsafe without changing the per-key latest-row selection.
+ 	queries := []struct {
+ 		sql  string
+ 		args []any
+@@ -161,7 +163,7 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
+ 		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND NOT(project=? AND id=?) AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, []any{subject.Project, subject.Run}, &s.UnresolvedOtherRuns},
+ 		{`SELECT count(*) FROM runtime_dispatches WHERE NOT(project=? AND run=? AND epoch=?) AND state IN ('PREPARED','STARTED','UNKNOWN')`, []any{subject.Project, subject.Run, subject.Epoch}, &s.UnresolvedOtherDispatches},
+ 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, nil, &s.UnresolvedExternalEffects},
+-		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state')!='CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state') IS NOT 'CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
+ 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.payload.capability')='MODEL' AND json_extract(body,'$.state')='CONFIRMED' AND x.project=? AND x.run=?`, []any{subject.Project, subject.Run}, &s.ConfirmedModelEffects},
+ 		{`SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`, nil, &s.PendingClientCommands},
+ 		{`SELECT count(*) FROM client_control_requests WHERE state!='CONFIRMED'`, nil, &s.PendingControlRequests},
+diff --git a/internal/store/owned_stop_barrier_windows_test.go b/internal/store/owned_stop_barrier_windows_test.go
+index d903b319..2d3059a9 100644
+--- a/internal/store/owned_stop_barrier_windows_test.go
++++ b/internal/store/owned_stop_barrier_windows_test.go
+@@ -107,6 +107,60 @@ func TestOwnedStopSchema24SafetyRejectsUnresolvedEffectsAndOtherDispatches(t *te
+ 	}
+ }
+ 
++func TestOwnedStopLatestEffectStateFiniteMatrix(t *testing.T) {
++	cases := []struct {
++		name, key, body string
++		sequence        int
++		wantSafe        bool
++	}{
++		{"additional null", "extra", `{"state":null,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional missing", "extra", `{"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional boolean", "extra", `{"state":true,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional numeric", "extra", `{"state":0,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional array", "extra", `{"state":[],"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional object", "extra", `{"state":{},"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional empty string", "extra", `{"state":"","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional unknown enum", "extra", `{"state":"UNRECOGNIZED","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional UNKNOWN", "extra", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional CONFIRMED", "extra", `{"state":"CONFIRMED","payload":{"capability":"MODEL"}}`, 1, false},
++		{"missing capability", "extra", `{"state":null}`, 1, false},
++		{"null capability", "extra", `{"state":null,"payload":{"capability":null}}`, 1, false},
++		{"old latest null", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 2, false},
++		{"old latest missing", "old-model", `{"payload":{"capability":"MODEL"}}`, 2, false},
++		{"old history null before valid latest", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 0, true},
++		{"old history UNKNOWN before valid latest", "old-model", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 0, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			path, db, subject := ownedStopSchema24Fixture(t)
++			if _, err := db.Exec(`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)`, subject.Project, subject.Run, tc.key, tc.sequence, tc.body); err != nil {
++				t.Fatalf("real schema fixture insert: %v", err)
++			}
++			preflight, err := ReadOwnedStopSafetyPreflight(context.Background(), path, subject)
++			if err != nil || preflight.ExactOldSubjectSafe() != tc.wantSafe {
++				t.Fatalf("preflight safety=%v want=%v snapshot=%+v error=%v", preflight.ExactOldSubjectSafe(), tc.wantSafe, preflight, err)
++			}
++			barrier, err := AcquireOwnedStopBarrier(context.Background(), path)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer barrier.Close()
++			reserved, err := barrier.SafetySnapshot(context.Background(), subject)
++			if err != nil || reserved.ExactOldSubjectSafe() != tc.wantSafe {
++				t.Fatalf("reserved safety=%v want=%v snapshot=%+v error=%v", reserved.ExactOldSubjectSafe(), tc.wantSafe, reserved, err)
++			}
++			if preflight != reserved {
++				t.Fatalf("preflight and reserved classifications differ: %+v %+v", preflight, reserved)
++			}
++			if tc.key == "extra" && (tc.name == "additional null" || tc.name == "additional missing") {
++				if reserved.NonModelEffects != 1 || reserved.ConfirmedModelEffects != 1 {
++					t.Fatalf("latest extra malformed MODEL was not counted unsafe: %+v", reserved)
++				}
++			}
++		})
++	}
++}
++
+ func TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter(t *testing.T) {
+ 	path, db := ownedStopFixtureDB(t)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//go:build windows
+
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// OwnedStopBarrier owns one SQLite connection and one zero-row writer reservation.
+// It deliberately exposes no SQL executor or connection to its caller.
+type OwnedStopBarrier struct {
+	db       *sql.DB
+	conn     *sql.Conn
+	reserved bool
+}
+
+type OwnedStopSubject struct {
+	Project     string `json:"project"`
+	Run         string `json:"run"`
+	Epoch       int    `json:"epoch"`
+	DispatchKey string `json:"dispatch_key"`
+	RequestKey  string `json:"request_key"`
+}
+
+type OwnedStopSafetySnapshot struct {
+	RunStatus                 string `json:"run_status"`
+	DispatchState             string `json:"dispatch_state"`
+	DispatchKey               string `json:"dispatch_key"`
+	UnresolvedOtherRuns       int    `json:"unresolved_other_runs"`
+	UnresolvedOtherDispatches int    `json:"unresolved_other_dispatches"`
+	UnresolvedExternalEffects int    `json:"unresolved_external_effects"`
+	NonModelEffects           int    `json:"non_model_effects"`
+	ConfirmedModelEffects     int    `json:"confirmed_model_effects"`
+	PendingClientCommands     int    `json:"pending_client_commands"`
+	PendingControlRequests    int    `json:"pending_control_requests"`
+	SchemaVersion             int    `json:"schema_version"`
+}
+
+func (s OwnedStopSafetySnapshot) ExactOldSubjectSafe() bool {
+	return s.SchemaVersion == 24 && s.RunStatus == "RUNNING" && s.DispatchState == "UNKNOWN" &&
+		s.UnresolvedOtherRuns == 0 && s.UnresolvedOtherDispatches == 0 &&
+		s.UnresolvedExternalEffects == 0 && s.NonModelEffects == 0 && s.ConfirmedModelEffects == 1 &&
+		s.PendingClientCommands == 0 && s.PendingControlRequests == 0
+}
+
+func ownedStopExistingDB(path string) (string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".sqlite") {
+		return "", errors.New("canonical existing SQLite path required")
+	}
+	actual, err := filepath.EvalSymlinks(path)
+	if err != nil || !strings.EqualFold(filepath.Clean(actual), path) {
+		return "", errors.New("SQLite path reparse or absence")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("regular existing SQLite file required")
+	}
+	return path, nil
+}
+
+// AcquireOwnedStopBarrier does not call store.Open, create, bootstrap, migrate,
+// checkpoint or change a persistent PRAGMA. The only SQLite writes it requests
+// are BEGIN IMMEDIATE and ROLLBACK, with no product row write.
+func AcquireOwnedStopBarrier(ctx context.Context, path string) (_ *OwnedStopBarrier, err error) {
+	path, err = ownedStopExistingDB(path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", ownedStopURI(path, "rw"))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	b := &OwnedStopBarrier{db: db}
+	defer func() {
+		if err != nil {
+			_ = b.Close()
+		}
+	}()
+	b.conn, err = db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = b.conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("reserve writer: %w", err)
+	}
+	b.reserved = true
+	if _, err = b.conn.ExecContext(ctx, "PRAGMA query_only=ON"); err != nil {
+		return nil, fmt.Errorf("enable query_only: %w", err)
+	}
+	var readback int
+	if err = b.conn.QueryRowContext(ctx, "PRAGMA query_only").Scan(&readback); err != nil || readback != 1 {
+		return nil, errors.New("query_only readback failed")
+	}
+	return b, nil
+}
+
+// Census reads on the reserved connection, so a Core transaction committed
+// while BEGIN IMMEDIATE waited is included in this exact snapshot.
+func (b *OwnedStopBarrier) Census(ctx context.Context) (OwnedStopCensus, error) {
+	if b == nil || b.conn == nil || !b.reserved {
+		return OwnedStopCensus{}, errors.New("writer reservation unavailable")
+	}
+	return ownedStopCensus(ctx, b.conn)
+}
+
+// SafetySnapshot executes a closed catalog of parameterized SELECTs on the
+// reserved connection. The one historical RUNNING/UNKNOWN subject is allowed;
+// every other unresolved subject or external effect is rejected.
+func (b *OwnedStopBarrier) SafetySnapshot(ctx context.Context, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
+	if b == nil || b.conn == nil || !b.reserved {
+		return OwnedStopSafetySnapshot{}, errors.New("reserved connection required")
+	}
+	return ownedStopSafetySnapshot(ctx, b.conn, subject)
+}
+
+// ReadOwnedStopSafetyPreflight is informational. Commit repeats this exact
+// catalog after acquiring the writer reservation and uses that result.
+func ReadOwnedStopSafetyPreflight(ctx context.Context, path string, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
+	path, err := ownedStopExistingDB(path)
+	if err != nil {
+		return OwnedStopSafetySnapshot{}, err
+	}
+	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
+	if err != nil {
+		return OwnedStopSafetySnapshot{}, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return ownedStopSafetySnapshot(ctx, db, subject)
+}
+
+func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
+	var s OwnedStopSafetySnapshot
+	if subject.Project == "" || subject.Run == "" || subject.Epoch < 1 || subject.DispatchKey == "" || subject.RequestKey == "" {
+		return s, errors.New("exact subject required")
+	}
+	var n, minVersion int
+	if err := source.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&s.SchemaVersion, &minVersion, &n); err != nil || s.SchemaVersion != 24 || minVersion != 1 || n != 24 {
+		return s, errors.New("schema 24 required")
+	}
+	if err := source.QueryRowContext(ctx, `SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='Run' AND id=?`, subject.Project, subject.Run).Scan(&s.RunStatus); err != nil {
+		return s, err
+	}
+	if err := source.QueryRowContext(ctx, `SELECT state,dispatch_key FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.Project, subject.Run, subject.Epoch).Scan(&s.DispatchState, &s.DispatchKey); err != nil {
+		return s, err
+	}
+	// SQLite != yields NULL for a missing/null state. IS NOT makes that
+	// latest effect unsafe without changing the per-key latest-row selection.
+	queries := []struct {
+		sql  string
+		args []any
+		dst  *int
+	}{
+		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND NOT(project=? AND id=?) AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, []any{subject.Project, subject.Run}, &s.UnresolvedOtherRuns},
+		{`SELECT count(*) FROM runtime_dispatches WHERE NOT(project=? AND run=? AND epoch=?) AND state IN ('PREPARED','STARTED','UNKNOWN')`, []any{subject.Project, subject.Run, subject.Epoch}, &s.UnresolvedOtherDispatches},
+		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, nil, &s.UnresolvedExternalEffects},
+		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state') IS NOT 'CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
+		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.payload.capability')='MODEL' AND json_extract(body,'$.state')='CONFIRMED' AND x.project=? AND x.run=?`, []any{subject.Project, subject.Run}, &s.ConfirmedModelEffects},
+		{`SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`, nil, &s.PendingClientCommands},
+		{`SELECT count(*) FROM client_control_requests WHERE state!='CONFIRMED'`, nil, &s.PendingControlRequests},
+	}
+	for _, q := range queries {
+		if err := source.QueryRowContext(ctx, q.sql, q.args...).Scan(q.dst); err != nil {
+			return s, err
+		}
+	}
+	if s.DispatchKey != subject.DispatchKey {
+		return s, errors.New("dispatch identity mismatch")
+	}
+	var requestCount int
+	if err := source.QueryRowContext(ctx, `SELECT count(*) FROM idempotency WHERE project=? AND operation='host:managed-runtime-qualification' AND key=?`, subject.Project, subject.RequestKey).Scan(&requestCount); err != nil {
+		return s, err
+	}
+	if requestCount != 1 {
+		return s, errors.New("exact original request not found")
+	}
+	return s, nil
+}
+
+// Close is idempotent and always rolls back; no COMMIT path exists.
+func (b *OwnedStopBarrier) Close() error {
+	if b == nil {
+		return nil
+	}
+	var errs []error
+	if b.conn != nil {
+		if b.reserved {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, err := b.conn.ExecContext(ctx, "ROLLBACK")
+			cancel()
+			if err != nil {
+				errs = append(errs, err)
+			}
+			b.reserved = false
+		}
+		if err := b.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		b.conn = nil
+	}
+	if b.db != nil {
+		if err := b.db.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		b.db = nil
+	}
+	return errors.Join(errs...)
+}

@@ -1,0 +1,92 @@
+{
+  "step_id": "W14-01",
+  "review_kind": "SCOPED_SECURITY_AND_CORRECTNESS_SOURCE_REVIEW",
+  "reviewer": "codex:/root/w1202_review",
+  "recorded_at": "2026-10-05T15:05:10.6728214Z",
+  "worktree": ".local/worktrees/codex-w1401",
+  "head_at_capture": "c22cd82d16c2c4a8befc1607d1cd8ce32c4beadc",
+  "verdict": "BLOCKING_FINDINGS_REPORTED_REMEDIATION_PENDING_REVIEW",
+  "review_disposition": "REJECT_PENDING_REPAIR_REVIEW",
+  "card_acceptance": "NOT_GRANTED",
+  "independence_limit": "This is a review of root-owned broker, file-tool and protocol integration. The reviewer previously implemented session projection and the Mu deterministic verifier; this record is not independent acceptance of those contributions or of the W14 card.",
+  "execution_boundary": {
+    "product_files_modified_by_this_review": false,
+    "tests_rerun_during_this_review": false,
+    "credential_values_read": false,
+    "provider_calls": 0,
+    "live_qualification_claimed": false,
+    "method": "Read-only source tracing across typed command transaction, canonical Run cancellation, broker effect admission/settlement, filesystem tools, check sandbox and recovery. Previously passed tests were not rerun."
+  },
+  "source_capture_note": "The shared worktree was being repaired concurrently after findings were delivered. These hashes record files at receipt creation, not a claim that every finding remains present in that captured partial remediation. Line references and excerpts below identify the code observed when each finding was raised; all fixes still require targeted verification and follow-up review.",
+  "source_hashes": [
+    {"path":"internal/domain/client_protocol.go","sha256":"6d88b510ab143af9602d07bf5411c212be0a2748ac868c8f89b59cc9c9b03b24"},
+    {"path":"internal/domain/runtime_tools_windows.go","sha256":"ddaa5cf116a58fdad791c9efc8013c9e8b52bb83d76af9cf483cc2e910ae36c7"},
+    {"path":"internal/domain/runtime_model_windows.go","sha256":"f0e4a2dc8a657fe95dbef40d254f49ecb5327d108ddcd9fdb9e539c1801916f4"},
+    {"path":"internal/domain/runtime_sessions_windows.go","sha256":"62d64fa0971ad7e429afdfb505a839fa883507bdf4d00f672e10ffb21efb0fbb"},
+    {"path":"internal/domain/runtime_broker_windows.go","sha256":"7975213a0b31fccd926ecb1dbb54b322879a8763eee3e374d04a121f24355277"},
+    {"path":"internal/domain/runtime_recovery_windows.go","sha256":"26aa6b10bb06b4c823d72ad18a17ebaa165b9a0a36c9ca187be17f9f5136d499"},
+    {"path":"internal/host/runtime_tools_windows.go","sha256":"a7b063ffa894a55ea422a998647ae54a2429e46c5949579054a0d12e391ace2e"},
+    {"path":"internal/host/runtime_check_windows.go","sha256":"e19e68cba45234eab8c897b04ec278599621ab9f5a8b6f700d50f71d3a417e06"}
+  ],
+  "findings": [
+    {
+      "id": "W14-SEC-01",
+      "priority": "P1",
+      "title": "Typed CANCEL acknowledged without cancelling canonical Run",
+      "observed_evidence": ["internal/domain/client_protocol.go:1098-1111 only journals RUN_STATE(CANCEL_REQUESTED) and returns ACKNOWLEDGED", "internal/domain/client_protocol_journal.go:44 AppendSessionEvent writes outbox and session watermark only", "internal/api/v2.go serve calls Execute and commits without an execution-cancel adapter", "internal/domain/runtime_coordinator_windows.go:454 dispatchGate checks canonical Run.status"],
+      "trigger_and_impact": "A valid session.control CANCEL during a running SDK model/tool operation changes the client event stream while canonical Run remains runnable. The coordinator can continue provider/tool effects after the user receives cancellation acknowledgement.",
+      "required_fix": "Within the same command transaction, use current principal authority and the existing canonical cancelRun operation, bind the target to the current session run, then journal the actual new Run revision. Verify typed cancellation stops real execution and cannot target an unrelated run.",
+      "remediation_status": "ROOT_REPORTED_IN_PROGRESS_NOT_REVIEWED"
+    },
+    {
+      "id": "W14-SEC-02",
+      "priority": "P1",
+      "title": "Known unexecuted tool rejection becomes unrecoverable UNKNOWN",
+      "observed_evidence": ["internal/domain/runtime_tools_windows.go:110-125 maps both pre-dispatch authority failure and every RunTool error to UNKNOWN", "internal/host/runtime_tools_windows.go:123-128 rejects paths outside frozen permission before access; 161-162 rejects missing/invalid targets; 340-345 rejects stale expected_hash before replacement", "internal/domain/runtime_recovery_windows.go:253-254 refuses terminal recovery while effectsReconciled fails", "internal/domain/client_protocol_sessions.go clientTurnSettled rejects unresolved effects"],
+      "trigger_and_impact": "A normal denied/missing-file read or stale edit hash leaves an UNKNOWN effect even though no write/process dispatch occurred. The stopped turn cannot settle and the session cannot admit its next turn.",
+      "required_fix": "Give the host port an explicit proven-NOT_APPLIED outcome for pre-dispatch/pre-write rejection, persist a zero-cost receipt, and retain UNKNOWN for uncertain or partially executed operations. Do not blanket-convert arbitrary I/O failures to NOT_APPLIED.",
+      "remediation_status": "ROOT_AND_WORKER_REPORTED_IN_PROGRESS_NOT_REVIEWED"
+    },
+    {
+      "id": "W14-SEC-03",
+      "priority": "P1",
+      "title": "Allowed run_check evidence cannot be recovered under the old effect-file bound",
+      "observed_evidence": ["internal/host/runtime_check_windows.go permits full source/toolchain/vendor host evidence up to 4 MiB", "internal/domain/runtime_tools_windows.go persists host_tool_evidence in effect-*.json", "internal/domain/runtime_recovery_windows.go:297-299 rejects an effect receipt file larger than 128 KiB"],
+      "trigger_and_impact": "A valid check with a sufficiently large toolchain manifest writes a receipt accepted by the live path but rejected during recovery. A crash after persistence and before effect ingestion cannot import the completed operation; larger already-ingested receipts also stop the recovery scan.",
+      "required_fix": "Use one bounded receipt format and limit across write/read/ingest, including envelope overhead and a verified hash binding for host evidence, or split large evidence into a separately sealed referenced file.",
+      "remediation_status": "ROOT_REPORTED_IN_PROGRESS_NOT_REVIEWED"
+    },
+    {
+      "id": "W14-SEC-04",
+      "priority": "P1",
+      "title": "Effect ingestion settles money without validating inner receipt identity/state",
+      "observed_evidence": ["internal/domain/runtime_broker_windows.go:337-345 accepts any receipt object and checks replay before inner identity validation", "internal/domain/runtime_broker_windows.go:348-357 checks response hash only for one MODEL special case", "internal/domain/runtime_broker_windows.go:359-371 otherwise reconciles actual_cost and writes receipt.state without validating receipt key/run_id/epoch/allowed state"],
+      "trigger_and_impact": "An outer fact bound to a valid intent can carry a receipt for another effect/run/epoch, or an UNKNOWN/PREPARED inner state with actual_cost=0. The ingest path can release the original reservation and persist the inconsistent effect. This is an internal/recovery trust-boundary defect, not evidence of a public HTTP injection endpoint.",
+      "required_fix": "Before replay fast return and any budget mutation, validate receipt key/run/epoch against fact and intent, permit only CONFIRMED or proven NOT_APPLIED, and require receipt identity. For W14 TOOL, bind host_tool to the frozen request and verify both provider_response_hash and receipt_id against canonical receipt.payload bytes. For MODEL, verify original SSE hash, receipt_id and transport shape; handle proven no-dispatch separately. Legacy HTTP response hashes cover original JSON bytes, so do not incorrectly compare them with reserialized JSON; use an additional canonical receipt hash or a versioned format if extending that branch.",
+      "remediation_status": "REPORTED_PENDING_IMPLEMENTATION_REVIEW"
+    },
+    {
+      "id": "W14-SEC-05",
+      "priority": "P2",
+      "title": "Valid file read can overflow encoded broker reply",
+      "observed_evidence": ["internal/host/runtime_tools_windows.go:198-202 permits max_read_bytes up to 64 KiB", "internal/host/runtime_tools_windows.go:253-258 duplicates returned file text in content[0].text and details", "internal/domain/runtime_tools_windows.go:134-135 rejects encoded replies above 64 KiB as UNKNOWN"],
+      "trigger_and_impact": "A permitted roughly 32 KiB or larger ASCII read, or smaller heavily escaped text, exceeds the bridge reply bound despite satisfying the host read limit and can wedge the turn as UNKNOWN.",
+      "required_fix": "Budget the encoded complete reply when choosing a read page or enforce a compatible explicit limit, preserving a truthful continuation offset and truncation flag.",
+      "remediation_status": "REPORTED_PENDING_IMPLEMENTATION_REVIEW"
+    },
+    {
+      "id": "W14-SEC-06",
+      "priority": "P2",
+      "title": "Current writer has no same-client lease renewal path",
+      "observed_evidence": ["internal/api/v2.go leaseTTL defaults to 15 minutes", "internal/domain/client_protocol_sessions.go:222-227 rejects session.send after lease expiration", "internal/domain/client_protocol.go:1013-1014 rejects writer takeover by the same client", "apps/cli/cli_verbs.go:348-353 generates a stable client ID across CLI restarts"],
+      "trigger_and_impact": "After the lease expires, a normal ongoing session cannot continue with the same CLI identity, even after the previous turn has settled. Restarting the CLI retains the same identity and does not renew the lease.",
+      "required_fix": "Provide authenticated same-writer renewal under current revision/epoch CAS, distinct from ownership handoff, without inventing a new client identity.",
+      "remediation_status": "ROOT_REPORTED_IN_PROGRESS_NOT_REVIEWED"
+    }
+  ],
+  "other_observations": [
+    "The outer client_command savepoint rolls back handler mutations for typed rejection; non-nil errors cause the API caller to roll back its transaction. No additional atomicity defect was confirmed in that path.",
+    "No additional confirmed credential disclosure or filesystem escape was found in this bounded review: tool access uses frozen allowlists, current root binding and reparse checks plus os.Root; checks copy selected source and hash-bound toolchain/vendor inputs into the existing no-network sandbox; model credentials stay in the trusted broker. This is not a blanket security certification.",
+    "Source findings were sent to root before this record was written, and remediation is underway. A later repair review must reference the final code and targeted evidence; this record must not be used as W14 ACCEPT."
+  ]
+}

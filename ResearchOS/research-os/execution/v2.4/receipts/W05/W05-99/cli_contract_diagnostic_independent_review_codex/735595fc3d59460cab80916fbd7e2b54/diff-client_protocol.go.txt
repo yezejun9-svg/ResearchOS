@@ -1,0 +1,250 @@
+--- main/internal/domain/client_protocol.go
++++ handler22752/internal/domain/client_protocol.go
+@@ -18,6 +18,8 @@
+ 	"sort"
+ 	"strings"
+ 	"time"
++
++	"researchos.local/research-os/internal/canonical"
+ )
+ 
+ const ProtocolV2 = "researchos-client/2"
+@@ -42,8 +44,8 @@
+ // durable command methods may never carry native-only or secret-bearing payloads
+ // write-class methods require full identity/CAS fields in the envelope
+ var writeMethods = map[string]bool{
+-	"session.create": true,
+-	"session.send":   true, "session.control": true, "session.update": true, "session.handoff": true,
++	"session.create": true, "host.configure": true,
++	"session.send": true, "session.control": true, "session.update": true, "session.handoff": true,
+ 	"workspace.write": true, "artifact.import": true, "permission.respond": true, "goal.start": true,
+ 	"project.bootstrap": true,
+ }
+@@ -59,6 +61,7 @@
+ 	Method           *string         `json:"method"`
+ 	Payload          json.RawMessage `json:"payload"`
+ 	extra            map[string]json.RawMessage
++	originalRaw      []byte
+ }
+ 
+ func requiredString(name string, v *string) error {
+@@ -71,6 +74,12 @@
+ // DecodeEnvelope enforces protocol_version first; a bare object (no protocol_version)
+ // can never be mistaken for a valid command and there is no /1 downgrade path.
+ func DecodeEnvelope(raw []byte) (*Envelope, error) {
++	if len(raw) == 0 || len(raw) > clientIdentityMaxRequest {
++		return nil, fmt.Errorf("ENVELOPE_SIZE")
++	}
++	if _, err := canonical.JSON(raw); err != nil {
++		return nil, fmt.Errorf("ENVELOPE_JSON: %w", err)
++	}
+ 	var probe map[string]json.RawMessage
+ 	dec := json.NewDecoder(strings.NewReader(string(raw)))
+ 	dec.DisallowUnknownFields()
+@@ -92,6 +101,12 @@
+ 		return nil, err
+ 	}
+ 	e.extra = probe
++	e.originalRaw = append([]byte(nil), raw...)
++	for _, key := range []string{"project_id", "session_id", "expected_revision", "writer_epoch"} {
++		if _, ok := probe[key]; !ok {
++			return nil, fmt.Errorf("MISSING_FIELD:%s", key)
++		}
++	}
+ 	if err := requiredString("protocol_version", e.ProtocolVersion); err != nil {
+ 		return nil, err
+ 	}
+@@ -136,7 +151,7 @@
+ 			return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
+ 		}
+ 	}
+-	if writeMethods[*e.Method] && *e.Method != "session.attach" && *e.Method != "session.create" && *e.Method != "project.bootstrap" && *e.Method != "workspace.register" {
++	if writeMethods[*e.Method] && *e.Method != "host.configure" && *e.Method != "session.attach" && *e.Method != "session.create" && *e.Method != "project.bootstrap" && *e.Method != "workspace.register" {
+ 		if err := requiredString("project_id", e.ProjectID); err != nil {
+ 			return nil, err
+ 		}
+@@ -156,12 +171,11 @@
+ 		}
+ 	}
+ 	if *e.Method == "host.configure" {
+-		var cm map[string]json.RawMessage
+-		json.Unmarshal(e.Payload, &cm)
+-		if (hasKeyRaw(cm, "model_id") || hasKeyRaw(cm, "provider_id")) && e.WriterEpoch == nil {
+-			return nil, fmt.Errorf("MODEL_CHANGE_WITHOUT_EPOCH")
+-		}
+-	}
++		if err := validateClientConfigurationScope(&e); err != nil {
++			return nil, err
++		}
++	}
++
+ 	if err := e.validatePayload(); err != nil {
+ 		return nil, err
+ 	}
+@@ -629,13 +643,14 @@
+ 
+ // ClientService is the single typed command service shared by the CLI and the Desktop (W03-02).
+ type ClientService struct {
+-	Doc                *SchemaDoc
+-	Host               ClientHostInfo
+-	Domain             *Service
+-	SessionRuntime     ClientSessionRuntime
+-	WorkspaceAuthority WorkspaceAuthority
+-	WorkspaceFiles     ClientWorkspaceFiles
+-	InventoryScanner   LocalInventoryScanner
++	Doc                    *SchemaDoc
++	Host                   ClientHostInfo
++	Domain                 *Service
++	SessionRuntime         ClientSessionRuntime
++	WorkspaceAuthority     WorkspaceAuthority
++	WorkspaceFiles         ClientWorkspaceFiles
++	InventoryScanner       LocalInventoryScanner
++	ConfigurationAuthority ClientConfigurationAuthority
+ }
+ 
+ var (
+@@ -693,23 +708,30 @@
+ // normal response, while a non-nil error means the caller must roll the whole transaction
+ // back so neither business state nor an event survives.
+ func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, bool, error) {
+-	if s.Doc != nil {
+-		var request any
+-		raw, err := json.Marshal(env)
+-		if err != nil {
+-			return nil, false, err
+-		}
+-		if err = json.Unmarshal(raw, &request); err != nil {
+-			return nil, false, err
+-		}
+-		if err = s.Doc.ValidateDefInput("CommandEnvelope", request); err != nil {
+-			return NewTypedRejection(env, "INVALID_REQUEST", "command violates the published request schema"), false, nil
+-		}
++	if env == nil || env.Method == nil {
++		return nil, false, fmt.Errorf("COMMAND_ENVELOPE_REQUIRED")
++	}
++	if _, err := clientAuthenticatedPrincipal(ctx, tx, principal); err != nil {
++		return nil, false, err
++	}
++	if s.Doc == nil {
++		return nil, false, fmt.Errorf("COMMAND_SCHEMA_REQUIRED")
++	}
++	if _, err := validateClientIdentityRequest(s.Doc, env.originalRaw, env); err != nil {
++		return NewTypedRejection(env, "INVALID_REQUEST", "command violates the published request schema"), false, nil
+ 	}
+ 	hash, err := env.ContentHash()
+ 	if err != nil {
+ 		return nil, false, err
+ 	}
++	original, err := lookupClientCommandIdentity(ctx, tx, s.Doc, principal, env.originalRaw, env)
++	if err != nil {
++		return nil, false, err
++	}
++	if original != nil && !(deref(env.Method) == "session.control" && deref(original.Status) == "ACKNOWLEDGED") {
++		return original, true, nil
++	}
++
+ 	var existingHash, body string
+ 	row := tx.QueryRowContext(ctx, `SELECT request_hash, body FROM idempotency WHERE principal=? AND project=? AND operation=? AND key=?`,
+ 		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID)
+@@ -751,9 +773,20 @@
+ 	case err != sql.ErrNoRows:
+ 		return nil, false, err
+ 	}
++	if _, err = reserveClientCommandIdentity(ctx, tx, s.Doc, principal, env.originalRaw, env); err != nil {
++		return nil, false, err
++	}
++	headers, err := writeClientCommandEnvelope(s.Doc, env)
++	if err != nil {
++		return nil, false, err
++	}
+ 	// A typed rejection is committed for idempotency, but must not preserve any
+ 	// intermediate business writes made before a handler discovers the refusal.
+ 	if _, err = tx.ExecContext(ctx, "SAVEPOINT client_command"); err != nil {
++		return nil, false, err
++	}
++	ctx, err = s.pendingCommandContext(ctx, tx, env, principal)
++	if err != nil {
+ 		return nil, false, err
+ 	}
+ 	res, err := s.dispatch(ctx, tx, env, principal)
+@@ -793,8 +826,38 @@
+ 		}
+ 	}
+ 	if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+-		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID, hash, 0, string(rb), "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
++		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID, hash, 0, string(rb), headers, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+ 		return nil, false, err
++	}
++	if _, err = lookupClientCommandIdentity(ctx, tx, s.Doc, principal, env.originalRaw, env); err != nil {
++		return nil, false, err
++	}
++	if deref(env.Method) == "goal.start" && deref(res.Status) == "COMPLETED" {
++		snapshot, _ := res.Result["snapshot"].(map[string]any)
++		sid := Str(snapshot, "session_id")
++		row, e := loadClientSession(ctx, tx, sid, deref(env.ProjectID))
++		if e != nil {
++			return nil, false, e
++		}
++		creator, e := clientSessionCreationPrincipal(ctx, tx, deref(env.ProjectID), sid)
++		if e != nil || creator != principal {
++			return nil, false, fmt.Errorf("COMMAND_IDENTITY_GOAL_CREATION")
++		}
++		if env.SessionID != nil && sid != *env.SessionID {
++			return nil, false, fmt.Errorf("COMMAND_IDENTITY_GOAL_SESSION")
++		}
++		if e = s.validateSessionConfiguration(ctx, tx, principal, row, true); e != nil {
++			return nil, false, e
++		}
++	}
++	if deref(env.Method) == "host.configure" && deref(res.Status) == "COMPLETED" {
++		owner, e := s.configurationOwner(ctx, tx, principal)
++		if e != nil {
++			return nil, false, e
++		}
++		if _, e = readClientConfiguration(ctx, tx, s.Doc, owner, principal, Str(res.Result, "model_config_ref")); e != nil {
++			return nil, false, e
++		}
+ 	}
+ 	return res, false, nil
+ }
+@@ -895,6 +958,11 @@
+ 			return reject(sess.revision, sess.epoch, "WRITER_BUSY", "writer attribution belongs to another client"), nil
+ 		}
+ 	}
++	if deref(env.Method) == "session.send" || deref(env.Method) == "goal.start" {
++		if err := s.validateSessionConfiguration(ctx, tx, principal, sess, false); err != nil {
++			return clientFault(env, err)
++		}
++	}
+ 	return s.handleWrite(ctx, tx, env, principal, sess, reject)
+ }
+ 
+@@ -951,12 +1019,16 @@
+ 			}
+ 			return in
+ 		}
++		revision, configs, credentials, err := s.clientConfigurationStatus(ctx, tx, principal)
++		if err != nil {
++			return clientFault(env, err)
++		}
+ 		return complete(1, map[string]any{
+ 			"host_instance_id": s.Host.InstanceID, "core_build_id": s.Host.CoreBuildID,
+ 			"protocol_versions": []any{ProtocolV2}, "host_state": "READY",
+-			"client_id": deref(env.ClientID), "authenticated_principal_ref": "principal:" + principal,
+-			"config_revision": s.Host.ConfigRevision, "model_configurations": nulls(s.Host.ModelConfigs),
+-			"credentials": nulls(s.Host.CredentialSumm), "workspaces": nulls(s.Host.WorkspaceBind),
++			"client_id": deref(env.ClientID), "authenticated_principal_ref": principal,
++			"config_revision": revision, "model_configurations": configs,
++			"credentials": credentials, "workspaces": nulls(s.Host.WorkspaceBind),
+ 			"supported_methods": support, "operating_mode": mode,
+ 		}), nil
+ 	case "workspace.tree", "workspace.read", "workspace.diff":
+@@ -1038,6 +1110,8 @@
+ 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
+ 	}
+ 	switch *env.Method {
++	case "host.configure":
++		return s.configureClientHost(ctx, tx, env, principal, sess)
+ 	case "workspace.register", "project.bootstrap":
+ 		return s.clientFirstUse(ctx, tx, env, principal)
+ 	case "session.send":

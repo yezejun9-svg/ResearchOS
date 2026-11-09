@@ -1,0 +1,66 @@
+//go:build windows
+
+package domain
+
+import (
+	"sync"
+	"testing"
+
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+func TestQualificationBrokerDrainRequiresEveryAdmittedCompletion(t *testing.T) {
+	r := newQualificationBrokerRegistry()
+	for _, seq := range []int64{2, 3} {
+		if !r.admit(rt.BridgeFrame{Sequence: seq, Type: "effect.request", Capability: "MODEL"}) {
+			t.Fatalf("admit %d", seq)
+		}
+	}
+	if !r.complete(2, "model-confirmed") {
+		t.Fatal("MODEL completion lost")
+	}
+	r.close(3)
+	before := r.snapshot()
+	if !before.closed || before.disqualified || before.accepted != 2 || before.completed != 1 || before.pending != 1 {
+		t.Fatalf("premature drain: %+v", before)
+	}
+	var wg sync.WaitGroup
+	block := make(chan struct{})
+	wg.Add(1)
+	go func() { defer wg.Done(); <-block; r.complete(3, "tool-denied") }()
+	if r.snapshot().pending != 1 {
+		t.Fatal("blocked broker counted complete")
+	}
+	close(block)
+	wg.Wait()
+	after := r.snapshot()
+	if !after.closed || after.disqualified || after.pending != 0 || after.completed != 2 || after.rejectedSeq != 3 {
+		t.Fatalf("drain incomplete: %+v", after)
+	}
+	if r.admit(rt.BridgeFrame{Sequence: 4}) {
+		t.Fatal("suffix frame admitted after fence")
+	}
+	if !r.snapshot().disqualified {
+		t.Fatal("suffix failed to disqualify closed proof")
+	}
+}
+
+func TestQualificationBrokerDrainDuplicateAndMissingCompletion(t *testing.T) {
+	r := newQualificationBrokerRegistry()
+	if r.complete(2, "unadmitted") || !r.snapshot().disqualified {
+		t.Fatal("unadmitted completion accepted")
+	}
+	r = newQualificationBrokerRegistry()
+	if !r.admit(rt.BridgeFrame{Sequence: 2}) || !r.complete(2, "first") || r.complete(2, "duplicate") || !r.snapshot().disqualified {
+		t.Fatal("duplicate completion was accepted")
+	}
+	r = newQualificationBrokerRegistry()
+	if !r.admit(rt.BridgeFrame{Sequence: 3}) {
+		t.Fatal("admission failed")
+	}
+	r.close(3)
+	if r.snapshot().pending != 1 {
+		t.Fatal("worker exit or closed flag fabricated completion")
+	}
+}
+

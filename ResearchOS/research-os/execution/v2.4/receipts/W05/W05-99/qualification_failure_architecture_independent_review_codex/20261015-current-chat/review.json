@@ -1,0 +1,167 @@
+{
+  "schema": "researchos.qualification-failure-architecture-review.v1",
+  "at": "2026-10-15T10:18:24.708313+00:00",
+  "reviewer": "codex:/root/qualification_failure_arch_review",
+  "model_policy": "gpt-6-astra high requested by parent/repo; runtime model selection not independently introspected",
+  "base_commit": "4f4023c956f84d65743f39ce77d6c8899a21ada1",
+  "verdict": "BOUNDED_ARCHITECTURE_PRINCIPLES_ACCEPTED_IMPLEMENTATION_CONTRACT_NEEDS_REVISION",
+  "findings": [
+    {
+      "id": "F01",
+      "priority": "P1",
+      "area": "C historical provenance",
+      "title": "冻结输入尚未把历史 Core 可执行文件绑定到审查过的 gate/sandbox 源码",
+      "anchors": [
+        "ARCHITECTURE.md:45",
+        "internal/domain/runtime_broker_windows.go:149",
+        "internal/domain/runtime_broker_windows.go:203",
+        "ops/experiment_sandbox/sandbox_windows.go:264",
+        "ops/experiment_sandbox/sandbox_windows.go:301"
+      ],
+      "impact": "现有冻结输入证明当前 Main 源码和公开运行摘要；不能据此签发历史 NO_EFFECT 重建证明。此为所审输入包的证据缺口，不声称整个仓库不存在相关证据。",
+      "required_correction": "增加公开 provenance matrix：实际 Core image digest及可信构建来源 -> exact source tree/dirty patch/toolchain/build flags；worker.exe、worker.mjs及bundle/profile digest -> 实际staged输入；历史AppContainer/handle/env/网络边界与host tool/provider路由全链。已捕获安装/构建证明优先；新fixture只能验证代码语义，不能替代历史执行身份。任一缺项保持NOT_PROVABLE/UNKNOWN。",
+      "safe_scope": "仅收集既有公开构建/安装回执并复核哈希，或隔离历史fixture；不读密钥，不读写当前DB，不运行当前Core。"
+    },
+    {
+      "id": "F02",
+      "priority": "P1",
+      "area": "C proof attribution",
+      "title": "历史重建证明不能沿用原 executor 输出的 provenance",
+      "anchors": [
+        "ARCHITECTURE.md:56",
+        "internal/domain/runtime_recovery_windows.go:100",
+        "internal/domain/runtime_recovery_windows.go:124",
+        "internal/domain/runtime_recovery_windows.go:137",
+        "internal/domain/runtime_recovery_windows.go:165",
+        "internal/domain/runtime.go:244"
+      ],
+      "impact": "recoverArtifact把produced_by、artifact_use.principal固定为manifest原executor，input_refs只来自原运行。若原样导入当前重建证明，会把维护作者的推导归给原worker，且新增证明不能加入旧native artifacts清单冒充历史输出。",
+      "required_correction": "冻结独立maintenance proof envelope，含当前actor/Owner-root、observed_at、operation/plan hash、historical subject、每个证据hash、推导规则版本和原native manifest。外层Artifact作者应真实表示Host/维护主体；若现有contract迫使沿用executor outer association，必须明确该字段仅为subject association，并经独立contract决策，不能默称原executor生成。证明LOG/maintenance artifact与旧result_artifact_ids分开；保持旧native output manifest精确匹配。",
+      "safe_scope": "先做schema24 contract兼容性fixture；选择现有允许Artifact字段/类型表达，不能改spec/v2.0原快照。"
+    },
+    {
+      "id": "F03",
+      "priority": "P1",
+      "area": "C atomic schema24 plan",
+      "title": "精确写集需要包括事件水位与全部 provenance 辅表，并固定幂等行映射",
+      "anchors": [
+        "ARCHITECTURE.md:56",
+        "internal/domain/store.go:189",
+        "internal/domain/store.go:234",
+        "internal/domain/store.go:375",
+        "internal/domain/store.go:401",
+        "internal/domain/store.go:410",
+        "internal/domain/runtime_recovery_windows.go:221",
+        "migrations/sqlite/0002_domain.sql:31"
+      ],
+      "impact": "现有event helper除EventEnvelope/outbox外还推进ProjectState版本；put生成domain_versions/domain_refs，artifact helper写uploaded_content/runtime_uploads/artifact_uses/ImpactLink。当前设计的高层允许增量尚不足以形成精确CAS/禁止增量比较。recoverTerminal在artifact与Run之间主动提交，不能直接满足单事务承诺。",
+      "required_correction": "冻结schema24表/键/字段级before-and-after集合：精确Run、dispatch、runtime_observations；新增Artifact及其versions/refs/uploads/uses/ImpactLink；ProjectState revision/event_sequence、EventEnvelope与outbox watermark；idempotency固定namespace例如host:qualification-failure-maintenance，key=operationID，principal=currentOwner，request_hash=planHash，body包含outcomeHash/确切subject。只抽取接受现有tx的helper；全部新facts+Run+marker一次commit。schema fingerprint包括sqlite_master的表/索引/触发器以及合同hash，不能仅max(schema_migrations)=24。",
+      "safe_scope": "先冻结事务写集和schema24 isolated fixture，做每条写入前后crash cut、同operation冲突、已提交重入零增量；不修改实际schema。"
+    },
+    {
+      "id": "F04",
+      "priority": "P1",
+      "area": "C crash startup",
+      "title": "BEGIN 意图的固定发现位置和与现有 early commands 的互锁尚未指定",
+      "anchors": [
+        "ARCHITECTURE.md:60",
+        "apps/control/main.go:34",
+        "apps/control/main.go:37",
+        "apps/control/main.go:103",
+        "apps/control/main.go:116",
+        "apps/control/main.go:119",
+        "internal/host/runtime_verifier_replacement_journal_windows.go:469"
+      ],
+      "impact": "只有外部preflight plan文件不能让正常启动知道哪里有未完成BEGIN。现有startup gate只扫描verifier replacement journal；其他early maintenance分支在普通startup gate之前返回。若仅给正常路径加一个检查，另一个正式维护入口仍可能在未分类的qualification intent期间获得同一lease并改状态。",
+      "required_correction": "固定data-root/host下私有非reparse journal namespace；持lease先create-new并flush完整plan+BEGIN，再允许DB修改；所有会修改同data-root的official early entry都先组合检查各maintenance namespaces，recover只可豁免自己的exactoperation。定义空目录/半写plan/torn BEGIN、未知文件、外部plan丢失均fail closed；preflight保持外部且无BEGIN。NOT_APPLIED分类是否允许退出block、是否需显式同plancommit或append-onlyabort必须冻结，禁止默认重放。",
+      "safe_scope": "单独early parser/startup gate source卡；若要改现有replacement/prepared maintenance入口，先扩展C文件allowlist并串行交接；隔离crash fixture验证。"
+    },
+    {
+      "id": "F05",
+      "priority": "P1",
+      "area": "D attempt identity",
+      "title": "新 Task/Plan 需要同时修复 binding 创建与所有 runtime-only 查找",
+      "anchors": [
+        "internal/domain/runtime_qualification.go:163",
+        "internal/domain/client_runtime_setup_windows.go:196",
+        "internal/domain/client_runtime_setup_windows.go:368",
+        "internal/domain/client_runtime_setup_windows.go:398",
+        "internal/domain/runtime_qualification_execution_windows.go:253",
+        "migrations/sqlite/0016_runtime_qualification.sql:2"
+      ],
+      "impact": "同runtime创建新plan会撞runtime_bindings主键；即使绕过此处，两个plan会使setup/confirmation取到任意旧Task。runtimeSetupGrants按runtime取一个task后逐一比较历史grants，使合法旧新executorgrant不能同时通过。",
+      "required_correction": "复用runtime绑定仅在profile_ref/hash、technical_hash、owner及当前Owner-root全部精确一致时允许，否则显式重配置scope；禁止INSERT OR IGNORE吞掉漂移。计划/确认/UI选定不可变attemptID/taskID/planHash；历史grant按grant.TaskID+grant.RunID+runtime+epoch查它自己的plan和qualification marker。普通mu_turn按原dispatch验证，不绑定最新qualificationTask；不删除历史grant。当前fresh-intent与新attempt事务唯一，lineage单调，旧CONFIRM永不重定向。",
+      "safe_scope": "D独立schema/contract卡明确runtime_qualification.go、client_runtime_setup_windows.go、runtime_qualification_execution_windows.go及精确GUI/Host调用点；测试至少两个历史qualificationgrants+普通mu_turngrant、冲突binding、并发intent、旧CONFIRM。"
+    },
+    {
+      "id": "F06",
+      "priority": "P2",
+      "area": "B typed construction",
+      "title": "typed NO_EFFECT 构造点需明确在首次prepare之前且不能靠原generic gate返回值辨识",
+      "anchors": [
+        "internal/domain/runtime_model.go:100",
+        "internal/domain/runtime_model.go:106",
+        "internal/domain/runtime_broker_windows.go:84",
+        "internal/domain/runtime_broker_windows.go:149",
+        "internal/domain/runtime_broker_windows.go:226",
+        "internal/domain/runtime_command_queue_windows.go:457"
+      ],
+      "impact": "非MODEL会在marker和route验证前返回generic503；providerRoute还会在PREPARED之后第二次调用。直接把这一generic故障换成typed或在共享helper上升级错误会扩大proof资格。冻结文字要求正确，源码落点还应显式锁定。",
+      "required_correction": "B实现卡指定首次broker gate的私有构造函数，先精确核验marker/manifest/task/epoch/knownroute/key/frame及零历史effectstage；第二次gate或任何已有stage只能generic UNKNOWN。closure必须证明所有broker completion已结束/可逐帧归责；nativeworker结束本身不替代hostinflight结算。最小v1严格只许3帧/ACK2/rejection1，无额外suffix。",
+      "safe_scope": "在A冻结交接后只做B原scope；补拒绝unknownroute、marker缺失、已PREPARED重检、并发额外frame和错误持久化失败fixture。"
+    },
+    {
+      "id": "F07",
+      "priority": "P2",
+      "area": "STOP console and crash",
+      "title": "隔离 console 成员快照尚未证明到广播时的独占性",
+      "anchors": [
+        "ARCHITECTURE.md:66",
+        "apps/desktop/main/lib/desktop-management.js:440",
+        "apps/control/main.go:220",
+        "internal/store/sqlite.go:44"
+      ],
+      "impact": "当前spawn参数不是已有私有console证明。设计先枚举再CTRL_C_EVENT广播的间隔没有成员稳定性依据；精确Core handle只固定Core身份，不能固定console其他成员。尚无nativefixture，所以不能批准actualsignal。crashstop同样不能用新ro连接PRAGMA冒充liveCore设置证据。",
+      "required_correction": "STOP source卡先固定console隔离威胁/所有权模型，验证真实Electron启动方式的console可用性；至少插入join-before-signal fixture，无法建立成员稳定性就STOP_UNAVAILABLE。不要将重复枚举称为原子排他。保持单独exacthandlecrashstop计划、没有自动fallback；构建来源证明liveCore执行了Ready校验，取得SQLiteonlinebackup并最终lease后逻辑CAS；原nativeworker及verifier闭合证据均须独立齐全。",
+      "safe_scope": "仅独立nativeWindowsconsole/handle/WALfixture；不向当前Core发信号、不调用当前进程句柄terminate、不做当前DBbackup。"
+    }
+  ],
+  "accepted_boundaries": [
+    "FAILED-only closure; original frames ACK2/native cancellation facts preserved; generic faults UNKNOWN",
+    "C separate historical reconstruction observed now, no fabricated old rejection",
+    "early schema24 constructor without migration; same SID/Host/Owner; native lease; exact-plan CAS; single SQLite commit decision",
+    "STOP separately scoped; no automatic crash fallback; console feasibility unproven",
+    "D explicit fresh Owner intent, newTask immutablePlan, append-only lineage, ancestor budget conservation, new one-call confirmation"
+  ],
+  "levels": {
+    "architecture": "bounded principles accepted; F01-F05 implementation/actual blockers remain",
+    "source_acceptance": false,
+    "fixture_acceptance": false,
+    "actual_acceptance": false,
+    "formal_increment": 0
+  },
+  "checks": {
+    "frozen_input_hashes": 40,
+    "frozen_input_hashes_matched": 40,
+    "tests_run": 0,
+    "actual_db_opened": false,
+    "model_calls": 0,
+    "stop_signals": 0,
+    "source_changes": 0,
+    "tracked_dirty_before": 20,
+    "index_empty_before": true
+  },
+  "next_scopes": [
+    "B typed rejection and FAILED closure only after A handoff, including F06 cuts",
+    "C1 public historical provenance matrix and proof attribution contract (F01/F02)",
+    "C2 schema24 row-delta/idempotency/atomic fixture (F03)",
+    "C3 early maintenance intent discovery and all-entry startup interlock (F04)",
+    "STOP native fixture and separate operational plan only (F07)",
+    "D explicit immutable attempt and binding/grant lookup repair (F05)"
+  ],
+  "limitations": [
+    "No actual data freshness claim: actual facts referenced from frozen diagnosis/public observation only.",
+    "No native console/worker/process/DB operation performed.",
+    "No A implementation or Source25 composition review performed."
+  ]
+}

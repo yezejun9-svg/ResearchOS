@@ -1,0 +1,110 @@
+        first=run("cli-synthetic-crash-reentry",[stop_exe,"commit","--plan",out/"plan.json","--expect-plan-sha256",plan_sha],expect=1 if fail else 3)
+        second=run("cli-synthetic-crash-reentry-repeat",[stop_exe,"commit","--plan",out/"plan.json","--expect-plan-sha256",plan_sha],expect=1 if fail else 3)
+        if not fail and (json.loads(first)["state"]!="UNKNOWN" or json.loads(second)!=json.loads(first)):raise RuntimeError("consumed crash state did not remain UNKNOWN")
+        if fail and (first or second):raise RuntimeError("torn/orphan crash state returned success JSON")
+        if MODE=="crash_claim":
+            altered={**stop_grant,"expires_at":(now+dt.timedelta(minutes=19)).isoformat().replace("+00:00","Z")}
+            third_path=CASE/"third-STOP-grant.json";write_json(third_path,altered,canonical=True)
+            third_exe=CASE/"third-stop-once.exe"
+            run("build-third-grant",[GO,"build","-ldflags","-X researchos.local/research-os/internal/ownedcorestop.compiledOperationGrantBase64="+base64.b64encode(third_path.read_bytes()).decode("ascii"),"-o",third_exe,"./ops/owned_core_stop"],go_env)
+            run("third-grant-conflict",[third_exe,"commit","--plan",out/"plan.json","--expect-plan-sha256",plan_sha],expect=1)
+        if MODE not in ("crash_orphan_begin","crash_torn_claim"):
+            run("preflight-after-consumed-attempt-denied",[pre_exe,"preflight","--input",proposal_path,"--operation-id",operation,"--out",out],expect=1)
+        after={x.name:sha(x.read_bytes()) for x in out.iterdir() if x.is_file()}
+        if before!=after or core.poll() is not None or (out/"POSTFLIGHT.json").exists():raise RuntimeError("synthetic crash reentry mutated journal or signaled Core")
+        (CASE/"case-result.json").write_text(json.dumps({"case":str(CASE),"mode":MODE,"injection":"SYNTHETIC_REACHABLE_JOURNAL_IMAGE_NOT_ACTUAL_PROCESS_CRASH","native_signal_count":0,"core_alive":True,"first_stdout":first.decode(),"third_grant_conflict":MODE=="crash_claim","preflight_reset_denied":MODE not in ("crash_orphan_begin","crash_torn_claim"),"stop_grant_sha256":stop_digest,"stop_executable_sha256":sha(stop_exe.read_bytes()),"journal_files":after},indent=2),encoding="utf-8")
+        print(CASE)
+        sys.exit(0)
+    if MODE in ("s209","s209_started","s209_unknown","s209_nonmodel","s209_other_run","s209_other_dispatch","s209_control_request"):
+        db=sqlite3.connect(data/"researchos.sqlite",timeout=5)
+        if MODE in ("s209","s209_started","s209_unknown","s209_nonmodel"):
+            state={"s209":"PREPARED","s209_started":"STARTED","s209_unknown":"UNKNOWN","s209_nonmodel":"CONFIRMED"}[MODE]
+            capability="FILESYSTEM" if MODE=="s209_nonmodel" else "MODEL"
+            body=json.dumps({"state":state,"payload":{"capability":capability}})
+            db.execute("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)",(subject["project"],subject["run"],"new-"+MODE,body))
+        elif MODE=="s209_other_run":
+            db.execute("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash) VALUES(?,'Run',?,1,?,?)",(subject["project"],"other-run",'{"status":"RUNNING"}',"other-run-hash"))
+        elif MODE=="s209_other_dispatch":
+            db.execute("INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(subject["project"],"other-run",1,"other-dispatch-key",'{}',"0"*64,"UNKNOWN",now.isoformat(),now.isoformat()))
+        elif MODE=="s209_control_request":
+            db.execute("INSERT INTO client_control_requests(principal,project,command_id,session_id,control_request_id,request_hash,target_id,task_ids,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(host["owner_id"],subject["project"],"new-control","session","new-control-id","0"*64,"target",'[]',"REQUESTED",now.isoformat()))
+        db.commit();db.close()
+    if MODE=="proof_drift":
+        (verifier/"f01_ready.json").write_bytes(b'{"forged":true}\n')
+    if MODE=="forged_caller_set":
+        for target in [proposal_path,historical_path,pre_scope,pre_review,stop_review,root_scope,*[verifier/(kind+".json") for kind in kinds]]:
+            target.write_bytes(b'{"forged_caller_set":true}\n')
+    writer_errors=[]
+    writer_done=threading.Event()
+    def poststop_writer():
+        try:
+            for _ in range(20000):
+                if (out/"TERMINATE_INTENT.json").exists():break
+                time.sleep(.0005)
+            else:raise RuntimeError("intent was never created")
+            db=sqlite3.connect(data/"researchos.sqlite",timeout=10)
+            db.execute("PRAGMA busy_timeout=10000")
+            db.execute("INSERT INTO stop_fixture_rows VALUES('poststop-race',x'ff')")
+            db.commit();db.close()
+        except Exception as exc:writer_errors.append(repr(exc))
+        finally:writer_done.set()
+    if MODE=="s216":threading.Thread(target=poststop_writer,daemon=True).start()
+    supplied_sha=plan_sha if MODE!="wrong_plan" else "0"*64
+    expected_exit=0 if MODE in ("positive","expired_inspect","concurrent") else 3 if MODE.startswith("s209") or MODE in ("s216","proof_drift","forged_caller_set","bad_review","wrong_root") else 1
+    if MODE=="concurrent":
+        concurrent=[]
+        def contender(number):
+            try:
+                argv=[sys.executable,"-B","-X","utf8",str(RUN),"--label",f"cli-concurrent-{number}","--cwd",str(WORKTREE),"--",str(stop_exe),"commit","--plan",str(out/"plan.json"),"--expect-plan-sha256",plan_sha]
+                done=subprocess.run(argv,cwd=WORKTREE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                (CASE/f"cli-concurrent-{number}.stdout.bin").write_bytes(done.stdout)
+                (CASE/f"cli-concurrent-{number}.stderr.bin").write_bytes(done.stderr)
+                concurrent.append((done.returncode,done.stdout,done.stderr))
+            except Exception as exc:concurrent.append((-999,b"",repr(exc).encode()))
+        threads=[threading.Thread(target=contender,args=(i,)) for i in range(2)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(timeout=30)
+        if any(thread.is_alive() for thread in threads):raise RuntimeError("concurrent contender hung")
+        if len(concurrent)!=2 or any(code not in (0,1,3) for code,_,_ in concurrent) or not any(code==0 for code,_,_ in concurrent):raise RuntimeError("concurrent stop calls failed: "+repr(concurrent))
+        commit_raw=next(stdout for code,stdout,_ in concurrent if code==0)
+    else:
+        commit_raw=run("cli-real-stop-once",[stop_exe,"commit","--plan",out/"plan.json","--expect-plan-sha256",supplied_sha],expect=expected_exit)
+    if MODE in ("wrong_native","wrong_parent","wrong_root","wrong_opdir","wrong_expected_sid","wrong_host","wrong_owner"):
+        rejected=json.loads(commit_raw) if commit_raw else None
+        if (rejected and rejected["state"]!="STOP_UNAVAILABLE") or (out/"STOP_ATTEMPT.json").exists() or core.poll() is not None:raise RuntimeError("wrong compiled identity reached attempt/signal")
+        (CASE/"case-result.json").write_text(json.dumps({"case":str(CASE),"mode":MODE,"zero_signal":True,"rejected_result":rejected,"stop_grant_sha256":sha(stop_grant_path.read_bytes()),"stop_executable_sha256":sha(stop_exe.read_bytes())},indent=2),encoding="utf-8")
+        print(CASE)
+        sys.exit(0)
+    if MODE=="s216":
+        if not writer_done.wait(10) or writer_errors:raise RuntimeError("poststop writer failed: "+repr(writer_errors))
+    if MODE=="wrong_plan":
+        if (out/"STOP_ATTEMPT.json").exists() or core.poll() is not None:raise RuntimeError("wrong plan caused attempt/signal")
+        (CASE/"case-result.json").write_text(json.dumps({"case":str(CASE),"mode":MODE,"zero_signal":True,"stop_executable_sha256":sha(stop_exe.read_bytes())},indent=2),encoding="utf-8")
+        print(CASE)
+        sys.exit(0)
+    result=json.loads(commit_raw)
+    before_files={str(x):sha(x.read_bytes()) for x in out.iterdir() if x.is_file()}
+    if MODE=="expired_inspect":
+        expiry=dt.datetime.fromisoformat(stop_grant["expires_at"].replace("Z","+00:00"))
+        while dt.datetime.now(dt.timezone.utc)<expiry+dt.timedelta(milliseconds=100):time.sleep(.02)
+    inspect=json.loads(run("cli-real-inspect",[stop_exe,"inspect","--plan",out/"plan.json"],expect=0 if result["state"]=="STOPPED_LEASE_VERIFIED" else 3))
+    after_files={str(x):sha(x.read_bytes()) for x in out.iterdir() if x.is_file()}
+    if before_files!=after_files:raise RuntimeError("inspect mutated operation journal")
+    if MODE in ("positive","expired_inspect","s216","concurrent") or MODE.startswith("s209"):
+        if inspect!=result:raise RuntimeError("immutable inspect differs from commit")
+    if MODE=="positive":
+        repeated=json.loads(run("cli-repeat-commit-readonly",[stop_exe,"commit","--plan",out/"plan.json","--expect-plan-sha256",plan_sha]))
+        if repeated!=result or {str(x):sha(x.read_bytes()) for x in out.iterdir() if x.is_file()}!=before_files:raise RuntimeError("repeated commit mutated terminal or retried signal")
+    if MODE in ("positive","expired_inspect","concurrent"):
+        if result["state"]!="STOPPED_LEASE_VERIFIED" or result["native"]["terminate_calls"]!=1 or not result["native"]["exit_observed"]:raise RuntimeError("real stop outcome incomplete: "+repr(result))
+    elif MODE.startswith("s209"):
+        if result["state"]!="STALE_PLAN" or core.poll() is not None or (out/"TERMINATE_INTENT.json").exists():raise RuntimeError("dangerous state reached signal: "+repr(result))
+    elif MODE=="s216":
+        if result["state"]!="STOP_OBSERVED_MAINTENANCE_BLOCKED" or result["native"]["terminate_calls"]!=1 or not result["native"]["exit_observed"]:raise RuntimeError("poststop drift was not blocked: "+repr(result))
+    elif MODE in ("proof_drift","forged_caller_set","bad_review","wrong_native","wrong_parent","wrong_root","wrong_opdir"):
+        if result["state"]!="STOP_UNAVAILABLE" or core.poll() is not None or (out/"STOP_ATTEMPT.json").exists():raise RuntimeError("proof drift reached attempt/signal: "+repr(result))
+    (CASE/"case-result.json").write_text(json.dumps({"case":str(CASE),"mode":MODE,"operation_id":operation,"preflight_grant_sha256":pre_grant_sha,"preflight_executable_sha256":pre_exe_sha,"stop_grant_sha256":sha(stop_grant_path.read_bytes()),"stop_executable_sha256":sha(stop_exe.read_bytes()),"plan_sha256":plan_sha,"preflight_manifest_sha256":manifest_sha,"result":result,"zero_signal":MODE.startswith("s209") or MODE in ("proof_drift","bad_review")},indent=2),encoding="utf-8")
+finally:
+    if core.poll() is None:parent_cleanup.write_text("task-owned fixture cleanup",encoding="utf-8")
+    code=core.wait(timeout=10)
+    core_stdout.close();core_stderr.close()

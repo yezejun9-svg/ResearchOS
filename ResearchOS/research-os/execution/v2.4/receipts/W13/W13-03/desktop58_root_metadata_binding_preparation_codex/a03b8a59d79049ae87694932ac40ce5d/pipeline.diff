@@ -1,0 +1,222 @@
+--- old.current58.py
++++ desktop58.proposed.py
+@@ -19,10 +19,28 @@
+ CANON = ['execution/v2.4/'+n+'.json' for n in ('checkpoint','path_ownership','step_state','commands')]
+ SOURCE = 'e2ee22a0e4d697bf98b46f10ebb58ae7e23159a7'
+ OLD_GATE_SHA = '3e5f7843ce15f709c7fd416ef30d787246f04818b7d25513ce6c171fddba1fe8'
+-V3_GATE_SHA = '6ff7a907980da9ffe50a7a2f3ba5669820cd1d99a820be476e5327abd0dec782'
+-WIP_KEYS = ('cli43_fresh_compiler_held2_scope_ref',
+-            'cli43_fresh_compiler_current_source_authority_ref',
+-            'cli43_fresh_compiler_controller_review_ref')
++V3_GATE_SHA = '6a8b87dd4b1edfcbe669a656d02fe5b0bc16a7ac1eca1412be5d737e1c4dadd8'
++WIP_KEYS = ('desktop58_finite_validation_scope_ref',
++            'desktop58_finite_validation_current_source_authority_ref',
++            'desktop58_finite_validation_controller_review_ref',
++            'desktop58_finite_validation_CLI2_qualification_ref',
++            'desktop58_finite_validation_state')
++DESKTOP_RECEIPTS = ROOT/'execution/v2.4/receipts/W13/W13-03'
++OBSERVATION_PHASES = ('admission.runtime','grant-final.runtime','grant-final.runtime.after')
++DESKTOP_VALUE_KEYS = ('source_catalog_ref','resource_catalog_ref','current58_CLI2_qualification_ref',
++    'current58_CLI2_review_ref','current58_CLI2_manifest_ref','Root_forward_head_seal_ref',
++    'Root_forward_head_review_ref','negative_alias_declarations','inner_seconds','outer_seconds',
++    'builder_seconds','controller_evidence_reserve_seconds','launcher_evidence_reserve_seconds',
++    'expected_runtime_observation_paths','runtime_observation_phases')
++
++def wip_values(b, scope_ref):
++    return [scope_ref,b['current43_authority_ref'],b['controller_review_ref'],
++            b['desktop_scope_values']['current58_CLI2_qualification_ref'],'REGISTERED_PENDING_ONCE_EXECUTION']
++
++def desktop_lease(b, scope_ref):
++    return {'owner':'codex:/root','current_source_writer':None,'state':'REGISTERED_PENDING_ONCE_EXECUTION',
++            'scope_ref':scope_ref,'run_uuid':b['run_uuid'],'source_commit':SOURCE}
++
+ 
+ def need(ok, msg):
+     if not ok:
+@@ -112,11 +130,18 @@
+         need(hashlib.sha256(Path(lock[name]['path']).read_bytes()).hexdigest()==lock[name]['sha256'],'tool SHA')
+     helper=load_module(b['owned_process_helper_ref'],'root_cli43_owned')
+     # Reuse the frozen controller's Python __file__/__cached__/loaded-DLL point observation.
+-    util=load_module(b['runner_ref'],'root_cli43_runtime_definitions')
++    util=load_module(b['utility_ref'],'root_desktop58_runtime_definitions')
+     for r in b['metadata_code_refs']: verify(r)
+-    allowed=rows+[b[k] for k in ('runner_ref','launcher_ref','authorization_gate_ref','owned_process_helper_ref','debug_tree_helper_ref')]+[{'path':str(safe(r['path'])),'sha256':r['sha256'],'bytes':r['bytes']} for r in b['metadata_code_refs']]
++    actual_code=[b[k] for k in ('runner_ref','launcher_ref','authorization_gate_ref','owned_process_helper_ref','debug_tree_helper_ref','utility_ref')]+b['metadata_code_refs']
++    allowed={os.path.normcase(str(Path(r['path']).absolute())):r for r in rows}
++    for r in actual_code:
++        raw=verify(r); path=str(safe(r['path']))
++        need(os.path.normcase(path) in allowed and allowed[os.path.normcase(path)]['sha256']==hashlib.sha256(raw).hexdigest()
++             and allowed[os.path.normcase(path)]['bytes']==len(raw),'current metadata/controller absent from Root runtime catalogue')
++    allowed=list(allowed.values())
+     observation=util.module_observation(allowed,helper)
+     observation['all_observed_inputs_pre_pinned']=True
++    observation['producer_stage']=label
+     return helper,lock,save(output/(label+'.json'),observation)
+ 
+ def git_guard(b, output, label):
+@@ -150,7 +175,7 @@
+ 
+ def binding(r, mode):
+     b=doc(r)
+-    need(b['schema']=='researchos.cli43-root-metadata-binding.v1' and b['owner']=='codex:/root','binding schema/owner')
++    need(b['schema']=='researchos.desktop58-root-metadata-binding.v1' and b['owner']=='codex:/root','binding schema/owner')
+     need(b['preparation_only'] is False and b['execution_authorized'] is True,'unbound preparation')
+     before=b['before']; after=b['after']
+     need(all(isinstance(x,list) and len(x)==3 and all(type(y)is int for y in x) for x in (before,after)),'explicit tuples')
+@@ -164,7 +189,7 @@
+     need(b['authorization_gate_ref']['sha256']==V3_GATE_SHA,'exact acyclic v3 gate')
+     safe(b['controller_review_path'],False)
+     pf=safe(b['new_grant_preflight_root'],False)
+-    need(pf.is_relative_to(RECEIPTS) and b['run_uuid'] in pf.name,'explicit bounded preflight UUID leaf')
++    need(pf.is_relative_to(DESKTOP_RECEIPTS) and b['run_uuid'] in pf.name,'explicit bounded preflight UUID leaf')
+     roots=[safe(b[k],False) for k in ('new_output_root','new_wrapper_root','new_export_root','new_authorization_root')]
+     need(all(pf!=p and not pf.is_relative_to(p) and not p.is_relative_to(pf) for p in roots),'preflight disjoint from four run roots')
+     if mode!='scope':
+@@ -177,6 +202,16 @@
+         need(isinstance(rows,list) and rows,'empty full public inventory')
+         for row in rows: verify(row)
+     for x in b['metadata_code_refs']: verify(x)
++    values=b['desktop_scope_values']
++    need(type(values)is dict and set(values)==set(DESKTOP_VALUE_KEYS) and all(values[k] is not None for k in DESKTOP_VALUE_KEYS),'all Desktop future values explicit')
++    for k in DESKTOP_VALUE_KEYS:
++        if k.endswith('_ref'):verify(values[k])
++    root=safe(b['new_authorization_root'],False)
++    expected=[str(root/(phase+'.json')) for phase in OBSERVATION_PHASES]
++    need(values['expected_runtime_observation_paths']==expected,'Root exact observation paths must match actual three producer stages')
++    need(values['runtime_observation_phases']==[{'stage':phase,'path':path} for phase,path in zip(OBSERVATION_PHASES,expected)],'Root frozen observation stage mapping')
++    need(safe(b['new_output_root'],False).is_relative_to(DESKTOP_RECEIPTS) and
++         safe(b['new_wrapper_root'],False).is_relative_to(DESKTOP_RECEIPTS) and root.is_relative_to(DESKTOP_RECEIPTS),'Desktop receipt roots')
+     return b
+ 
+ def canonical_expected(b):
+@@ -204,13 +239,19 @@
+ 
+ def scope_build(b, scope_template_ref, dest):
+     s=doc(scope_template_ref)
+-    for k in ('run_uuid','new_output_root','new_wrapper_root','new_export_root','new_authorization_root','new_grant_preflight_root',
+-              'registration_namespace','runtime_resources_ref','compiler_resources_ref','current43_authority_ref',
+-              'controller_review_path','main_git','public_environment','authorization_gate_ref','runner_ref','launcher_ref'):
+-        need(b.get(k) is not None,'explicit scope field '+k); s[k]=b[k]
++    need(s['preparation_only'] is True and s['execution_authorized'] is False,'original preparation template required')
++    aliases={'output_root':'new_output_root','outer_output_root':'new_wrapper_root','export_root':'new_export_root',
++        'new_authorization_root':'new_authorization_root','new_grant_preflight_root':'new_grant_preflight_root',
++        'current_source_authority_ref':'current43_authority_ref','authorization_verifier_ref':'authorization_gate_ref',
++        'controller_ref':'runner_ref','owned_helper_ref':'owned_process_helper_ref','debug_helper_ref':'debug_tree_helper_ref'}
++    for key,src in aliases.items():s[key]=b[src]
++    for k in ('run_uuid','registration_namespace','runtime_resources_ref','compiler_resources_ref',
++              'controller_review_path','main_git','public_environment','launcher_ref','utility_ref','toolchain_lock_ref'):
++        s[k]=b[k]
++    s.update(b['desktop_scope_values'])
+     s.update(preparation_only=False,execution_authorized=True,expected_before_registration=b['before'],
+              expected_registration=b['after'],registration_metadata_paths=CANON[:2])
+-    need(s['source_commit']==SOURCE and s['ordered_cases']==['real-existing-open-readonly','real-existing-self-send'],'fixed source/roster')
++    need(s['source_commit']==SOURCE and s['node_cases']==169 and s['Go_top_cases']==3,'fixed source/roster')
+     return save(dest,s)
+ 
+ def prepare(b, scope_ref, output):
+@@ -218,13 +259,19 @@
+     gate=load_module(b['authorization_gate_ref'],'root_cli43_gate_prepare')
+     gate.load_scope(gate.Reader(),str(safe(scope_ref['path'])),scope_ref['sha256'])
+     review=doc(b['controller_review_ref'])
+-    need(review['schema']=='researchos.cli43-compiler-controller-static-review.v1' and
++    need(review['schema']=='researchos.desktop58-controller-static-review.v1' and
+          review['reviewer']=='codex:/root/w05_merge_review' and
+-         review['decision']=='READY_FOR_ROOT_CURRENT43_HELD2_ONCE' and review['requested_changes']==[], 'controller review verdict')
+-    for key,actual in [('scope_sha256',scope_ref['sha256']),('runner_sha256',s['runner_ref']['sha256']),
+-                       ('launcher_sha256',s['launcher_ref']['sha256']),('gate_sha256',s['authorization_gate_ref']['sha256'])]:
++         review['decision']=='READY_FOR_ROOT_CURRENT58_DESKTOP169_GO3_ONCE' and review['requested_changes']==[], 'controller review verdict')
++    for key,actual in [('scope_sha256',scope_ref['sha256']),('controller_sha256',s['controller_ref']['sha256']),
++                       ('launcher_sha256',s['launcher_ref']['sha256']),('gate_sha256',s['authorization_verifier_ref']['sha256'])]:
+         need(review[key]==actual,'controller review complete scope/code pin')
+     before=canonical_expected(b); cp,ow=map(parse,before[:2]); rows=origins(b,cp)
++    reader=gate.Reader()
++    gate.validate_cli2(reader,s)
++    gate.validate_current58_source(reader,{'catalog_ref':s['source_catalog_ref']},doc(b['current43_authority_ref']),cp,ow)
++    for path,raw in reader.raw.items():
++        if path in READS:need(READS[path]==raw,'qualification/source input drift')
++        READS[path]=raw
+     # These must be staged by Root from the reviewed template before preparation.
+     known={safe(x['path']):x for x in b['metadata_code_refs'] if Path(x['path']).is_absolute() or not Path(x['path']).drive}
+     for name in ('register.py','run.py','seal.py','grant_preflight.py','scope_builder.py','prepare.py'):
+@@ -235,9 +282,14 @@
+     desiredcp['revision']=b['after'][0]; desiredcp['expected_previous_revision']=b['before'][0]
+     desiredcp['updated_at']=stamp; desiredcp['updated_by']='codex:/root'
+     desiredcp['failure_counters'].extend(copy.deepcopy(rows))
+-    wipvalues=[scope_ref,b['current43_authority_ref'],b['controller_review_ref']]
++    wipvalues=wip_values(b,scope_ref)
+     desiredcp['work_in_progress'].update(dict(zip(WIP_KEYS,wipvalues)))
+     desiredow.update(revision=b['after'][1],amended_at=stamp,amended_by='codex:/root')
++    card=desiredow['card_path_bindings']['W13-03']
++    need(type(card['subtasks'])is dict,'Root actual W13-03 subtask map required')
++    prior=card['subtasks'].get('desktop58_finite_validation')
++    need(prior is None or prior.get('state') not in ('REGISTERED_PENDING_ONCE_EXECUTION','RUNNING'),'cannot replace active Desktop lease')
++    card['subtasks']['desktop58_finite_validation']=desktop_lease(b,scope_ref)
+     need(desiredcp['failure_counters'][:len(cp['failure_counters'])]==cp['failure_counters'],'failure prefix')
+     rawdesired=[encoded(desiredcp),encoded(desiredow),*before[2:]]
+     original=[write(output/(Path(p).stem+'.original.json'),raw) for p,raw in zip(CANON,before)]
+@@ -268,9 +320,13 @@
+     for k in ('revision','amended_at','amended_by'):
+         if k in oldow: protectedow[k]=oldow[k]
+         else: protectedow.pop(k,None)
++    expectedcard=copy.deepcopy(oldow['card_path_bindings']['W13-03'])
++    expectedcard['subtasks']['desktop58_finite_validation']=desktop_lease(b,p['scope_ref'])
++    need(ow['card_path_bindings']['W13-03']==expectedcard,'only registered finite Desktop sublease may change')
++    protectedow['card_path_bindings']['W13-03']=oldow['card_path_bindings']['W13-03']
+     need(protectedcp==oldcp and protectedow==oldow,'unrelated canonical field modified')
+     need([cp['revision'],ow['revision'],len(cp['failure_counters'])]==b['after'],'desired tuple')
+-    need([cp['work_in_progress'][k] for k in WIP_KEYS]==[p['scope_ref'],b['current43_authority_ref'],b['controller_review_ref']], 'desired scope/review authority values')
++    need([cp['work_in_progress'][k] for k in WIP_KEYS]==wip_values(b,p['scope_ref']), 'desired scope/review authority values')
+     return p,original,desired
+ 
+ def registration_review(output,b,p,r):
+@@ -356,8 +412,8 @@
+     need(scope['new_grant_preflight_root']==b['new_grant_preflight_root'],'full-scope preflight path binding')
+     pf=safe(scope['new_grant_preflight_root'],False)
+     root=safe(scope['new_authorization_root'],False)
+-    others=[safe(scope[k],False) for k in ('new_output_root','new_wrapper_root','new_export_root')]
+-    need(pf.is_relative_to(RECEIPTS) and b['run_uuid'] in pf.name,'bounded preflight leaf/UUID')
++    others=[safe(scope[k],False) for k in ('output_root','outer_output_root','export_root')]
++    need(pf.is_relative_to(DESKTOP_RECEIPTS) and b['run_uuid'] in pf.name,'bounded preflight leaf/UUID')
+     roots=[pf,root,*others]
+     need(len(set(roots))==5 and all(not x.is_relative_to(y) for x in roots for y in roots if x!=y),'five disjoint leaves')
+     need(pf.parent.is_dir() and root.parent.is_dir() and all(not os.path.lexists(p) for p in roots),'fresh preflight/auth/execution leaves')
+@@ -431,9 +487,17 @@
+     copies=[{'canonical_path':x['canonical_path'],'ref':copy_fact(safe(x['ref']['path']))} for x in preliminary]
+     # Re-evaluate the real registration chain using actual authorization copies before final Git.
+     ar=gate.validate_authority(reader,scope,scope_ref,copies,rr)
++    ar.update({'CLI2_qualification_ref':scope['current58_CLI2_qualification_ref'],
++        'CLI2_review_ref':scope['current58_CLI2_review_ref'],'CLI2_manifest_ref':scope['current58_CLI2_manifest_ref']})
+     final_records,final_observed=facts('grant-final')
+     _,_,after_observed=runtime(b,pf,'grant-final.runtime.after')
+-    preflight_pre=save(pf/'prelaunch.json',{'runtime_resources_ref':scope['runtime_resources_ref'],
++    observed=[]
++    for phase,r in zip(OBSERVATION_PHASES,(first_observed,final_observed,after_observed)):
++        need(safe(r['path'])==pf/(phase+'.json'),'actual observation producer/path mismatch')
++        copyref=copy_fact(safe(r['path']))
++        observed.append({'path':str(safe(copyref['path'])),'sha256':copyref['sha256'],'bytes':copyref['bytes']})
++    need([r['path'] for r in observed]==scope['expected_runtime_observation_paths'],'actual ordered observation selection differs from frozen scope')
++    preflight_pre=save(pf/'prelaunch.json',{'runtime_observation_refs':observed,'runtime_resources_ref':scope['runtime_resources_ref'],
+         'toolchain_lock_ref':b['toolchain_lock_ref'],'git':final_records,
+         'source_round':'grant-final','time_window_ref':pin(pf/'grant-final.time-window.json'),
+         'admission_ref':admission,'point_in_time_only':True,
+@@ -442,15 +506,17 @@
+     for p in sorted(pf.iterdir()):
+         if p.is_file():copy_fact(p)
+     pre=copy_fact(safe(preflight_pre['path']))
+-    observed=[copy_fact(safe(r['path'])) for r in (first_observed,final_observed,after_observed)]
+     save(root/'preflight-copy-map.json',{'preflight_root':str(pf),'entries':list(copied.values()),
+         'time_boundary':'admission before auth mkdir; independent grant-final Git after auth mkdir; live four immediately before grant',
+         'directory_or_copy_is_not_authority':True})
+     need(all((ROOT/x['canonical_path']).read_bytes()==verify(x['ref']) for x in copies),'immediate pre-grant live four CAS')
+-    gr=save(root/'authorization.execute.json',{'schema':'researchos.cli43-compiler-authorization.v1','actor':'codex:/root',
++    need(all(not os.path.lexists(p) for p in others),'fresh execution leaves appeared before grant')
++    gr=save(root/'authorization.execute.json',{'schema':'researchos.desktop58-finite-authorization.v1','actor':'codex:/root',
+         'status':'ROOT_REGISTERED_EXECUTION_AUTHORIZED','actual_registration_completed':True,'scope_ref':scope_ref,
+         'binding':gate.binding(scope),'canonical_copies':copies,'registration_refs':rr,'authority_review_refs':ar,
+-        'prelaunch_evidence_ref':pre,'runtime_observation_refs':observed})
++        'prelaunch_evidence_ref':pre,'runtime_observation_refs':observed,
++        'fresh_roots_observed_absent':[scope[k] for k in ('output_root','outer_output_root','export_root')],
++        'automatic_retry':False,'counter_reset':False})
+     gate.validate_grant(str(safe(scope_ref['path'])),scope_ref['sha256'],str(root/'authorization.execute.json'),gr['sha256'])
+     save(root/'grant.completed.json',{'grant_ref':gr,'source_acceptance':False,'formal_increment':0,
+         'launcher_executions':0,'preflight_root':str(pf),'point_in_time_not_lifecycle':True})

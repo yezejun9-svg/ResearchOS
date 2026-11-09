@@ -1,0 +1,256 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\f08_driver18_root_producer_preparation_codex\fe7a07dcb98a4f2aacb2f73d4ff60780\driver18_root_producer.proposed.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\f08_driver18_root_producer_revision_preparation_codex\dcfcd2f9a20e4962af5fa8278efa1ab0\driver18_root_producer.v2.proposed.py
+@@ -44,10 +44,113 @@
+     with p.open('xb') as f:f.write(b);f.flush();os.fsync(f.fileno())
+     return pin(p)
+ def save(p,v):return write(p,encoded(v))
+-def leaf(text):
++def leaf(text,checked=False):
++    need(checked,'PREALLOCATION_REQUIRED')
+     global OWN
+     p=safe(text);need(p!=RECEIPTS and p.is_relative_to(RECEIPTS) and p.parent.is_dir() and not os.path.lexists(p),'FRESH_OWNED_RECEIPT_LEAF')
+     p.mkdir();OWN=p;return p
++def disjoint(a,b):
++    a=str(safe(str(a))).casefold();b=str(safe(str(b))).casefold()
++    return a!=b and not a.startswith(b+'\\') and not b.startswith(a+'\\')
++
++def receipt_input_trees(values):
++    """Protect original receipt parents; never follow arbitrary JSON as executable code."""
++    trees=set()
++    def visit(v):
++        if isinstance(v,dict):
++            if set(v)=={'path','sha256','bytes'}:
++                verify(v);p=safe(str(Path(v['path'])))
++                if p.is_relative_to(RECEIPTS):trees.add(p.parent)
++            else:
++                for x in v.values():visit(x)
++        elif isinstance(v,list):
++            for x in v:visit(x)
++    visit(values)
++    return trees
++
++def allocation_check(text,values,s=None,metadata=True):
++    p=safe(text)
++    if metadata:
++        parent=RECEIPTS/'f08_driver18_root_producer_executor_codex'
++        need(p.parent==parent and len(p.name)==32 and all(c in '0123456789abcdef' for c in p.name),'DEDICATED_NEW_METADATA_UUID')
++    need(p.parent.is_dir() and not os.path.lexists(p),'FRESH_OUTPUT_BEFORE_ANY_WRITE')
++    protected=receipt_input_trees(values)
++    if s is not None:
++        protected.update(safe(s[k]) for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root'])
++    need(all(disjoint(p,q) for q in protected),'OUTPUT_OVERLAPS_ORIGINAL_INPUT_OR_PHASE_TREE')
++    return p
++
++def preallocate(action,data,inp,text):
++    allowed={'resources','stage-code','scope','draft','register','seal-registration','grant','launch-request','capture-action','seal-outer','seal-prepare'}
++    need(action in allowed and isinstance(data,dict),'KNOWN_ACTION_BEFORE_ALLOCATION')
++    binding=data['producer_output_binding']
++    need(binding=={'schema':'researchos.driver18-producer-output-binding.v1','owner':'codex:/root','action':action,'metadata_output_root':text},'EXPLICIT_ROOT_OUTPUT_BINDING')
++    s=None;extra=[]
++    if action=='scope':
++        g=gate();r=g.Reader();b=module(BINDER,'driver18_preallocation_binder');s=b.build_scope(g,r,inp)
++    elif action in {'register','seal-registration'}:
++        g,r,s,sref,d,index,mfref,before,desired=reviewed(data['draft_ref'],data['registration_review_ref']);extra=[sref,d,index,mfref]
++    elif action not in {'resources','stage-code'}:
++        g,r,s=load(data['scope_ref'])
++        if action in {'launch-request','capture-action','seal-outer','seal-prepare'}:
++            g.verify_authority(r,s,data['scope_ref'],r.doc(data['grant_ref']))
++        extra=list(r.refs.values())
++    elif action=='resources':need(data['schema']=='researchos.driver18-root-resource-input.v1','RESOURCE_INPUT')
++    else:need(data['schema']=='researchos.driver18-stage-code-input.v1','STAGED_SOURCE_INPUT')
++    values=[inp,data,extra,GATE,BINDER,pin(Path(__file__).resolve())]
++    if s is not None:values.append(s)
++    return allocation_check(text,values,s)
++
++def exact_resource_catalog(res):
++    """Reject aliases before emission; frozen consumers compare literal REF dictionaries."""
++    rows=res['files'];need(type(rows)is list and rows,'NONEMPTY_EXACT_RESOURCE_ROWS')
++    for row in rows:
++        need(row==pin(safe(row['path'])),'RESOURCE_REF_NOT_ACTUAL_CANONICAL_PIN')
++    need(len({str(safe(row['path'])).casefold() for row in rows})==len(rows),'RESOURCE_CASEFOLD_COLLISION')
++    need(all(item in rows for item in [res['python'],res['go'],*res['compiler_images']]),'TOOLS_REQUIRE_EXACT_FILES_DICTIONARY')
++    need(res['python']==pin(Path(sys.executable).resolve()),'RESOURCE_ACTUAL_CURRENT_PYTHON_PIN')
++    for row in res['offline_modcache_copies']:need(row['ref'] in rows,'OFFLINE_REQUIRE_EXACT_FILES_DICTIONARY')
++    goroot=safe(res['GOROOT']);need(goroot.is_dir() and res['GOROOT']==str(goroot),'EXACT_GOROOT_DIRECTORY')
++    need(safe(res['go']['path'])==goroot/'bin/go.exe','GOROOT_GO_PAIR')
++    return res
++
++def original_capture_closure(g,r,s,sref,gref,refs):
++    """Requires real external Root capture plus nonauthor pairing review, never manufactures either."""
++    need(isinstance(refs,dict) and set(refs)=={'bundle_ref','manifest_ref','pair_review_ref','pair_review_manifest_ref'},'FATAL_OPEN_ORIGINAL_CAPTURE_CLOSURE')
++    a=s['actual_Root_registration'];identity=action_identity(s,sref,gref,a['phase'])
++    root=g.safe(a['original_tool_capture_root']);reviewpath=g.safe(a['original_tool_capture_review_path'])
++    need(root.is_relative_to(RECEIPTS) and not root==RECEIPTS and a['run_uuid'] in root.name,'ROOT_CAPTURE_NAMESPACE')
++    need(g.safe(refs['bundle_ref']['path']).parent==root and g.safe(refs['manifest_ref']['path']).parent==root and g.safe(refs['pair_review_ref']['path'])==reviewpath,'CAPTURE_EXACT_PATH_BINDING')
++    need(g.safe(refs['pair_review_manifest_ref']['path']).parent==reviewpath.parent and disjoint(root,reviewpath.parent),'INDEPENDENT_CAPTURE_REVIEW_NAMESPACE')
++    bundle=r.doc(refs['bundle_ref']);review=r.doc(refs['pair_review_ref'])
++    need(bundle['schema']=='researchos.driver18-original-host-tool-capture.v1' and bundle['actor']=='codex:/root' and bundle['scope_ref']==sref and bundle['grant_ref']==gref and bundle['command_identity']==identity,'ORIGINAL_CAPTURE_BINDING')
++    need(review['schema']=='researchos.driver18-original-tool-pair-independent-review.v1' and review['reviewer'] in g.REVIEWERS and review['reviewer'] not in {'codex:/root','codex:/root/command_queue_impl'} and review['non_author'] is True,'NONAUTHOR_CAPTURE_REVIEW')
++    need(review['decision']=='ORIGINAL_HOST_TOOL_INPUT_RESPONSE_PAIR_VERIFIED' and review['requested_changes']==[] and review['original_host_event_association_verified'] is True and review['actual_candidate_execution'] is False,'FATAL_OPEN_HOST_EVENT_ASSOCIATION')
++    for k,v in [('capture_bundle_ref',refs['bundle_ref']),('capture_manifest_ref',refs['manifest_ref']),('scope_ref',sref),('grant_ref',gref),('command_identity',identity),('host_capture_ref',bundle['host_capture_ref']),('events',bundle['events'])]:need(review[k]==v,'CAPTURE_REVIEW_'+k)
++    def sealed(mref,required,parent):
++        mf=r.doc(mref);rows=mf['files'];need(type(rows)is list and rows,'CAPTURE_MANIFEST_NOT_EMPTY');seen={}
++        for row in rows:
++            p=g.safe(row['path']);need(p.is_relative_to(parent) and str(p).casefold() not in seen,'CAPTURE_MEMBER_BOUNDARY');r.verify(row);seen[str(p).casefold()]=row
++        for row in required:need(seen.get(str(g.safe(row['path'])).casefold())==row,'CAPTURE_REQUIRED_MEMBER')
++    events=bundle['events'];need(type(events)is list and len(events)==2,'EXACT_INITIAL_TERMINAL_CAPTURE')
++    required=[refs['bundle_ref'],bundle['host_capture_ref']];actions=[]
++    for i,event in enumerate(events):
++        need(set(event)=={'tool_name','request_event_locator','response_event_locator','input_ref','response_ref','action_ref'},'ORIGINAL_EVENT_FIELDS')
++        act=r.doc(event['action_ref']);need(event['tool_name']==['exec_command','write_stdin'][i],'TOOL_PAIR_ORDER')
++        for k in ['tool_name','request_event_locator','response_event_locator','input_ref','response_ref']:need(act[k]==event[k],'RAW_EVENT_ACTION_'+k)
++        need(act['schema']=='researchos.driver18-original-tool-action.v1' and act['actor']=='codex:/root' and act['command_identity']==identity,'CAPTURE_ACTION_COMMAND')
++        for k in ['request_event_locator','response_event_locator']:need(type(event[k])is str and event[k],'CAPTURE_EVENT_LOCATOR')
++        required.extend([event['input_ref'],event['response_ref'],event['action_ref']]);actions.append(act)
++    need(actions[0]['initial_action_ref'] is None and actions[1]['initial_action_ref']==events[0]['action_ref'],'ORIGINAL_INITIAL_REF')
++    initial=r.doc(events[0]['response_ref']);terminal_input=r.doc(events[1]['input_ref']);terminal=r.doc(events[1]['response_ref'])
++    need(type(initial.get('session_id'))is int and initial.get('exit_code') is None and terminal_input['session_id']==initial['session_id'] and terminal_input.get('chars','')=='' and type(terminal.get('exit_code'))is int,'EXACT_ORIGINAL_SESSION_PAIR')
++    if 'session_id' in terminal:need(terminal['session_id']==initial['session_id'],'TERMINAL_SESSION_CONTRADICTION')
++    need(len({x[k] for x in events for k in ['request_event_locator','response_event_locator']})==4,'DISTINCT_EVENT_LOCATORS')
++    sealed(refs['manifest_ref'],required,root)
++    sealed(refs['pair_review_manifest_ref'],[refs['pair_review_ref']],reviewpath.parent)
++    r.unchanged();return bundle
++
++
+ def immutable_manifest(out,extra=()):
+     refs=[pin(p) for p in sorted(out.rglob('*')) if p.is_file() and p.name!='manifest.json']
+     for ref in extra:
+@@ -62,14 +165,14 @@
+     need(s['authority_validator_ref']['sha256']==GATE['sha256'],'FROZEN_GATE')
+     return g,r,s
+ def runtime(g,r,s,out,label):
+-    res=r.doc(s['resource_catalog_ref']);rows=res['files']
++    res=exact_resource_catalog(r.doc(s['resource_catalog_ref']));rows=res['files']
+     for ref in rows:r.verify(ref)
+     allowed={str(g.safe(ref['path'])).casefold():ref for ref in rows}
+     code=[pin(Path(__file__).resolve()),pin(Path(sys.modules['__main__'].__file__).resolve()),GATE,BINDER]
+     for ref in code+[s['utility_ref'],s['owned_helper_ref']]:
+         key=str(g.safe(ref['path'])).casefold()
+-        need(key in allowed and g.same_ref(allowed[key],ref),'METADATA_CODE_NOT_PREPINNED')
+-    need(g.same_ref(pin(Path(sys.executable).resolve()),res['python']),'ACTUAL_PYTHON')
++        need(key in allowed and allowed[key]==pin(g.safe(ref['path']).resolve()),'METADATA_CODE_NOT_PREPINNED')
++    need(pin(Path(sys.executable).resolve())==res['python'],'ACTUAL_PYTHON')
+     helper=module(s['owned_helper_ref'],'driver18_root_owned')
+     util=module(s['utility_ref'],'driver18_root_util')
+     obs=util.module_observation(rows,helper)
+@@ -114,6 +217,7 @@
+         need(not (p.parts[0].casefold()=='modernc.org' and len(p.parts)>1 and p.parts[1].casefold()=='sqlite@v1.60.1'),'PRISTINE_OVERWRITE')
+         need(any(g.same_ref(item['ref'],v) for v in rows),'OFFLINE_SOURCE')
+     for item in x['provenance_refs']:r.verify(item)
++    exact_resource_catalog(x)
+     r.unchanged();return save(out/'resource-catalog.json',{k:x[k] for k in ['files','python','go','GOROOT','compiler_images','offline_modcache_copies']}|{'provenance_refs':x['provenance_refs'],'actual_graph':'OPEN_NOT_RUN','source_acceptance':False})
+ 
+ def stage_sources(out):
+@@ -127,6 +231,13 @@
+ 
+ def prepare_scope(inp,out):
+     g=gate();r=g.Reader();b=module(BINDER,'driver18_root_binder');s=b.build_scope(g,r,inp)
++    for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']:
++        need(s[k]==str(g.safe(s[k])),'EXACT_CONSUMER_ROOT_STRING_'+k)
++    exact_resource_catalog(r.doc(s['resource_catalog_ref']))
++    a=s['actual_Root_registration']
++    capture=g.safe(a['original_tool_capture_root']);reviewpath=g.safe(a['original_tool_capture_review_path'])
++    need(capture.is_relative_to(RECEIPTS) and a['run_uuid'] in capture.name and disjoint(capture,reviewpath.parent),'FUTURE_CAPTURE_REVIEW_PATHS')
++    need(all(disjoint(capture,g.safe(s[k])) and disjoint(reviewpath.parent,g.safe(s[k])) for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']),'CAPTURE_PHASE_OVERLAP')
+     ref=save(out/'scope.proposed.json',s);g.scope(r,ref);r.unchanged();return ref
+ def prepare_draft(sref,cref,stage_ref,out):
+     g,r,s=load(sref);a=s['actual_Root_registration'];stage=r.doc(stage_ref)
+@@ -224,7 +335,10 @@
+ 
+ def run_registration(dref,regref):
+     global OWN
+-    g,r,s,sref,d,index,mfref,before,desired=reviewed(dref,regref);a=s['actual_Root_registration'];out=leaf(a['registration_output_root'])
++    g,r,s,sref,d,index,mfref,before,desired=reviewed(dref,regref);a=s['actual_Root_registration']
++    planned=allocation_check(a['registration_output_root'],[s],s,metadata=False)
++    need(planned.is_relative_to(g.safe(a['registration_namespace'])),'EXACT_REGISTRATION_OUTPUT_BOUNDARY')
++    out=leaf(str(planned),True)
+     live4(before);reqref=save(out/'requested.json',request_for(g,s,sref,dref,regref,index,out));helper,res=runtime(g,r,s,out,'outer-before')
+     args=[res['python']['path'],*FLAGS,index['codes']['wrapper']['path'],'--request',reqref['path'],'--request-sha256',reqref['sha256']]
+     result=None;error=None
+@@ -252,12 +366,13 @@
+ 
+ def grant(sref,bundleref,prepared_proof_ref,preflight,authroot):
+     g,r,s=load(sref);a=s['actual_Root_registration'];bundle=r.doc(bundleref);desired=g.registration(r,s,sref,bundle)
+-    pf=leaf(preflight);auth=safe(authroot);need(auth.parent.is_dir() and not os.path.lexists(auth) and auth.is_relative_to(RECEIPTS) and a['run_uuid'] in auth.name and a['run_uuid'] in pf.name and not (auth.is_relative_to(pf) or pf.is_relative_to(auth)),'FRESH_DISJOINT_AUTH')
+-    for k in ['prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']:
+-        q=g.safe(s[k]);need(not (auth==q or auth.is_relative_to(q) or q.is_relative_to(auth)),'AUTH_EXECUTION_OVERLAP')
+     proof=None if prepared_proof_ref is None else r.doc(prepared_proof_ref)
+     if a['phase']=='execute':need(proof is not None,'REAL_PREPARE_REQUIRED');g.prepared_evidence(r,s,proof)
+     else:need(proof is None,'NO_FUTURE_PREPARE_FACT')
++    inputs=[sref,s,bundleref,bundle,prepared_proof_ref,proof,list(r.refs.values()),pin(Path(__file__).resolve())]
++    pfpath=allocation_check(preflight,inputs,s,metadata=False);auth=allocation_check(authroot,inputs,s,metadata=False)
++    need(pfpath.parent==RECEIPTS/'f08_driver18_root_grant_preflight_codex' and auth.parent==RECEIPTS/'f08_driver18_root_authorization_codex' and pfpath.name==auth.name==a['run_uuid'] and disjoint(pfpath,auth),'DEDICATED_FRESH_GRANT_OUTPUTS')
++    live4(desired);r.unchanged();pf=leaf(str(pfpath),True)
+     live4(desired);r.unchanged();source_guard(g,r,s,pf,'preflight',bundle['canonical_after_copies']);live4(desired)
+     # No authorization directory is created until real registration/source/CAS pass.
+     auth.mkdir();copies=[{'canonical_path':p,'ref':write(auth/(Path(p).stem+'.json'),raw)} for p,raw in zip(CANON,desired)]
+@@ -283,8 +398,12 @@
+     req={'cmd':command,'workdir':str(ROOT),'yield_time_ms':1000,'max_output_tokens':4000}
+     return save(out/'exec-command.input.json',req),save(out/'command-identity.json',ident)
+ 
+-def capture_action(sref,gref,kind,inputref,responseref,request_locator,response_locator,initialref,out):
++def capture_action(sref,gref,kind,inputref,responseref,request_locator,response_locator,initialref,out,capture_refs,actionref):
+     g,r,s=load(sref);g.verify_authority(r,s,sref,r.doc(gref));phase=s['actual_Root_registration']['phase'];identity=action_identity(s,sref,gref,phase)
++    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)
++    event=next((x for x in bundle['events'] if x['action_ref']==actionref),None)
++    need(event is not None and event['tool_name']==kind and event['input_ref']==inputref and event['response_ref']==responseref and event['request_event_locator']==request_locator and event['response_event_locator']==response_locator,'CAPTURE_EXACT_ORIGINAL_EVENT')
++    need(r.doc(actionref)['initial_action_ref']==initialref,'CAPTURE_ORIGINAL_INITIAL_REF')
+     inp=r.doc(inputref);response=r.doc(responseref)
+     need(isinstance(request_locator,str) and request_locator and isinstance(response_locator,str) and response_locator,'ACTUAL_TOOL_EVENT_LOCATORS_REQUIRED')
+     if kind=='exec_command':
+@@ -298,20 +417,30 @@
+         need(type(response.get('exit_code')) is int,'TERMINAL_RESULT_REQUIRED')
+     # Copy caller-supplied original bytes, never reconstruct a response or locator.
+     iref=write(out/'original-input.json',r.verify(inputref));rref=write(out/'original-response.json',r.verify(responseref))
+-    return save(out/'tool-action.json',{'schema':'researchos.driver18-original-tool-action.v1','actor':'codex:/root','tool_name':kind,'input_ref':iref,'response_ref':rref,'initial_action_ref':initialref,'command_identity':identity,'request_event_locator':request_locator,'response_event_locator':response_locator})
+-
+-def seal_outer(sref,gref,initialref,terminalref,out):
+-    g,r,s=load(sref);phase=s['actual_Root_registration']['phase'];identity=action_identity(s,sref,gref,phase);ia=r.doc(initialref);ta=r.doc(terminalref);first=r.doc(ia['response_ref']);last=r.doc(ta['response_ref'])
++    write(out/'tool-action.original.json',r.verify(actionref))
++    save(out/'capture-provenance.json',{'original_capture_closure':capture_refs,'original_action_ref':actionref,'copied_raw_refs':[iref,rref],'qualification':'EXTERNAL_ORIGINAL_PAIR_REVIEW_REQUIRED_NO_SELF_AUTHENTICATION'})
++    r.unchanged();return actionref
++
++def seal_outer(sref,gref,initialref,terminalref,out,capture_refs):
++    g,r,s=load(sref);g.verify_authority(r,s,sref,r.doc(gref))
++    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)
++    need([x['action_ref'] for x in bundle['events']]==[initialref,terminalref],'OUTER_EXACT_ORIGINAL_CAPTURE_PAIR')
++    phase=s['actual_Root_registration']['phase'];identity=action_identity(s,sref,gref,phase);ia=r.doc(initialref);ta=r.doc(terminalref);first=r.doc(ia['response_ref']);last=r.doc(ta['response_ref'])
+     need(ia['command_identity']==ta['command_identity']==identity and ta['initial_action_ref']==initialref,'ACTUAL_ACTION_PAIR')
+     original={'schema':'researchos.driver18-root-outer-invocation.v1','actor':'codex:/root','cwd':str(ROOT),'argv':identity['argv'],'run_uuid':identity['run_uuid'],'scope_ref':sref,'grant_ref':gref,'launcher_output_root':s[phase+'_launcher_output_root'],'inner_output_root':s[phase+'_output_root'],'session_id':first['session_id'],'tool_initial_result_ref':ia['response_ref'],'tool_initial_action_ref':initialref,'tool_initial_input_ref':ia['input_ref'],'tool_command':r.doc(ia['input_ref'])['cmd']}
+     originalref=save(out/'outer-invocation.json',original)
+     completion={'schema':'researchos.driver18-root-outer-completion.v1','actor':'codex:/root','phase':phase,'run_uuid':identity['run_uuid'],'launcher_ref':s['launcher_ref'],'argv':identity['argv'],'scope_ref':sref,'outer_invocation_ref':originalref,'tool_result_ref':ta['response_ref'],'terminal_tool_action_ref':terminalref,'session_id':first['session_id'],'tool_completion_session_id':r.doc(ta['input_ref'])['session_id'],'actual_outer_exit':last['exit_code'],'actual_native_launcher_exit':None,'automatic_retry':False,'counter_reset':False}
++    completion['original_capture_closure']=capture_refs
+     cref=save(out/'outer-completion.json',completion)
+     # A nonzero terminal result has already been preserved; it cannot become a proof.
+     g.outer_completion(r,cref,s,sref,gref,phase);r.unchanged();return cref
+ 
+ def seal_prepare(sref,gref,outerref,out):
+     g,r,s=load(sref);need(s['actual_Root_registration']['phase']=='prepare','PREPARE_ONLY');g.verify_authority(r,s,sref,r.doc(gref));inner=g.safe(s['prepare_output_root']);launcher=g.safe(s['prepare_launcher_output_root'])
++    outer=r.doc(outerref);capture_refs=outer['original_capture_closure']
++    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)
++    original=r.doc(outer['outer_invocation_ref'])
++    need([x['action_ref'] for x in bundle['events']]==[original['tool_initial_action_ref'],outer['terminal_tool_action_ref']],'PREPARE_CAPTURE_PAIR')
+     proof={'prepare_scope_ref':sref,'prepare_grant_ref':gref,'outer_completion_ref':outerref}
+     for key,name in [('prepared_ref','prepared.json'),('inner_result_ref','result.json'),('inner_manifest_ref','manifest.json')]:proof[key]=pin(inner/name)
+     for key,name in [('launcher_invocation_ref','inner.invocation.json'),('launcher_requested_ref','requested.json'),('launcher_completed_ref','completed.json'),('launcher_manifest_ref','manifest.json'),('launcher_stdout_ref','stdout.raw'),('launcher_stderr_ref','stderr.raw')]:proof[key]=pin(launcher/name)
+@@ -329,7 +458,8 @@
+         need(sys.flags.isolated and sys.flags.no_site and sys.flags.utf8_mode,'PYTHON_I_S_UTF8');STAGE=action
+         if action in ['register_entry','wrapper_entry']:return globals()[action](args)
+         ap=argparse.ArgumentParser();ap.add_argument('--input-ref',required=True);ap.add_argument('--output-root',required=True);x=ap.parse_args(args)
+-        inp=parse(x.input_ref.encode());data=parse(verify(inp));out=leaf(x.output_root)
++        inp=parse(x.input_ref.encode());data=parse(verify(inp))
++        planned=preallocate(action,data,inp,x.output_root);out=leaf(str(planned),True)
+         save(out/'producer-request.json',{'action':action,'input_ref':inp,'actualargv':sys.argv,'cwd':str(Path.cwd()),'automatic_retry':False,'counter_reset':False})
+         if action=='resources':result=resource_catalog(inp,out)
+         elif action=='stage-code':result=stage_sources(out)
+@@ -339,8 +469,8 @@
+         elif action=='seal-registration':result=seal_registration(data['draft_ref'],data['registration_review_ref'])
+         elif action=='grant':result=grant(data['scope_ref'],data['registration_bundle_ref'],data['prepared_proof_ref'],data['new_preflight_root'],data['new_authorization_root'])
+         elif action=='launch-request':result=launch_request(data['scope_ref'],data['grant_ref'],out)
+-        elif action=='capture-action':result=capture_action(data['scope_ref'],data['grant_ref'],data['tool_name'],data['original_input_ref'],data['original_response_ref'],data['request_event_locator'],data['response_event_locator'],data['initial_action_ref'],out)
+-        elif action=='seal-outer':result=seal_outer(data['scope_ref'],data['grant_ref'],data['initial_action_ref'],data['terminal_action_ref'],out)
++        elif action=='capture-action':result=capture_action(data['scope_ref'],data['grant_ref'],data['tool_name'],data['original_input_ref'],data['original_response_ref'],data['request_event_locator'],data['response_event_locator'],data['initial_action_ref'],out,data['original_capture_closure'],data['original_action_ref'])
++        elif action=='seal-outer':result=seal_outer(data['scope_ref'],data['grant_ref'],data['initial_action_ref'],data['terminal_action_ref'],out,data['original_capture_closure'])
+         elif action=='seal-prepare':result=seal_prepare(data['scope_ref'],data['grant_ref'],data['outer_completion_ref'],out)
+         else:raise ValueError('UNKNOWN_ACTION')
+         save(out/'completed.json',{'action':action,'result_ref':result,'source_acceptance':False,'formal_increment':0,'counter_reset':False,'reported_exit':0});immutable_manifest(out)

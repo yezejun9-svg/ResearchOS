@@ -1,0 +1,57 @@
+--- client_cancel_finalization_test.v2.go.proposed.txt
++++ client_cancel_finalization_test.v3.go.proposed.txt
+@@ -359,7 +359,7 @@
+ 		body := map[string]any{"task_id":"B","from":"ENQUEUED","to":"DROPPED"}; raw:=f08TestJSON(t,body)
+ 		rows=append(rows,
+ 			[]any{"sessions",[]any{"session-B","p",f08Number(1),when,when,"goal-B","B",nil,f08Number(1),"client-B",when,f08Number(0),"native-B",nil,nil,nil,nil,nil,nil,nil,f08Number(0),nil,nil,ProtocolV2}},
+-			[]any{"fences",[]any{"p","B","session-B","generation-B","CANCEL_FENCED",f08Number(1),f08Number(1),nil,nil,nil,nil,nil,f08Number(0),f08Number(2)}},
++			[]any{"fences",[]any{"p","B","session-B","generation-B","CANCEL_FENCED",f08Number(1),f08Number(1),nil,nil,nil,nil,nil,f08Number(0),f08Number(3)}},
+ 			[]any{"queue",[]any{"principal-B","p","command-B","session-B","B","goal-B","generation-B",f08Number(1),"sha256:"+strings.Repeat("b",64),"message-B",f08Number(1),"STEER",strings.ToUpper(hex.EncodeToString(contentRaw)),f08RawHash(contentRaw),"DROPPED",f08Number(2),"receipt-B",when}},
+ 			[]any{"receipts",[]any{"receipt-B","p","generation-B","command-B","CANCEL_FENCE",strings.ToUpper(hex.EncodeToString(raw)),f08RawHash(raw),nil,when}})
+ 	}
+@@ -421,7 +421,7 @@
+ 	}
+ 	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){rows:=tc.change(f08AbsenceFixture(t,true));s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("admission accepted bad locator/current producer graph")};original,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",original);e==nil{t.Fatal("final accepted bad locator/current producer graph")}})}
+ 	t.Run("known_dropped_producer_graph",func(t *testing.T){s:=f08AbsenceDecode(t,f08AbsenceFixture(t,true));q,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",q);e!=nil{t.Fatal(e)}})
+-	t.Run("known_enqueued_without_receipt",func(t *testing.T){rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[14]="ENQUEUED";q[15]=f08Number(1);q[16]=nil;fence:=f08AbsenceRow(rows,"fences");fence[4]="OPEN";fence[6]=f08Number(0);fence[13]=f08Number(1);kept:=[]any{};for _,x:=range rows{if x.([]any)[0]!="receipts"{kept=append(kept,x)}};s:=f08AbsenceDecode(t,kept);before,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e!=nil{t.Fatal(e)}})
++	t.Run("known_enqueued_without_receipt",func(t *testing.T){rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[14]="ENQUEUED";q[15]=f08Number(1);q[16]=nil;fence:=f08AbsenceRow(rows,"fences");fence[4]="OPEN";fence[6]=f08Number(0);fence[13]=f08Number(2);kept:=[]any{};for _,x:=range rows{if x.([]any)[0]!="receipts"{kept=append(kept,x)}};s:=f08AbsenceDecode(t,kept);before,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e!=nil{t.Fatal(e)}})
+ }
+ func f08PureProfileFixture()map[string]any{
+ 	c:=map[string]any{"api":"openai-completions","model":"fixture-model","provider":"fixture-provider","ref":"fixture-config","route":"fixture-route","endpoint":"https://fixture.invalid/v1/chat/completions","max_output_tokens":f08Number(8192),"max_calls":f08Number(4),"tools":[]any{}}
+@@ -561,3 +561,36 @@
+   e:=f08FrozenModelProfile(p);open:=strings.Contains(endpoint,"a:80")||strings.Contains(endpoint,"[::1]");if open&&e!=f08ProfileEndpointGlobalGap{t.Fatal("environment-dependent URL branch not refused",e)};if !open&&e!=nil{t.Fatal("ordinary pure host rejected",e)}
+  })}
+ }
++
++// C01-R2 pure producer-graph fixture proposal. All cases remain NOT_RUN.
++// Only unrelated Task B contributes retained history; Task A has NO_SESSION.
++func f08AbsenceEnqueuedFixture(t *testing.T) []any {
++	t.Helper();rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[14]="ENQUEUED";q[15]=f08Number(1);q[16]=nil
++	f:=f08AbsenceRow(rows,"fences");f[4]="OPEN";f[6]=f08Number(0);f[13]=f08Number(2)
++	kept:=[]any{};for _,x:=range rows{if x.([]any)[0]!="receipts"{kept=append(kept,x)}};return kept
++}
++func TestF08NoSessionFenceProducerBounds(t *testing.T) {
++	v:=f08AbsenceValidator(t)
++	for _,enqueued:=range []bool{true,false}{t.Run(fmt.Sprintf("known_producer_enqueued_%v",enqueued),func(t *testing.T){
++		rows:=f08AbsenceFixture(t,true);if enqueued{rows=f08AbsenceEnqueuedFixture(t)};f:=f08AbsenceRow(rows,"fences")
++		wantRevision:=f08Number(3);if enqueued{wantRevision=f08Number(2)};if !f08Equal(f[13],wantRevision){t.Fatal("fixture does not include actual producer increments")}
++		s:=f08AbsenceDecode(t,rows);q,e:=v.queueAdmission(s,"p","A");if e!=nil||q["variant"]!="NO_SESSION"{t.Fatal(q,e)}
++		final,e:=v.emptyQueueFinal(s,"p","A",q);if e!=nil||!f08EmptyArray(final["entry_refs"])||!f08EmptyArray(final["receipt_refs"]){t.Fatal(final,e)}
++	})}
++	cases:=[]struct{name string;enqueued bool;index int;value any;want error}{
++		{"ENQUEUED_CLOSED_CANCEL_FENCE",true,4,"CANCEL_FENCED",f08Binding},
++		{"ENQUEUED_SEALED_FENCE",true,4,"SEALED",f08NativeProofGap},
++		{"ENQUEUED_SEALED_SEQUENCE",true,6,f08Number(1),f08Binding},
++		{"ENQUEUED_RESTORE_OPEN",true,12,f08Number(1),f08NativeProofGap},
++		{"ENQUEUED_FENCE_REVISION_BEFORE_ACCEPTANCE",true,13,f08Number(1),f08Binding},
++		{"DROPPED_FENCE_REVISION_BEFORE_CANCEL",false,13,f08Number(2),f08Binding},
++	}
++	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){
++		rows:=f08AbsenceFixture(t,true);if tc.enqueued{rows=f08AbsenceEnqueuedFixture(t)}
++		// Establish a valid baseline for both entrypoints before one fact changes.
++		valid:=f08AbsenceDecode(t,rows);original,e:=v.queueAdmission(valid,"p","A");if e!=nil{t.Fatal("invalid baseline",e)};if _,e=v.emptyQueueFinal(valid,"p","A",original);e!=nil{t.Fatal("invalid final baseline",e)}
++		q:=f08AbsenceRow(rows,"queue");queueBefore:=append([]any{},q...);f:=f08AbsenceRow(rows,"fences");fenceBefore:=append([]any{},f...);f[tc.index]=tc.value
++		if !f08Equal(queueBefore,q){t.Fatal("queue/content/hash/locator changed")};changed:=0;for i:=range f{if !f08Equal(fenceBefore[i],f[i]){changed++;if i!=tc.index{t.Fatal("unexpected fence mutation")}}};if changed!=1{t.Fatal("control must change exactly one fence fact")}
++		s:=f08AbsenceDecode(t,rows);if _,e=v.queueAdmission(s,"p","A");e!=tc.want{t.Fatal("admission did not refuse with expected typed reason",e)};if _,e=v.emptyQueueFinal(s,"p","A",original);e!=tc.want{t.Fatal("final did not refuse with expected typed reason",e)}
++	})}
++}

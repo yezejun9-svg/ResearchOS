@@ -1,0 +1,171 @@
+	cleanupAllowed = false
+	defer func() { if e := windows.CloseHandle(pi.Process); e != nil { cleanupAllowed = false; err = errors.Join(err, e) } }()
+	defer func() { if e := windows.CloseHandle(pi.Thread); e != nil { cleanupAllowed = false; err = errors.Join(err, e) } }()
+	// Release parent write ends before observing natural EOF.
+	stdout.Close()
+	stderr.Close()
+	stdin.Close()
+	r.PID = pi.ProcessId
+	resumed, finished := false, false
+	deadline := time.Now().Add(c.Timeout)
+	finish := func(cause error) {
+		finished = true
+		if !resumed && cause == nil { cause = errors.New("sandbox stopped before resume") }
+		ops := sandboxLifecycleOps{
+			now: time.Now, pause: time.Sleep,
+			primary: func() (bool, error) {
+				state, e := windows.WaitForSingleObject(pi.Process, 0)
+				if e != nil { return false, e }
+				if state != windows.WAIT_OBJECT_0 && state != windows.WAIT_TIMEOUT { return false, errors.New("unexpected primary wait state") }
+				return state == windows.WAIT_OBJECT_0, nil
+			},
+			account: func() (uint32, uint32, error) {
+				var a struct { User, Kernel, PeriodUser, PeriodKernel int64; Faults, TotalProcesses, ActiveProcesses, Terminated uint32 }
+				e := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), nil)
+				return a.TotalProcesses, a.ActiveProcesses, e
+			},
+			terminate: func(code uint32) error { return windows.TerminateJobObject(job, code) },
+			closeJob: closeJob,
+			exitCode: func() (uint32, error) { var code uint32; e := windows.GetExitCodeProcess(pi.Process, &code); return code, e },
+			closeReaders: func() error {
+				var failure error
+				for _, reader := range []*os.File{stdoutReader, stderrReader} {
+					if e := reader.Close(); e != nil && !errors.Is(e, os.ErrClosed) { failure = errors.Join(failure, e) }
+				}
+				return failure
+			},
+		}
+		life := coordinateSandboxLifecycle(ctx, deadline, cause, ops, outDone, errDone)
+		r.Stopped, r.StreamsDrained, r.JobProcesses, r.TimedOut = life.stopped, life.drained, life.total, life.timedOut
+		if life.codeKnown { r.ExitCode = int(life.code) }
+		r.Stdout, r.Stderr = life.stdout, life.stderr
+		r.Finished = time.Now().UTC().Format(time.RFC3339Nano)
+		cleanupAllowed = life.resourcesQuiescent()
+		err = errors.Join(err, life.err)
+	}
+	// All post-Create failures use the same original-handle stop path while the
+	// process is still suspended; no stream/diagnostic join precedes Job close.
+	defer func() { if !finished { finish(err) } }()
+	var created, exited, kernel, user windows.Filetime
+	if e = windows.GetProcessTimes(pi.Process, &created, &exited, &kernel, &user); e != nil { return r, e }
+	r.Created = created.Nanoseconds()
+	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile, StagingDirectory: staging}
+	if options.BeforeResume != nil {
+		if e = options.BeforeResume(identity); e != nil { return r, fmt.Errorf("beforeResume: %w", e) }
+	}
+	if ctx.Err() != nil { return r, ctx.Err() }
+	if _, e = windows.ResumeThread(pi.Thread); e != nil { return r, e }
+	resumed = true
+	deadline = time.Now().Add(c.Timeout)
+	process.ready <- nil
+	finish(nil)
+	return r, err
+}
+
+const sandboxChildGrace = 500 * time.Millisecond
+const sandboxCleanupBudget = 5 * time.Second
+
+// Private real production coordinator. Tests replace operations, never the
+// public runner or an alleged Native outcome. The caller remains sole owner.
+type sandboxLifecycleOps struct {
+	now func() time.Time
+	pause func(time.Duration)
+	primary func() (bool, error)
+	account func() (total, active uint32, err error)
+	terminate func(uint32) error
+	closeJob func() error
+	exitCode func() (uint32, error)
+	closeReaders func() error
+}
+
+type sandboxLifecycleResult struct {
+	stopped, drained, jobClosed, timedOut, codeKnown bool
+	total, code uint32
+	stdout, stderr []byte
+	err error
+}
+
+func (r sandboxLifecycleResult) resourcesQuiescent() bool {
+	return r.stopped && r.drained && r.jobClosed && r.codeKnown
+}
+
+func coordinateSandboxLifecycle(ctx context.Context, deadline time.Time, initial error, ops sandboxLifecycleOps, stdout, stderr <-chan streamResult) (r sandboxLifecycleResult) {
+	var primaryAt, cleanupAt time.Time
+	var primarySeen, stopping bool
+	var out, diagnostic *streamResult
+	errorsSeen := map[string]bool{}
+	failure := func(key string, err error) {
+		if err != nil && !errorsSeen[key] { r.err = errors.Join(r.err, err); errorsSeen[key] = true }
+	}
+	beginCleanup := func() { if cleanupAt.IsZero() { cleanupAt = ops.now().Add(sandboxCleanupBudget) } }
+	stop := func(code uint32) {
+		beginCleanup()
+		if !stopping { stopping = true; failure("terminate", ops.terminate(code)) }
+	}
+	collect := func() {
+		if out == nil { select { case v := <-stdout: out = &v; failure("stdout", v.err); default: } }
+		if diagnostic == nil { select { case v := <-stderr: diagnostic = &v; failure("stderr", v.err); default: } }
+	}
+	pause := func(until time.Time) {
+		wait := 20 * time.Millisecond
+		if left := until.Sub(ops.now()); left < wait { wait = left }
+		if wait > 0 { ops.pause(wait) }
+	}
+	if initial != nil { failure("initial", initial); stop(125) }
+	for {
+		collect()
+		if out != nil && out.err != nil || diagnostic != nil && diagnostic.err != nil { stop(125) }
+		now := ops.now()
+		if initial == nil && (ctx.Err() != nil || !now.Before(deadline)) { r.timedOut = true; stop(124) }
+		seen, err := ops.primary()
+		if err != nil { failure("primary", err); stop(125) }
+		if seen && !primarySeen { primarySeen = true; primaryAt = now }
+		total, active, err := ops.account()
+		if err != nil { failure("account", err); stop(125) } else {
+			r.total = total
+			if primarySeen && active == 0 { r.stopped = true; beginCleanup(); break }
+		}
+		if !stopping && primarySeen && !now.Before(primaryAt.Add(sandboxChildGrace)) {
+			failure("descendants", errors.New("sandbox descendants survived primary exit grace"))
+			stop(125)
+		}
+		if !cleanupAt.IsZero() && !now.Before(cleanupAt) { break }
+		next := deadline
+		if !cleanupAt.IsZero() { next = cleanupAt } else if primarySeen && primaryAt.Add(sandboxChildGrace).Before(next) { next = primaryAt.Add(sandboxChildGrace) }
+		pause(next)
+	}
+	if primarySeen {
+		code, err := ops.exitCode()
+		failure("exit-code", err)
+		if err == nil { r.code, r.codeKnown = code, true }
+	}
+	// Kernel fallback is synchronous and independent of all stream/callback
+	// joins. After this point no operation uses the closed Job handle.
+	closeErr := ops.closeJob()
+	r.jobClosed = closeErr == nil
+	failure("close-job", closeErr)
+	readersClosed := false
+	closeReaders := func() { if !readersClosed { readersClosed = true; failure("close-readers", ops.closeReaders()) } }
+	if !r.stopped || !r.jobClosed {
+		failure("stop-proof", errors.New("sandbox stop not confirmed before cleanup deadline"))
+		closeReaders()
+	} else {
+		for {
+			collect()
+			if out != nil && diagnostic != nil { break }
+			if !ops.now().Before(cleanupAt) {
+				failure("drain", errors.New("sandbox streams or callback incomplete before cleanup deadline"))
+				closeReaders()
+				break
+			}
+			if ctx.Err() != nil || !ops.now().Before(deadline) { r.timedOut = true; closeReaders() }
+			pause(cleanupAt)
+		}
+	}
+	if out != nil { r.stdout = append([]byte{}, out.bytes...) }
+	if diagnostic != nil { r.stderr = append([]byte{}, diagnostic.bytes...) }
+	r.drained = r.stopped && r.jobClosed && !readersClosed && out != nil && diagnostic != nil && out.eof && diagnostic.eof && out.err == nil && diagnostic.err == nil
+	if !r.drained { failure("incomplete", errors.New("sandbox streams not naturally drained")) }
+	return r
+}
+

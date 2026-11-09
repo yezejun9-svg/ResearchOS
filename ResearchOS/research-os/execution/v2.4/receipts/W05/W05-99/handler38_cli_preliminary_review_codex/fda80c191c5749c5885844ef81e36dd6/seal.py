@@ -1,0 +1,32 @@
+import json,pathlib,hashlib,datetime
+N=pathlib.Path(__file__).parent;H=lambda b:hashlib.sha256(b).hexdigest()
+def save(n,o):(N/n).write_bytes((json.dumps(o,ensure_ascii=False,indent=2)+'\n').encode())
+def ref(p):
+ p=pathlib.Path(p);b=p.read_bytes();return {'path':str(p),'sha256':H(b),'bytes':len(b)}
+rows=json.loads((N/'inputs.before.json').read_bytes());after=[]
+for r in rows:
+ b=pathlib.Path(r['path']).read_bytes();after.append({**r,'after_sha256':H(b),'unchanged':H(b)==r['sha256']})
+save('inputs.after.json',after)
+old=N.parent/'acf3406cef3a4fe8b20e0ee340bafc55'/'review.json'
+review={
+ 'schema':'researchos.handler38.cli-preliminary-followup.v1','reviewer':'codex:/root/w05_merge_review','created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+ 'decision':'STATIC_NUMERIC_FIXES_CONFIRMED_PENDING_FINAL_FREEZE_AND_EXECUTION','prior_review':ref(old),'input_count':len(rows),'input_drift':[x['path'] for x in after if not x['unchanged']],
+ 'source_acceptance':False,'formal_acceptance_delta':0,'scope':'Read-only numeric/ACK follow-up within Handler38 WIP; not whole38 review or execution certification.',
+ 'findings':[
+ {'id':'NUMERIC-RAW','status':'STATIC_FIXED','evidence':['apps/cli/cli_contract.go:731-743','internal/domain/client_protocol_schema.go:190-214','internal/domain/contracts.go:90-96,115-133','public_tools/jsontext_value.go:80-103','public_tools/jsonschema/util.go:271-275','public_tools/jsonschema/validator.go:167,518-548'], 'conclusion':'Original response bytes are strictly checked for complete single JSON value, Unicode and recursively unique decoded property names before UseNumber. No JCS canonicalization precedes schema. Bytes(json.Number) preserves its number lexeme; schema roundtrip again uses UseNumber. Pinned v6.0.3 uses big.Rat integer and numeric bounds, then domain.Num requires exact signed int64. Fractional near-integer lexemes are not rounded into accepted integers.'},
+ {'id':'SESSION-BOUNDARY','status':'STATIC_FIXED','evidence':['apps/cli/cli_contract.go:553,574,641-657,686-690','apps/cli/cli_model_configuration_test.go:308-312,348-381,438-453','apps/cli/cli_model_configuration_windows_test.go:274-308'], 'conclusion':'Configuration head still requires current < 9007199254740991. Scoped Session expected revision equal to that maximum is admitted; exact response revision current+1=9007199254740992 is consumed and persisted as int64, sent epoch retained. Real-Host test injects only counters and explicitly labels INJECTED; this is boundary behavior, not proof of quadrillions of real handoffs.'},
+ {'id':'ACK-STIMULUS','status':'STATIC_VALID_WITH_EXECUTION_REASON_TO_VERIFY','evidence':['apps/cli/cli_model_configuration_test.go:224-227','apps/cli/cli_contract.go:741-769','internal/api/contracts/client.protocol.schema.json:PendingResult/CommandResponse'], 'conclusion':'ACKNOWLEDGED fixture now supplies accepted_at, operation_id, after_sequence and related_resource_ref and has the frozen PendingResult shape. Code reaches CONFIGURE_NOT_COMPLETED after schema/identity for a valid ACK. The table currently asserts exit1, 2 requests and unchanged local bytes but not this exact reason, so runtime evidence must distinguish intentional non-completion from earlier malformed-schema rejection. IN_PROGRESS is intentionally not a valid frozen status.', 'severity':'verification-strength note; no new production blocker identified','next_action':'Inspect final sealed ACK stdout reason; if a later authorized test edit occurs add precise CONFIGURE_NOT_COMPLETED assertion without changing old assertions or restarting current cohort solely for this note.'},
+ {'id':'GENERIC-PROTECTION','status':'BYTE_IDENTICAL_TO_PRIOR_PRELIM','evidence':['prior_comparison.json'], 'conclusion':'cli_v2.go and cli_stream.go are whole-byte identical to previous preliminary snapshots. configure response precision no longer depends on generic cliInteger. Request-side float decoding in these fixtures operates on explicitly bounded exactly representable integers; it does not establish response precision authority.'}
+ ],
+ 'static_test_inventory':['status/config/session near-integer raw response negatives','configuration exact maximum positive','scoped Session maximum-to-maximum-plus-one positive','compiled CLI against actual Host with explicitly injected high counters','valid PendingResult ACK plus local-file non-adoption'],
+ 'execution':{'product_tests':0,'sql':0,'http':0,'node':0,'models':0,'private_reads':0,'paid_calls':0,'product_source_writes':0,'canonical_writes':0},
+ 'limitations':['No final candidate commit or complete38 closure has been supplied for this review.','No PASS claims are made for newly added tests or running author cohorts.','Only 18 relevant public inputs were snapshotted, not the full compile closure.','The prior preliminary receipt and its original numeric findings remain immutable; this is a new scoped static follow-up.'],
+ 'tool_diagnostics':[{'chunk':'85ca64','actual_outer_exit':0,'detail':'Console displayed non-ASCII path using replacement characters; receipt bytes are UTF8 and actual path is retained in files. This was not a failed invocation.'}],
+ 'failure_origins':[]}
+if review['input_drift']:review['decision']='WIP_INPUT_DRIFT_NO_CURRENT_CONCLUSION'
+save('review.json',review);save('failure_origins.json',{'origins':[],'note':'No new nonzero invocation in this follow-up; zero-exit console rendering diagnostic is preserved in review.'})
+save('read_audit.json',{'before':ref(N/'inputs.before.json'),'after':ref(N/'inputs.after.json'),'tool_calls':[{'chunk':x,'actual_outer_exit':0} for x in ['b1473e','1e3657','85ca64','058d93']], 'procedure':'Read-only source/schema/tool implementation inspection and hashing; no product execution.'})
+entries=[{'path':p.relative_to(N).as_posix(),'sha256':H(p.read_bytes()),'bytes':p.stat().st_size} for p in sorted(N.rglob('*')) if p.is_file() and p.name not in ['manifest.json','handoff.json']]
+save('manifest.json',{'schema':'researchos.public-review-manifest.v1','entries':entries,'count':len(entries),'excludes':['manifest.json','handoff.json']})
+save('handoff.json',{'decision':review['decision'],'review':ref(N/'review.json'),'manifest':ref(N/'manifest.json'),'inputs':len(rows),'drift':review['input_drift'],'formal_delta':0,'source_ready':False})
+print(json.dumps({'namespace':str(N),'review':ref(N/'review.json'),'manifest':ref(N/'manifest.json'),'handoff':ref(N/'handoff.json'),'entries':len(entries),'drift':review['input_drift']},ensure_ascii=True))

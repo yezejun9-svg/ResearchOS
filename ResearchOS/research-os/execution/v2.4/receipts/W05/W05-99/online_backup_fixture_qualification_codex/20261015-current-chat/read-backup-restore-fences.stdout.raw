@@ -1,0 +1,96 @@
+567:func RestoreBackup(ctx context.Context, directory, destination string, opt RestoreOptions) (RestoreReport, error) {
+568-	return restoreBackupPolicy(ctx, directory, destination, opt, nil)
+569-}
+570-func restoreBackupPolicy(ctx context.Context, directory, destination string, opt RestoreOptions, policy *backupPolicy) (RestoreReport, error) {
+571-	start := time.Now()
+572-	r := RestoreReport{Started: Now(), Status: "FAILED"}
+573-	absDestination, absErr := filepath.Abs(destination)
+574-	if absErr != nil {
+575-		return r, absErr
+576-	}
+577-	destination = absDestination
+578-	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
+579-		return r, fmt.Errorf("RESTORE_VERSION_POLICY_REQUIRED")
+580-	}
+581-	if opt.Irreversible {
+582-		return r, fmt.Errorf("IRREVERSIBLE_MIGRATION_MAINTENANCE_REQUIRED")
+583-	}
+584-	m, files, e := readBackupPolicy(directory, opt.Key, policy)
+585-	if e != nil {
+586-		return r, e
+587-	}
+588-	if backupOrdinaryPublicPolicy(policy) {
+589-		if e = backupWorkspaceRestorePaths(files, directory, destination); e != nil {
+590-			return r, e
+591-		}
+592-	}
+593-	r.BackupID = m.ID
+594-	if Hash(m.Migrations) != Hash(opt.SupportedMigrations) {
+595-		return r, fmt.Errorf("MIGRATION_INCOMPATIBLE: restore with matching application version")
+596-	}
+597-	stage, e := backupNewStage(destination)
+598-	if e != nil {
+599-		return r, e
+600-	}
+601-	defer backupDiscard(stage)
+602-	databaseName := "state.sqlite"
+603-	if opt.DatabaseName != "" {
+604-		if filepath.Base(opt.DatabaseName) != opt.DatabaseName || strings.ContainsAny(opt.DatabaseName, "/\\:") {
+605-			return r, fmt.Errorf("RESTORE_DATABASE_NAME_INVALID")
+606-		}
+607-		databaseName = opt.DatabaseName
+608-	}
+609-	if policy != nil && policy.databaseName != "" {
+610-		if filepath.Base(policy.databaseName) != policy.databaseName || strings.ContainsAny(policy.databaseName, "/\\:") {
+611-			return r, fmt.Errorf("RESTORE_DATABASE_NAME_INVALID")
+612-		}
+613-		databaseName = policy.databaseName
+614-	}
+615-	if e = backupWrite(filepath.Join(stage, databaseName), files["state.sqlite"]); e != nil {
+616-		return r, e
+617-	}
+618-	db, e := store.Open(filepath.Join(stage, databaseName))
+619-	if e != nil {
+620-		return r, e
+621-	}
+622-	defer db.Close()
+623-	if e = backupIntegrityPolicy(db, policy); e != nil {
+624-		return r, e
+625-	}
+626-	actual, e := backupMigrations(db)
+627-	if e != nil {
+628-		return r, e
+629-	}
+630-	if Hash(actual) != Hash(m.Migrations) {
+631-		return r, fmt.Errorf("MIGRATION_MANIFEST_MISMATCH")
+632-	}
+633-	schema, e := backupSchema(db)
+634-	if e != nil {
+635-		return r, e
+636-	}
+637-	if schema != m.SchemaHash {
+638-		return r, fmt.Errorf("BACKUP_SCHEMA_HASH_MISMATCH")
+639-	}
+640-	if backupOrdinaryPublicPolicy(policy) {
+641-		queue, err := backupQueueState(db)
+642-		if err != nil {
+643-			return r, err
+644-		}
+645-		if queue != nil {
+646-			var saved Object
+647-			if json.Unmarshal(files["command-queue.json"], &saved) != nil || Hash(saved) != Hash(queue) {
+648-				return r, fmt.Errorf("RESTORE_QUEUE_SIDECAR_MISMATCH")
+649-			}
+650-		}
+651-	}
+652-	// Types are loaded separately so schema evolution cannot silently reinterpret
+653-	// stored objects under a changed application contract.
+654-	types, e := db.Query("SELECT kind,body FROM domain_versions")
+655-	if e != nil {
+656-		return r, e
+657-	}
+658-	for types.Next() {
+659-		var kind, raw string
+660-		if e = types.Scan(&kind, &raw); e != nil {
+661-			types.Close()
+662-			return r, e

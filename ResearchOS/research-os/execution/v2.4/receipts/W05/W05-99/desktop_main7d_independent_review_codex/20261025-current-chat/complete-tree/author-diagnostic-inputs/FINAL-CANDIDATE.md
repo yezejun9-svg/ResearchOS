@@ -1,0 +1,12 @@
+# Desktop complete development tree candidate
+
+**Result:** A complete development tree was built and sealed without launching Electron or Core. It is a source candidate for independent review, not native Desktop or W20 acceptance.
+
+- Scope: `Desktop-complete-tree-source-scope.json` SHA-256 `a9e0c1b29282468b2d7a10d2cbd3db88feaa673b8480e0aab3d6176019bc7ab3`.
+- Candidate branch: `desktop-main7d-native-20261025`; commit `ecc28dd3c91a0f68dcddb41b53325aa7f0e81419`; tree `1d44a02c9483fc529b08ffe81895ec443920bdd1`; parent `7d1e3ff288f91254c7304dd32f6e5bb4b66b8f1e`.
+- Exact source delta: seven allowlisted paths, six added and `apps/desktop/main/main.js` modified. The candidate worktree is clean. `POSTCOMMIT-VALIDATION.json` SHA-256 `72f0d5cf4db4ec775f5b103cf6529748c87ce57664679da15c3d38385264ee00` checks all seven committed blobs against `SOURCE-FREEZE-03.json` (SHA-256 `c6ac8745f27d91a7d74aa804acdc05f3a50932b0d414a91f63daefe75c00c113`).
+- Build: `build-02.pre.json` native exit 0; 132-file development manifest SHA-256 `e1d61b68d12c61e2dda341df3541d2b4b541b9c2331af5da26ca56dff759b620`. Its result is `BUILT_NOT_NATIVE_TESTED`. Builder receipts include equal before/after source, public Mu vendor, Mu compiled-input and Core/verifier Go-input manifests; all builder subcommands exited 0.
+- Checks: `focused-04` Node launcher and smoke tests 6/6 passed, including a Chinese UTF-8 character split across stdout chunks and truncated final reports. `postbuild-03` Python built-bundle tests ran 5 with 4 pass and 1 Windows symlink-privilege skip; generated launcher `--dry-run` exited 0 without creating the state path; nearest Desktop tests 5/5 passed. `resources-02` static installed-resource resolution exited 0. `precommit-02` applied the r3 patch check against an isolated temporary Git index with exit 0; `stage-02` exact seven-path stage and diff check exited 0.
+- `PRECOMMIT-MANIFEST-r3.json` SHA-256 `e0a7e587b3f1c6a613f738b56b5b2401cd8a3aa841308cae1e82da01b759301f`; `diagnostics-r3.json` SHA-256 `23739f6877eaf8586340df8755ceadcd4300012c79c6ed23e28648e209913071` records the superseded r2 build and a receipt-script seal failure before the corrected seal passed. Earlier raw receipts remain intact.
+
+No native GUI/Core launch, original data or credential access, Main merge, or formal acceptance increment occurred. A real Windows session smoke and independent review remain separate work.

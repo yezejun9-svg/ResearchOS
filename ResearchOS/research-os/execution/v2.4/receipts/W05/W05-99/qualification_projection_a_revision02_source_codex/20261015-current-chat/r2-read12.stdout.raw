@@ -1,0 +1,240 @@
+	if err == nil || !strings.Contains(err.Error(), "tool schemas") {
+		t.Fatalf("old coding tools accepted or wrong guard: %v", err)
+	}
+	var after string
+	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("UNKNOWN ledger changed after rejection")
+	}
+}
+
+func TestQualificationProjectionUnknownCostFullMatrix(t *testing.T) {
+	f, _, runID, key := desktopExitFixture(t)
+	tx, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	run, err := load(tx, f.project, "Run", runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := load(tx, f.project, "Task", Str(run, "task_id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := runtimeDispatch(tx, f.project, runID, run["lease_epoch"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := dispatch["manifest"].(map[string]any)
+	effect, err := latestEffect(tx, f.project, runID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := effect["payload"].(map[string]any)
+	payload := request["payload"].(map[string]any)
+	var ledgerBefore, effectsBefore string
+	if err := tx.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsBefore); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			positive := qualificationProjectionClone(t, manifest)
+			if err := validateCompletedLocalModelRequest(positive, task, payload); err != nil {
+				t.Fatalf("unmodified completed local request invalid: %v", err)
+			}
+			mutated := qualificationProjectionMutant(t, manifest, mutation)
+			if err := validateCompletedLocalModelRequest(mutated, task, payload); err == nil {
+				t.Fatal("completed-local request gate accepted mutation")
+			}
+		})
+	}
+	var ledgerAfter, effectsAfter string
+	if err := tx.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerBefore != ledgerAfter || effectsBefore != effectsAfter {
+		t.Fatal("rejected projection changed original ledger or effect history")
+	}
+}
+func TestDesktopExitUnknownIncompleteRefused(t *testing.T) {
+	for _, name := range []string{"paid_capability", "credential", "request_hash", "receipt_hash", "effect_unknown", "active_run", "queue_not_empty", "missing_observation", "missing_identity", "reservation", "budget_changed", "active_qualification"} {
+		t.Run(name, func(t *testing.T) {
+			f, c, run, key := desktopExitFixture(t)
+			ctx := context.Background()
+			sourceTx(t, f.db, func(tx *sql.Tx) error {
+				switch name {
+				case "missing_observation":
+					_, e := tx.Exec(`UPDATE runtime_dispatches SET observation_hash='missing' WHERE run=?`, run)
+					return e
+				case "missing_identity":
+					_, e := tx.Exec(`UPDATE runtime_dispatches SET identity='{}' WHERE run=?`, run)
+					return e
+				case "active_qualification":
+					c.qualificationActive = true
+					return nil
+				case "active_run", "queue_not_empty":
+					r, e := load(tx, f.project, "Run", run)
+					if e != nil {
+						return e
+					}
+					if name == "active_run" {
+						r["status"] = "RUNNING"
+					} else {
+						r["queue_empty"] = false
+					}
+					if e = bump(r); e != nil {
+						return e
+					}
+					return f.s.put(tx, "Run", r)
+				case "budget_changed":
+					r, e := load(tx, f.project, "Run", run)
+	s := c.service
+	if e := s.Contracts.Validate("Id", request.RequestID); e != nil {
+		return nil, "", e
+	}
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, "", e
+	}
+	defer tx.Rollback()
+	p, e := resourcePrincipal(tx, token, request.ProjectID, "OWNER")
+	if e != nil {
+		return nil, "", e
+	}
+	if _, _, e = c.localQualification(tx, p, request); e != nil {
+		return nil, "", e
+	}
+	if e = c.validateLocalConfirmation(ctx, tx, p, request); e != nil {
+		return nil, "", e
+	}
+	if e = localQualificationIdle(tx); e != nil {
+		return nil, "", e
+	}
+	var prior string
+	e = tx.QueryRow(`SELECT request_hash FROM idempotency WHERE principal=? AND project=? AND operation='host:managed-runtime-qualification' AND key=?`, p.ID, request.ProjectID, request.RequestID).Scan(&prior)
+	if e == nil {
+		return nil, "", Fail(409, "STATE_CONFLICT", "managed qualification request already consumed; no automatic replay")
+	}
+	if e != sql.ErrNoRows {
+		return nil, "", e
+	}
+	// These are the same Owner, frozen plan, budget and claim gates used by the
+	// public trusted Go BeginRuntimeQualification wrapper, in the same transaction
+	// as the non-secret request-consumption receipt. No lease enters the receipt.
+	run, lease, e := s.beginRuntimeQualification(tx, p, request.ProjectID, request.TaskID, request.RuntimeID, executor)
+	if e != nil {
+		return nil, "", e
+	}
+	// Recheck the wall-clock deadline after all claim gates; an expired claim is
+	// rolled back together with consumption, even if earlier checks were slow.
+	if e = validateLocalConfirmationTime(request); e != nil {
+		return nil, "", e
+	}
+	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:managed-runtime-qualification',?,?,201,?,'{}',?)`, p.ID, request.ProjectID, request.RequestID, Hash(request), Bytes(Object{"request_hash": Hash(request), "run_ref": Ref(run, "Run"), "task_id": request.TaskID, "runtime_id": request.RuntimeID}), Now())
+	if e != nil {
+		return nil, "", e
+	}
+	return run, lease, tx.Commit()
+}
+
+// PreparedLocalQualification is for the privileged managed producer. It emits
+// the current immutable identifiers and a short-lived private confirmation
+// record without starting work or granting authority.
+func (c *RuntimeCoordinator) PreparedLocalQualification(ctx context.Context, ownerToken string, candidate RuntimeSetupCandidate, seconds int) (LocalRuntimeQualificationRequest, error) {
+	var request LocalRuntimeQualificationRequest
+	tx, e := c.service.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return request, e
+	}
+	defer tx.Rollback()
+	p, e := authenticate(tx, ownerToken)
+	if e != nil {
+		return request, e
+	}
+	record, e := c.service.runtimeSetupConfiguration(ctx, tx, p, candidate, c.config.ClientSchema, c.config.ConfigurationAuthority)
+	if e != nil {
+		return request, e
+	}
+	runtime, _, e := c.sessionModel(tx, candidate.ProjectID, candidate.ModelRef)
+	if e != nil {
+		return request, e
+	}
+	var taskID string
+	if e = tx.QueryRow(`SELECT task FROM runtime_qualification_plans WHERE project=? AND runtime=?`, candidate.ProjectID, runtime["id"]).Scan(&taskID); e != nil {
+		return request, e
+	}
+	plan, hash, _, e := qualificationPlan(tx, candidate.ProjectID, taskID, Str(runtime, "id"))
+	if e != nil {
+		return request, e
+	}
+	request = LocalRuntimeQualificationRequest{RequestID: ID(), ProjectID: candidate.ProjectID, SessionID: candidate.SessionID, ModelRef: candidate.ModelRef, RuntimeID: Str(runtime, "id"), TaskID: taskID, PlanHash: hash, ProfileHash: Hash(plan["profile_ref"]), AuthorizePurpose: "mu_turn", PurposeSeconds: seconds}
+	request.OwnerHost, request.OwnerPrincipal, request.ConfigurationHash = record.Owner, p.ID, record.ConfigHash
+	request.OwnerRoot, e = currentAuthorityRoot(tx, p.ID)
+	if e != nil {
+		return request, e
+	}
+	request.SessionHash, e = localConfirmationSessionHash(ctx, tx, request)
+	if e != nil {
+		return request, e
+	}
+	issued := time.Now().UTC()
+	request.IssuedAt, request.ExpiresAt = issued.Format(time.RFC3339Nano), issued.Add(time.Minute).Format(time.RFC3339Nano)
+	_, task, e := c.localQualification(tx, p, request)
+	if e != nil {
+		return request, e
+	}
+	if task["status"] != "DRAFT" {
+		return request, Fail(409, "STATE_CONFLICT", "qualification already consumed; no automatic retry")
+	}
+	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-confirmation',?,?,200,?,'{}',?)`, p.ID, request.ProjectID, request.RequestID, Hash(request), Bytes(request), Now())
+	if e != nil {
+		return request, e
+	}
+	return request, tx.Commit()
+}
+
+// RecordLocalRuntimeAdministration seals provenance of a trusted local action;
+// this is not an AcceptanceReceipt and confers no availability.
+func (s *Service) RecordLocalRuntimeAdministration(ctx context.Context, token, project string, evidence Object) (Object, error) {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	p, e := resourcePrincipal(tx, token, project, "OWNER")
+	if e != nil {
+		return nil, e
+	}
+	if evidence["schema"] != "researchos.local-runtime-administration.v1" {
+		return nil, Fail(422, "GATE_FAILED", "local administration evidence schema required")
+	}
+	if evidence["action"] == "EXPLICIT_QUALIFICATION_REQUEST" {
+		child, root := Str(evidence, "verifier_principal"), Str(evidence, "service_root")
+		actual, e := currentAuthorityRoot(tx, child)
+		ownerRoot, ownerErr := currentAuthorityRoot(tx, p.ID)
+		var parent string
+		if e != nil || ownerErr != nil || actual != root || root == ownerRoot || root == child || !runtimeRoleAndGrant(tx, child, project, "VERIFIER") || tx.QueryRow(`SELECT parent FROM orchestration_identity WHERE principal=?`, child).Scan(&parent) != nil || parent != root {
+			return nil, Fail(403, "FORBIDDEN", "explicit active independent verifier lineage required")
+		}
+		anchor := Object{"schema": "researchos.managed-verifier-lineage.v1", "principal": child, "root": root, "project_id": project, "registered_by": p.ID}
+		var prior string
+		e = tx.QueryRow(`SELECT request_hash FROM idempotency WHERE principal=? AND project=? AND operation='host:managed-verifier-lineage' AND key=?`, child, project, child).Scan(&prior)
+		if e == sql.ErrNoRows {
+			_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:managed-verifier-lineage',?,?,200,?,'{}',?)`, child, project, child, Hash(anchor), Bytes(anchor), Now())
+		} else if e == nil && prior != Hash(anchor) {
+			e = Fail(403, "FORBIDDEN", "managed verifier original lineage changed")
+		}
+		if e != nil {
+			return nil, e
+		}
+	}

@@ -1,0 +1,301 @@
+SOURCE=internal/host/host.go
+197: // so a crash cannot leave a half-written credential or root registry.
+198: func writePrivate(dir, name string, payload any) error {
+199: 	raw, err := json.MarshalIndent(payload, "", "  ")
+200: 	if err != nil {
+201: 		return err
+202: 	}
+203: 	tmp, err := os.CreateTemp(dir, name+".tmp-")
+204: 	if err != nil {
+205: 		return err
+206: 	}
+207: 	defer os.Remove(tmp.Name())
+208: 	if err := tmp.Chmod(0o600); err != nil {
+209: 		tmp.Close()
+210: 		return err
+211: 	}
+212: 	if _, err := tmp.Write(raw); err != nil {
+213: 		tmp.Close()
+214: 		return err
+215: 	}
+216: 	if err := tmp.Sync(); err != nil {
+217: 		tmp.Close()
+218: 		return err
+219: 	}
+220: 	if err := tmp.Close(); err != nil {
+221: 		return err
+222: 	}
+223: 	if err := privateFile(tmp.Name()); err != nil {
+224: 		return err
+225: 	}
+226: 	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+227: }
+228: 
+229: func readPrivate(dir, name string, into any) error {
+230: 	raw, err := os.ReadFile(filepath.Join(dir, name))
+231: 	if err != nil {
+232: 		if errors.Is(err, os.ErrNotExist) {
+233: 			return nil
+234: 		}
+235: 		return err
+236: 	}
+237: 	return json.Unmarshal(raw, into)
+238: }
+SOURCE=internal/host/native.go
+260: // nativeWorkspaceChoose resolves the chosen directory here, never in the client: the host is the
+261: // component that can see real paths, links and permissions.
+262: func (h *Host) nativeWorkspaceChoose(ctx context.Context, clientID string, payload []byte, chooser func(string) (string, error)) ([]byte, func(), error) {
+263: 	var req workspaceChooseRequest
+264: 	dec := json.NewDecoder(bytesReader(payload))
+265: 	dec.DisallowUnknownFields()
+266: 	if err := dec.Decode(&req); err != nil {
+267: 		return nil, nil, fmt.Errorf("%w: %v", ErrFrameShape, err)
+268: 	}
+269: 	if req.RequestedAccess != AccessReadOnly && req.RequestedAccess != AccessReadWrite {
+270: 		return nil, nil, ErrFrameShape
+271: 	}
+272: 	path := ""
+273: 	if req.RequestedPath != nil {
+274: 		// A client-named directory is only a hint: without a real chooser the host would be
+275: 		// binding whatever path a caller typed, which is the "public OWNER registration" failure
+276: 		// mode in filesystem form, so the request is refused rather than trusted.
+277: 		if chooser == nil {
+278: 			return nil, nil, fmt.Errorf("%w: a client-named path needs a user chooser", ErrUntrustedPathChoice)
+279: 		}
+280: 		path = *req.RequestedPath
+281: 	}
+282: 	if chooser != nil {
+283: 		picked, err := chooser(path)
+284: 		if err != nil {
+285: 			return nil, nil, err
+286: 		}
+287: 		path = picked
+288: 	}
+289: 	if path == "" {
+290: 		return nil, nil, fmt.Errorf("%w: no directory was chosen", ErrFrameShape)
+291: 	}
+292: 	real, err := filepath.Abs(path)
+293: 	if err != nil {
+294: 		return nil, nil, err
+295: 	}
+296: 	real, err = filepath.EvalSymlinks(real)
+297: 	if err != nil {
+298: 		return nil, nil, err
+299: 	}
+300: 	if reparse, err := chainHasReparsePoint(real); err != nil {
+301: 		return nil, nil, err
+302: 	} else if reparse {
+303: 		return nil, nil, ErrPathReparsePoint
+304: 	}
+305: 	ref, err := h.roots.nextRef()
+306: 	if err != nil {
+307: 		return nil, nil, err
+308: 	}
+309: 	created, err := h.roots.Register(ref, real, req.RequestedAccess, h.nowUTC())
+310: 	if err != nil {
+311: 		return nil, nil, err
+312: 	}
+313: 	rec, err := h.selections.Issue(h.identity.Ref, clientID, real, real, req.RequestedAccess, h.nowUTC())
+314: 	if err != nil {
+315: 		_ = h.roots.Revoke(created.Ref)
+316: 		return nil, nil, err
+317: 	}
+318: 	undo := func() {
+319: 		_ = h.roots.Revoke(created.Ref)
+320: 		h.selections.Withdraw(rec.Ref)
+321: 	}
+322: 	reply, err := json.Marshal(map[string]any{
+323: 		"kind":    KindWorkspaceChooseResult,
+324: 		"payload": map[string]any{"selection_ref": rec.Ref, "display_path": rec.DisplayPath, "expires_at": rec.ExpiresAt},
+325: 	})
+326: 	if err != nil {
+327: 		undo()
+328: 		return nil, nil, err
+329: 	}
+330: 	return reply, undo, nil
+331: }
+332: 
+333: // ConsumeSelection is the host-side redemption of a selection reference; a later command that
+334: // carries one can only use it once, by the same principal and client, before it expires.
+335: func (h *Host) ConsumeSelection(ref, clientID string) (*SelectionRecord, error) {
+SOURCE=internal/host/surface.go
+1: package host
+2: 
+3: // Exported host surface used by the local CLI/Desktop and by qualification. Each method keeps the
+4: // boundary it belongs to: paths are resolved by the host, credentials only ever come back as a
+5: // reference plus a state, and a selection reference is consumable once.
+6: 
+7: // ResolveWorkspace validates one published relative path against a bound root and returns the
+8: // absolute path to open. Registration-time correctness is never assumed: the reparse chain and
+9: // the pinned volume/file identity are re-checked on every call.
+10: func (h *Host) ResolveWorkspace(ref, rel, wantAccess string) (string, error) {
+11: 	return h.roots.Resolve(ref, rel, wantAccess)
+12: }
+13: 
+14: // RevokeWorkspace withdraws a root. Subsequent calls answer WORKSPACE_REVOKED rather than an empty
+15: // listing, so an inaccessible directory can never be presented as "no files".
+16: func (h *Host) RevokeWorkspace(ref string) error { return h.roots.Revoke(ref) }
+17: 
+18: // WorkspaceStatus reports the binding state of one root reference.
+19: func (h *Host) WorkspaceStatus(ref string) string { return h.roots.Status(ref) }
+20: 
+21: // CredentialUsable answers whether a reference can still yield material to the host's own
+22: // provider path. It reports a boolean only: no call in this package returns plaintext to a
+23: // caller outside the host.
+24: func (h *Host) CredentialUsable(ref string) bool {
+25: 	buf, err := h.vault.open(ref)
+26: 	if err != nil {
+27: 		return false
+28: 	}
+29: 	for i := range buf {
+30: 		buf[i] = 0
+31: 	}
+32: 	return true
+33: }
+34: 
+35: // SelectionFor exposes an issued selection record's fields to the host's own configuration path
+36: // (the reference itself is consumed by ConsumeSelection).
+37: func (h *Host) OutstandingSelections() int { return h.selections.Outstanding() }
+38: 
+39: // VaultRefs lists credential references (never values) for host diagnostics and the CLI settings
+40: // screen.
+41: func (h *Host) VaultRefs() ([]string, error) { return h.vault.Refs() }
+SOURCE=internal/host/workspace_files_windows.go
+65: 	if h == nil || h.roots == nil || (access != AccessReadOnly && access != AccessReadWrite) || workspacePath == "" {
+66: 		return nil, nil, ErrRootDenied
+67: 	}
+68: 	var match *RootBinding
+69: 	for _, candidate := range h.roots.List() {
+70: 		if strings.EqualFold(filepath.Clean(candidate.RealPath), filepath.Clean(workspacePath)) {
+71: 			if candidate.Revoked {
+72: 				return nil, nil, ErrRootRevoked
+73: 			}
+74: 			if match != nil || candidate.Access != access {
+75: 				return nil, nil, ErrRootDenied
+76: 			}
+77: 			match = candidate
+78: 		}
+79: 	}
+80: 	if match == nil {
+81: 		return nil, nil, ErrRootUnknown
+82: 	}
+83: 	if _, err := h.ResolveWorkspace(match.Ref, ".", AccessReadOnly); err != nil {
+84: 		return nil, nil, err
+85: 	}
+86: 	root, err := os.OpenRoot(match.RealPath)
+87: 	if err != nil {
+88: 		return nil, nil, err
+89: 	}
+90: 	vol, id, _, err := fileIdentity(match.RealPath)
+91: 	if err != nil || vol != match.VolumeID || id != match.FileID {
+92: 		root.Close()
+93: 		return nil, nil, ErrPathReparsePoint
+94: 	}
+95: 	return match, root, nil
+96: }
+97: 
+98: func (h *Host) workspacePlain(root *os.Root, binding *RootBinding, rel string, directory bool) error {
+99: 	if _, err := h.ResolveWorkspace(binding.Ref, rel, AccessReadOnly); err != nil {
+100: 		return err
+101: 	}
+102: 	if rel == "." {
+103: 		if directory {
+104: 			return nil
+105: 		}
+106: 		return ErrPathEscape
+107: 	}
+108: 	parts := strings.Split(rel, "/")
+109: 	for i := range parts {
+110: 		prefix := strings.Join(parts[:i+1], "/")
+SOURCE=internal/host/workspace_write_windows.go
+350: 			out = writeIntentResult(prior, priorPath)
+351: 			err = writeError(classified.Code, "UNKNOWN", classified)
+352: 		}
+353: 	}()
+354: 	rootPath, err := validateWorkspaceWrite(in)
+355: 	if err != nil {
+356: 		return out, err
+357: 	}
+358: 	if err := in.Revalidate(ctx); err != nil {
+359: 		return out, writeError("POLICY_DENIED", "NOT_APPLIED", err)
+360: 	}
+361: 	journal, err := writeJournalDirs(in.JournalRoot)
+362: 	if err != nil {
+363: 		return out, writeError("JOURNAL_UNAVAILABLE", "NOT_APPLIED", err)
+364: 	}
+365: 	volume, fileID, _, err := fileIdentity(rootPath)
+366: 	if err != nil {
+367: 		return out, writeError("WORKSPACE_REVOKED", "NOT_APPLIED", err)
+368: 	}
+369: 	rootIdentity := fmt.Sprintf("%s:%016x", volume, fileID)
+370: 	keyHash := strings.TrimPrefix(writeHash([]byte(in.IntentKey)), "sha256:")
+371: 	pathHash := strings.TrimPrefix(writeHash([]byte(rootIdentity+"|"+strings.ToLower(in.RelativePath))), "sha256:")
+372: 	unlockKey, err := lockWorkspaceWrite(ctx, filepath.Join(journal, "locks", "intent-"+keyHash+".lock"))
+373: 	if err != nil {
+374: 		return out, writeError("LOCK_UNAVAILABLE", "NOT_APPLIED", err)
+375: 	}
+376: 	defer unlockKey()
+377: 	unlockPath, err := lockWorkspaceWrite(ctx, filepath.Join(journal, "locks", "path-"+pathHash+".lock"))
+378: 	if err != nil {
+379: 		return out, writeError("LOCK_UNAVAILABLE", "NOT_APPLIED", err)
+380: 	}
+381: 	defer unlockPath()
+382: 	if err := in.Revalidate(ctx); err != nil {
+383: 		return out, writeError("POLICY_DENIED", "NOT_APPLIED", err)
+384: 	}
+385: 	absolute := filepath.Join(rootPath, filepath.FromSlash(in.RelativePath))
+386: 	guards, err := guardWriteDirectories(filepath.Dir(absolute))
+387: 	if err != nil {
+388: 		return out, writeError("PATH_OUT_OF_SCOPE", "NOT_APPLIED", err)
+389: 	}
+390: 	defer closeWriteGuards(guards)
+391: 	vol2, id2, _, err := fileIdentity(rootPath)
+392: 	if err != nil || vol2 != volume || id2 != fileID {
+393: 		return out, writeError("WORKSPACE_REVOKED", "NOT_APPLIED", errors.New("root identity changed while locking path"))
+394: 	}
+395: 	if err := in.Revalidate(ctx); err != nil {
+396: 		return out, writeError("POLICY_DENIED", "NOT_APPLIED", err)
+397: 	}
+398: 	expected := ""
+399: 	if in.ExpectedHash != nil {
+400: 		expected = *in.ExpectedHash
+401: 	}
+402: 	after := writeHash(in.Content)
+403: 	bodyHash := intentBodyHash(rootIdentity, in.RelativePath, expected, after, in.CreateIfMissing, in.ScopeHash)
+internal/host\backup_integration_windows_test.go:43:func backupTestHost(t *testing.T, db *sql.DB, dataRoot, repo string) *host.Host {
+internal/host\runtime_coding_windows_test.go:14:func codingInventory(t *testing.T) (*os.Root, string, domain.RuntimeCodingCheck) {
+internal/host\runtime_qualification_integration_windows_test.go:206:func TestManagedLocalQualificationRootRevocation(t *testing.T) {
+internal/host\runtime_tools_windows_test.go:18:func runtimeToolFixture(t *testing.T, access string) (*Host, string, *RootBinding) {
+internal/host\runtime_tools_windows_test.go:25:	registry, err := openRootRegistry(filepath.Join(base, "host"))
+internal/host\workspace_files_windows_test.go:19:func TestWorkspaceTreeReadAndContentUsePinnedRoot(t *testing.T) {
+internal/host\workspace_write_windows_test.go:16:func writeFixture(t *testing.T) (*os.Root, string, string) {
+internal/host\workspace_write_windows_test.go:32:func writeInput(root *os.Root, rootPath, journal, rel, key string, expected *string, content string) WorkspaceWriteInput {
+BLOB=4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/host/roots_windows.go
+9057ffb989e5f03a50d39ca2c7eef79ada47612d
+BLOB=4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/host/roots.go
+49e26a66909ac9c71019b978e16e39d841983387
+BLOB=4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/host/backup_windows.go
+68cbb1d1a33b763031ec26f2c8cb99c7f6560b85
+BLOB=4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/host/host.go
+4c231c79e5cf77c52bb0cecaf2f9a86e00aeaa15
+BLOB=4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/host/native.go
+bbe1bea8a82f6c6b55f3e49432d78e7c66fc04de
+BLOB=6802628826dcc4b79a16ced20a8e26f7e5494a1b:internal/host/roots_windows.go
+9057ffb989e5f03a50d39ca2c7eef79ada47612d
+BLOB=6802628826dcc4b79a16ced20a8e26f7e5494a1b:internal/host/roots.go
+49e26a66909ac9c71019b978e16e39d841983387
+BLOB=6802628826dcc4b79a16ced20a8e26f7e5494a1b:internal/host/backup_windows.go
+68cbb1d1a33b763031ec26f2c8cb99c7f6560b85
+BLOB=6802628826dcc4b79a16ced20a8e26f7e5494a1b:internal/host/host.go
+4c231c79e5cf77c52bb0cecaf2f9a86e00aeaa15
+BLOB=6802628826dcc4b79a16ced20a8e26f7e5494a1b:internal/host/native.go
+bbe1bea8a82f6c6b55f3e49432d78e7c66fc04de
+
+Algorithm       Hash                                                                   Path                            
+---------       ----                                                                   ----                            
+SHA256          49DA785D1531314A9B74ECD5AD5A378B5203DAD7D239F8E9F7860433364AD6A8       D:\作品集\ResearchOS\research-os...
+SHA256          49DA785D1531314A9B74ECD5AD5A378B5203DAD7D239F8E9F7860433364AD6A8       D:\作品集\ResearchOS\research-os...
+go version go1.27.1 windows/amd64
+X_SYS_EXISTS=True
+
+

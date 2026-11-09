@@ -1,0 +1,30 @@
+import ast,hashlib,json
+from pathlib import Path
+N=Path(__file__).resolve().parent
+def pin(p):
+ p=Path(p).resolve();b=p.read_bytes();return dict(path=str(p),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+def save(name,v):
+ with (N/name).open('xb') as f:f.write((json.dumps(v,ensure_ascii=False,indent=2)+'\n').encode())
+ return pin(N/name)
+controls=json.loads((N/'source-controls.json').read_bytes());choice=json.loads((N/'source.choice.json').read_bytes());contract=json.loads((N/'calling-contract.json').read_bytes());inputs=json.loads((N/'source-input-pins.original.json').read_bytes())
+assert controls['status']=='PASS' and controls['count']==148 and all(v['passed'] for v in controls['checks'])
+for v in inputs:assert pin(v['path'])==v
+assert all(not Path(p).exists() for p in choice['fixed_future_paths'])
+for p in N.glob('*.py'):ast.parse(p.read_bytes())
+failures=save('failure-origins.json',dict(new_original_failures=[],automatic_retry=False,future_ordinal_reserved=False,prior_failures_immutable=True))
+report='''# W09 C19 v7 two-component Consumer Caller Source
+
+Status: SOURCE_PREPARED_PENDING_NEW_PRODUCER_QUALIFICATION_AND_ROOT_SCOPE. No actual execution authority. The new producer must create a v7 Source21 report and tool-run packet and receive independent actual qualification plus two route-specific mode decisions sharing a qualified independent mode review. Root must supply the exact future request, vector, scope and Caller review refs. Old v6 native packet and mode receipts cannot serve this new candidate. This Source package creates none of those actual receipts.
+
+The original blocked Caller is preserved. This derived Caller changes only five fixed path strings, its own source-choice SHA/size constants, and two canonical-binding checks. The canonical vector keeps exactly schema/checkpoint_revision/refs. Its checkpoint revision is a positive integer equal to pinned checkpoint content; ownership revision is a positive integer from the exact vector-pinned ownership file. The same explicit vector ref remains mandatory in producer pre-run and Root scope. Historical CP365/OW169 refs are provenance, not current input pins. Current canonical files were not read or locked.
+
+All other function ASTs are unchanged. The full original caller byte content and AST are recovered by reversing the nine explicit substitutions. Full byte inverse records also cover source choice and both contracts. The derived consumer contract changes candidate/TEMP paths, closure Source and producer-calling-contract refs and adds provenance. Source21 roster, exact request and mode schemas, report/tool/run/source/Go binding, route order, owned process handling, first-failure stop and cleanup behavior are preserved. Five original Source refs remain equal; only the closure points to v7. The source choice pins r3 producer and v7 independent closure review HDF/MF and their manifest members.
+
+148 static controls passed across full inverse, unchanged functions, source pins and pure synthetic vector predicates; 81 input refs remain unchanged. Synthetic CP366/OW170 and CP367/OW171 predicates pass; malformed schema, boolean/string/zero revisions and checkpoint mismatch are rejected. These are Source checks, not actual producer or consumer verification.
+
+Future component route order remains test.research.fixture then test.retrieval, both consuming the same fresh report/tool packet. Expected each result has C19-01..03 formal assertions and C19-01..05 native IDs, with PENDING_INDEPENDENT_VERIFIER. Formal dispatcher, registry changes, Main adoption, new Go/SQL/API/model calls and formal accepted delta remain zero. Consumer output and environment roots are absent. No actual caller, SourceReadGuard or OwnedJob was executed by this preparation. No new original failures.
+'''
+with (N/'REPORT.md').open('xb') as f:f.write(report.encode())
+mf=save('MF.json',dict(schema='researchos.w09-c19-v7-consumer-caller-source-manifest.v1',members=[pin(p) for p in sorted(N.iterdir()) if p.is_file() and p.name not in ('HDF.json','MF.json')]))
+h=save('HDF.json',dict(schema='researchos.w09-c19-v7-consumer-caller-source-handoff.v1',status=contract['status'],manifest_ref=mf,report_ref=pin(N/'REPORT.md'),caller_ref=pin(N/'run_c19_consumers.actual_owned.py'),choice_ref=pin(N/'source.choice.json'),calling_contract_ref=pin(N/'calling-contract.json'),derived_consumer_contract_ref=pin(N/'consumer-contract.v7.json'),source_controls_ref=pin(N/'source-controls.json'),source_input_pins_ref=pin(N/'source-input-pins.original.json'),caller_inverse_ref=pin(N/'caller.allowed-substitutions.json'),caller_byte_inverse_ref=pin(N/'caller.complete-byte-inverse.json'),failure_origins_ref=failures,source_check_count=148,unchanged_inputs=len(inputs),whole_caller_byte_AST_inverse=True,other_functions_AST_unchanged=True,allowed_main_change='Explicit vector schema and dynamic revision binding only',canonical_vector_schema_fields=['schema','checkpoint_revision','refs'],same_vector_as_producer_pre_run_and_Root_scope=True,historical_canonical_refs=choice['canonical_at_source_preparation'],current_canonical_read_locked_or_written=False,r3_producer_source_refs=contract['r3_producer_source_refs'],v7_independent_closure_review_refs=contract['v7_source_review_refs'],source21_required=True,new_actual_producer_report_tool_mode_review_Root_scope_required=True,actual_ready=False,do_not_execute_without_new_Root_authorization=True,formal_dispatcher=False,formal_case_count=1,formal_case_accepted_delta=0,registry_written=False,Main_adopted=False,actual_Git_Go_SQL_API_model_consumer=False,actual_SourceReadGuard_or_OwnedJob=False,actual_request_scope_mode_decisions_created=False,fixed_future_consumer_paths=choice['fixed_future_paths'],future_consumer_paths_absent=True,route_order=contract['route_order'],new_original_failures=[],STOP=True,FINAL=True))
+print(json.dumps(dict(handoff_ref=h,manifest_ref=mf,caller_ref=pin(N/'run_c19_consumers.actual_owned.py'),choice_ref=pin(N/'source.choice.json'),calling_contract_ref=pin(N/'calling-contract.json'),derived_contract_ref=pin(N/'consumer-contract.v7.json'),controls=148,inputs=len(inputs))))

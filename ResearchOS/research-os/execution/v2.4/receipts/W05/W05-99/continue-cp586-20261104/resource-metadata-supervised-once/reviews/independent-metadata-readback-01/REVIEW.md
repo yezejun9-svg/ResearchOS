@@ -1,0 +1,14 @@
+本次唯一 metadata 实测的实际回执已独立只读核验，readback_verified=true。它是 metadata diagnostic 回执结论，不是推理资格、业务接受或正式 PASS；resource_ready=false、formal_increment=0、正式进度0/42。
+
+授权链以原始CP594字节为准：C观察快照与D永久快照均为SHA744f7be96d8c65bd20d5f7f86390d28d3557c82bf9935149d761aed60256cea0，root-authorization为49be9bed3cb9868b1e7347450f7bf085a3a5f8339aaa78ff7e73b803640d6334。CONSUMED、supervisor、源manifest/scope/review同链；后续CP595/596和动态RESUME是正常结算，不是原授权漂移。
+
+实际supervisor/controller退出0、termination_confirmed=true、没有outer kill。R4最终Total20/Active0/Complete=true，20条final记录held/injob/event/signaled均true，JobClosed及PrimarySignaled=true，无kernel错误。Primary启动快照的event/signaled=false只代表启动时刻：同PID117256、FILETIME134382736600907272在final State为true，不能混读。记录退出码为0:11、1:7、125:2；清理证明不等于每个探测子进程都成功，也不代表推理通过。
+
+version=0.30.0-rc31；tags只有qwen3:4b-instruct，digest0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0、size2497293803。version/tags各GET1次，raw HTTP日志一致；inference/paid/old-root-writes/formal均0。streams_drained与assets_unchanged=true。981份资产前后校验依赖已pinned controller的本次真实结果；本审查仅哈希StageA manifest，不重哈希权重或遍历资产/profile。
+
+数据verifier实际0f95b9 exit0，64项断言一致。新13/旧16/R4 22/旧76源pins均未变；D准备证据36/36，实际归档9/9逐字节匹配C原件，严格为7个允许的R4顶层公共文件与2个supervisor文件。没有profile/私钥读取或复制，也没有新增Popen/controller/native/GPU/模型/HTTP操作。
+
+首次独立verifier493388因错误假定动态RESUME仍有prelaunch空间字段而KeyError退出1；原脚本、工具返回trace及诊断保留。修正后只用冻结CP594链判原授权，独立结论未改变真实native rc0，未重跑、未重置计数。
+
+只凭这些回执不另做live PID/TCP/Native查询、不授予GPU/model inference或业务资格。全局attempt/run已经消费，禁止重跑。Root可把此报告归档到最终结算，仍保持resource_ready=false与formal0/42。
+

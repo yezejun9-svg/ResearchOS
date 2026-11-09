@@ -1,0 +1,200 @@
+	if e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+func authorityRoot(tx *sql.Tx, id string) (string, error) {
+	root := id
+	e := tx.QueryRow("SELECT root FROM orchestration_identity WHERE principal=?", id).Scan(&root)
+	if e == sql.ErrNoRows {
+		return id, nil
+	}
+	return root, e
+}
+
+// currentAuthorityRoot proves current authority lineage, not inherited roles or
+// grants. Legacy direct principals need not have an orchestration row. Managed
+// verifier children are explicitly anchored by their trusted installation and
+// may never fall back to that legacy direct-identity rule after row deletion.
+func currentAuthorityRoot(tx *sql.Tx, id string) (string, error) {
+	denied := func() (string, error) {
+		return "", Fail(403, "FORBIDDEN", "authority principal or registered lineage is missing, revoked or changed")
+	}
+	if id == "" {
+		return denied()
+	}
+	var anchorHash, anchorRaw, anchorProject string
+	var anchors int
+	if e := tx.QueryRow(`SELECT count(*) FROM idempotency WHERE principal=? AND operation='host:managed-verifier-lineage' AND key=?`, id, id).Scan(&anchors); e != nil {
+		return "", e
+	}
+	if anchors > 1 {
+		return denied()
+	}
+	err := tx.QueryRow(`SELECT project,request_hash,body FROM idempotency WHERE principal=? AND operation='host:managed-verifier-lineage' AND key=?`, id, id).Scan(&anchorProject, &anchorHash, &anchorRaw)
+	var anchor Object
+	if err == nil {
+		anchor, err = Decode([]byte(anchorRaw))
+		if err != nil || Hash(anchor) != anchorHash || anchor["schema"] != "researchos.managed-verifier-lineage.v1" || anchor["principal"] != id || Str(anchor, "root") == "" || anchorProject == "" || anchor["project_id"] != anchorProject || Str(anchor, "registered_by") == "" {
+			return denied()
+		}
+	} else if err != sql.ErrNoRows {
+		return "", err
+	}
+	var root string
+	}
+	return Decode([]byte(raw))
+}
+func singleton(tx *sql.Tx, project, kind string) (Object, error) {
+	var raw string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind=?", project, kind).Scan(&raw)
+	if errors.Is(e, sql.ErrNoRows) {
+		return nil, Fail(404, "NOT_FOUND", "object unavailable")
+	}
+	if e != nil {
+		return nil, e
+	}
+	return Decode([]byte(raw))
+}
+func bump(o Object) error {
+	n, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
+	if n == 1<<63-1 {
+		return Fail(409, "STATE_CONFLICT", "revision exhausted")
+	}
+	o["revision"] = n + 1
+	o["updated_at"] = Now()
+	return nil
+}
+
+var idTargets = map[string]string{
+	"budget_policy_id": "BudgetPolicy", "run_policy_id": "RunPolicy", "goal_id": "Goal", "task_id": "Task", "task_ids": "Task", "dependency_task_ids": "Task", "active_run_id": "Run", "run_id": "Run", "run_ids": "Run", "runtime_id": "RuntimeRegistration", "context_bundle_id": "ContextBundle", "no_progress_record_id": "NoProgressRecord", "acceptance_id": "AcceptanceReceipt", "acceptance_ids": "AcceptanceReceipt", "output_artifact_ids": "Artifact", "result_artifact_ids": "Artifact", "checkpoint_artifact_id": "Artifact", "blocking_conflict_ids": "Conflict", "conflict_ids": "Conflict", "active_goal_ids": "Goal", "active_cycle_id": "ResearchCycle", "latest_release_id": "MilestoneRelease", "pending_change_ids": "ChangeProposal", "origin_evidence_id": "Evidence", "verified_by_run_id": "Run", "candidate_evidence_ids": "Evidence", "required_experiment_ids": "Experiment", "decision_ids": "DecisionReceipt", "follow_up_task_ids": "Task", "cycle_id": "ResearchCycle", "qualification_id": "Qualification", "qualification_ids": "Qualification", "impact_link_ids": "ImpactLink", "semantic_review_run_id": "Run", "blocked_task_ids": "Task", "continuable_task_ids": "Task", "parent_release_id": "MilestoneRelease", "open_resource_request_ids": "ResourceRequest", "baseline_skill_id": "SkillVersion", "experiment_id": "Experiment", "rollback_skill_id": "SkillVersion", "regression_acceptance_id": "AcceptanceReceipt", "canary_acceptance_id": "AcceptanceReceipt", "rollback_verified_receipt_id": "AcceptanceReceipt", "last_cycle_id": "ResearchCycle", "policy_id": "BudgetPolicy", "reservation_id": "BudgetLedgerEntry", "release_id": "MilestoneRelease", "resource_request_id": "ResourceRequest", "resolution_proposal_id": "ChangeProposal",
+}
+
+func relationKind(owner, field string) string {
+	if owner == "RuntimeRegistration" && field == "qualification_ids" {
+		return "AcceptanceReceipt"
+	}
+	return idTargets[field]
+}
+
+func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
+	if !s.Contracts.Entities[kind] {
+		return Fail(400, "INVALID_REQUEST", "unknown entity")
+	}
+	if e := s.Contracts.Validate(kind, o); e != nil {
+		return Fail(400, "INVALID_REQUEST", "entity violates "+kind+" schema")
+	}
+	project := Str(o, "project_id")
+	id := Str(o, "id")
+	rev, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
+	old, e := load(tx, project, kind, id)
+	if e == nil {
+		if _, immutable := old["receipt_hash"]; immutable {
+			return Fail(409, "STATE_CONFLICT", "receipt immutable")
+		}
+		oldRevision, e := Num(old, "revision")
+		if e != nil {
+			return e
+		}
+		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
+			return Fail(409, "STATE_CONFLICT", "revision must advance once")
+		}
+		if kind == "Task" && !taskTransition(old, o) {
+			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
+		}
+	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {
+		return e
+	}
+	if e = s.invariants(kind, o); e != nil {
+		return e
+	}
+	var hash any
+	immutable := 0
+	if h, ok := o["receipt_hash"]; ok {
+		if h != Receipt(o) {
+			return Fail(422, "CONTENT_HASH_MISMATCH", "receipt hash mismatch")
+		}
+		hash = h
+		immutable = 1
+	} else if kind == "Artifact" {
+		hash = o["content_hash"]
+	}
+	if _, e = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)", project, kind, id, rev, string(Bytes(o)), hash); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body,content_hash=excluded.content_hash", project, kind, id, rev, string(Bytes(o)), hash, immutable); e != nil {
+		return e
+	}
+	return s.refs(tx, project, kind, id, rev, "", o)
+			return e
+		}
+		if lease <= heartbeat {
+			return Fail(422, "GATE_FAILED", "lease must exceed heartbeat")
+		}
+	}
+	if kind == "BudgetPolicy" || kind == "RunPolicy" {
+		scope := Str(o, "scope_type")
+		if scope == "PROJECT" && o["scope_id"] != o["project_id"] {
+			return Fail(422, "GATE_FAILED", "policy scope mismatch")
+		}
+	}
+	return nil
+}
+func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, correlation, eventType string) error {
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return e
+	}
+	seq, e := Num(state, "event_sequence")
+	if e != nil {
+		return e
+	}
+	// Typed session events share this outbox and allocate from its committed
+	// watermark. Continue the same sequence inside the existing transaction;
+	// ProjectState may predate intervening typed events.
+	var outboxSequence int64
+	if e = tx.QueryRow("SELECT COALESCE(MAX(sequence),0) FROM outbox WHERE project=?", project).Scan(&outboxSequence); e != nil {
+		return e
+	}
+	if outboxSequence > seq {
+		seq = outboxSequence
+	}
+	if seq == 1<<63-1 {
+		return Fail(409, "STATE_CONFLICT", "event sequence exhausted")
+	}
+	seq++
+	if e = bump(state); e != nil {
+		return e
+	}
+	state["event_sequence"] = seq
+	if e = s.put(tx, "ProjectState", state); e != nil {
+		return e
+	}
+	ev := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "sequence": seq, "event_type": eventType, "aggregate_ref": Ref(o, kind), "actor_id": actor, "correlation_id": correlation, "causation_id": nil, "event_data_artifact_ref": nil}
+	ev["receipt_hash"] = Receipt(ev)
+	if e = s.put(tx, "EventEnvelope", ev); e != nil {
+		return e
+	}
+	_, e = tx.Exec("INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)", project, seq, ev["id"], string(Bytes(ev)))
+	if e != nil {
+		return e
+	}
+	_, e = tx.Exec("INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)", project, ev["id"], state["revision"], string(Bytes(state)))
+	return e
+}
+
+// AcknowledgeEvent is idempotent. Unacknowledged events remain durable for retry.
+func (s *Service) AcknowledgeEvent(ctx context.Context, project, id string) error {
+	res, e := s.DB.ExecContext(ctx, "UPDATE outbox SET acknowledged=1 WHERE project=? AND id=?", project, id)
+	if e != nil {
+		return e
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {

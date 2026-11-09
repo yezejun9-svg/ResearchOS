@@ -1,0 +1,259 @@
+FILE internal/domain/backup_command_queue.go SHA256 bd44154330600f4e743ab93bbd82f633c948c41e76000e99bbee0e4a17afa93a LINES 150-202
+150: 	}
+151: 	return validateModelStreamBackup(db)
+152: }
+153: 
+154: func fenceRestoredClientQueues(tx *sql.Tx) error {
+155: 	var version int
+156: 	if err := tx.QueryRow(`SELECT coalesce(max(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+157: 		return err
+158: 	}
+159: 	if version < 22 {
+160: 		return nil
+161: 	}
+162: 	rows, err := tx.Query(`SELECT project,generation,command_id,state,last_receipt_id FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`)
+163: 	if err != nil {
+164: 		return err
+165: 	}
+166: 	entries := []Object{}
+167: 	for rows.Next() {
+168: 		var project, generation, command, state string
+169: 		var prior sql.NullString
+170: 		if err = rows.Scan(&project, &generation, &command, &state, &prior); err != nil {
+171: 			rows.Close()
+172: 			return err
+173: 		}
+174: 		var previous any
+175: 		if prior.Valid {
+176: 			previous = prior.String
+177: 		}
+178: 		entries = append(entries, Object{"project": project, "generation": generation, "command": command, "state": state, "previous": previous})
+179: 	}
+180: 	err = rows.Err()
+181: 	rows.Close()
+182: 	if err != nil {
+183: 		return err
+184: 	}
+185: 	for _, entry := range entries {
+186: 		receipt := ID()
+187: 		if err = appendClientReceipt(tx, Str(entry, "project"), Str(entry, "generation"), Str(entry, "command"), "RESTORE_UNKNOWN", receipt, Object{"prior_state": entry["state"], "reason": "SNAPSHOT_MAY_PREDATE_SEND"}, entry["previous"]); err != nil {
+188: 			return err
+189: 		}
+190: 		if _, err = tx.Exec(`UPDATE client_command_queue SET state='UNKNOWN',revision=revision+1,last_receipt_id=? WHERE project=? AND generation=? AND command_id=?`, receipt, entry["project"], entry["generation"], entry["command"]); err != nil {
+191: 			return err
+192: 		}
+193: 	}
+194: 	if _, err = tx.Exec(`UPDATE client_queue_fences SET restore_fenced=1,state=CASE WHEN state='CANCEL_FENCED' THEN state ELSE 'RECONCILING' END,revision=revision+1 WHERE state NOT IN ('SEALED') OR EXISTS(SELECT 1 FROM client_command_queue q WHERE q.generation=client_queue_fences.generation AND q.state='UNKNOWN')`); err != nil {
+195: 		return err
+196: 	}
+197: 	if _, err = tx.Exec(`UPDATE client_control_requests SET state='RECONCILING' WHERE state<>'CONFIRMED'`); err != nil {
+198: 		return err
+199: 	}
+200: 	_, err = tx.Exec(`UPDATE client_sessions SET resume_requires_explicit_user=1 WHERE id IN (SELECT session_id FROM client_queue_fences WHERE restore_fenced=1) OR id IN (SELECT session_id FROM client_control_requests WHERE state='RECONCILING')`)
+201: 	return err
+202: }
+
+FILE internal/domain/backup_recovery.go SHA256 ad50a120ff8bf9bdec40d8843ca509b60bdb70e8ac5c1a9ab401731845e57806 LINES 216-279
+216: func (s *Service) backupFence(ctx context.Context) (Object, error) {
+217: 	runs, e := backupObjects(s.DB, "SELECT body FROM domain_objects WHERE kind='Run' AND json_extract(body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING','LOST')")
+218: 	if e != nil {
+219: 		return nil, e
+220: 	}
+221: 	effects, e := backupObjects(s.DB, `SELECT body FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`)
+222: 	if e != nil {
+223: 		return nil, e
+224: 	}
+225: 	tx, e := s.DB.BeginTx(ctx, nil)
+226: 	if e != nil {
+227: 		return nil, e
+228: 	}
+229: 	defer tx.Rollback()
+230: 	// Restore-local guard survives restart and applies to every existing resume
+231: 	// route. A snapshot's old observation is never fresh reconciliation evidence.
+232: 	if _, e = tx.Exec(`CREATE TABLE IF NOT EXISTS backup_restore_barriers(project TEXT NOT NULL,run TEXT NOT NULL,restored_at TEXT NOT NULL,PRIMARY KEY(project,run));
+233: CREATE TRIGGER IF NOT EXISTS backup_require_fresh_observation BEFORE UPDATE ON domain_objects
+234: WHEN NEW.kind='Run' AND json_extract(NEW.body,'$.lease_epoch')>json_extract(OLD.body,'$.lease_epoch')
+235: AND EXISTS(SELECT 1 FROM backup_restore_barriers b WHERE b.project=NEW.project AND b.run=NEW.id)
+236: AND NOT EXISTS(SELECT 1 FROM runtime_observations o JOIN backup_restore_barriers b ON b.project=o.project AND b.run=o.run WHERE o.project=NEW.project AND o.run=NEW.id AND o.epoch=json_extract(OLD.body,'$.lease_epoch') AND o.observed_at>b.restored_at AND json_extract(o.body,'$.children_stopped')=1 AND json_extract(o.body,'$.queue_empty')=1)
+237: BEGIN SELECT RAISE(ABORT,'RESTORE_FRESH_RECONCILIATION_REQUIRED'); END;`); e != nil {
+238: 		return nil, e
+239: 	}
+240: 	if e = EnsureClientSessionFence(ctx, tx); e != nil {
+241: 		return nil, e
+242: 	}
+243: 	if e = fenceRestoredClientQueues(tx); e != nil {
+244: 		return nil, e
+245: 	}
+246: 	if _, e = tx.Exec("UPDATE auth_credentials SET revoked=1"); e != nil {
+247: 		return nil, e
+248: 	}
+249: 	for _, r := range runs {
+250: 		if _, e = tx.Exec("INSERT INTO backup_restore_barriers(project,run,restored_at) VALUES(?,?,?) ON CONFLICT(project,run) DO UPDATE SET restored_at=excluded.restored_at", r["project_id"], r["id"], Now()); e != nil {
+251: 			return nil, e
+252: 		}
+253: 		status := "RECONCILING"
+254: 		if r["status"] == "CANCEL_REQUESTED" {
+255: 			status = "CANCEL_REQUESTED"
+256: 		}
+257: 		Merge(r, Object{"status": status, "lease_token_hash": Digest([]byte(ID() + ID())), "lease_expires_at": "1970-01-01T00:00:00Z"})
+258: 		if e = bump(r); e != nil {
+259: 			return nil, e
+260: 		}
+261: 		if e = s.put(tx, "Run", r); e != nil {
+262: 			return nil, e
+263: 		}
+264: 		if e = s.event(tx, Str(r, "project_id"), "Run", r, "restore-local-admin", ID(), "RUN_CHANGED"); e != nil {
+265: 			return nil, e
+266: 		}
+267: 	}
+268: 	for _, o := range effects {
+269: 		o["state"] = "UNKNOWN"
+270: 		o["restore_reason"] = "SNAPSHOT_MAY_PREDATE_EXTERNAL_DISPATCH"
+271: 		if e = effectAppend(tx, Str(o, "project_id"), Str(o, "run_id"), Str(o, "key"), o); e != nil {
+272: 			return nil, e
+273: 		}
+274: 	}
+275: 	if e = tx.Commit(); e != nil {
+276: 		return nil, e
+277: 	}
+278: 	return Object{"active_runs_fenced": len(runs), "effects_requiring_reconciliation": len(effects), "credentials": "REVOKED_REPROVISION_LOCALLY", "external_keys": "NOT_INCLUDED_RESTORE_SEPARATELY", "external_actions_dispatched": 0, "outbox_policy": "preserved; internal consumers deduplicate by event ID; external delivery requires provider reconciliation", "expected_differences": []any{"revoked session credentials", "relocated source roots", "active runs RECONCILING with expired leases and new revisions", "unfinished effects UNKNOWN", "restore audit events"}}, nil
+279: }
+
+FILE ops/supervisor/control_holdout_windows.go SHA256 a560ee8ce4aba5e6e077080c04a6279aa75a0a6ae25631ee6b651cbe624bf22d LINES 1-50
+1: //go:build windows
+2: 
+3: package supervisor
+4: 
+5: import (
+6: 	"bytes"
+7: 	"context"
+8: 	"encoding/hex"
+9: 	"fmt"
+10: 	"os"
+11: 	"path/filepath"
+12: 	"strings"
+13: 	"time"
+14: 
+15: 	"golang.org/x/sys/windows"
+16: 	"researchos.local/research-os/evaluation/evolution"
+17: 	"researchos.local/research-os/internal/store"
+18: 	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+19: )
+20: 
+21: type ControlInvocation struct {
+22: 	Request            evolution.ControlRequest `json:"request"`
+23: 	InputHash          string                   `json:"input_hash"`
+24: 	BuildHash          string                   `json:"build_hash"`
+25: 	SourceHash         string                   `json:"source_hash"`
+26: 	ImagePath          string                   `json:"image_path"`
+27: 	Identity           sandbox.Identity         `json:"suspended_identity"`
+28: 	Raw                string                   `json:"raw"`
+29: 	RawHash            string                   `json:"raw_hash"`
+30: 	OutputDatabaseHash string                   `json:"output_database_hash"`
+31: 	OutputStateHash    string                   `json:"output_state_hash"`
+32: 	Receipt            sandbox.Receipt          `json:"receipt"`
+33: }
+34: type ControlPair struct {
+35: 	Baseline  ControlInvocation `json:"baseline"`
+36: 	Candidate ControlInvocation `json:"candidate"`
+37: }
+38: type ControlProof struct {
+39: 	Profile             string                   `json:"profile"`
+40: 	Revision            string                   `json:"revision"`
+41: 	Binding             evolution.ControlBinding `json:"binding"`
+42: 	PlanHash            string                   `json:"plan_hash"`
+43: 	InputsHash          string                   `json:"inputs_hash"`
+44: 	LabelsHash          string                   `json:"labels_hash"`
+45: 	PublicSuiteHash     string                   `json:"public_suite_hash"`
+46: 	PolicyHash          string                   `json:"policy_hash"`
+47: 	StableHash          string                   `json:"stable_hash"`
+48: 	CandidateHash       string                   `json:"candidate_hash"`
+49: 	StableSourceHash    string                   `json:"stable_source_hash"`
+50: 	CandidateSourceHash string                   `json:"candidate_source_hash"`
+
+FILE ops/supervisor/release_host/main.go SHA256 a70f9c4dd68a7b5b29b8b808c93302ebd37cbd6be783eee403acf56115d109be LINES 1-45
+1: //go:build windows
+2: 
+3: // release_host is a same-user disposable R2 fixture process. It has no LIVE
+4: // authority and never installs or controls a Windows service.
+5: package main
+6: 
+7: import (
+8: 	"context"
+9: 	"encoding/json"
+10: 	"flag"
+11: 	"fmt"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"researchos.local/research-os/adapters/protectedstore"
+15: 	rt "researchos.local/research-os/adapters/runtime"
+16: 	"researchos.local/research-os/internal/domain"
+17: 	"researchos.local/research-os/internal/store"
+18: )
+19: 
+20: func run() error {
+21: 	dbPath := flag.String("db", "", "fixture authority SQLite path")
+22: 	contracts := flag.String("contracts", "", "contracts directory")
+23: 	migration := flag.String("migration", "", "migration path")
+24: 	private := flag.String("private", "", "existing CanaryStore root")
+25: 	project := flag.String("project", "", "project")
+26: 	operation := flag.String("operation", "", "operation")
+27: 	control := flag.String("control", "", "exact actual-control fixture executable")
+28: 	root := flag.String("root", "", "existing fixture host root")
+29: 	work := flag.String("work-dir", "", "control working directory")
+30: 	web := flag.String("web-dir", "", "fixture web build directory")
+31: 	listen := flag.String("listen", "", "control loopback listener")
+32: 	flag.Parse()
+33: 	if *control != "" {
+34: 		return runControlHost(*control, *root, *work, *web, *listen, *private, *contracts)
+35: 	}
+36: 	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
+37: 		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
+38: 	}
+39: 	protected, err := protectedstore.OpenCanary(*private)
+40: 	if err != nil {
+41: 		return err
+42: 	}
+43: 	defer protected.Close()
+44: 	lease, err := rt.AcquireDataRootLease(filepath.Dir(*dbPath))
+45: 	if err != nil {
+
+ARGV ["rg", "-n", "ContentHash|canonicalBytes|func .*Execute", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain\\client_protocol.go"]
+226:			ExpectedContentHash *string `json:"expected_content_hash"`
+257:			if string(rawHash) != "null" && hasKey(m, "expected_content_hash") && p.ExpectedContentHash != nil {
+261:			if p.ExpectedContentHash == nil {
+264:			if !isSHA256("", true, rawHash) && !isSHA256(*p.ExpectedContentHash, false, rawHash) {
+351:// ContentHash is the canonical (RFC8785-flavoured: sorted keys, no extra space)
+353:func (e *Envelope) ContentHash() (string, error) {
+395:	b := canonicalBytes(v)
+400:func canonicalBytes(v any) []byte {
+417:			sb.Write(canonicalBytes(t[k]))
+428:			sb.Write(canonicalBytes(x))
+695:func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, bool, error) {
+709:	hash, err := env.ContentHash()
+
+
+ARGV ["rg", "-n", "TestClientQueueFreshNumberedSchema|TestClientQueueHistorical22NumberedSchema", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain\\backup_command_queue_test.go"]
+118:func TestClientQueueFreshNumberedSchema(t *testing.T) {
+159:func TestClientQueueHistorical22NumberedSchema(t *testing.T) {
+
+
+ARGV ["rg", "-n", "actual_Service_New", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain\\client_configuration_test.go"]
+268:	t.Run("actual_Service_New", func(t *testing.T) {
+
+
+ARGV ["rg", "-n", "func configurationMigrationFiles|func TestConfiguration", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain\\backup_configuration_upgrade_test.go"]
+19:func configurationMigrationFiles(t *testing.T) []string {
+133:func TestConfigurationUpgradeActiveQueueRecovery(t *testing.T) {
+273:func TestConfigurationUpgradeLegacySQLChild(t *testing.T) {
+313:func TestConfigurationUpgradeLegacyWriterLock(t *testing.T) {
+378:func TestConfigurationUpgradeFrozen22ProgramLock(t *testing.T) {
+468:func TestConfigurationUpgradePostSnapshotFaults(t *testing.T) {
+530:func TestConfigurationUpgradeNativeCLI(t *testing.T) {
+596:func TestConfigurationUpgradeNumberedOnlyAndMalformedRefusal(t *testing.T) {
+646:func TestConfigurationUpgradePublicRoundTrip(t *testing.T) {
+732:func TestConfigurationUpgradeReleaseAndMigrationRefusals(t *testing.T) {
+810:func TestConfigurationUpgradeHostOnlyStartupGuard(t *testing.T) {
+838:func TestConfigurationUpgradeFutureBeforeDomainDDL(t *testing.T) {
+866:func TestConfigurationUpgradeFreshAndAdditiveGuard(t *testing.T) {
+

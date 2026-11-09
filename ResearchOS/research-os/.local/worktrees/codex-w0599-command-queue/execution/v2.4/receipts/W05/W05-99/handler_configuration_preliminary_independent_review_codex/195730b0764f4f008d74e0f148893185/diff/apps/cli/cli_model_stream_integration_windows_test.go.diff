@@ -1,0 +1,54 @@
+--- baseline/apps/cli/cli_model_stream_integration_windows_test.go
++++ snapshot/apps/cli/cli_model_stream_integration_windows_test.go
+@@ -40,6 +40,9 @@
+ }
+ 
+ func testCLIModelStream(t *testing.T, mode string) {
++	if queueCLIExactTLSChild(t) {
++		return
++	}
+ 	if os.Getenv("RESEARCHOS_NODE") == "" || os.Getenv("RESEARCHOS_MU_BUNDLE") == "" {
+ 		t.Fatal("actual pinned Node and current built Mu bundle are required")
+ 	}
+@@ -72,7 +75,8 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	handler := &queueCLISwitchableHandler{h: api.HandlerWithLocalHost(db, t.TempDir(), svc, nil, h.InstanceID(), localworkspace.NewAuthority(h), localworkspace.NewScanner(), h)}
++	p := &queueCLIPermissionProfile{host: h}
++	handler := &queueCLISwitchableHandler{h: api.HandlerWithConfigurationHost(db, t.TempDir(), svc, nil, h.InstanceID(), localworkspace.NewAuthority(h), localworkspace.NewScanner(), p, h)}
+ 	server := httptest.NewServer(handler)
+ 	defer server.Close()
+ 	discoveryFile := filepath.Join(data, "discovery.json")
+@@ -128,13 +132,12 @@
+ 			}
+ 		}()
+ 	}
+-	p := &queueCLIPermissionProfile{}
+ 	gates := make(chan int, 1)
+ 	arrived := make(chan int, 1)
+ 	fixtureError := make(chan error, 1)
+ 	var rawMu sync.Mutex
+ 	var original bytes.Buffer
+-	p.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	p.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if r.URL.Path == "/__researchos_fixture_readiness__" {
+ 			w.WriteHeader(404)
+ 			return
+@@ -264,13 +267,14 @@
+ 		rawMu.Unlock()
+ 	}))
+ 	defer p.server.Close()
++	queueCLIInstallTLSFixture(t, p.server)
+ 	coordinator, e := queueCLIFixtureModelProfile(ctx, svc, h, server.Client(), server.URL, owner.Token, cfg.ProjectID, data, p)
+ 	if e != nil {
+ 		t.Fatal("actual qualification", e)
+ 	}
+ 	defer coordinator.Close()
+-	handler.swap(api.HandlerWithLocalHost(db, t.TempDir(), svc, coordinator, h.InstanceID(), localworkspace.NewAuthority(h), localworkspace.NewScanner(), h))
+-	cfg.Model = queueCLIFixtureModelRef
++	handler.swap(api.HandlerWithConfigurationHost(db, t.TempDir(), svc, coordinator, h.InstanceID(), localworkspace.NewAuthority(h), localworkspace.NewScanner(), p, h))
++	cfg.Model = p.modelRef
+ 	if e = os.WriteFile(configFile, domain.Bytes(cfg), 0600); e != nil {
+ 		t.Fatal(e)
+ 	}

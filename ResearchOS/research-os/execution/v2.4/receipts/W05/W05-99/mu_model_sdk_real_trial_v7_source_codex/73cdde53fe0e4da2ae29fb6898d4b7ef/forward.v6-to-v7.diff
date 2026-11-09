@@ -1,0 +1,107 @@
+--- v6/mu_sdk_trial.v6.graph.proposed.py
++++ v7/mu_sdk_trial.v7.final.proposed.py
+@@ -10,6 +10,7 @@
+ import ctypes
+ import json
+ import os
++import re
+ from pathlib import Path
+ import sqlite3
+ import stat
+@@ -245,12 +246,16 @@
+             type(execution.get("exit_code")) is int and execution["exit_code"] == 0 and
+             execution.get("independent_acceptance") == "NOT_EVALUATED" and
+             execution.get("reason") == "HOST_EXECUTION_SETTLED" and
++            isinstance(execution.get("goal_id"), str) and execution["goal_id"] and
++            isinstance(execution.get("task_id"), str) and execution["task_id"] and
+             isinstance(execution.get("run_id"), str) and execution["run_id"] and
+             isinstance(summary.get("admission_command_id"), str) and
+             summary["admission_command_id"] and
+             execution.get("project_id") == final_snapshot.get("project_id") and
+             execution.get("session_id") == summary.get("session_id") ==
+-            final_snapshot.get("session_id"),
++            final_snapshot.get("session_id") and
++            final_snapshot.get("goal_id") == execution.get("goal_id") and
++            final_snapshot.get("active_run_id") == execution.get("run_id"),
+             "CLI_FINAL_EXECUTION_SCOPE_INVALID")
+     last_result = operations[-1].get("result")
+     require(isinstance(last_result, dict), "CLI_ADMISSION_RESULT_INVALID")
+@@ -342,17 +347,32 @@
+             states[-1].get("queue_empty") is True and
+             states[-1].get("settled_at") == report["runtime_settled_at"],
+             "CLI_TERMINAL_LATEST_RUN_STATE_MISMATCH")
+-    artifacts = {event["payload"].get("artifact_ref", {}).get("id")
+-                 for event in events if event.get("kind") == "ARTIFACT" and
+-                 event.get("run_id") == execution["run_id"] and
+-                 event["payload"].get("availability") == "AVAILABLE" and
+-                 isinstance(event["payload"].get("artifact_ref"), dict)}
++    artifacts = {}
++    for event in events:
++        if (event.get("kind") != "ARTIFACT" or
++                event.get("run_id") != execution["run_id"] or
++                event["payload"].get("availability") != "AVAILABLE"):
++            continue
++        ref = event["payload"].get("artifact_ref")
++        require(isinstance(ref, dict) and set(ref) ==
++                {"entity_type", "id", "revision", "content_hash"} and
++                ref["entity_type"] == "Artifact" and
++                isinstance(ref["id"], str) and ref["id"] and
++                type(ref["revision"]) is int and ref["revision"] > 0 and
++                isinstance(ref["content_hash"], str) and
++                re.fullmatch(r"sha256:[0-9a-f]{64}", ref["content_hash"]),
++                "CLI_ARTIFACT_ENTITY_REF_INVALID")
++        require(ref["id"] not in artifacts or artifacts[ref["id"]] == ref,
++                "CLI_ARTIFACT_REF_CONFLICT")
++        artifacts[ref["id"]] = ref
+     require(set(report["result_artifact_ids"]).issubset(artifacts),
+             "CLI_TERMINAL_RESULT_ARTIFACT_EVENT_ABSENT")
+     return summary, {"original_jsonl_records": len(parsed),
+                      "session_event_count": len(parsed) - 1,
+                      "initial_cursor": cursor - (len(parsed) - 1),
+-                     "final_cursor": cursor}
++                     "final_cursor": cursor,
++                     "result_artifact_refs": {identity: artifacts[identity]
++                                              for identity in report["result_artifact_ids"]}}
+ 
+ 
+ def verified_cli_context_transition(label, old, parsed, post_raw):
+@@ -737,7 +757,7 @@
+ 
+ 
+ def verify_ordinary_goal_graph(db, doc, before, original_summary, prior_snapshot,
+-                               admitted, draft_policies):
++                               admitted, draft_policies, stream_evidence):
+     """Tie the original CLI admission and host report to exact new domain rows."""
+     execution = original_summary["execution"]
+     host = execution.get("host_execution")
+@@ -778,10 +798,15 @@
+             run.get("result_artifact_ids") == ids and
+             task.get("output_artifact_ids") == ids,
+             "host artifact IDs differ from Run or Task")
++    refs = stream_evidence.get("result_artifact_refs")
++    require(isinstance(refs, dict) and set(refs) == set(ids),
++            "original typed Artifact stream differs from host result IDs")
+     for identity in ids:
+-        artifact = object_by_id(db, "Artifact", identity, project)
+-        require(artifact.get("id") == identity,
+-                "original host artifact absent from this project")
++        reference = refs[identity]
++        historical = object_by_ref(db, project, reference, "Artifact")
++        require(historical.get("id") == identity and
++                reference == exact_artifact_ref(db, project, identity),
++                "original Artifact version/hash differs from current exact result")
+     policies = budget_chain(db, project, new_goal_id, "ACTIVE")
+     require([p["id"] for p in policies[1:]] ==
+             [p["id"] for p in draft_policies[1:]] and
+@@ -1383,8 +1408,10 @@
+             "ordinary admission did not create a new Goal from the draft Session")
+     guard_deadline(deadline, "ordinary Run DB read")
+     with readonly_db(db_path) as db:
++        stream_evidence = run_invocation["consumed_file_transition"]["context_evidence"]["stream_evidence"]
+         new_goal_id, task_id, run_id, policies = verify_ordinary_goal_graph(
+-            db, doc, before, original_summary, prior_snapshot, admitted, draft_policies)
++            db, doc, before, original_summary, prior_snapshot, admitted,
++            draft_policies, stream_evidence)
+         ordinary = effects(db, doc["project_id"], run_id)
+         require([row.get("payload", {}).get("capability") for row in ordinary] ==
+                 ["MODEL", "TOOL", "MODEL"] and

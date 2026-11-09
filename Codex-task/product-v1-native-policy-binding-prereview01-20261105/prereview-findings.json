@@ -1,0 +1,90 @@
+{
+  "schema": "researchos.native-policy-binding-independent-prereview/1",
+  "status": "PRELIMINARY_READONLY_NOT_FINAL_FREEZE",
+  "decision": "REQUIRES_CHANGES",
+  "formal_increment": 0,
+  "product_increment": 0,
+  "captured_at": "2026-11-05T04:18:28.552222+00:00",
+  "selected_candidate": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\product-v1-native-policy-binding-20261105",
+  "contract_sha256": "fc52dd1ea75f0eebecd6ec09cd64524fccabc823b2bc593467bd388e2b7213a4",
+  "source_sha256": {
+    "adapters/runtime/codex.go": "ee48edf7d9c13d2ebda3d49be794d861f5ac319d6259afcc02a27431266514fd",
+    "adapters/runtime/codex_driver_windows.go": "343e36f77f226d1f2c9db72663c5b019376b2ed75143eefc06469c804dc772b9",
+    "adapters/runtime/codex_policy.go": "62a4c166c51c1408d19ce64519722b16e7b74cbc94722bb357741cbe03069e86",
+    "internal/domain/runtime_harness_windows.go": "6154ecb710f61924fa93e1b076ccec6a028abe043a1b5a9e4654ab729344c635",
+    "internal/domain/harness_v1.go": "68a543a4b120a997c5469bca5714ff447c57e8645754a74d7490857fb9438efe",
+    "internal/domain/runtime_dispatch.go": "6d988c6b7bb6963b9af8fdffa1d46ac32ab7372ea448876dc06da9ee2ba5d9b4",
+    "internal/host/harness_windows.go": "6315bee300c7273778bb29405f87f20d3cb91e177f1da239758caeb6cc24a062",
+    "adapters/runtime/codex_driver_windows_test.go": "a6a6770a3b78ef11d5279a2201ffac43cef1ed1749490ad68d813559de4afd31",
+    "adapters/runtime/codex_policy_test.go": "5eeb300e80b3e160cf1c0e9f18e53e4caa4e7911ac2f6aac7a208f33293982c6",
+    "internal/domain/runtime_harness_windows_test.go": "a45b593bd4e767035488b9eac5516d03140ba412907ce5333a8a1647e0f13902",
+    "internal/host/harness_windows_test.go": "6260ef69329b8c5d9095b60ae8232516c5e5e6dd5590e0a83538029de51d26b3"
+  },
+  "findings": [
+    {
+      "origin_key": "native-policy-binding:workspace-snapshot-toctou",
+      "classification": "SOURCE_SECURITY_BOUNDARY_GAP_CONFIRMED",
+      "severity": "HIGH",
+      "location": "internal/domain/runtime_harness_windows.go:247,250,931,968,991,996,998",
+      "detail": "Submit seals only request.workspace_ref and discards the authorized binding value. Start reads binding.RealPath, commits, then passes that old string into the driver. BeforeResume re-enters harnessGate, but workspace() only validates the current binding and discards it; there is no comparison with the exact path/revision already supplied to the suspended child. A still-authorized changed binding under the same ref can validate while the old source path is resumed. Production constructor currently remains UNVERIFIED, so this is a latent path-binding gap, not a claim that an unauthorized real child has run.",
+      "fix_required": "After current test scope reaches terminal, create Host-owned immutable binding ref/revision/canonical path digest snapshot in new sealed input; compare current authority/binding to it at admission, scan, launch and BeforeResume, and explicitly tie BeforeResume to the exact binding/path passed to driver. Reject legacy input lacking snapshot for new execution; keep historical Get/List/read paths compatible.",
+      "author_response": "Author independently acknowledged current gap and intends fix only after test01 terminal."
+    },
+    {
+      "origin_key": "native-policy-binding:ready-with-reason-accepted",
+      "classification": "SOURCE_FAIL_CLOSED_PREDICATE_GAP",
+      "severity": "MEDIUM",
+      "location": "adapters/runtime/codex_policy.go:57",
+      "detail": "Given a present/config-controlled/logged-in descriptor without descriptor.UnavailableReason and matching canonical identity, snapshot State READY plus Reason PERMISSION_PROFILE_UNAVAILABLE returns READY. Reason is checked only when snapshot.State==UNAVAILABLE. This admits a contradictory readiness snapshot despite the frozen any-unavailable-reason fail-closed contract. Current ordinary production constructor returns UNVERIFIED and no external READY route was found.",
+      "fix_required": "READY must also require an empty snapshot.Reason; reject nonempty/contradictory readiness reasons consistently, with narrow trusted fake-provider table cases after test01 ends."
+    }
+  ],
+  "pending_blockers": [
+    "native-policy-binding:workspace-snapshot-toctou",
+    "native-policy-binding:ready-with-reason-accepted"
+  ],
+  "observations": [
+    "Exact global windows.sandbox=\"mxc\" occurs once in the canonical argument builder; no profile-prefixed sandbox key remains. Root prior-mode-key correction is acknowledged without recounting its existing diagnostic.",
+    "Canonical requested policy identity hashes the same argument builder using Host cwd/source placeholders; it is not claimed to measure effective managed permissions. Full identity equality is checked against fresh descriptor/snapshot by the shared predicate.",
+    "Capabilities/Submit/scan/runHarness/BeforeResume and driver Start use the common readiness helper. Driver rechecks before cb.BeforeResume while launchWithCallback has created a suspended child; ResumeThread occurs only on nil callback error. This is source inspection, not independently verified process-stop evidence.",
+    "NewCodexCLI rejects PermissionOverrides and returns UNVERIFIED. NewCodexCLIForTrustedGoTest is selected only in Go tests among reviewed apps/internal/adapters call sites; actual Host uses ordinary NewCodexCLI. No external JSON/env/HTTP READY selector found.",
+    "Public capability verification values remain UNVERIFIED and enforcement_verified=false; public profile_id remains codex-workspace-read-v1, with no added public DTO field observed.",
+    "Native sealed sandbox/command/policy v2 fields are checked during reuse/admission/dispatch and against current policy in launch gate. History reader harnessTaskInput is currently independent of current readiness. Fix must preserve that history separation.",
+    "Existing test source has a readiness mutation-before-resume case and canonical global-key argv assertions. Coverage still needs field-wise stale policy/READY+reason and same-ref binding changes, plus legacy history-preserving rejection. No tests were executed or declared successful by this reviewer."
+  ],
+  "diagnostic_events": [
+    {
+      "origin_key": "native-policy-binding:workspace-snapshot-toctou",
+      "classification": "SOURCE_SECURITY_BOUNDARY_GAP_CONFIRMED",
+      "severity": "HIGH",
+      "location": "internal/domain/runtime_harness_windows.go:247,250,931,968,991,996,998",
+      "detail": "Submit seals only request.workspace_ref and discards the authorized binding value. Start reads binding.RealPath, commits, then passes that old string into the driver. BeforeResume re-enters harnessGate, but workspace() only validates the current binding and discards it; there is no comparison with the exact path/revision already supplied to the suspended child. A still-authorized changed binding under the same ref can validate while the old source path is resumed. Production constructor currently remains UNVERIFIED, so this is a latent path-binding gap, not a claim that an unauthorized real child has run.",
+      "fix_required": "After current test scope reaches terminal, create Host-owned immutable binding ref/revision/canonical path digest snapshot in new sealed input; compare current authority/binding to it at admission, scan, launch and BeforeResume, and explicitly tie BeforeResume to the exact binding/path passed to driver. Reject legacy input lacking snapshot for new execution; keep historical Get/List/read paths compatible.",
+      "author_response": "Author independently acknowledged current gap and intends fix only after test01 terminal."
+    },
+    {
+      "origin_key": "native-policy-binding:ready-with-reason-accepted",
+      "classification": "SOURCE_FAIL_CLOSED_PREDICATE_GAP",
+      "severity": "MEDIUM",
+      "location": "adapters/runtime/codex_policy.go:57",
+      "detail": "Given a present/config-controlled/logged-in descriptor without descriptor.UnavailableReason and matching canonical identity, snapshot State READY plus Reason PERMISSION_PROFILE_UNAVAILABLE returns READY. Reason is checked only when snapshot.State==UNAVAILABLE. This admits a contradictory readiness snapshot despite the frozen any-unavailable-reason fail-closed contract. Current ordinary production constructor returns UNVERIFIED and no external READY route was found.",
+      "fix_required": "READY must also require an empty snapshot.Reason; reject nonempty/contradictory readiness reasons consistently, with narrow trusted fake-provider table cases after test01 ends."
+    },
+    {
+      "origin_key": "native-policy-binding-prereview01:workspace-source-path-read-miss",
+      "classification": "REVIEW_READONLY_PATH_RESOLUTION_DIAGNOSTIC",
+      "detail": "One grouped rg read used nonexistent workspace.go/workspace_authority.go filenames. Follow-up scoped symbol search found project_workspace.go and binding structure was read. No source mutation or command replay occurred."
+    }
+  ],
+  "runtime_test_status": "Root native-policy-tests-01 was reported running under original f13 ownership during this prereview. No result inferred; source hold honored. Final approval awaits corrected source freeze and controlled test receipts.",
+  "review_actions": {
+    "source_writes": 0,
+    "d_writes": 0,
+    "go_test_runs": 0,
+    "native_cli_runs": 0,
+    "app_runs": 0,
+    "model_calls": 0,
+    "auth_or_private_config_reads": 0
+  },
+  "archive_role": "Read-only prereview evidence; do not integrate this as final approval."
+}

@@ -1,0 +1,795 @@
+
+FILE internal/host/maintenance_startup_gate_windows.go
+1: //go:build windows
+2: 
+3: package host
+4: 
+5: import "researchos.local/research-os/internal/qualificationmaintenancejournal"
+6: 
+7: // QualificationMaintenanceRootGate is a pure read. Its caller must already
+8: // hold the native root through a lease or an inherited recovery token.
+9: func QualificationMaintenanceRootGate(root string) error {
+10: 	if err := qualificationmaintenancejournal.CheckOrdinary(root); err != nil {
+11: 		return err
+12: 	}
+13: 	return replacementCheckHistoryCurrent(root)
+14: }
+
+FILE apps/control/main.go
+34: func main() {
+35: 	if err := classifyControlEarlyMode(os.Args[1:]); err != nil {
+36: 		log.Fatal(err)
+37: 	}
+38: 	if handled, err := runQualificationFailureMaintenance(os.Args[1:]); handled {
+39: 		if err != nil {
+40: 			log.Fatal(err)
+41: 		}
+42: 		return
+43: 	}
+44: 	if handled, code := runRuntimeVerifierReplacement(os.Args[1:], os.Stdout); handled {
+45: 		os.Exit(code)
+46: 	}
+47: 	if handled, err := runPreparedRecoveryMaintenance(os.Args[1:]); handled {
+48: 		if err != nil {
+49: 			log.Fatal(err)
+50: 		}
+51: 		return
+52: 	}
+53: 	if handled, err := runFixtureControlReplay(os.Args[1:]); handled {
+54: 		if err != nil {
+55: 			log.Fatal(err)
+56: 		}
+57: 		return
+58: 	}
+59: 	bootstrapOwner := flag.Bool("bootstrap-owner", false, "initialize the local Owner and write a private credential file")
+60: 	credentialFile := flag.String("credential-file", "", "private local output path")
+61: 	importSpec := flag.String("import-spec", "", "import a pinned specification directory as the initial ResearchOS goal")
+62: 	manifestHash := flag.String("manifest-sha256", "", "trusted sha256 digest of the complete package manifest")
+63: 	importJev := flag.String("import-jev", "", "register the completed frozen evaluation in this project; independent acceptance remains required")
+64: 	developmentFile := flag.String("development-file", "evaluation/development/jev-v2/dataset.json", "hash-pinned public development corpus")
+65: 	provision := flag.String("provision-principal", "", "trusted local administration: principal JSON to provision")
+66: 	issue := flag.String("issue-credential", "", "trusted local administration: existing principal ID")
+67: 	coordinatorFile := flag.String("runtime-coordinator-config", "", "private host configuration for the single runtime coordinator")
+68: 	runtimeAssetsDir := flag.String("runtime-assets-dir", "", "local runtime assets directory; defaults to runtime beside the installed control executable")
+69: 	qualificationRequest := flag.String("runtime-qualification-request", "", "trusted managed startup request for one bounded local runtime qualification")
+70: 	verifierManifest := flag.String("runtime-verifier-manifest", "", "trusted installed deterministic verifier manifest for the managed qualification request")
+71: 	desktopManagement := flag.Bool("desktop-management-stdio", false, "private inherited Desktop management pipes; never HTTP or Native3")
+72: 	trialVault := flag.String("trial-readonly-model-vault-dir", "", "trial-only exact existing sealed host vault directory")
+73: 	trialCredential := flag.String("trial-readonly-credential-ref", "", "trial-only single protected credential reference")
+74: 	trialProvider := flag.String("trial-readonly-provider", "", "trial-only provider identity")
+75: 	discoveryFile := flag.String("discovery-file", "", "local host discovery output; defaults to data-root/discovery.json")
+76: 	flag.Parse()
+77: 	adminActions := 0
+78: 	for _, active := range []bool{*bootstrapOwner, *importSpec != "", *importJev != "", *provision != "", *issue != ""} {
+79: 		if active {
+80: 			adminActions++
+81: 		}
+82: 	}
+83: 	if adminActions > 1 {
+84: 		log.Fatal("choose one local administrative action")
+85: 	}
+86: 	managedManifest := *verifierManifest
+87: 	if *desktopManagement {
+88: 		if adminActions != 0 || *qualificationRequest != "" || *coordinatorFile != "" || *trialVault != "" || *verifierManifest == "" {
+89: 			log.Fatal("Desktop management requires normal host composition and installed verifier manifest")
+90: 		}
+91: 		managedManifest = ""
+92: 	}
+93: 	managedQualification, err := readManagedLocalQualification(*qualificationRequest, managedManifest)
+94: 	if err != nil {
+95: 		log.Fatal(err)
+96: 	}
+97: 	if managedQualification != nil && (adminActions != 0 || *coordinatorFile != "" || *trialVault != "") {
+98: 		log.Fatal("managed local qualification requires the normal host composition without another administrative action")
+99: 	}
+100: 	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
+101: 	if *trialVault != "" {
+102: 		if adminActions != 0 || *coordinatorFile == "" || *trialCredential == "" || *trialProvider == "" ||
+103: 			hostboundary.ValidateTrialStorageLayout(dataDir, filepath.Join(dataDir, "host"), *trialVault) != nil {
+104: 			log.Fatal("trial readonly vault requires an isolated existing data root and exact coordinator/ref/provider")
+105: 		}
+106: 	} else if *trialCredential != "" || *trialProvider != "" {
+107: 		log.Fatal("partial trial readonly vault configuration")
+108: 	}
+109: 	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
+110: 	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && adminActions == 0 {
+111: 		log.Fatalf("web build unavailable: %v", err)
+112: 	}
+113: 	lease, err := rt.AcquireDataRootLease(dataDir)
+114: 	if err != nil {
+115: 		if managedQualification != nil {
+116: 			log.Fatal("managed qualification request not consumed: control data root is already owned or unavailable; the privileged Desktop host must complete an orderly managed restart, never start a second coordinator")
+117: 		}
+118: 		log.Fatalf("control data-root lease unavailable: %v", err)
+119: 	}
+120: 	defer func() {
+121: 		if err := lease.Close(); err != nil {
+122: 			log.Fatalf("data-root lease close failed: %v", err)
+123: 		}
+124: 	}()
+125: 	dataDir = lease.Root()
+126: 	if err := runtimeVerifierReplacementStartupGate(lease); err != nil {
+127: 		log.Fatalf("runtime verifier replacement recovery required: %v", err)
+128: 	}
+129: 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
+130: 	if err != nil {
+131: 		log.Fatalf("database unavailable: %v", err)
+132: 	}
+133: 	defer func() {
+134: 		if err := db.Close(); err != nil {
+135: 			log.Fatalf("database close failed: %v", err)
+136: 		}
+
+FILE apps/control/replay_command.go
+73: func replayOutputLease(data string) (*os.File, error) {
+74: 	if err := replayPlain(data); err != nil {
+75: 		return nil, err
+76: 	}
+77: 	path := filepath.Join(data, "coordinator.lock")
+78: 	name, err := windows.UTF16PtrFromString(path)
+79: 	if err != nil {
+80: 		return nil, err
+81: 	}
+82: 	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+83: 	if err != nil {
+84: 		return nil, err
+85: 	}
+86: 	if err := qualificationmaintenancejournal.CheckOrdinary(data); err != nil {
+87: 		windows.CloseHandle(h)
+88: 		return nil, err
+89: 	}
+90: 	return os.NewFile(uintptr(h), path), nil
+91: }
+92: 
+93: func fixtureControlReplay(requestPath string) error {
+94: 	token, err := windows.OpenCurrentProcessToken()
+95: 	if err != nil {
+96: 		return err
+97: 	}
+98: 	var appContainer, size uint32
+99: 	const tokenIsAppContainer = 29 // TOKEN_INFORMATION_CLASS from Windows SDK winnt.h.
+100: 	err = windows.GetTokenInformation(token, tokenIsAppContainer, (*byte)(unsafe.Pointer(&appContainer)), uint32(unsafe.Sizeof(appContainer)), &size)
+101: 	token.Close()
+102: 	if err != nil || appContainer != 1 {
+103: 		return fmt.Errorf("fixture control replay requires AppContainer")
+104: 	}
+105: 	if err := replayPlain(requestPath); err != nil {
+106: 		return err
+107: 	}
+108: 	input := filepath.Dir(requestPath)
+109: 	output, err := os.Getwd()
+110: 	if err != nil {
+111: 		return err
+112: 	}
+113: 	if err = replayPlain(output); err != nil {
+114: 		return err
+115: 	}
+116: 	if filepath.Base(requestPath) != "current-case.json" || filepath.Base(input) != "input" || filepath.Base(output) != "output" || !strings.EqualFold(filepath.Dir(input), filepath.Dir(output)) {
+117: 		return fmt.Errorf("replay requires isolated sibling input/output roots")
+118: 	}
+119: 	entries, err := os.ReadDir(output)
+120: 	if err != nil || len(entries) != 0 {
+121: 		return fmt.Errorf("empty replay output required")
+122: 	}
+123: 	raw, err := replayRead(requestPath, 64*1024)
+124: 	if err != nil {
+125: 		return err
+126: 	}
+127: 	var request evolution.ControlRequest
+128: 	if err = evolution.StrictControlJSON(raw, &request); err != nil {
+129: 		return err
+130: 	}
+131: 	if err = evolution.ValidateControlCase(request.Case, request.Binding); err != nil {
+132: 		return err
+133: 	}
+134: 	bundle := evolution.ControlBundle{Binding: request.Binding, Files: map[string][]byte{}}
+135: 	for name := range evolution.ControlReleaseHashes() {
+136: 		b, e := replayRead(filepath.Join(input, filepath.FromSlash(name)), 2*1024*1024)
+137: 		if e != nil {
+138: 			return e
+139: 		}
+140: 		bundle.Files[name] = b
+141: 	}
+142: 	bundle.Files["snapshot.sqlite"], err = replayRead(filepath.Join(input, "snapshot.sqlite"), 32*1024*1024)
+143: 	if err != nil {
+144: 		return err
+145: 	}
+146: 	if err = bundle.Validate(); err != nil {
+147: 		return err
+148: 	}
+149: 	data := filepath.Join(output, "replay-data")
+150: 	if err = os.Mkdir(data, 0700); err != nil {
+151: 		return err
+152: 	}
+153: 	path := filepath.Join(data, "researchos.sqlite")
+154: 	if err = os.WriteFile(path, bundle.Files["snapshot.sqlite"], 0600); err != nil {
+155: 		return err
+156: 	}
+157: 	lease, err := replayOutputLease(data)
+158: 	if err != nil {
+159: 		return err
+160: 	}
+161: 	defer lease.Close()
+162: 	db, err := store.Open(path)
+163: 	if err != nil {
+164: 		return err
+165: 	}
+166: 	defer db.Close()
+167: 	state, err := evolution.ControlDatabaseHash(db)
+168: 	if err != nil || state != request.Binding.ProjectionHash {
+
+FILE ops/backup/main.go
+26: func run() (runErr error) {
+27: 	if len(os.Args) < 2 {
+28: 		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+29: 	}
+30: 	command := os.Args[1]
+31: 	f := flag.NewFlagSet(command, flag.ContinueOnError)
+32: 	source := f.String("db", "", "existing source SQLite database")
+33: 	backup := f.String("backup", "", "existing encrypted backup directory")
+34: 	out := f.String("out", "", "new destination (must not exist)")
+35: 	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
+36: 	root := f.String("root", ".", "matching application repository root")
+37: 	asDataRoot := f.Bool("as-data-root", false, "restore an operational data root (researchos.sqlite plus fresh Host bindings)")
+38: 	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
+39: 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+40: 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+41: 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
+42: 	handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+43: 	handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+44: 	if e := f.Parse(os.Args[2:]); e != nil {
+45: 		return e
+46: 	}
+47: 	if f.NArg() != 0 {
+48: 		return fmt.Errorf("unexpected positional arguments")
+49: 	}
+50: 	if *keyfile == "" {
+51: 		return fmt.Errorf("--key-file required")
+52: 	}
+53: 	if command == "keygen" {
+54: 		key := make([]byte, 32)
+55: 		if _, e := rand.Read(key); e != nil {
+56: 			return e
+57: 		}
+58: 		f, e := os.OpenFile(*keyfile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+59: 		if e != nil {
+60: 			return e
+61: 		}
+62: 		defer f.Close()
+63: 		if _, e = f.Write(key); e != nil {
+64: 			return e
+65: 		}
+66: 		if e = f.Sync(); e != nil {
+67: 			return e
+68: 		}
+69: 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
+70: 		return nil
+71: 	}
+72: 	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+73: 		return fmt.Errorf("unknown command")
+74: 	}
+75: 	if *out == "" {
+76: 		return fmt.Errorf("--out required")
+77: 	}
+78: 	var sourceOwner *backupSourceOwner
+79: 	if command != "restore" {
+80: 		if *source == "" {
+81: 			return fmt.Errorf("--db required")
+82: 		}
+83: 		var err error
+84: 		sourceOwner, err = openBackupSourceLease(*source)
+85: 		if err != nil {
+86: 			return err
+87: 		}
+88: 		defer func() {
+89: 			if closeErr := sourceOwner.Close(); runErr == nil && closeErr != nil {
+90: 				runErr = closeErr
+91: 			}
+92: 		}()
+93: 	}
+94: 	if command == "upgrade-prepared-backup" {
+95: 		r, e := sourceOwner.UpgradePrepared(context.Background(), domain.PreparedBackupHandoffOptions{
+96: 			Upgrade: domain.LocalUpgradeOptions{
+97: 				Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+98: 				SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+99: 				TargetProgram: *targetProgram, Plan: *plan,
+100: 			},
+101: 			BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+102: 		})
+103: 		if e != nil {
+104: 			return e
+105: 		}
+106: 		return json.NewEncoder(os.Stdout).Encode(r)
+107: 	}
+108: 	if command == "upgrade-local" {
+109: 		r, e := sourceOwner.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+110: 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+111: 			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+112: 			TargetProgram: *targetProgram, Plan: *plan,
+
+FILE ops/supervisor/release_host/main.go
+18: func run() error {
+19: 	dbPath := flag.String("db", "", "fixture authority SQLite path")
+20: 	contracts := flag.String("contracts", "", "contracts directory")
+21: 	migration := flag.String("migration", "", "migration path")
+22: 	private := flag.String("private", "", "existing CanaryStore root")
+23: 	project := flag.String("project", "", "project")
+24: 	operation := flag.String("operation", "", "operation")
+25: 	control := flag.String("control", "", "exact actual-control fixture executable")
+26: 	root := flag.String("root", "", "existing fixture host root")
+27: 	work := flag.String("work-dir", "", "control working directory")
+28: 	web := flag.String("web-dir", "", "fixture web build directory")
+29: 	listen := flag.String("listen", "", "control loopback listener")
+30: 	flag.Parse()
+31: 	if *control != "" {
+32: 		return runControlHost(*control, *root, *work, *web, *listen, *private, *contracts)
+33: 	}
+34: 	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
+35: 		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
+36: 	}
+37: 	lease, err := openReleaseHostSourceLease(*dbPath)
+38: 	if err != nil {
+39: 		return fmt.Errorf("offline legacy fixture authority required: %w", err)
+40: 	}
+41: 	defer lease.Close()
+42: 	protected, err := protectedstore.OpenCanary(*private)
+43: 	if err != nil {
+44: 		return err
+45: 	}
+46: 	defer protected.Close()
+47: 	db, err := store.Open(*dbPath)
+48: 	if err != nil {
+49: 		return err
+50: 	}
+51: 	defer db.Close()
+52: 	svc, err := domain.New(db, *contracts, *migration)
+53: 	if err != nil {
+54: 		return err
+55: 	}
+
+FILE internal/domain/backup_upgrade.go
+60: func UpgradeLocal(ctx context.Context, opt LocalUpgradeOptions) (RestoreReport, error) {
+61: 	return RestoreReport{Status: "FAILED"}, fmt.Errorf("UPGRADE_SOURCE_LEASE_REQUIRED")
+62: }
+63: 
+64: type upgradeVerifier struct {
+65: 	provider protectedstore.Provider
+66: 	summary  func(context.Context) (protectedstore.SafeSummary, error)
+67: }
+68: 
+
+FILE internal/domain/backup_upgrade.go
+113: func upgradePaths(opt *LocalUpgradeOptions) error {
+114: 	for _, p := range []*string{&opt.Source, &opt.KeyFile, &opt.SourceRoot, &opt.TargetRoot, &opt.SourceProgram, &opt.TargetProgram} {
+115: 		v, e := upgradePath(*p, true)
+116: 		if e != nil {
+117: 			return e
+118: 		}
+119: 		*p = v
+120: 	}
+121: 	for _, p := range []*string{&opt.Snapshot, &opt.Destination} {
+122: 		v, e := upgradePath(*p, false)
+123: 		if e != nil {
+124: 			return e
+125: 		}
+126: 		*p = v
+127: 	}
+128: 	dirs := []string{filepath.Dir(opt.Source), filepath.Dir(opt.KeyFile), opt.Snapshot, opt.Destination}
+129: 	for i, a := range dirs {
+130: 		for _, b := range dirs[i+1:] {
+131: 			if upgradeInside(a, b) || upgradeInside(b, a) {
+132: 				return fmt.Errorf("UPGRADE_PATH_OVERLAP: source, key, snapshot and target require separate directories")
+133: 			}
+134: 		}
+135: 	}
+136: 	var infos []os.FileInfo
+137: 	for _, p := range []string{opt.Source, opt.KeyFile, opt.SourceProgram, opt.TargetProgram} {
+138: 		info, e := os.Stat(p)
+139: 		if e != nil || !info.Mode().IsRegular() {
+140: 			return fmt.Errorf("UPGRADE_REGULAR_FILE_REQUIRED")
+141: 		}
+142: 		infos = append(infos, info)
+143: 	}
+144: 	for i := 1; i < len(infos); i++ {
+145: 		if os.SameFile(infos[0], infos[i]) || (i > 1 && os.SameFile(infos[1], infos[i])) {
+146: 			return fmt.Errorf("UPGRADE_FILE_ALIAS")
+147: 		}
+148: 	}
+149: 	if opt.sourceLease != nil {
+150: 		if err := opt.sourceLease.Check(filepath.Dir(opt.Source), opt.Source); err != nil {
+151: 			return err
+152: 		}
+153: 	}
+154: 	return nil
+155: }
+156: 
+157: func upgradeRelease(root string, count int) (Object, [][]byte, error) {
+
+FILE internal/domain/backup_upgrade.go
+243: func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+244: 	if opt.Plan == PreparedAbandonmentSchemaUpgradePlan {
+245: 		return upgradePreparedAbandonmentLocal(ctx, opt, verifier)
+246: 	}
+247: 	if opt.Plan == ConfigurationSchemaUpgradePlan {
+248: 		return upgradeConfigurationLocal(ctx, opt, verifier)
+249: 	}
+250: 	if opt.Plan == QueueSchemaUpgradePlan {
+251: 		return upgradeQueueLocal(ctx, opt, verifier)
+252: 	}
+253: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+254: 	targetVersion := 14
+255: 	switch opt.Plan {
+256: 	case LocalUpgradePlan:
+257: 	case FinalSchemaUpgradePlan:
+258: 		targetVersion = 20
+259: 	default:
+260: 		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+261: 	}
+262: 	if e := upgradePaths(&opt); e != nil {
+263: 		return report, e
+264: 	}
+265: 	sourceRelease, _, e := upgradeRelease(opt.SourceRoot, 13)
+266: 	if e != nil {
+267: 		return report, e
+268: 	}
+269: 	targetRelease, sqls, e := upgradeRelease(opt.TargetRoot, targetVersion)
+270: 	if e != nil {
+271: 		return report, e
+272: 	}
+273: 	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+274: 	if e != nil {
+275: 		return report, e
+276: 	}
+277: 	expectedSourceSchema, expectedTargetSchema, e := upgradeTemplate(ctx, sqls, contracts)
+278: 	if e != nil {
+279: 		return report, e
+280: 	}
+281: 	key, e := os.ReadFile(opt.KeyFile)
+282: 	if e != nil || len(key) != 32 {
+283: 		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+284: 	}
+285: 	defer clear(key)
+
+FILE internal/domain/backup_prepared_abandonment_upgrade_windows.go
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6:     "bytes"
+7:     "context"
+8:     "database/sql"
+9:     "encoding/json"
+10:     "fmt"
+11:     "io"
+12:     "os"
+13:     "path/filepath"
+14:     "reflect"
+15:     "strings"
+16: 
+17:     runtimeadapter "researchos.local/research-os/adapters/runtime"
+18:     "researchos.local/research-os/internal/recoveryauthority"
+19: )
+20: 
+21: type preparedUpgradeRootLease struct {
+22:     native *runtimeadapter.DataRootLease
+23:     inherited *backupSourceLease
+24:     root, source string
+25:     closed bool
+26: }
+27: 
+28: func acquirePreparedUpgradeRootLease(root, source string, inherited *backupSourceLease) (*preparedUpgradeRootLease, error) {
+29:     if inherited != nil {
+30:         if err := inherited.Check(root, source); err != nil { return nil, err }
+31:         return &preparedUpgradeRootLease{inherited: inherited, root: root, source: source}, nil
+32:     }
+33:     lease, err := runtimeadapter.AcquireDataRootLease(root)
+34:     if err != nil { return nil, err }
+35:     return &preparedUpgradeRootLease{native: lease}, nil
+36: }
+37: func (l *preparedUpgradeRootLease) Check() error {
+38:     if l == nil || l.closed { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
+39:     if l.inherited != nil { return l.inherited.Check(l.root, l.source) }
+40:     if l.native == nil || !l.native.Held() { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
+41:     return nil
+42: }
+43: func (l *preparedUpgradeRootLease) Close() error {
+44:     if l == nil || l.closed { return nil }
+45:     l.closed = true
+46:     if l.inherited != nil { return nil }
+47:     if l.native == nil { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
+48:     return l.native.Close()
+49: }
+50: 
+51: func preparedUpgradeReadPin(pin recoveryauthority.RawPin, path, role string) ([]byte, error) {
+52:     resolved, err := upgradePath(path, true)
+53:     if err != nil { return nil, err }
+54:     pinned, err := upgradePath(pin.Path, true)
+55:     if err != nil || !strings.EqualFold(resolved, pinned) || pin.Role != role || pin.Bytes <= 0 {
+56:         return nil, fmt.Errorf("PREPARED_UPGRADE_EVIDENCE_PATH")
+57:     }
+58:     raw, err := os.ReadFile(resolved)
+59:     if err != nil || int64(len(raw)) != pin.Bytes || Digest(raw) != pin.SHA256 {
+60:         return nil, fmt.Errorf("PREPARED_UPGRADE_EVIDENCE_PIN")
+61:     }
+62:     return raw, nil
+63: }
+64: 
+65: 
+66: func preparedUpgradeRequireFilePin(token recoveryauthority.MigrationToken, role, path, expected string) error {
+67:     raw, err := os.ReadFile(path)
+68:     if err != nil || Digest(raw) != expected { return fmt.Errorf("PREPARED_UPGRADE_HELD_INPUT_HASH: %s", role) }
+69:     return token.RequirePin(recoveryauthority.RawPin{Role: role, Path: path, SHA256: expected, Bytes: int64(len(raw))})
+70: }
+71: 
+72: // No original-root operation is available through caller JSON alone.
+73: // The native leaf owns the purpose-separated signature, accepted release anchor,
+74: // actual Windows peer/self/root/DB identities, lifetime and held DataRootLease.
+75: func ExecutePreparedAbandonmentSchemaUpgrade(ctx context.Context, db *sql.DB, token recoveryauthority.MigrationToken, ownerToken string, opt LocalUpgradeOptions) (result Object, err error) {
+76:     result = Object{"plan": PreparedAbandonmentSchemaUpgradePlan, "status": "DENIED_BEFORE_DDL",
+77:         "committed": false, "automatic_retry": false, "original_restore_called": false,
+78:         "abandonment_performed": false, "provider_requests": nil, "financial_closed": false}
+79:     binding, err := token.Binding()
+80:     if err != nil { return result, err }
+81:     if binding.PlanID != PreparedAbandonmentSchemaUpgradePlan || opt.Plan != binding.PlanID ||
+82:         binding.SQLSHA256 != preparedUpgradeSQLHash {
+83:         return result, fmt.Errorf("PREPARED_UPGRADE_NATIVE_PLAN")
+84:     }
+85:     optionsRaw, err := json.Marshal(opt)
+86:     if err != nil || Digest(optionsRaw) != binding.OptionsSHA256 {
+87:         return result, fmt.Errorf("PREPARED_UPGRADE_NATIVE_OPTIONS")
+88:     }
+89:     if err = token.Check(binding); err != nil { return result, err }
+90:     if db == nil || db.Stats().MaxOpenConnections != 1 {
+91:         return result, fmt.Errorf("PREPARED_UPGRADE_SINGLE_CONNECTION_REQUIRED")
+92:     }
+93:     // Do not run upgradePaths here: these are reviewed EXISTING backup and
+94:     // rehearsal outputs, not fresh destinations. Reject aliases before reading.
+95:     for _, path := range []string{opt.Source, opt.SourceRoot, opt.TargetRoot, opt.SourceProgram, opt.TargetProgram, opt.KeyFile, opt.Snapshot, opt.Destination} {
+96:         resolved, pathErr := upgradePath(path, true)
+97:         if pathErr != nil || !filepath.IsAbs(path) || !strings.EqualFold(filepath.Clean(path), resolved) {
+98:             return result, fmt.Errorf("PREPARED_UPGRADE_REVIEWED_PATH_CHANGED")
+99:         }
+100:     }
+101:     for _, path := range []string{opt.KeyFile, opt.Snapshot, opt.Destination} {
+102:         parent := path
+103:         if path == opt.KeyFile { parent = filepath.Dir(path) }
+104:         if upgradeInside(filepath.Dir(opt.Source), parent) || upgradeInside(parent, filepath.Dir(opt.Source)) {
+105:             return result, fmt.Errorf("PREPARED_UPGRADE_OUTPUT_OVERLAP")
+106:         }
+107:     }
+108:     if !strings.EqualFold(filepath.Clean(binding.Root), filepath.Dir(opt.Source)) ||
+109:         !strings.EqualFold(filepath.Clean(binding.Database), filepath.Clean(opt.Source)) {
+110:         return result, fmt.Errorf("PREPARED_UPGRADE_NATIVE_DATABASE")
+111:     }
+112:     dbs, err := db.QueryContext(ctx, "PRAGMA database_list")
+113:     if err != nil { return result, err }
+114:     mainPath, databaseCount := "", 0
+115:     for dbs.Next() {
+116:         var sequence int
+117:         var name, path string
+118:         if err = dbs.Scan(&sequence, &name, &path); err != nil { dbs.Close(); return result, err }
+119:         if name != "temp" { databaseCount++ }
+120:         if name == "main" { mainPath = path }
+121:     }
+122:     err = dbs.Err()
+123:     dbs.Close()
+124:     if err != nil || databaseCount != 1 || !strings.EqualFold(filepath.Clean(mainPath), filepath.Clean(opt.Source)) {
+125:         return result, fmt.Errorf("PREPARED_UPGRADE_CONNECTION_IDENTITY")
+126:     }
+127:     var temporaryObjects int
+128:     if err = db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_temp_master").Scan(&temporaryObjects); err != nil || temporaryObjects != 0 {
+129:         return result, fmt.Errorf("PREPARED_UPGRADE_TEMP_SCHEMA_PROHIBITED")
+130:     }
+131:     // Retained EXCLUSIVE SQLite ownership is separate from the native lease.
+132:     // This no-op transaction establishes it without restore/recovery changes.
+133:     if _, err = db.ExecContext(ctx, "PRAGMA busy_timeout=250; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;"); err != nil {
+134:         return result, fmt.Errorf("PREPARED_UPGRADE_SOURCE_NOT_OFFLINE: %w", err)
+135:     }
+136:     sourceRelease, _, err := preparedUpgradeRelease(opt.SourceRoot, 23)
+137:     if err != nil || Hash(sourceRelease) != binding.SourceInventorySHA256 {
+138:         return result, fmt.Errorf("PREPARED_UPGRADE_SOURCE_RELEASE_ANCHOR")
+139:     }
+140:     targetRelease, sqls, err := preparedUpgradeRelease(opt.TargetRoot, 24)
+141:     if err != nil || Hash(targetRelease) != binding.TargetInventorySHA256 {
+142:         return result, fmt.Errorf("PREPARED_UPGRADE_TARGET_RELEASE_ANCHOR")
+143:     }
+144:     for relative, digest := range sourceRelease {
+145:         if err = preparedUpgradeRequireFilePin(token, "source-inventory:"+relative,
+146:             filepath.Join(opt.SourceRoot, filepath.FromSlash(relative)), digest.(string)); err != nil { return result, err }
+147:     }
+148:     for relative, digest := range targetRelease {
+149:         if err = preparedUpgradeRequireFilePin(token, "target-inventory:"+relative,
+150:             filepath.Join(opt.TargetRoot, filepath.FromSlash(relative)), digest.(string)); err != nil { return result, err }
+151:     }
+152:     sourceProgram, targetProgram, err := preparedUpgradeProgramHashes(opt, true)
+153:     if err != nil || sourceProgram != binding.SourceReleaseSHA256 || targetProgram != binding.TargetReleaseSHA256 {
+154:         return result, fmt.Errorf("PREPARED_UPGRADE_NATIVE_PROGRAM_ANCHOR")
+155:     }
+156:     for _, pin := range []struct{ role, path, hash string }{
+157:         {"source-program", opt.SourceProgram, sourceProgram},
+158:         {"target-program", opt.TargetProgram, targetProgram},
+159:         {"migration-sql", filepath.Join(opt.TargetRoot, "migrations/sqlite/0024_prepared_run_abandonment.sql"), preparedUpgradeSQLHash},
+160:     } {
+161:         if err = preparedUpgradeRequireFilePin(token, pin.role, pin.path, pin.hash); err != nil { return result, err }
+162:     }
+163:     contracts, err := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+164:     if err != nil { return result, err }
+165:     schemas, err := preparedUpgradeTemplate(ctx, sqls, contracts)
+166:     if err != nil { return result, err }
+167:     if schemas.Source23 != binding.SourceSchemaSHA256 || schemas.Original24 != binding.TargetSchemaSHA256 {
+168:         return result, fmt.Errorf("PREPARED_UPGRADE_NATIVE_SCHEMA_ANCHOR")
+169:     }
+170:     guard := &upgradeQueueProtection{upgradeProtection: upgradeProtection{ctx: ctx, verifier: preparedUpgradeConcreteVerifier()}, contracts: contracts}
+171:     if err = guard.refresh(db); err != nil { return result, err }
+172:     backupRaw, err := preparedUpgradeReadPin(binding.Backup, filepath.Join(opt.Snapshot, "manifest.json"), "encrypted-backup-manifest")
+173:     if err != nil { return result, err }
+174:     rehearsalRaw, err := preparedUpgradeReadPin(binding.Rehearsal, filepath.Join(opt.Destination, preparedUpgradeReceiptName), "isolated-restore-rehearsal")
+175:     if err != nil { return result, err }
+176:     var rehearsal preparedUpgradeRehearsalReceipt
+177:     decoder := json.NewDecoder(bytes.NewReader(rehearsalRaw))
+178:     decoder.DisallowUnknownFields()
+179:     if err = decoder.Decode(&rehearsal); err != nil { return result, err }
+180:     if err = decoder.Decode(new(any)); err != io.EOF { return result, fmt.Errorf("PREPARED_UPGRADE_REHEARSAL_TRAILING_DATA") }
+181:     if rehearsal.Schema != "researchos.prepared-abandonment-schema-rehearsal.v1" ||
+182:         rehearsal.Plan != binding.PlanID || rehearsal.Status != "ISOLATED_REHEARSAL_COMPLETE_ORIGINAL_UNCHANGED" ||
+183:         !rehearsal.RollbackVerified || !rehearsal.OriginalUnchanged || !rehearsal.ExistingRowsUnchanged || !rehearsal.NewProofTableEmpty ||
+184:         rehearsal.AutomaticPromotion || !reflect.DeepEqual(rehearsal.Options, opt) || rehearsal.OptionsHash != binding.OptionsSHA256 ||
+185:         rehearsal.SourceProgramHash != sourceProgram || rehearsal.TargetProgramHash != targetProgram ||
+186:         rehearsal.SourceInventoryHash != Hash(sourceRelease) || rehearsal.TargetInventoryHash != Hash(targetRelease) ||
+187:         rehearsal.SQLHash != preparedUpgradeSQLHash || rehearsal.SourceSchema != schemas.Source23 || rehearsal.TargetSchema != schemas.Original24 ||
+188:         rehearsal.RestoredSchema != schemas.Restored23 || rehearsal.RestoredTargetSchema != schemas.Restored24 ||
+189:         rehearsal.OriginalRowsHash != binding.OriginalRowsSHA256 ||
+190:         rehearsal.BackupManifestHash != Digest(backupRaw) || rehearsal.BackupManifestBytes != int64(len(backupRaw)) ||
+191:         rehearsal.RestoreReport.Status != "RESTORED_RECONCILIATION_REQUIRED" ||
+192:         !backupConfigurationHash.MatchString(rehearsal.PostRestoreRowsHash) || !backupConfigurationHash.MatchString(rehearsal.PostDDLRowsHash) ||
+193:         rehearsal.RestoreDelta == nil || rehearsal.ReleaseAuthority != "RECORDED_PROGRAM_PINS_REQUIRE_SEPARATE_NATIVE_APPLY_AUTHORITY" {
+194:         return result, fmt.Errorf("PREPARED_UPGRADE_REHEARSAL_BINDING")
+195:     }
+196:     savedPlan, planOK := rehearsal.BackupPurpose["plan"].(map[string]any)
+197:     if !planOK || rehearsal.BackupPurpose["kind"] != "SAME_HOST_PREPARED_ABANDONMENT_SCHEMA_REHEARSAL" ||
+198:         rehearsal.BackupPurpose["scope"] != "IsolatedRestoreOnly" || rehearsal.BackupPurpose["automatic_promotion"] != false ||
+199:         rehearsal.BackupPurpose["original_business_mutation"] != false || Str(rehearsal.BackupPurpose, "plan_hash") != Hash(savedPlan) ||
+200:         savedPlan["id"] != binding.PlanID || savedPlan["source_database_logical_hash"] != binding.OriginalRowsSHA256 ||
+201:         savedPlan["source_schema_hash"] != schemas.Source23 || savedPlan["original_target_schema_hash"] != schemas.Original24 ||
+202:         savedPlan["restored_target_schema_hash"] != schemas.Restored24 || savedPlan["migration_sql_hash"] != preparedUpgradeSQLHash ||
+203:         savedPlan["source_release_hash"] != Hash(sourceRelease) || savedPlan["target_release_hash"] != Hash(targetRelease) ||
+204:         savedPlan["source_program_hash"] != sourceProgram || savedPlan["target_program_hash"] != targetProgram ||
+205:         savedPlan["options_hash"] != binding.OptionsSHA256 || Hash(savedPlan["source_versions"]) != Hash(upgradeVersions(23)) ||
+206:         Hash(savedPlan["target_versions"]) != Hash(upgradeVersions(24)) {
+207:         return result, fmt.Errorf("PREPARED_UPGRADE_BACKUP_PURPOSE")
+208:     }
+209:     key, err := os.ReadFile(opt.KeyFile)
+210:     if err != nil || len(key) != 32 { return result, fmt.Errorf("BACKUP_KEY_UNAVAILABLE") }
+211:     defer clear(key)
+212:     policy := &backupPolicy{format: localUpgradeFormat, databaseName: "researchos.sqlite", purpose: rehearsal.BackupPurpose}
+213:     manifest, files, err := readBackupPolicy(opt.Snapshot, key, policy)
+214:     if err != nil { return result, err }
+215:     defer func() { for _, raw := range files { clear(raw) } }()
+216:     if !reflect.DeepEqual(manifest.Migrations, upgradeVersions(23)) || manifest.SchemaHash != schemas.Source23 ||
+217:         manifest.ID != rehearsal.RestoreReport.BackupID || Digest(Bytes(manifest.Purpose)) != Digest(Bytes(rehearsal.BackupPurpose)) {
+218:         return result, fmt.Errorf("PREPARED_UPGRADE_BACKUP_BINDING")
+219:     }
+220:     for _, file := range manifest.Files {
+221:         path := filepath.Join(opt.Snapshot, file.Name+".enc")
+222:         encrypted, readErr := os.ReadFile(path)
+223:         if readErr != nil { return result, readErr }
+224:         if err = token.RequirePin(recoveryauthority.RawPin{Role: "encrypted-backup-payload:"+file.Name+".enc",
+225:             Path: path, SHA256: Digest(encrypted), Bytes: int64(len(encrypted))}); err != nil { return result, err }
+226:     }
+227:     if err = token.Check(binding); err != nil { return result, err }
+228:     if err = preparedUpgradeVersions(db, 23); err != nil { return result, err }
+229:     original, err := preparedUpgradeSnapshot(db)
+230:     if err != nil || Hash(original) != binding.OriginalRowsSHA256 { return result, fmt.Errorf("PREPARED_UPGRADE_ORIGINAL_DRIFT") }
+231:     schema, err := preparedUpgradeSchema(db)
+232:     if err != nil || schema != schemas.Source23 { return result, fmt.Errorf("PREPARED_UPGRADE_SOURCE_SCHEMA") }
+233:     if err = token.Check(binding); err != nil { return result, err }
+234:     // An existing intent is a recovery boundary, never an automatic retry.
+235:     receiptDir := opt.Destination + ".original-schema24"
+236:     if _, err = upgradePath(receiptDir, false); err != nil { return result, err }
+237:     if err = os.Mkdir(receiptDir, 0700); err != nil { return result, err }
+238:     result["receipt_directory"] = receiptDir
+239:     intent := Object{"schema": "researchos.prepared-abandonment-schema-migration-intent.v1", "binding": binding,
+240:         "created_at": Now(), "status": "PREPARED_NOT_COMMITTED", "automatic_retry": false,
+241:         "original_rows_sha256": Hash(original), "source_schema_sha256": schema}
+242:     if err = backupWrite(filepath.Join(receiptDir, "migration-intent.json"), Bytes(intent)); err != nil { return result, err }
+243:     // The native caller also records the result. A durable intent without a
+244:     // final receipt requires inspection of schema/version, not replay.
+245:     defer func() {
+246:         result["finished_at"] = Now()
+247:         if err != nil && result["committed"] == false && result["status"] != "COMMIT_OUTCOME_UNKNOWN" {
+248:             result["status"] = "NOT_COMMITTED"
+249:         }
+250:         if err != nil { result["error"] = err.Error() }
+251:         writeErr := backupWrite(filepath.Join(receiptDir, "migration-result.json"), Bytes(result))
+252:         if writeErr != nil {
+253:             result["receipt_persistence_error"] = writeErr.Error()
+254:             if err == nil { err = fmt.Errorf("PREPARED_UPGRADE_RESULT_PERSISTENCE: %w", writeErr) }
+255:         }
+256:     }()
+257:     tx, err := db.BeginTx(ctx, nil)
+258:     if err != nil { return result, err }
+259:     defer tx.Rollback()
+260:     if err = resourceWriteLock(tx); err != nil { return result, err }
+261:     owner, err := authenticate(tx, ownerToken)
+262:     if err != nil { return result, err }
+263:     if !owner.HasRole("OWNER") || !owner.Allowed(binding.ProjectID, "", "", false) {
+264:         return result, Fail(403, "FORBIDDEN", "current project Owner required")
+265:     }
+266:     root, err := authorityRoot(tx, owner.ID)
+267:     if err != nil || root != owner.ID || root != binding.OwnerRoot {
+268:         return result, Fail(403, "FORBIDDEN", "direct local Root Owner required")
+269:     }
+270:     if err = token.Begin(binding); err != nil { return result, err }
+271:     commitAttempted := false
+272:     defer func() { _ = tx.Rollback(); token.Finish(commitAttempted) }()
+273:     result["status"] = "TRANSACTION_OPEN"
+274:     if err = preparedUpgradeDDL(ctx, tx, sqls[23], original, schemas.Source23, schemas.Original24); err != nil {
+275:         result["status"] = "ROLLED_BACK_BEFORE_COMMIT"
+276:         return result, err
+277:     }
+278:     if err = token.Check(binding); err != nil { return result, err }
+279:     // Recheck public pins before commit; the SQL used above is the already
+280:     // verified immutable byte slice, never reloaded from a mutable path.
+281:     a, _, pinErr := preparedUpgradeRelease(opt.SourceRoot, 23)
+282:     if pinErr != nil || Hash(a) != Hash(sourceRelease) { return result, fmt.Errorf("PREPARED_UPGRADE_RELEASE_CHANGED") }
+283:     b, _, pinErr := preparedUpgradeRelease(opt.TargetRoot, 24)
+284:     if pinErr != nil || Hash(b) != Hash(targetRelease) { return result, fmt.Errorf("PREPARED_UPGRADE_RELEASE_CHANGED") }
+285:     x, y, pinErr := preparedUpgradeProgramHashes(opt, true)
+286:     if pinErr != nil || x != sourceProgram || y != targetProgram { return result, fmt.Errorf("PREPARED_UPGRADE_PROGRAM_CHANGED") }
+287:     if _, pinErr = preparedUpgradeReadPin(binding.Backup, filepath.Join(opt.Snapshot, "manifest.json"), "encrypted-backup-manifest"); pinErr != nil { return result, pinErr }
+288:     if _, pinErr = preparedUpgradeReadPin(binding.Rehearsal, filepath.Join(opt.Destination, preparedUpgradeReceiptName), "isolated-restore-rehearsal"); pinErr != nil { return result, pinErr }
+289:     after, err := preparedUpgradeSnapshot(tx)
+290:     if err != nil { return result, err }
+291:     result["before_rows_sha256"], result["after_rows_sha256"] = Hash(original), Hash(after)
+292:     result["source_schema_sha256"], result["target_schema_sha256"] = schemas.Source23, schemas.Original24
+293:     result["existing_business_rows_unchanged"], result["new_proof_table_empty"] = true, true
+294:     result["migration_only_adds_version"] = 24
+295:     // A Commit error can have an uncertain durable outcome. Consume the token
+296:     // conservatively and leave the immutable intent for independent inspection.
+297:     commitAttempted = true
+298:     result["status"] = "COMMIT_OUTCOME_UNKNOWN"
+299:     if err = tx.Commit(); err != nil { return result, err }
+300:     result["status"], result["committed"] = "SCHEMA24_COMMITTED_ORIGINAL_BUSINESS_ROWS_UNCHANGED", true
+301:     result["binding"] = binding
+302:     return result, nil
+303: }
+
+FILE internal/domain/runtime_qualification_failure_windows.go
+894: 	if err != nil || artifact["kind"] != "MANIFEST" || artifact["evidence_kind"] != "GENERATED" || artifact["measurement_mode"] != "LIVE" || artifact["run_id"] != nil || artifact["access_class"] != "PROJECT" || artifact["produced_by"] != principal.ID || artifact["sealed_at"] == nil || artifact["validity"] != "CURRENT" || artifact["media_type"] != "application/json" || Hash(Ref(artifact, "Artifact")) != Hash(ref) || len(Arr(artifact, "input_refs")) != 1 || Hash(Arr(artifact, "input_refs")[0]) != Hash(plan["profile_ref"]) || len(Arr(artifact, "source_refs")) != 0 {
+895: 		return unavailable()
+896: 	}
+897: 	profileRef, profileOK := plan["profile_ref"].(map[string]any)
+898: 	if !profileOK || s.effective(tx, project, Object(profileRef)) != nil {
+899: 		return unavailable()
+900: 	}
+901: 	var raw []byte
+902: 	var uploadHash, uploadPrincipal string
+903: 	var sealed int
+904: 	if err = tx.QueryRow(`SELECT bytes,content_hash,principal,sealed FROM uploaded_content WHERE project=? AND storage_key=?`, project, artifact["storage_key"]).Scan(&raw, &uploadHash, &uploadPrincipal, &sealed); err != nil || sealed != 1 || uploadPrincipal != principal.ID || uploadHash != Digest(raw) || artifact["content_hash"] != uploadHash || Hash(artifact["byte_size"]) != Hash(len(raw)) || len(raw) == 0 || len(raw) > 64*1024 {
+905: 		return unavailable()
+906: 	}
+907: 	proof, err := Decode(raw)
+908: 	if err != nil || proof["schema"] != "researchos.qualification-failure-proof.v1" || proof["kind"] != onlineQualificationDenial || proof["author"] != principal.ID || proof["owner_root"] != ownerRoot || Hash(proof["subject"]) != Hash(subject) || proof["rejection_digest"] != marker["denial_digest"] {
+909: 		return unavailable()
+910: 	}
+911: 	core, ok := proof["plan_core"].(map[string]any)
+912: 	if !ok || Hash(core) != proof["plan_hash"] || proof["plan_hash"] != marker["plan_hash"] || marker["plan_file_sha256"] != Digest(Bytes(Object{"core": core, "proof": proof})) || core["author"] != principal.ID || core["owner_root"] != ownerRoot || Hash(core["subject"]) != Hash(subject) || core["upload_key"] != artifact["storage_key"] || core["artifact_id"] != artifact["id"] || core["before_dispatch_hash"] != Hash(core["before_dispatch"]) || core["observation_hash"] != marker["observation_hash"] || core["observed_at"] != proof["observed_at"] || run["runtime_settled_at"] != core["observed_at"] || run["ended_at"] != core["observed_at"] {
+913: 		return unavailable()
+914: 	}
+915: 	rejection, ok := proof["rejection"].(map[string]any)
+916: 	if !ok || rejection["schema"] != "researchos.qualification-pre-effect-rejection.v1" || rejection["kind"] != onlineQualificationDenial || rejection["stage"] != "BEFORE_PREPARE_EFFECT_TX" || rejection["outcome"] != "NO_EFFECT" || rejection["rule"] != "QUALIFICATION_MODEL_ONLY_V1" || Hash(rejection) != marker["denial_digest"] || rejection["frame_key"] != proof["rejected_effect_key"] || rejection["frame_route"] != proof["model_route"] || rejection["frame_sequence"] == nil || Hash(rejection["frame_sequence"]) != Hash(3) || rejection["plan_hash"] != planHash || rejection["project_id"] != project || rejection["task_id"] != taskID || rejection["run_id"] != runID || Hash(rejection["epoch"]) != Hash(epoch) {
+917: 		return unavailable()
+918: 	}
+919: 	observation, ok := proof["derived_observation"].(map[string]any)
+920: 	protocol, protocolOK := observation["protocol"].(map[string]any)
+921: 	qf, qfOK := observation["qualification_failure"].(map[string]any)
+922: 	if !ok || !protocolOK || !qfOK || observation["state"] != "FAILED" || observation["queue_empty"] != true || observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Hash(protocol["frames"]) != Hash(3) || Hash(protocol["acknowledged"]) != Hash(2) || Hash(protocol["verified_rejected"]) != Hash(1) || qf["denial_digest"] != marker["denial_digest"] || qf["raw_stdout_hash"] == "" || qf["raw_bridge_hash"] == "" || Hash(observation) != marker["observation_hash"] || Hash(run["exit_code"]) != Hash(observation["exit_code"]) {
+923: 		return unavailable()
+924: 	}
+925: 	native, nativeOK := proof["native"].(map[string]any)
+926: 	broker, brokerOK := proof["broker"].(map[string]any)
+927: 	if !nativeOK || !brokerOK || native["journal_hash"] != qf["raw_bridge_hash"] || native["stdout_hash"] != qf["raw_stdout_hash"] || native["stderr_hash"] != qf["raw_stderr_hash"] || native["ended"] != qf["native_ended"] || Hash(native["exit_code"]) != Hash(run["exit_code"]) || Hash(native["frames"]) != Hash(3) || Hash(native["acknowledged"]) != Hash(2) || native["cancelled"] != true || Hash(broker["accepted"]) != Hash(2) || Hash(broker["completed"]) != Hash(2) || Hash(broker["pending"]) != Hash(0) || Hash(broker["rejected_sequence"]) != Hash(3) {
+928: 		return unavailable()
+929: 	}
+930: 	var observedRaw string

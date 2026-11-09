@@ -1,0 +1,772 @@
+
+FILE go.mod
+1: module researchos.local/research-os
+2: 
+3: go 1.27.1
+4: 
+5: require (
+6: 	github.com/pdfcpu/pdfcpu v0.16.0
+7: 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
+8: 	golang.org/x/sys v0.48.0
+9: 	modernc.org/sqlite v1.60.1
+10: )
+11: 
+12: require (
+13: 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+14: 	github.com/dustin/go-humanize v1.0.1 // indirect
+15: 	github.com/google/uuid v1.6.0 // indirect
+16: 	github.com/hhrutter/tiff v1.0.6 // indirect
+17: 	github.com/mattn/go-isatty v0.0.24 // indirect
+18: 	github.com/mattn/go-runewidth v0.0.30 // indirect
+19: 	github.com/ncruces/go-strftime v1.0.0 // indirect
+20: 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+21: 	go.yaml.in/yaml/v3 v3.0.5 // indirect
+22: 	golang.org/x/crypto v0.57.0 // indirect
+23: 	golang.org/x/image v0.46.0 // indirect
+24: 	golang.org/x/text v0.42.0 // indirect
+25: 	modernc.org/libc v1.77.1 // indirect
+26: 	modernc.org/mathutil v1.7.1 // indirect
+27: 	modernc.org/memory v1.12.1 // indirect
+28: )
+
+FILE internal/host/roots_windows.go
+1: //go:build windows
+2: 
+3: package host
+4: 
+5: import (
+6: 	"fmt"
+7: 	"path/filepath"
+8: 	"strings"
+9: 
+10: 	"golang.org/x/sys/windows"
+11: )
+12: 
+13: const fileAttributeReparsePoint = 0x400
+14: 
+15: // fileIdentity pins a directory by volume serial plus file index and reports the resolved
+16: // final path, which is how a junction or symlink substitution is detected later.
+17: func fileIdentity(path string) (volume string, fileID uint64, final string, err error) {
+18: 	wide, err := windows.UTF16PtrFromString(path)
+19: 	if err != nil {
+20: 		return "", 0, "", err
+21: 	}
+22: 	h, err := windows.CreateFile(wide, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+23: 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+24: 	if err != nil {
+25: 		return "", 0, "", fmt.Errorf("open %s: %w", path, err)
+26: 	}
+27: 	defer windows.CloseHandle(h)
+28: 	var info windows.ByHandleFileInformation
+29: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+30: 		return "", 0, "", err
+31: 	}
+32: 	vol := fmt.Sprintf("%08x", info.VolumeSerialNumber)
+33: 	id := uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+34: 	buf := make([]uint16, 4096)
+35: 	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+36: 	if err != nil {
+37: 		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
+38: 	}
+39: 	final, err = boundedFinalPathUTF16(buf, n)
+40: 	if err != nil {
+41: 		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
+42: 	}
+43: 	final = strings.TrimPrefix(final, `\\?\`)
+44: 	return vol, id, final, nil
+45: }
+46: 
+47: // GetFinalPathNameByHandleW reports UTF-16 code units, not UTF-8 bytes. On
+48: // insufficient capacity its return is the required capacity, including NUL.
+49: func boundedFinalPathUTF16(buf []uint16, n uint32) (string, error) {
+50: 	if n == 0 {
+51: 		return "", fmt.Errorf("empty final path")
+52: 	}
+53: 	if n >= uint32(len(buf)) {
+54: 		return "", fmt.Errorf("final path needs %d UTF-16 units; capacity is %d", n, len(buf))
+55: 	}
+56: 	return windows.UTF16ToString(buf[:n]), nil
+57: }
+58: 
+59: // chainHasReparsePoint walks every prefix of the path, so a junction anywhere above the target
+60: // is caught even when the final component is an ordinary file.
+61: func chainHasReparsePoint(path string) (bool, error) {
+62: 	abs, err := filepath.Abs(path)
+63: 	if err != nil {
+64: 		return false, err
+65: 	}
+66: 	parts := strings.Split(abs, string(filepath.Separator))
+67: 	var cur string
+68: 	for _, p := range parts {
+69: 		if p == "" {
+70: 			cur = abs[:1] + string(filepath.Separator)
+71: 			continue
+72: 		}
+73: 		if cur == "" {
+74: 			cur = p + string(filepath.Separator)
+75: 			continue
+76: 		}
+77: 		cur = filepath.Join(cur, p)
+78: 		reparse, err := isReparsePoint(cur)
+79: 		if err != nil {
+80: 			// Not existing yet is normal for a write target; only existing components can be
+81: 			// reparse points.
+82: 			continue
+83: 		}
+84: 		if reparse {
+85: 			return true, nil
+86: 		}
+87: 	}
+88: 	return false, nil
+89: }
+90: 
+91: func isReparsePoint(path string) (bool, error) {
+92: 	wide, err := windows.UTF16PtrFromString(path)
+93: 	if err != nil {
+94: 		return false, err
+95: 	}
+96: 	h, err := windows.CreateFile(wide, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+97: 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+98: 	if err != nil {
+99: 		return false, err
+100: 	}
+101: 	defer windows.CloseHandle(h)
+102: 	var info windows.ByHandleFileInformation
+103: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+104: 		return false, err
+105: 	}
+106: 	return info.FileAttributes&fileAttributeReparsePoint != 0, nil
+107: }
+
+FILE internal/host/roots.go
+1: package host
+2: 
+3: // Workspace root binding (22 §workspace binding, 04 §鉴权). A root is registered once from a
+4: // user-chosen directory, pinned by volume serial plus file index so a later junction or symlink
+5: // swap of the same path is detectable, and revoked rather than "appearing empty" when access is
+6: // withdrawn - an inaccessible directory must never be presented as an empty one.
+7: 
+8: import (
+9: 	"errors"
+10: 	"fmt"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"sort"
+14: 	"strings"
+15: 	"sync"
+16: 	"time"
+17: )
+18: 
+19: const (
+20: 	AccessReadOnly  = "READ_ONLY"
+21: 	AccessReadWrite = "READ_WRITE"
+22: )
+23: 
+24: type RootBinding struct {
+25: 	Ref          string `json:"ref"`
+26: 	DisplayPath  string `json:"display_path"`
+27: 	RealPath     string `json:"real_path"`
+28: 	Access       string `json:"access"`
+29: 	VolumeID     string `json:"volume_id"`
+30: 	FileID       uint64 `json:"file_id"`
+31: 	FinalPath    string `json:"final_path"`
+32: 	RegisteredAt string `json:"registered_at"`
+33: 	Revoked      bool   `json:"revoked"`
+34: }
+35: 
+36: type rootIndex struct {
+37: 	Version int            `json:"version"`
+38: 	Roots   []*RootBinding `json:"roots"`
+39: }
+40: 
+41: type RootRegistry struct {
+42: 	dir   string
+43: 	mu    sync.RWMutex
+44: 	roots map[string]*RootBinding
+45: }
+46: 
+47: func openRootRegistry(dir string) (*RootRegistry, error) {
+48: 	d := filepath.Join(dir, "workspaces")
+49: 	if err := os.MkdirAll(d, 0o700); err != nil {
+50: 		return nil, err
+51: 	}
+52: 	if err := privateDir(d); err != nil {
+53: 		return nil, err
+54: 	}
+55: 	r := &RootRegistry{dir: d, roots: map[string]*RootBinding{}}
+56: 	var idx rootIndex
+57: 	if err := readPrivate(d, "roots.json", &idx); err != nil {
+58: 		return nil, err
+59: 	}
+60: 	for _, b := range idx.Roots {
+61: 		if b != nil && b.Ref != "" {
+62: 			r.roots[b.Ref] = b
+63: 		}
+64: 	}
+65: 	return r, nil
+66: }
+67: 
+68: func (r *RootRegistry) save() error {
+69: 	idx := rootIndex{Version: 1}
+70: 	for _, ref := range sortedRefs(r.roots) {
+71: 		idx.Roots = append(idx.Roots, r.roots[ref])
+72: 	}
+73: 	if idx.Roots == nil {
+74: 		idx.Roots = []*RootBinding{}
+75: 	}
+76: 	return writePrivate(r.dir, "roots.json", &idx)
+77: }
+78: 
+79: func sortedRefs(m map[string]*RootBinding) []string {
+80: 	out := make([]string, 0, len(m))
+81: 	for k := range m {
+82: 		out = append(out, k)
+83: 	}
+84: 	sort.Strings(out)
+85: 	return out
+86: }
+87: 
+88: // Register pins the chosen directory. A path that is itself a reparse point, or whose parent
+89: // chain contains one, is refused: the binding must describe the real directory the user picked.
+90: func (r *RootRegistry) Register(ref, displayPath, access string, now time.Time) (*RootBinding, error) {
+91: 	if ref == "" || displayPath == "" {
+92: 		return nil, fmt.Errorf("%w: root ref and path are required", ErrBadState)
+93: 	}
+94: 	if access != AccessReadOnly && access != AccessReadWrite {
+95: 		return nil, fmt.Errorf("%w: unknown workspace access", ErrRootDenied)
+96: 	}
+97: 	abs, err := filepath.Abs(displayPath)
+98: 	if err != nil {
+99: 		return nil, err
+100: 	}
+101: 	real, err := filepath.EvalSymlinks(abs)
+102: 	if err != nil {
+103: 		return nil, err
+104: 	}
+105: 	if cleanReal := filepath.Clean(real); cleanReal != filepath.Clean(abs) {
+106: 		return nil, fmt.Errorf("%w: chosen path resolves through a link", ErrPathReparsePoint)
+107: 	}
+108: 	if reparse, err := chainHasReparsePoint(clean(real)); err != nil {
+109: 		return nil, err
+110: 	} else if reparse {
+111: 		return nil, ErrPathReparsePoint
+112: 	}
+113: 	vol, id, final, err := fileIdentity(clean(real))
+114: 	if err != nil {
+115: 		return nil, err
+116: 	}
+117: 	r.mu.Lock()
+118: 	defer r.mu.Unlock()
+119: 	if existing, ok := r.roots[ref]; ok && !existing.Revoked {
+120: 		return nil, fmt.Errorf("%w: root ref already registered", ErrBadState)
+121: 	}
+122: 	b := &RootBinding{Ref: ref, DisplayPath: displayPath, RealPath: clean(real), Access: access,
+123: 		VolumeID: vol, FileID: id, FinalPath: final, RegisteredAt: now.UTC().Format(time.RFC3339Nano)}
+124: 	r.roots[ref] = b
+125: 	if err := r.save(); err != nil {
+126: 		delete(r.roots, ref)
+127: 		return nil, err
+128: 	}
+129: 	return b, nil
+130: }
+131: 
+132: // Resolve validates one published relative path against a bound root and returns the absolute
+133: // path to use. Every check is re-done per access: registration time correctness does not grant
+134: // later immunity, because links and permissions can change underneath.
+135: func (r *RootRegistry) Resolve(ref, rel, wantAccess string) (string, error) {
+136: 	r.mu.RLock()
+137: 	b, ok := r.roots[ref]
+138: 	r.mu.RUnlock()
+139: 	if !ok || b == nil {
+140: 		return "", ErrRootUnknown
+141: 	}
+142: 	if b.Revoked {
+143: 		return "", ErrRootRevoked
+144: 	}
+145: 	if wantAccess == AccessReadWrite && b.Access == AccessReadOnly {
+146: 		return "", ErrRootDenied
+147: 	}
+148: 	if err := CheckRelativePath(rel); err != nil {
+149: 		return "", err
+150: 	}
+151: 	if err := r.verifyStillPinned(b); err != nil {
+152: 		return "", err
+153: 	}
+154: 	vol, id, _, err := fileIdentity(b.RealPath)
+155: 	if err != nil {
+156: 		return "", ErrRootRevoked
+157: 	}
+158: 	if vol != b.VolumeID || id != b.FileID {
+159: 		// Same path, different object: the authorised root was replaced under us.
+160: 		return "", ErrPathReparsePoint
+161: 	}
+162: 	abs := filepath.Join(b.RealPath, filepath.FromSlash(NormalizeRelative(rel)))
+163: 	inside, err := filepath.Rel(b.RealPath, abs)
+164: 	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+165: 		return "", ErrPathEscape
+166: 	}
+167: 	if reparse, err := chainHasReparsePoint(abs); err != nil {
+168: 		return "", err
+169: 	} else if reparse {
+170: 		return "", ErrPathReparsePoint
+171: 	}
+172: 	return abs, nil
+173: }
+174: 
+175: // List returns the live bindings for the host's own diagnostics. A revoked root is reported as
+176: // revoked (never silently as "no files"), which is what the contract demands.
+177: // nextRef derives an unambiguous binding reference from the current count plus nanoseconds, so a
+178: // revoked root's reference can never be silently reused.
+179: func (r *RootRegistry) nextRef() (string, error) {
+180: 	r.mu.RLock()
+181: 	n := len(r.roots)
+182: 	r.mu.RUnlock()
+183: 	return hostRef("ws", n), nil
+184: }
+185: 
+186: func (r *RootRegistry) List() []*RootBinding {
+187: 	r.mu.RLock()
+188: 	defer r.mu.RUnlock()
+189: 	out := make([]*RootBinding, 0, len(r.roots))
+190: 	for _, ref := range sortedRefs(r.roots) {
+191: 		b := *r.roots[ref]
+192: 		out = append(out, &b)
+193: 	}
+194: 	return out
+195: }
+196: 
+197: func (r *RootRegistry) Status(ref string) string {
+198: 	r.mu.RLock()
+199: 	defer r.mu.RUnlock()
+200: 	b, ok := r.roots[ref]
+201: 	if !ok || b == nil {
+202: 		return StatusMissing
+203: 	}
+204: 	if b.Revoked {
+205: 		return StatusRevoked
+206: 	}
+207: 	return StatusAvailable
+208: }
+209: 
+210: func (r *RootRegistry) Revoke(ref string) error {
+211: 	r.mu.Lock()
+212: 	defer r.mu.Unlock()
+213: 	b, ok := r.roots[ref]
+214: 	if !ok || b == nil {
+215: 		return ErrRootUnknown
+216: 	}
+217: 	b.Revoked = true
+218: 	return r.save()
+219: }
+220: 
+221: var errPinnedRootLost = errors.New("pinned workspace root is unavailable")
+222: 
+223: func (r *RootRegistry) verifyStillPinned(b *RootBinding) error {
+224: 	if _, err := os.Stat(b.RealPath); err != nil {
+225: 		return errPinnedRootLost
+226: 	}
+227: 	return nil
+228: }
+229: 
+230: func clean(p string) string { return filepath.Clean(p) }
+
+FILE ops/owned_core_stop/main_windows_test.go
+1: //go:build windows
+2: 
+3: package main
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"os"
+9: 	"os/exec"
+10: 	"path/filepath"
+11: 	"testing"
+12: 	"time"
+13: 
+14: 	_ "modernc.org/sqlite"
+15: 	rt "researchos.local/research-os/adapters/runtime"
+16: 	"researchos.local/research-os/internal/store"
+17: 	"researchos.local/research-os/ops/supervisor"
+18: )
+19: 
+20: func waitFixtureFile(t *testing.T, path string) {
+21: 	t.Helper()
+22: 	for deadline := time.Now().Add(6 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+23: 		if _, e := os.Stat(path); e == nil {
+24: 			return
+25: 		}
+26: 	}
+27: 	t.Fatalf("fixture marker absent: %s", path)
+28: }
+29: 
+30: func TestOwnedCoreControlledCrashWALAndLease(t *testing.T) {
+31: 	fixture := os.Getenv("RESEARCHOS_OWNED_STOP_FIXTURE_EXE")
+32: 	if fixture == "" {
+33: 		t.Fatal("built new owned fixture exe required; no skip")
+34: 	}
+35: 	root := filepath.Join(t.TempDir(), "data")
+36: 	if err := os.Mkdir(root, 0700); err != nil {
+37: 		t.Fatal(err)
+38: 	}
+39: 	dbPath := filepath.Join(root, "researchos.sqlite")
+40: 	db, err := sql.Open("sqlite", dbPath)
+41: 	if err != nil {
+42: 		t.Fatal(err)
+43: 	}
+44: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`); err != nil {
+45: 		db.Close()
+46: 		t.Fatal(err)
+47: 	}
+48: 	if err = db.Close(); err != nil {
+49: 		t.Fatal(err)
+50: 	}
+51: 	out := t.TempDir()
+52: 	ready := filepath.Join(out, "ready")
+53: 	attempt := filepath.Join(out, "attempt")
+54: 	attempted := filepath.Join(out, "attempted")
+55: 	cmd := exec.Command(fixture, "--root", root, "--ready", ready, "--attempt", attempt, "--attempted", attempted)
+56: 	if err = cmd.Start(); err != nil {
+57: 		t.Fatal(err)
+58: 	}
+59: 	defer cmd.Wait()
+60: 	waitFixtureFile(t, ready)
+61: 	baseline, backupHash, err := store.OnlineOwnedStopBackup(context.Background(), dbPath, filepath.Join(out, "backup.sqlite"))
+62: 	if err != nil || backupHash == "" || baseline.Rows != 1 {
+63: 		t.Fatalf("WAL online backup failed: %+v %q %v", baseline, backupHash, err)
+64: 	}
+65: 	identity, err := supervisor.ObserveOwnedCoreReadOnly(uint32(cmd.Process.Pid))
+66: 	if err != nil {
+67: 		t.Fatal(err)
+68: 	}
+69: 	h, err := supervisor.OpenOwnedCoreRetained(identity)
+70: 	if err != nil {
+71: 		t.Fatal(err)
+72: 	}
+73: 	defer h.Close()
+74: 	barrier, err := store.AcquireOwnedStopBarrier(context.Background(), dbPath)
+75: 	if err != nil {
+76: 		t.Fatal(err)
+77: 	}
+78: 	defer barrier.Close()
+79: 	current, err := barrier.Census(context.Background())
+80: 	if err != nil || current != baseline {
+81: 		t.Fatalf("baseline differs before signal: %+v %v", current, err)
+82: 	}
+83: 	if err = os.WriteFile(attempt, []byte("go"), 0600); err != nil {
+84: 		t.Fatal(err)
+85: 	}
+86: 	waitFixtureFile(t, attempted)
+87: 	// The fixture has a deferred transaction attempting a write. The reserved
+88: 	// writer lock prevents its durable PREPARED/row commit before the crash.
+89: 	exit, err := h.TerminateOnceAndWait(5 * time.Second)
+90: 	if err != nil || exit.TerminateCalls != 1 || !exit.ExitObserved || exit.ExitCode != supervisor.OwnedCoreMaintenanceExitCode {
+91: 		t.Fatalf("exact controlled crash unavailable: %+v %v", exit, err)
+92: 	}
+93: 	if err = barrier.Close(); err != nil {
+94: 		t.Fatal(err)
+95: 	}
+96: 	lease, err := rt.AcquireDataRootLease(root)
+97: 	if err != nil {
+98: 		t.Fatalf("native exit did not release real root lease: %v", err)
+99: 	}
+100: 	defer lease.Close()
+101: 	if !lease.Held() {
+102: 		t.Fatal("poststop real lease not held")
+103: 	}
+104: 	post, err := store.ReadOwnedStopCensus(context.Background(), dbPath)
+105: 	if err != nil || post != baseline {
+106: 		t.Fatalf("committed WAL lost or in-flight row escaped: %+v %v", post, err)
+107: 	}
+108: 	read, err := sql.Open("sqlite", dbPath)
+109: 	if err != nil {
+110: 		t.Fatal(err)
+111: 	}
+112: 	defer read.Close()
+113: 	var committed, inflight int
+114: 	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='committed'`).Scan(&committed); err != nil {
+115: 		t.Fatal(err)
+116: 	}
+117: 	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='inflight'`).Scan(&inflight); err != nil {
+118: 		t.Fatal(err)
+119: 	}
+120: 	if committed != 1 || inflight != 0 {
+121: 		t.Fatalf("wrong crash durability: committed=%d inflight=%d", committed, inflight)
+122: 	}
+123: }
+124: 
+125: func TestOwnedCoreCLIRequiresExactArguments(t *testing.T) {
+126: 	if got := run([]string{"commit", "--plan", "missing"}); got != 2 {
+127: 		t.Fatalf("commit accepted missing reviewed SHA: %d", got)
+128: 	}
+129: 	if got := run([]string{"preflight", "--input", "missing", "--operation-id", "a"}); got != 2 {
+130: 		t.Fatalf("preflight accepted missing new out: %d", got)
+131: 	}
+132: 	if got := run([]string{"inspect"}); got != 2 {
+133: 		t.Fatalf("inspect accepted missing plan: %d", got)
+134: 	}
+135: 	for _, args := range [][]string{
+136: 		{"commit", "--plan", "x", "--plan", "y"},
+137: 		{"commit", "--plan", "x", "--expect-plan-sha256", "a", "--out", "z"},
+138: 		{"preflight", "--input", "a", "--operation-id", "b", "--out", "c", "commit"},
+139: 		{"inspect", "--plan", "x", "--expect-plan-sha256", "a"},
+140: 		{"inspect", "--plan", "x", "--plan", "y"},
+141: 	} {
+142: 		if got := run(args); got != 2 {
+143: 			t.Fatalf("mixed or duplicate flags accepted: %q exit=%d", args, got)
+144: 		}
+145: 	}
+146: }
+
+FILE ops/owned_core_stop/fixture/main_windows.go
+1: //go:build windows
+2: 
+3: // The fixture is a separate executable and is never linked into the stop CLI.
+4: package main
+5: 
+6: import (
+7: 	"context"
+8: 	"database/sql"
+9: 	"encoding/json"
+10: 	"flag"
+11: 	"fmt"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"sort"
+15: 	"time"
+16: 
+17: 	"golang.org/x/sys/windows"
+18: 	_ "modernc.org/sqlite"
+19: 	rt "researchos.local/research-os/adapters/runtime"
+20: 	"researchos.local/research-os/internal/auth"
+21: 	"researchos.local/research-os/internal/host"
+22: 	"researchos.local/research-os/internal/store"
+23: 	"researchos.local/research-os/ops/supervisor"
+24: )
+25: 
+26: type nativeFile struct {
+27: 	Path   string `json:"path"`
+28: 	Volume uint32 `json:"volume"`
+29: 	Index  uint64 `json:"index"`
+30: }
+31: 
+32: func fileID(path string, dir bool) (nativeFile, error) {
+33: 	w, e := windows.UTF16PtrFromString(path)
+34: 	if e != nil {
+35: 		return nativeFile{}, e
+36: 	}
+37: 	h, e := windows.CreateFile(w, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+38: 	if e != nil {
+39: 		return nativeFile{}, e
+40: 	}
+41: 	defer windows.CloseHandle(h)
+42: 	var i windows.ByHandleFileInformation
+43: 	if e = windows.GetFileInformationByHandle(h, &i); e != nil {
+44: 		return nativeFile{}, e
+45: 	}
+46: 	if i.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (i.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != dir {
+47: 		return nativeFile{}, fmt.Errorf("reparse or type mismatch: %s", path)
+48: 	}
+49: 	return nativeFile{path, i.VolumeSerialNumber, uint64(i.FileIndexHigh)<<32 | uint64(i.FileIndexLow)}, nil
+50: }
+51: func private(path string, dir bool) error {
+52: 	token := windows.GetCurrentProcessToken()
+53: 	u, e := token.GetTokenUser()
+54: 	if e != nil {
+55: 		return e
+56: 	}
+57: 	sid := u.User.Sid.String()
+58: 	ace := "(A;;FA;;;" + sid + ")"
+59: 	if dir {
+60: 		ace = "(A;OICI;FA;;;" + sid + ")"
+61: 	}
+62: 	sd, e := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + ace)
+63: 	if e != nil {
+64: 		return e
+65: 	}
+66: 	acl, _, e := sd.DACL()
+67: 	if e != nil {
+68: 		return e
+69: 	}
+70: 	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+71: }
+72: func setup(root, out string) error {
+73: 	if root == "" || out == "" || filepath.IsAbs(root) == false || filepath.IsAbs(out) == false {
+74: 		return fmt.Errorf("new absolute fixture root/opdir required")
+75: 	}
+76: 	for _, path := range []string{root, filepath.Join(root, "host"), out} {
+77: 		if e := os.Mkdir(path, 0700); e != nil {
+78: 			return e
+79: 		}
+80: 	}
+81: 	if e := private(filepath.Join(root, "host"), true); e != nil {
+82: 		return e
+83: 	}
+84: 	if e := private(out, true); e != nil {
+85: 		return e
+86: 	}
+87: 	a, e := auth.Current()
+88: 	if e != nil {
+89: 		return e
+90: 	}
+91: 	state := map[string]any{"version": 1, "principal_ref": a.Ref, "principal_id": "owner-fixture", "host_instance_id": "host-fixture", "bootstrap_at": "", "created_owner": false, "bootstrap_iterations": 0, "active_credential_hash": ""}
+92: 	raw, e := json.Marshal(state)
+93: 	if e != nil {
+94: 		return e
+95: 	}
+96: 	statePath := filepath.Join(root, "host", "host_state.json")
+97: 	if e = os.WriteFile(statePath, raw, 0600); e != nil {
+98: 		return e
+99: 	}
+100: 	if e = private(statePath, false); e != nil {
+101: 		return e
+102: 	}
+103: 	db, e := sql.Open("sqlite", filepath.Join(root, "researchos.sqlite"))
+104: 	if e != nil {
+105: 		return e
+106: 	}
+107: 	defer db.Close()
+108: 	if _, e = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL`); e != nil {
+109: 		return e
+110: 	}
+111: 	files, e := filepath.Glob(filepath.Join("migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
+112: 	if e != nil || len(files) != 24 {
+113: 		return fmt.Errorf("schema24 migration inventory: %d %v", len(files), e)
+114: 	}
+115: 	sort.Strings(files)
+116: 	for i, file := range files {
+117: 		raw, e := os.ReadFile(file)
+118: 		if e != nil {
+119: 			return e
+120: 		}
+121: 		if _, e = db.Exec(string(raw)); e != nil {
+122: 			return fmt.Errorf("migration %s: %w", file, e)
+123: 		}
+124: 		if _, e = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); e != nil {
+125: 			return e
+126: 		}
+127: 	}
+128: 	for _, stmt := range []string{
+129: 		`INSERT INTO auth_principals(id,roles,revoked) VALUES('owner-fixture','["OWNER"]',0)`,
+130: 		`INSERT INTO orchestration_identity(principal,root) VALUES('owner-fixture','root-fixture')`,
+131: 		`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('fixture-project','Run','f3dcb996b2e43cf52cba874be7abfc70',1,'{"status":"RUNNING"}')`,
+132: 		`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70',1,'705b11ec99044fef19e85f57e2d2b712','{}','fixture-hash','UNKNOWN','fixture-time','fixture-time')`,
+133: 		`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70','old-model',1,'{"state":"CONFIRMED","payload":{"capability":"MODEL"}}')`,
+134: 		`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES('fixture-principal','fixture-project','host:managed-runtime-qualification','bc269e772ada7e1bce54439fd080550c','fixture-hash',202,x'00','{}','fixture-time')`,
+135: 		`CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`,
+136: 	} {
+137: 		if _, e = db.Exec(stmt); e != nil {
+138: 			return fmt.Errorf("fixture statement: %w", e)
+139: 		}
+140: 	}
+141: 	return nil
+142: }
+143: func describe(root, out string, pid uint32) error {
+144: 	n, e := supervisor.ObserveOwnedCoreReadOnly(pid)
+145: 	if e != nil {
+146: 		return e
+147: 	}
+148: 	h, e := host.ReadOwnedCoreStopPublicIdentity(context.Background(), root)
+149: 	if e != nil {
+150: 		return e
+151: 	}
+152: 	c, e := store.ReadOwnedStopCensus(context.Background(), h.Database)
+153: 	if e != nil {
+154: 		return e
+155: 	}
+156: 	r, e := fileID(root, true)
+157: 	if e != nil {
+158: 		return e
+159: 	}
+160: 	d, e := fileID(h.Database, false)
+161: 	if e != nil {
+162: 		return e
+163: 	}
+164: 	o, e := fileID(out, true)
+165: 	if e != nil {
+166: 		return e
+167: 	}
+168: 	return json.NewEncoder(os.Stdout).Encode(struct {
+169: 		Native       supervisor.OwnedCoreNativeIdentity `json:"native"`
+170: 		Host         host.OwnedCoreStopPublicIdentity   `json:"host"`
+171: 		Census       store.OwnedStopCensus              `json:"census"`
+172: 		DataRoot     nativeFile                         `json:"data_root"`
+173: 		Database     nativeFile                         `json:"database"`
+174: 		OperationDir nativeFile                         `json:"operation_dir"`
+175: 	}{n, h, c, r, d, o})
+176: }
+177: 
+178: func main() {
+179: 	mode := flag.String("mode", "run", "setup|describe|run")
+180: 	root := flag.String("root", "", "new owned fixture data root")
+181: 	out := flag.String("out", "", "pre-created private operation directory")
+182: 	pid := flag.Uint("pid", 0, "new owned Core fixture PID")
+183: 	ready := flag.String("ready", "", "ready marker outside product")
+184: 	attempt := flag.String("attempt", "", "attempt trigger")
+185: 	attempted := flag.String("attempted", "", "attempted marker")
+186: 	flag.Parse()
+187: 	if *mode == "setup" {
+188: 		if e := setup(*root, *out); e != nil {
+189: 			fmt.Fprintln(os.Stderr, e)
+190: 			os.Exit(2)
+191: 		}
+192: 		return
+193: 	}
+194: 	if *mode == "describe" {
+195: 		if e := describe(*root, *out, uint32(*pid)); e != nil {
+196: 			fmt.Fprintln(os.Stderr, e)
+197: 			os.Exit(2)
+198: 		}
+199: 		return
+200: 	}
+201: 	if *root == "" || *ready == "" || *attempt == "" || *attempted == "" {
+202: 		fmt.Fprintln(os.Stderr, "all fixture paths required")
+203: 		os.Exit(2)
+204: 	}
+205: 	lease, err := rt.AcquireDataRootLease(*root)
+206: 	if err != nil {
+207: 		fmt.Fprintln(os.Stderr, err)
+208: 		os.Exit(2)
+209: 	}
+210: 	defer lease.Close()
+211: 	db, err := sql.Open("sqlite", filepath.Join(*root, "researchos.sqlite"))
+212: 	if err != nil {
+213: 		fmt.Fprintln(os.Stderr, err)
+214: 		os.Exit(2)
+215: 	}
+216: 	defer db.Close()
+217: 	db.SetMaxOpenConns(1)
+218: 	if _, err = db.Exec(`PRAGMA busy_timeout=10000`); err != nil {
+219: 		fmt.Fprintln(os.Stderr, err)
+220: 		os.Exit(2)
+221: 	}
+222: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; INSERT INTO stop_fixture_rows VALUES('committed',x'0001ff')`); err != nil {
+223: 		fmt.Fprintln(os.Stderr, err)
+224: 		os.Exit(2)
+225: 	}
+226: 	if err = os.WriteFile(*ready, []byte("READY\n"), 0600); err != nil {
+227: 		fmt.Fprintln(os.Stderr, err)
+228: 		os.Exit(2)
+229: 	}
+230: 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+231: 		if _, err = os.Stat(*attempt); err == nil {
+232: 			break
+233: 		}
+234: 	}
+235: 	if _, err = os.Stat(*attempt); err != nil {
+236: 		return
+237: 	}
+238: 	conn, err := db.Conn(context.Background())
+239: 	if err != nil {
+240: 		return
+241: 	}
+242: 	defer conn.Close()
+243: 	if _, err = conn.ExecContext(context.Background(), "BEGIN DEFERRED"); err != nil {
+244: 		return
+245: 	}
+246: 	if err = os.WriteFile(*attempted, []byte("ATTEMPTED\n"), 0600); err != nil {
+247: 		return
+248: 	}
+249: 	_, _ = conn.ExecContext(context.Background(), `INSERT INTO stop_fixture_rows VALUES('inflight',x'02')`)
+250: 	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+251: }

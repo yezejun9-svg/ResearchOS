@@ -1,0 +1,81 @@
+type historicalQualificationNative struct {
+	journal    rt.BridgeJournal
+	frames     [3]rt.BridgeFrame
+	bridgeHash string
+	stdoutHash string
+	stderrHash string
+	modelHash  string
+	modelRaw   []byte
+}
+
+type historicalNativeID struct {
+	volume uint64
+	file   [16]byte
+}
+
+type historicalNativeFile struct {
+	path               string
+	file               *os.File
+	identity           historicalNativeID
+	final              string
+	owner              string
+	securityDescriptor string
+	digest             string
+	size               int64
+}
+
+type historicalQualificationHold struct {
+	mu     sync.Mutex
+	files  []*historicalNativeFile
+	owner  *os.File
+	closed bool
+}
+func (h *historicalQualificationHold) Check() error {
+	if h == nil {
+		return errors.New("historical qualification hold required")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.owner == nil {
+		return errors.New("historical qualification hold closed")
+	}
+	for _, f := range h.files {
+		if err := f.check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *historicalQualificationHold) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	var err error
+	for i := len(h.files) - 1; i >= 0; i-- {
+		err = errors.Join(err, h.files[i].file.Close())
+	}
+	if h.owner != nil {
+		err = errors.Join(err, h.owner.Close())
+	}
+	return err
+}
+
+// The transaction uses a non-canceling lifetime while individual SQL calls
+// use the caller's context. This makes a canceled call end in this synchronous
+// Rollback, whose driver return precedes release of the native source hold.
+func finishHistoricalQualificationTx(tx *sql.Tx, committed bool, hold *historicalQualificationHold) error {
+	var err error
+	if tx != nil && !committed {
+		err = tx.Rollback()
+	}
+	return errors.Join(err, hold.Close())
+}
+
+func (h *historicalQualificationHold) add(path string, directory, requireOwner bool, sid string) (*historicalNativeFile, error) {

@@ -1,0 +1,5 @@
+# Harness progress UI source candidate — SOURCE ONLY
+
+Native Codex conversation now shows Task submission, associated Run, tool events observed in the current event window, and Task result. It derives every stage from existing typed Task/Run/events; UNKNOWN and cancel-requested remain unresolved. A completed Task says independent review is still needed. Permission blocks translate existing reason codes into plain language, retain raw codes in a disclosure, and explain that installation/login do not establish execution permission. The projection and components do not call a bridge, send tasks, probe capabilities, or schedule work.
+
+Only six leased paths changed. The existing mobile CSS prefix matches its baseline SHA byte-for-byte; scoped styles were appended. No App, Native, CLI, model, install, Go test or bundle build was run. Root owns build and actual zero-model runtime review. `SOURCE.patch` is relative to the exact baseline snapshot; `SOURCE.json` has file hashes. The focused Node fixture passed 5/5.

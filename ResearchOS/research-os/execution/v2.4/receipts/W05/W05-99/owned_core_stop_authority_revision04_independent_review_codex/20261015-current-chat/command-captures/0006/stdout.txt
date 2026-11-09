@@ -1,0 +1,244 @@
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\bootstrap-lineage.json
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\bootstrap-recipe.json
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\fixture_e2e_r4.py
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\fixture_parent_r4.go
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\freeze_r4.py
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\freeze_r4_v2.py
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\inspect_safe_acl.ps1
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\run_logged.py
+execution\v2.4\receipts\W05\W05-99\owned_core_stop_authority_revision04_source_codex\20261015-current-chat\selected-image-path-threat-model.md
+
+FILE ops/supervisor/owned_core_handle_windows.go
+443: func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+444: 	if h == nil || h.closed || h.core.handle == 0 {
+445: 		return errors.New("native handle closed")
+446: 	}
+447: 	pid, err := windows.GetProcessId(h.core.handle)
+448: 	if err != nil || pid != h.identity.PID {
+449: 		return errors.New("retained PID changed")
+450: 	}
+451: 	var created, exited, kernel, user windows.Filetime
+452: 	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
+453: 		return errors.New("retained process creation changed")
+454: 	}
+455: 	// Every path component remains open without delete sharing. The final image
+456: 	// also denies write sharing; identity and security are rechecked by handle.
+457: 	if err = verifyOwnedImageFile(h.core.image, h.identity.ImageVolume, h.identity.ImageIndex); err != nil {
+458: 		return err
+459: 	}
+460: 	parentPID, err := windows.GetProcessId(h.parent.handle)
+461: 	if err != nil || parentPID != h.identity.ParentPID {
+462: 		return errors.New("retained parent PID changed")
+463: 	}
+464: 	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+465: 		return errors.New("retained parent creation changed")
+466: 	}
+467: 	parentStatus, err := h.nativeParentWait()
+468: 	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+469: 		return errors.New("retained parent no longer live")
+470: 	}
+471: 	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
+472: 		return err
+473: 	}
+474: 	return nil
+475: }
+476: 
+477: func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {
+478: 	return windows.WaitForSingleObject(h.parent.handle, 0)
+479: }
+480: 
+481: // OwnedCoreNativeExit records whether the one call was made and the numeric
+482: // exit code from the same retained handle. Unknown wait is never retried.
+483: type OwnedCoreNativeExit struct {
+484: 	TerminateCalls int    `json:"terminate_calls"`
+485: 	ExitObserved   bool   `json:"exit_observed"`
+486: 	ExitCode       uint32 `json:"exit_code"`
+487: 	BeforeSignal   bool   `json:"before_signal"`
+488: }
+489: 
+490: const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
+491: 
+492: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
+493: 	return h.TerminateOnceAndWaitUntil(timeout, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+494: }
+495: 
+496: // TerminateOnceAndWaitUntil applies both the invocation monotonic deadline and
+497: // the grant's wall expiry at the last native boundary, after pre-signal waits.
+498: // A failed deadline check returns with zero TerminateProcess calls; the caller's
+499: // already-durable intent remains consumed.
+500: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+501: 	return h.TerminateOnceAndWaitUntilContext(context.Background(), timeout, invocationDeadline, wallExpiry)
+502: }
+503: 
+504: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntilContext(ctx context.Context, timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+505: 	var out OwnedCoreNativeExit
+506: 	if ctx == nil {
+507: 		return out, errors.New("caller context required")
+508: 	}
+509: 	if timeout <= 0 || timeout > 30*time.Second {
+510: 		return out, errors.New("bounded native wait required")
+511: 	}
+512: 	if earlier, ok := ctx.Deadline(); ok && earlier.Before(invocationDeadline) {
+513: 		invocationDeadline = earlier
+514: 	}
+515: 	if err := ctx.Err(); err != nil {
+516: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+517: 	}
+518: 	if err := h.verifyRetained(); err != nil {
+519: 		return out, err
+520: 	}
+521: 	if h.terminateCalls != 0 {
+522: 		return out, errors.New("native termination already attempted")
+523: 	}
+524: 	status, err := h.nativeWait(0)
+525: 	if err != nil {
+526: 		return out, err
+527: 	}
+528: 	if status == windows.WAIT_OBJECT_0 {
+529: 		out.BeforeSignal = true
+530: 		out.ExitObserved = true
+531: 		if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+532: 			return out, err
+533: 		}
+534: 		return out, nil
+535: 	}
+536: 	if status != uint32(windows.WAIT_TIMEOUT) {
+537: 		return out, fmt.Errorf("unexpected native wait status %d", status)
+538: 	}
+539: 	if err := ctx.Err(); err != nil {
+540: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+541: 	}
+542: 	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+543: 		return out, errors.New("invocation or grant expired before native signal")
+544: 	}
+545: 	if err := ctx.Err(); err != nil {
+546: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+547: 	}
+548: 	h.terminateCalls = 1
+549: 	out.TerminateCalls = 1
+550: 	if err = h.nativeTerminate(OwnedCoreMaintenanceExitCode); err != nil {
+551: 		return out, fmt.Errorf("one TerminateProcess failed: %w", err)
+552: 	}
+553: 	status, err = h.nativeWait(uint32(timeout.Milliseconds()))
+554: 	if err != nil || status != windows.WAIT_OBJECT_0 {
+555: 		return out, fmt.Errorf("native wait unknown: status=%d err=%v", status, err)
+556: 	}
+557: 	out.ExitObserved = true
+558: 	if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+559: 		return out, err
+560: 	}
+561: 	return out, nil
+562: }
+563: 
+564: func (h *OwnedCoreRetainedHandle) Close() {
+565: 	if h == nil || h.closed {
+566: 		return
+567: 	}
+568: 	h.closed = true
+569: 	h.core.close()
+570: 	h.parent.close()
+571: }
+
+FILE ops/supervisor/owned_core_handle_windows_test.go
+1: //go:build windows
+2: 
+3: package supervisor
+4: 
+5: import (
+6: 	"context"
+7: 	"errors"
+8: 	"io"
+9: 	"os"
+10: 	"os/exec"
+11: 	"path/filepath"
+12: 	"strconv"
+13: 	"strings"
+14: 	"testing"
+15: 	"time"
+16: 
+17: 	"golang.org/x/sys/windows"
+18: )
+19: 
+20: func testOperatorSID(t *testing.T) string {
+21: 	t.Helper()
+22: 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+23: 	if err != nil || u == nil || u.User.Sid == nil {
+24: 		t.Fatalf("operator SID unavailable: %v", err)
+25: 	}
+26: 	return u.User.Sid.String()
+27: }
+28: 
+29: func testImageSecurityDescriptor(t *testing.T, sddl string) *windows.SECURITY_DESCRIPTOR {
+30: 	t.Helper()
+31: 	sd, err := windows.SecurityDescriptorFromString(sddl)
+32: 	if err != nil {
+33: 		t.Fatalf("fixture SDDL %q: %v", sddl, err)
+34: 	}
+35: 	return sd
+36: }
+37: 
+38: func setTestImageDACL(t *testing.T, path, sddl string) {
+39: 	t.Helper()
+40: 	sd := testImageSecurityDescriptor(t, sddl)
+41: 	acl, _, err := sd.DACL()
+42: 	if err != nil || acl == nil {
+43: 		t.Fatalf("fixture DACL absent: %v", err)
+44: 	}
+45: 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+46: 		t.Fatalf("setting task-owned fixture DACL: %v", err)
+47: 	}
+48: }
+49: 
+50: func TestOwnedImageOwnerAndACEAuthorization(t *testing.T) {
+51: 	operator := testOperatorSID(t)
+52: 	for _, tc := range []struct {
+53: 		name, sddl string
+54: 		directory  bool
+55: 		wantError  bool
+56: 	}{
+57: 		{"current operator", "O:" + operator + "D:P(A;;FA;;;" + operator + ")", false, false},
+58: 		{"SYSTEM install owner", "O:SYD:P(A;;FA;;;SY)", false, false},
+59: 		{"Administrators install owner", "O:BAD:P(A;;FA;;;BA)", true, false},
+60: 		{"TrustedInstaller install owner", "O:" + trustedInstallerSID + "D:P(A;;FA;;;SY)", false, false},
+61: 		{"foreign owner", "O:WDD:P(A;;FA;;;SY)", false, true},
+62: 		{"Everyone direct full control", "O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)", false, true},
+63: 		{"Users direct write", "O:SYD:P(A;;FA;;;SY)(A;;GW;;;BU)", false, true},
+64: 		{"Users direct control", "O:SYD:P(A;;FA;;;SY)(A;;WD;;;BU)", true, true},
+65: 		{"Everyone inherited write", "O:SYD:P(A;;FA;;;SY)(A;ID;GW;;;WD)", true, true},
+66: 		{"Users inherited delete child", "O:SYD:P(A;;FA;;;SY)(A;ID;DC;;;BU)", true, true},
+67: 		{"inherit only does not grant on directory", "O:SYD:P(A;;FA;;;SY)(A;OICIIO;FA;;;WD)", true, false},
+68: 		{"generic read remains safe", "O:SYD:P(A;;FA;;;SY)(A;;GR;;;WD)", false, false},
+69: 	} {
+70: 		t.Run(tc.name, func(t *testing.T) {
+71: 			err := imageSecurityAuthorized(testImageSecurityDescriptor(t, tc.sddl), tc.directory)
+72: 			if (err != nil) != tc.wantError {
+73: 				t.Fatalf("authorization mismatch: error=%v wantError=%t", err, tc.wantError)
+74: 			}
+75: 		})
+76: 	}
+77: 	t.Run("unsupported ACE type", func(t *testing.T) {
+78: 		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+79: 		acl, _, _ := sd.DACL()
+80: 		var ace *windows.ACCESS_ALLOWED_ACE
+81: 		if err := windows.GetAce(acl, 0, &ace); err != nil {
+82: 			t.Fatal(err)
+83: 		}
+84: 		ace.Header.AceType = 9 // callback allow: not safely interpreted by this policy
+85: 		if err := imageSecurityAuthorized(sd, false); err == nil {
+86: 			t.Fatal("unsupported ACE type accepted")
+87: 		}
+88: 	})
+89: 	t.Run("malformed ACE size", func(t *testing.T) {
+90: 		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+91: 		acl, _, _ := sd.DACL()
+92: 		var ace *windows.ACCESS_ALLOWED_ACE
+93: 		if err := windows.GetAce(acl, 0, &ace); err != nil {
+94: 			t.Fatal(err)
+95: 		}
+96: 		ace.Header.AceSize = 4
+97: 		if err := imageSecurityAuthorized(sd, false); err == nil {
+98: 			t.Fatal("malformed ACE accepted")
+99: 		}
+100: 	})
+101: }
+102: 

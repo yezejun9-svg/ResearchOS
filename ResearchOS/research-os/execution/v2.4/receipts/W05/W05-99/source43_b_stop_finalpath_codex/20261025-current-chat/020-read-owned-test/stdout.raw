@@ -1,0 +1,51 @@
+25: 		}
+26: 	}
+27: 	t.Fatalf("fixture marker absent: %s", path)
+28: }
+29: 
+30: func TestOwnedCoreControlledCrashWALAndLease(t *testing.T) {
+31: 	fixture := os.Getenv("RESEARCHOS_OWNED_STOP_FIXTURE_EXE")
+32: 	if fixture == "" {
+33: 		t.Fatal("built new owned fixture exe required; no skip")
+34: 	}
+35: 	root := filepath.Join(t.TempDir(), "data")
+36: 	if err := os.Mkdir(root, 0700); err != nil {
+37: 		t.Fatal(err)
+38: 	}
+39: 	dbPath := filepath.Join(root, "researchos.sqlite")
+40: 	db, err := sql.Open("sqlite", dbPath)
+41: 	if err != nil {
+42: 		t.Fatal(err)
+43: 	}
+44: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`); err != nil {
+45: 		db.Close()
+46: 		t.Fatal(err)
+47: 	}
+48: 	if err = db.Close(); err != nil {
+49: 		t.Fatal(err)
+50: 	}
+51: 	out := t.TempDir()
+52: 	ready := filepath.Join(out, "ready")
+53: 	attempt := filepath.Join(out, "attempt")
+54: 	attempted := filepath.Join(out, "attempted")
+55: 	cmd := exec.Command(fixture, "--root", root, "--ready", ready, "--attempt", attempt, "--attempted", attempted)
+56: 	if err = cmd.Start(); err != nil {
+57: 		t.Fatal(err)
+58: 	}
+59: 	defer cmd.Wait()
+60: 	waitFixtureFile(t, ready)
+61: 	baseline, backupHash, err := store.OnlineOwnedStopBackup(context.Background(), dbPath, filepath.Join(out, "backup.sqlite"))
+62: 	if err != nil || backupHash == "" || baseline.Rows != 1 {
+63: 		t.Fatalf("WAL online backup failed: %+v %q %v", baseline, backupHash, err)
+64: 	}
+65: 	identity, err := supervisor.ObserveOwnedCoreReadOnly(uint32(cmd.Process.Pid))
+66: 	if err != nil {
+67: 		t.Fatal(err)
+68: 	}
+69: 	h, err := supervisor.OpenOwnedCoreRetained(identity)
+70: 	if err != nil {
+71: 		t.Fatal(err)
+72: 	}
+73: 	defer h.Close()
+74: 	barrier, err := store.AcquireOwnedStopBarrier(context.Background(), dbPath)
+75: 	if err != nil {

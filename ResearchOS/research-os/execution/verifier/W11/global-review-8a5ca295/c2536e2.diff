@@ -1,0 +1,233 @@
+commit c2536e2853e6ca64ac345e2cad0680f71c29bd50
+Author:     ResearchOS Codex <researchos-codex@localhost>
+AuthorDate: Wed Sep 30 19:58:42 2026 +0800
+Commit:     ResearchOS Codex <researchos-codex@localhost>
+CommitDate: Wed Sep 30 19:58:42 2026 +0800
+
+    test: rebind unreachable loopback listeners before fixture effects
+
+diff --git a/internal/domain/domain_test.go b/internal/domain/domain_test.go
+index f3d2a7a..ed09528 100644
+--- a/internal/domain/domain_test.go
++++ b/internal/domain/domain_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"researchos.local/research-os/internal/store"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ )
+@@ -45,36 +46,96 @@ func fixtureConnect(t *testing.T, server *httptest.Server) net.Conn {
+ 	return nil
+ }
+ 
+-// Retry only read-only readiness probes; submitted business requests stay single-shot.
+-func fixtureHTTPReady(t *testing.T, client *http.Client, url string) []any {
++func fixtureHTTPProbe(client *http.Client, url string) (Object, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	probe, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
++	response, err := client.Do(probe)
++	entry := Object{"url": url, "status": nil, "error": nil}
++	if err == nil {
++		entry["status"] = response.StatusCode
++		_, err = io.Copy(io.Discard, response.Body)
++		response.Body.Close()
++	}
++	if err != nil {
++		entry["error"] = err.Error()
++	}
++	return entry, err
++}
++
++// A child process cannot replace its parent's provider URL. Only its read-only
++// probe may retry; the subsequent effect request remains single-shot.
++func fixtureHTTPReady(t *testing.T, client *http.Client, url string) {
+ 	t.Helper()
+-	readiness := Empty()
+-	for attempt := 0; attempt < 3; attempt++ {
+-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+-		probe, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+-		response, err := client.Do(probe)
+-		entry := Object{"attempt": attempt + 1, "status": nil, "error": nil}
++	for attempt := 1; attempt <= 3; attempt++ {
++		entry, err := fixtureHTTPProbe(client, url)
+ 		if err == nil {
+-			entry["status"] = response.StatusCode
+-			_, err = io.Copy(io.Discard, response.Body)
+-			response.Body.Close()
+-		}
+-		cancel()
+-		if err != nil {
+-			entry["error"] = err.Error()
++			if entry["status"] != 404 {
++				t.Fatalf("unexpected fixture readiness response: %v", entry)
++			}
++			return
+ 		}
++		t.Logf("fixture read-only probe %d: %v", attempt, err)
++	}
++	t.Fatal("fixture provider unavailable after three read-only probes")
++}
++
++// Windows can bind a loopback port that remains unreachable. Retry startup on
++// fresh listeners before handing the URL to a caller; never replay business IO.
++func fixtureHTTPServer(t *testing.T, handler http.Handler) (*httptest.Server, []any) {
++	t.Helper()
++	readiness := Empty()
++	for attempt := 0; attempt < 3; attempt++ {
++		server := httptest.NewServer(handler)
++		url := server.URL + "/__researchos_fixture_readiness__"
++		entry, err := fixtureHTTPProbe(server.Client(), url)
++		entry["attempt"] = attempt + 1
+ 		readiness = append(readiness, entry)
+ 		if err == nil {
+-			if response.StatusCode != 404 {
+-				t.Fatalf("unexpected fixture readiness response: %d", response.StatusCode)
++			if entry["status"] != 404 {
++				server.Close()
++				t.Fatalf("unexpected fixture readiness response: %v", entry)
+ 			}
+-			break
++			return server, readiness
+ 		}
++		server.Close()
++		t.Logf("fixture startup attempt %d failed before business IO: %v", attempt+1, err)
+ 		if attempt == 2 {
+-			t.Fatalf("fixture listener unavailable after three read-only probes: %v", err)
++			t.Fatalf("fixture unavailable after three fresh listeners: %v", err)
++		}
++	}
++	return nil, readiness
++}
++
++func TestFixtureHTTPStartupRecovery(t *testing.T) {
++	var probes, business atomic.Int32
++	server, attempts := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/__researchos_fixture_readiness__" {
++			if probes.Add(1) == 1 {
++				conn, _, err := w.(http.Hijacker).Hijack()
++				if err == nil {
++					conn.Close()
++				}
++				return
++			}
++			w.WriteHeader(404)
++			return
+ 		}
++		business.Add(1)
++		w.WriteHeader(200)
++	}))
++	defer server.Close()
++	if len(attempts) != 2 || attempts[0].(map[string]any)["url"] == attempts[1].(map[string]any)["url"] || business.Load() != 0 {
++		t.Fatalf("startup must replace only the failed listener before business IO: %v", attempts)
++	}
++	response, err := server.Client().Post(server.URL, "text/plain", strings.NewReader("single effect"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != 200 || business.Load() != 1 {
++		t.Fatal("business request was not single-shot")
+ 	}
+-	return readiness
+ }
+ 
+ func setup(t *testing.T) *fixture {
+diff --git a/internal/domain/durability_test.go b/internal/domain/durability_test.go
+index 5fea209..7db505c 100644
+--- a/internal/domain/durability_test.go
++++ b/internal/domain/durability_test.go
+@@ -7,7 +7,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"net/http/httptest"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -132,7 +131,7 @@ func TestW12CrashAndResume(t *testing.T) {
+ 	if _, e = external.Exec("CREATE TABLE effects(key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, receipt TEXT NOT NULL)"); e != nil {
+ 		t.Fatal(e)
+ 	}
+-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
++	provider, _ := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+ 		if q.Method == "POST" {
+ 			raw, _ := io.ReadAll(q.Body)
+ 			b, _ := Decode(raw)
+diff --git a/internal/domain/orchestration_dispatch_test.go b/internal/domain/orchestration_dispatch_test.go
+index b7c56d1..db3881f 100644
+--- a/internal/domain/orchestration_dispatch_test.go
++++ b/internal/domain/orchestration_dispatch_test.go
+@@ -5,7 +5,6 @@ import (
+ 	"context"
+ 	"io"
+ 	"net/http"
+-	"net/http/httptest"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -24,9 +23,8 @@ func TestW06ConcurrentDispatch(t *testing.T) {
+ 		t.Fatal(e)
+ 	}
+ 	body := Object{"runtime_id": o.rt["id"], "executor_principal_id": executor, "context_bundle_id": task["context_bundle_id"]}
+-	server := httptest.NewServer(f.h)
++	server, _ := fixtureHTTPServer(t, f.h)
+ 	defer server.Close()
+-	fixtureHTTPReady(t, server.Client(), server.URL+"/__researchos_fixture_readiness__")
+ 	type result struct {
+ 		status int
+ 		body   Object
+diff --git a/internal/domain/resources_evidence_test.go b/internal/domain/resources_evidence_test.go
+index 3ccaf4f..3c90a88 100644
+--- a/internal/domain/resources_evidence_test.go
++++ b/internal/domain/resources_evidence_test.go
+@@ -53,9 +53,8 @@ func resourceHTTP(f *fixture) {
+ 	evidenceName := "http-" + ID() + ".json"
+ 	var mu sync.Mutex
+ 	events := Empty()
+-	readiness := Empty()
+ 	handler := f.s.Handler()
+-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	server, readiness := fixtureHTTPServer(f.t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		raw, e := io.ReadAll(r.Body)
+ 		if e != nil {
+ 			http.Error(w, e.Error(), 500)
+@@ -82,7 +81,6 @@ func resourceHTTP(f *fixture) {
+ 		defer mu.Unlock()
+ 		resourceEvidence(f.t, evidenceName, Object{"transport": "REAL_LOOPBACK_HTTP", "base_url": server.URL, "readiness": readiness, "exchanges": events})
+ 	})
+-	readiness = fixtureHTTPReady(f.t, server.Client(), server.URL+"/__researchos_fixture_readiness__")
+ 	f.h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		req, e := http.NewRequest(r.Method, server.URL+r.URL.RequestURI(), r.Body)
+ 		if e != nil {
+diff --git a/internal/domain/sources_test.go b/internal/domain/sources_test.go
+index 726a0e3..08ad111 100644
+--- a/internal/domain/sources_test.go
++++ b/internal/domain/sources_test.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"net/http"
+-	"net/http/httptest"
+ 	"researchos.local/research-os/adapters/sources"
+ 	"testing"
+ 	"time"
+@@ -293,7 +292,7 @@ func TestW07Provider429PersistsRetryBeforeAnotherFetch(t *testing.T) {
+ 		t.Fatal(e)
+ 	}
+ 	count := 0
+-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	server, _ := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if r.URL.Path == "/__researchos_fixture_readiness__" {
+ 			w.WriteHeader(404)
+ 			return
+@@ -303,7 +302,6 @@ func TestW07Provider429PersistsRetryBeforeAnotherFetch(t *testing.T) {
+ 		w.WriteHeader(http.StatusTooManyRequests)
+ 	}))
+ 	defer server.Close()
+-	fixtureHTTPReady(t, server.Client(), server.URL+"/__researchos_fixture_readiness__")
+ 	adapter := sources.GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
+ 	from := time.Now().UTC().Add(-time.Hour)
+ 	to := time.Now().UTC().Add(-time.Minute)

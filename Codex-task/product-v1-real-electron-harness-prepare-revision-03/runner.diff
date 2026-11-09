@@ -1,0 +1,48 @@
+--- freeze2/real-electron-flow.mjs
++++ freeze3/real-electron-flow.mjs
+@@ -12,6 +12,10 @@
+ const CONTRACT = '046a49b2b1f82593fe86924913b2ee4d77152ac1cef7dbbb86562f6dfe0cfa1c';
+ const UIA_SHELL = 'C:/Users/yqyyds/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.exe';
+ const UIA_SHELL_SHA256 = '362a356ce7f0940ec74f73a8fc2c990a2cc24a38a11c90bbd8eca947110ad139';
++const UI8_SELECTOR_SOURCE = {
++  'apps/web/src/workbench.jsx': 'e0f4c6db45757b0f506b950fb5eb004de7358f1667cbaf876ab5addee7eadd19',
++  'apps/web/src/screens.jsx': 'd7405a7bf396b97907dca9ac4bf9182295fba5251b9766e276a67f9ef6b573be',
++};
+ const sha = data => crypto.createHash('sha256').update(data).digest('hex');
+ const fileSHA = name => sha(fs.readFileSync(name));
+ const folded = name => path.resolve(name).toLowerCase();
+@@ -97,6 +101,9 @@
+   requireThat(scope.native_picker.operator_fallback === false, 'AUTOMATION_SCOPE_HAS_NO_OPERATOR_FALLBACK');
+   requireThat(scope.contract_sha256 === CONTRACT, 'HARNESS_CONTRACT_PIN_REQUIRED');
+   requireThat(/^[a-f0-9]{40}$/.test(scope.source.head || '') && scope.source.pins?.length > 0, 'INTEGRATED_SOURCE_PINS_REQUIRED');
++  for (const [name, expected] of Object.entries(UI8_SELECTOR_SOURCE)) {
++    requireThat(scope.source.pins.some(row => row.path === name && row.sha256 === expected), 'EXACT_UI8_SELECTOR_SOURCE_PIN_REQUIRED:' + name);
++  }
+   pin(process.execPath, scope.node.sha256);
+   requireThat(folded(process.execPath) === folded(scope.node.path), 'EXACT_NODE_REQUIRED');
+   pin(path.join(HERE, 'real-electron-flow.mjs'), scope.harness.runner_sha256);
+@@ -211,8 +218,13 @@
+     requireThat(core.image_sha256 === scope.bundle.control_sha256, 'ACTUAL_CORE_HASH_MISMATCH');
+     write('owned-core.json', { scope_nonce: scope.scope_nonce, identity_source: 'ROS_DESKTOP_REPORT.ready_to_show',
+       action_deadline_utc: new Date(until).toISOString(), owned_core_identity: core });
+-    await bounded(() => page.getByLabel('项目显示名称', { exact: true }).fill(scope.project_display_name));
+-    guard(); await bounded(() => page.getByRole('button', { name: '选择本地项目目录', exact: true }).click());
++    const nameOptions = page.locator('details.project-name-option');
++    requireThat(await nameOptions.count() === 1, 'EXACT_UI8_PROJECT_NAME_DETAILS_REQUIRED');
++    const nameSummary = nameOptions.locator('summary');
++    requireThat((await nameSummary.textContent()).trim() === '自定义项目名称', 'UI8_PROJECT_NAME_SUMMARY_CHANGED');
++    await bounded(() => nameSummary.click());
++    await bounded(() => page.getByLabel('显示名称', { exact: true }).fill(scope.project_display_name));
++    guard(); await bounded(() => page.getByRole('button', { name: '选择目录', exact: true }).click());
+     const helperOutcome = new Promise(resolve => {
+       const osEnv = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('RESEARCHOS_')));
+       helper = spawn(scope.windows.powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', path.join(HERE, 'choose-owned-folder.ps1'),
+@@ -233,7 +245,7 @@
+     requireThat(chosen.exit === 0 && pickerResult.clicked_ok === true &&
+       pickerResult.reliable_absolute_path_count >= 1, 'REAL_NATIVE_PICKER_BLOCKED_NO_OPERATOR_FALLBACK');
+     state.native_picker = 'REAL_SHELL_AUTOMATION_OK_CLICKED';
+-    const open = page.getByRole('button', { name: '配置模型并打开工作台', exact: true });
++    const open = page.getByRole('button', { name: '打开工作台', exact: true });
+     await bounded(() => open.waitFor({ state: 'visible', timeout: Math.min(60000, until - Date.now()) }), 60000);
+     const displayed = await open.locator('..').locator('p').allTextContents();
+     requireThat(displayed.some(text => path.isAbsolute(text) && folded(text) === folded(workspace)), 'REGISTERED_WORKSPACE_NOT_OWNED_FIXTURE');

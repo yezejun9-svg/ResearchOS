@@ -1,0 +1,11 @@
+# Main7 v2 independent Source review
+
+Decision: SOURCE_ACCEPTED_FOR_ROOT_SEVEN_TARGET_ADOPTION. The CP367-v3 integer0 / Boolean False cross-caller conflict is fixed. Actual adoption is not executed or granted by this review.
+
+49 independent checks, including21 cross-interface controls, passed against235 exact input pins. The positive control executes actual Root facts_scope, actual Root transform and the complete Main validate_scope using the same integer-zero Scope. Source HDF/MF, contract, seven targets and sealed component evidence are real and exact. Future Root Scope, CP/OW/vector and reviewer linkage used only in-memory documents and were never written to canonical locations. Both validators reject false/float/nonzero/null for the integer fields, and integer0 for each Boolean flag. Both reject author/Root self-review, wrong decision schema and wrong Source binding; Main rejects a mismatched registered Owner.
+
+The complete caller and metadata byte inverses pass. Caller AST outside the fixed N assignment and boundary predicates is unchanged; the remaining validate_scope body is identical. Seven business-target after bytes and four before archives are unchanged, as is the source21 contract. Actual Source manifest members remain local; caller, change-set, journal and future argv agree on the new package. Exact Scope/Request namespace predicates pass for synthetic future paths under W09/W09-99/integration_codex. The old425/471 finite transaction controls were retained as history and not rerun.
+
+The formal source-decision.json contains the exact required11 fields, real independent reviewer identity and new Source HDF/MF/caller/change-set/seven-target refs. It is a member of this review MF, and HDF exposes actor_id, manifest_ref and source_decision_ref required by both consumers. Root must issue a new Scope, register its exact refs in the successor CP/OW, then seal the current vector and separate request. Old Scope or review refs do not authorize this Source revision.
+
+SourceReadGuard closed without errors, retained0. Canonical four files and all pinned inputs unchanged. No Main adoption, Native, dispatcher, Go/Git/SQL/API/model call or canonical write occurred. Formal delta0; no new original failure. This qualification is Source-only and does not claim new current production/formal applicability.

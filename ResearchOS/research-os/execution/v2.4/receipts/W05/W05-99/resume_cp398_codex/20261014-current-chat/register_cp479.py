@@ -1,0 +1,26 @@
+import datetime,hashlib,json,os,subprocess
+from pathlib import Path
+R=Path('D:/作品集/ResearchOS/research-os');B=Path(__file__).parent;O=B/'continuation-cp479'
+def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ref(p):return {'path':p.relative_to(R).as_posix() if p.is_relative_to(R) else p.as_posix(),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size}
+def new(p,v):
+ with p.open('x',encoding='utf8') as f:json.dump(v,f,ensure_ascii=False,indent=2);f.write('\n')
+def replace(p,b,v):
+ assert p.read_bytes()==b
+ t=p.with_name(p.name+'.cp479.pending')
+ with t.open('xb') as f:f.write(v)
+ assert p.read_bytes()==b;os.replace(t,p)
+cp_p=R/'execution/v2.4/checkpoint.json';ow_p=R/'execution/v2.4/path_ownership.json';hp=R/'execution/v2.4/HANDOFF_RESUME_PACK.md';sp=R/'execution/v2.4/step_state.json';raw={p:p.read_bytes() for p in [cp_p,ow_p,hp,sp]};cp=read(cp_p);ow=read(ow_p)
+assert cp['revision']==478 and ow['revision']==264 and len(cp['failure_counters'])==1443
+head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=R,text=True).strip();assert head=='c8b7adab9f0c15eb33f235f8d0d9eb205794e376'
+bridge=R/'execution/v2.4/receipts/W17/W17-03/bridge_checkpoint_compat_independent_review_codex/20261014-current-chat/FINAL-report.json';assert ref(bridge)['sha256']=='a4ecc9d609e9a51a7ad4ebc9409ed28282200f4eae714aa74aa71c7b16ea87cf';assert read(bridge)['status']=='SOURCE_ACCEPTED_LIMITED' and not read(bridge)['findings']
+controller=R/'execution/v2.4/receipts/W17/W17-03/native25_controller_adaptation_codex/20261014-current-chat/manifest.json';assert ref(controller)['sha256']=='bafd6a40f11ddc8f757abb08a21b5f906b69a97cf7c63e1b20fc11c46734ef67'
+O.mkdir(exist_ok=False);now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+for key,attempts,detail in [('root-native25-controller-fixture-inverse-count',1,'First local test inverse replacement counted a function declaration and call; corrected test uses forward exact reconstruction. Controller bytes unchanged,7top fixtures pass; no Native execution/signatures.'),('root-optional-receipt-path-lookups',2,'Two read-only future/guessed receipt paths were absent and PowerShell returned1. Switched to directory enumeration and direct reviewer resource handoff; no source or runtime changes.'),('desktop-profile-package-acl-and-diagnostic',3,'Builder retained first ACL owner display-name versus SID comparison exit1, second redundant Set-Acl SeSecurityPrivilege exit1, and wrong-cwd diagnostic read exit1. Final ACL compliant read-only path and independent readback exit0; original package unchanged.')]:
+ cp['failure_counters'].append({'origin_key':'20261014|'+key,'attempts':attempts,'status':'DIAGNOSTIC_PRESERVED','detail':detail,'counter_reset':False})
+resume=read(B/'continuation-cp478/RESUME.current.json');resume.update(schema='researchos.current-chat-resume.v57',at=now,checkpoint_revision=479,ownership_revision=265,failure_records_preserved=len(cp['failure_counters']),bridge_checkpoint_compat_state='INDEPENDENT_SOURCE_ACCEPTED_LIMITED_NOT_MAIN_INTEGRATED',bridge_checkpoint_compat_review_ref=ref(bridge),native25_controller_state='FROZEN_LOCAL_FIXTURES_PASS_PENDING_INDEPENDENT_REVIEW_NO_NATIVE',native25_controller_manifest_ref=ref(controller),native25_review_state='SUBSET6_INDEPENDENT_RECHECK_ACTIVE',next_command='Desktop package final freeze then independent package review; Root normal close/reopen preserving schema24/newrefmc3f932 before actual new qualification. Native25 subset6 and Core17 reviews active. Root Native25 controller frozen7localfixtures pending independent review. Bridge2 accepted, defer Main integration until fixed Desktop package freeze. Formal0/42 all22open, no duplicate codingCONFIRM.')
+new(O/'RESUME.current.json',resume);rr=ref(O/'RESUME.current.json');cp.update(revision=479,expected_previous_revision=478,updated_at=now,updated_by='codex:/root',next_command=resume['next_command']);cp['work_in_progress'].update(current_chat_continuation_cp479=rr,bridge_checkpoint_compat_review_ref=ref(bridge),native25_controller_manifest_ref=ref(controller));cp['evidence_index'].append({'kind':'BRIDGE2_INDEPENDENT_ACCEPTED_CONTROLLER_LOCAL_FIXTURES_FROZEN','ref':rr,'formal_increment':0});ow.update(revision=265,expected_previous_revision=264,updated_at=now,updated_by='codex:/root');ow['special_paths']['native25_controller']={'owner':'codex:/root','state':'FROZEN_PENDING_INDEPENDENT_REVIEW','manifest_ref':ref(controller),'native_execution':'NOT_RUN'}
+for p,n in [(cp_p,'checkpoint.before.raw.json'),(ow_p,'ownership.before.raw.json'),(hp,'handoff.before.raw.md')]:(O/n).write_bytes(raw[p])
+for p,b in raw.items():assert p.read_bytes()==b
+replace(ow_p,raw[ow_p],(json.dumps(ow,ensure_ascii=False,indent=2)+'\n').encode());replace(cp_p,raw[cp_p],(json.dumps(cp,ensure_ascii=False,indent=2)+'\n').encode());replace(hp,raw[hp],('# Current verified continuation CP479\n\nRead `'+rr['path']+'` first. Main c8b7adab; bridge2 source accepted but not integrated. Desktop package freeze/review pending. Native25 Source revision recheck and Core17 review active; Root controller frozen local fixtures only. Formal0/42 all22open.\n\n').encode()+raw[hp]);assert sp.read_bytes()==raw[sp]
+print(json.dumps({'checkpoint':479,'ownership':265,'failures':len(cp['failure_counters']),'resume':rr}))

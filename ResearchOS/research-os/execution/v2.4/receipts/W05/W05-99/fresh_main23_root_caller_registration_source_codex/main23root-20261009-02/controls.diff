@@ -1,0 +1,30 @@
+--- v1/source_controls.py
++++ v2/source_controls.py
+@@ -29,7 +29,17 @@
+ documents = [m.strict(p.read_bytes()) for p in m.CANON]
+ revisions = {k: v.get("revision") for k, v in zip(("checkpoint", "path_ownership", "step_state", "commands"), documents)}
+ case("compile-import-does-not-run-native-or-product", lambda: True)
+-case("current-pre371-canon-rejected", lambda: m.current_four(before, revisions), "POST_PUBLIC371_ROOT_CANON_REQUIRED")
++# Preserve the pre371 rejection with a synthetic legacy fixture now that actual Canon is 371.
++legacy_canon = list(m.CANON)
++legacy_checked = m.checked
++legacy_documents = copy.deepcopy(documents)
++legacy_documents[0]["revision"] = 370; legacy_documents[1]["revision"] = 174
++legacy_refs = copy.deepcopy(before)
++legacy_map = {m.canonical(ref["path"]): m.encoded(value) for ref,value in zip(legacy_refs,legacy_documents)}
++m.checked = lambda ref: legacy_map[m.canonical(ref["path"])]
++try:
++    case("current-pre371-canon-rejected", lambda: m.current_four(legacy_refs, dict(revisions, checkpoint=370, path_ownership=174)), "POST_PUBLIC371_ROOT_CANON_REQUIRED")
++finally: m.checked = legacy_checked
+ case("actual-accepted-builder-hdf-chain", lambda: len(m.builder_chain()["refs"]) > 14000)
+ original = dict(m.BUILDER_REVIEW_REFS["decision"])
+ case("foreign-forward-slash-ref-preserved", lambda: m.checked(original) is not None and original == m.BUILDER_REVIEW_REFS["decision"])
+@@ -77,7 +87,7 @@
+ case("all-six-phases-in-order", lambda: live.next_phase == 6)
+ case("phase-replay-rejected", lambda: live.require_phase("prepare", original, scope["output_root"]), "BUILD_PHASE_SEQUENCE_OR_SCOPE")
+ live.held = None
+-case("released-runtime-closure-rejected", lambda: live.require_registered(original, original, m.AUTHOR), "ROOT_RESOURCE_CLOSURE_RELEASED")
++case("released-runtime-closure-rejected", lambda: live.require_registered(original, original, m.BUILDER_AUTHOR), "ROOT_RESOURCE_CLOSURE_RELEASED")
+ m.live_lease = saved_live
+ 
+ register = next(x for x in tree.body if isinstance(x, ast.FunctionDef) and x.name == "register")

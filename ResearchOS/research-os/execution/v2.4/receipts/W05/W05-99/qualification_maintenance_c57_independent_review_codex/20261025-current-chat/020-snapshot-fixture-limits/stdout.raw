@@ -1,0 +1,152 @@
+202:func TestDisposableExecutableFenceReadbackAndRestore(t *testing.T) {
+203:	dir := t.TempDir()
+204:	path := filepath.Join(dir, "boot-fixture.exe")
+205:	if err := os.WriteFile(path, []byte("fixture-only"), 0600); err != nil {
+206:		t.Fatal(err)
+207:	}
+208:	before, err := openNative(path, false, true)
+209:	if err != nil {
+210:		t.Fatal(err)
+211:	}
+212:	defer windows.CloseHandle(before.handle)
+213:	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+214:	if err != nil {
+215:		t.Fatal(err)
+216:	}
+217:	installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), "executable")
+218:	if err != nil {
+219:		t.Fatal(err)
+220:	}
+221:	if installed == before.identity.SecurityDescriptor {
+222:		t.Fatal("fence did not change descriptor")
+223:	}
+224:	if err = setTargetDescriptor(path, installed); err != nil {
+225:		t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+226:	}
+227:	defer func() {
+228:		if err := setTargetDescriptor(path, before.identity.SecurityDescriptor); err != nil {
+229:			t.Errorf("fixture descriptor restore: %v", err)
+230:		}
+231:	}()
+232:	after, err := openNative(path, false, true)
+233:	if err != nil {
+234:		t.Fatal(err)
+235:	}
+236:	if !identityCoreEqual(before.identity, after.identity) || after.identity.SecurityDescriptor != installed {
+237:		t.Errorf("installed native identity/readback mismatch: core=%v expectedSD=%q actualSD=%q", identityCoreEqual(before.identity, after.identity), installed, after.identity.SecurityDescriptor)
+238:	}
+239:	if err := windows.CloseHandle(after.handle); err != nil {
+240:		t.Fatal(err)
+241:	}
+242:	w, err := windows.UTF16PtrFromString(path)
+243:	if err != nil {
+244:		t.Fatal(err)
+245:	}
+246:	h, err := windows.CreateFile(w, windows.FILE_EXECUTE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+247:	if err == nil {
+248:		windows.CloseHandle(h)
+249:		t.Fatal("business SID execute opened through fence")
+250:	}
+251:	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+252:		t.Fatalf("execute rejection differs: %v", err)
+253:	}
+254:	if err = setTargetDescriptor(path, before.identity.SecurityDescriptor); err != nil {
+255:		t.Fatal(err)
+256:	}
+257:	restored, err := openNative(path, false, true)
+258:	if err != nil {
+259:		t.Fatal(err)
+260:	}
+261:	if !identityEqual(before.identity, restored.identity) {
+262:		t.Error("original descriptor not restored exactly")
+263:	}
+264:	if err := windows.CloseHandle(restored.handle); err != nil {
+265:		t.Fatal(err)
+266:	}
+267:}
+268:
+269:func TestDistinctManagerPlanTransfersOwnerAndDeniesFenceTamper(t *testing.T) {
+270:	path:=filepath.Join(t.TempDir(),"managed-entry.exe")
+271:	if err:=os.WriteFile(path,[]byte("fixture"),0600); err!=nil { t.Fatal(err) }
+272:	h,err:=openNative(path,false,true); if err!=nil { t.Fatal(err) }; defer windows.CloseHandle(h.handle)
+273:	u,err:=windows.GetCurrentProcessToken().GetTokenUser(); if err!=nil { t.Fatal(err) }
+274:	manager:="S-1-5-32-544" // descriptor-construction fixture only; no privileged owner change
+275:	installed,err:=denyDescriptor(h.identity.SecurityDescriptor,u.User.Sid.String(),manager,"executable"); if err!=nil { t.Fatal(err) }
+276:	sd,err:=windows.SecurityDescriptorFromString(installed); if err!=nil { t.Fatal(err) }
+277:	owner,_,err:=sd.Owner(); if err!=nil || owner.String()!=manager { t.Fatalf("management owner absent: %v %v",owner,err) }
+278:	acl,_,err:=sd.DACL(); if err!=nil { t.Fatal(err) }
+279:	var ace *windows.ACCESS_ALLOWED_ACE; if err=windows.GetAce(acl,0,&ace); err!=nil { t.Fatal(err) }
+280:	want:=uint32(windows.FILE_EXECUTE|windows.WRITE_DAC|windows.WRITE_OWNER|windows.DELETE|windows.FILE_WRITE_DATA|windows.FILE_APPEND_DATA)
+281:	if ace.Header.AceType!=windows.ACCESS_DENIED_ACE_TYPE || ace.Mask&want!=want || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()!=u.User.Sid.String() { t.Fatal("exact business SID anti-tamper deny absent") }
+282:}
+283:
+313:	script := filepath.Join(dir, "owned-entry.ps1")
+314:	if err = os.WriteFile(script, []byte("Write-Output fixture-only\n"), 0600); err != nil {
+315:		t.Fatal(err)
+316:	}
+317:	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+318:	if err != nil {
+319:		t.Fatal(err)
+320:	}
+321:	for _, item := range []struct{ path, mode string }{{pe, "executable"}, {script, "script"}} {
+322:		before, err := openNative(item.path, false, true)
+323:		if err != nil {
+324:			t.Fatal(err)
+325:		}
+326:		installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), item.mode)
+327:		if err != nil {
+328:			windows.CloseHandle(before.handle)
+329:			t.Fatal(err)
+330:		}
+331:		if err = setTargetDescriptor(item.path, installed); err != nil {
+332:			windows.CloseHandle(before.handle)
+333:			t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+334:		}
+335:		func() {
+336:			defer func() {
+337:				if err := setTargetDescriptor(item.path, before.identity.SecurityDescriptor); err != nil {
+338:					t.Errorf("restore owned %s: %v", item.mode, err)
+394:func exerciseSQLiteWALUnderFence(t *testing.T, parent string) {
+395:	t.Helper()
+396:	root := filepath.Join(parent, "data-root")
+397:	if err := os.Mkdir(root, 0700); err != nil {
+398:		t.Fatal(err)
+399:	}
+400:	lease, err := rt.AcquireDataRootLease(root)
+401:	if err != nil {
+402:		t.Fatalf("business root lease under fence: %v", err)
+403:	}
+404:	defer func() {
+405:		if err := lease.Close(); err != nil {
+406:			t.Errorf("business lease close: %v", err)
+407:		}
+408:	}()
+409:	if !lease.Held() {
+410:		t.Fatal("business root lease not held")
+411:	}
+412:	dbPath := filepath.Join(root, "researchos.sqlite")
+413:	db, err := sql.Open("sqlite", dbPath)
+414:	if err != nil {
+415:		t.Fatal(err)
+416:	}
+417:	defer db.Close()
+418:	var mode string
+419:	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode); err != nil || strings.ToLower(mode) != "wal" {
+420:		t.Fatalf("business WAL unavailable: %q %v", mode, err)
+421:	}
+422:	if _, err = db.Exec(`CREATE TABLE fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+423:		t.Fatal(err)
+424:	}
+425:	if _, err = db.Exec(`INSERT INTO fixture(value) VALUES ('fence-compatible')`); err != nil {
+426:		t.Fatal(err)
+427:	}
+428:	var got string
+429:	if err = db.QueryRow(`SELECT value FROM fixture WHERE id=1`).Scan(&got); err != nil || got != "fence-compatible" {
+430:		t.Fatalf("business SQLite read under fence: %q %v", got, err)
+431:	}
+432:	if _, err = os.Stat(dbPath + "-wal"); err != nil {
+433:		t.Fatalf("business WAL file missing while DB open: %v", err)
+434:	}
+435:	t.Log("business data-root lease held; SQLite read/write and WAL file remained usable under executable fence")
+436:}
+437:

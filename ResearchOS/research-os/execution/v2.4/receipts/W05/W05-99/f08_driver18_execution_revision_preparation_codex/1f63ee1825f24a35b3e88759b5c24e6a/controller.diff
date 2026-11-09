@@ -1,0 +1,62 @@
+--- original/controller
++++ revision/controller
+@@ -75,7 +75,7 @@
+     u=module(s['utility_ref'],'driver18_fixed_utilities')
+     out=None;work=None;ledger=None;normal=None;first=None;secondary=[];stage='CREATE_OWN_OUTPUT'
+     roster=[{'id':i,'status':'NOT_STARTED','actual_exit':None,'qualified':False} for i in IDS]
+-    active=None;last=None;calls=0;started=time.monotonic()
++    active=None;last=None;calls=0;started=time.monotonic();inner_deadline=started+CAPS['inner_seconds']
+     try:
+         out=u.safe(s[phase+'_output_root'],ROOT/'execution/v2.4/receipts/W05/W05-99',True)
+         out.mkdir();save(out/'authority.json',authority)
+@@ -140,14 +140,17 @@
+                     'GOCACHE':str(build/'cache'),'GOTMPDIR':str(build/'gotmp'),'TEMP':str(build/'tmp'),'TMP':str(build/'tmp')})
+         def run(label,argv,cwd,seconds,extra=None):
+             nonlocal stage,calls,last
+-            stage=label;need(time.monotonic()-started<CAPS['inner_seconds'] and calls<32,'FINITE_DEADLINE_OR_CALLCAP')
++            stage=label;remaining_seconds=inner_deadline-time.monotonic()
++            need(remaining_seconds>CAPS['cleanup_seconds'] and calls<32,'FINITE_DEADLINE_OR_CALLCAP')
++            effective_seconds=min(seconds,remaining_seconds-CAPS['cleanup_seconds'])
+             calls+=1;ee=dict(env);ee.update(extra or {})
+             if active is not None:active['status']='STARTED'
+-            save(out/(label+'.request.json'),{'argv':argv,'cwd':str(cwd),'env':ee,'timeout':seconds,'call':calls})
++            save(out/(label+'.request.json'),{'argv':argv,'cwd':str(cwd),'env':ee,'timeout':effective_seconds,'requested_timeout':seconds,'effective_timeout':effective_seconds,
++                'remaining_inner_seconds':remaining_seconds,'cleanup_reserve_seconds':CAPS['cleanup_seconds'],'call':calls})
+             error=None;result=None
+             try:
+                 with (out/(label+'.stdout.raw')).open('xb') as so,(out/(label+'.stderr.raw')).open('xb') as se:
+-                    result=debug.run_owned(argv,str(cwd),ee,so,se,seconds,
++                    result=debug.run_owned(argv,str(cwd),ee,so,se,effective_seconds,
+                         {k:pin(argv[0])[k] for k in ('sha256','bytes')},images,list(ledger.members.values()),2048)
+                 last=result
+                 if active is not None:active.update(status='NATIVE_EXIT_OBSERVED',actual_exit=result.get('actual_exit'))
+@@ -228,9 +231,9 @@
+             if ident=='I16':
+                 no_sidecars(db);copy_one(pin(db),case/'after-fork.closed-copy.sqlite')
+                 save(out/'I16-third-stage.json',{'closed_db':pin(db),'test_assertions':'Original x=7, count=1, real insert9, count=2','actual_native_exit':active['actual_exit']})
+-            ledger.check(ident+'-fixture-after');active.update(status='QUALIFIED',qualified=True);save(out/(ident+'.result.json'),active);active=None
++            ledger.check(ident+'-fixture-after');need(time.monotonic()<inner_deadline,'INNER_DEADLINE_EXPIRED');active.update(status='QUALIFIED',qualified=True);save(out/(ident+'.result.json'),active);active=None
+         need(calls==30,'PARTIAL17_COMPLETE_NATIVE_ROSTER')
+-        ledger.check('final');save(out/'qualified-partial17.json',{'partial17':True,'I17':'OPEN_NOT_AUTHORIZED','all18_pass':False,'source_acceptance':False})
++        ledger.check('final');need(time.monotonic()<inner_deadline,'INNER_DEADLINE_EXPIRED');save(out/'qualified-partial17.json',{'partial17':True,'I17':'OPEN_NOT_AUTHORIZED','all18_pass':False,'source_acceptance':False})
+     except PreparedComplete:
+         pass
+     except BaseException as e:
+@@ -244,6 +247,7 @@
+                              ('artifacts-final',lambda:save(out/'artifacts.final.json',{'files':[pin(p) for p in u.files(work/'build')]} ) if work and (work/'build').exists() else None)]:
+                 try:fn()
+                 except BaseException as e:secondary.append({'stage':label,'error':repr(e)})
++            if time.monotonic()>=inner_deadline:secondary.append({'stage':'EVIDENCE_FINALIZATION','error':'INNER_DEADLINE_EXPIRED','actual_stage_native_exit':None})
+             if first is None and secondary:first={'stage':'EVIDENCE_FINALIZATION','error':secondary[0],'actual_stage_native_exit':None}
+             try:
+                 if first:save(out/'failure.origin.json',first)
+@@ -253,6 +257,7 @@
+                 sys.stderr.write(json.dumps({'first_cause':first,'finalize_error':repr(e),'native_exit':None})+'\n');first=first or {'error':repr(e)}
+     return 1 if first else 0
+ if __name__=='__main__':
+-    try:sys.exit(main())
++    try:exit_code=main()
+     except BaseException as e:
+-        sys.stderr.write(json.dumps({'stage':'ENTRY','error':repr(e),'traceback':traceback.format_exc(),'actual_native_exit':None,'outer_raw_authority':True})+'\n');sys.exit(1)
++        sys.stderr.write(json.dumps({'stage':'ENTRY','error':repr(e),'traceback':traceback.format_exc(),'actual_native_exit':None,'outer_raw_authority':True})+'\n');exit_code=1
++    sys.exit(exit_code)

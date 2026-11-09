@@ -1,0 +1,510 @@
+diff --git a/apps/desktop/main/lib/desktop-management.js b/apps/desktop/main/lib/desktop-management.js
+index 6a50d747..59685423 100644
+--- a/apps/desktop/main/lib/desktop-management.js
++++ b/apps/desktop/main/lib/desktop-management.js
+@@ -205,8 +205,11 @@ class DesktopManagement {
+     if (!intent) return { available: base.available, state: base.state, reason: base.reason || null };
+     const selected = this.sameSelection(intent.projectId, intent.sessionId);
+     const sameGeneration = this.sameCodingGeneration(intent);
+-    if (!intent.requestId) return { available: false, state: 'CODING_PREPARE_UNRESOLVED',
+-      reason: base.reason || 'CODING_ORIGINAL_PREPARE_UNRESOLVED' };
++    if (!intent.requestId) return { available: intent.state === 'PREPARE_REJECTED' &&
++        base.available && selected && sameGeneration,
++      state: intent.state === 'PREPARE_REJECTED' ? 'CODING_PREPARE_REJECTED' : 'CODING_PREPARE_UNRESOLVED',
++      reason: base.reason || (intent.state === 'PREPARE_REJECTED' ? 'CODING_PREPARE_REJECTED' :
++        'CODING_ORIGINAL_PREPARE_UNRESOLVED') };
+     return { available: base.available && selected && sameGeneration,
+       state: !selected || !sameGeneration ? 'CONTEXT_CHANGED_PENDING' :
+       !base.available ? base.state : intent.state,
+@@ -339,6 +342,9 @@ class DesktopManagement {
+         if (frame.error.code !== 'MANAGEMENT_REJECTED' || typeof frame.error.message !== 'string')
+           throw failure('PRIVATE_REPLY_ERROR');
+       }
++      // The caller may already have timed out. Apply a valid original terminal
++      // before releasing the shared barrier or resolving its abandoned promise.
++      pending.onTerminal?.(frame);
+       this.pending = null; clearTimeout(pending.timer);
+       pending.resolve(frame);
+     } catch (error) { this.broken(error.code || 'PRIVATE_REPLY_INVALID'); }
+@@ -422,15 +428,21 @@ class DesktopManagement {
+       return this.summary();
+     }
+   }
+-  async exchange(operation, scope, timeoutMs, postflight = true) {
++  async exchange(operation, scope, timeoutMs, postflight = true, hooks = {}) {
+     this.currentHost();
+-    this.commandIdle();
++    if (hooks.beforeWrite) {
++      if (operation !== 'CONFIRM_CODING' || this.pending || !this.consentPending)
++        throw failure('PRIVILEGED_CONFIRM_PENDING');
++    } else this.commandIdle();
+     const messageId = crypto.randomUUID();
+     const request = { protocol: PROTOCOL, message_id: messageId, operation, host_id: this.hostId, ...scope };
+     const bytes = Buffer.from(JSON.stringify(request) + '\n');
+     if (bytes.length - 1 > FRAME_LIMIT) throw failure('PRIVATE_FRAME_SIZE');
+     return new Promise((resolve, reject) => {
+-      const pending = { messageId, operation, resolve, reject, timer: null };
++      // This hook runs in the same JS turn as the write, after all prior awaits.
++      hooks.beforeWrite?.();
++      const pending = { messageId, operation, resolve, reject, timer: null,
++        onTerminal: hooks.onTerminal || null };
+       this.pending = pending;
+       pending.timer = setTimeout(() => {
+         // A timed-out write may already be executing. Keep the barrier until a
+@@ -507,13 +519,26 @@ class DesktopManagement {
+   async prepareCoding(scope, context, review) {
+     this.commandIdle();
+     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
++    if (!object(scope)) throw failure('CODING_SCOPE_INVALID');
++    const { projectId, sessionId, modelRef, model, coding } = scope;
++    if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)) || !object(coding))
++      throw failure('CODING_SCOPE_INVALID');
++    if (!Number.isSafeInteger(review?.resource_generation) ||
++        typeof this.options.codingResourceGeneration !== 'function' ||
++        this.options.codingResourceGeneration() !== review.resource_generation)
++      throw failure('CODING_RESOURCE_CHANGED');
+     if (this.codingIntent) {
+       const old = this.codingIntent;
+-      if (old.state !== 'CODING_CONFIGURED' &&
++      if (old.state !== 'PREPARE_REJECTED' && old.state !== 'CODING_CONFIGURED' &&
+           (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
+             Date.parse(old.expiresAt) > Date.now())) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
++      if (old.state === 'PREPARE_REJECTED' &&
++          (old.prepareTerminal !== 'ERROR' || old.prepareRejection?.code !== 'MANAGEMENT_REJECTED' ||
++            old.requestId || old.confirmSent)) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
+       this.currentHost();
+-      this.retiredCodingIntents.push(Object.freeze({ ...old, retiredAt: new Date().toISOString() }));
++      this.retiredCodingIntents.push(Object.freeze({ ...old, retiredAt: new Date().toISOString(),
++        retireReason: old.state === 'PREPARE_REJECTED' ? 'AUTHORITATIVE_PREPARE_REJECTION' :
++          'ORIGINAL_CODING_SETTLED' }));
+       this.codingIntent = null;
+     }
+     if (this.intent) {
+@@ -522,9 +547,6 @@ class DesktopManagement {
+         !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
+         throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
+     }
+-    const { projectId, sessionId, modelRef, model, coding } = scope;
+-    if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)) || !object(coding))
+-      throw failure('CODING_SCOPE_INVALID');
+     // Retain the original operation before sending. A changed UI selection or
+     // a missing reply cannot make another PREPARE appear safe.
+     const originHost = this.currentHost();
+@@ -533,38 +555,62 @@ class DesktopManagement {
+       scope: frozenCopy(coding), review: review ? frozenCopy(review) : null,
+       hostId: this.hostId, dataRoot: originHost.data_dir,
+       controlIdentity: structuredClone(this.identity), parentIdentity: structuredClone(this.parentIdentity),
+-      confirmSent: false };
++      confirmSent: false, prepareTerminal: null, prepareSentAt: Date.now() };
+     this.codingIntent = operation;
+     const reply = await this.exchange('PREPARE_CODING', { project_id: projectId, session_id: sessionId,
+-      model_config_ref: modelRef, coding }, 45000, false);
++      model_config_ref: modelRef, coding }, 45000, false,
++    { onTerminal: frame => this.acceptCodingPrepareTerminal(operation, frame) });
+     if (reply.kind !== 'RESULT') throw failure('CODING_PREPARE_REJECTED');
+-    const value = reply.result;
++    if (operation.state === 'EXPIRED') throw failure('CODING_PREPARE_EXPIRED');
++    this.currentHost();
++    return this.codingSummary();
++  }
++  acceptCodingPrepareTerminal(operation, frame) {
++    if (this.codingIntent !== operation || operation.prepareTerminal || operation.state !== 'PREPARE_UNRESOLVED')
++      throw failure('CODING_PREPARE_TERMINAL_MISMATCH');
++    const current = this.currentHost();
++    if (this.hostId !== operation.hostId || current.data_dir !== operation.dataRoot ||
++        !sameIdentity(this.identity, operation.controlIdentity) ||
++        !sameIdentity(this.parentIdentity, operation.parentIdentity))
++      throw failure('CODING_PREPARE_ORIGIN_CHANGED');
++    if (frame.kind === 'ERROR') {
++      if (frame.result !== null) throw failure('CODING_PREPARE_REJECTION_AMBIGUOUS');
++      operation.prepareTerminal = 'ERROR'; operation.state = 'PREPARE_REJECTED';
++      operation.prepareRejection = Object.freeze({ operation: 'PREPARE_CODING',
++        messageId: frame.message_id, hostId: frame.host_id, code: frame.error.code,
++        receivedAt: new Date().toISOString() });
++      return;
++    }
++    const value = frame.result;
+     if (!object(value) || value.state !== 'AWAITING_CODING_CONFIRMATION' ||
+         typeof value.request_id !== 'string' || !ID.test(value.request_id) || !HASH.test(value.request_hash) ||
+-        value.project_id !== projectId || value.session_id !== sessionId || value.old_model_config_ref !== modelRef ||
+-        !object(value.scope) || !sameValue(value.scope, coding) ||
+-        !Array.isArray(value.frozen_checks) || value.frozen_checks.length !== coding.checks.length ||
++        value.project_id !== operation.projectId || value.session_id !== operation.sessionId ||
++        value.old_model_config_ref !== operation.modelRef ||
++        !object(value.scope) || !sameValue(value.scope, operation.scope) ||
++        !Array.isArray(value.frozen_checks) || value.frozen_checks.length !== operation.scope.checks.length ||
+         value.normal_max_model_calls !== 8 || value.qualification_model_calls !== 1 ||
+         value.qualification_tool_calls !== 0 || value.model_calls !== 0)
+       throw failure('CODING_PREPARE_RESULT_INVALID');
+-    for (const check of value.frozen_checks) {
++    for (const [index, check] of value.frozen_checks.entries()) {
++      const original = operation.scope.checks[index];
+       keys(check, ['id', 'package', 'test_pattern', 'source_count', 'source_bytes',
+         'source_manifest_hash', 'toolchain_hash', 'build_hash', 'vendor_hash']);
+-      if (typeof check.id !== 'string' || typeof check.package !== 'string' ||
+-          typeof check.test_pattern !== 'string' || !Number.isSafeInteger(check.source_count) ||
+-          !Number.isSafeInteger(check.source_bytes) ||
++      if (check.id !== original.id || check.package !== original.package ||
++          check.test_pattern !== original.test_pattern ||
++          !Number.isSafeInteger(check.source_count) || check.source_count < 0 ||
++          !Number.isSafeInteger(check.source_bytes) || check.source_bytes < 0 ||
+           ![check.source_manifest_hash, check.toolchain_hash, check.build_hash].every(v => HASH.test(v)) ||
+           !(check.vendor_hash === '' || HASH.test(check.vendor_hash)))
+         throw failure('CODING_FROZEN_CHECK_INVALID');
+     }
+     const expires = Date.parse(value.expires_at);
+-    if (!Number.isFinite(expires) || expires <= Date.now() || expires - Date.now() > 60000)
+-      throw failure('CODING_PREPARE_EXPIRED');
+-    Object.assign(operation, { state: value.state, requestId: value.request_id,
++    if (!Number.isFinite(expires) || expires <= operation.prepareSentAt || expires - Date.now() > 60000)
++      throw failure('CODING_PREPARE_RESULT_INVALID');
++    Object.assign(operation, { state: expires <= Date.now() ? 'EXPIRED' : value.state,
++      prepareTerminal: 'RESULT', prepareMessageId: frame.message_id,
++      requestId: value.request_id,
+       requestHash: value.request_hash, expiresAt: value.expires_at,
+       scope: frozenCopy(value.scope), frozenChecks: frozenCopy(value.frozen_checks) });
+-    this.currentHost();
+-    return this.codingSummary();
+   }
+   async confirmCoding(askConsent, recheckScope) {
+     const intent = this.codingIntent;
+@@ -581,18 +627,22 @@ class DesktopManagement {
+       await this.recheckCodingConsent(intent, recheckScope);
+       const accepted = await askConsent(this.codingReview(intent));
+       if (accepted !== true) throw failure('PRIVILEGED_CONFIRM_CANCELLED');
+-      await this.recheckCodingConsent(intent, recheckScope);
+-    } finally { this.consentPending = false; }
+-    // No await between the final guard and the consumed write.
+-    intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
+-    try {
++      const finalScope = await this.recheckCodingConsent(intent, recheckScope);
+       const reply = await this.exchange('CONFIRM_CODING', { project_id: intent.projectId,
+-        request_id: intent.requestId, request_hash: intent.requestHash }, 195000);
++        request_id: intent.requestId, request_hash: intent.requestHash }, 195000, true,
++      { beforeWrite: () => {
++        // exchange invokes this after building the frame and immediately before
++        // setting the pending barrier and writing, without another await.
++        this.assertCodingConsent(intent, finalScope);
++        this.consentPending = false;
++        intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
++      } });
+       if (reply.kind !== 'RESULT') { intent.state = 'UNRESOLVED'; throw failure('CODING_CONFIRM_REJECTED_CHECK_STATUS'); }
+       this.acceptCodingResult(intent, reply.result);
+       this.retireQualificationAfterCodingCommit();
+       return this.codingSummary();
+     } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
++    finally { this.consentPending = false; }
+   }
+   codingReview(intent) {
+     if (!intent.review?.workspace?.display_name || !intent.review.workspace.display_path)
+@@ -605,25 +655,28 @@ class DesktopManagement {
+       frozen_checks: intent.frozenChecks, expires_at: intent.expiresAt });
+   }
+   async recheckCodingConsent(intent, recheckScope) {
++    this.assertCodingConsent(intent);
++    const refreshed = await recheckScope();
++    this.assertCodingConsent(intent, refreshed);
++    return refreshed;
++  }
++  assertCodingConsent(intent, refreshed) {
+     if (this.codingIntent !== intent || this.pending || !this.consentPending ||
+-        !this.sameContext(intent.context)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++        intent.state !== 'AWAITING_CODING_CONFIRMATION' || intent.confirmSent ||
++        !this.sameContext(intent.context) ||
++        typeof this.options.codingResourceGeneration !== 'function' ||
++        !Number.isSafeInteger(intent.review?.resource_generation) ||
++        this.options.codingResourceGeneration() !== intent.review.resource_generation)
++      throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+     const current = this.currentHost();
+     if (this.hostId !== intent.hostId || current.data_dir !== intent.dataRoot ||
+         !sameIdentity(this.identity, intent.controlIdentity) ||
+         !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
+         !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+-    const refreshed = await recheckScope();
+-    if (this.codingIntent !== intent || this.pending || !this.consentPending ||
+-        !this.sameContext(intent.context) ||
+-        refreshed?.context !== intent.context ||
++    if (refreshed !== undefined && (refreshed?.context !== intent.context ||
+         !sameValue(refreshed?.scope, { projectId: intent.projectId, sessionId: intent.sessionId,
+           modelRef: intent.modelRef, model: intent.model, coding: intent.scope }) ||
+-        !sameValue(refreshed?.review, intent.review)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+-    const after = this.currentHost();
+-    if (this.hostId !== intent.hostId || after.data_dir !== intent.dataRoot ||
+-        !sameIdentity(this.identity, intent.controlIdentity) ||
+-        !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
+-        !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
++        !sameValue(refreshed?.review, intent.review))) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+   }
+   acceptCodingResult(intent, value) {
+     if (!object(value) || value.state !== 'CODING_CONFIGURED' || value.request_id !== intent.requestId ||
+diff --git a/apps/desktop/main/main.js b/apps/desktop/main/main.js
+index a0833160..58883e90 100644
+--- a/apps/desktop/main/main.js
++++ b/apps/desktop/main/main.js
+@@ -186,6 +186,7 @@ const desktopManagement = createDesktopManagement({
+   fsImpl: fs, spawn: childProcess.spawn, httpImpl: http, discoveryFile: DISCOVERY,
+   dataRoot, controlExe: coreExecutable, verifierManifest, runtimeAssetsDir,
+   webDir: WEB_DIST, cwd: REPO, context: qualificationContext,
++  codingResourceGeneration: () => codingDirectories.generation,
+   diagnostic: captureManagementDiagnostic,
+ });
+ const v2Deps = Object.assign({}, deps, {
+diff --git a/tests/ui/continuity/coding_authorization_driver.mjs b/tests/ui/continuity/coding_authorization_driver.mjs
+index 82a02cec..f59a3661 100644
+--- a/tests/ui/continuity/coding_authorization_driver.mjs
++++ b/tests/ui/continuity/coding_authorization_driver.mjs
+@@ -29,6 +29,7 @@ const frozen = { ok: true, available: true, state: 'AWAITING_CODING_CONFIRMATION
+ let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0, refreshAttempts = 0
+ const statusRecovery = process.env.ROS_STATUS_RECOVERY === '1'
+ const refreshFailOnce = process.env.ROS_REFRESH_FAIL_ONCE === '1'
++const prepareErrorRepick = process.env.ROS_PREPARE_ERROR_REPICK === '1'
+ let server, browser, page
+ try {
+   fs.writeFileSync(html, `<div id="root"></div><script type="module" src="/${path.basename(entry)}"></script>`, 'utf8')
+@@ -61,7 +62,14 @@ try {
+     if (method === 'codingCurrent') return state
+     if (method === 'codingPickToolchain') return { ok: true, selected: true, name: 'go-toolchain', ...state }
+     if (method === 'codingPickVendor') return { ok: true, selected: true, name: 'vendor', ...state }
+-    if (method === 'codingPrepare') { prepares++; state = frozen; return state }
++    if (method === 'codingPrepare') {
++      prepares++
++      if (prepareErrorRepick && prepares === 1) {
++        state = { ok: true, available: true, state: 'PREPARE_REJECTED', reason: 'CODING_PREPARE_REJECTED' }
++        return { ok: false, reason: 'CODING_PREPARE_REJECTED' }
++      }
++      state = frozen; return state
++    }
+     if (method === 'codingConfirm') { confirms++; state = { ...frozen, state: 'CODING_CONFIGURED',
+       consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED',
+       config_revision: 2, commit_key: 'original-commit-1' };
+@@ -79,8 +87,13 @@ try {
+   await page.getByRole('button', { name: '选择 Go 工具链目录' }).click()
+   await page.getByText('go-toolchain').waitFor()
+   await page.getByRole('button', { name: '准备并冻结' }).click()
++  if (prepareErrorRepick) {
++    await page.getByRole('alert').getByText('CODING_PREPARE_REJECTED').waitFor()
++    await page.getByRole('button', { name: '选择 Go 工具链目录' }).click()
++    await page.getByRole('button', { name: '准备并冻结' }).click()
++  }
+   await page.getByText('冻结完成；配置尚未写入', { exact: false }).waitFor()
+-  assert.equal(prepares, 1); assert.equal(confirms, 0)
++  assert.equal(prepares, prepareErrorRepick ? 2 : 1); assert.equal(confirms, 0)
+   const preparedInput = record.find(item => item.method === 'codingPrepare').args[0]
+   assert.equal(preparedInput.checks[0].toolchain_root, undefined)
+   assert.equal(preparedInput.read_paths[0], 'go.mod')
+@@ -112,7 +125,8 @@ try {
+   assert.equal(refreshes, 1)
+   assert.equal(await page.getByText('C:/trusted-go').count(), 0)
+   assert.deepEqual(errors, [])
+-  console.log(JSON.stringify({ status: refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
++  console.log(JSON.stringify({ status: prepareErrorRepick ? 'SYNTHETIC_CODING_PREPARE_ERROR_REPICK_PASS' :
++    refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
+     statusRecovery ? 'SYNTHETIC_CODING_STATUS_RECOVERY_PASS' : 'SYNTHETIC_CODING_DOM_PASS',
+     prepares, confirms, refreshes, refresh_attempts: refreshAttempts, actual_model_calls: 0, page_errors: errors }))
+ } finally {
+diff --git a/tests/ui/desktop/coding-authorization-boundary.test.mjs b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+index be830274..caab9b91 100644
+--- a/tests/ui/desktop/coding-authorization-boundary.test.mjs
++++ b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+@@ -19,11 +19,13 @@ function fixture() {
+   fs.writeFileSync(discoveryFile, JSON.stringify({ url: 'http://127.0.0.1:54321/', pid,
+     data_dir: dir, host_instance_id: hostId }))
+   let context = JSON.stringify(['project-1', 'session-1', 1, 1]), suppress = false, expiryMs = 55000
++  let resourceGeneration = 0, rejectPrepareOnce = false
+   const queued = []
+   const log = [], identity = id => ({ PID: id, CreatedNS: String(id) + '000000000', ImageSHA256: 'a'.repeat(64) })
+   const child = new EventEmitter(); child.pid = pid
+   const manager = createDesktopManagement({ fsImpl: fs, discoveryFile, dataRoot: dir,
+-    context: () => context, observeProcess: identity })
++    context: () => context, observeProcess: identity,
++    codingResourceGeneration: () => resourceGeneration })
+   child.stdin = { write(bytes, callback) {
+     const frame = JSON.parse(bytes.toString('utf8')); log.push(frame)
+     const base = { state: 'AWAITING_CODING_CONFIRMATION', request_id: 'coding-1', request_hash: hash,
+@@ -42,14 +44,20 @@ function fixture() {
+             ? { ...base, state: 'EXPIRED' } : base
+     const answer = { protocol, message_id: frame.message_id, operation: frame.operation,
+       host_id: hostId, kind: 'RESULT', result }
++    if (frame.operation === 'PREPARE_CODING' && rejectPrepareOnce) {
++      rejectPrepareOnce = false; answer.kind = 'ERROR'; answer.result = null
++      answer.error = { code: 'MANAGEMENT_REJECTED', message: 'fixture source path is missing' }
++    }
+     if (suppress) queued.push(answer)
+     else setImmediate(() => manager.onLine(Buffer.from(JSON.stringify(answer))))
+     callback?.(); return true
+   } }
+   manager.state = 'READY'; manager.child = child; manager.childExited = false; manager.hostId = hostId
+   manager.identity = identity(pid); manager.parentIdentity = identity(process.pid)
+-  return { manager, log, dir, setContext: value => { context = value }, suppress: value => { suppress = value },
+-    expiry: value => { expiryMs = value }, release: () => manager.onLine(Buffer.from(JSON.stringify(queued.shift()))),
++  return { manager, log, dir, setContext: value => { context = value },
++    setResourceGeneration: value => { resourceGeneration = value }, suppress: value => { suppress = value },
++    rejectNextPrepare: () => { rejectPrepareOnce = true }, expiry: value => { expiryMs = value },
++    release: change => { const answer = queued.shift(); manager.onLine(Buffer.from(JSON.stringify(change ? change(answer) : answer))) },
+     close: () => fs.rmSync(dir, { recursive: true, force: true }) }
+ }
+ 
+@@ -62,7 +70,7 @@ function coding() { return { client_id: 'desktop-shell', expected_revision: 1, w
+     memory_mib: 1024, max_text_bytes: 4096 }] } }
+ const scope = () => ({ projectId: 'project-1', sessionId: 'session-1', modelRef: 'model-1',
+   model: { provider_id: 'local', model_id: 'fixture' }, coding: coding() })
+-const review = () => ({ workspace: { authorized_workspace_ref: 'workspace-1',
++const review = () => ({ resource_generation: 0, workspace: { authorized_workspace_ref: 'workspace-1',
+   display_name: 'Trusted workspace', display_path: 'C:/trusted-workspace', project_id: 'project-1',
+   revision: 1, access: 'READ_WRITE', status: 'ACTIVE' } })
+ const original = JSON.stringify(['project-1', 'session-1', 1, 1])
+@@ -136,7 +144,7 @@ test('uncertain confirmation keeps original request and cannot send a second con
+     f.manager.pending = null
+     const originalExchange = f.manager.exchange.bind(f.manager)
+     f.manager.exchange = async (operation, ...args) => {
+-      if (operation === 'CONFIRM_CODING') { f.log.push({ operation });
++      if (operation === 'CONFIRM_CODING') { args[3].beforeWrite(); f.log.push({ operation });
+         throw Object.assign(new Error('MANAGEMENT_REPLY_UNCERTAIN'), { code: 'MANAGEMENT_REPLY_UNCERTAIN' }) }
+       return originalExchange(operation, ...args)
+     }
+@@ -349,3 +357,145 @@ test('returning to same session after selection generation changes permits origi
+     assert.equal(f.log.filter(item => item.operation === 'CONFIRM_CODING').length, 1)
+   } finally { f.close() }
+ })
++
++test('unchanged 45000ms PREPARE timeout retains a valid late expired terminal for original STATUS',
++  { timeout: 60000 }, async () => {
++    const f = fixture()
++    try {
++      f.expiry(400); f.suppress(true)
++      const pending = prepare(f)
++      await assert.rejects(pending, { code: 'MANAGEMENT_REPLY_UNCERTAIN' })
++      assert.equal(f.manager.pending.operation, 'PREPARE_CODING')
++      assert.equal(f.manager.pending.timedOut, true)
++      await assert.rejects(prepare(f), { code: 'MANAGEMENT_COMMAND_PENDING' })
++      f.release()
++      assert.equal(f.manager.pending, null)
++      assert.equal(f.manager.codingIntent.prepareTerminal, 'RESULT')
++      assert.equal(f.manager.codingIntent.requestId, 'coding-1')
++      assert.equal(f.manager.codingIntent.requestHash, hash)
++      assert.equal(f.manager.codingIntent.state, 'EXPIRED')
++      f.suppress(false)
++      assert.equal((await f.manager.statusCoding()).state, 'EXPIRED')
++      assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'STATUS_CODING'])
++    } finally { f.close() }
++  })
++
++test('authoritative original PREPARE error permits only a corrected explicit retry with audit', async () => {
++  const f = fixture()
++  try {
++    f.rejectNextPrepare()
++    await assert.rejects(prepare(f), { code: 'CODING_PREPARE_REJECTED' })
++    assert.equal(f.manager.codingIntent.state, 'PREPARE_REJECTED')
++    assert.equal(f.manager.codingSummary().available, true)
++    assert.equal(f.manager.codingIntent.prepareRejection.code, 'MANAGEMENT_REJECTED')
++    assert.equal(f.manager.pending, null)
++    const corrected = scope()
++    corrected.coding.read_paths = ['go.mod', 'calc/corrected.go', 'calc/value_test.go']
++    assert.equal((await f.manager.prepareCoding(corrected, original, review())).state,
++      'AWAITING_CODING_CONFIRMATION')
++    assert.equal(f.manager.retiredCodingIntents.length, 1)
++    assert.equal(f.manager.retiredCodingIntents[0].retireReason, 'AUTHORITATIVE_PREPARE_REJECTION')
++    assert.equal(f.manager.retiredCodingIntents[0].prepareRejection.code, 'MANAGEMENT_REJECTED')
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('PREPARE error permits an explicit retry after reselecting the Go resource', async () => {
++  const f = fixture()
++  try {
++    f.rejectNextPrepare()
++    await assert.rejects(prepare(f), { code: 'CODING_PREPARE_REJECTED' })
++    assert.equal(f.manager.codingSummary().available, true)
++    f.setResourceGeneration(1)
++    const corrected = scope()
++    corrected.coding.read_paths = ['go.mod', 'calc/corrected.go', 'calc/value_test.go']
++    assert.equal((await f.manager.prepareCoding(corrected, original,
++      { ...review(), resource_generation: 1 })).state, 'AWAITING_CODING_CONFIRMATION')
++    assert.equal(f.manager.retiredCodingIntents[0].retireReason, 'AUTHORITATIVE_PREPARE_REJECTION')
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('fixture-timed-out PREPARE only rearms after its exact late terminal ERROR', async () => {
++  const f = fixture()
++  try {
++    f.suppress(true); f.rejectNextPrepare()
++    const pending = prepare(f)
++    const originalPending = f.manager.pending
++    clearTimeout(originalPending.timer)
++    originalPending.timedOut = true
++    originalPending.reject(Object.assign(new Error('MANAGEMENT_REPLY_UNCERTAIN'),
++      { code: 'MANAGEMENT_REPLY_UNCERTAIN' }))
++    await assert.rejects(pending, { code: 'MANAGEMENT_REPLY_UNCERTAIN' })
++    await assert.rejects(prepare(f), { code: 'MANAGEMENT_COMMAND_PENDING' })
++    f.release()
++    assert.equal(f.manager.pending, null)
++    assert.equal(f.manager.codingIntent.prepareTerminal, 'ERROR')
++    assert.equal(f.manager.codingIntent.prepareRejection.messageId, f.log[0].message_id)
++    f.suppress(false)
++    assert.equal((await prepare(f)).state, 'AWAITING_CODING_CONFIRMATION')
++    assert.equal(f.manager.retiredCodingIntents[0].retireReason, 'AUTHORITATIVE_PREPARE_REJECTION')
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('wrong-host PREPARE terminal never rearms or overwrites the original operation', async () => {
++  const f = fixture()
++  try {
++    f.suppress(true)
++    const pending = prepare(f)
++    f.release(frame => ({ ...frame, host_id: 'host-bbbbbbbbbbbb' }))
++    await assert.rejects(pending, { code: 'PRIVATE_REPLY_MISMATCH' })
++    assert.equal(f.manager.codingIntent.state, 'PREPARE_UNRESOLVED')
++    assert.equal(f.manager.codingIntent.requestId, undefined)
++    await assert.rejects(prepare(f), { code: 'CODING_ORIGINAL_REQUEST_PENDING' })
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('malformed frozen check in an original PREPARE result remains quarantined', async () => {
++  const f = fixture()
++  try {
++    f.suppress(true)
++    const pending = prepare(f)
++    f.release(frame => {
++      frame.result.frozen_checks[0].id = 'different-check'
++      return frame
++    })
++    await assert.rejects(pending, { code: 'CODING_FROZEN_CHECK_INVALID' })
++    assert.equal(f.manager.codingIntent.state, 'PREPARE_UNRESOLVED')
++    assert.equal(f.manager.codingIntent.requestId, undefined)
++    await assert.rejects(prepare(f), { code: 'CODING_ORIGINAL_REQUEST_PENDING' })
++    assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++  } finally { f.close() }
++})
++
++test('a post-inner-check microtask changing session or resource generation blocks final CONFIRM write', async () => {
++  for (const kind of ['session', 'resource']) {
++    const f = fixture()
++    try {
++      await prepare(f)
++      const observe = f.manager.observe
++      let checks = 0, armed = false, queued = false
++      f.manager.observe = pid => {
++        const value = observe(pid)
++        if (armed && pid === process.pid && !queued) {
++          queued = true
++          queueMicrotask(() => {
++            if (kind === 'session') f.setContext(JSON.stringify(['project-1', 'session-2', 1, 1]))
++            else f.setResourceGeneration(1)
++          })
++        }
++        return value
++      }
++      await assert.rejects(f.manager.confirmCoding(async () => true, async () => {
++        if (++checks === 2) armed = true
++        return recheck()
++      }), { code: 'CODING_CONSENT_CONTEXT_CHANGED' })
++      assert.equal(queued, true)
++      assert.equal(f.manager.codingIntent.confirmSent, false)
++      assert.equal(f.manager.codingIntent.state, 'AWAITING_CODING_CONFIRMATION')
++      assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING'])
++    } finally { f.close() }
++  }
++})

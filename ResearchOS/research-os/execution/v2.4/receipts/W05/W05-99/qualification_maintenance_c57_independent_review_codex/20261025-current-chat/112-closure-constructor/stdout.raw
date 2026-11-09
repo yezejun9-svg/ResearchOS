@@ -1,0 +1,45 @@
+// all original bytes through the caller's actual Commit or Rollback return.
+type historicalQualificationClosure struct {
+	proof Object
+	hold  *historicalQualificationHold
+}
+
+func (c historicalQualificationClosure) Check() error {
+	if c.hold == nil || c.proof == nil {
+		return errors.New("historical qualification closure absent")
+	}
+	return c.hold.Check()
+}
+
+func (c historicalQualificationClosure) Close() error { return c.hold.Close() }
+
+const historicalMaintenanceProofKind = "HISTORICAL_HOST_BROKER_DENIAL_RECONSTRUCTION_V1"
+func (s *Service) validatedHistoricalQualificationFailureTx(tx *sql.Tx,
+	plan HistoricalQualificationPlan, verified verifiedHistoricalQualification,
+	hold *historicalQualificationHold) (historicalQualificationClosure, error) {
+	var zero historicalQualificationClosure
+	if tx == nil || hold == nil || verified.subject != plan.Subject ||
+		verified.author.ID != plan.AuthorID || verified.ownerRoot != plan.OwnerRoot ||
+		Hash(verified.run) != Hash(plan.BeforeRun) || Hash(verified.state) != Hash(plan.BeforeState) ||
+		Hash(verified.dispatch) != Hash(plan.BeforeDispatch) ||
+		verified.native.bridgeHash != plan.Source.BridgeSHA256 ||
+		plan.Proof["kind"] != historicalMaintenanceProofKind ||
+		plan.Proof["claim"] != "HOST_TOOL_EFFECT_NOT_DISPATCHED" ||
+		plan.Proof["native_class"] != historicalMaintenanceNativeClass ||
+		plan.Proof["plan_hash"] != plan.coreHash() ||
+		plan.Proof["owner_root"] != plan.OwnerRoot ||
+		plan.Proof["author"] != plan.AuthorID ||
+		plan.Proof["model_binding"] == nil ||
+		Hash(plan.Proof["model_binding"]) != Hash(verified.modelBinding) {
+		return zero, qualificationDenialUnavailable("historical private consumer mismatch")
+	}
+	closure := historicalQualificationClosure{proof: plan.Proof, hold: hold}
+	if err := closure.Check(); err != nil {
+		return zero, err
+	}
+	return closure, nil
+}
+
+// ApplyHistoricalQualification consumes only a validated full plan and its
+// exact external file digest. Native evidence stays held through the actual
+// Commit/Rollback return, including a failed Commit and every early error.

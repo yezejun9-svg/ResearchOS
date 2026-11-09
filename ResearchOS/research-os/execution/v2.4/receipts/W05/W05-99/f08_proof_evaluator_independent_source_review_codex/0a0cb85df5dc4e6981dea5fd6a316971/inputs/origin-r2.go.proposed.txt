@@ -1,0 +1,109 @@
+// R2 initial qualification epoch, selected from actual immutable facts. The
+// later-epoch route/carry derivation below is independently usable, but cannot
+// authorize its absent original admission.operation predicate.
+const f08LaterOperationUnbound=f08Error("F08_R2_ADMISSION_OPERATION_NOT_RETAINED")
+
+func (v *f08ProofValidator) artifactContent(s *f08Sources,a f08Version)([]byte,error){
+	if a.kind!="Artifact" || a.body["sealed_at"]==nil{return nil,f08Binding}
+	row,e:=s.one("content",[]int{0,1},[]any{a.body["storage_key"],a.project});if e!=nil{return nil,e}
+	raw,e:=f08Hex(row[3]);if e!=nil{return nil,e}
+	if !f08Equal(row[6],f08Number(1)) || f08RawHash(raw)!=row[4] || row[4]!=a.body["content_hash"]{return nil,f08Binding}
+	n,e:=f08Integer(a.body["byte_size"],0);if e!=nil || n!=int64(len(raw)){return nil,f08Binding};return raw,nil
+}
+func (v *f08ProofValidator) originalBirth(s *f08Sources,project,runID string,admission map[string]any)(map[string]any,[]f08Version,error){
+	r,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{project,"Run",runID,f08Number(1)});if e!=nil{return nil,nil,e}
+	run,e:=v.version(s,project,map[string]any{"entity_type":"Run","id":runID,"revision":r[3],"content_hash":r[5]});if e!=nil{return nil,nil,e}
+	if run.body["status"]!="QUEUED" || !f08NullFields(run.body,"cancel_requested_at","cancel_confirmed_at","started_at","ended_at","external_run_id"){return nil,nil,f08Binding}
+	runtime,e:=v.version(s,project,admission["runtime_ref"]);if e!=nil || runtime.kind!="RuntimeRegistration" || runtime.id!=run.body["runtime_id"]{return nil,nil,f08Binding}
+	var claimTask,runEvent,taskEvent f08Version;var runRef,taskRef map[string]any;pairs:=0
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=project || row[1]!="EventEnvelope"{continue}
+		event,e:=v.version(s,project,map[string]any{"entity_type":"EventEnvelope","id":row[2],"revision":row[3],"content_hash":row[5]});if e!=nil{return nil,nil,e}
+		if event.body["event_type"]!="RUN_CHANGED" || !f08Equal(event.body["aggregate_ref"],run.ref()){continue}
+		for _,candidate:=range s.rows["domain_versions"]{
+			if candidate[0]!=project || candidate[1]!="Task" || candidate[2]!=run.body["task_id"]{continue}
+			task,e:=v.version(s,project,map[string]any{"entity_type":"Task","id":candidate[2],"revision":candidate[3],"content_hash":candidate[5]});if e!=nil{return nil,nil,e}
+			if task.body["status"]!="RUNNING" || task.body["active_run_id"]!=runID || task.body["assigned_principal_id"]!=run.body["executor_principal_id"]{continue}
+			for _,er:=range s.rows["domain_versions"]{
+				if er[0]!=project || er[1]!="EventEnvelope"{continue}
+				te,e:=v.version(s,project,map[string]any{"entity_type":"EventEnvelope","id":er[2],"revision":er[3],"content_hash":er[5]});if e!=nil{return nil,nil,e}
+				if te.body["event_type"]!="TASK_CHANGED" || !f08Equal(te.body["aggregate_ref"],task.ref()) || te.body["actor_id"]!=event.body["actor_id"] || te.body["correlation_id"]!=event.body["correlation_id"]{continue}
+				re,e:=v.exactEvent(s,event);if e!=nil{return nil,nil,e};tr,e:=v.exactEvent(s,te);if e!=nil{return nil,nil,e}
+				claimTask,runEvent,taskEvent=task,event,te;runRef,taskRef=re,tr;pairs++
+			}
+		}
+	}
+	if pairs!=1{return nil,nil,f08Binding}
+	if !f08Equal(run.body["input_refs"],claimTask.body["input_refs"]) || run.body["context_bundle_id"]!=claimTask.body["context_bundle_id"]{return nil,nil,f08Binding}
+	dep,e:=s.one("run_dependencies",[]int{0,1},[]any{project,runID});if e!=nil{return nil,nil,e}
+	doc,raw,e:=f08RawObject(dep[2]);if e!=nil{return nil,nil,e};if _,e=f08Object(doc,"refs");e!=nil{return nil,nil,e}
+	refs,e:=f08Array(doc["refs"]);if e!=nil{return nil,nil,e}
+	// Qualification plans require no dependencies in the actual producer. A
+	// nonempty dependency vector requires the ordinary admission branch below,
+	// including ordered accepted-output/contribution proofs; never deduplicate.
+	if !f08EmptyArray(claimTask.body["dependency_task_ids"]) || len(refs)!=0{return nil,nil,f08NativeProofGap}
+	epoch,e:=f08Integer(run.body["lease_epoch"],1);if e!=nil{return nil,nil,e}
+	birth:=map[string]any{"run_birth":f08VersionAnchor(run),"task_at_claim":f08VersionAnchor(claimTask),"run_birth_event":runRef,"task_claim_event":taskRef,"claim_principal":runEvent.body["actor_id"],"claim_correlation_id":runEvent.body["correlation_id"],"birth_epoch":f08Number(epoch),"birth_runtime_ref":runtime.ref(),"executor_principal_id":run.body["executor_principal_id"],"birth_lease_token_hash":run.body["lease_token_hash"],"dependency_snapshot":map[string]any{"category":"run_dependencies","key":[]any{project,runID},"body_digest":f08RawHash(raw)}}
+	return birth,[]f08Version{run,claimTask,runtime,runEvent,taskEvent},nil
+}
+func (v *f08ProofValidator) exactEvent(s *f08Sources,event f08Version)(map[string]any,error){
+	if event.kind!="EventEnvelope"{return nil,f08Binding}
+	o,e:=s.one("outbox",[]int{0,1,2},[]any{event.project,event.body["sequence"],event.id});if e!=nil{return nil,e}
+	b,e:=f08Hex(o[3]);if e!=nil || !bytes.Equal(b,event.raw){return nil,f08Binding}
+	return map[string]any{"version_ref":event.ref(),"outbox_id":o[2],"sequence":o[1],"body_digest":f08RawHash(b)},nil
+}
+func (v *f08ProofValidator) bootstrapAdmission(s *f08Sources,run,task f08Version,a map[string]any)([]f08Version,error){
+	if _,e:=f08Object(a,"mode","runtime_id","runtime_ref","profile_ref","profile_hash","profile","technical_hash","qualification_ids","qualification_evidence","permission","credential_revision","expires_at","requested_capabilities","qualification_bootstrap");e!=nil{return nil,e}
+	if a["qualification_bootstrap"]!=true || task.body["task_type"]!="runtime_qualification" || !f08EmptyArray(a["qualification_ids"]) || !f08EmptyArray(a["qualification_evidence"]){return nil,f08Binding}
+	runtime,e:=v.version(s,run.project,a["runtime_ref"]);if e!=nil || runtime.kind!="RuntimeRegistration" || runtime.id!=run.body["runtime_id"] || runtime.id!=a["runtime_id"] || runtime.body["measurement_mode"]!=a["mode"]{return nil,f08Binding}
+	if runtime.body["status"]=="REVOKED" || runtime.body["status"]=="UNAVAILABLE"{return nil,f08Binding}
+	profile,e:=v.version(s,run.project,a["profile_ref"]);if e!=nil{return nil,e};raw,e:=v.artifactContent(s,profile);if e!=nil{return nil,e}
+	pv,_,e:=f08Strict(raw);if e!=nil || !f08Equal(pv,a["profile"]){return nil,f08Binding};p,ok:=pv.(map[string]any);if !ok{return nil,f08Shape}
+	technical:=Hash([]any{runtime.body["adapter"],runtime.body["adapter_revision"],runtime.body["capabilities"],runtime.body["platform"],runtime.body["measurement_mode"],runtime.body["credential_ref"]})
+	if a["technical_hash"]!=technical || a["profile_hash"]!=Hash(a["profile_ref"]) || p["runtime_id"]!=runtime.id || p["technical_hash"]!=technical || p["credential_revision"]!=a["credential_revision"]{return nil,f08Binding}
+	for _,key:=range []string{"adapter","adapter_revision","platform"}{if p[key]!=runtime.body[key]{return nil,f08Binding}}
+	b,e:=s.one("runtime_bindings",[]int{0,1},[]any{run.project,runtime.id});if e!=nil{return nil,e};ref,_,e:=f08JSONHex(b[2]);if e!=nil || !f08Equal(ref,a["profile_ref"]) || b[3]!=a["profile_hash"] || b[4]!=technical{return nil,f08Binding}
+	planRow,e:=s.one("qualification_plans",[]int{0,1,2},[]any{run.project,task.id,runtime.id});if e!=nil{return nil,e}
+	plan,_,e:=f08RawObject(planRow[3]);if e!=nil || Hash(plan)!=planRow[4]{return nil,f08Binding}
+	keys:=[]string{"runtime_id","profile_ref","task_hash","required_capabilities","max_validity_seconds","resume_check_id"};if _,ok:=plan["model_qualification"];ok{keys=append(keys,"model_qualification")};if _,e=f08Object(plan,keys...);e!=nil{return nil,e}
+	if plan["runtime_id"]!=runtime.id || !f08Equal(plan["profile_ref"],a["profile_ref"]) || !f08Equal(plan["required_capabilities"],a["requested_capabilities"]){return nil,f08Binding}
+	if plan["task_hash"]!=Hash([]any{task.body["goal_id"],task.body["task_type"],task.body["input_refs"],task.body["requirement_refs"],task.body["context_bundle_id"],task.body["dependency_task_ids"],task.body["acceptance_contract"],task.body["stop_policy"]}){return nil,f08Binding}
+	permission,e:=f08Object(a["permission"],"purpose","authorized_by","author_root","plan_hash");if e!=nil{return nil,e}
+	if permission["purpose"]!="runtime_qualification" || permission["authorized_by"]!=planRow[5] || permission["author_root"]!=planRow[6] || permission["plan_hash"]!=planRow[4] || b[5]!=planRow[5]{return nil,f08Binding}
+	marker,e:=s.one("qualification_runs",[]int{0,1,2,3},[]any{run.project,task.id,run.id,runtime.id});if e!=nil{return nil,e}
+	contract,ok:=task.body["acceptance_contract"].(map[string]any);if !ok{return nil,f08Shape}
+	if !f08Equal(marker[4],run.body["lease_epoch"]) || marker[5]!=planRow[4] || marker[6]!=a["profile_hash"] || marker[7]!=contract["contract_hash"] || marker[8]!=Hash(run.body["input_refs"]) || marker[10]!=planRow[6]{return nil,f08Binding}
+	contextRef,_,e:=f08JSONHex(marker[9]);if e!=nil{return nil,e};context,e:=v.version(s,run.project,contextRef);if e!=nil || context.kind!="ContextBundle" || context.id!=run.body["context_bundle_id"]{return nil,f08Binding}
+	// Literal timestamps are validated without time.Now; exact elapsed policy
+	// is a retained source equality, not a new wall-clock authorization.
+	created,e:=time.Parse(time.RFC3339Nano,run.body["created_at"].(string));if e!=nil{return nil,f08Binding}
+	seconds,e:=f08Integer(plan["max_validity_seconds"],1);if e!=nil || seconds>30*24*3600{return nil,f08Binding}
+	if a["expires_at"]!=created.Add(time.Duration(seconds)*time.Second).UTC().Format(time.RFC3339Nano){return nil,f08Binding}
+	return []f08Version{runtime,profile,context},nil
+}
+
+func (v *f08ProofValidator) deriveInitialOrigin(s *f08Sources,d []any)(map[string]any,error){
+	if e:=f08ValidateTuple("dispatches",d);e!=nil{return nil,e}
+	if len(s.selectRows("legacy",[]int{0,1},d[:2]))!=0{return nil,f08Binding}
+	actual,e:=s.one("dispatches",[]int{0,1,2},d[:3]);if e!=nil || !f08Equal(actual,d){return nil,f08Binding}
+	id,e:=f08Identity(d[9]);if e!=nil || d[6]!="PREPARED" || d[7]!="" || d[8]!="" || len(id)!=0 || !f08Equal(d[10],f08Number(0)) || d[11]!=""{return nil,f08Binding}
+	run,e:=v.head(s,d[0].(string),"Run",d[1].(string));if e!=nil{return nil,e}
+	taskID,e:=f08String(run.body["task_id"]);if e!=nil{return nil,e};task,e:=v.head(s,run.project,"Task",taskID);if e!=nil{return nil,e}
+	manifest,e:=v.dispatchManifest(s,d,run,task);if e!=nil{return nil,e};admission:=manifest["admission"].(map[string]any)
+	if run.revision!=1{return nil,f08LaterOperationUnbound}
+	if admission["qualification_bootstrap"]!=true{return nil,f08NativeProofGap}
+	if len(s.selectRows("dispatches",[]int{0,1},d[:2]))!=1{return nil,f08Binding}
+	birth,roots,e:=v.originalBirth(s,run.project,run.id,admission);if e!=nil{return nil,e}
+	if !f08Equal(birth["run_birth"],f08VersionAnchor(run)) || !f08Equal(birth["task_at_claim"],f08VersionAnchor(task)){return nil,f08Binding}
+	more,e:=v.bootstrapAdmission(s,run,task,admission);if e!=nil{return nil,e};roots=append(roots,more...)
+	closure,versions,e:=v.referenceClosure(s,roots);if e!=nil{return nil,e}
+	admissionDigest,e:=f08Hash(admission);if e!=nil{return nil,e};manifestBytes,e:=f08Hex(d[4]);if e!=nil{return nil,e}
+	authority:=map[string]any{"kind":"INITIAL_CLAIM","run_at_prepare":f08VersionAnchor(run),"task_at_prepare":f08VersionAnchor(task),"runtime_ref":admission["runtime_ref"],"executor_principal_id":run.body["executor_principal_id"],"lease_epoch":run.body["lease_epoch"],"lease_token_hash":run.body["lease_token_hash"],"lease_expires_at":run.body["lease_expires_at"],"admission_digest":admissionDigest,"previous_run":nil,"previous_origin":nil,"previous_dispatch":nil,"session_rebuild":nil,"resource_switch":nil,"checkpoint_carry":nil,"prior_epochs":[]any{}}
+	return map[string]any{"format":f08Format,"project":run.project,"run_id":run.id,"epoch":run.body["lease_epoch"],"dispatch_key":d[3],"manifest_digest":d[5],"manifest_bytes_digest":f08RawHash(manifestBytes),"birth":birth,"epoch_authority":authority,"source_closure":map[string]any{"versions":versions,"reference_closure":closure}},nil
+}
+func (v *f08ProofValidator) originInsert(s *f08Sources,row []any)error{
+	if e:=f08ValidateTuple("origins",row);e!=nil{return e}
+	d,e:=s.one("dispatches",[]int{0,1,2,3},row[:4]);if e!=nil{return e}
+	want,e:=v.deriveInitialOrigin(s,d);if e!=nil{return e};actual,_,e:=f08RawObject(row[4]);if e!=nil{return e}
+	h,e:=f08Hash(actual);if e!=nil || row[5]!=h || !f08Equal(actual,want){return f08Binding};return nil
+}

@@ -1,0 +1,281 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cli43_fresh_compiler_preparation_codex\7bf10c8e8cc54412ba7bb89b53f5a622\current43_runner.proposed.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cli43_fresh_compiler_preparation_revision_codex\bb395255ecb14df6820b2e20631c9c39\current43_runner.proposed.py
+@@ -159,6 +159,88 @@
+     return {'files': rows, 'point_in_time_only': True, 'Python_lifecycle_proof': False}
+ 
+ 
++def validate_http_evidence(directory, summary):
++    def raw_bytes(value):
++        b=b'' if value['raw_base64'] is None and value['bytes']==0 else base64.b64decode(value['raw_base64'],validate=True)
++        need(len(b)==value['bytes'] and hashlib.sha256(b).hexdigest()==value['sha256'],'Actual body bytes/SHA')
++        return b
++    need(summary['first_overflow'] is None and summary['stopped'] is False and not summary['pending'],
++         'HTTP overflow/unfinished pending reservation')
++    need(summary['setup_included_in_upstream'] is True and summary['unobserved_client_outbound_attempts'] is None,
++         'HTTP boundary claim changed')
++    up,proxy=summary['upstream'],summary['proxy'];records=summary['records']
++    for layer,c in [('upstream',up),('proxy',proxy)]:
++        need(all(type(v) is int and v>=0 for v in c.values()),'Counter type')
++        need(c['attempt']==c['admitted']+c['rejected']==c['completed'] and c['outstanding']==0 and
++             c['rejected']==0 and 0<c['admitted']<=32,'HTTP reservation/completion counters')
++        need(sum(x['layer']==layer for x in records.values())==c['attempt'],'Counters vs preserved attempts')
++    need(up['dispatched']==up['admitted']==up['responses']==up['body_closed']==up['received']==summary['upstream_received'],
++         'Upstream dispatch/response/body close/server ingress mismatch')
++    need(proxy['received']==proxy['attempt'] and summary['actual_received_HTTP_legs']==up['received']+proxy['received']<=64,
++         'Actual observed ingress qualification cap')
++    need(sorted(int(x) for x in records)==list(range(1,len(records)+1)),'Admission sequence continuity')
++    forwards={}
++    for key,row in records.items():
++        seq=int(key);need(row['sequence']==seq and row['completed'] is True and row['admitted'] is True,'HTTP record status')
++        original=strict((directory/f'http-attempt-{seq:04d}.json').read_bytes())
++        completed=strict((directory/f'http-completed-{seq:04d}.json').read_bytes())
++        need(completed==row and original['request']==row['request'] and original['request_key']==row['request_key'],
++             'Immutable raw attempt/completion pair')
++        raw_bytes(row['request'])
++        if row['layer']=='upstream':
++            need(row['dispatched'] is True and row['response_observed'] is True and
++                 row['read_EOF_observed'] is True and row['response_close_error'] is None and
++                 type(row['status']) is int and isinstance(row['response_headers'],dict),'Upstream received boundary')
++            need(all(x['error'] in (None,'EOF') for x in row['read_calls']),'Upstream response reader error')
++            raw_bytes(row['response'])
++            parent=row['proxy_sequence']
++            if parent is not None:
++                need(type(parent) is int and str(parent) in records and records[str(parent)]['layer']=='proxy' and
++                     records[str(parent)]['request_key']==row['request_key'] and parent<seq,'Exact proxy-forward pairing')
++                need(parent not in forwards,'Proxy forwarded more than once')
++                forwards[parent]=row
++        else:
++            need(row['CLI_facing_handler_boundary'] is True and row['request_read_error'] is None and
++                 row['request_close_error'] is None and row['actual_client_received_headers'] is None and
++                 row['actual_client_received_body'] is None and row['automatic_transport_headers'] is None,
++                 'Proxy boundary promoted to unobserved socket/client fields')
++            accepted=[]
++            for w in row['write_calls']:
++                requested=raw_bytes(w['requested']);part=raw_bytes(w['accepted'])
++                need(type(w['actual_n']) is int and 0<=w['actual_n']<=len(requested) and
++                     part==requested[:w['actual_n']],'Actual accepted write subset')
++                need(w['error'] is None and w['actual_n']==len(requested),'Partial/error write: execution remains unqualified')
++                accepted.append(part)
++            need(b''.join(accepted)==raw_bytes(row['accepted_body']),'Actual writer body aggregation')
++    for key,row in records.items():
++        if row['layer']=='proxy':
++            need(int(key) in forwards,'Proxy with no original upstream forward')
++            upstream=forwards[int(key)]
++            need(row['status']==upstream['status'] and raw_bytes(row['accepted_body'])==raw_bytes(upstream['response']),
++                 'Upstream received and proxy accepted bytes/status differ')
++    ingress=[]
++    for p in sorted(directory.glob('upstream-received-*.json')):
++        r=strict(p.read_bytes());need(r['read_error'] is None and r['close_error'] is None,'Upstream request reader error')
++        seq=r['dispatch_sequence'];need(type(seq) is int and str(seq) in records and records[str(seq)]['layer']=='upstream','Unpaired real ingress')
++        need(r['request']==records[str(seq)]['request'],'Real ingress vs original dispatched raw')
++        f=strict((directory/f"upstream-handler-{r['received_sequence']:04d}.json").read_bytes())
++        need(f['dispatch_sequence']==seq and f['request_key']==records[str(seq)]['request_key'],'Handler pairing')
++        need(f['actual_client_received_headers'] is None and f['automatic_transport_headers'] is None,'Handler automatic headers unknown')
++        accepted=[]
++        for w in f['write_calls']:
++            requested=raw_bytes(w['requested']);part=raw_bytes(w['accepted'])
++            need(type(w['actual_n']) is int and w['actual_n']==len(requested) and w['error'] is None and
++                 part==requested,'Upstream actual writer incomplete/error')
++            accepted.append(part)
++        need(b''.join(accepted)==raw_bytes(f['accepted_body'])==raw_bytes(records[str(seq)]['response']) and
++             f['status']==records[str(seq)]['status'],'Upstream handler accepted bytes vs actual fixture transport received')
++        ingress.append(seq)
++    need(len(ingress)==len(set(ingress))==up['received'],'Every ingress preserved once')
++    return {'upstream_dispatches':up['dispatched'],'proxy_admissions':proxy['admitted'],
++            'actual_received_HTTP_legs':summary['actual_received_HTTP_legs'],
++            'unobserved_client_outbound_attempts':None,'cap_is_observation_qualification':True}
++
++
+ def main():
+     need(sys.flags.isolated and sys.flags.no_site and sys.flags.utf8_mode, 'Use -I -S -X utf8')
+     sys.dont_write_bytecode = True
+@@ -177,6 +259,11 @@
+     stage, first, secondary, last_result = 'CREATE_OWNED_OUTPUT', None, [], None
+     ledger = None
+     stages, case_results, native_calls = [], [], 0
++    case_roster = [{'leaf':leaf,'state':'NOT_STARTED','launch_attempted':False,'resumed':None,
++                    'owned_child_pid':None,'creation_time_100ns':None,'actual_native_exit':None,
++                    'requested':False,'test_leaf_started':None,'fixture_observation':'NOT_STARTED',
++                    'qualified':False,'failure':None} for leaf in LEAVES]
++    current_case = None
+     started = time.monotonic()
+     normal = debug = None
+     try:
+@@ -207,8 +294,13 @@
+         normal = raw_module(scope['owned_process_helper_ref'], 'owned_process')
+         debug = raw_module(scope['debug_tree_helper_ref'], 'debug_process_tree')
+         ledger = Ledger(out)
++        authorization_refs=[]
++        for row in authorized['authorization_input_refs']:
++            p=Path(row['path']);p=p if p.is_absolute() else ROOT/p
++            expected={**row,'path':str(p.absolute())};verify(expected);authorization_refs.append(expected)
+         ledger.add('authorization-runtime-and-compiler', authorized['authorization_paths'] +
+                    [x['path'] for x in resources + controls])
++        need(all(ledger.members[x['path']]==x for x in authorization_refs),'Authorization changed before initial freeze')
+         ledger.check('initial')
+         save(out / 'python-os.before.json', module_observation(allowed, normal))
+         tools = strict(Path(scope['toolchain_lock_path']).read_bytes())['tools']
+@@ -231,12 +323,16 @@
+             stage = label
+             need(time.monotonic() - started < 3300 and native_calls < 16, 'Controller time/call cap')
+             native_calls += 1
++            if current_case is not None:
++                current_case['state']='STARTED';current_case['requested']=True
++                save(out/(label+'.case-started.json'),dict(current_case))
+             request = {'argv':argv,'cwd':str(cwd),'environment':case_env or env,'timeout_seconds':timeout,
+                        'sequence':native_calls,'debug_tree':tree,'process_cap':process_cap}
+             save(out/(label+'.request.json'), request)
+-            r = None
++            r = None; invocation_error=None
+             try:
+                 with (out/(label+'.stdout.raw')).open('xb') as stdout, (out/(label+'.stderr.raw')).open('xb') as stderr:
++                    if current_case is not None: current_case['launch_attempted']=True
+                     if tree:
+                         r = debug.run_owned(argv,str(cwd),case_env or env,stdout,stderr,timeout,
+                               expected_image={k:pin(argv[0])[k] for k in ['sha256','bytes']},
+@@ -245,10 +341,44 @@
+                     else:
+                         r = normal.run_owned(argv,str(cwd),case_env or env,stdout,stderr,timeout,stdin=stdin)
+                 last_result = r
++            except BaseException as e:
++                invocation_error=e
+             finally:
+                 save(out/(label+'.invocation.json'), {'request':request,'result':r,
+                     'actual_exit':r['actual_exit'] if r else None, 'automatic_retry':False,'counter_reset':False})
+-            job_ok(r, tree)
++                if current_case is not None:
++                    current_case.update(resumed=r.get('resumed') if r else None,
++                        owned_child_pid=r.get('owned_child_pid') if r else None,
++                        creation_time_100ns=r.get('creation_time_100ns') if r else None,
++                        actual_native_exit=r.get('actual_exit') if r else None)
++                    if r and r.get('resumed'): current_case['state']='RESUMED'
++                    if r and r.get('actual_exit') is not None: current_case['state']='NATIVE_EXIT_OBSERVED'
++                    save(out/(label+'.case-native-observation.json'),dict(current_case))
++            primary_error=invocation_error
++            if primary_error is None:
++                try: job_ok(r, tree)
++                except BaseException as e: primary_error=e
++            native_observation_errors=[]
++            if current_case is not None:
++                try:
++                    case_events=[strict(line) for line in (out/(label+'.stdout.raw')).read_bytes().splitlines() if line.strip()]
++                    expected_leaf='TestCLIProtocolInteractiveAuthority/'+current_case['leaf']
++                    entered=any(x.get('Action')=='run' and x.get('Test')==expected_leaf for x in case_events)
++                    current_case['test_leaf_started']=True if entered else (False if r and r.get('actual_exit') is not None else None)
++                    save(out/(label+'.test-events.observed.json'),{'events':case_events,
++                        'test_leaf_started':current_case['test_leaf_started'],'qualification_claim':False})
++                except BaseException as e:
++                    native_observation_errors.append({'stage':label+'-partial-test-events','error':repr(e)})
++            try: ledger.check(label+'-native-after')
++            except BaseException as e: native_observation_errors.append({'stage':label+'-native-after-vector','error':repr(e)})
++            try: save(out/(label+'.python-os.native-after.json'),module_observation(allowed,normal))
++            except BaseException as e: native_observation_errors.append({'stage':label+'-native-after-runtime','error':repr(e)})
++            if primary_error is not None:
++                secondary.extend(native_observation_errors)
++                raise primary_error
++            if native_observation_errors:
++                secondary.extend(native_observation_errors[1:])
++                raise RuntimeError(native_observation_errors[0])
+             stages.append({'label':label,'result_ref':pin(out/(label+'.invocation.json'))})
+             return (out/(label+'.stdout.raw')).read_bytes(), r
+ 
+@@ -346,6 +476,7 @@
+         run('buildinfo-test',[go,'version','-m',str(test)],export,30,True,images,4)
+         ledger.check('compiled-before-first-case')
+         for i,leaf in enumerate(LEAVES):
++            current_case=case_roster[i]
+             label=f'case-{i:02d}';case=build/'case-evidence'/label;case.mkdir()
+             for r in compiler['complete_public_roots']:
+                 need([pin(p) for p in files(r['path'])]==r['files'],'Compiler root membership drift before case')
+@@ -356,6 +487,7 @@
+             argv=[go,'tool','test2json','-t','-p','researchos.local/research-os/apps/cli',str(test),
+                   '-test.v','-test.count=1','-test.timeout=480s','-test.failfast','-test.run',selector]
+             stdout,r=run(label,argv,export/'apps/cli',510,True,images+[pin(cli),pin(test)],16,ee)
++            current_case['fixture_observation']='STARTED'
+             events=[strict(line) for line in stdout.splitlines() if line.strip()]
+             expected={'TestCLIProtocolInteractiveAuthority','TestCLIProtocolInteractiveAuthority/'+leaf}
+             need({x.get('Test') for x in events if x['Action']=='run'}==expected,'Unexpected test roster')
+@@ -374,29 +506,35 @@
+                 need(not os.path.lexists(str(evidence/name)+'-wal') and not os.path.lexists(str(evidence/name)+'-shm'),'Sidecar exists')
+             before=strict((evidence/'db-post-open.rows.json').read_bytes());after=strict((evidence/'db-closed-copy.rows.json').read_bytes())
+             need(before==after,'Actual schema/typed row mismatch')
+-            wire=[strict(p.read_bytes()) for p in sorted(evidence.glob('wire-*.json'))]
+-            counts={layer:sum(x['layer']==layer for x in wire) for layer in ['proxy','upstream']}
+-            need(0<counts['proxy']<=32 and 0<counts['upstream']<=32,'HTTP layer bounds')
+-            for x in wire:
+-                for kind in ['request','response']:
+-                    b=base64.b64decode(x[kind]['raw_base64'],validate=True)
+-                    need(len(b)==x[kind]['bytes'] and hashlib.sha256(b).hexdigest()==x[kind]['sha256'],'Raw wire hash')
+-                need(type(x['status']) is int and isinstance(x['response_headers'],dict),'HTTP status/header evidence')
++            summary=strict((evidence/'http-summary.json').read_bytes())
++            counts=validate_http_evidence(evidence,summary)
+             business=strict((evidence/'business-counts.json').read_bytes())
+             need(business=={'sends':i,'tasks':i,'send_journal':i,'read_only_attach':1,'cli_exit':0 if i==0 else 3},'Original business assertions')
+             ident=strict((evidence/'identity-proof.json').read_bytes())
+             need(ident['before_sid']==ident['after_sid']==ident['db_sid'] and ident['epoch']==1,'Original SID')
+-            ledger.check(label+'-after')
++            current_case['fixture_observation']='OBSERVED'
++            ledger.check(label+'-fixture-after')
++            save(out/(label+'.python-os.fixture-after.json'),module_observation(allowed,normal))
+             for rr in compiler['complete_public_roots']:
+                 need([pin(p) for p in files(rr['path'])]==rr['files'],'Compiler root membership drift after case')
+             case_results.append({'leaf':leaf,'status':'PASS','HTTP':counts,'proof_ref':pin(evidence/'closed-proof.json')})
++            current_case['qualified']=True;current_case['state']='QUALIFIED'
+             save(out/(label+'.verified.json'),case_results[-1])
++            current_case=None
+         ledger.check('final')
+         need(len(case_results)==2,'Incomplete finite run')
+     except BaseException as e:
+         first={'stage':stage,'error':repr(e),'traceback':traceback.format_exc(),
+                'actual_stage_native_exit':None,'last_child_result':last_result,
+                'automatic_retry':False,'counter_reset':False}
++        if current_case is not None:
++            current_case['failure']=first
++            if current_case['resumed'] is True:
++                current_case['state']='EXECUTED_FAILED' if current_case['actual_native_exit'] not in (None,0) else 'EXECUTED_UNQUALIFIED'
++            elif current_case['launch_attempted']:
++                current_case['state']='LAUNCH_ATTEMPT_FAILED_OR_UNCONFIRMED'
++            else:
++                current_case['state']='PRELAUNCH_BLOCKED'
+         if out is None:
+             sys.stderr.write(json.dumps(first,ensure_ascii=False)+'\n')
+     finally:
+@@ -412,15 +550,30 @@
+                 except BaseException as e: secondary.append({'stage':'runtime-after','error':repr(e)})
+             if first is None and secondary:
+                 first={'stage':'EVIDENCE_FINALIZATION','error':secondary[0], 'actual_stage_native_exit':None}
+-            if first is not None: save(out/'failure.origin.json',first)
+-            save(out/'result.json',{'status':'BOUNDED_DEVELOPMENT_EVIDENCE_REPORTED' if first is None else 'STOPPED',
+-                 'first_cause':first,'secondary':secondary,'stages':stages,'cases':case_results,
+-                 'NOT_RUN':LEAVES[len(case_results):],'native_calls':native_calls,
+-                 'product_acceptance':False,'formal_increment':0,'SDK_MODEL_external_paid':0})
+-            manifest=[pin(p) for p in files(out)]
+-            save(out/'manifest.json',{'files':manifest,'count':len(manifest),'excluded_only_self':True})
++            try:
++                if first is not None: save(out/'failure.origin.json',first)
++                save(out/'result.json',{'status':'BOUNDED_DEVELOPMENT_EVIDENCE_REPORTED' if first is None else 'STOPPED',
++                     'first_cause':first,'secondary':secondary,'stages':stages,'cases':case_results,
++                     'case_roster':case_roster,'NOT_RUN':[x['leaf'] for x in case_roster if not x['launch_attempted']],
++                     'not_started_definition':'No launch call entered; never derived from qualified/pass counts','native_calls':native_calls,
++                     'product_acceptance':False,'formal_increment':0,'SDK_MODEL_external_paid':0})
++                manifest=[pin(p) for p in files(out)]
++                save(out/'manifest.json',{'files':manifest,'count':len(manifest),'excluded_only_self':True})
++            except BaseException as e:
++                secondary.append({'stage':'FINAL_RECEIPT_WRITE','error':repr(e)})
++                first=first or {'stage':'FINAL_RECEIPT_WRITE','error':repr(e),'actual_stage_native_exit':None}
++                sys.stderr.write(json.dumps({'first_cause':first,'secondary':secondary,'case_roster':case_roster,
++                    'partial_inner_manifest_not_success':True,'actual_stage_native_exit':None},ensure_ascii=False)+'\n')
+     return 0 if first is None else 1
+ 
+ 
+ if __name__ == '__main__':
+-    raise SystemExit(main())
++    try:
++        code=main()
++    except BaseException as exc:
++        # No safe owned leaf may exist: actual Root outer saves these original stderr bytes.
++        sys.stderr.write(json.dumps({'stage':'ENTRY_OR_UNHANDLED_FINALIZE','error':repr(exc),
++            'traceback':traceback.format_exc(),'actual_native_exit':None,'local_origin_available':False,
++            'outer_raw_stderr_is_authority':True,'automatic_retry':False,'counter_reset':False},ensure_ascii=False)+'\n')
++        code=1
++    raise SystemExit(code)

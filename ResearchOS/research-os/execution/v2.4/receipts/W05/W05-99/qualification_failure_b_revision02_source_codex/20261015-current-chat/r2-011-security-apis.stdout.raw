@@ -1,0 +1,222 @@
+	SessionID uint32
+}
+
+type WTS_SESSION_INFO struct {
+	SessionID         uint32
+	WindowStationName *uint16
+	State             uint32
+}
+
+//sys WTSQueryUserToken(session uint32, token *Token) (err error) = wtsapi32.WTSQueryUserToken
+//sys WTSEnumerateSessions(handle Handle, reserved uint32, version uint32, sessions **WTS_SESSION_INFO, count *uint32) (err error) = wtsapi32.WTSEnumerateSessionsW
+//sys WTSFreeMemory(ptr uintptr) = wtsapi32.WTSFreeMemory
+//sys WTSGetActiveConsoleSessionId() (sessionID uint32)
+
+type ACL struct {
+	aclRevision byte
+	sbz1        byte
+	aclSize     uint16
+	AceCount    uint16
+	sbz2        uint16
+}
+
+type SECURITY_DESCRIPTOR struct {
+	revision byte
+	sbz1     byte
+	control  SECURITY_DESCRIPTOR_CONTROL
+	owner    *SID
+	group    *SID
+	sacl     *ACL
+	dacl     *ACL
+}
+
+type SECURITY_QUALITY_OF_SERVICE struct {
+	Length              uint32
+	ImpersonationLevel  uint32
+	ContextTrackingMode byte
+	EffectiveOnly       byte
+}
+
+// Constants for the ContextTrackingMode field of SECURITY_QUALITY_OF_SERVICE.
+const (
+	SECURITY_STATIC_TRACKING  = 0
+	SECURITY_DYNAMIC_TRACKING = 1
+)
+
+type SecurityAttributes struct {
+	Length             uint32
+	SecurityDescriptor *SECURITY_DESCRIPTOR
+	InheritHandle      uint32
+}
+
+type SE_OBJECT_TYPE uint32
+
+)
+
+type EXPLICIT_ACCESS struct {
+	AccessPermissions ACCESS_MASK
+	AccessMode        ACCESS_MODE
+	Inheritance       uint32
+	Trustee           TRUSTEE
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-ace_header
+type ACE_HEADER struct {
+	AceType  uint8
+	AceFlags uint8
+	AceSize  uint16
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-access_allowed_ace
+type ACCESS_ALLOWED_ACE struct {
+	Header   ACE_HEADER
+	Mask     ACCESS_MASK
+	SidStart uint32
+}
+
+const (
+	// Constants for AceType
+	// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-ace_header
+	ACCESS_ALLOWED_ACE_TYPE = 0
+	ACCESS_DENIED_ACE_TYPE  = 1
+)
+
+// This type is the union inside of TRUSTEE and must be created using one of the TrusteeValueFrom* functions.
+//
+// Go pointers stored in a TrusteeValue must be pinned using [runtime.Pinner]
+// for the lifetime of the TrusteeValue.
+type TrusteeValue uintptr
+
+// TrusteeValueFromString is unsafe and should not be used.
+//
+// It returns a uintptr containing a reference to newly-allocated memory
+// which will be freed by the garbage collector.
+// There is no way for the caller to safely reference this memory.
+// SetControl sets the security descriptor control bits.
+func (sd *SECURITY_DESCRIPTOR) SetControl(controlBitsOfInterest SECURITY_DESCRIPTOR_CONTROL, controlBitsToSet SECURITY_DESCRIPTOR_CONTROL) error {
+	return setSecurityDescriptorControl(sd, controlBitsOfInterest, controlBitsToSet)
+}
+
+// RMControl returns the security descriptor resource manager control bits.
+func (sd *SECURITY_DESCRIPTOR) RMControl() (control uint8, err error) {
+	err = getSecurityDescriptorRMControl(sd, &control)
+	return
+}
+
+// SetRMControl sets the security descriptor resource manager control bits.
+func (sd *SECURITY_DESCRIPTOR) SetRMControl(rmControl uint8) {
+	setSecurityDescriptorRMControl(sd, &rmControl)
+}
+
+// DACL returns the security descriptor DACL and whether it was defaulted. The dacl return value may be nil
+// if a DACL exists but is an "empty DACL", meaning fully permissive. If the DACL does not exist, err returns
+// ERROR_OBJECT_NOT_FOUND.
+func (sd *SECURITY_DESCRIPTOR) DACL() (dacl *ACL, defaulted bool, err error) {
+	var present bool
+	err = getSecurityDescriptorDacl(sd, &present, &dacl, &defaulted)
+	if !present {
+		err = ERROR_OBJECT_NOT_FOUND
+	}
+	return
+}
+
+// SetDACL sets the absolute security descriptor DACL.
+func (absoluteSD *SECURITY_DESCRIPTOR) SetDACL(dacl *ACL, present, defaulted bool) error {
+	return setSecurityDescriptorDacl(absoluteSD, present, dacl, defaulted)
+}
+
+// SACL returns the security descriptor SACL and whether it was defaulted. The sacl return value may be nil
+// if a SACL exists but is an "empty SACL", meaning fully permissive. If the SACL does not exist, err returns
+// ERROR_OBJECT_NOT_FOUND.
+func (sd *SECURITY_DESCRIPTOR) SACL() (sacl *ACL, defaulted bool, err error) {
+	var present bool
+	err = getSecurityDescriptorSacl(sd, &present, &sacl, &defaulted)
+	if !present {
+		err = ERROR_OBJECT_NOT_FOUND
+	}
+	return
+}
+
+// SetSACL sets the absolute security descriptor SACL.
+func (absoluteSD *SECURITY_DESCRIPTOR) SetSACL(sacl *ACL, present, defaulted bool) error {
+	return setSecurityDescriptorSacl(absoluteSD, present, sacl, defaulted)
+}
+
+// Owner returns the security descriptor owner and whether it was defaulted.
+func (sd *SECURITY_DESCRIPTOR) Owner() (owner *SID, defaulted bool, err error) {
+	err = getSecurityDescriptorOwner(sd, &owner, &defaulted)
+	return
+}
+
+// SetOwner sets the absolute security descriptor owner.
+func (absoluteSD *SECURITY_DESCRIPTOR) SetOwner(owner *SID, defaulted bool) error {
+	return setSecurityDescriptorOwner(absoluteSD, owner, defaulted)
+}
+
+	FILE_READ_ATTRIBUTES  = 0x00000080
+	FILE_READ_EA          = 0x00000008
+	FILE_WRITE_DATA       = 0x00000002
+	FILE_WRITE_ATTRIBUTES = 0x00000100
+	FILE_WRITE_EA         = 0x00000010
+	FILE_APPEND_DATA      = 0x00000004
+	FILE_EXECUTE          = 0x00000020
+
+	FILE_GENERIC_READ    = STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
+	FILE_GENERIC_WRITE   = STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | FILE_APPEND_DATA | SYNCHRONIZE
+	FILE_GENERIC_EXECUTE = STANDARD_RIGHTS_EXECUTE | FILE_READ_ATTRIBUTES | FILE_EXECUTE | SYNCHRONIZE
+
+	FILE_LIST_DIRECTORY = 0x00000001
+	FILE_TRAVERSE       = 0x00000020
+
+	FILE_SHARE_READ   = 0x00000001
+	FILE_SHARE_WRITE  = 0x00000002
+	FILE_SHARE_DELETE = 0x00000004
+
+	FILE_ATTRIBUTE_READONLY              = 0x00000001
+	FILE_ATTRIBUTE_HIDDEN                = 0x00000002
+	FILE_ATTRIBUTE_SYSTEM                = 0x00000004
+	FILE_ATTRIBUTE_DIRECTORY             = 0x00000010
+	FILE_ATTRIBUTE_ARCHIVE               = 0x00000020
+	FILE_ATTRIBUTE_DEVICE                = 0x00000040
+	FILE_ATTRIBUTE_NORMAL                = 0x00000080
+	FILE_ATTRIBUTE_TEMPORARY             = 0x00000100
+	FILE_ATTRIBUTE_SPARSE_FILE           = 0x00000200
+	FILE_ATTRIBUTE_REPARSE_POINT         = 0x00000400
+	FILE_ATTRIBUTE_COMPRESSED            = 0x00000800
+	FILE_ATTRIBUTE_OFFLINE               = 0x00001000
+	FILE_ATTRIBUTE_NOT_CONTENT_INDEXED   = 0x00002000
+	FILE_ATTRIBUTE_ENCRYPTED             = 0x00004000
+	FILE_ATTRIBUTE_INTEGRITY_STREAM      = 0x00008000
+	FILE_ATTRIBUTE_VIRTUAL               = 0x00010000
+	FILE_ATTRIBUTE_NO_SCRUB_DATA         = 0x00020000
+	FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x00040000
+	FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+
+	INVALID_FILE_ATTRIBUTES = 0xffffffff
+
+	CREATE_NEW        = 1
+	CREATE_ALWAYS     = 2
+	OPEN_EXISTING     = 3
+	OPEN_ALWAYS       = 4
+	TRUNCATE_EXISTING = 5
+
+	FILE_FLAG_OPEN_REQUIRING_OPLOCK = 0x00040000
+	FILE_FLAG_FIRST_PIPE_INSTANCE   = 0x00080000
+	FILE_FLAG_OPEN_NO_RECALL        = 0x00100000
+	FILE_FLAG_OPEN_REPARSE_POINT    = 0x00200000
+	FILE_FLAG_SESSION_AWARE         = 0x00800000
+	FILE_FLAG_POSIX_SEMANTICS       = 0x01000000
+	FILE_FLAG_BACKUP_SEMANTICS      = 0x02000000
+	FILE_FLAG_DELETE_ON_CLOSE       = 0x04000000
+	FILE_FLAG_SEQUENTIAL_SCAN       = 0x08000000
+	FILE_FLAG_RANDOM_ACCESS         = 0x10000000
+	FILE_FLAG_NO_BUFFERING          = 0x20000000
+	FILE_FLAG_OVERLAPPED            = 0x40000000
+	FILE_FLAG_WRITE_THROUGH         = 0x80000000
+
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows/security_windows.go:982:	SE_DACL_PROTECTED        = 0x1000
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows/security_windows.go:1038:	INHERIT_ONLY_ACE                   = 0x8
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows/security_windows.go:1091:type ACE_HEADER struct {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows/security_windows.go:1099:	Header   ACE_HEADER
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows/security_windows.go:1107:	ACCESS_ALLOWED_ACE_TYPE = 0
+adapters/runtime\process_windows.go:20:func PrivateDirectory(path string) (string, error) {

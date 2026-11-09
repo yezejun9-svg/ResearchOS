@@ -1,0 +1,13 @@
+import fs from 'node:fs';import path from 'node:path';import crypto from 'node:crypto';import assert from 'node:assert/strict';import {spawnSync} from 'node:child_process';import {fileURLToPath,pathToFileURL} from 'node:url';
+const O=path.dirname(fileURLToPath(import.meta.url));const P='C:/Users/yqyyds/.codex/researchos-resource-cache/normal-readlane-combined-91218bdd-20261012';
+const put=(n,v)=>fs.writeFileSync(path.join(O,n),typeof v==='string'||Buffer.isBuffer(v)?v:JSON.stringify(v,null,2)+'\n',{flag:'wx'});
+const request=fs.readFileSync(path.join(O,'003-request.raw'));const env=JSON.parse(request);assert.equal(env.method,'session.attach');assert.equal(env.payload.request_write_owner,true);
+const result='{"snapshot":'+fs.readFileSync(path.join(O,'original-latest-snapshot.raw'),'utf8')+',"write_owner_acquired":true}';
+const response=JSON.stringify({protocol_version:'researchos-client/2',command_id:env.command_id,method:env.method,status:'COMPLETED',session_id:env.session_id,revision:3,error_code:null,error:null}).slice(0,-1)+',"result":'+result+'}';
+put('proposed-completed-response.raw',response);
+const packet={schema:'researchos.desktop.http-validation/1',phase:'RESPONSE',nonce:crypto.randomUUID(),http_status:200,request_raw_base64:request.toString('base64'),response_raw_base64:Buffer.from(response).toString('base64')};
+const executable=P+'/apps/desktop/resources/client-wire/researchos-client-wire-validator.exe',input=JSON.stringify(packet);put('completed-contract.input.raw',input);
+const child=spawnSync(executable,[],{cwd:O,input,windowsHide:true,shell:false,timeout:10000,maxBuffer:8388608,env:{SystemRoot:process.env.SystemRoot}});
+put('completed-contract.stdout.raw',child.stdout);put('completed-contract.stderr.raw',child.stderr);put('completed-contract.process.json',{executable,argv:[],pid:child.pid,numeric_exit:child.status,signal:child.signal,error:child.error?.message||null,synchronous_owned_child_reaped:true});
+assert.equal(child.status,0);const out=JSON.parse(child.stdout);assert.equal(out.outcome,'VALID');const exact=await import(pathToFileURL(P+'/apps/desktop/main/lib/wire-values.mjs'));const body=exact.reify(out.value);assert.equal(body.status,'COMPLETED');assert.equal(body.result.write_owner_acquired,true);assert.equal(body.result.snapshot.revision,3);assert.equal(body.result.snapshot.writer.epoch,2);
+put('completed-contract.result.json',{pass:true,scope:'Prospective response shape only; not an actual host response or implemented fix',schema_extension_needed:false,numeric_exit:child.status,model:0,api:0,formal_increment:0});console.log('PASS: existing native schema accepts COMPLETED/AttachResult; prospective fixture only.');

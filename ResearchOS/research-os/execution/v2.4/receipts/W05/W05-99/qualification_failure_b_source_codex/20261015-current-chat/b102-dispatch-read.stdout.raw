@@ -1,0 +1,67 @@
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return e
+	}
+	_, e = s.currentDispatchAdmission(tx, project, task, run, dispatch, operation)
+	return e
+}
+
+func nativeDispatchProof(tx *sql.Tx, project string, run, observation Object) (Object, error) {
+	dispatch, e := runtimeDispatch(tx, project, Str(run, "id"), run["lease_epoch"])
+	if e != nil {
+		return nil, e
+	}
+	if dispatch["state"] != "OBSERVED" || dispatch["observation_hash"] != Hash(observation) || observation["dispatch_key"] != dispatch["dispatch_key"] || observation["manifest_hash"] != dispatch["manifest_hash"] || observation["worker"] != dispatch["worker"] || Hash(observation["identity"]) != Hash(dispatch["identity"]) || observation["streams_drained"] != true || observation["cleanup_complete"] != true {
+		return nil, Fail(422, "GATE_FAILED", "native terminal proof missing or changed")
+	}
+	return dispatch, nil
+}
+		failures = append(failures, e)
+	}
+	if e := c.advanceResearchCycles(ctx); e != nil {
+		failures = append(failures, e)
+	}
+	if e := c.advanceIntentTasks(ctx); e != nil {
+		failures = append(failures, e)
+	}
+	for _, route := range c.runtimeRoutes() {
+		key := route.ProjectID + "/" + route.ExecutorID
+		c.mu.Lock()
+		busy := c.active[key]
+		c.mu.Unlock()
+		if busy {
+			continue
+		}
+		if e := c.authority(ctx, route); e != nil {
+			failures = append(failures, e)
+			continue
+		}
+		var active int
+		if e := c.service.DB.QueryRowContext(ctx, "SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.executor_principal_id')=? AND json_extract(body,'$.status') NOT IN ('SETTLED','FAILED','CANCELLED')", route.ProjectID, route.ExecutorID).Scan(&active); e != nil {
+			failures = append(failures, e)
+			continue
+		}
+		if active != 0 {
+			continue
+		}
+		rows, e := c.service.DB.QueryContext(ctx, "SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.status')='READY' AND json_extract(body,'$.task_type')!='runtime_qualification' ORDER BY rowid", route.ProjectID)
+		if e != nil {
+			failures = append(failures, e)
+			continue
+		}
+		candidates := []Object{}
+		for rows.Next() {
+			var raw string
+			if e = rows.Scan(&raw); e != nil {
+				break
+			}
+			var task Object
+			task, e = Decode([]byte(raw))
+			if e != nil {
+				break
+			}
+			candidates = append(candidates, task)
+		}
+		e = errors.Join(e, rows.Err())
+		rows.Close()
+		if e != nil {

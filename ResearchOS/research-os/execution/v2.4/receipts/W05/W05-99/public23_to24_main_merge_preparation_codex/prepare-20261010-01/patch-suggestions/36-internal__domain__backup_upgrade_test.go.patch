@@ -1,0 +1,38 @@
+--- a/internal/domain/backup_upgrade_test.go
++++ b/internal/domain/backup_upgrade_test.go
+@@ -732,7 +732,14 @@
+ 	default:
+ 		t.Fatal("unknown historical plan")
+ 	}
+-	svc := upgradeHistoricalFixtureService(t, db, opt.TargetRoot, version, true)
++	svc := upgradeHistoricalFixtureService(t, db, opt.TargetRoot, version, true)
++	resume := svc.ResumeCheckpoint
++	if version == 14 {
++		resume = func(ctx context.Context, token, project, runID, key string, expectedRevision int64) (Object, error) {
++			upgradeHistoricalFixtureService(t, db, opt.TargetRoot, 14, true)
++			return svc.upgradeHistorical14ResumeCheckpoint(ctx, token, project, runID, key, expectedRevision)
++		}
++	}
+ 	var costs, cursors int
+ 	db.QueryRow("SELECT count(*) FROM domain_objects WHERE kind='BudgetLedgerEntry'").Scan(&costs)
+ 	db.QueryRow("SELECT count(*) FROM domain_objects WHERE kind='SourceCursor'").Scan(&cursors)
+@@ -759,16 +766,16 @@
+ 	current := f.read("runs", Str(pending.run, "id"))
+ 	pending.run = current
+ 	rev, _ := Num(current, "revision")
+-	_, resumeErr := svc.ResumeCheckpoint(ctx, token, f.project, Str(current, "id"), "before-effect-reconcile", rev)
++	_, resumeErr := resume(ctx, token, f.project, Str(current, "id"), "before-effect-reconcile", rev)
+ 	_, dispatchErr := svc.BeginEffect(ctx, token, f.project, Str(current, "id"), effectKey)
+ 	upgradeAssert(t, "UNKNOWN-EFFECT-BLOCKS-REPLAY", true, resumeErr != nil && dispatchErr != nil)
+ 	if e = svc.ObserveEffect(ctx, f.project, Str(current, "id"), effectKey, "NOT_APPLIED", Object{"public_fixture": "query original idempotency key; absent"}); e != nil {
+ 		t.Fatal(e)
+ 	}
+-	_, resumeErr = svc.ResumeCheckpoint(ctx, token, f.project, Str(current, "id"), "before-fresh-observation", rev)
++	_, resumeErr = resume(ctx, token, f.project, Str(current, "id"), "before-fresh-observation", rev)
+ 	upgradeAssert(t, "OLD-OBSERVATION-REJECTED", true, resumeErr != nil)
+ 	pending.observe(pending.observation("LOST", false))
+-	continued, e := svc.ResumeCheckpoint(ctx, token, f.project, Str(current, "id"), "after-fresh-observation", rev)
++	continued, e := resume(ctx, token, f.project, Str(current, "id"), "after-fresh-observation", rev)
+ 	if e != nil {
+ 		t.Fatal(e)
+ 	}

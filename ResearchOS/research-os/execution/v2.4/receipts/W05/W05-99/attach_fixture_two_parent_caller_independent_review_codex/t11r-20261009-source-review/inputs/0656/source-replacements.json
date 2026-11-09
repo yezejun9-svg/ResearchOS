@@ -1,0 +1,10 @@
+[
+  {
+    "old": "\t\t\tcase \"unowned\":\n\t\t\t\tif _, err := f.db.Exec(\"UPDATE client_sessions SET writer_client_id='',lease_expires_at=NULL WHERE id=?\", sid); err != nil { t.Fatal(err) }\n",
+    "new": "\t\t\tcase \"unowned\":\n\t\t\t\t// No current lease: retain the required historical writer attribution.\n\t\t\t\tif _, err := f.db.Exec(\"UPDATE client_sessions SET lease_expires_at=NULL WHERE id=?\", sid); err != nil { t.Fatal(err) }\n\t\t\t\tsnapshot, _ := handlerCommand(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2),\n\t\t\t\t\tCommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: &sid,\n\t\t\t\t\tMethod: strptr(\"session.get\"), Payload: Bytes(Object{})})\n\t\t\t\twriter, present := snapshot.Result[\"writer\"]\n\t\t\t\tif deref(snapshot.Status) != \"COMPLETED\" || !present || writer != nil {\n\t\t\t\t\tt.Fatalf(\"unowned fixture has a public writer lease: %s\", Bytes(snapshot))\n\t\t\t\t}\n\t\t\t\tif err := ValidateResultAgainstMethod(\"session.get\", snapshot, service.Doc); err != nil { t.Fatal(err) }\n"
+  },
+  {
+    "old": "\t\tcase \"claimed-epoch\": env.WriterEpoch = revPtr(before.epoch); want = \"INVALID_REQUEST\"\n",
+    "new": "\t\tcase \"claimed-epoch\":\n\t\t\tenv.WriterEpoch = revPtr(before.epoch)\n\t\t\t// The public decoder rejects this before Execute; HTTP maps it to INVALID_REQUEST.\n\t\t\tdecoded, err := DecodeEnvelope(Bytes(env))\n\t\t\tif decoded != nil || err == nil || err.Error() != \"ATTACKER_CLAIMED_EPOCH\" ||\n\t\t\t\tattachContractRead(t, f, sid) != before || attachContractEventCount(t, f, sid, deref(env.CommandID)) != 0 {\n\t\t\t\tt.Fatalf(\"claimed epoch reached a command or changed state: decoded=%v err=%v\", decoded, err)\n\t\t\t}\n\t\t\tcontinue\n"
+  }
+]

@@ -1,0 +1,117 @@
+290: 				t.Fatal("invalid gate persisted a refusal receipt")
+291: 			}
+292: 		})
+293: 	}
+294: 	if calls.Load() != 0 {
+295: 		t.Fatal("refusal matrix reached provider")
+296: 	}
+297: }
+298: 
+299: func TestQualificationFailureControlledLiveFirstGate(t *testing.T) {
+300: 	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+301: 	taskBefore := r.f.read("tasks", Str(r.task, "id"))
+302: 	var noProgressBefore int
+303: 	if err := r.f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='NoProgressRecord'", r.f.project).Scan(&noProgressBefore); err != nil {
+304: 		t.Fatal(err)
+305: 	}
+306: 	err := c.RunAdmitted(context.Background(), route, r.run, r.lease)
+307: 	if err == nil || !strings.Contains(err.Error(), "qualification grants no unplanned effect authority") {
+308: 		var dispatchState, dispatchReason string
+309: 		_ = r.f.db.QueryRow("SELECT state,reason FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&dispatchState, &dispatchReason)
+310: 		var observation, locator, runRaw string
+311: 		_ = r.f.db.QueryRow("SELECT body FROM domain_objects WHERE kind='Run' AND id=?", r.run["id"]).Scan(&runRaw)
+312: 		_ = r.f.db.QueryRow("SELECT body FROM runtime_observations WHERE run=?", r.run["id"]).Scan(&observation)
+313: 		_ = r.f.db.QueryRow("SELECT journal_locator FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator)
+314: 		stderr, _ := os.ReadFile(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "stderr.raw"))
+315: 		stdout, _ := os.ReadFile(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "stdout.raw"))
+316: 		t.Fatalf("first gate did not deny TOOL: %v run=%s dispatch=%s reason=%s calls=%d observation=%s native_stdout=%s native_stderr=%s", err, runRaw, dispatchState, dispatchReason, calls.Load(), observation, stdout, stderr)
+317: 	}
+318: 	run := r.f.read("runs", Str(r.run, "id"))
+319: 	if run["status"] != "FAILED" || calls.Load() != 1 {
+320: 		var locator string
+321: 		_ = r.f.db.QueryRow("SELECT journal_locator FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator)
+322: 		journal, _ := os.ReadFile(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator, "bridge.json"))
+323: 		journalObject, _ := Decode(journal)
+324: 		facts, factErr := rt.ReadQualificationNativeFacts(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator), Str(journalObject, "manifest_hash"))
+325: 		var frameDiagnostic any
+326: 		if factErr == nil && len(facts.Frames) == 3 {
+327: 			reject, _ := Decode(facts.Rejection)
+328: 			frameDiagnostic = Object{"sequences": []any{facts.Frames[0].Sequence, facts.Frames[1].Sequence, facts.Frames[2].Sequence}, "types": []any{facts.Frames[0].Type, facts.Frames[1].Type, facts.Frames[2].Type}, "capabilities": []any{facts.Frames[1].Capability, facts.Frames[2].Capability}, "keys": []any{facts.Frames[1].Key, facts.Frames[2].Key}, "hashes": []any{Hash(facts.Frames[1]), Hash(facts.Frames[2]), reject["frame_hash"]}, "payload_hashes": []any{Digest(facts.Frames[2].Payload), reject["raw_payload_hash"]}}
+329: 		}
+330: 		t.Fatalf("terminal failure or single MODEL missing: err=%v run=%s calls=%d factErr=%v frameDiagnostic=%s journal=%s", err, Bytes(run), calls.Load(), factErr, Bytes(frameDiagnostic), journal)
+331: 	}
+332: 	var effects, observations, closures, ledger int
+333: 	for _, q := range []struct {
+334: 		sql string
+335: 		out *int
+336: 	}{
+337: 		{"SELECT count(DISTINCT effect_key) FROM resource_effects WHERE run=?", &effects},
+338: 		{"SELECT count(*) FROM runtime_observations WHERE run=?", &observations},
+339: 		{"SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND json_extract(body,'$.subject.run_id')=?", &closures},
+340: 		{"SELECT count(*) FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", &ledger},
+341: 	} {
+342: 		if scanErr := r.f.db.QueryRow(q.sql, r.run["id"]).Scan(q.out); scanErr != nil {
+343: 			t.Fatal(scanErr)
+344: 		}
+345: 	}
+346: 	if effects != 1 || observations != 1 || closures != 1 || ledger != 1 {
+347: 		t.Fatalf("closure census effects=%d observations=%d closures=%d ledger=%d", effects, observations, closures, ledger)
+348: 	}
+349: 	if Hash(taskBefore) != Hash(r.f.read("tasks", Str(r.task, "id"))) {
+350: 		t.Fatal("FAILED-only closure changed Task")
+351: 	}
+352: 	var proofArtifacts, links, events, sealedUploads, runtimeUploads, uses, useProofs, noProgressAfter, acceptance int
+353: 	for _, query := range []struct {
+354: 		sql  string
+355: 		args []any
+356: 		out  *int
+357: 	}{
+358: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.produced_by') LIKE 'local-scheduler-%'", []any{r.f.project}, &proofArtifacts},
+359: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.relation')='DERIVED_FROM'", []any{r.f.project}, &links},
+360: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='EventEnvelope' AND json_extract(body,'$.event_type')='RUN_CHANGED' AND json_extract(body,'$.aggregate_ref.id')=? AND json_extract(body,'$.aggregate_ref.revision')=3", []any{r.f.project, r.run["id"]}, &events},
+361: 		{"SELECT count(*) FROM uploaded_content u JOIN domain_objects a ON a.project=u.project AND a.kind='Artifact' AND json_extract(a.body,'$.storage_key')=u.storage_key WHERE u.project=? AND u.sealed=1 AND json_extract(a.body,'$.produced_by') LIKE 'local-scheduler-%'", []any{r.f.project}, &sealedUploads},
+362: 		{"SELECT count(*) FROM runtime_uploads WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &runtimeUploads},
+363: 		{"SELECT count(*) FROM artifact_uses WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &uses},
+364: 		{"SELECT count(*) FROM artifact_use_proofs WHERE project=? AND run=?", []any{r.f.project, r.run["id"]}, &useProofs},
+365: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='NoProgressRecord'", []any{r.f.project}, &noProgressAfter},
+366: 		{"SELECT count(*) FROM domain_objects WHERE project=? AND kind='AcceptanceReceipt'", []any{r.f.project}, &acceptance},
+367: 	} {
+368: 		if queryErr := r.f.db.QueryRow(query.sql, query.args...).Scan(query.out); queryErr != nil {
+369: 			t.Fatal(queryErr)
+370: 		}
+371: 	}
+372: 	if proofArtifacts != 1 || links != 1 || events != 1 || sealedUploads != 1 || runtimeUploads != 0 || uses != 0 || useProofs != 0 || noProgressAfter != noProgressBefore || acceptance != 0 {
+373: 		t.Fatalf("FAILED-only delta wrong: proof=%d link=%d event=%d sealed=%d runtimeUpload=%d use=%d useProof=%d noProgress=%d/%d acceptance=%d", proofArtifacts, links, events, sealedUploads, runtimeUploads, uses, useProofs, noProgressBefore, noProgressAfter, acceptance)
+374: 	}
+375: 	var money, operation string
+376: 	if scanErr := r.f.db.QueryRow("SELECT coalesce(json_extract(body,'$.money'),'null'),json_extract(body,'$.operation') FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", r.run["id"]).Scan(&money, &operation); scanErr != nil || money != "null" || operation != "UNKNOWN" {
+377: 		t.Fatalf("unknown cost changed: money=%s operation=%s err=%v", money, operation, scanErr)
+378: 	}
+379: 	epoch, err := Num(r.run, "lease_epoch")
+380: 	if err != nil {
+381: 		t.Fatal(err)
+382: 	}
+383: 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
+384: 		_, verifyErr := r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch)
+385: 		return verifyErr
+386: 	})
+387: 	if duplicateErr := c.RunAdmitted(context.Background(), route, r.run, r.lease); duplicateErr == nil {
+388: 		t.Fatal("duplicate dispatch admitted")
+389: 	}
+390: 	var replayClosure, replayObservation, replayProof int
+391: 	if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&replayClosure); err != nil {
+392: 		t.Fatal(err)
+393: 	}
+394: 	if err := r.f.db.QueryRow("SELECT count(*) FROM runtime_observations WHERE project=? AND run=?", r.f.project, r.run["id"]).Scan(&replayObservation); err != nil {
+395: 		t.Fatal(err)
+396: 	}
+397: 	if err := r.f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.produced_by') LIKE 'local-scheduler-%'", r.f.project).Scan(&replayProof); err != nil {
+398: 		t.Fatal(err)
+399: 	}
+400: 	if replayClosure != 1 || replayObservation != 1 || replayProof != 1 || calls.Load() != 1 || Hash(run) != Hash(r.f.read("runs", Str(r.run, "id"))) {
+401: 		t.Fatal("duplicate request changed completed failure closure")
+402: 	}
+403: 	t.Log("CONTROLLED_LIVE_LOOPBACK first-gate TOOL denied; native raw3 ACK2 rejected1; Host proof closure committed; not a Mu bundle success or independent acceptance")
+404: }
+405: 
+406: func TestQualificationFailurePrivateConsumerRejectsTampering(t *testing.T) {

@@ -1,0 +1,75 @@
+--- original-v1
++++ candidate-v2
+@@ -3,7 +3,7 @@
+ No general OS lifecycle or product qualification is claimed."""
+ import sys
+ sys.dont_write_bytecode=True
+-import argparse,hashlib,json,os,subprocess
++import argparse,hashlib,json,os,subprocess,traceback
+ from pathlib import Path
+ ROOT=Path('D:/作品集/ResearchOS/research-os')
+ OUT=Path(__file__).resolve().parent
+@@ -17,19 +17,46 @@
+ def save(name,value):
+     with (OUT/name).open('xb') as f:f.write((json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+'\n').encode('utf-8'))
+ def invoke(label,argv,env,timeout):
+-    save(label+'.request.json',{'argv':argv,'cwd':str(ROOT),'environment':env,'timeout_seconds':timeout,
+-        'purpose':'Root metadata only','automatic_retry':False,'outer_subprocess_Job_or_OS_lifecycle_qualification':False})
+-    result=None;error=None
++    result=None;first=None;secondary=[]
++    phase='request'
++    refs={'stdout_ref':None,'stderr_ref':None}
+     try:
++        save(label+'.request.json',{'argv':argv,'cwd':str(ROOT),'environment':env,'timeout_seconds':timeout,
++            'purpose':'Root metadata only','automatic_retry':False,'outer_subprocess_Job_or_OS_lifecycle_qualification':False})
++        phase='open-raw'
+         with (OUT/(label+'.stdout.raw')).open('xb') as stdout,(OUT/(label+'.stderr.raw')).open('xb') as stderr:
++            phase='native-launch'
+             result=subprocess.run(argv,cwd=ROOT,env=env,stdout=stdout,stderr=stderr,timeout=timeout,check=False)
++        phase='native-completed'
++        if result.returncode!=0:
++            first={'phase':phase,'error':'Metadata child exited nonzero','actual_native_exit':result.returncode}
+     except BaseException as exc:
+-        error=repr(exc);raise
+-    finally:
+-        save(label+'.invocation.json',{'actual_native_exit':result.returncode if result is not None else None,
+-            'wrapper_error':error,'stdout_ref':pin(OUT/(label+'.stdout.raw')),'stderr_ref':pin(OUT/(label+'.stderr.raw')),
+-            'automatic_retry':False,'counter_reset':False,'product_cases_executed':False})
+-    need(result.returncode==0,'Metadata phase stopped: '+label)
++        first={'phase':phase,'error':repr(exc),'traceback':traceback.format_exc(),
++            'actual_native_exit':result.returncode if result is not None else None}
++    for field,suffix in [('stdout_ref','.stdout.raw'),('stderr_ref','.stderr.raw')]:
++        try:
++            refs[field]=pin(OUT/(label+suffix))
++        except BaseException as exc:
++            secondary.append({'phase':'seal-'+field,'error':repr(exc),'actual_native_exit':None})
++    invocation={'actual_native_exit':result.returncode if result is not None else None,
++        'first_error':first,'secondary_errors':secondary,**refs,'automatic_retry':False,
++        'counter_reset':False,'product_cases_executed':False,'outer_OS_lifecycle_qualification':False}
++    try:
++        save(label+'.invocation.json',invocation)
++    except BaseException as exc:
++        detail={'phase':'save-invocation','error':repr(exc),'actual_native_exit':None}
++        if first is None:
++            first=detail
++        else:
++            secondary.append(detail)
++    if first is not None or secondary:
++        if first is None:
++            first=secondary.pop(0)
++        print(json.dumps({'first_error':first,'secondary_errors':secondary,
++            'source_metadata_may_be_partial':True,'automatic_retry':False,'counter_reset':False},
++            ensure_ascii=False,allow_nan=False),file=sys.stderr)
++        raise SystemExit(1)
++
+ need(sys.flags.isolated and sys.flags.no_site and sys.flags.utf8_mode and not sys.flags.optimize and Path.cwd()==ROOT,'isolated flags/cwd')
+ ap=argparse.ArgumentParser()
+ ap.add_argument('phase',choices=['run','seal','grant'])
+@@ -53,6 +80,6 @@
+ else:
+     need(a.review_path is None and a.review_sha256 is None,'no reused run arguments')
+ env={k:v for k,v in os.environ.items() if k.upper() in ['SYSTEMROOT','WINDIR','COMSPEC','PATHEXT']}
+-invoke('metadata-'+a.phase,command,env,900)
++invoke('metadata-'+a.phase,command,env,1500)
+ print(json.dumps({'phase':a.phase,'actual_metadata_native_exit':0,'invocation_ref':pin(OUT/('metadata-'+a.phase+'.invocation.json')),
+     'source_acceptance':False,'formal_increment':0,'outer_OS_lifecycle_qualification':False},ensure_ascii=False))

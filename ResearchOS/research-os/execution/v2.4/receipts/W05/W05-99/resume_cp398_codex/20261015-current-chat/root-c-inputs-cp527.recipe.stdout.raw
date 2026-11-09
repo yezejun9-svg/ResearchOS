@@ -1,0 +1,340 @@
+INPUT C_design_adopted_constraints_ref {'path': 'execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261015-current-chat/continuation-cp511/C-design-adopted-constraints.json', 'sha256': '66df2cc54b7e9ef89db1976043171299f72fd02a6a25971c78b1a23d57dfcf6c', 'bytes': 14308}
+{
+  "schema": "researchos.C-lease-and-narrow-classification-design-adoption.v1",
+  "at": "2026-10-15T11:37:01.759797+00:00",
+  "status": "DESIGN_CONSTRAINTS_ADOPTED_NOT_SOURCE_OR_ACTUAL_AUTHORITY",
+  "independent_review_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_independent_review_codex/20261015-current-chat/FINAL-manifest.json",
+    "sha256": "c1f517f80da18e29a3b2f27c278ac65828372513552d35e3c7fc75ad5eb7b807",
+    "bytes": 17101
+  },
+  "lease_scope_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_architecture_codex/20261015-current-chat/C-lease-exact-scope.json",
+    "sha256": "ef69f8dcd63578f3692439b95f5ba21c155aeb75bc362bc9a52c65f4352f78b3",
+    "bytes": 4127
+  },
+  "mandatory_addendum": {
+    "C": [
+      {
+        "id": "C-LD01",
+        "priority": "P1",
+        "title": "Parent lease copies and legacy borrow release share one lifetime",
+        "evidence": [
+          "adapters/runtime/data_root_windows.go:16-22",
+          "adapters/runtime/data_root_windows.go:58-107",
+          "18.stdout.raw"
+        ],
+        "problem": "Current exported DataRootLease value contains mutex, file and borrowed flag directly. External code can copy the value without touching private fields. Revision03 explicitly protects borrow copies but does not explicitly protect parent copies or distinguish old ReturnBorrow from the new maintenance borrower. A copied parent could Close its copied state while a maintenance borrower is active; a reused boolean could let ReturnBorrow clear the wrong borrow.",
+        "required": "Make every DataRootLease value point to one private heap owner-state containing mutex, file, generation, closed state and active borrow identity/kind. Copies, Root/Held/Close, old Borrow/ReturnBorrow and new Maintenance methods must consult that same state. Nil/zero parent and borrow must fail closed without panic. Legacy ReturnBorrow may release only an active legacy coordinator borrow; it must reject an active maintenance borrow. Maintenance Release consumes only its exact private generation-bound token, and cannot release a later or legacy borrow. Parent Close refuses either live borrow and invalidates all copies atomically on successful close. No lock held while recursively calling a method that takes it.",
+        "paths": [
+          "adapters/runtime/data_root_windows.go",
+          "adapters/runtime/qualification_maintenance_gate_windows_test.go"
+        ],
+        "tests": [
+          "Copy parent before borrow; copied Close refuses and original Held remains true.",
+          "Copy parent/borrow; release one borrow; stale copy cannot release a newly acquired borrow.",
+          "Legacy ReturnBorrow during maintenance borrow fails and cannot enable Close; concurrent legacy/maintenance borrow admits only one.",
+          "Zero-value Close/Check/Borrow never panics and never claims Held."
+        ]
+      },
+      {
+        "id": "C-LD02",
+        "priority": "P1",
+        "title": "One normalization and identity guard across all upgrade branches",
+        "evidence": [
+          "internal/domain/backup_upgrade.go:120-135,245-253",
+          "internal/domain/backup_configuration_upgrade.go:174-191",
+          "internal/domain/backup_queue_upgrade.go:320-337",
+          "19.stdout.raw"
+        ],
+        "problem": "All five plans enter the new adapter, but queue/configuration branches call upgradePaths again and then open templates/source later. Merely retaining coordinator.lock and checking a path at adapter entry does not stop a source/root rename or alias change before a downstream open. The text requires revalidation after normalization but does not place it in these existing common call sites.",
+        "required": "Within the existing allowed backup_upgrade.go, make the shared upgradePaths path finish by validating opt.sourceLease against the final normalized root/source for guarded production workflows, before returning to any branch. The private adapter/source borrow must retain native no-delete/rename guards for the exact root path components and source file identity until all downstream DB defers complete; metadata handles may share read/write needed by SQLite but cannot permit identity replacement. Check canonical containment, no reparse and exact native file identities. Existing prepared wrapper Check remains required. Public UpgradeLocal/UpgradePreparedAbandonmentBackup stay fail-closed before any provider/key/template/store work. Isolated private legacy algorithm fixtures cannot count as guarded entry proof. This selected central implementation avoids adding queue/configuration production files; if the builder cannot implement these persistent guards, STOP and request an exact scope addition for explicit checks, rather than omit the invariant.",
+        "paths": [
+          "internal/domain/backup_upgrade.go",
+          "internal/domain/backup_source_lease_windows.go",
+          "adapters/runtime/data_root_windows.go",
+          "internal/domain/backup_source_lease_windows_test.go",
+          "internal/domain/backup_configuration_upgrade_test.go",
+          "internal/domain/backup_queue_upgrade_test.go",
+          "internal/domain/backup_upgrade_test.go"
+        ],
+        "tests": [
+          "Exercise every five-plan dispatch using a real held lease, including normalized option copy.",
+          "Attempt source file/root component replacement after adapter borrow and before template/source open; deny replacement or fail before forbidden setup.",
+          "Prepared nested local/handoff inner Close/error leaves outer Held and cannot release the native owner.",
+          "Forbidden Canary/key/provider/template/store sentinel remains untouched for invalid plans, wrong identity and pending journals."
+        ]
+      },
+      {
+        "id": "C-LD03",
+        "priority": "P1",
+        "title": "Exact-own recovery validates the pending transition, not only prior terminal target",
+        "evidence": [
+          "internal/host/runtime_verifier_replacement_windows.go:752-771",
+          "internal/host/runtime_verifier_replacement_journal_windows.go:315-405",
+          "12.stdout.raw",
+          "19.stdout.raw"
+        ],
+        "problem": "Replacement can die after ReplaceFile while journal remains PUBLISHING and target already equals NewBytes. Applying ordinary history-current/latest-terminal-target comparison before granting its exact own inspection permit would reject this legitimate recovery. Treating the permit as a broad pending exemption would create the opposite flaw.",
+        "required": "Freeze two separate pure predicates in the shared reader: ordinary acquisition validates complete history and current terminal target; exact-own inspection validates the full causal history including the one exact pending operation and its permitted current old/new state using the existing replacementRecover applied/unapplied evidence predicates. Include exact namespace/root/operation/plan digest and bounded file inventory. PREPARED/PUBLISHING partial histories may enter only the exact recovery inspection that existing recovery rules permit; no ordinary lease or backup borrow may pass. The other namespace and every non-own pending operation always deny. PUBLISHING with exact applied NewBytes may be inspected/completed; it cannot abort or replay ReplaceFile. Unknown/mixed/tampered backup/stage/hash evidence denies. C own inspection must similarly preserve its existing NOT_APPLIED/ABORTED rules. Revalidate under the held lock; no serialized permit, callback, bool or raw handle supplies authority.",
+        "paths": [
+          "internal/qualificationmaintenancejournal/replacement_windows.go",
+          "internal/qualificationmaintenancejournal/replacement_windows_test.go",
+          "internal/host/runtime_verifier_replacement_windows.go",
+          "internal/host/runtime_verifier_replacement_journal_windows.go",
+          "adapters/runtime/data_root_windows.go",
+          "adapters/runtime/qualification_maintenance_gate_windows_test.go"
+        ],
+        "tests": [
+          "Both PUBLISHING-before-ReplaceFile and PUBLISHING-after-ReplaceFile retain the exact existing recovery result.",
+          "A prior completed replacement followed by pending own replacement never requires target to remain predecessor bytes once own publish applied.",
+          "Own C permit cannot exempt replacement; own replacement cannot exempt C; backup borrow rejects both exceptions.",
+          "Unknown inventory, wrong plan/root/operation, concurrent second pending entry and changed target all fail closed."
+        ]
+      }
+    ],
+    "F01_worker": [
+      {
+        "id": "F01-D01",
+        "required": "The new historical type states only HOST_TOOL_EFFECT_NOT_DISPATCHED for the exact qualification MODEL-only first-gate TOOL frame, with the exact frozen subject, raw evidence digests, actual compiled Core/source bindings and rule version. It is generated by current Owner and run_id=null. It cannot satisfy a UNIVERSAL_OS_NO_EFFECT consumer, become an original online denial or claim raw denial text that was not recorded.",
+        "tests": "Changing route/capability/key/subject/first-gate source digest, a TOOL prepare/start/provider/ledger row, extra suffix frame or missing raw bytes denies construction."
+      },
+      {
+        "id": "F01-D02",
+        "required": "Keep raw frames=3, ACK=2 and raw queue_empty=false. A separately named derived FAILED-only observation may classify all three exact frames only after complete census, exact MODEL ACK/receipt/effect binding, no unresolved extra external effect or queue/control/checkpoint, accepted worker native class, accepted current STOP including original verifier prerequisite, held root+dispatch owner locks, and accepted private consumer. Never change generic Finalize/Observation, fabricate ACK3 or historical broker join, or equate queue_required=false to empty.",
+        "tests": "Missing/UNKNOWN effect outcome denies; CONFIRMED MODEL with UNKNOWN money preserves ledger/budget and does not become zero money. Missing any current closure premise denies even when historical native receipt matches."
+      },
+      {
+        "id": "F01-D03",
+        "required": "Keep B actual online private drain ticket distinct from historical reconstruction. The historical constructor must independently prove current quiescence after accepted STOP and root/owner locks; it cannot manufacture a B ticket or call an online constructor with a bool. The common FAILED-only transaction accepts only the verified private variant and preserves the exact prior C five-version write set and all frozen protected rows. B Source must be independently accepted before D; F01 alone opens no D or actual C action.",
+        "tests": "Forged JSON/caller booleans/wrong proof-kind/online-ticket substitution reject. Exact frozen write-set census shows only Run and ProjectState updates plus Artifact/ImpactLink/EventEnvelope new versions and the existing enumerated ancillary rows; no Task/consumption/effect/ledger/budget/NoProgress/lease/qualification/schema/history edits."
+      },
+      {
+        "id": "W-D01",
+        "required": "HISTORICAL_NATIVE_JOB_ACCOUNTING_CLOSURE_V1 is a distinct source-derived class, bound to bridge SHA256 10b1a3bfa74132fbed965df31fd90125b90b1470556001e254af360c35451bce, PID69860, creation1792057406096619100, Job Local\\ResearchOS.W10.1792057404322293200, profile/SID/manifest/build/source identities and exact public receipt fields. Its fact is the recorded Stopped=true backed by successful Job accounting query ActiveProcesses==0 plus streams_drained. It has no raw WAIT result, no exit0, no historical successful owner Close receipt and no proof DeleteAppContainerProfile succeeded. Current owner lock possession remains a separate future prerequisite.",
+        "tests": "Reject changed binary/source/receipt hashes, any mismatched identity, stopped=false, undrained streams, missing chain to runSandbox completion, or a consumer requiring raw WAIT_OBJECT_0."
+      }
+    ],
+    "additional_paths": [],
+    "actual_authority": false,
+    "formal_increment": 0
+  },
+  "classification_decisions": {
+    "schema": "researchos.CP509.classification-decisions.v1",
+    "narrow_Host": {
+      "design_class": "ACCEPTED_WITH_F01_D01",
+      "historical_support": "SUPPORTED_EXACT_HOST_FIRST_GATE_SOURCE_RECONSTRUCTION",
+      "claim": "HOST_TOOL_EFFECT_NOT_DISPATCHED",
+      "universal_OS_NO_EFFECT": "NOT_PROVABLE"
+    },
+    "worker_Job_accounting": {
+      "design_class": "ACCEPTED_WITH_W_D01",
+      "historical_support": "SUPPORTED_RECORDED_STOPPED_FIELD_PLUS_PINNED_OS_ACCOUNTING_SOURCE_INFERENCE",
+      "raw_WAIT_RESULT": "MISSING_NOT_INVENTED",
+      "current_owner_lock": "NOT_PROBED_REQUIRES_FUTURE_ACTUAL_HELD_LOCK"
+    },
+    "FAILED_only_combined_classification": {
+      "design_class": "ACCEPTABLE_ONLY_WITH_F01_D01_D02_D03_AND_W_D01",
+      "current_operational_acceptance": false,
+      "source_prerequisites": [
+        "Real B Source independently accepted; historical constructor never fabricates B drain ticket",
+        "Real C private proof validator and unchanged five-version transaction independently accepted",
+        "Mandatory C-LD01..03 implemented and tested under exact Root scope"
+      ],
+      "actual_prerequisites": [
+        "Current accepted STOP proving original Core and worker and original verifier closure",
+        "Original verifier native proof or separately accepted full operational substitute; currently NOT_PROVABLE",
+        "Current held exact root lease and dispatch owner lock",
+        "Complete exact current evidence revalidation and frozen reviewed C operation/authority"
+      ],
+      "does_not_require_new_universal_OS_NO_EFFECT_claim": true,
+      "never_weakens_generic_observation": true
+    },
+    "verifier_operational_substitute": "NOT_PROVABLE_TRANSITIVE_INIT_BACKGROUND_CLOSURE",
+    "actual_STOP_C_enabled": false,
+    "additional_paths": [],
+    "formal_increment": 0
+  },
+  "scope_expansion": [],
+  "actual_STOP_C_enabled": false,
+  "formal_increment": 0
+}
+
+INPUT boot_supplement_root_decision_ref {'path': 'execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261015-current-chat/continuation-cp521/boot-proposal-adopted-limits.json', 'sha256': '5933670aa546382834ad4309d7d2debc7ed0f065ed82ddc4df6b2b5848a22e6b', 'bytes': 8897}
+{
+  "design_review": {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_boot_supplement_independent_design_review_codex/20261015-current-chat/FINAL-manifest.json",
+    "sha256": "97a51cd59fd3a7336ecfb1148a41c657dd5d87650bbb27b568a361cf91219bf7",
+    "bytes": 14851
+  },
+  "verdict": "CONDITIONAL_IMPLEMENTABLE_SOURCE_PROPOSAL",
+  "findings_required": [
+    {
+      "id": "F01",
+      "priority": "P1",
+      "status": "MANDATORY_SOURCE_REFINEMENT",
+      "title": "Per-object deny needs persistent namespace and effective ACL validation",
+      "fix": "Native same-handle volume/128bitID/finalpath/hash/SD/reparse and retained ancestor checks inside boot_windows.go; no existing accepted helper prerequisite."
+    },
+    {
+      "id": "F02",
+      "priority": "P1",
+      "status": "MANDATORY_SOURCE_AND_ACTUAL_REFINEMENT",
+      "title": "Shared ancestors require explicit exact deployment scope",
+      "fix": "D root AU 0x1301bf excludes DELETE_CHILD/WRITE_DAC/WRITE_OWNER; no drive ACL reset. Protect selected D portfolio and C home/.codex/cache edges; preserve dense deny preimages; no implicit authority."
+    },
+    {
+      "id": "F03",
+      "priority": "P1",
+      "status": "SOURCE_CAPABILITY_AND_ACTUAL_GAP",
+      "title": "Runtime RestartApps cannot be inferred from static no-call scan",
+      "fix": "Bounded exact-process registration reader plus exact runtime/argv native fixture; unknown registration or uncovered normal branch blocks arm."
+    },
+    {
+      "id": "F04",
+      "priority": "P1",
+      "status": "MANDATORY_RECOVERY_STATE_FIX",
+      "title": "Pending C cannot release ungated legacy entry fence",
+      "fix": "Allow legacy restore only pre-BEGIN proven no C effect or exact classified durable terminal/NOT_APPLIED/ABORTED; pending/unknown retains fence and journals."
+    },
+    {
+      "id": "F05",
+      "priority": "P1",
+      "status": "ACTUAL_RESOURCE_REQUIRED",
+      "title": "Recovery principal and business identity must be distinct",
+      "fix": "Prefer distinct SID elevated recovery admin; same-SID elevation does not nullify SID deny. Trusted owner or independently tested OWNER RIGHTS policy; preserve business Owner."
+    },
+    {
+      "id": "F06",
+      "priority": "P1",
+      "status": "SEPARATE_QUALIFICATION_AND_ACTUAL_GAP",
+      "title": "Online backup cannot blindly acquire lease or initialize Host",
+      "fix": "Consume Root mapped CLI contract and unchanged-Source held-lease/restore fixture; actual workspace/Host changes, key, restore usable proof before arm."
+    },
+    {
+      "id": "F07",
+      "priority": "P1",
+      "status": "SOURCE_GATE",
+      "title": "B online private API does not authorize historical C",
+      "fix": "Wait independent B-r2; private historical validator with distinct marker namespace and exact currentOwner/model/raw bindings; no fabricated denial/drain/ACK."
+    },
+    {
+      "id": "F08",
+      "priority": "P1",
+      "status": "ROOT_ADOPTION_REQUIRED",
+      "title": "C-only operational substitute must be explicit",
+      "fix": "Keep CP511 history and strict STOP unchanged; explicit alternative only for present quiescence under accepted boot boundary."
+    },
+    {
+      "id": "F09",
+      "priority": "P1",
+      "status": "SOURCE_TEST_AND_ACTUAL_GATE",
+      "title": "Namespace ACL cannot block necessary business data operations",
+      "fix": "Separate entry/ancestor/data policies; actual SQLite/WAL/lease positive plus namespace-negative native tests. No broad temporary unlock or admin-as-business-Owner."
+    }
+  ],
+  "source57": [
+    "apps/control/main.go",
+    "apps/control/prepared_recovery_windows.go",
+    "apps/control/replay_command.go",
+    "adapters/runtime/bridge_windows.go",
+    "adapters/runtime/data_root_windows.go",
+    "internal/host/runtime_verifier_replacement_windows.go",
+    "internal/host/runtime_verifier_replacement_journal_windows.go",
+    "internal/domain/runtime_qualification_failure_windows.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows.go",
+    "internal/store/sqlite.go",
+    "ops/backup/main.go",
+    "internal/domain/backup_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_handoff.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_other.go",
+    "ops/supervisor/release_host/main.go",
+    "apps/control/qualification_failure_maintenance_windows.go",
+    "apps/control/qualification_failure_maintenance_other.go",
+    "internal/host/qualification_failure_maintenance_windows.go",
+    "internal/host/maintenance_startup_gate_windows.go",
+    "internal/domain/qualification_failure_maintenance_windows.go",
+    "internal/store/qualification_maintenance_windows.go",
+    "internal/qualificationmaintenancejournal/contract.go",
+    "internal/qualificationmaintenancejournal/journal_windows.go",
+    "internal/qualificationmaintenancejournal/journal_other.go",
+    "ops/backup/maintenance_gate_windows.go",
+    "ops/backup/maintenance_gate_other.go",
+    "internal/domain/backup_source_lease_windows.go",
+    "internal/domain/backup_source_lease_other.go",
+    "ops/supervisor/release_host/maintenance_gate_windows.go",
+    "ops/supervisor/release_host/maintenance_gate_other.go",
+    "internal/qualificationmaintenancejournal/replacement_windows.go",
+    "apps/control/qualification_failure_maintenance_windows_test.go",
+    "apps/control/runtime_verifier_replacement_windows_test.go",
+    "apps/control/replay_command_test.go",
+    "internal/host/qualification_failure_maintenance_windows_test.go",
+    "internal/host/maintenance_startup_gate_windows_test.go",
+    "internal/domain/qualification_failure_maintenance_windows_test.go",
+    "internal/domain/runtime_qualification_failure_windows_test.go",
+    "internal/store/qualification_maintenance_windows_test.go",
+    "internal/qualificationmaintenancejournal/journal_windows_test.go",
+    "adapters/runtime/qualification_maintenance_gate_windows_test.go",
+    "ops/backup/maintenance_gate_windows_test.go",
+    "internal/domain/backup_source_lease_windows_test.go",
+    "internal/domain/backup_prepared_abandonment_handoff_test.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows_test.go",
+    "ops/supervisor/release_host/maintenance_gate_windows_test.go",
+    "internal/qualificationmaintenancejournal/replacement_windows_test.go",
+    "internal/domain/backup_configuration_upgrade_test.go",
+    "internal/domain/backup_queue_upgrade_test.go",
+    "internal/domain/backup_upgrade_test.go",
+    "internal/recoveryboundary/contract.go",
+    "internal/recoveryboundary/boot_windows.go",
+    "ops/qualification_recovery_boundary/main_windows.go",
+    "ops/qualification_recovery_boundary/main_nonwindows.go",
+    "internal/recoveryboundary/boot_windows_test.go",
+    "ops/qualification_recovery_boundary/main_windows_test.go"
+  ],
+  "gates": {
+    "source": [
+      "B independent accepted snapshot",
+      "Root exact 57-path responsibility/API freeze",
+      "F01-F09 incorporated; no new mechanism"
+    ],
+    "native": [
+      "same-handle/ACL/reparse/hardlink/ancestor races tested",
+      "real PE execute and script read denial",
+      "real RestartApps outcomes and phase CLI",
+      "all C-LD01..03 and private transaction/replay checks"
+    ],
+    "privileged": [
+      "distinct SID restore vs business user",
+      "dense-ACE-preserving deployment and restoration",
+      "persistent protection across actual fixture full restart",
+      "legitimate OS ancestors and sibling/no business DB breakage"
+    ],
+    "actual_before_arm": [
+      "complete actual supported-set image mapping",
+      "accepted usable consistent online backup and Host side-effects scope",
+      "authorized exact shared ACL delta/readback",
+      "working protected recovery path",
+      "accepted Source/native/privileged qualification"
+    ],
+    "after_restart": [
+      "explicit later user FullRestart",
+      "native uptime strict decrease and <=10m; pre>=10m; UTC delta<=30m",
+      "trusted time and no VM/disk rollback assumption",
+      "same host/businessSID/native root+DB identity",
+      "persistent fence continuity and no normal supported postboot execution",
+      "held root lease and dispatch owner lock through census/CAS/commit/receipt",
+      "complete present census with no unresolved external effects"
+    ]
+  },
+  "root_decision": "After independent B-r2 acceptance and exact composite baseline, author a concrete Source57 proposal for C-only POST_RESTART_CURRENT_QUIESCENCE_V1; existing STOP classes unchanged. This is not Source implementation/semantic or actual acceptance.",
+  "actual_authority": false,
+  "source_card_issued": false,
+  "formal_increment": 0
+}
+
+INPUT boot_supplement_design_ref {'path': 'execution/v2.4/receipts/W05/W05-99/qualification_recovery_boot_supplement_architecture_codex/20261015-current-chat/FINAL-manifest.json', 'sha256': 'a4237a000b8a73af47cb45514057947f913be6e6b11771f37e0628a3407bbad5', 'bytes': 6584}
+INPUT qualification_failure_revision03_design_ref {'path': 'execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_architecture_codex/20261015-current-chat/FINAL-manifest.json', 'sha256': 'ca88e381c286affe751cf7542ee580f0b04b45d72e3bf479f8b1d282f60f5b61', 'bytes': 18465}
+INPUT source41_ready_map_draft_ref {'path': 'execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261015-current-chat/source41-ready-map-draft-cp525.json', 'sha256': '791e54e4df9d15f663b4eaa92a8849a1f6ad8725dcfcc4b2da5beef4bfe4bfb6', 'bytes': 13989}
+DRAFT_KEYS ['schema', 'status', 'base_Main', 'base_candidate_B_r3_not_accepted', 'STOP_candidate_limited_source_accepted', 'path_count', 'path_overlap', 'expected_source41_pins', 'activation_gates', 'proposed_mechanical_method', 'proposed_minimum_new_composition_checks', 'no_original_root_or_api_or_model_or_Stop_or_backup', 'actual_authority', 'formal_increment', 'source25_overlap_inventory_reference']
+{"schema": "researchos.source41-ready-map-draft.v1", "status": "DRAFT_READONLY_NO_CONSTRUCTION_AUTHORITY", "base_Main": "4f4023c956f84d65743f39ce77d6c8899a21ada1", "base_candidate_B_r3_not_accepted": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "STOP_candidate_limited_source_accepted": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "path_count": 41, "path_overlap": [], "expected_source41_pins": {"adapters/runtime/bridge_program.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "16e544534b2da4939a5831768f062d6ed5d458725db5499a065c92f56f86c5bc", "bytes": 1859}, "adapters/runtime/bridge_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "a5839fe3c3a090f5e2faadeea6ff6a1d5f5be312f897497ecf338a307b826b12", "bytes": 42988}, "adapters/runtime/qualification_failure_proof_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "e8660b22d6cd1e14e39cc115249f2bc783707e156007cb6f08b235ffe5b01719", "bytes": 16593}, "adapters/runtime/qualification_failure_proof_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "4eb422ded5ce5d122eef6d3656ac8334fb36a3760a20568dc53142473e0f34db", "bytes": 9653}, "adapters/runtime/qualification_projection_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "f8e8b69e8128953a0d9b51dab9b38f31079b3ce9cff928bc117352bf4c67de98", "bytes": 11124}, "internal/domain/runtime_broker_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "28e218dae055d3a0e2ee357e28f135a0d4e4aa9a7eebaca67b1a11e9871a4ccc", "bytes": 20702}, "internal/domain/runtime_command_queue_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "09200cfa00212de84dee339182349707da9dbc811d318883d01bd6de3d74d839", "bytes": 21828}, "internal/domain/runtime_command_queue_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "8349540007e1cc5e2ddaff3e299c229b987c1f3025001f72f42672010d27a388", "bytes": 16263}, "internal/domain/runtime_coordinator_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "03cb79dca91b9ec18ce4653db7cbc6fbdd44ab3443f74e3b74d7abf349d40c12", "bytes": 37915}, "internal/domain/runtime_dispatch.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "1b6f8b5f04bbd2b75f95d9ed304bba4a2e027e265f1663239ccc9f1cdd1dd17c", "bytes": 10362}, "internal/domain/runtime_drain_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "bb70c602a7c194e3a5705909247cf71d8c39223e6adf0510e4665be53b3cd070", "bytes": 13721}, "internal/domain/runtime_drain_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "5bb4c256da9d494a22d857becc4ce787ab42e92fb159fadfcc763be1c0becaa8", "bytes": 16983}, "internal/domain/runtime_model_verification.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "8947d8e6e53b638fc1bbf5ca42d6ca756820ca0d75058797b8cc688dd2126763", "bytes": 28377}, "internal/domain/runtime_model_verification_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "d2f1a98b9f5ed1b579ff10a29e031347dc1b67ccfd184bb83e69adbe11ea4544", "bytes": 12337}, "internal/domain/runtime_model_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "5be27c3474795323b4174b64beb5e7b98b08a46a6535c8cf8f696443144c093a", "bytes": 8160}, "internal/domain/runtime_model_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "2dd94c1957319c3c6a6ae3ff81a611513c101721f7c1e05ff0eb605370ee621e", "bytes": 25822}, "internal/domain/runtime_qualification_failure_windows.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "f647a1188e8f0289880e37143c85727c9fab128b9cd7b5150e3624e446da47f2", "bytes": 62113}, "internal/domain/runtime_qualification_failure_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "90930a746f3c60ac29f0e3cf113e48bafd4f1d0e270fc81b83b662426fa506fa", "bytes": 64663}, "internal/domain/runtime_qualification_projection_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "1dd9db26757d1cc605c214e31e4c6271d4f5b09fdc79934447115b64ed49f6f4", "bytes": 5122}, "internal/domain/runtime_qualification_projection_windows_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "6287f3823001d0e6d9aedc4056107649b974bcc71d37e8031b7018a159053936", "bytes": 15861}, "internal/runtimepolicy/qualification_projection.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "2012264988b2af1efe94c8eb734c93ec1cdbbb6d64f63e0c425805cb027d2d1b", "bytes": 10370}, "internal/runtimepolicy/qualification_projection_test.go": {"source_commit": "fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f", "lane": "B_r3_Aincluded_22_NOT_ACCEPTED", "sha256": "bd297a68f5ef8782f7a8c94119364dca5a7ec3181851e2f1b9b73a6158d211e7", "bytes": 7588}, "internal/host/owned_core_stop_identity_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "bc901da3af77e0d6ea40df009480b82940dfc6aaf7600a76bb0d619ebac953b7", "bytes": 4301}, "internal/host/owned_core_stop_identity_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "612d6a29f8790d99b78bcd66534115b6ad85d406e3817d5e827d09cf773905a0", "bytes": 2212}, "internal/ownedcorestop/contract.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "f0e22243f90ffac03753a135fa43ce8b87d67e4eb264828801718520ce1fed08", "bytes": 18518}, "internal/ownedcorestop/journal_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "f04ad0ffcb60e8a794fac6ff948a3e72e0ed9b11245d88c078079b53bfdd4afd", "bytes": 25180}, "internal/ownedcorestop/journal_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "6dc489fcfe5eacd214ed2958a5f73ac0ea4a6dd733adb28d6d3e3b0274b2d544", "bytes": 6830}, "internal/ownedcorestop/proof_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "70397504d4a98c6665b50a13e1fb2a9ea94001d72184e581d2cfb74f6540cd4f", "bytes": 14849}, "internal/ownedcorestop/proof_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "f83d894dbd2760094594761b06a5141daeb3e4c1a18c6ca11cdda32675b0ce63", "bytes": 6844}, "internal/ownedcorestop/stop_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "c5d2309a00f5822f0ebb7a043b02921842616ef024f2e109e945d349a8fe7ef0", "bytes": 15067}, "internal/ownedcorestop/stop_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "279fcf53c8ce0ac66691196eb46e6eb04c4388ab56992dc8bad98f54509fbf06", "bytes": 5848}, "internal/store/owned_stop_backup.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "11a26d70cb3e4de34c84ba62bd66ebaeab6cf22793505befa9c0e16bc97a9edc", "bytes": 9239}, "internal/store/owned_stop_backup_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "b705521ae752409f50791b44a80d80ae558d0d25023d153250881934928bfb17", "bytes": 1410}, "internal/store/owned_stop_barrier_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "eb7c1e9b6c224bf2c9f3df984caf258ee93967244881fe0a0570c3fbed090920", "bytes": 9301}, "internal/store/owned_stop_barrier_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "3f0d004a377172540418250f53acf90cdb088ff548c863673e362dd9de37cfd7", "bytes": 10812}, "ops/owned_core_stop/fixture/main_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "54aeef90e1cd049f5fcd0a96f2f1e56a23b0a3856e116a7064f1ad2728fb9817", "bytes": 8446}, "ops/owned_core_stop/main_nonwindows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "126aab563b2085cdbbd3d557934c9583dd8ac374e9055779e37a3dbf7729f5a8", "bytes": 174}, "ops/owned_core_stop/main_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "e7cb62f2bc727413466f24d0130ce72fd42eeef4a3ded2b40e87074d8529aae3", "bytes": 2491}, "ops/owned_core_stop/main_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "0f57d62765bcd9b40a8aeb0c82cc70ff4415215e4823dbecf3203ae6db9b54bd", "bytes": 4798}, "ops/supervisor/owned_core_handle_windows.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "11e020cb648d780c8179e2300de8a788db0e1a743e336c7423b51f82a248bb60", "bytes": 20639}, "ops/supervisor/owned_core_handle_windows_test.go": {"source_commit": "37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373", "lane": "STOP_r5_19_LIMITED_SOURCE_ACCEPTED", "sha256": "d96943defa4fd7aa5c6b7bc72094ff53572cbfb62b4b7beaeee9a0a4595bd2f0", "bytes": 18553}}, "activation_gates": ["B-r3 independent full9/delta4 semantic acceptance by Root; current author freeze is insufficient.", "Root registers exact composition Source41 card with immutable inputs/sparse worktree/ownership/guards before any construction.", "Main4f dirty20/protected9/config/step_state/index remain protected.", "C57 Source requires exact accepted composition and inherited new B nativehold Check/Close Tx lifetime contract."], "proposed_mechanical_method": "New sparse worktree from accepted frozen B-r3(Aincluded), apply immutable whole19 STOP patch fromMain4f with explicit paths; exact41hashidentity check then clean local commit/full41binarypatch. No Source25 integration.", "proposed_minimum_new_composition_checks": ["Build genuine apps/control and ops/owned_core_stop from exact41 and record buildinfo/sourceclean.", "Focused combined qualification/nativehold/Owner and ownedstop store/host integration compilation; no unrelated allrepo suites.", "Independent Source41 review with own genuine B closure+completed replay census and compiled STOP nonempty fixture positive/denial as proportionate; preserve historical residual limits."], "no_original_root_or_api_or_model_or_Stop_or_backup": true, "actual_authority": false, "formal_increment": 0, "source25_overlap_inventory_reference": {"path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\resume_cp398_codex\\20261015-current-chat\\provisional-composition-inventory-cp522.json", "sha256": "fede9e7141ad31bf2e4ade17c96b29fa95c68daa1639a8ef841dffbb9483adfd", "bytes": 39408}}

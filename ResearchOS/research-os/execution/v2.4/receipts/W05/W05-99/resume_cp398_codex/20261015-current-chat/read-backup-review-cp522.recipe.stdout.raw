@@ -1,0 +1,47 @@
+SEMANTIC {"verdict": "LIMITED_FIXTURE_SOURCE_CAPABILITY_ACCEPTED", "actual_authority": false, "formal_increment": 0}
+MD_LENGTH 4571 PART1_0_6000
+# 在线备份有限夹具独立复核
+
+结论：LIMITED_FIXTURE_SOURCE_CAPABILITY_ACCEPTED，待 Root 采纳。本结论只覆盖固定 Main4f 源码的有限夹具能力；actual authority = 0，formal increment = 0，self acceptance = false。Source HEAD 4f4023c956f84d65743f39ce77d6c8899a21ada1 / tree 3db13a15cc52b2b0bd75cae3452c66509a9f55c9，前后 worktree clean，未改任何 tracked Source、tests 或 Git。11 项 scope 输入 SHA-256 与大小均核验一致。
+
+## 新独立证据
+
+生产 ops/backup 编译没有 overlay；仅夹具 helper 使用 overlay。fresh key 与 wrong key 由真实 CLI keygen 创建，保存在独立私有目录，证据不含 key bytes。Go build-info 确认原生产 CLI、Go1.27.1、vcs.modified=false。程序和 helper pin 在 source-helper-native-pins.json。
+
+作者 fixture_setup.go 的 DB defer Close 在 setup 结束执行，后续 lease_holder.go 只持 lease，因此旧 Q01/Q02/Q03 不能单凭 holder 推断 live Host/DB。本次 live_fixture.go 在新的小型 Host 授权 workspace 完成后，保持真实 Host 对象和 SQLite 连接，用 runtime.KeepAlive 保证 Host 生命周期；create 前后 Ping 成功、OpenConnections>=1、Host instance ID 相等，直到明确 release 才正常关闭。这个 holder 与真实 CLI 为不同进程，没有替换备份实现。
+
+跨进程 root lease 在 create 前、后令独立 probe 返回10；holder 正常退出0后 probe 返回0。真正 encrypted create 与 operational restore 均返回0。fixture 只含一个小文件及 empty directory；恢复后文件 SHA-256 c9f09e0a76fbbf83847013f7d79aa09c1566778489cc499e76e3e5d72b1c8db6、空目录、authorized workspace ref 与 project ref 保留，路径移至新恢复根。
+
+全部88张表（87张非 sqlite_ 表加 sqlite_sequence）的逐行值摘要、schema、版本及 integrity 在 create 前后完全相同，源 native files/sidefiles 的完整 census 与 ACL 也完全相同。否定例后源逻辑 census 仍相等。这里不能把88误说成88张业务表。恢复仅 auth_credentials 与 domain_objects 表值变化：WorkspaceBinding real_path/display_path/revision、Project real_path/revision；凭据重新签发。恢复 schema 另新增 backup_require_fresh_observation 触发器，这是 backup_recovery.go:233 的恢复屏障，因此源前后 schema 相等不等于恢复 schema 完全相同。
+
+本次独立执行三个否定例：已有目的包 → DESTINATION_EXISTS，包完整 census 不变；新错误 key → BACKUP_MANIFEST_INVALID，未发布恢复目录；相同可见文件字节但新 native workspace file ID → BACKUP_WORKSPACE_PIN_CHANGED，未发布备份包。旧作者的通过结果不替代这三次新执行。
+
+## 源码语义及官方文档
+
+ops/backup/main.go 不调用 DataRootLease acquisition。它以 store.Open 打开源；internal/store/sqlite.go 设置/验证 foreign_keys、WAL、FULL、busy_timeout=5000 并 quick_check，不能称为只读 URI。active workspace=0 时直接 Service.CreateBackup；大于0则 Host.New 后 CreateBackupWithWorkspaces。
+
+backup.go:380 执行 VACUUM INTO，之后 runtime、migration/schema、inventory、sealed BLOB、portable objects、queue 等都从该 snapshot DB 导出，并关闭/checkpoint snapshot 后加密；没有重读原业务 DB 导出这些内容。SQLite 官方说明 VACUUM INTO 可生成 live DB 的一致快照，未完成时的中断仍可能留下不完整输出。[VACUUM INTO](https://www.sqlite.org/lang_vacuum.html)
+
+WAL 的读事务保持自己的已提交视图，读写可并行，但 writer 仍串行；独立连接通常只见已提交事务。这些说明支持代码的 SQLite 快照设计；本次没有执行并发业务 writer，不把文档推断记成实测。[WAL](https://www.sqlite.org/wal.html)、[Isolation](https://www.sqlite.org/isolation.html)。官方浏览内容保存在006/020。
+
+Host.New 并非纯读：会 MkdirAll、privateDir 修改 DACL；打开 credentials/workspaces/selections 目录与 registry/vault/state；domain.NewCurrentMu→New 包含迁移安全检查、可能迁移与 session additive schema/fence事务。已有初始化夹具重复构造无差异不能保证任意实际根无副作用。固定 Main4f host.Config 没有名为 RuntimeAssetsRoot 的字段；实际 Core 资产在 apps/control/main.go:277-286 解析 runtimeAssetsDir/安装目录，再传 NewRuntimeSetup(...assets)。备份 CLI 的 generic Host config 不走该资产接线，因此尚未核验实际部署的配置等价性。
+
+SQLite 中的 workspace binding 来自 snapshot，但 native workspace 文件由 Host.SnapshotWorkspace 在其后逐文件读取，有 native pin、路径/文件/字节上限及身份检查；不能把它说成 SQLite 与所有变化中文件的统一原子快照。此 finite 小工作区没有并发外部文件写入。上限为8 roots、4096 files、4096 dirs、总256MiB、单文件16MiB，实际根资源是否符合未知。
+
+## Q03 历史复核
+
+作者 current24/88表 Q03 由当前 public Prepare/Begin/ObserveEffect 创建 UNKNOWN effect，并显式使用 fixture SQL 为 queue UNKNOWN 及 revoked binding 造状态；未借旧22版本复制后迁移冒充。独立只读查询确认源 Run QUEUED、effect UNKNOWN1、queue UNKNOWN1、control REQUESTED、binding REVOKED；恢复 Run/control RECONCILING、queue UNKNOWN1、binding REVOKED。
+
+原3条 resource_effects、原1条 client_control_receipts 及 uploaded_content 全部以完整行值保留于恢复结果；effect 追加一条 UNKNOWN、receipt 追加恢复记录。另执行生产 validateBackupQueue 中10条无参数绑定 SQL，源/恢复均0违规；完整生产 validator 的既有作者执行与真实CLI证据已 pin，不伪称这10条等于所有Go校验。未执行外部 provider 或 worker。此 synthetic 事实不能证明原实际 f3d raw3/ACK2/MODELCONFIRMED/costUNKNOWN 已具备备份资格。
+
+## 限制与证据完整性
+
+本次仅证明 live idle Host/SQLite + root lease + 小型 Host-pinned workspace 的 finite create/restore；未测试并发业务writer、任意并发workspace改动、真实worker/provider。实际root/workspace计数、尺寸上限、访问权限、source identity/config/assets、native accepted ID、key可用性及恢复授权均待独立实际资源范围。本复核不因未来实际资源未知否定已测Source能力，也不据fixture批准实际backup计划。
+
+旧作者195recipes/777files、freeze时193完整及随后自封完成194、bootstrap缺口与初始错误路径、25非零分组全部保留原口径，不重置、不重算。新失败诊断亦保留：001编码路径失败、014表数量口径断言、两次辅助rg错误路径、一次缺失作者文件读取、两次工具JS解析失败。它们与5项预期非零拒绝分别记录在 diagnostic-ledger.json。早期文字编码和首个web本地捕获边界如实记录，正确读取与官方引用有后续完整证据。
+
+可重建 Go cache 259672073 bytes 已仅从本支 ownTMP 删除；小型encrypted fixture、fresh keys、原生程序保留供Root复核。final manifest 不包括 key文件；receipts包含命令、原始输出、native exit、census/deltas、source/helper pins与测试矩阵。Root采纳属于下一步，本报告不写共享state。
+
+LEDGER_FILES ["diagnostic-ledger.json"]
+MANIFEST_META {"schema": "researchos.online-backup-independent-final.v1", "verdict": "LIMITED_FIXTURE_SOURCE_CAPABILITY_ACCEPTED", "actual_authority": false, "formal_increment": 0, "self_acceptance": false, "root_adoption_required": true, "source_commit": "4f4023c956f84d65743f39ce77d6c8899a21ada1", "scope_sha256": "b6cfd9fdd2406ae771e6a8949dedba611dc0764bd4671747c49a654c208c45a3", "command_records": 53, "all_native_captures_closed": true, "file_count": 258, "files": {"type": "list", "count": 258}, "excluded": {"type": "list", "count": 2}, "sealed_at": "2026-10-15T14:33:15.6900678Z"}
+VERIFICATION {"ref": {"path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\resume_cp398_codex\\20261015-current-chat\\backup-review-root-input-verification.json", "sha256": "925b251b70a9bc1f0bab5d3b4353aa6733844852af99ec684cc75a59ba20e3a9", "bytes": 82612}, "verified": 258, "unresolved": []}

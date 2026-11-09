@@ -1,0 +1,55 @@
+{
+  "schema": "researchos.systemdrive-rootcause-readonly/1",
+  "decision": "SUPPORT_MINIMAL_ENV_ONLY_SOURCE_LEASE_NOT_RUNTIME_EXECUTION",
+  "d_source_modified": false,
+  "app_or_model_or_test_run": false,
+  "cache_db_opened": false,
+  "bundle_modified_or_deleted": false,
+  "reported_actual_evidence": {
+    "origin": "Root actual diagnostic03, f13closed89e8a4",
+    "status": "BUNDLE_UNLISTED_PATH_BEFORE_SDK_APP_START",
+    "listed_files_sha_unchanged": 134,
+    "new_unlisted_path_prefix": "%SystemDrive%/ProgramData/Microsoft/Windows/Caches/",
+    "new_file_sizes": [16384, 309072, 1240, 662488],
+    "stop_confirmed": true,
+    "forced_kill": 0,
+    "new_state_root_created": false,
+    "independently_opened_db_or_replayed_run": false,
+    "evidence_limit": "These actual metadata were supplied by Root. This source review did not inspect cache DB contents, recursively rescan the bundle, or establish the precise OS writer."
+  },
+  "confirmed_source_chain": [
+    {"path":"apps/desktop/main/lib/desktop-management.js","lines":"793-802","finding":"Managed Core environment is rebuilt from a case-normalized allowlist. SystemDrive is absent even when the parent environment supplies it.","sha256":"ae9bfb0d2f37db6d6eced30b56a47b90b7119e483a91e66368c484ed57172060"},
+    {"path":"apps/desktop/main/lib/desktop-management.js","lines":"430,437-439","finding":"Core spawn receives the filtered environment and options.cwd verbatim."},
+    {"path":"apps/desktop/main/main.js","lines":"228-231","finding":"Main explicitly selects cwd=REPO. Packaged layout makes REPO the sealed bundle root.","sha256":"4761dd35e6fba99cefbf340181053e1264f76fb7326f27823c2db32724f57f5a"},
+    {"path":"internal/host/native_folder_windows.go","lines":"67-106","finding":"Native folder choice initializes COM and calls SHBrowseForFolderW within Core itself, using Core process environment/cwd."},
+    {"path":"C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-real-electron-harness-prepare/real-electron-flow.mjs","lines":"31-53,179","finding":"The already registered public controller template also omits SystemDrive and launches Electron with cwd=bundle.bundle.","sha256":"4524561f6e2a5edf1b888851e510e8ef58790fa12358a5359feb1c36bb0aebf2"},
+    {"path":"apps/desktop/launch-development.mjs","lines":"152-183,224,238","finding":"The standard launcher also rebuilds an environment without SystemDrive, and uses the bundle cwd. It is outside the proposed minimal slice."},
+    {"path":"adapters/runtime/runtime_windows.go","lines":"520-531","finding":"The separate Go Harness child environment also omits SystemDrive. This is not the direct path of the in-Core folder Shell UI and remains outside this minimal slice.","sha256":"a21ca4dd3f88f3b76ce0a68ceebf5247e4124e07ae9bcdf200d3bf196ef0adc1"}
+  ],
+  "rootcause_assessment": {
+    "source_defect_confirmed": "SystemDrive is dropped from managed Core environment.",
+    "causal_inference": "A Windows Shell component using an unexpanded %SystemDrive%-based cache location could treat the literal path as relative to Core cwd, explaining the new prefix beneath the bundle after folder choice.",
+    "not_proven": "No OS expansion API, Shell action, cache DB parser or process-write tracer was run. The exact internal expansion call and writer are not independently established."
+  },
+  "cwd_migration_blocker": {
+    "desktop_precreates_data_root": false,
+    "controller_precreates_data_root": false,
+    "data_root_creation_proof": "apps/control/main.go:103 calls rt.AcquireDataRootLease after process startup; adapters/runtime/data_root_windows.go:25 calls LockDataRoot; adapters/runtime/bridge_windows.go:165-177 creates the absolute root with os.MkdirAll then checks canonical/non-reparse layout and locks coordinator.lock.",
+    "absolute_managed_inputs": "Installed controlExe/verifier executable+manifest/runtimeAssetsDir are validated absolute by installedResources/exactFile. dataRoot/discoveryFile/webDir are checked absolute by Desktop start. Their explicit flags and environment paths can survive a cwd move.",
+    "remaining_relative_inputs": ["apps/control/main.go:128 migrations/sqlite/0001_bootstrap.sql", "apps/control/main.go:131 spec/v2.0/contracts and migrations/sqlite/0002_domain.sql", "apps/control/main.go:222 Host ContractsDir/MigrationFile/SchemaDir under spec, migrations and internal/api/contracts"],
+    "existing_root_compensation_found": false,
+    "decision": "Keep Core cwd unchanged in this slice. Moving it to dataRoot would break real startup until a separately scoped absolute-resource change and prelaunch directory lifecycle exist. Do not copy contracts into user data or weaken resource validation as a workaround."
+  },
+  "minimum_source_lease": {
+    "production": ["apps/desktop/main/lib/desktop-management.js"],
+    "test": ["tests/ui/desktop/managed-environment.test.mjs"],
+    "test_baseline_sha256": "8d1613eaa2509ff03aa81e202436b517942b25830203c5d9aa10ce246c6aa474",
+    "changes": ["Validate the selected case-normalized SystemRoot as a nonempty drive-rooted Windows system path, rejecting relative/UNC/device/unexpanded/NUL values; if WINDIR is also supplied require the same normalized system directory.", "Derive exactly one canonical SystemDrive such as C: from that validated SystemRoot volume. Never derive from D: bundle/dataRoot/cwd and never copy ambient SystemDrive.", "Preserve sensitive-variable filtering, case-collision rejection, explicit owned data/web/listen overrides and all Native identity/pipe/Job/stop checks.", "Keep Core cwd and installed-resource resolution unchanged."],
+    "preconditions": ["Root registers a new isolated worktree/scope and exact baseline pins before D writes.", "The validation behavior for absent/invalid SystemRoot is explicit and fail-closed before spawn; update existing synthetic environment fixtures with a valid public OS root while preserving their original optional-home/PATH assertions.", "Existing old bundle, diagnostic03, listed/unlisted guard and all old source/evidence freezes remain immutable."]
+  },
+  "tests_after_lease": ["Actual managedControlEnvironment: SystemRoot=C:\\Windows and bundle/dataRoot D: derives SystemDrive=C:.", "Malicious ambient SystemDrive/alternate case values cannot override the derived drive; ambient API keys, proxy, NODE_OPTIONS, CODEX_HOME and RESEARCHOS overrides remain dropped.", "Mixed-case SystemRoot works; duplicates, conflicting WINDIR, missing/relative/UNC/device/NUL/unexpanded roots fail safely.", "Existing managed-environment and relevant pure startup/management compatibility remain intact. No Native Shell UI or model execution is part of author tests."],
+  "separate_controller_change": "Root should copy to a new controller revision, derive SystemDrive from the same validated public SystemRoot and set Electron launch cwd=the owned existing run_root. Core still has Main's explicit REPO cwd; do not claim full Core cwd isolation. Use a fresh valid bundle; never relax BUNDLE_UNLISTED_PATH or delete the poisoned old bundle.",
+  "diagnostics": [{"origin":"ee82c4/f0a97e/312f34","classification":"READONLY_SOURCE_PATH_DISCOVERY_MISS","detail":"Early narrow rg requests guessed cmd/control/main.go, cmd/ and data_root.go, which are absent. Corrected using actual apps/control/main.go and rg-discovered runtime data_root_windows.go/bridge_windows.go; no source/test/runtime mutation."}, {"origin":"29fd39","classification":"READONLY_OUTPUT_TRUNCATED","detail":"An overbroad C evidence text search returned truncated output. No cause or pin was inferred from it; conclusions rely on subsequent exact source reads and the explicit public controller template only."}],
+  "formal_increment": 0,
+  "product_acceptance_increment": 0
+}

@@ -1,0 +1,633 @@
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\libc.go HASH 312b4fa5adc3cb80988aec2aa2650e85e71dcf86d2321ebcee4242a93c976646
+40: )
+41: 
+42: const (
+43: 	ENOENT = errno.ENOENT
+44: )
+45: 
+46: type (
+47: 	// RawMem64 represents the biggest uint64 array the runtime can handle.
+48: 	RawMem64 [unsafe.Sizeof(RawMem{}) / unsafe.Sizeof(uint64(0))]uint64
+49: )
+50: 
+51: var (
+52: 	allocMu            sync.Mutex
+53: 	environInitialized bool
+54: 	isWindows          bool
+55: 	ungetcMu           sync.Mutex
+56: 	ungetc             = map[uintptr]byte{}
+57: )
+58: 
+59: // Keep these outside of the var block otherwise go generate will miss them.
+60: var Xenviron uintptr
+61: var Xstdin = newFile(nil, unistd.STDIN_FILENO)
+62: var Xstdout = newFile(nil, unistd.STDOUT_FILENO)
+63: var Xstderr = newFile(nil, unistd.STDERR_FILENO)
+64: 
+65: func setEnviron() {
+66: 	SetEnviron(nil, os.Environ())
+67: }
+68: 
+69: func Environ() uintptr {
+70: 	if !environInitialized {
+71: 		SetEnviron(nil, os.Environ())
+72: 	}
+73: 	return Xenviron
+74: }
+75: 
+76: func EnvironP() uintptr {
+77: 	if !environInitialized {
+78: 		SetEnviron(nil, os.Environ())
+79: 	}
+80: 	return uintptr(unsafe.Pointer(&Xenviron))
+81: }
+82: 
+83: func X___errno_location(t *TLS) uintptr {
+84: 	if __ccgo_strace {
+85: 		trc("t=%v, (%v:)", t, origin(2))
+86: 	}
+87: 	return X__errno_location(t)
+88: }
+89: 
+90: // int * __errno_location(void);
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\libc_windows.go HASH cb863451675c6e3664c8eb403ad9e775eecb18c45c6419d523f24e8b1c5d3164
+25: 	"github.com/ncruces/go-strftime"
+26: 	"golang.org/x/sys/windows"
+27: 	"modernc.org/libc/errno"
+28: 	"modernc.org/libc/fcntl"
+29: 	"modernc.org/libc/limits"
+30: 	"modernc.org/libc/stdio"
+31: 	"modernc.org/libc/sys/stat"
+32: 	"modernc.org/libc/sys/types"
+33: 	"modernc.org/libc/time"
+34: 	"modernc.org/libc/unistd"
+35: )
+36: 
+37: // Keep these outside of the var block otherwise go generate will miss them.
+38: var X__imp__environ = EnvironP()
+39: var X__imp__wenviron = uintptr(unsafe.Pointer(&wenviron))
+40: var X_imp___environ = EnvironP()
+41: var X_imp___wenviron = uintptr(unsafe.Pointer(&wenviron))
+42: var X_iob [stdio.X_IOB_ENTRIES]stdio.FILE
+43: var Xin6addr_any [16]byte
+44: var Xtimezone long // extern long timezone;
+45: 
+46: type Tsize_t = types.Size_t
+47: 
+48: var (
+49: 	iobMap     = map[uintptr]int32{} // &_iob[fd] -> fd
+50: 	wenvValid  bool
+51: 	wenviron   uintptr // &winEnviron[0]
+52: 	winEnviron = []uintptr{0}
+53: )
+54: 
+55: func init() {
+56: 	for i := range X_iob {
+57: 		iobMap[uintptr(unsafe.Pointer(&X_iob[i]))] = int32(i)
+58: 	}
+59: }
+60: 
+61: func X__p__wenviron(t *TLS) uintptr {
+62: 	if !wenvValid {
+63: 		bootWinEnviron(t)
+64: 	}
+65: 	return uintptr(unsafe.Pointer(&wenviron))
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\libc_windows.go HASH cb863451675c6e3664c8eb403ad9e775eecb18c45c6419d523f24e8b1c5d3164
+260: 	procWmkdir          = moducrt.NewProc("_wmkdir")
+261: 	procWstat32         = moducrt.NewProc("_wstat32")
+262: 	procWstat64i32      = moducrt.NewProc("_wstat64i32")
+263: )
+264: 
+265: var (
+266: 	threadCallback uintptr
+267: )
+268: 
+269: func init() {
+270: 	isWindows = true
+271: 	threadCallback = windows.NewCallback(ThreadProc)
+272: }
+273: 
+274: // ---------------------------------
+275: // Windows filehandle-to-fd mapping
+276: // so the lib-c interface contract looks
+277: // like normal fds being passed around
+278: // but we're mapping them back and forth to
+279: // native windows file handles (windows.Handle)
+280: //
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\libc_windows.go HASH cb863451675c6e3664c8eb403ad9e775eecb18c45c6419d523f24e8b1c5d3164
+363: func newFile(t *TLS, fd int32) uintptr {
+364: 
+365: 	if fd == unistd.STDIN_FILENO {
+366: 		h, err := windows.GetStdHandle(windows.STD_INPUT_HANDLE)
+367: 		if err != nil {
+368: 			panic("no console")
+369: 		}
+370: 		return addFile(h, fd)
+371: 	}
+372: 	if fd == unistd.STDOUT_FILENO {
+373: 		h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
+374: 		if err != nil {
+375: 			panic("no console")
+376: 		}
+377: 		return addFile(h, fd)
+378: 	}
+379: 	if fd == unistd.STDERR_FILENO {
+380: 		h, err := windows.GetStdHandle(windows.STD_ERROR_HANDLE)
+381: 		if err != nil {
+382: 			panic("no console")
+383: 		}
+384: 		return addFile(h, fd)
+385: 	}
+386: 
+387: 	// should not get here -- unless newFile
+388: 	// is being used from somewhere we don't know about
+389: 	// to originate fds.
+390: 
+391: 	panic("unknown fd source")
+392: 	return 0
+393: }
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\pthread.go HASH c7b35c2e527d058dfd6729ddaccae124d4453612a73c85708ba2e50eb59a1aed
+40: 	allocaStack [][]uintptr
+41: 	allocas     []uintptr
+42: 	jumpBuffers []uintptr
+43: 	lastError   uint32
+44: 	pthreadData
+45: 	sp    int
+46: 	stack stackHeader
+47: 
+48: 	ID                 int32
+49: 	reentryGuard       int32 // memgrind
+50: 	stackHeaderBalance int32
+51: }
+52: 
+53: var errno0 int32 // Temp errno for NewTLS
+54: 
+55: func NewTLS() *TLS {
+56: 	return newTLS(false)
+57: }
+58: 
+59: func newTLS(detached bool) *TLS {
+60: 	id := atomic.AddInt32(&tid, 1)
+61: 	t := &TLS{ID: id, errnop: uintptr(unsafe.Pointer(&errno0))}
+62: 	t.pthreadData.init(t, detached)
+63: 	if memgrind {
+64: 		atomic.AddInt32(&tlsBalance, 1)
+65: 	}
+66: 	t.errnop = t.Alloc(int(unsafe.Sizeof(int32(0))))
+67: 	*(*int32)(unsafe.Pointer(t.errnop)) = 0
+68: 	return t
+69: }
+70: 
+71: // StackSlots reports the number of tls stack slots currently in use.
+72: func (tls *TLS) StackSlots() int {
+73: 	return tls.sp
+74: }
+75: 
+76: func (t *TLS) alloca(n size_t) (r uintptr) {
+77: 	r = Xmalloc(t, n)
+78: 	t.allocas = append(t.allocas, r)
+79: 	return r
+80: }
+81: 
+82: func (t *TLS) FreeAlloca() func() {
+83: 	t.allocaStack = append(t.allocaStack, t.allocas)
+84: 	t.allocas = nil
+85: 	return func() {
+86: 		for _, v := range t.allocas {
+87: 			Xfree(t, v)
+88: 		}
+89: 		n := len(t.allocaStack)
+90: 		t.allocas = t.allocaStack[n-1]
+91: 		t.allocaStack = t.allocaStack[:n-1]
+92: 	}
+93: }
+94: 
+95: // PushJumpBuffer arms jb, which stays armed until the matching PopJumpBuffer or
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\etc.go HASH 01c214eab1d31834772c313891cc6315f256034debf7ad6b49616ce7f64534b7
+185: 		}()
+186: 	}
+187: 	// if dmesgs {
+188: 	// 	dmesg("%v: %T(%v)\n%s", origin(1), err, err, debug.Stack())
+189: 	// }
+190: again:
+191: 	switch x := err.(type) {
+192: 	case int:
+193: 		*(*int32)(unsafe.Pointer(t.errnop)) = int32(x)
+194: 	case int32:
+195: 		*(*int32)(unsafe.Pointer(t.errnop)) = x
+196: 	case *os.PathError:
+197: 		err = x.Err
+198: 		goto again
+199: 	case syscallErrno:
+200: 		*(*int32)(unsafe.Pointer(t.errnop)) = int32(x)
+201: 	case *os.SyscallError:
+202: 		err = x.Err
+203: 		goto again
+204: 	default:
+205: 		panic(todo("%T", x))
+206: 	}
+207: }
+208: 
+209: // Close frees the resources of t.
+210: func (t *TLS) Close() {
+211: 	t.Free(int(unsafe.Sizeof(int32(0))))
+212: 	if memgrind {
+213: 		if t.stackHeaderBalance != 0 {
+214: 			panic(todo("non zero stack header balance: %d", t.stackHeaderBalance))
+215: 		}
+216: 
+217: 		atomic.AddInt32(&tlsBalance, -1)
+218: 	}
+219: 	t.pthreadData.close(t)
+220: 	*t = TLS{}
+221: }
+222: 
+223: // Alloc allocates n bytes of thread-local storage. It must be paired with a
+224: // call to t.Free(n), using the same n. The order matters. This is ok:
+225: //
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\libc@v1.77.1\mem.go HASH 981b610a56d1c091695c52ef08552b33c28723799d33719bb83c3ff324530434
+1: // Copyright 2021 The Libc Authors. All rights reserved.
+2: // Use of this source code is governed by a BSD-style
+3: // license that can be found in the LICENSE file.
+4: 
+5: //go:build !libc.membrk && !libc.memgrind && !(linux && (amd64 || arm64 || loong64 || ppc64le || s390x || riscv64 || 386 || arm))
+6: 
+7: package libc // import "modernc.org/libc"
+8: 
+9: import (
+10: 	"math"
+11: 	"math/bits"
+12: 
+13: 	"modernc.org/libc/errno"
+14: 	"modernc.org/libc/sys/types"
+15: 	"modernc.org/memory"
+16: )
+17: 
+18: const memgrind = false
+19: 
+20: var (
+21: 	allocator memory.Allocator
+22: )
+23: 
+24: // void *malloc(size_t size);
+25: func Xmalloc(t *TLS, n types.Size_t) uintptr {
+26: 	if __ccgo_strace {
+27: 		trc("t=%v n=%v, (%v:)", t, n, origin(2))
+28: 	}
+29: 	if n == 0 {
+30: 		// malloc(0) should return unique pointers
+31: 		// (often expected and gnulib replaces malloc if malloc(0) returns 0)
+32: 		n = 1
+33: 	}
+34: 
+35: 	allocMu.Lock()
+36: 
+37: 	defer allocMu.Unlock()
+38: 
+39: 	p, err := allocator.UintptrMalloc(int(n))
+40: 	if err != nil {
+41: 		t.setErrno(errno.ENOMEM)
+42: 		return 0
+43: 	}
+44: 
+45: 	return p
+46: }
+47: 
+48: // void *calloc(size_t nmemb, size_t size);
+49: func Xcalloc(t *TLS, n, size types.Size_t) uintptr {
+50: 	if __ccgo_strace {
+51: 		trc("t=%v n=%v size=%v, (%v:)", t, n, size, origin(2))
+52: 	}
+53: 	hi, rq0 := bits.Mul(uint(n), uint(size))
+54: 	if hi != 0 || rq0 > math.MaxInt {
+55: 		t.setErrno(errno.ENOMEM)
+56: 		return 0
+57: 	}
+58: 	rq := int(rq0)
+59: 	if rq == 0 {
+60: 		rq = 1
+61: 	}
+62: 
+63: 	allocMu.Lock()
+64: 
+65: 	defer allocMu.Unlock()
+66: 
+67: 	p, err := allocator.UintptrCalloc(rq)
+68: 	if err != nil {
+69: 		t.setErrno(errno.ENOMEM)
+70: 		return 0
+71: 	}
+72: 
+73: 	return p
+74: }
+75: 
+76: // void *realloc(void *ptr, size_t size);
+77: func Xrealloc(t *TLS, ptr uintptr, size types.Size_t) uintptr {
+78: 	if __ccgo_strace {
+79: 		trc("t=%v ptr=%v size=%v, (%v:)", t, ptr, size, origin(2))
+80: 	}
+81: 	allocMu.Lock()
+82: 
+83: 	defer allocMu.Unlock()
+84: 
+85: 	p, err := allocator.UintptrRealloc(ptr, int(size))
+86: 	if err != nil {
+87: 		t.setErrno(errno.ENOMEM)
+88: 		return 0
+89: 	}
+90: 
+91: 	return p
+92: }
+93: 
+94: // void free(void *ptr);
+95: func Xfree(t *TLS, p uintptr) {
+96: 	if __ccgo_strace {
+97: 		trc("t=%v p=%v, (%v:)", t, p, origin(2))
+98: 	}
+99: 	if p == 0 {
+100: 		return
+101: 	}
+102: 
+103: 	allocMu.Lock()
+104: 
+105: 	defer allocMu.Unlock()
+106: 
+107: 	allocator.UintptrFree(p)
+108: }
+109: 
+110: func Xmalloc_usable_size(tls *TLS, p uintptr) (r types.Size_t) {
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\sqlite@v1.60.1\lib\mutex.go HASH efde48ba9080edc6bdd5b200a360fec3d52c07f53e1801df3787f3e82135e104
+1: // Copyright 2021 The Sqlite Authors. All rights reserved.
+2: // Use of this source code is governed by a BSD-style
+3: // license that can be found in the LICENSE file.
+4: 
+5: //go:build !linux
+6: 
+7: package sqlite3
+8: 
+9: import (
+10: 	"fmt"
+11: 	"sync"
+12: 	"sync/atomic"
+13: 	"unsafe"
+14: 
+15: 	"modernc.org/libc"
+16: 	"modernc.org/libc/sys/types"
+17: )
+18: 
+19: func init() {
+20: 	tls := libc.NewTLS()
+21: 	if Xsqlite3_threadsafe(tls) == 0 {
+22: 		panic(fmt.Errorf("sqlite: thread safety configuration error"))
+23: 	}
+24: 
+25: 	varArgs := libc.Xmalloc(tls, types.Size_t(unsafe.Sizeof(uintptr(0))))
+26: 	if varArgs == 0 {
+27: 		panic(fmt.Errorf("cannot allocate memory"))
+28: 	}
+29: 
+30: 	// int sqlite3_config(int, ...);
+31: 	if rc := Xsqlite3_config(tls, SQLITE_CONFIG_MUTEX, libc.VaList(varArgs, uintptr(unsafe.Pointer(&mutexMethods)))); rc != SQLITE_OK {
+32: 		p := Xsqlite3_errstr(tls, rc)
+33: 		str := libc.GoString(p)
+34: 		panic(fmt.Errorf("sqlite: failed to configure mutex methods: %v", str))
+35: 	}
+36: 
+37: 	libc.Xfree(tls, varArgs)
+38: 	tls.Close()
+39: }
+40: 
+41: var (
+42: 	mutexMethods = Sqlite3_mutex_methods{
+43: 		FxMutexInit: *(*uintptr)(unsafe.Pointer(&struct{ f func(*libc.TLS) int32 }{mutexInit})),
+44: 		FxMutexEnd:  *(*uintptr)(unsafe.Pointer(&struct{ f func(*libc.TLS) int32 }{mutexEnd})),
+45: 		FxMutexAlloc: *(*uintptr)(unsafe.Pointer(&struct {
+46: 			f func(*libc.TLS, int32) uintptr
+47: 		}{mutexAlloc})),
+48: 		FxMutexFree:  *(*uintptr)(unsafe.Pointer(&struct{ f func(*libc.TLS, uintptr) }{mutexFree})),
+49: 		FxMutexEnter: *(*uintptr)(unsafe.Pointer(&struct{ f func(*libc.TLS, uintptr) }{mutexEnter})),
+50: 		FxMutexTry: *(*uintptr)(unsafe.Pointer(&struct {
+51: 			f func(*libc.TLS, uintptr) int32
+52: 		}{mutexTry})),
+53: 		FxMutexLeave: *(*uintptr)(unsafe.Pointer(&struct{ f func(*libc.TLS, uintptr) }{mutexLeave})),
+54: 		FxMutexHeld: *(*uintptr)(unsafe.Pointer(&struct {
+55: 			f func(*libc.TLS, uintptr) int32
+56: 		}{mutexHeld})),
+57: 		FxMutexNotheld: *(*uintptr)(unsafe.Pointer(&struct {
+58: 			f func(*libc.TLS, uintptr) int32
+59: 		}{mutexNotheld})),
+60: 	}
+61: 
+62: 	mutexApp10   mutex
+63: 	mutexApp20   mutex
+64: 	mutexApp30   mutex
+65: 	mutexLRU0    mutex
+66: 	mutexMaster0 mutex
+67: 	mutexMem0    mutex
+68: 	mutexOpen0   mutex
+69: 	mutexPMem0   mutex
+70: 	mutexPRNG0   mutex
+71: 	mutexVFS10   mutex
+72: 	mutexVFS20   mutex
+73: 	mutexVFS30   mutex
+74: 
+75: 	mutexApp1   = uintptr(unsafe.Pointer(&mutexApp10))
+76: 	mutexApp2   = uintptr(unsafe.Pointer(&mutexApp20))
+77: 	mutexApp3   = uintptr(unsafe.Pointer(&mutexApp30))
+78: 	mutexLRU    = uintptr(unsafe.Pointer(&mutexLRU0))
+79: 	mutexMaster = uintptr(unsafe.Pointer(&mutexMaster0))
+80: 	mutexMem    = uintptr(unsafe.Pointer(&mutexMem0))
+81: 	mutexOpen   = uintptr(unsafe.Pointer(&mutexOpen0))
+82: 	mutexPMem   = uintptr(unsafe.Pointer(&mutexPMem0))
+83: 	mutexPRNG   = uintptr(unsafe.Pointer(&mutexPRNG0))
+84: 	mutexVFS1   = uintptr(unsafe.Pointer(&mutexVFS10))
+85: 	mutexVFS2   = uintptr(unsafe.Pointer(&mutexVFS20))
+86: 	mutexVFS3   = uintptr(unsafe.Pointer(&mutexVFS30))
+87: )
+88: 
+89: type mutex struct {
+90: 	sync.Mutex
+91: 	cnt       int32
+92: 	id        int32 // tls.ID
+93: 	recursive bool
+94: }
+95: 
+96: // int (*xMutexInit)(void);
+97: //
+98: // The xMutexInit method defined by this structure is invoked as part of system
+99: // initialization by the sqlite3_initialize() function. The xMutexInit routine
+100: // is called by SQLite exactly once for each effective call to
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\sqlite@v1.60.1\lib\sqlite.go HASH 17cce24fa2c422a0b6cfa6511193d174b98819ef6b56223977411afc6bc2754c
+13888: const __UINT_LEAST32_MAX__ = 4294967295
+13889: 
+13890: const __UINT_LEAST64_MAX__ = 18446744073709551615
+13891: 
+13892: const __UINT_LEAST8_MAX__ = 255
+13893: 
+13894: const __bf16 = "short"
+13895: 
+13896: func __ccgo_fp(f interface{}) uintptr {
+13897: 	type iface [2]uintptr
+13898: 	return (*iface)(unsafe.Pointer(&f))[1]
+13899: }
+13900: 
+13901: var __ccgo_ts = (*reflect.StringHeader)(unsafe.Pointer(&__ccgo_ts1)).Data
+13902: 
+13903: func __ccgo_up(n uintptr) unsafe.Pointer {
+13904: 	return unsafe.Pointer(&n)
+13905: }
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\sqlite@v1.60.1\lib\sqlite_windows.go HASH 4bd37c8278b040a0e02f2c80714af515482c6b4447d1c18788211295e039ee3e
+5105: func Xsqlite3_config(tls *libc.TLS, op int32, va uintptr) (r int32) {
+5106: 	var ap Tva_list
+5107: 	var bOpenUri, rc int32
+5108: 	var mxMmap, szMmap Tsqlite3_int64
+5109: 	var pLogArg, pVal, xLog uintptr
+5110: 	_, _, _, _, _, _, _, _ = ap, bOpenUri, mxMmap, pLogArg, pVal, rc, szMmap, xLog
+5111: 	rc = SQLITE_OK
+5112: 	/* sqlite3_config() normally returns SQLITE_MISUSE if it is invoked while
+5113: 	 ** the SQLite library is in use.  Except, a few selected opcodes
+5114: 	 ** are allowed.
+5115: 	 */
+5116: 	if libc.AtomicLoadPInt32(uintptr(unsafe.Pointer(&_sqlite3Config))+340) != 0 {
+5117: 		if op < 0 || op > int32(63) || libc.Uint64FromInt32(1)<<op&_mAnytimeConfigOption == uint64(0) {
+5118: 			return _sqlite3MisuseError(tls, int32(188230))
+5119: 		}
+5120: 	}
+5121: 	ap = va
+5122: 	switch op {
+5123: 	/* Mutex configuration options are only available in a threadsafe
+5124: 	 ** compile.
+5125: 	 */
+5126: 	case int32(SQLITE_CONFIG_SINGLETHREAD):
+5127: 		/* EVIDENCE-OF: R-02748-19096 This option sets the threading mode to
+5128: 		 ** Single-thread. */
+5129: 		_sqlite3Config.FbCoreMutex = uint8(0) /* Disable mutex on core */
+5130: 		_sqlite3Config.FbFullMutex = uint8(0) /* Disable mutex on connections */
+5131: 	case int32(SQLITE_CONFIG_MULTITHREAD):
+5132: 		/* EVIDENCE-OF: R-14374-42468 This option sets the threading mode to
+5133: 		 ** Multi-thread. */
+5134: 		_sqlite3Config.FbCoreMutex = uint8(1) /* Enable mutex on core */
+5135: 		_sqlite3Config.FbFullMutex = uint8(0) /* Disable mutex on connections */
+5136: 	case int32(SQLITE_CONFIG_SERIALIZED):
+5137: 		/* EVIDENCE-OF: R-41220-51800 This option sets the threading mode to
+5138: 		 ** Serialized. */
+5139: 		_sqlite3Config.FbCoreMutex = uint8(1) /* Enable mutex on core */
+5140: 		_sqlite3Config.FbFullMutex = uint8(1) /* Enable mutex on connections */
+5141: 	case int32(SQLITE_CONFIG_MUTEX):
+5142: 		/* Specify an alternative mutex implementation */
+5143: 		_sqlite3Config.Fmutex = **(**Tsqlite3_mutex_methods)(__ccgo_up(libc.VaUintptr(&ap)))
+5144: 	case int32(SQLITE_CONFIG_GETMUTEX):
+5145: 		/* Retrieve the current mutex implementation */
+5146: 		**(**Tsqlite3_mutex_methods)(__ccgo_up(libc.VaUintptr(&ap))) = _sqlite3Config.Fmutex
+5147: 	case int32(SQLITE_CONFIG_MALLOC):
+5148: 		/* EVIDENCE-OF: R-55594-21030 The SQLITE_CONFIG_MALLOC option takes a
+5149: 		 ** single argument which is a pointer to an instance of the
+5150: 		 ** sqlite3_mem_methods structure. The argument specifies alternative
+5151: 		 ** low-level memory allocation routines to be used in place of the memory
+5152: 		 ** allocation routines built into SQLite. */
+5153: 		_sqlite3Config.Fm = **(**Tsqlite3_mem_methods)(__ccgo_up(libc.VaUintptr(&ap)))
+5154: 	case int32(SQLITE_CONFIG_GETMALLOC):
+5155: 		/* EVIDENCE-OF: R-51213-46414 The SQLITE_CONFIG_GETMALLOC option takes a
+5156: 		 ** single argument which is a pointer to an instance of the
+5157: 		 ** sqlite3_mem_methods structure. The sqlite3_mem_methods structure is
+5158: 		 ** filled with the currently defined memory allocation routines. */
+5159: 		if _sqlite3Config.Fm.FxMalloc == uintptr(0) {
+5160: 			_sqlite3MemSetDefault(tls)
+5161: 		}
+5162: 		**(**Tsqlite3_mem_methods)(__ccgo_up(libc.VaUintptr(&ap))) = _sqlite3Config.Fm
+5163: 	case int32(SQLITE_CONFIG_MEMSTATUS):
+5164: 		/* Cannot change at runtime */
+5165: 		/* EVIDENCE-OF: R-61275-35157 The SQLITE_CONFIG_MEMSTATUS option takes
+5166: 		 ** single argument of type int, interpreted as a boolean, which enables
+5167: 		 ** or disables the collection of memory allocation statistics. */
+5168: 		_sqlite3Config.FbMemstat = libc.VaInt32(&ap)
+5169: 	case int32(SQLITE_CONFIG_SMALL_MALLOC):
+5170: 		_sqlite3Config.FbSmallMalloc = uint8(libc.VaInt32(&ap))
+5171: 	case int32(SQLITE_CONFIG_PAGECACHE):
+5172: 		/* EVIDENCE-OF: R-18761-36601 There are three arguments to
+5173: 		 ** SQLITE_CONFIG_PAGECACHE: A pointer to 8-byte aligned memory (pMem),
+5174: 		 ** the size of each page cache line (sz), and the number of cache lines
+5175: 		 ** (N). */
+5176: 		_sqlite3Config.FpPage = libc.VaUintptr(&ap)
+5177: 		_sqlite3Config.FszPage = libc.VaInt32(&ap)
+5178: 		_sqlite3Config.FnPage = libc.VaInt32(&ap)
+5179: 	case int32(SQLITE_CONFIG_PCACHE_HDRSZ):
+5180: 		/* EVIDENCE-OF: R-39100-27317 The SQLITE_CONFIG_PCACHE_HDRSZ option takes
+5181: 		 ** a single parameter which is a pointer to an integer and writes into
+5182: 		 ** that integer the number of extra bytes per page required for each page
+5183: 		 ** in SQLITE_CONFIG_PAGECACHE. */
+5184: 		**(**int32)(__ccgo_up(libc.VaUintptr(&ap))) = _sqlite3HeaderSizeBtree(tls) + _sqlite3HeaderSizePcache(tls) + _sqlite3HeaderSizePcache1(tls)
+5185: 	case int32(SQLITE_CONFIG_PCACHE):
+5186: 		/* no-op */
+5187: 	case int32(SQLITE_CONFIG_GETPCACHE):
+5188: 		/* now an error */
+5189: 		rc = int32(SQLITE_ERROR)
+5190: 	case int32(SQLITE_CONFIG_PCACHE2):
+5191: 		/* EVIDENCE-OF: R-63325-48378 The SQLITE_CONFIG_PCACHE2 option takes a
+5192: 		 ** single argument which is a pointer to an sqlite3_pcache_methods2
+5193: 		 ** object. This object specifies the interface to a custom page cache
+5194: 		 ** implementation. */
+5195: 		_sqlite3Config.Fpcache2 = **(**Tsqlite3_pcache_methods2)(__ccgo_up(libc.VaUintptr(&ap)))
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\sqlite@v1.60.1\lib\hooks.go HASH f409885d5320894ee49b3b2757e78a04392d388511ec92e1a0cb9732385901bb
+1: // Copyright 2019 The Sqlite Authors. All rights reserved.
+2: // Use of this source code is governed by a BSD-style
+3: // license that can be found in the LICENSE file.
+4: 
+5: //go:build !(linux && arm64)
+6: 
+7: package sqlite3
+8: 
+9: import (
+10: 	"modernc.org/libc"
+11: )
+12: 
+13: // Format and write a message to the log if logging is enabled.
+14: func X__ccgo_sqlite3_log(t *libc.TLS, iErrCode int32, zFormat uintptr, va uintptr) { /* sqlite3.c:29405:17: */
+15: 	libc.X__ccgo_sqlite3_log(t, iErrCode, zFormat, va)
+16: }
+17: 
+18: func PatchIssue199() {
+19: 	// nop
+20: }
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\modernc.org\sqlite@v1.60.1\driver.go HASH 5b0b9aa8b86b6c7946c5dba22b666a17140c202d564b81c4d9aa1a664f4a3276
+50: //
+51: // Constructing one is supported for the private-registration pattern: a driver
+52: // registered under a name of its own with sql.Register, so that its functions,
+53: // collations, modules and connection hooks apply to its own connections rather
+54: // than to every connection in the process. Prefer sql.Open or NewConnector for
+55: // anything else.
+56: type Driver struct {
+57: 	// mu guards the registration state below against concurrent
+58: 	// registrations. Open reads that state without it, which the ordering
+59: 	// requirement in the type documentation makes safe.
+60: 	mu sync.Mutex
+61: 	// user defined functions that are added to every new connection on Open
+62: 	udfs map[string]*userDefinedFunction
+63: 	// collations that are added to every new connection on Open
+64: 	collations map[string]*collation
+65: 	// connection hooks are called after a connection is opened
+66: 	connectionHooks []ConnectionHookFn
+67: 	// modules holds registered virtual table modules that should be added to
+68: 	// every new connection on Open.
+69: 	modules map[string]vtab.Module
+70: }
+71: 
+72: var d = &Driver{
+73: 	udfs:            make(map[string]*userDefinedFunction, 0),
+74: 	collations:      make(map[string]*collation, 0),
+75: 	connectionHooks: make([]ConnectionHookFn, 0),
+76: 	modules:         make(map[string]vtab.Module, 0),
+77: }
+78: 
+79: func defaultDriver() *Driver { return d }
+80: 
+81: // Open returns a new connection to the database. The name is a string in a
+82: // driver-specific format.
+83: //
+84: // Open may return a cached connection (one previously closed), but doing so is
+85: // unnecessary; the sql package maintains a pool of idle connections for
+86: // efficient re-use.
+87: //
+88: // The returned connection is only used by one goroutine at a time.
+89: //
+90: // The name is either a plain file name, e.g. "/tmp/mydata.sqlite", or a

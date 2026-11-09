@@ -1,0 +1,207 @@
+//go:build windows
+
+package runtime
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDataRootLeaseCopySharesBorrowAndClose(t *testing.T) {
+	root := t.TempDir()
+	lease, err := AcquireDataRootLease(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied := *lease
+	if err := lease.Borrow(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := copied.Close(); err == nil {
+		t.Fatal("copied parent closed an active borrow")
+	}
+	if !lease.Held() || !copied.Held() {
+		t.Fatal("owner handle lost")
+	}
+	if err := copied.ReturnBorrow(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if copied.Held() || copied.Root() != "" {
+		t.Fatal("closed copy remains live")
+	}
+}
+
+func TestDataRootLeaseMaintenanceBorrowGeneration(t *testing.T) {
+	root := t.TempDir()
+	lease, err := AcquireDataRootLease(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	db := filepath.Join(root, "researchos.sqlite")
+	if err := os.WriteFile(db, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := lease.reserve(root, maintenanceDataRootBorrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.guards, err = openDataRootGuards(root, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &DataRootSourceBorrow{state: first}
+	copyB := *b
+	if err := lease.ReturnBorrow(); err == nil {
+		t.Fatal("legacy release cleared maintenance borrow")
+	}
+	if err := lease.Close(); err == nil {
+		t.Fatal("parent closed maintenance borrow")
+	}
+	if err := b.Check(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyB.Release(); err == nil {
+		t.Fatal("copied borrow released twice")
+	}
+	second, err := lease.reserve(root, maintenanceDataRootBorrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.guards, err = openDataRootGuards(root, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyB.Release(); err == nil {
+		t.Fatal("stale copy released a later borrow")
+	}
+	if err := (&DataRootSourceBorrow{state: second}).Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Borrow(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.reserve(root, maintenanceDataRootBorrow); err == nil {
+		t.Fatal("concurrent borrow admitted")
+	}
+	if err := lease.ReturnBorrow(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDataRootLeaseZeroValueFailsClosed(t *testing.T) {
+	var lease DataRootLease
+	if lease.Held() || lease.Root() != "" {
+		t.Fatal("zero lease claimed held")
+	}
+	if lease.Close() == nil || lease.Borrow(t.TempDir()) == nil || lease.ReturnBorrow() == nil {
+		t.Fatal("zero lease accepted operation")
+	}
+	var borrow DataRootSourceBorrow
+	if borrow.Check("x") == nil || borrow.Release() == nil {
+		t.Fatal("zero borrow accepted operation")
+	}
+}
+
+func TestDataRootSourceGuardPinsFileAndAncestor(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "data")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, "researchos.sqlite")
+	if err := os.WriteFile(db, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	guards, err := openDataRootGuards(root, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDataRootGuards(guards)
+	if err := checkDataRootGuards(guards); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(db, db+".moved"); err == nil {
+		t.Fatal("guard admitted source replacement")
+	}
+	if err := os.Rename(root, root+".moved"); err == nil {
+		t.Fatal("guard admitted ancestor replacement")
+	}
+	if err := checkDataRootGuards(guards); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMaintenanceBorrowHoldsExactNativeOwner(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, "researchos.sqlite")
+	if err := os.WriteFile(db, []byte("owned fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := AcquireDataRootLease(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyParent := *lease
+	borrow, err := lease.BorrowMaintenanceSource(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyBorrow := *borrow
+	if err := borrow.Check(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := borrow.Check(filepath.Join(root, "other.sqlite")); err == nil {
+		t.Fatal("wrong source accepted")
+	}
+	if err := os.Rename(db, db+".moved"); err == nil {
+		t.Fatal("borrow let source be replaced")
+	}
+	if err := copyParent.Close(); err == nil {
+		t.Fatal("copied parent closed live borrow")
+	}
+	if err := lease.ReturnBorrow(); err == nil {
+		t.Fatal("legacy release cleared maintenance borrow")
+	}
+	if _, err := lease.BorrowMaintenanceSource(db); err == nil {
+		t.Fatal("second borrow admitted")
+	}
+	if err := borrow.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyBorrow.Check(db); err == nil {
+		t.Fatal("released copy stayed valid")
+	}
+	if err := copyBorrow.Release(); err == nil {
+		t.Fatal("released copy freed later borrow")
+	}
+	if err := copyParent.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBothPendingNamespacesDenyOrdinaryLockBeforeSetup(t *testing.T) {
+	for _, namespace := range []string{"qualification-failure-maintenance", "runtime-verifier-replacements"} {
+		t.Run(namespace, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "host", namespace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if lease, err := AcquireDataRootLease(root); err == nil {
+				_ = lease.Close()
+				t.Fatal("pending namespace admitted ordinary lock")
+			}
+			if file, err := LockDataRoot(root); err == nil {
+				_ = file.Close()
+				t.Fatal("raw coordinator lock admitted pending namespace")
+			}
+		})
+	}
+}

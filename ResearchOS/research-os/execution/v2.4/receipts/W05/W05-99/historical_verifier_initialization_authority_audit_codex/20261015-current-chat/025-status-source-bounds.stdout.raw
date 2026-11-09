@@ -1,0 +1,90 @@
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\internal\\domain\\runtime_qualification_confirmation_windows.go', 'sha256': '7500423c3496560db5a9b04ea6a922170c2948692b052064b5ba4efa98d0d4cf', 'start': 94, 'end': 175, 'provenance': 'CURRENT_SOURCE_LOCATOR_NOT_ORIGINAL_CORE_ATTESTATION'}
+94: func (c *RuntimeCoordinator) LocalQualificationStatus(ctx context.Context, token, project, id, digest string) (Object, error) {
+95: 	tx, e := c.service.DB.BeginTx(ctx, nil)
+96: 	if e != nil {
+97: 		return nil, e
+98: 	}
+99: 	defer tx.Rollback()
+100: 	p, e := resourcePrincipal(tx, token, project, "OWNER")
+101: 	if e != nil {
+102: 		return nil, e
+103: 	}
+104: 	var body, hash string
+105: 	e = tx.QueryRow(`SELECT body,request_hash FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-confirmation' AND key=?`, p.ID, project, id).Scan(&body, &hash)
+106: 	var request LocalRuntimeQualificationRequest
+107: 	if e != nil || hash != digest || json.Unmarshal([]byte(body), &request) != nil || Hash(request) != hash {
+108: 		return nil, Fail(404, "NOT_FOUND", "original qualification confirmation unavailable")
+109: 	}
+110: 	root, e := currentAuthorityRoot(tx, p.ID)
+111: 	if e != nil || root != request.OwnerRoot {
+112: 		return nil, Fail(403, "FORBIDDEN", "original Owner authority unavailable")
+113: 	}
+114: 	metadata, e := c.config.ConfigurationAuthority.ConfigurationMetadata(ctx, p.ID, "", nil)
+115: 	if e != nil || metadata.OwnerHost != request.OwnerHost {
+116: 		return nil, Fail(403, "FORBIDDEN", "original Host unavailable")
+117: 	}
+118: 	out := Object{"request_id": id, "request_hash": hash, "expires_at": request.ExpiresAt, "state": "AWAITING_CONFIRMATION", "consumed": false}
+119: 	expires, e := time.Parse(time.RFC3339Nano, request.ExpiresAt)
+120: 	if e != nil || !expires.After(time.Now()) {
+121: 		out["state"] = "EXPIRED"
+122: 	}
+123: 	var consumed string
+124: 	e = tx.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='host:managed-runtime-qualification' AND key=?`, p.ID, project, id).Scan(&consumed)
+125: 	if e == sql.ErrNoRows {
+126: 		return out, nil
+127: 	}
+128: 	if e != nil {
+129: 		return nil, e
+130: 	}
+131: 	row, e := Decode([]byte(consumed))
+132: 	if e != nil {
+133: 		return nil, e
+134: 	}
+135: 	ref, ok := row["run_ref"].(map[string]any)
+136: 	if !ok {
+137: 		return nil, Fail(409, "STATE_CONFLICT", "consumed qualification evidence incomplete")
+138: 	}
+139: 	out["consumed"], out["state"], out["run_ref"] = true, "UNRESOLVED", ref
+140: 	run, e := load(tx, project, "Run", Str(ref, "id"))
+141: 	if e != nil {
+142: 		return out, nil
+143: 	}
+144: 	out["run_status"] = run["status"]
+145: 	if run["status"] == "SETTLED" {
+146: 		out["state"] = "EXECUTION_SETTLED"
+147: 	}
+148: 	runtime, e := load(tx, project, "RuntimeRegistration", request.RuntimeID)
+149: 	if e != nil {
+150: 		return nil, e
+151: 	}
+152: 	out["runtime_status"] = runtime["status"]
+153: 	// Current evidence and purpose are revalidated, not inferred from a historical
+154: 	// AVAILABLE string or from the privileged process's last stdout response.
+155: 	if _, e = c.service.currentRuntimeAdmission(tx, project, nil, runtime, []any{"start"}, "session.send"); e == nil {
+156: 		if profile, _, err := c.service.currentRuntimeBinding(tx, project, runtime); err == nil {
+157: 			if _, e = c.service.currentRuntimePurpose(tx, project, Object{"task_type": "mu_turn"}, runtime, profile); e == nil {
+158: 				out["state"] = "QUALIFIED_PURPOSE_AUTHORIZED"
+159: 			}
+160: 		}
+161: 	}
+162: 	return out, nil
+163: }
+164: 
+165: // A settled UNKNOWN-cost ledger is left byte-for-byte intact: it is not an
+166: // unknown external effect. Only original effect/dispatch state resolves that.
+167: func localQualificationIdle(tx *sql.Tx) error {
+168: 	for _, query := range []string{
+169: 		`SELECT count(*) FROM domain_objects WHERE kind='Run' AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`,
+170: 		`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`,
+171: 		`SELECT count(*) FROM runtime_dispatches WHERE state IN ('PREPARED','STARTED','UNKNOWN')`,
+172: 	} {
+173: 		var n int
+174: 		if e := tx.QueryRow(query).Scan(&n); e != nil {
+175: 			return e
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\internal\\host\\desktop_management_windows.go', 'sha256': 'ceadc33520229494eccef4b0738fbb5bbb83a4e0dbe5a182184832dae84b65e5', 'start': 254, 'end': 278, 'provenance': 'CURRENT_SOURCE_LOCATOR_NOT_ORIGINAL_CORE_ATTESTATION'}
+254: 		bounded, cancel := context.WithTimeout(ctx, 3*time.Minute)
+255: 		defer cancel()
+256: 		return d.host.QualifyLocalRuntime(bounded, d.service, d.coordinator, d.apiURL, request, d.installation)
+257: 	}
+258: 	return nil, errors.New("unsupported operation")
+259: }

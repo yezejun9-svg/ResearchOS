@@ -1,0 +1,93 @@
+1: package domain
+2: 
+3: import (
+4: 	"context"
+5: 	"encoding/json"
+6: 	"os"
+7: 	"os/exec"
+8: 	"path/filepath"
+9: 	"testing"
+10: )
+11: 
+12: func TestW18CLI(t *testing.T) {
+13: 	goexe := os.Getenv("RESEARCHOS_GO")
+14: 	if goexe == "" {
+15: 		var e error
+16: 		goexe, e = exec.LookPath("go")
+17: 		if e != nil {
+18: 			t.Fatal("RESEARCHOS_GO required for CLI acceptance")
+19: 		}
+20: 	}
+21: 	f := contextFixture(t)
+22: 	f.artifact(Object{"portable": "CLI export preserves provenance"}, Empty())
+23: 	var dbpath, name string
+24: 	var seq int
+25: 	if e := f.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &dbpath); e != nil {
+26: 		t.Fatal(e)
+27: 	}
+28: 	work := t.TempDir()
+29: 	key := filepath.Join(work, "separate.key")
+30: 	pack := filepath.Join(work, "export")
+31: 	target := filepath.Join(work, "restored")
+32: 	commands := []any{}
+33: 	invoke := func(args ...string) []byte {
+34: 		t.Helper()
+35: 		cmd := exec.Command(goexe, append([]string{"run", "./ops/backup"}, args...)...)
+36: 		cmd.Dir = "../.."
+37: 		raw, e := cmd.CombinedOutput()
+38: 		if e != nil {
+39: 			t.Fatalf("CLI %v: %v %s", args, e, raw)
+40: 		}
+41: 		commands = append(commands, Object{"argv": cmd.Args, "exit_code": 0, "output_sha256": Digest(raw)})
+42: 		return raw
+43: 	}
+44: 	invoke("keygen", "--key-file", key)
+45: 	raw := invoke("export", "--db", dbpath, "--out", pack, "--key-file", key)
+46: 	var manifest BackupManifest
+47: 	if e := json.Unmarshal(raw, &manifest); e != nil {
+48: 		t.Fatal(e)
+49: 	}
+50: 	raw = invoke("restore", "--backup", pack, "--out", target, "--key-file", key)
+51: 	var report RestoreReport
+52: 	if e := json.Unmarshal(raw, &report); e != nil {
+53: 		t.Fatal(e)
+54: 	}
+55: 	secret, e := os.ReadFile(key)
+56: 	if e != nil {
+57: 		t.Fatal(e)
+58: 	}
+59: 	_, files, e := readBackup(pack, secret)
+60: 	if e != nil {
+61: 		t.Fatal(e)
+62: 	}
+63: 	var portable Object
+64: 	if e = json.Unmarshal(files["portable.json"], &portable); e != nil {
+65: 		t.Fatal(e)
+66: 	}
+67: 	backupAssert(t, "A12-04-CLI", true, report.BackupID == manifest.ID && len(Arr(portable, "objects")) > 0 && report.Status == "RESTORED_RECONCILIATION_REQUIRED", Object{"commands": commands, "manifest": manifest, "report": report})
+68: 	// The encryption key is not evidence and is never copied into the package.
+69: 	if out := os.Getenv("W18_EVIDENCE_DIR"); out != "" {
+70: 		dest := filepath.Join(out, "encrypted-cli-package")
+71: 		if e = os.Mkdir(dest, 0700); e != nil {
+72: 			t.Fatal(e)
+73: 		}
+74: 		entries, e := os.ReadDir(pack)
+75: 		if e != nil {
+76: 			t.Fatal(e)
+77: 		}
+78: 		for _, entry := range entries {
+79: 			b, e := os.ReadFile(filepath.Join(pack, entry.Name()))
+80: 			if e != nil {
+81: 				t.Fatal(e)
+82: 			}
+83: 			if e = os.WriteFile(filepath.Join(dest, entry.Name()), b, 0600); e != nil {
+84: 				t.Fatal(e)
+85: 			}
+86: 		}
+87: 		backupEvidence(t, "cli.json", Object{"commands": commands, "manifest": manifest, "report": report, "key_retained_in_evidence": false, "verification": "independent rerun generates a new key/package; original package remains encrypted"})
+88: 	}
+89: 	// Repeating create refuses overwrite and leaves the stable manifest unchanged.
+90: 	_, e = f.s.CreateBackup(context.Background(), pack, secret)
+91: 	backupAssert(t, "W18-CLI-NO-OVERWRITE", true, e != nil, Object{"error": e.Error()})
+92: 	clear(secret)
+93: }

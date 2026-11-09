@@ -1,0 +1,102 @@
+def disjoint(a,b):
+    a=str(safe(str(a))).casefold();b=str(safe(str(b))).casefold()
+    return a!=b and not a.startswith(b+'\\') and not b.startswith(a+'\\')
+
+def receipt_input_trees(values):
+    """Protect original receipt parents; never follow arbitrary JSON as executable code."""
+    trees=set()
+    def visit(v):
+        if isinstance(v,dict):
+            if set(v)=={'path','sha256','bytes'}:
+                verify(v);p=safe(str(Path(v['path'])))
+                if p.is_relative_to(RECEIPTS):trees.add(p.parent)
+            else:
+                for x in v.values():visit(x)
+        elif isinstance(v,list):
+            for x in v:visit(x)
+    visit(values)
+    return trees
+
+def allocation_check(text,values,s=None,metadata=True):
+    p=safe(text)
+    if metadata:
+        parent=RECEIPTS/'f08_driver18_root_producer_executor_codex'
+        need(p.parent==parent and len(p.name)==32 and all(c in '0123456789abcdef' for c in p.name),'DEDICATED_NEW_METADATA_UUID')
+    need(p.parent.is_dir() and not os.path.lexists(p),'FRESH_OUTPUT_BEFORE_ANY_WRITE')
+    protected=receipt_input_trees(values)
+    if s is not None:
+        protected.update(safe(s[k]) for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root'])
+    need(all(disjoint(p,q) for q in protected),'OUTPUT_OVERLAPS_ORIGINAL_INPUT_OR_PHASE_TREE')
+    return p
+
+def preallocate(action,data,inp,text):
+    allowed={'resources','stage-code','scope','draft','register','seal-registration','grant','launch-request','capture-action','seal-outer','seal-prepare'}
+    need(action in allowed and isinstance(data,dict),'KNOWN_ACTION_BEFORE_ALLOCATION')
+    binding=data['producer_output_binding']
+    need(binding=={'schema':'researchos.driver18-producer-output-binding.v1','owner':'codex:/root','action':action,'metadata_output_root':text},'EXPLICIT_ROOT_OUTPUT_BINDING')
+    s=None;extra=[]
+    if action=='scope':
+        g=gate();r=g.Reader();b=module(BINDER,'driver18_preallocation_binder');s=b.build_scope(g,r,inp)
+    elif action in {'register','seal-registration'}:
+        g,r,s,sref,d,index,mfref,before,desired=reviewed(data['draft_ref'],data['registration_review_ref']);extra=[sref,d,index,mfref]
+    elif action not in {'resources','stage-code'}:
+        g,r,s=load(data['scope_ref'])
+        if action in {'launch-request','capture-action','seal-outer','seal-prepare'}:
+            g.verify_authority(r,s,data['scope_ref'],r.doc(data['grant_ref']))
+        extra=list(r.refs.values())
+    elif action=='resources':need(data['schema']=='researchos.driver18-root-resource-input.v1','RESOURCE_INPUT')
+    else:need(data['schema']=='researchos.driver18-stage-code-input.v1','STAGED_SOURCE_INPUT')
+    values=[inp,data,extra,GATE,BINDER,pin(Path(__file__).resolve())]
+    if s is not None:values.append(s)
+    return allocation_check(text,values,s)
+
+def exact_resource_catalog(res):
+    """Reject aliases before emission; frozen consumers compare literal REF dictionaries."""
+    rows=res['files'];need(type(rows)is list and rows,'NONEMPTY_EXACT_RESOURCE_ROWS')
+    for row in rows:
+        need(row==pin(safe(row['path'])),'RESOURCE_REF_NOT_ACTUAL_CANONICAL_PIN')
+    need(len({str(safe(row['path'])).casefold() for row in rows})==len(rows),'RESOURCE_CASEFOLD_COLLISION')
+    need(all(item in rows for item in [res['python'],res['go'],*res['compiler_images']]),'TOOLS_REQUIRE_EXACT_FILES_DICTIONARY')
+    need(res['python']==pin(Path(sys.executable).resolve()),'RESOURCE_ACTUAL_CURRENT_PYTHON_PIN')
+    for row in res['offline_modcache_copies']:need(row['ref'] in rows,'OFFLINE_REQUIRE_EXACT_FILES_DICTIONARY')
+    goroot=safe(res['GOROOT']);need(goroot.is_dir() and res['GOROOT']==str(goroot),'EXACT_GOROOT_DIRECTORY')
+    need(safe(res['go']['path'])==goroot/'bin/go.exe','GOROOT_GO_PAIR')
+    return res
+
+def original_capture_closure(g,r,s,sref,gref,refs):
+    """Requires real external Root capture plus nonauthor pairing review, never manufactures either."""
+    need(isinstance(refs,dict) and set(refs)=={'bundle_ref','manifest_ref','pair_review_ref','pair_review_manifest_ref'},'FATAL_OPEN_ORIGINAL_CAPTURE_CLOSURE')
+    a=s['actual_Root_registration'];identity=action_identity(s,sref,gref,a['phase'])
+    root=g.safe(a['original_tool_capture_root']);reviewpath=g.safe(a['original_tool_capture_review_path'])
+    need(root.is_relative_to(RECEIPTS) and not root==RECEIPTS and a['run_uuid'] in root.name,'ROOT_CAPTURE_NAMESPACE')
+    need(g.safe(refs['bundle_ref']['path']).parent==root and g.safe(refs['manifest_ref']['path']).parent==root and g.safe(refs['pair_review_ref']['path'])==reviewpath,'CAPTURE_EXACT_PATH_BINDING')
+    need(g.safe(refs['pair_review_manifest_ref']['path']).parent==reviewpath.parent and disjoint(root,reviewpath.parent),'INDEPENDENT_CAPTURE_REVIEW_NAMESPACE')
+    bundle=r.doc(refs['bundle_ref']);review=r.doc(refs['pair_review_ref'])
+    need(bundle['schema']=='researchos.driver18-original-host-tool-capture.v1' and bundle['actor']=='codex:/root' and bundle['scope_ref']==sref and bundle['grant_ref']==gref and bundle['command_identity']==identity,'ORIGINAL_CAPTURE_BINDING')
+    need(review['schema']=='researchos.driver18-original-tool-pair-independent-review.v1' and review['reviewer'] in g.REVIEWERS and review['reviewer'] not in {'codex:/root','codex:/root/command_queue_impl'} and review['non_author'] is True,'NONAUTHOR_CAPTURE_REVIEW')
+    need(review['decision']=='ORIGINAL_HOST_TOOL_INPUT_RESPONSE_PAIR_VERIFIED' and review['requested_changes']==[] and review['original_host_event_association_verified'] is True and review['actual_candidate_execution'] is False,'FATAL_OPEN_HOST_EVENT_ASSOCIATION')
+    for k,v in [('capture_bundle_ref',refs['bundle_ref']),('capture_manifest_ref',refs['manifest_ref']),('scope_ref',sref),('grant_ref',gref),('command_identity',identity),('host_capture_ref',bundle['host_capture_ref']),('events',bundle['events'])]:need(review[k]==v,'CAPTURE_REVIEW_'+k)
+    def sealed(mref,required,parent):
+        mf=r.doc(mref);rows=mf['files'];need(type(rows)is list and rows,'CAPTURE_MANIFEST_NOT_EMPTY');seen={}
+        for row in rows:
+            p=g.safe(row['path']);need(p.is_relative_to(parent) and str(p).casefold() not in seen,'CAPTURE_MEMBER_BOUNDARY');r.verify(row);seen[str(p).casefold()]=row
+        for row in required:need(seen.get(str(g.safe(row['path'])).casefold())==row,'CAPTURE_REQUIRED_MEMBER')
+    events=bundle['events'];need(type(events)is list and len(events)==2,'EXACT_INITIAL_TERMINAL_CAPTURE')
+    required=[refs['bundle_ref'],bundle['host_capture_ref']];actions=[]
+    for i,event in enumerate(events):
+        need(set(event)=={'tool_name','request_event_locator','response_event_locator','input_ref','response_ref','action_ref'},'ORIGINAL_EVENT_FIELDS')
+        act=r.doc(event['action_ref']);need(event['tool_name']==['exec_command','write_stdin'][i],'TOOL_PAIR_ORDER')
+        for k in ['tool_name','request_event_locator','response_event_locator','input_ref','response_ref']:need(act[k]==event[k],'RAW_EVENT_ACTION_'+k)
+        need(act['schema']=='researchos.driver18-original-tool-action.v1' and act['actor']=='codex:/root' and act['command_identity']==identity,'CAPTURE_ACTION_COMMAND')
+        for k in ['request_event_locator','response_event_locator']:need(type(event[k])is str and event[k],'CAPTURE_EVENT_LOCATOR')
+        required.extend([event['input_ref'],event['response_ref'],event['action_ref']]);actions.append(act)
+    need(actions[0]['initial_action_ref'] is None and actions[1]['initial_action_ref']==events[0]['action_ref'],'ORIGINAL_INITIAL_REF')
+    initial=r.doc(events[0]['response_ref']);terminal_input=r.doc(events[1]['input_ref']);terminal=r.doc(events[1]['response_ref'])
+    need(type(initial.get('session_id'))is int and initial.get('exit_code') is None and terminal_input['session_id']==initial['session_id'] and terminal_input.get('chars','')=='' and type(terminal.get('exit_code'))is int,'EXACT_ORIGINAL_SESSION_PAIR')
+    if 'session_id' in terminal:need(terminal['session_id']==initial['session_id'],'TERMINAL_SESSION_CONTRADICTION')
+    need(len({x[k] for x in events for k in ['request_event_locator','response_event_locator']})==4,'DISTINCT_EVENT_LOCATORS')
+    sealed(refs['manifest_ref'],required,root)
+    sealed(refs['pair_review_manifest_ref'],[refs['pair_review_ref']],reviewpath.parent)
+    r.unchanged();return bundle
+
+

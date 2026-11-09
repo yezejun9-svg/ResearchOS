@@ -1,0 +1,140 @@
+--- old/seal_readonly.v2.sealed.py
++++ new/seal_readonly.v2.sealed.py
+@@ -34,11 +34,117 @@
+  return {'selected':selected,'actual_run_records':runs,'actual_pass_records':passed,'actual_leaf_records':leaves,'skip_fail':bad,'scenario_rows_qualified':1,'parents_not_counted_as_separate_scenarios':ancestry}
+ 
+ 
++VECTOR_BINDINGS={}
++
++def exact_pin_map(pins):
++ result={}
++ for pin in pins:
++  if not isinstance(pin,dict) or set(pin)!={'path','sha256','bytes'}:raise Stop('Nonexact ledger pin')
++  if not isinstance(pin['path'],str) or not re.fullmatch('[0-9a-f]{64}',pin['sha256']) or type(pin['bytes']) is not int or pin['bytes']<0:raise Stop('Malformed exact ledger pin')
++  key=pin['path'].casefold()
++  if key in result:raise Stop('Duplicate/colliding ledger membership')
++  result[key]=pin
++ return result
++
++class PrefixProof:
++ def __init__(self,directory):
++  self.directory=directory;self.revision=0;self.rows={};self.vectors=[];self.last_end=None
++ def add(self,group,pins):
++  # Match Ledger.add, including deduplication and empty additions advancing revision.
++  new=[]
++  for pin in pins:
++   if set(pin)!={'path','sha256','bytes'}:raise Stop('Unexpected addition pin fields')
++   verify(pin);key=pin['path'].casefold()
++   if key in self.rows:
++    if self.rows[key]['ref']!=pin:raise Stop('Addition collides with immutable prefix')
++   else:self.rows[key]={'ref':pin,'group':group};new.append(pin)
++  self.revision+=1
++  actual=raw_json((self.directory/('%04d-add.json'%self.revision)).read_bytes())
++  expected={'revision':self.revision,'group':group,'new_files':new,'total':len(self.rows)}
++  if actual!=expected or type(actual.get('revision')) is not int or type(actual.get('total')) is not int:raise Stop('Exact producer addition/prefix mismatch')
++ def vector(self,name):
++  p=self.directory/(name+'.json');key=str(p)
++  if key in VECTOR_BINDINGS:raise Stop('Duplicate vector stage')
++  VECTOR_BINDINGS[key]={'revision':self.revision,'members':[row['ref'] for row in self.rows.values()]}
++  v=check_vector(p)
++  if self.last_end is not None and v['started_at_unix']<self.last_end:raise Stop('Vector observation order regressed')
++  self.last_end=v['ended_at_unix'];self.vectors.append(p.name)
++ def finish(self,final):
++  expected_files={('%04d-add.json'%i) for i in range(1,self.revision+1)}|set(self.vectors)
++  if {p.name for p in self.directory.iterdir()}!=expected_files:raise Stop('Missing/extra prefix or vector file')
++  rows=raw_json(final.read_bytes())
++  if rows!=list(self.rows.values()):raise Stop('Final ordered membership/group differs from exact prefix')
++  exact_pin_map([r['ref'] for r in rows])
++
+ def check_vector(path,expected_count=None):
+- v=raw_json(Path(path).read_bytes())
+- if v.get('drift')!=[] or type(v.get('revision')) is not int or type(v.get('file_count')) is not int or v['file_count']<1:raise Stop('Missing/faulted actual input vector')
++ p=Path(path);bound=VECTOR_BINDINGS.get(str(p))
++ if bound is None:raise Stop('Vector has no producer-specific prefix binding')
++ v=raw_json(p.read_bytes())
++ if set(v)!={'revision','file_count','started_at_unix','ended_at_unix','drift'}:raise Stop('Vector shape')
++ members=exact_pin_map(bound['members'])
++ if v['drift']!=[] or type(v['revision']) is not int or v['revision']!=bound['revision'] or type(v['file_count']) is not int or v['file_count']!=len(members):raise Stop('Stage vector revision/cardinality does not match exact prefix')
+  if expected_count is not None and v['file_count']!=expected_count:raise Stop('Input vector count mismatch')
++ start,end=v['started_at_unix'],v['ended_at_unix']
++ if type(start) not in (int,float) or type(end) not in (int,float) or not (0<start<=end<float('inf')):raise Stop('Vector timestamps invalid')
+  return v
++
++def bind_all_prefixes(root,g,s):
++ VECTOR_BINDINGS.clear()
++ pins=lambda paths:[file_ref(p) for p in paths]
++ outerdir=root.with_name(root.name+'-outer')
++ outer=PrefixProof(outerdir/'vectors')
++ outer.add('actual-authorization-public-inputs',pins(g['_authorization_paths'])+g['resource_files'])
++ outer.vector('before');outer.vector('after');outer.finish(outerdir/'inputs.final.json')
++ c=PrefixProof(root/'vectors');serial=0
++ c.add('consumed-immutable-Root-authorization-chain',pins(g['_authorization_paths']))
++ c.add('root-pinned-public-resource-universe',g['resource_files'])
++ c.add('controller-spec',g['controller_refs']+[g['spec_ref']])
++ def stage(label):
++  nonlocal serial
++  serial+=1;d=root/'native'/('%03d-%s'%(serial,label))
++  c.vector('%03d-%s-before'%(serial,label))
++  if label.startswith('case-'):
++   request=raw_json((d/'case-request.json').read_bytes())
++   before=[row['ref'] for row in c.rows.values()]
++   if request['allowed_module_files']!=before:raise Stop('Case allowed_module_files differ from exact before-prefix')
++   exact_pin_map(request['allowed_module_files'])
++   worker=PrefixProof(d/'worker-vectors')
++   worker.add('worker-actual-inputs',pins(g['_authorization_paths'])+[file_ref(d/'case-request.json')]+before)
++   worker.vector('before');worker.vector('after');worker.finish(d/'worker.inputs.final.json')
++  inv=raw_json((d/'invocation.json').read_bytes());modules=[]
++  for entry in inv['owned_result']['debug_capture']['modules']:
++   p=entry['path_from_actual_file_handle'];slash=chr(92)
++   if p.startswith(slash*2+'?'+slash+'UNC'+slash):p=slash*2+p[8:]
++   elif p.startswith(slash*2+'?'+slash):p=p[4:]
++   pin=file_ref(p)
++   if pin['sha256']!=entry['before']['sha256'] or pin['bytes']!=entry['before']['bytes'] or entry['before']!=entry['after']:raise Stop('Held image/prefix pin differs')
++   modules.append(pin)
++  c.add('actual-loaded-images-'+label,modules)
++  c.vector('%03d-%s-after'%(serial,label))
++ stage('git-parent');stage('git-four-diff')
++ c.add('exact-export-request',[file_ref(root/'git-export.stdin.raw')]);stage('git-export')
++ exported=raw_json((root/'source-export.json').read_bytes())['files']
++ c.add('fixed-Git-export',exported);c.vector('pre-build-complete')
++ stage('go-version');stage('go-env')
++ for label in ['domain','adapter']:
++  stage('list-'+label)
++  # The unchanged producer explicitly requires all stable list inputs already present.
++  # Thus this group is an empty-new-files event, but still advances the revision.
++  c.add('actual-go-list-'+label,[])
++  stage('compile-'+label)
++  c.add('compiled-test-image-'+label,[file_ref(root/(label+'.test.exe'))])
++  stage('buildinfo-'+label)
++ generated=walk_files(root/'gotmpdir')+walk_files(root/'gocache')+[root/'domain.test.exe',root/'adapter.test.exe']
++ c.add('final-WORK-generated-importcfg-archives-exes',pins(generated))
++ if c.revision!=21:raise Stop('Pinned compile producer revision differs')
++ if raw_json((root/'compiled-inputs.frozen.json').read_bytes())!=list(c.rows.values()):raise Stop('Compile prefix membership differs')
++ c.vector('compile-complete')
++ if g['resources']['junction']:stage('junction-resource')
++ for row in s['roster']:
++  if all(g['resources'][key] for key in row['requires_resource']):stage('case-'+row['id'])
++ c.vector('final');c.finish(root/'inputs.final.json')
++ return {'stage_vectors':len(VECTOR_BINDINGS),'controller_final_revision':c.revision,'controller_final_members':len(c.rows),'membership_source':'EXACT_PINNED_PRODUCER_ADD_PREFIX','timestamp_role':'AUXILIARY_ORDER_ONLY','raw_vectors_contain_member_list':False}
++
+ 
+ def verify_runtime_pair(directory,prefix,resources):
+  allowed={x['path'].casefold():x for x in resources}
+@@ -54,7 +160,7 @@
+  ap=argparse.ArgumentParser();ap.add_argument('--grant',required=True);ap.add_argument('--grant-sha256',required=True);ap.add_argument('--result-sha256',required=True);a=ap.parse_args()
+  g,s,root=validate_grant(a.grant,a.grant_sha256)
+  if file_ref(__file__)!=s['sealer_ref']:raise Stop('Sealer exact pin')
+- root=no_alias(root);resultref=file_ref(root/'result.json')
++ root=no_alias(root);prefix_audit=bind_all_prefixes(root,g,s);resultref=file_ref(root/'result.json')
+  if resultref['sha256']!=a.result_sha256:raise Stop('Explicit completed result required')
+  result=raw_json((root/'result.json').read_bytes());outerdir=root.with_name(root.name+'-outer');outer=raw_json((outerdir/'completion.json').read_bytes())
+  if outer.get('first_error') or outer.get('secondary_errors'):raise Stop('Faulted outer result')
+@@ -171,7 +277,7 @@
+    if package.get('Module',{}).get('GoMod') and str(no_alias(package['Module']['GoMod'])) not in frozenpaths:raise Stop('Actual module metadata omitted')
+  # All evidence is preserved. The new summary is included; only this manifest excludes itself.
+  seal=root/'sealed-readonly-v2';seal.mkdir(exist_ok=False)
+- write_json(seal/'summary.json',{'schema':'researchos.w09.finite-evidence-seal.v2','result_ref':resultref,'grant_ref':g['_grant_ref'],'spec_ref':g['spec_ref'],'scenario_rows':49,'actual_pass_rows':passed,'actual_leaf_records':leafs,'holds':holds,'source_acceptance':False,'formal_increment':0,'status':'EVIDENCE_ASSEMBLED_PENDING_NONAUTHOR_REVIEW','SQL_reads':0,'processes_started':0,'python_inventory':'ACTUAL_POINT_IN_TIME_ONLY','closed_DB_limitation':'29 new domain VACUUM copies; 21 selected four-table driver-value JSON and 8 business JSON; not fullDB/typeof/rowid equivalence; old six domain no export'})
++ write_json(seal/'summary.json',{'schema':'researchos.w09.finite-evidence-seal.v2','result_ref':resultref,'grant_ref':g['_grant_ref'],'spec_ref':g['spec_ref'],'scenario_rows':49,'actual_pass_rows':passed,'actual_leaf_records':leafs,'holds':holds,'source_acceptance':False,'formal_increment':0,'status':'EVIDENCE_ASSEMBLED_PENDING_NONAUTHOR_REVIEW','SQL_reads':0,'processes_started':0,'stage_prefix_audit':prefix_audit,'python_inventory':'ACTUAL_POINT_IN_TIME_ONLY','closed_DB_limitation':'29 new domain VACUUM copies; 21 selected four-table driver-value JSON and 8 business JSON; not fullDB/typeof/rowid equivalence; old six domain no export'})
+  members=[];links=[]
+  permitted_links={str(root/'symlink-prerequisite/A/outside'):root/'symlink-prerequisite/B',str(root/'junction-resource/A/outside'):root/'junction-resource/B'}
+  for base in [root,outerdir]:

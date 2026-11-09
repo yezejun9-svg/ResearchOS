@@ -1,0 +1,152 @@
+{
+  "path": "internal/recoveryboundary/contract.go",
+  "sha256": "15228E75D5FCA2C40EC847522AE0CAAABA01DE84F34953A4E0DD490408161F5B"
+}
+39:	InstalledSD       string       `json:"installed_sd,omitempty"`
+53:	ManagementSID          string         `json:"management_sid"`
+62:	Ancestors              []FileIdentity `json:"ancestors"`
+105:func digest(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToString(h[:]) }
+106:func validDigest(s string) bool {
+113:func validOperation(s string) bool {
+125:func PlanCoreSHA256(p EntryFencePlan) (string, error) {
+138:func ComputePlanSHA256(p EntryFencePlan) (string, error) {
+147:func ValidatePlan(p EntryFencePlan) error {
+156:		!validDigest(p.RecoveryPackageSHA256) || p.BusinessSID == "" || p.ManagementSID == "" ||
+157:		strings.EqualFold(p.BusinessSID, p.ManagementSID) || len(p.Targets) == 0 || len(p.Targets) > 64 {
+165:		return errors.New("boundary ancestor inventory missing")
+169:			return errors.New("boundary ancestor identity invalid")
+193:func ValidateRestart(pre, post BootWitness) error {
+224:func transition(from, to string) bool {
+246:func ValidateEvents(events []BoundaryEvent, operation, plan string) error {
+{
+  "path": "internal/recoveryboundary/boot_windows.go",
+  "sha256": "EFABBCD8504E46B28B421E497CC3000FE0AD921F3C5EFB7CFADBC852BCCE3285"
+}
+31:type quiescenceOwner struct {
+42:type CurrentQuiescence struct{ owner *quiescenceOwner }
+52:func nativeFileID(h windows.Handle) (uint64, string, error) {
+63:func finalPath(h windows.Handle) (string, error) {
+81:func openNative(path string, directory bool, hashFile bool) (nativeHold, error) {
+119:	sd, e := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+151:func closeHolds(holds []nativeHold) error {
+159:func identityEqual(a, b FileIdentity) bool {
+162:func identityCoreEqual(a, b FileIdentity) bool {
+168:func pathAncestors(path string) []string {
+182:func openPlanHolds(p EntryFencePlan) ([]nativeHold, error) {
+195:				return nil, fmt.Errorf("ancestor absent from frozen inventory: %s", a)
+215:				if strings.EqualFold(target.File.Path, x.Path) && identityCoreEqual(x, h.identity) && target.InstalledSD == h.identity.SecurityDescriptor {
+231:func checkHolds(holds []nativeHold) error {
+251:func registryRestartApps(businessSID string) (uint32, error) {
+271:func restartSettingsForProcess(h windows.Handle) (string, uint32, bool, error) {
+288:func bootClock() (uint64, time.Time, error) {
+312:func witness(p EntryFencePlan, fenceHash string) (BootWitness, error) {
+324:func stateRoot(p EntryFencePlan) (string, error) {
+336:func readRecord(p EntryFencePlan) (boundaryRecord, error) {
+416:func boolInt(b bool) int {
+423:func checkManagedDirectory(path, sid string) error {
+429:	sd, e := windows.GetSecurityInfo(h.handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+433:	owner, _, e := sd.Owner()
+438:	if e != nil || control&windows.SE_DACL_PROTECTED == 0 {
+439:		return errors.New("boundary state DACL not protected")
+447:func checkManagedChain(p EntryFencePlan) error {
+458:			if e = checkManagedDirectory(path, p.ManagementSID); e != nil {
+463:	return checkManagedDirectory(dir, p.ManagementSID)
+466:func checkCurrentBoot(post BootWitness, businessSID string) error {
+487:func checkPreCurrent(pre BootWitness, businessSID string) error {
+508:func checkFence(p EntryFencePlan, holds []nativeHold) error {
+515:		if !ok || !identityCoreEqual(x, t.File) || t.InstalledSD == "" || x.SecurityDescriptor != t.InstalledSD {
+518:		expected, e := denyDescriptor(t.File.SecurityDescriptor, p.BusinessSID, p.ManagementSID,t.Mode)
+520:			return errors.New("business SID exact deny descriptor absent")
+526:func denyDescriptor(original, sidText, managementSID, mode string) (string, error) {
+535:	old, _, e := sd.DACL()
+546:		mask |= windows.ACCESS_MASK(windows.WRITE_DAC|windows.WRITE_OWNER|windows.DELETE|windows.FILE_WRITE_DATA|windows.FILE_APPEND_DATA)
+554:	// Protecting a DACL makes formerly inherited ACEs explicit on the object.
+569:		if e=abs.SetOwner(manager,false); e!=nil { return "",e }
+571:	if e = abs.SetDACL(acl, true, false); e != nil {
+574:	if e = abs.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); e != nil {
+586:func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+639:	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
+643:func discoverPlan(root, operation, sha string) (EntryFencePlan, error) {
+687:func ReadBoundaryPlan(dataRoot, operationID, boundaryPlanSHA256 string) (EntryFencePlan, string, error) {
+721:func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
+759:func (q *CurrentQuiescence) Close() error {
+778:func MarkCDurable(ctx context.Context, q *CurrentQuiescence, held *rt.DataRootLease, dataRoot, database, operationID, boundaryPlanSHA256, cPlanDigest string) error {
+850:func managedToken(p EntryFencePlan) error {
+859:	if u.User.Sid.String() != p.ManagementSID || p.BusinessSID == p.ManagementSID {
+865:func checkAcceptanceFiles(p EntryFencePlan) error {
+906:func validateAttestation(p EntryFencePlan, kind string, proof BoundaryAttestation) error {
+908:	if e != nil || proof.Schema != "researchos.boundary-attestation.v1" || proof.Kind != kind || proof.Status != "ACCEPTED" || proof.OperationID != p.OperationID || proof.PlanCoreSHA256 != core || proof.Issuer == "" || proof.Issuer == p.ManagementSID || !validDigest(proof.EvidenceSHA256) || proof.RecordedUTC.IsZero() {
+917:func readFullRestartEvidence(p EntryFencePlan, pre BootWitness, now time.Time) (string, error) {
+948:func fenceDigest(p EntryFencePlan) string {
+951:		parts = append(parts, strings.ToLower(t.File.FinalUTF16)+"\x00"+t.File.FileID+"\x00"+t.InstalledSD)
+957:func writeExclusiveJSON(path string, value any) error {
+976:func appendEvent(p EntryFencePlan, events []BoundaryEvent, state string) error {
+997:func setTargetDescriptor(path, sddl string) error {
+1002:	owner,_,e:=sd.Owner(); if e!=nil || owner==nil { return errors.New("target owner descriptor missing") }
+1003:	dacl, _, e := sd.DACL()
+1011:	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
+1012:	if control&windows.SE_DACL_PROTECTED != 0 {
+1013:		flags = windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+1019:	h, e := windows.CreateFile(w, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER|windows.FILE_READ_ATTRIBUTES,
+1025:	return windows.SetSecurityInfo(h, windows.SE_FILE_OBJECT, flags|windows.OWNER_SECURITY_INFORMATION, owner, nil, dacl, nil)
+1028:func checkNoOfficialProcess(p EntryFencePlan) error {
+1071:func checkRestartRegistrations(p EntryFencePlan) error {
+1136:func RunPhase(ctx context.Context, phase, dataRoot, operationID, planSHA256 string) (stateOut string, errOut error) {
+1140:	if phase != "plan" && phase != "arm" && phase != "observe" && phase != "status" && phase != "disarm-request" {
+1180:			expected, e := denyDescriptor(t.File.SecurityDescriptor, p.BusinessSID, p.ManagementSID,t.Mode)
+1181:			if e != nil || expected != t.InstalledSD {
+1231:			if e = setTargetDescriptor(t.File.Path, t.InstalledSD); e != nil {
+1238:			ok := identityCoreEqual(t.File, h.identity) && h.identity.SecurityDescriptor == t.InstalledSD
+1288:	case "disarm-request":
+1317:			return "", errors.New("disarm requires durable C or explicit boundary abort")
+1328:				return "", errors.New("disarm predecessor invalid")
+1347:			if !identityCoreEqual(x, t.File) || (x.SecurityDescriptor != t.File.SecurityDescriptor && x.SecurityDescriptor != t.InstalledSD) {
+1348:				return "", errors.New("disarm target differs from exact before/installed descriptor")
+1374:				return "", errors.New("disarm exact descriptor readback mismatch")
+1389:func checkExactCDurable(p EntryFencePlan) error {
+{
+  "path": "ops/qualification_recovery_boundary/main_windows.go",
+  "sha256": "6CFEA3562BCE3E334E1DD65FAB7FE8579370140AA28D681FC2C37A6B39C28680"
+}
+22:func parse(args []string) (phase, root, operation, plan string, err error) {
+27:	if phase != "plan" && phase != "arm" && phase != "observe" && phase != "status" && phase != "disarm-request" {
+44:func run(ctx context.Context, args []string) (string, error) {
+52:func main() {
+{
+  "path": "ops/qualification_recovery_boundary/main_nonwindows.go",
+  "sha256": "7F448C872DC959DB2C7CA0CB341CE5C07239E63A42A408BAC01E24ACD1ED1B68"
+}
+10:func main() {
+{
+  "path": "internal/recoveryboundary/boot_windows_test.go",
+  "sha256": "C27479C730BDD2EF635BABAFF33D2857F3158B1C77D70CD3F01D48D2CF253A2A"
+}
+25:func TestRestartWitnessStrictDecreaseAndWindow(t *testing.T) {
+59:func TestBoundaryEventSequenceRejectsGapAndReplay(t *testing.T) {
+75:func TestAppendOnlyBoundaryCrashSequence(t *testing.T) {
+123:func TestOnlineBackupGateRequiresRestorationAndIndependentIssuer(t *testing.T) {
+125:	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, ManagementSID: "S-1-5-21-1"}
+139:	proof.Issuer = p.ManagementSID
+145:func TestBoundaryPlanDigestBindsAttestationFilesWithoutCycle(t *testing.T) {
+173:func TestNativeHoldSurvivesGCAndBlocksReplacement(t *testing.T) {
+202:func TestDisposableExecutableFenceReadbackAndRestore(t *testing.T) {
+217:	installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), "executable")
+225:		t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+269:func TestDistinctManagerPlanTransfersOwnerAndDeniesFenceTamper(t *testing.T) {
+275:	installed,err:=denyDescriptor(h.identity.SecurityDescriptor,u.User.Sid.String(),manager,"executable"); if err!=nil { t.Fatal(err) }
+277:	owner,_,err:=sd.Owner(); if err!=nil || owner.String()!=manager { t.Fatalf("management owner absent: %v %v",owner,err) }
+278:	acl,_,err:=sd.DACL(); if err!=nil { t.Fatal(err) }
+280:	want:=uint32(windows.FILE_EXECUTE|windows.WRITE_DAC|windows.WRITE_OWNER|windows.DELETE|windows.FILE_WRITE_DATA|windows.FILE_APPEND_DATA)
+281:	if ace.Header.AceType!=windows.ACCESS_DENIED_ACE_TYPE || ace.Mask&want!=want || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()!=u.User.Sid.String() { t.Fatal("exact business SID anti-tamper deny absent") }
+284:func TestPEExecutionProbe(t *testing.T) {
+290:func TestDisposableRealPEAndScriptFence(t *testing.T) {
+326:		installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), item.mode)
+333:			t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+374:func TestOwnProcessRestartRegistrationNativeArgv(t *testing.T) {
+394:func exerciseSQLiteWALUnderFence(t *testing.T, parent string) {
+438:func TestOpaqueTokenZeroAndPhaseFailClosed(t *testing.T) {
+{
+  "path": "ops/qualification_recovery_boundary/main_windows_test.go",
+  "sha256": "EE75928E4FD575B31B6321243F0A2CD83ADD347A84FDA92732CADCAC265E36B1"
+}
+11:func TestCLIOnlyFixedPhasesAndExactSelector(t *testing.T) {

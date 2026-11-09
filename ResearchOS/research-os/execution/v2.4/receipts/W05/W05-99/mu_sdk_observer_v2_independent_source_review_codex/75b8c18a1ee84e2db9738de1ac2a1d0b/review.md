@@ -1,0 +1,30 @@
+独立窄审结论：SOURCE_PASS_IN_SCOPE_WITH_OPEN。observer v2 在本次限定的 R06 启动绑定及 observer 环境闭集范围内通过；这不是整链 READY_SOURCE_ONLY，不授权 native、模型或 provider 执行。
+
+Source为7077b2b70098f64f6b0a4aa5d993c59fb6cb3ffa4f08e66eb73cdb00cecc7dc0，31072 bytes。新封包、旧v1封包、上一轮独立fixture及固定runner/base/worker/metadata Python字节共35项输入读取时零漂移。作者forward diff逐字重建v2，独立生成的inverse diff逐字恢复v1；AST恰为5函数修改、3函数新增，以及PUBLIC_ENVIRONMENT_KEYS一个八键常量新增，其余13函数与其他顶层内容未改。
+
+39项独立pure AST/内存检查全部符合预期。未执行作者的46项控件，也未导入完整候选模块、调用真实observer/WinAPI、启动目标进程、访问产品SQL或请求provider。实际worker与Python解释器文件仅只读提取原文；错误bytes/hash/size均在内存中构造，没有修改真实文件。
+
+旧反例与合法路径
+
+上一轮独立fixture里的foreign argv、foreign cwd及REVIEW_DUMMY_EXTRA原始负例payload保持不变，v2现在全部拒绝。为建立v2合法基线，只补上新契约要求的WINDIR、launch state、-X utf8和worker/Python pins；这项fixture更新明确记录在控件报告中，没有用缺字段拒绝冒充漏洞修复。
+
+合法launch输入和完整callback-frame替身通过。更换Python路径、worker路径、input路径、cwd、argv容器类型或已冻结环境均拒绝。ComSpec/PATHEXT现在也被八键环境闭集拒绝，不能再绕过basis。bootstrap和execute两种phase投影均与固定v8 runner源码的独立投影一致。
+
+字节与审查绑定
+
+validate_launch_inputs直接消费pin_bytes返回的worker_raw/python_raw；每份文件只读一次。独立changing-reader反例确认不会进行第二次未校验读取，compile接收的就是同一个已校验worker buffer。worker只编译，没有执行。worker/Python真实快照的内存内容变更、错误hash和错误size均被拒绝。
+
+Source-review schema升级为researchos.mu-sdk-controller-observer-independent-source-review.v2，除了原有controller/observer/hooks/runner tuple，必须精确绑定phase_worker_source_ref与python_binary_ref。旧v1四Source READY会被拒绝；新ref缺失、路径/hash/size错配以及Root/observer作者/program actor自签也会被拒绝。SOURCE_PASS_IN_SCOPE_WITH_OPEN同样不满足READY gate；本报告不会生成可启动的READY模板。
+
+实际observe_callback_frame在原有固定代码位置/handles/PID/clock检查之后调用validate_callback_launch，把frame内argv/cwd/env与已校验的launch合同匹配；输出原文加入actual_launch及两个新source refs。validate_context在观察前后都会重新检查source/authority和launch，保留原有program作者与Root实际执行者边界、admission-only及full_lifecycle_cleanup_verified=false。
+
+保留OPEN
+
+本结论没有验证实际Windows process/frame、OS argv/映像加载、suspend状态、Job watchdog、canonical事务或完整清理。后续controller必须提供新context pins和八键环境，并把进程创建后/后续文件加载的不可变性、全部资格Host/worker生命周期与真实OS探针封闭。CTRL-R02、CTRL-R05和执行加载不可变性仍OPEN。Root后来告知controller v3已封存，未在本轮读取或审查；需要独立后续任务。
+
+工具失败记录
+
+本轮有且只有1次新增工具失败，Root分配序号682：首次只读批量读取误用了旧报告名source-preparation.json，实际名称在handoff中为source-preparation.v2.json。外层PowerShell退出1，Python/native目标未调用（NULL），没有candidate/canonical修改。原始命令、完整输出和退出状态保存在failure-origin.read-report-name.json。随后按handoff的真实报告路径继续，余下metadata与控件命令均退出0；Source PASS不抹去该历史失败。任务接收时Root登记681，本包不写或重复累计canonical计数。
+
+formal_acceptance=false，execution_ready=false，whole_chain_ready=false。完成后停止，旧源包和旧review均保持immutable。
+

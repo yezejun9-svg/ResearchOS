@@ -1,0 +1,317 @@
+--- a/internal/domain/qualification_failure_maintenance_windows.go
++++ b/internal/domain/qualification_failure_maintenance_windows.go
+@@ -14,6 +14,7 @@
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"reflect"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -490,46 +491,97 @@
+ }
+ 
+ type HistoricalQualificationPlan struct {
+-	Schema                string                         `json:"schema"`
+-	OperationID           string                         `json:"operation_id"`
+-	DataRoot              string                         `json:"data_root"`
+-	Database              string                         `json:"database"`
+-	Subject               HistoricalQualificationSubject `json:"subject"`
+-	Source                HistoricalQualificationSource  `json:"source"`
+-	BoundaryPlanSHA256    string                         `json:"boundary_plan_sha256"`
+-	AuthorID              string                         `json:"author_id"`
+-	OwnerRoot             string                         `json:"owner_root"`
+-	DispatchDirectory     string                         `json:"dispatch_directory"`
+-	SID                   string                         `json:"sid"`
+-	BeforeCensus          store.OwnedStopCensus          `json:"before_census"`
+-	BeforeProtectedSHA256 string                         `json:"before_protected_sha256"`
+-	BeforeResidualSHA256  string                         `json:"before_residual_sha256"`
+-	Core                  Object                         `json:"core"`
+-	Proof                 Object                         `json:"proof"`
+-	ProofBytes            []byte                         `json:"proof_bytes"`
+-	Artifact              Object                         `json:"artifact"`
+-	ImpactLink            Object                         `json:"impact_link"`
+-	Run                   Object                         `json:"run"`
+-	ProjectState          Object                         `json:"project_state"`
+-	Event                 Object                         `json:"event"`
+-	Observation           Object                         `json:"observation"`
+-	BeforeRun             Object                         `json:"before_run"`
+-	BeforeState           Object                         `json:"before_state"`
+-	BeforeDispatch        Object                         `json:"before_dispatch"`
+-	UploadKey             string                         `json:"upload_key"`
+-	ExpiresAt             string                         `json:"expires_at"`
+-	ObservedAt            string                         `json:"observed_at"`
+-	EventSequence         int64                          `json:"event_sequence"`
+-	DispatchSequence      int64                          `json:"dispatch_sequence"`
+-	OutcomeHash           string                         `json:"outcome_hash"`
++	Schema                string                             `json:"schema"`
++	OperationID           string                             `json:"operation_id"`
++	DataRoot              string                             `json:"data_root"`
++	Database              string                             `json:"database"`
++	Subject               HistoricalQualificationSubject     `json:"subject"`
++	Source                HistoricalQualificationSource      `json:"source"`
++	BoundaryPlanSHA256    string                             `json:"boundary_plan_sha256"`
++	AuthorID              string                             `json:"author_id"`
++	OwnerRoot             string                             `json:"owner_root"`
++	DispatchDirectory     string                             `json:"dispatch_directory"`
++	SID                   string                             `json:"sid"`
++	BeforeCensus          store.OwnedStopCensus              `json:"before_census"`
++	BeforeProtectedSHA256 string                             `json:"before_protected_sha256"`
++	BeforeResidualSHA256  string                             `json:"before_residual_sha256"`
++	Core                  Object                             `json:"core"`
++	Proof                 Object                             `json:"proof"`
++	ProofBytes            []byte                             `json:"proof_bytes"`
++	Artifact              Object                             `json:"artifact"`
++	ImpactLink            Object                             `json:"impact_link"`
++	Run                   Object                             `json:"run"`
++	ProjectState          Object                             `json:"project_state"`
++	Event                 Object                             `json:"event"`
++	Observation           Object                             `json:"observation"`
++	BeforeRun             Object                             `json:"before_run"`
++	BeforeState           Object                             `json:"before_state"`
++	BeforeDispatch        Object                             `json:"before_dispatch"`
++	BeforeDispatchRow     historicalQualificationDispatchRow `json:"before_dispatch_row"`
++	UploadKey             string                             `json:"upload_key"`
++	ExpiresAt             string                             `json:"expires_at"`
++	ObservedAt            string                             `json:"observed_at"`
++	EventSequence         int64                              `json:"event_sequence"`
++	DispatchSequence      int64                              `json:"dispatch_sequence"`
++	OutcomeHash           string                             `json:"outcome_hash"`
+ }
+ 
+ func (p HistoricalQualificationPlan) coreHash() string { return Hash(p.Core) }
+ 
+ func (p HistoricalQualificationPlan) beforeHash() string {
+ 	return Hash(Object{"census": p.BeforeCensus, "run": p.BeforeRun,
+-		"state": p.BeforeState, "dispatch": p.BeforeDispatch,
++		"state": p.BeforeState, "dispatch": p.BeforeDispatch, "dispatch_row": p.BeforeDispatchRow,
+ 		"protected": p.BeforeProtectedSHA256, "residual": p.BeforeResidualSHA256})
++}
++
++// Keep the raw SQL image of every dispatch column. The decoded dispatch
++// object does not retain the exact manifest/identity bytes or prepared_at.
++type historicalQualificationDispatchRow struct {
++	Project             string                             `json:"project"`
++	Run                 string                             `json:"run"`
++	Epoch               int64                              `json:"epoch"`
++	DispatchKey         string                             `json:"dispatch_key"`
++	Manifest            string                             `json:"manifest"`
++	ManifestHash        string                             `json:"manifest_hash"`
++	State               string                             `json:"state"`
++	Worker              string                             `json:"worker"`
++	JournalLocator      string                             `json:"journal_locator"`
++	Identity            string                             `json:"identity"`
++	ObservationSequence int64                              `json:"observation_sequence"`
++	ObservationHash     string                             `json:"observation_hash"`
++	PreparedAt          string                             `json:"prepared_at"`
++	UpdatedAt           string                             `json:"updated_at"`
++	Reason              string                             `json:"reason"`
++	Cells               [15]historicalQualificationSQLCell `json:"cells"`
++}
++
++type historicalQualificationSQLCell struct {
++	Type string `json:"type"`
++	Data []byte `json:"data"`
++}
++
++func historicalQualificationReadDispatchRow(ctx context.Context, tx *sql.Tx, subject HistoricalQualificationSubject) (historicalQualificationDispatchRow, error) {
++	var r historicalQualificationDispatchRow
++	err := tx.QueryRowContext(ctx, `SELECT project,run,epoch,dispatch_key,manifest,manifest_hash,state,worker,journal_locator,identity,observation_sequence,observation_hash,prepared_at,updated_at,reason
++		FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.ProjectID, subject.RunID, subject.Epoch).
++		Scan(&r.Project, &r.Run, &r.Epoch, &r.DispatchKey, &r.Manifest, &r.ManifestHash,
++			&r.State, &r.Worker, &r.JournalLocator, &r.Identity, &r.ObservationSequence,
++			&r.ObservationHash, &r.PreparedAt, &r.UpdatedAt, &r.Reason)
++	if err != nil {
++		return r, err
++	}
++	// SQLite affinity permits BLOB or numeric storage in a TEXT column.
++	// Preserve every cell's storage class and exact bytes across JSON round trips.
++	cols := []string{"project", "run", "epoch", "dispatch_key", "manifest", "manifest_hash", "state", "worker", "journal_locator", "identity", "observation_sequence", "observation_hash", "prepared_at", "updated_at", "reason"}
++	fields := make([]string, 0, len(cols)*2)
++	args := make([]any, 0, len(cols)*2)
++	for i, col := range cols {
++		fields = append(fields, "typeof("+col+")", "CAST("+col+" AS BLOB)")
++		args = append(args, &r.Cells[i].Type, &r.Cells[i].Data)
++	}
++	err = tx.QueryRowContext(ctx, "SELECT "+strings.Join(fields, ",")+" FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?",
++		subject.ProjectID, subject.RunID, subject.Epoch).Scan(args...)
++	return r, err
+ }
+ 
+ func (p HistoricalQualificationPlan) residualSelectors() (store.QualificationResidualSelectors, error) {
+@@ -571,6 +623,11 @@
+ 	if len(operationID) != 32 || before.Tables < 87 || before.SHA256 == "" ||
+ 		dataRoot == "" || boundaryPlanSHA256 == "" || database != filepath.Join(dataRoot, "researchos.sqlite") {
+ 		return plan, qualificationDenialUnavailable("historical plan inputs invalid")
++	}
++	beforeDispatchRow, err := historicalQualificationReadDispatchRow(ctx, tx, verified.subject)
++	if err != nil || beforeDispatchRow.DispatchKey != verified.subject.DispatchKey ||
++		beforeDispatchRow.ManifestHash != Str(verified.dispatch, "manifest_hash") {
++		return plan, qualificationDenialUnavailable("historical dispatch SQL image unavailable")
+ 	}
+ 	currentRun, err := cloneQualificationObject(verified.run)
+ 	if err != nil {
+@@ -715,7 +772,8 @@
+ 		ProofBytes: proofBytes, Artifact: artifact, ImpactLink: link, Run: currentRun,
+ 		ProjectState: currentState, Event: event, Observation: observation,
+ 		BeforeRun: verified.run, BeforeState: verified.state, BeforeDispatch: verified.dispatch,
+-		UploadKey: uploadKey, ExpiresAt: expiresAt, ObservedAt: observedAt,
++		BeforeDispatchRow: beforeDispatchRow,
++		UploadKey:         uploadKey, ExpiresAt: expiresAt, ObservedAt: observedAt,
+ 		EventSequence: seq, DispatchSequence: dispatchSeq, OutcomeHash: outcomeHash}
+ 	plan.BeforeProtectedSHA256, err = store.QualificationMaintenanceProtectedCensus(ctx, tx)
+ 	if err != nil {
+@@ -1162,8 +1220,12 @@
+ 			if entry.kind == "EventEnvelope" {
+ 				wantHash = Str(entry.object, "receipt_hash")
+ 			}
++			wantImmutable := 0
++			if entry.kind == "EventEnvelope" {
++				wantImmutable = 1
++			}
+ 			if contentHash.Valid != (wantHash != "") || contentHash.Valid && contentHash.String != wantHash ||
+-				table == "domain_objects" && (immutable == 1) != (entry.kind == "EventEnvelope") {
++				table == "domain_objects" && immutable != wantImmutable {
+ 				return false, nil
+ 			}
+ 		}
+@@ -1258,20 +1320,28 @@
+ 	if observed != string(Bytes(plan.Observation)) || observedAt != plan.ObservedAt {
+ 		return false, nil
+ 	}
+-	var dispatchState, dispatchHash, dispatchKey, manifestHash, dispatchUpdated, dispatchReason string
+-	var dispatchSequence int64
+-	err = tx.QueryRowContext(ctx, `SELECT state,observation_sequence,observation_hash,dispatch_key,manifest_hash,updated_at,reason
+-		FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch).
+-		Scan(&dispatchState, &dispatchSequence, &dispatchHash, &dispatchKey, &manifestHash, &dispatchUpdated, &dispatchReason)
++	dispatchRow, err := historicalQualificationReadDispatchRow(ctx, tx, plan.Subject)
+ 	if err == sql.ErrNoRows {
+ 		return false, nil
+ 	}
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	if dispatchState != "OBSERVED" || dispatchSequence != plan.DispatchSequence || dispatchHash != Hash(plan.Observation) ||
+-		dispatchKey != plan.Subject.DispatchKey || manifestHash != Str(plan.BeforeDispatch, "manifest_hash") ||
+-		dispatchUpdated != plan.ObservedAt || dispatchReason != "historical qualification first-gate TOOL reconstruction "+plan.OperationID {
++	expectedDispatchRow := plan.BeforeDispatchRow
++	expectedDispatchRow.State = "OBSERVED"
++	expectedDispatchRow.ObservationSequence = plan.DispatchSequence
++	expectedDispatchRow.ObservationHash = Hash(plan.Observation)
++	expectedDispatchRow.UpdatedAt = plan.ObservedAt
++	expectedDispatchRow.Reason = "historical qualification first-gate TOOL reconstruction " + plan.OperationID
++	expectedDispatchRow.Cells[6] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.State)}
++	expectedDispatchRow.Cells[10] = historicalQualificationSQLCell{Type: "integer", Data: []byte(strconv.FormatInt(expectedDispatchRow.ObservationSequence, 10))}
++	expectedDispatchRow.Cells[11] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.ObservationHash)}
++	expectedDispatchRow.Cells[13] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.UpdatedAt)}
++	expectedDispatchRow.Cells[14] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.Reason)}
++	if !reflect.DeepEqual(dispatchRow, expectedDispatchRow) || expectedDispatchRow.Project != plan.Subject.ProjectID ||
++		expectedDispatchRow.Run != plan.Subject.RunID || expectedDispatchRow.Epoch != plan.Subject.Epoch ||
++		expectedDispatchRow.DispatchKey != plan.Subject.DispatchKey ||
++		expectedDispatchRow.ManifestHash != Str(plan.BeforeDispatch, "manifest_hash") {
+ 		return false, nil
+ 	}
+ 	var outbox string
+--- a/internal/domain/qualification_failure_maintenance_windows_test.go
++++ b/internal/domain/qualification_failure_maintenance_windows_test.go
+@@ -118,6 +118,10 @@
+ 		OutcomeHash: Hash(Object{"outcome": "fixture"}),
+ 	}
+ 	tx, e := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
++	if e != nil {
++		t.Fatal(e)
++	}
++	plan.BeforeDispatchRow, e = historicalQualificationReadDispatchRow(context.Background(), tx, plan.Subject)
+ 	if e != nil {
+ 		t.Fatal(e)
+ 	}
+@@ -782,6 +786,89 @@
+ 		}
+ 		t.Fatalf("applied: %s %v", state, e)
+ 	}
++	planJSON, e := json.Marshal(plan)
++	if e != nil {
++		t.Fatal(e)
++	}
++	var roundTripped HistoricalQualificationPlan
++	if e = json.Unmarshal(planJSON, &roundTripped); e != nil {
++		t.Fatal(e)
++	}
++	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
++	if e != nil || state != "APPLIED" {
++		t.Fatalf("serialized plan classified %s: %v", state, e)
++	}
++	// The target dispatch row is excluded from the residual census. Each
++	// unlicensed column must therefore be checked against its raw preimage.
++	for _, drift := range []struct{ column, changed, original string }{
++		{"worker", "changed-worker", plan.BeforeDispatchRow.Worker},
++		{"identity", `{"changed":true}`, plan.BeforeDispatchRow.Identity},
++		{"journal_locator", "changed-locator", plan.BeforeDispatchRow.JournalLocator},
++	} {
++		if _, e = db.Exec(`UPDATE runtime_dispatches SET `+drift.column+`=? WHERE project=? AND run=? AND epoch=?`,
++			drift.changed, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
++			t.Fatal(e)
++		}
++		state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
++		if e != nil || state != "UNKNOWN" {
++			t.Fatalf("%s drift classified %s: %v", drift.column, state, e)
++		}
++		if _, e = db.Exec(`UPDATE runtime_dispatches SET `+drift.column+`=? WHERE project=? AND run=? AND epoch=?`,
++			drift.original, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
++			t.Fatal(e)
++		}
++		state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
++		if e != nil || state != "APPLIED" {
++			t.Fatalf("%s restore classified %s: %v", drift.column, state, e)
++		}
++	}
++	if _, e = db.Exec(`UPDATE runtime_dispatches SET worker=CAST(? AS BLOB) WHERE project=? AND run=? AND epoch=?`,
++		plan.BeforeDispatchRow.Worker, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
++		t.Fatal(e)
++	}
++	var workerCellType string
++	if e = db.QueryRow(`SELECT typeof(worker) FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`,
++		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch).Scan(&workerCellType); e != nil || workerCellType != "blob" {
++		t.Fatalf("worker BLOB precondition: %q %v", workerCellType, e)
++	}
++	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
++	if e != nil || state != "UNKNOWN" {
++		t.Fatalf("same worker bytes with BLOB cell type classified %s: %v", state, e)
++	}
++	if _, e = db.Exec(`UPDATE runtime_dispatches SET worker=? WHERE project=? AND run=? AND epoch=?`,
++		plan.BeforeDispatchRow.Worker, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
++		t.Fatal(e)
++	}
++	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
++	if e != nil || state != "APPLIED" {
++		t.Fatalf("BLOB worker restore classified %s: %v", state, e)
++	}
++	immutableUpdate, e := db.Exec(`UPDATE domain_objects SET immutable=2 WHERE project=? AND kind='Artifact' AND id=?`,
++		plan.Subject.ProjectID, plan.Artifact["id"])
++	if e != nil {
++		t.Fatal(e)
++	}
++	changedRows, e := immutableUpdate.RowsAffected()
++	if e != nil || changedRows != 1 {
++		t.Fatalf("immutable UPDATE rows: %d %v", changedRows, e)
++	}
++	var actualImmutable int
++	if e = db.QueryRow(`SELECT immutable FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?`,
++		plan.Subject.ProjectID, plan.Artifact["id"]).Scan(&actualImmutable); e != nil || actualImmutable != 2 {
++		t.Fatalf("immutable 0->2 readback: %d %v", actualImmutable, e)
++	}
++	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
++	if e != nil || state != "UNKNOWN" {
++		t.Fatalf("domain_objects immutable 0->2 classified %s: %v", state, e)
++	}
++	if _, e = db.Exec(`UPDATE domain_objects SET immutable=0 WHERE project=? AND kind='Artifact' AND id=?`,
++		plan.Subject.ProjectID, plan.Artifact["id"]); e != nil {
++		t.Fatal(e)
++	}
++	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
++	if e != nil || state != "APPLIED" {
++		t.Fatalf("domain_objects immutable restore classified %s: %v", state, e)
++	}
+ 	if _, e = db.Exec(`INSERT INTO outbox(project,sequence,id,body) VALUES('project',2,'unrelated','{}')`); e != nil {
+ 		t.Fatal(e)
+ 	}

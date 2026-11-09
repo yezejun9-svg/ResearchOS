@@ -1,0 +1,46 @@
+[
+  {
+    "before": "def write_new(path, value):\n    raw = json.dumps(value, ensure_ascii=True, separators=(\",\", \":\")).encode(\"utf-8\")\n    with Path(path).open(\"xb\") as stream:\n        stream.write(raw)\n        stream.flush()\n        os.fsync(stream.fileno())\n    return public_ref(path)\n",
+    "after": "def write_new(path, value):\n    # Windows rename refuses an existing destination. Do not use os.replace,\n    # or run this publisher on a platform whose rename permits replacement.\n    if os.name != \"nt\":\n        raise OSError(\"atomic no-clobber publisher requires Windows\")\n    path = canonical_path(str(path))\n    parent = canonical_path(str(path.parent))\n    if not parent.is_dir():\n        raise ValueError(\"existing canonical publication directory required\")\n    if os.path.lexists(path):\n        raise FileExistsError(\"public destination already exists\")\n    raw = json.dumps(value, ensure_ascii=True, separators=(\",\", \":\")).encode(\"utf-8\")\n    temporary = parent/(\".\" + path.name + \".\" + uuid.uuid4().hex + \".pending\")\n    created = False\n    try:\n        with temporary.open(\"xb\") as stream:\n            created = True\n            if stream.write(raw) != len(raw):\n                raise OSError(\"short public JSON write\")\n            stream.flush()\n            os.fsync(stream.fileno())\n        if canonical_path(str(parent)) != parent or not parent.is_dir():\n            raise ValueError(\"publication directory changed\")\n        # Same-directory publication after close; the OS, not the earlier\n        # existence check, enforces no clobber if another writer wins.\n        os.rename(temporary, path)\n    except BaseException as error:\n        if created:\n            try:\n                temporary.unlink(missing_ok=True)\n            except OSError as cleanup_error:\n                # Keep the original failure type and the cleanup failure.\n                # Never remove the destination or another call's temporary.\n                raise error from cleanup_error\n        raise\n    return public_ref(path)\n\n\nclass PublicationPending(ValueError):\n    \"\"\"An unpinned public producer has not yet published complete JSON.\"\"\"\n\n\ndef _complete_public_json(path):\n    path = canonical_path(str(path))\n    try:\n        raw = path.read_bytes()\n        value = decode(raw)\n    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):\n        # Go still creates final ready/evidence names before Write/Sync/Close.\n        # Defer only unpinned publication reads; read_ref remains strict.\n        raise PublicationPending(\"public JSON publication pending\") from None\n    return {\"path\":str(path), \"sha256\":digest(raw), \"bytes\":len(raw)}, value\n"
+  },
+  {
+    "before": "def _phase(c):\n    out = c[\"output\"]\n    if (out/\"06-fixture-retained.ready.json\").is_file():\n        return \"fixture-retained\"\n    if (out/PHASES[\"grant\"][1]).is_file() and not (out/PHASES[\"grant\"][2]).exists():\n        return \"grant\"\n    if (out/PHASES[\"release\"][1]).is_file() and not (out/PHASES[\"release\"][2]).exists():\n        return \"release\"\n    return \"running\"\n",
+    "after": "def _phase(c):\n    out = c[\"output\"]\n    for phase, name, approval in (\n        (\"fixture-retained\", \"06-fixture-retained.ready.json\", None),\n        (\"grant\", PHASES[\"grant\"][1], PHASES[\"grant\"][2]),\n        (\"release\", PHASES[\"release\"][1], PHASES[\"release\"][2]),\n    ):\n        if (out/name).is_file() and (approval is None or not (out/approval).exists()):\n            try:\n                _complete_public_json(out/name)\n            except PublicationPending:\n                return \"running\"\n            return phase\n    return \"running\"\n"
+  },
+  {
+    "before": "            if stop.is_file():\n                value = decode(stop.read_bytes())\n                if value == {\"Action\":\"STOP_OWNED_CASE\", \"ConfigSHA256\":config_ref[\"sha256\"]}:\n                    cancellation.set()\n",
+    "after": "            if stop.is_file():\n                try:\n                    _, value = _complete_public_json(stop)\n                except PublicationPending:\n                    value = None\n                if value == {\"Action\":\"STOP_OWNED_CASE\", \"ConfigSHA256\":config_ref[\"sha256\"]}:\n                    cancellation.set()\n"
+  },
+  {
+    "before": "                value = decode(path.read_bytes())\n                if value != {\"Action\":\"OBSERVE_HELD_JOB\", \"ConfigSHA256\":config_ref[\"sha256\"], \"RequestID\":request_id}:\n",
+    "after": "                try:\n                    _, value = _complete_public_json(path)\n                except PublicationPending:\n                    continue\n                if value != {\"Action\":\"OBSERVE_HELD_JOB\", \"ConfigSHA256\":config_ref[\"sha256\"], \"RequestID\":request_id}:\n"
+  },
+  {
+    "before": "            raw = target.read_bytes()\n            try:\n                decode(raw)\n            except (ValueError, UnicodeError):\n                time.sleep(0.05)\n                continue\n            return public_ref(target)\n",
+    "after": "            try:\n                response_ref, _ = _complete_public_json(target)\n            except PublicationPending:\n                time.sleep(0.05)\n                continue\n            return response_ref\n"
+  },
+  {
+    "before": "    refs = [public_ref(c[\"output\"]/name) for name in files if (c[\"output\"]/name).is_file()]\n    fixture_path = c[\"output\"]/\"fixture.public.json\"\n    if fixture_path.is_file():\n        fixture = decode(fixture_path.read_bytes())\n",
+    "after": "    refs = [_complete_public_json(c[\"output\"]/name)[0]\n            for name in files if (c[\"output\"]/name).is_file()]\n    fixture_path = c[\"output\"]/\"fixture.public.json\"\n    if fixture_path.is_file():\n        fixture_ref, fixture = _complete_public_json(fixture_path)\n"
+  },
+  {
+    "before": "        retained = decode(fixture_path.read_bytes())\n        fixture = {\"database\":retained[\"database\"],\"root\":str(Path(retained[\"database\"]).parent)}\n",
+    "after": "        fixture_ref, retained = _complete_public_json(fixture_path)\n        fixture = {\"database\":retained[\"database\"],\"root\":str(Path(retained[\"database\"]).parent)}\n"
+  },
+  {
+    "before": "        payload_ref = public_ref(c[\"output\"]/PHASES[phase][0])\n        ready_ref = public_ref(c[\"output\"]/PHASES[phase][1])\n        payload = decode(read_ref(payload_ref))\n        ready = decode(read_ref(ready_ref))\n",
+    "after": "        payload_ref, payload = _complete_public_json(c[\"output\"]/PHASES[phase][0])\n        ready_ref, ready = _complete_public_json(c[\"output\"]/PHASES[phase][1])\n"
+  },
+  {
+    "before": "                \"fixture_public_ref\":public_ref(fixture_path),",
+    "after": "                \"fixture_public_ref\":fixture_ref,"
+  },
+  {
+    "before": "        snap[\"ready_ref\"] != public_ref(c[\"output\"]/PHASES[phase][1])):",
+    "after": "        snap[\"ready_ref\"] != _complete_public_json(c[\"output\"]/PHASES[phase][1])[0]):"
+  },
+  {
+    "before": "    current_payload = public_ref(c[\"output\"]/PHASES[phase][0])",
+    "after": "    current_payload = _complete_public_json(c[\"output\"]/PHASES[phase][0])[0]"
+  }
+]

@@ -1,0 +1,252 @@
+FILE ops/owned_core_stop/fixture/main_windows.go SHA256 54aeef90e1cd049f5fcd0a96f2f1e56a23b0a3856e116a7064f1ad2728fb9817
+1: //go:build windows
+2: 
+3: // The fixture is a separate executable and is never linked into the stop CLI.
+4: package main
+5: 
+6: import (
+7: 	"context"
+8: 	"database/sql"
+9: 	"encoding/json"
+10: 	"flag"
+11: 	"fmt"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"sort"
+15: 	"time"
+16: 
+17: 	"golang.org/x/sys/windows"
+18: 	_ "modernc.org/sqlite"
+19: 	rt "researchos.local/research-os/adapters/runtime"
+20: 	"researchos.local/research-os/internal/auth"
+21: 	"researchos.local/research-os/internal/host"
+22: 	"researchos.local/research-os/internal/store"
+23: 	"researchos.local/research-os/ops/supervisor"
+24: )
+25: 
+26: type nativeFile struct {
+27: 	Path   string `json:"path"`
+28: 	Volume uint32 `json:"volume"`
+29: 	Index  uint64 `json:"index"`
+30: }
+31: 
+32: func fileID(path string, dir bool) (nativeFile, error) {
+33: 	w, e := windows.UTF16PtrFromString(path)
+34: 	if e != nil {
+35: 		return nativeFile{}, e
+36: 	}
+37: 	h, e := windows.CreateFile(w, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+38: 	if e != nil {
+39: 		return nativeFile{}, e
+40: 	}
+41: 	defer windows.CloseHandle(h)
+42: 	var i windows.ByHandleFileInformation
+43: 	if e = windows.GetFileInformationByHandle(h, &i); e != nil {
+44: 		return nativeFile{}, e
+45: 	}
+46: 	if i.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (i.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != dir {
+47: 		return nativeFile{}, fmt.Errorf("reparse or type mismatch: %s", path)
+48: 	}
+49: 	return nativeFile{path, i.VolumeSerialNumber, uint64(i.FileIndexHigh)<<32 | uint64(i.FileIndexLow)}, nil
+50: }
+51: func private(path string, dir bool) error {
+52: 	token := windows.GetCurrentProcessToken()
+53: 	u, e := token.GetTokenUser()
+54: 	if e != nil {
+55: 		return e
+56: 	}
+57: 	sid := u.User.Sid.String()
+58: 	ace := "(A;;FA;;;" + sid + ")"
+59: 	if dir {
+60: 		ace = "(A;OICI;FA;;;" + sid + ")"
+61: 	}
+62: 	sd, e := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + ace)
+63: 	if e != nil {
+64: 		return e
+65: 	}
+66: 	acl, _, e := sd.DACL()
+67: 	if e != nil {
+68: 		return e
+69: 	}
+70: 	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+71: }
+72: func setup(root, out string) error {
+73: 	if root == "" || out == "" || filepath.IsAbs(root) == false || filepath.IsAbs(out) == false {
+74: 		return fmt.Errorf("new absolute fixture root/opdir required")
+75: 	}
+76: 	for _, path := range []string{root, filepath.Join(root, "host"), out} {
+77: 		if e := os.Mkdir(path, 0700); e != nil {
+78: 			return e
+79: 		}
+80: 	}
+81: 	if e := private(filepath.Join(root, "host"), true); e != nil {
+82: 		return e
+83: 	}
+84: 	if e := private(out, true); e != nil {
+85: 		return e
+86: 	}
+87: 	a, e := auth.Current()
+88: 	if e != nil {
+89: 		return e
+90: 	}
+91: 	state := map[string]any{"version": 1, "principal_ref": a.Ref, "principal_id": "owner-fixture", "host_instance_id": "host-fixture", "bootstrap_at": "", "created_owner": false, "bootstrap_iterations": 0, "active_credential_hash": ""}
+92: 	raw, e := json.Marshal(state)
+93: 	if e != nil {
+94: 		return e
+95: 	}
+96: 	statePath := filepath.Join(root, "host", "host_state.json")
+97: 	if e = os.WriteFile(statePath, raw, 0600); e != nil {
+98: 		return e
+99: 	}
+100: 	if e = private(statePath, false); e != nil {
+101: 		return e
+102: 	}
+103: 	db, e := sql.Open("sqlite", filepath.Join(root, "researchos.sqlite"))
+104: 	if e != nil {
+105: 		return e
+106: 	}
+107: 	defer db.Close()
+108: 	if _, e = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL`); e != nil {
+109: 		return e
+110: 	}
+111: 	files, e := filepath.Glob(filepath.Join("migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
+112: 	if e != nil || len(files) != 24 {
+113: 		return fmt.Errorf("schema24 migration inventory: %d %v", len(files), e)
+114: 	}
+115: 	sort.Strings(files)
+116: 	for i, file := range files {
+117: 		raw, e := os.ReadFile(file)
+118: 		if e != nil {
+119: 			return e
+120: 		}
+121: 		if _, e = db.Exec(string(raw)); e != nil {
+122: 			return fmt.Errorf("migration %s: %w", file, e)
+123: 		}
+124: 		if _, e = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); e != nil {
+125: 			return e
+126: 		}
+127: 	}
+128: 	for _, stmt := range []string{
+129: 		`INSERT INTO auth_principals(id,roles,revoked) VALUES('owner-fixture','["OWNER"]',0)`,
+130: 		`INSERT INTO orchestration_identity(principal,root) VALUES('owner-fixture','root-fixture')`,
+131: 		`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('fixture-project','Run','f3dcb996b2e43cf52cba874be7abfc70',1,'{"status":"RUNNING"}')`,
+132: 		`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70',1,'705b11ec99044fef19e85f57e2d2b712','{}','fixture-hash','UNKNOWN','fixture-time','fixture-time')`,
+133: 		`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70','old-model',1,'{"state":"CONFIRMED","payload":{"capability":"MODEL"}}')`,
+134: 		`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES('fixture-principal','fixture-project','host:managed-runtime-qualification','bc269e772ada7e1bce54439fd080550c','fixture-hash',202,x'00','{}','fixture-time')`,
+135: 		`CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`,
+136: 	} {
+137: 		if _, e = db.Exec(stmt); e != nil {
+138: 			return fmt.Errorf("fixture statement: %w", e)
+139: 		}
+140: 	}
+141: 	return nil
+142: }
+143: func describe(root, out string, pid uint32) error {
+144: 	n, e := supervisor.ObserveOwnedCoreReadOnly(pid)
+145: 	if e != nil {
+146: 		return e
+147: 	}
+148: 	h, e := host.ReadOwnedCoreStopPublicIdentity(context.Background(), root)
+149: 	if e != nil {
+150: 		return e
+151: 	}
+152: 	c, e := store.ReadOwnedStopCensus(context.Background(), h.Database)
+153: 	if e != nil {
+154: 		return e
+155: 	}
+156: 	r, e := fileID(root, true)
+157: 	if e != nil {
+158: 		return e
+159: 	}
+160: 	d, e := fileID(h.Database, false)
+161: 	if e != nil {
+162: 		return e
+163: 	}
+164: 	o, e := fileID(out, true)
+165: 	if e != nil {
+166: 		return e
+167: 	}
+168: 	return json.NewEncoder(os.Stdout).Encode(struct {
+169: 		Native       supervisor.OwnedCoreNativeIdentity `json:"native"`
+170: 		Host         host.OwnedCoreStopPublicIdentity   `json:"host"`
+171: 		Census       store.OwnedStopCensus              `json:"census"`
+172: 		DataRoot     nativeFile                         `json:"data_root"`
+173: 		Database     nativeFile                         `json:"database"`
+174: 		OperationDir nativeFile                         `json:"operation_dir"`
+175: 	}{n, h, c, r, d, o})
+176: }
+177: 
+178: func main() {
+179: 	mode := flag.String("mode", "run", "setup|describe|run")
+180: 	root := flag.String("root", "", "new owned fixture data root")
+181: 	out := flag.String("out", "", "pre-created private operation directory")
+182: 	pid := flag.Uint("pid", 0, "new owned Core fixture PID")
+183: 	ready := flag.String("ready", "", "ready marker outside product")
+184: 	attempt := flag.String("attempt", "", "attempt trigger")
+185: 	attempted := flag.String("attempted", "", "attempted marker")
+186: 	flag.Parse()
+187: 	if *mode == "setup" {
+188: 		if e := setup(*root, *out); e != nil {
+189: 			fmt.Fprintln(os.Stderr, e)
+190: 			os.Exit(2)
+191: 		}
+192: 		return
+193: 	}
+194: 	if *mode == "describe" {
+195: 		if e := describe(*root, *out, uint32(*pid)); e != nil {
+196: 			fmt.Fprintln(os.Stderr, e)
+197: 			os.Exit(2)
+198: 		}
+199: 		return
+200: 	}
+201: 	if *root == "" || *ready == "" || *attempt == "" || *attempted == "" {
+202: 		fmt.Fprintln(os.Stderr, "all fixture paths required")
+203: 		os.Exit(2)
+204: 	}
+205: 	lease, err := rt.AcquireDataRootLease(*root)
+206: 	if err != nil {
+207: 		fmt.Fprintln(os.Stderr, err)
+208: 		os.Exit(2)
+209: 	}
+210: 	defer lease.Close()
+211: 	db, err := sql.Open("sqlite", filepath.Join(*root, "researchos.sqlite"))
+212: 	if err != nil {
+213: 		fmt.Fprintln(os.Stderr, err)
+214: 		os.Exit(2)
+215: 	}
+216: 	defer db.Close()
+217: 	db.SetMaxOpenConns(1)
+218: 	if _, err = db.Exec(`PRAGMA busy_timeout=10000`); err != nil {
+219: 		fmt.Fprintln(os.Stderr, err)
+220: 		os.Exit(2)
+221: 	}
+222: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; INSERT INTO stop_fixture_rows VALUES('committed',x'0001ff')`); err != nil {
+223: 		fmt.Fprintln(os.Stderr, err)
+224: 		os.Exit(2)
+225: 	}
+226: 	if err = os.WriteFile(*ready, []byte("READY\n"), 0600); err != nil {
+227: 		fmt.Fprintln(os.Stderr, err)
+228: 		os.Exit(2)
+229: 	}
+230: 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+231: 		if _, err = os.Stat(*attempt); err == nil {
+232: 			break
+233: 		}
+234: 	}
+235: 	if _, err = os.Stat(*attempt); err != nil {
+236: 		return
+237: 	}
+238: 	conn, err := db.Conn(context.Background())
+239: 	if err != nil {
+240: 		return
+241: 	}
+242: 	defer conn.Close()
+243: 	if _, err = conn.ExecContext(context.Background(), "BEGIN DEFERRED"); err != nil {
+244: 		return
+245: 	}
+246: 	if err = os.WriteFile(*attempted, []byte("ATTEMPTED\n"), 0600); err != nil {
+247: 		return
+248: 	}
+249: 	_, _ = conn.ExecContext(context.Background(), `INSERT INTO stop_fixture_rows VALUES('inflight',x'02')`)
+250: 	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+251: }

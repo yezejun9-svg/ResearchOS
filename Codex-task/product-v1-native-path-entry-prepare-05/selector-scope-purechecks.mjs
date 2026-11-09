@@ -1,0 +1,22 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+const source=fs.readFileSync(new URL('./real-electron-flow.mjs',import.meta.url),'utf8');
+const start=source.indexOf('function requireWarningDismissSelector('),end=source.indexOf('\nfunction ',start+1);
+assert(start>=0&&end>start);
+const context=vm.createContext({folded:name=>path.resolve(name).toLowerCase(),requireThat:(test,code)=>{if(!test)throw new Error(code);}});
+vm.runInContext(source.slice(start,end),context);
+const scope=JSON.parse(fs.readFileSync(new URL('./scope.template.json',import.meta.url),'utf8'));
+const passed=[];
+const check=(name,fn)=>{fn();passed.push(name);};
+const fail=(name,mutate)=>check(name,()=>{const bad=structuredClone(scope);mutate(bad.native_picker.validation_warning.dismiss_selector);assert.throws(()=>context.requireWarningDismissSelector(bad));});
+check('fixed_actual03_single_button2_scope',()=>context.requireWarningDismissSelector(scope));
+fail('id1_not_allowed',s=>s.expected_control_id=1);
+fail('multiple_buttons_not_allowed',s=>s.expected_button_count=2);
+fail('arbitrary_valid_hex_evidence_not_allowed',s=>s.evidence_sha256='a'.repeat(64));
+fail('historical_event_name_not_renamed',s=>s.evidence_event='WARNING_DISMISS_CHILD_METADATA');
+fail('different_evidence_path_not_allowed',s=>s.evidence_path='C:/other.json');
+fail('messagebox_result_is_not_control_id',s=>s.message_box_result_is_control_id=true);
+console.log(JSON.stringify({schema:'researchos.native-path-entry-dismiss05-scope-pure/1',pure_cases:passed,
+  source_function_extracted_only:true,inherited_pure_cases_not_rerun:66,runner_import:0,run_function:0,app:0,cli:0,task:0,model:0},null,2));

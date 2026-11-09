@@ -1,0 +1,6 @@
+import pathlib,json,hashlib,subprocess
+E=pathlib.Path(__file__).parent;ROOT=pathlib.Path('D:/作品集/ResearchOS/research-os');S=pathlib.Path('C:/Users/yqyyds/.codex/researchos-build-worktrees/coding-any-combined-build-20261014');C='a7ec7ebf2d53848ea163b6115667b3e3761a6bd2';sha=lambda b:hashlib.sha256(b).hexdigest();inputs=json.loads((E/'source-and-root-evidence-binding.json').read_text(encoding='utf8'))
+for name in ['apps/desktop/main/main.js','apps/desktop/main/lib/ipc.js']:
+ b=(S/name).read_bytes();assert b==subprocess.check_output(['git','-C',str(ROOT),'show',C+':'+name]);o=E/'source'/name;o.parent.mkdir(parents=True,exist_ok=True);o.write_bytes(b);inputs.append({'source':str(S/name),'path':o.relative_to(E).as_posix(),'sha256':sha(b),'bytes':len(b),'commit':C})
+p=ROOT/'execution/v2.4/receipts/W05/W05-99/coding_model_observer_codex/20261014-current-chat/actual-coding-config-c671505-01.json';b=p.read_bytes();assert sha(b)=='75961da0f8907fe557dd42a4d67fae9b0630979fe74a1e79f0c10b7c9df71dc7';inputs.append({'source':str(p),'sha256':sha(b),'bytes':len(b),'root_formal_observer':True})
+(E/'source-and-root-evidence-binding.json').write_text(json.dumps(inputs,ensure_ascii=False,indent=2),encoding='utf8')

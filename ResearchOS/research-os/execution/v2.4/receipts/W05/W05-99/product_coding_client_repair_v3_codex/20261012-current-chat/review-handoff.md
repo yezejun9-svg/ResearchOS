@@ -1,0 +1,7 @@
+# Independent review handoff
+
+Review the exact candidate commit `2fda8155d457784c22655be553af87b8f3b114f2` in `C:/Users/yqyyds/.codex/researchos-build-worktrees/coding-client-v3-20261012`, against base `b20c816ec346c1dad1534b18b02abbb4f47c4628` and the three findings in the frozen B20 independent review. The authorized scope is the eight paths in `execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261012-current-chat/continuation-cp431/coding-client-v3-scope.json`.
+
+Focus on late PREPARE RESULT/ERROR after a true timeout, exact identity and scope binding, retry rearm boundaries after authoritative ERROR, stale session/host/resource invalidation, and the absence of an await between final CONFIRM authority check and write. Verify that original STATUS recovery, pending/uncertain barriers, consent dialog behavior, and zero implicit resubmission remain intact. The new browser scenario covers explicit Go reselection after PREPARE error.
+
+The frozen `source-bundle.json`, `c-build-binding.json`, copied build logs, descriptor, raw invocations, and all 1,663 copied desktop case files are in this receipt. The corrected complete desktop run passed 218/218. A prior diagnostic attempt lacking `RESEARCHOS_DESKTOP_ELECTRON` failed only the two renderer launch cases and is retained in raw evidence. Treat all fixture and source-bound results as local evidence, with formal acceptance delta zero.

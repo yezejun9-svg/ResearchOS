@@ -1,0 +1,122 @@
+ops/experiment_sandbox/async_windows.go
+1: //go:build windows
+2: 
+3: package sandbox
+4: 
+5: import (
+6: 	"bytes"
+7: 	"context"
+8: 	"errors"
+9: 	"io"
+10: 	"os"
+11: 	"sync"
+12: 	"time"
+13: )
+14: 
+15: const MaxStreamBytes = 4 * 1024 * 1024
+16: 
+17: // Identity is collected by the host while the process is still suspended.
+18: // BeforeResume must durably bind it to the admitted dispatch before returning.
+19: type Identity struct {
+20: 	PID              uint32 `json:"pid"`
+21: 	Created          int64  `json:"process_created_ns,string"`
+22: 	Job              string `json:"job"`
+23: 	SID              string `json:"appcontainer_sid"`
+24: 	Profile          string `json:"profile"`
+25: 	StagingDirectory string `json:"staging_directory"`
+26: }
+27: 
+28: type StreamChunk struct {
+29: 	Stream string `json:"stream"`
+30: 	Offset int64  `json:"offset"`
+31: 	Data   []byte `json:"data"`
+32: }
+33: 
+34: type StartOptions struct {
+35: 	BeforeResume func(Identity) error
+36: 	// OnStream must consume bounded chunks promptly. An error stops the Job;
+37: 	// the final receipt never treats a lost or truncated stream as drained.
+38: 	OnStream    func(StreamChunk) error
+39: 	Interactive bool
+40: 	// AllowCodingTurnTimeout is reserved for the trusted Mu coding bridge.
+41: 	// It raises only the per-process upper bound from 5 to 15 minutes;
+42: 	// Run and ordinary Start calls retain the 5-minute default.
+43: 	AllowCodingTurnTimeout bool
+44: }
+45: 
+46: type Process struct {
+47: 	mu        sync.Mutex
+48: 	writeGate chan struct{}
+49: 	stopped   <-chan struct{}
+50: 	stdin     *os.File
+51: 	cancel    context.CancelFunc
+52: 	done      chan struct{}
+53: 	ready     chan error
+54: 	receipt   Receipt
+55: 	err       error
+ops/experiment_sandbox/sandbox_windows.go
+1: //go:build windows
+2: 
+3: // Package sandbox runs one bounded process in a fresh AppContainer with no capabilities.
+4: package sandbox
+5: 
+6: import (
+7: 	"context"
+8: 	"errors"
+9: 	"fmt"
+10: 	"golang.org/x/sys/windows"
+11: 	"io"
+12: 	"os"
+13: 	"os/user"
+14: 	"path/filepath"
+15: 	"sort"
+16: 	"strings"
+17: 	"syscall"
+18: 	"time"
+19: 	"unicode/utf16"
+20: 	"unsafe"
+21: )
+22: 
+23: type Command struct {
+24: 	Executable                      string
+25: 	Args                            []string
+26: 	InputDirectory, OutputDirectory string
+27: 	Timeout                         time.Duration
+28: 	// Zero values preserve the original single-process, 256 MiB boundary.
+29: 	ProcessLimit, MemoryMiB uint32
+30: 	// Env accepts only the offline Go keys validated by goEnvironment.
+31: 	Env map[string]string
+32: }
+33: type Receipt struct {
+34: 	Executable      string   `json:"executable"`
+35: 	Args            []string `json:"argv"`
+36: 	Directory       string   `json:"cwd"`
+37: 	Profile         string   `json:"profile"`
+38: 	PID             uint32   `json:"pid"`
+39: 	Created         int64    `json:"process_created_ns,string"`
+40: 	Job             string   `json:"job"`
+41: 	StreamsDrained  bool     `json:"streams_drained"`
+42: 	CleanupComplete bool     `json:"cleanup_complete"`
+43: 	OutputCopied    bool     `json:"output_copied"`
+44: 	SID             string   `json:"appcontainer_sid"`
+45: 	Capabilities    []string `json:"capabilities"`
+46: 	ExitCode        int      `json:"exit_code"`
+47: 	Stopped         bool     `json:"children_stopped"`
+48: 	JobProcesses    uint32   `json:"job_total_processes"`
+49: 	TimedOut        bool     `json:"timed_out"`
+50: 	Started         string   `json:"started_at"`
+51: 	Finished        string   `json:"finished_at"`
+52: 	Stdout          []byte   `json:"stdout"`
+53: 	Stderr          []byte   `json:"stderr"`
+54: }
+55: 
+56: var userenv = windows.NewLazySystemDLL("userenv.dll")
+57: 
+58: func utf(s string) *uint16 { p, _ := windows.UTF16PtrFromString(s); return p }
+59: func acl(path, sid, rights string) error {
+60: 	u, e := user.Current()
+61: 	if e != nil {
+62: 		return e
+63: 	}
+64: 	sd, e := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + u.Uid + ")(A;OICI;" + rights + ";;;" + sid + ")S:(ML;OICI;NW;;;LW)")
+65: 	if e != nil {

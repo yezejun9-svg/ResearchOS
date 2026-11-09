@@ -1,0 +1,90 @@
+1: package domain
+2: 
+3: import (
+4: 	"bytes"
+5: 	"context"
+6: 	"database/sql"
+7: 	"encoding/json"
+8: 	"fmt"
+9: 	"os"
+10: 	"path/filepath"
+11: 	"researchos.local/research-os/internal/store"
+12: 	"strings"
+13: 	"testing"
+14: )
+15: 
+16: func streamTestEvent(text string) []byte {
+17: 	raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": text}}}})
+18: 	return append(append([]byte("data: "), raw...), []byte("\n\n")...)
+19: }
+20: 
+21: func modelStreamArchivedFixture(t *testing.T) (*sql.DB, *Service) {
+22: 	t.Helper()
+23: 	path := filepath.Join("..", "..", "execution", "v2.4", "receipts", "W05", "W05-99", "model_stream_executor_codex", "test-f4a65b87734641c8a39d7060dd8b24fb", "actual-fixtures", "TestCLIModelStreamInterruptedPrefix", "fixture.sqlite")
+24: 	raw, err := os.ReadFile(path)
+25: 	if err != nil {
+26: 		t.Fatal(err)
+27: 	}
+28: 	copy := filepath.Join(t.TempDir(), "state.sqlite")
+29: 	if err = os.WriteFile(copy, raw, 0600); err != nil {
+30: 		t.Fatal(err)
+31: 	}
+32: 	db, err := store.Open(copy)
+33: 	if err != nil {
+34: 		t.Fatal(err)
+35: 	}
+36: 	t.Cleanup(func() { db.Close() })
+37: 	contracts, err := LoadContracts("../../spec/v2.0/contracts")
+38: 	if err != nil {
+39: 		t.Fatal(err)
+40: 	}
+41: 	return db, &Service{DB: db, Contracts: contracts}
+42: }
+43: 
+44: func TestModelStreamInterruptedActualBackupRestore(t *testing.T) {
+45: 	db, s := modelStreamArchivedFixture(t)
+46: 	if err := validateBackupQueue(db); err != nil {
+47: 		t.Fatal("original observed partial", err)
+48: 	}
+49: 	// This copy is a local fixture. Revoke the already removed fixture workspace,
+50: 	// exactly as the existing queue restore suite does; original bytes stay sealed.
+51: 	if _, err := db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','REVOKED') WHERE kind='WorkspaceBinding'`); err != nil {
+52: 		t.Fatal(err)
+53: 	}
+54: 	var before string
+55: 	if err := db.QueryRow(`SELECT group_concat(body,'') FROM client_control_receipts WHERE kind=? ORDER BY rowid`, modelObservationKind).Scan(&before); err != nil {
+56: 		t.Fatal(err)
+57: 	}
+58: 	key := backupTestKey(t)
+59: 	archive, _ := backupTestCreate(t, s, key)
+60: 	destination := filepath.Join(t.TempDir(), "restored")
+61: 	report, err := RestoreBackup(context.Background(), archive, destination, backupOpt(t, s, key))
+62: 	if err != nil {
+63: 		t.Fatal(err)
+64: 	}
+65: 	if report.Status != "RESTORED_RECONCILIATION_REQUIRED" {
+66: 		t.Fatal(report.Status)
+67: 	}
+68: 	restored, err := store.Open(filepath.Join(destination, "state.sqlite"))
+69: 	if err != nil {
+70: 		t.Fatal(err)
+71: 	}
+72: 	defer restored.Close()
+73: 	if err = validateBackupQueue(restored); err != nil {
+74: 		t.Fatal("restored immutable prefix", err)
+75: 	}
+76: 	var after string
+77: 	var unknown, ends, fenced int
+78: 	if err = restored.QueryRow(`SELECT group_concat(body,'') FROM client_control_receipts WHERE kind=? ORDER BY rowid`, modelObservationKind).Scan(&after); err != nil {
+79: 		t.Fatal(err)
+80: 	}
+81: 	restored.QueryRow(`SELECT count(*) FROM resource_effects x WHERE json_extract(body,'$.state')='UNKNOWN' AND sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key)`).Scan(&unknown)
+82: 	restored.QueryRow(`SELECT count(*) FROM outbox WHERE json_extract(body,'$.kind')='MESSAGE' AND json_extract(body,'$.payload.role')='ASSISTANT' AND json_extract(body,'$.payload.phase')='END'`).Scan(&ends)
+83: 	restored.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE restore_fenced=1 AND state='RECONCILING'`).Scan(&fenced)
+84: 	if before != after || unknown != 1 || ends != 0 || fenced != 1 {
+85: 		t.Fatalf("partial restore changed facts equal=%v UNKNOWN=%d END=%d fenced=%d", before == after, unknown, ends, fenced)
+86: 	}
+87: 	// The old process/sequence cannot turn the restored prefix into a current live
+88: 	// stream. Restore preserves the evidence and fences its execution separately.
+89: 	t.Logf("MODEL_STREAM_RESTORE immutable=%v UNKNOWN=%d END=%d restore_fenced=%d", before == after, unknown, ends, fenced)
+90: }

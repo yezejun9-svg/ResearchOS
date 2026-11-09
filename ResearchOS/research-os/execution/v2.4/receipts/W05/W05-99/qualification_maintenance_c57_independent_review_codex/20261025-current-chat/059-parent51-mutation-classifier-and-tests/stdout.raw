@@ -1,0 +1,376 @@
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+188: func (h *historicalQualificationHold) Close() error {
+189: 	if h == nil {
+190: 		return nil
+191: 	}
+192: 	h.mu.Lock()
+193: 	defer h.mu.Unlock()
+194: 	if h.closed {
+195: 		return nil
+196: 	}
+197: 	h.closed = true
+198: 	var err error
+199: 	for i := len(h.files) - 1; i >= 0; i-- {
+200: 		err = errors.Join(err, h.files[i].file.Close())
+201: 	}
+202: 	if h.owner != nil {
+203: 		err = errors.Join(err, h.owner.Close())
+204: 	}
+205: 	return err
+206: }
+207: 
+208: // The transaction uses a non-canceling lifetime while individual SQL calls
+209: // use the caller's context. This makes a canceled call end in this synchronous
+210: // Rollback, whose driver return precedes release of the native source hold.
+211: func finishHistoricalQualificationTx(tx *sql.Tx, committed bool, hold *historicalQualificationHold) error {
+212: 	var err error
+213: 	if tx != nil && !committed {
+214: 		err = tx.Rollback()
+215: 	}
+216: 	return errors.Join(err, hold.Close())
+217: }
+218: 
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+797: func historicalMaintenanceMarker(plan HistoricalQualificationPlan, planFileSHA256 string) Object {
+798: 	return Object{"schema": "researchos.qualification-failure-maintenance-marker.v1",
+799: 		"kind": historicalMaintenanceProofKind, "operation_id": plan.OperationID,
+800: 		"plan_hash": plan.coreHash(), "plan_file_sha256": planFileSHA256,
+801: 		"subject": plan.Subject, "author": plan.AuthorID, "owner_root": plan.OwnerRoot,
+802: 		"proof_ref":        Ref(plan.Artifact, "Artifact"),
+803: 		"observation_hash": Hash(plan.Observation),
+804: 		"terminal_run_ref": Ref(plan.Run, "Run"), "outcome_hash": plan.OutcomeHash}
+805: }
+806: 
+807: func (s *Service) applyHistoricalQualificationTx(ctx context.Context, tx *sql.Tx,
+808: 	plan HistoricalQualificationPlan, planFileSHA256 string) error {
+809: 	if plan.Schema != "researchos.qualification-failure-maintenance-full-plan.v1" ||
+810: 		plan.Proof["kind"] != historicalMaintenanceProofKind ||
+811: 		plan.Proof["claim"] != "HOST_TOOL_EFFECT_NOT_DISPATCHED" ||
+812: 		plan.Proof["rule"] != historicalMaintenanceRule ||
+813: 		plan.Proof["native_class"] != historicalMaintenanceNativeClass ||
+814: 		plan.Proof["plan_hash"] != plan.coreHash() ||
+815: 		!bytes.Equal(plan.ProofBytes, Bytes(plan.Proof)) ||
+816: 		plan.Artifact["run_id"] != nil || len(Arr(plan.Artifact, "input_refs")) != 1 ||
+817: 		len(Arr(plan.Artifact, "source_refs")) != 0 ||
+818: 		plan.Artifact["content_hash"] != Digest(plan.ProofBytes) ||
+819: 		plan.Artifact["produced_by"] != plan.AuthorID ||
+820: 		plan.ImpactLink["relation"] != "DERIVED_FROM" ||
+821: 		plan.Event["event_type"] != "RUN_CHANGED" ||
+822: 		plan.Event["correlation_id"] != plan.OperationID ||
+823: 		plan.OutcomeHash == "" || len(plan.ProofBytes) > 64<<10 {
+824: 		return qualificationDenialUnavailable("historical planned write set invalid")
+825: 	}
+826: 	expiresAt, err := time.Parse(time.RFC3339Nano, plan.ExpiresAt)
+827: 	if err != nil || !expiresAt.After(time.Now()) {
+828: 		return qualificationDenialUnavailable("historical planned upload expired")
+829: 	}
+830: 	var used int
+831: 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.content_hash')=?`,
+832: 		plan.Subject.ProjectID, plan.Artifact["content_hash"]).Scan(&used); err != nil || used != 0 {
+833: 		return qualificationDenialUnavailable("historical proof content reused")
+834: 	}
+835: 	if _, err := tx.ExecContext(ctx, `INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,?,?,?,?,?,0)`,
+836: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID, plan.ProofBytes, Digest(plan.ProofBytes), plan.ExpiresAt); err != nil {
+837: 		return err
+838: 	}
+839: 	if err := s.put(tx, "Artifact", plan.Artifact); err != nil {
+840: 		return err
+841: 	}
+842: 	result, err := tx.ExecContext(ctx, `UPDATE uploaded_content SET sealed=1 WHERE storage_key=? AND project=? AND principal=? AND sealed=0`,
+843: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID)
+844: 	if err != nil {
+845: 		return err
+846: 	}
+847: 	if n, err := result.RowsAffected(); err != nil || n != 1 {
+848: 		return qualificationDenialUnavailable("historical upload seal CAS failed")
+849: 	}
+850: 	if err := s.put(tx, "ImpactLink", plan.ImpactLink); err != nil {
+851: 		return err
+852: 	}
+853: 	if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)`,
+854: 		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch,
+855: 		Hash(plan.Observation), string(Bytes(plan.Observation)), plan.ObservedAt); err != nil {
+856: 		return err
+857: 	}
+858: 	result, err = tx.ExecContext(ctx, `UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,reason=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state=? AND observation_sequence=? AND dispatch_key=? AND manifest_hash=?`,
+859: 		plan.DispatchSequence, Hash(plan.Observation), "historical qualification first-gate TOOL reconstruction "+plan.OperationID,
+860: 		plan.ObservedAt, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch,
+861: 		plan.BeforeDispatch["state"], plan.BeforeDispatch["observation_sequence"],
+862: 		plan.BeforeDispatch["dispatch_key"], plan.BeforeDispatch["manifest_hash"])
+863: 	if err != nil {
+864: 		return err
+865: 	}
+866: 	if n, err := result.RowsAffected(); err != nil || n != 1 {
+867: 		return qualificationDenialUnavailable("historical dispatch CAS failed")
+868: 	}
+869: 	if err := s.put(tx, "Run", plan.Run); err != nil {
+870: 		return err
+871: 	}
+872: 	if err := s.put(tx, "ProjectState", plan.ProjectState); err != nil {
+873: 		return err
+874: 	}
+875: 	if err := s.put(tx, "EventEnvelope", plan.Event); err != nil {
+876: 		return err
+877: 	}
+878: 	if _, err := tx.ExecContext(ctx, `INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)`,
+879: 		plan.Subject.ProjectID, plan.EventSequence, plan.Event["id"], string(Bytes(plan.Event))); err != nil {
+880: 		return err
+881: 	}
+882: 	if _, err := tx.ExecContext(ctx, `INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)`,
+883: 		plan.Subject.ProjectID, plan.Event["id"], plan.ProjectState["revision"], string(Bytes(plan.ProjectState))); err != nil {
+884: 		return err
+885: 	}
+886: 	marker := historicalMaintenanceMarker(plan, planFileSHA256)
+887: 	if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-failure-maintenance',?,?,200,?,'{}',?)`,
+888: 		plan.AuthorID, plan.Subject.ProjectID, plan.OperationID, planFileSHA256,
+889: 		string(Bytes(marker)), plan.ObservedAt); err != nil {
+890: 		return err
+891: 	}
+892: 	return nil
+893: }
+894: 
+895: func (s *Service) validatedHistoricalQualificationFailureTx(tx *sql.Tx,
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1106: func historicalQualificationExactRows(ctx context.Context, tx *sql.Tx, plan HistoricalQualificationPlan, planFileSHA256 string) (bool, error) {
+1107: 	for _, entry := range []struct {
+1108: 		kind   string
+1109: 		object Object
+1110: 	}{
+1111: 		{"Artifact", plan.Artifact}, {"ImpactLink", plan.ImpactLink}, {"Run", plan.Run},
+1112: 		{"ProjectState", plan.ProjectState}, {"EventEnvelope", plan.Event},
+1113: 	} {
+1114: 		id := Str(entry.object, "id")
+1115: 		rev, err := Num(entry.object, "revision")
+1116: 		if err != nil {
+1117: 			return false, err
+1118: 		}
+1119: 		for _, table := range []string{"domain_versions", "domain_objects"} {
+1120: 			var body string
+1121: 			var actualRevision int64
+1122: 			var contentHash sql.NullString
+1123: 			var immutable int
+1124: 			selection := "revision,body,content_hash"
+1125: 			if table == "domain_objects" {
+1126: 				selection += ",immutable"
+1127: 			}
+1128: 			row := tx.QueryRowContext(ctx, `SELECT `+selection+` FROM "`+table+`" WHERE project=? AND kind=? AND id=?`+
+1129: 				func() string {
+1130: 					if table == "domain_versions" {
+1131: 						return " AND revision=?"
+1132: 					}
+1133: 					return ""
+1134: 				}(),
+1135: 				func() []any {
+1136: 					args := []any{plan.Subject.ProjectID, entry.kind, id}
+1137: 					if table == "domain_versions" {
+1138: 						args = append(args, rev)
+1139: 					}
+1140: 					return args
+1141: 				}()...,
+1142: 			)
+1143: 			var e error
+1144: 			if table == "domain_objects" {
+1145: 				e = row.Scan(&actualRevision, &body, &contentHash, &immutable)
+1146: 			} else {
+1147: 				e = row.Scan(&actualRevision, &body, &contentHash)
+1148: 			}
+1149: 			if e == sql.ErrNoRows {
+1150: 				return false, nil
+1151: 			}
+1152: 			if e != nil {
+1153: 				return false, e
+1154: 			}
+1155: 			if actualRevision != rev || body != string(Bytes(entry.object)) {
+1156: 				return false, nil
+1157: 			}
+1158: 			wantHash := ""
+1159: 			if entry.kind == "Artifact" {
+1160: 				wantHash = Str(entry.object, "content_hash")
+1161: 			}
+1162: 			if entry.kind == "EventEnvelope" {
+1163: 				wantHash = Str(entry.object, "receipt_hash")
+1164: 			}
+1165: 			if contentHash.Valid != (wantHash != "") || contentHash.Valid && contentHash.String != wantHash ||
+1166: 				table == "domain_objects" && (immutable == 1) != (entry.kind == "EventEnvelope") {
+1167: 				return false, nil
+1168: 			}
+1169: 		}
+1170: 	}
+1171: 	// New revisions of the two mutable objects must carry the same reference
+1172: 	// edges as their immediately preceding versions.
+1173: 	for _, entry := range []struct {
+1174: 		kind   string
+1175: 		object Object
+1176: 	}{
+1177: 		{"Run", plan.Run}, {"ProjectState", plan.ProjectState},
+1178: 	} {
+1179: 		rev, err := Num(entry.object, "revision")
+1180: 		if err != nil {
+1181: 			return false, err
+1182: 		}
+1183: 		newRows, err := historicalQualificationRefs(tx, plan.Subject.ProjectID, entry.kind, Str(entry.object, "id"), rev)
+1184: 		if err != nil {
+1185: 			return false, err
+1186: 		}
+1187: 		oldRows, err := historicalQualificationRefs(tx, plan.Subject.ProjectID, entry.kind, Str(entry.object, "id"), rev-1)
+1188: 		if err != nil {
+1189: 			return false, err
+1190: 		}
+1191: 		if matched, err := historicalQualificationRefRevisionMatches(tx, plan.Subject.ProjectID, entry.kind, entry.object, oldRows, newRows); err != nil {
+1192: 			return false, err
+1193: 		} else if !matched {
+1194: 			return false, nil
+1195: 		}
+1196: 	}
+1197: 	profile, ok := plan.Core["profile_ref"].(map[string]any)
+1198: 	if !ok {
+1199: 		return false, nil
+1200: 	}
+1201: 	profileRevision, err := Num(Object(profile), "revision")
+1202: 	if err != nil {
+1203: 		return false, err
+1204: 	}
+1205: 	refExpected := []struct {
+1206: 		kind, id string
+1207: 		rows     []any
+1208: 	}{
+1209: 		{"Artifact", Str(plan.Artifact, "id"), []any{[]any{"/input_refs/0", plan.Subject.ProjectID, Str(Object(profile), "entity_type"), Str(Object(profile), "id"), profileRevision}}},
+1210: 		{"ImpactLink", Str(plan.ImpactLink, "id"), []any{
+1211: 			[]any{"/from_ref", plan.Subject.ProjectID, "Artifact", Str(plan.Artifact, "id"), int64(1)},
+1212: 			[]any{"/to_ref", plan.Subject.ProjectID, Str(Object(profile), "entity_type"), Str(Object(profile), "id"), profileRevision},
+1213: 		}},
+1214: 	}
+1215: 	runRevision, err := Num(plan.Run, "revision")
+1216: 	if err != nil {
+1217: 		return false, err
+1218: 	}
+1219: 	refExpected = append(refExpected, struct {
+1220: 		kind, id string
+1221: 		rows     []any
+1222: 	}{
+1223: 		"EventEnvelope", Str(plan.Event, "id"), []any{[]any{"/aggregate_ref", plan.Subject.ProjectID, "Run", plan.Subject.RunID, runRevision}},
+1224: 	})
+1225: 	for _, entry := range refExpected {
+1226: 		rows, err := historicalQualificationRefs(tx, plan.Subject.ProjectID, entry.kind, entry.id, 1)
+1227: 		if err != nil {
+1228: 			return false, err
+1229: 		}
+1230: 		if Hash(rows) != Hash(entry.rows) {
+1231: 			return false, nil
+1232: 		}
+1233: 	}
+1234: 	var uploaded []byte
+1235: 	var contentHash string
+1236: 	var sealed int
+1237: 	var expiresAt string
+1238: 	err = tx.QueryRowContext(ctx, `SELECT bytes,content_hash,sealed,expires_at FROM uploaded_content WHERE storage_key=? AND project=? AND principal=?`,
+1239: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID).Scan(&uploaded, &contentHash, &sealed, &expiresAt)
+1240: 	if err == sql.ErrNoRows {
+1241: 		return false, nil
+1242: 	}
+1243: 	if err != nil {
+1244: 		return false, err
+1245: 	}
+1246: 	if !bytes.Equal(uploaded, plan.ProofBytes) || contentHash != Digest(plan.ProofBytes) || sealed != 1 || expiresAt != plan.ExpiresAt {
+1247: 		return false, nil
+1248: 	}
+1249: 	var observed, observedAt string
+1250: 	err = tx.QueryRowContext(ctx, `SELECT body,observed_at FROM runtime_observations WHERE project=? AND run=? AND epoch=? AND receipt_hash=?`,
+1251: 		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch, Hash(plan.Observation)).Scan(&observed, &observedAt)
+1252: 	if err == sql.ErrNoRows {
+1253: 		return false, nil
+1254: 	}
+1255: 	if err != nil {
+1256: 		return false, err
+1257: 	}
+1258: 	if observed != string(Bytes(plan.Observation)) || observedAt != plan.ObservedAt {
+1259: 		return false, nil
+1260: 	}
+1261: 	var dispatchState, dispatchHash, dispatchKey, manifestHash, dispatchUpdated, dispatchReason string
+1262: 	var dispatchSequence int64
+1263: 	err = tx.QueryRowContext(ctx, `SELECT state,observation_sequence,observation_hash,dispatch_key,manifest_hash,updated_at,reason
+1264: 		FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch).
+1265: 		Scan(&dispatchState, &dispatchSequence, &dispatchHash, &dispatchKey, &manifestHash, &dispatchUpdated, &dispatchReason)
+1266: 	if err == sql.ErrNoRows {
+1267: 		return false, nil
+1268: 	}
+1269: 	if err != nil {
+1270: 		return false, err
+1271: 	}
+1272: 	if dispatchState != "OBSERVED" || dispatchSequence != plan.DispatchSequence || dispatchHash != Hash(plan.Observation) ||
+1273: 		dispatchKey != plan.Subject.DispatchKey || manifestHash != Str(plan.BeforeDispatch, "manifest_hash") ||
+1274: 		dispatchUpdated != plan.ObservedAt || dispatchReason != "historical qualification first-gate TOOL reconstruction "+plan.OperationID {
+1275: 		return false, nil
+1276: 	}
+1277: 	var outbox string
+1278: 	var acknowledged int
+1279: 	err = tx.QueryRowContext(ctx, `SELECT body,acknowledged FROM outbox WHERE project=? AND sequence=? AND id=?`,
+1280: 		plan.Subject.ProjectID, plan.EventSequence, Str(plan.Event, "id")).Scan(&outbox, &acknowledged)
+1281: 	if err == sql.ErrNoRows {
+1282: 		return false, nil
+1283: 	}
+1284: 	if err != nil {
+1285: 		return false, err
+1286: 	}
+1287: 	if outbox != string(Bytes(plan.Event)) || acknowledged != 0 {
+1288: 		return false, nil
+1289: 	}
+1290: 	var snapshot string
+1291: 	var snapshotRev int64
+1292: 	err = tx.QueryRowContext(ctx, `SELECT body,revision FROM event_state_snapshots WHERE project=? AND event_id=?`,
+1293: 		plan.Subject.ProjectID, Str(plan.Event, "id")).Scan(&snapshot, &snapshotRev)
+1294: 	if err == sql.ErrNoRows {
+1295: 		return false, nil
+1296: 	}
+1297: 	if err != nil {
+1298: 		return false, err
+1299: 	}
+1300: 	stateRevision, stateErr := Num(plan.ProjectState, "revision")
+1301: 	if stateErr != nil {
+1302: 		return false, stateErr
+1303: 	}
+1304: 	if snapshot != string(Bytes(plan.ProjectState)) || snapshotRev != stateRevision {
+1305: 		return false, nil
+1306: 	}
+1307: 	var markerRaw []byte
+1308: 	var status int
+1309: 	var headers, createdAt string
+1310: 	err = tx.QueryRowContext(ctx, `SELECT body,status,headers,created_at FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-failure-maintenance' AND key=? AND request_hash=?`,
+1311: 		plan.AuthorID, plan.Subject.ProjectID, plan.OperationID, planFileSHA256).Scan(&markerRaw, &status, &headers, &createdAt)
+1312: 	if err == sql.ErrNoRows {
+1313: 		return false, nil
+1314: 	}
+1315: 	if err != nil {
+1316: 		return false, err
+1317: 	}
+1318: 	if status != 200 || headers != "{}" || createdAt != plan.ObservedAt ||
+1319: 		!bytes.Equal(markerRaw, Bytes(historicalMaintenanceMarker(plan, planFileSHA256))) {
+1320: 		return false, nil
+1321: 	}
+1322: 	return true, nil
+1323: }
+1324: 
+1325: // ClassifyHistoricalQualification is a read-only crash classifier. An exact
+1326: // pre-BEGIN image is NOT_APPLIED; a committed image requires the nine planned
+1327: // table rows plus unchanged residual rows in all 87 application tables.
+
+FILE internal/domain/qualification_failure_maintenance_windows_test.go
+28: func qualificationClassifierFixture(t *testing.T) (*sql.DB, HistoricalQualificationPlan, string) {
+146: func TestHistoricalQualificationNativeThreeFrameHold(t *testing.T) {
+254: func TestHistoricalQualificationPrivateNativeHoldThroughSQLReturn(t *testing.T) {
+343: type historicalBlockingDriver struct {
+348: func (d *historicalBlockingDriver) Open(string) (driver.Conn, error) {
+352: type historicalBlockingConn struct{ owner *historicalBlockingDriver }
+354: func (*historicalBlockingConn) Prepare(string) (driver.Stmt, error) {
+357: func (*historicalBlockingConn) Close() error { return nil }
+358: func (c *historicalBlockingConn) Begin() (driver.Tx, error) {
+361: func (c *historicalBlockingConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+365: type historicalBlockingTx struct{ owner *historicalBlockingDriver }
+367: func (tx *historicalBlockingTx) Commit() error {
+375: func (tx *historicalBlockingTx) Rollback() error {
+381: func TestHistoricalQualificationNativeHoldWaitsForDriverRollbackAndCommitError(t *testing.T) {
+478: func TestHistoricalQualificationPlannedWriterFiveVersions(t *testing.T) {
+690: func TestHistoricalQualificationRecoveryClassificationNineTables(t *testing.T) {

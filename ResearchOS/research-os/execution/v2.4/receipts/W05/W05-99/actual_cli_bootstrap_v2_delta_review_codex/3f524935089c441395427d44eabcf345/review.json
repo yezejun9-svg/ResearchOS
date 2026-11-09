@@ -1,0 +1,95 @@
+{
+  "schema": "researchos.actual-cli-bootstrap-source-delta-review.v1",
+  "actor_id": "codex:/root/w05_merge_review",
+  "source_author": "codex:/root",
+  "decision": "BLOCKED_SOURCE_DELTA",
+  "scope": "Only delta from bootstrap bfeecc66 to v2 8512901a; existing fixed helper/binary pins and prior failed-attempt cleanup reused",
+  "source_ref": {
+    "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/sdk_five_go_root_adoption_preparation_codex/04a454a98b164aa2983f16245f273e9d/actual-cli-bootstrap-v2-d873bd7f77ab4d0a927d93c28a636dac/bootstrap_actual_cli.v2.py",
+    "sha256": "8512901abb581f184ec605dae384c6296a01ad37ec4f9c640f2478efafde16fb",
+    "bytes": 17917
+  },
+  "base_source_sha256": "bfeecc66acc6b40534d38f1bb23d11725175702caf9a8ba09ce5d0ee3ddbdf24",
+  "findings": [
+    {
+      "id": "BOOT-V2-R01",
+      "priority": "P1",
+      "lines": [
+        80,
+        81,
+        93,
+        95
+      ],
+      "title": "Use the supported cross-process control-text API for the required Static marker",
+      "trigger": "The Static child is owned by the Host process, not the Root Python process. wt() uses GetWindowTextW and treats its returned buffer as the control text.",
+      "impact": "GetWindowTextW is not the supported way to retrieve another process's control text and can provide no marker. The only matching branch then waits until the UI deadline while a real picker exists.",
+      "minimum_fix": "Send WM_GETTEXT (0x000D, a system message below WM_USER) through SendMessageTimeoutW with a local writable UTF-16 buffer, capacity and a timeout bounded by the remaining UI deadline. Check the actual send completion and text length; record failure in the callback error channel. Preserve Host-owned initial selection and pointer-free BM_CLICK.",
+      "source_url": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw",
+      "related_source_url": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw"
+    },
+    {
+      "id": "BOOT-V2-R02",
+      "priority": "P1",
+      "lines": [
+        89,
+        93,
+        94,
+        98,
+        115
+      ],
+      "title": "Catch exceptions inside each ctypes enumeration callback",
+      "trigger": "enum_top or enum_child raises after an earlier matching child/window has already been collected, for example a metadata read error after R01 is made fail-closed.",
+      "impact": "ctypes reports callback exceptions as unraisable; the enclosing Python try/except does not receive them. Partial children/matches can survive, so one collected match can be accepted without a successful complete enumeration.",
+      "minimum_fix": "Wrap both callbacks in their own try/except BaseException, append stage/HWND/error to shared callback_errors and return False on error. After every enumeration reject callback_errors before consuming children or matches. Do not rely on EnumChildWindows return value to propagate Python callback exceptions.",
+      "source_url": "https://raw.githubusercontent.com/python/cpython/v3.14.0/Modules/_ctypes/callbacks.c",
+      "source_lines": [
+        197,
+        201
+      ]
+    },
+    {
+      "id": "BOOT-V2-R03",
+      "priority": "P1",
+      "lines": [
+        134,
+        135,
+        136,
+        137,
+        138
+      ],
+      "title": "Bind confirmation to the selected workspace before publishing it",
+      "trigger": "The Shell picker closes after a different directory is selected, whether the initial preselection was not applied or a user changed it. CLI init can still successfully create a project bound to that directory.",
+      "impact": "The code sets confirmed_by_native_cli_result=True after only CLI success and dialog disappearance. It does not compare the actual Host workspace binding behind the returned workspace_ref with requested_workspace. The receipt can therefore confirm the intended workspace while the project uses another root.",
+      "minimum_fix": "Before publishing the confirmed flag, derive the actual chosen/bound root from the native-result/Host binding using the returned workspace_ref and compare its canonical directory with the unique intended workspace. Require the same ref in init result and persisted config; keep requested_workspace labelled as intent until this check succeeds.",
+      "evidence": "apps/cli/cli_contract.go passes the actual chooser-selected path into workspace.register/project.bootstrap and emits workspace_ref/result; the new producer currently checks only project_id and empty session_id."
+    }
+  ],
+  "positive_findings": [
+    "Original Host same-process initial selection remains unchanged; no custom cross-process pointer message is sent.",
+    "BM_CLICK uses zero WPARAM/LPARAM. SendMessageTimeoutW completion is distinguished from the message result, which is not treated as click success.",
+    "ctypes HWND/WPARAM/LPARAM and output DWORD_PTR widths match the ABI. c_size_t rather than signed LRESULT does not affect the used zero/nonzero completion check; this is not a blocker.",
+    "The selected dialog is tied to the held Host PID/creation and a live primary process, with exact class/title marker and enabled IDOK.",
+    "The UI stop/join and unconfirmed-thread inclusion preserve the same parent on unconfirmed UI/Job cleanup; Host60s/CLI init20s remain pre-trial zero-provider scope."
+  ],
+  "verification": {
+    "new_tests_written": 0,
+    "candidate_imports": 0,
+    "native_executions": 0,
+    "gui_operations": 0,
+    "provider_requests": 0,
+    "root_file_writes": 0,
+    "canonical_writes": 0,
+    "new_tool_errors": 0
+  },
+  "reused_evidence": {
+    "base_review_handoff": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/actual_cli_bootstrap_independent_source_review_codex/4cb73514758f4e6c80c8fc424a197aca/handoff.json",
+    "base_review_handoff_sha256": "953c83a6ceb4c815d464733399140c38fd7d5cb3c212c2127655378a3c13c37c",
+    "failed_attempt_lifecycle_sha256": "7786cfe07325d497a966e53e1d23e914189225c1a3e5d382ecca5a2e6cf6b9c8",
+    "failed_attempt_source_guard_cleanup_sha256": "a33bc09c9e0c187640a15b19ce53f12cc2c21de38f998aeacead92ccd576bd80"
+  },
+  "current_observed_failure_cut_from_root": 716,
+  "runtime_qualification": false,
+  "formal_acceptance": false,
+  "execution_grant_issued": false
+}
+

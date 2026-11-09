@@ -1,0 +1,615 @@
+1840: 	case "observe":
+1841: 		if state != "ARMED" {
+1842: 			return "", errors.New("observe requires ARMED")
+1843: 		}
+1844: 		holds, e := openPlanHolds(p)
+1845: 		if e != nil {
+1846: 			return "", e
+1847: 		}
+1848: 		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
+1849: 		if e = checkFence(p, holds); e != nil {
+1850: 			return "", e
+1851: 		}
+1852: 		if e = checkAncestorControl(p, holds); e != nil {
+1853: 			return "", e
+1854: 		}
+1855: 		if e = checkNoOfficialProcess(p); e != nil {
+1856: 			return "", e
+1857: 		}
+1858: 		post, e := witness(p, fenceDigest(p))
+1859: 		if e != nil {
+1860: 			return "", e
+1861: 		}
+1862: 		currentBusiness, e := inspectExistingBusinessProcess(p, r.Pre.BusinessEnabledSIDsSHA256, r.Pre)
+1863: 		if e != nil {
+1864: 			return "", e
+1865: 		}
+1866: 		post.BusinessEnabledSIDsSHA256 = currentBusiness.GroupsSHA256
+1867: 		post.BusinessSessionID = currentBusiness.SessionID
+1868: 		post.BusinessElevationType = currentBusiness.ElevationType
+1869: 		post.BusinessIntegritySID = currentBusiness.IntegritySID
+1870: 		post.BusinessLogonSID = currentBusiness.LogonSID
+1871: 		post.BusinessPrivilegesSHA256 = currentBusiness.PrivilegesSHA256
+1872: 		post.BusinessProcessPID = currentBusiness.ProcessID
+1873: 		post.BusinessProcessCreatedUTC = currentBusiness.ProcessCreated
+1874: 		post.BusinessProcessImageSHA256 = currentBusiness.ProcessImageSHA
+1875: 		post.FullRestartEvidenceSHA256, e = readFullRestartEvidence(p, r.Pre, post.UTC)
+1876: 		if e != nil {
+1877: 			return "", e
+1878: 		}
+1879: 		if e = ValidateRestart(r.Pre, post); e != nil {
+1880: 			return "", e
+1881: 		}
+1882: 		if e = writeExclusiveJSON(filepath.Join(dir, "post.json"), post); e != nil {
+1883: 			return "", e
+1884: 		}
+1885: 		if e = appendEvent(p, r.Events, "BOOT_OBSERVED"); e != nil {
+1886: 			return "", e
+1887: 		}
+1888: 		return "BOOT_OBSERVED", nil
+1889: 	case "disarm-request":
+1890: 		if state == "PREPARED" || state == "APPLYING" || state == "ARMED" || state == "BOOT_OBSERVED" {
+1891: 			// The only abort path is a proven pre-BEGIN path under the same
+1892: 			// exclusive root lock used by C. Any journal, even malformed or
+1893: 			// terminal, requires exact C recovery rather than a no-effect claim.
+1894: 			lease, leaseErr := rt.AcquireDataRootLease(p.DataRoot.Path)
+1895: 			if leaseErr != nil {
+1896: 				return "", leaseErr
+1897: 			}
+1898: 			defer func() { errOut = errors.Join(errOut, lease.Close()) }()
+1899: 			ownJournal := filepath.Join(p.DataRoot.Path, "host", qualificationmaintenancejournal.QualificationNamespace, p.OperationID)
+1900: 			if _, statErr := os.Lstat(ownJournal); statErr == nil {
+1901: 				return "", errors.New("C journal exists; pre-BEGIN abort forbidden")
+1902: 			} else if !errors.Is(statErr, os.ErrNotExist) {
+1903: 				return "", statErr
+1904: 			}
+1905: 			if e = qualificationmaintenancejournal.CheckOrdinary(p.DataRoot.Path); e != nil {
+1906: 				return "", e
+1907: 			}
+1908: 			if e = appendEvent(p, r.Events, "BOUNDARY_ABORTED"); e != nil {
+1909: 				return "", e
+1910: 			}
+1911: 			r, e = readRecord(p)
+1912: 			if e != nil {
+1913: 				return "", e
+1914: 			}
+1915: 			state = "BOUNDARY_ABORTED"
+1916: 		}
+1917: 		if state != "C_DURABLE" && state != "BOUNDARY_ABORTED" && state != "DISARMING" {
+1918: 			return "", errors.New("disarm requires durable C or explicit boundary abort")
+1919: 		}
+1920: 		if state == "C_DURABLE" {
+1921: 			if e = checkExactCDurable(p); e != nil {
+1922: 				return "", e
+1923: 			}
+1924: 		}
+1925: 		if state == "DISARMING" {
+1926: 			// A resumable partial restore is only legal if the earlier event
+1927: 			// records a durable C or explicit, non-success abort.
+1928: 			if len(r.Events) < 2 || (r.Events[len(r.Events)-2].State != "C_DURABLE" && r.Events[len(r.Events)-2].State != "BOUNDARY_ABORTED") {
+1929: 				return "", errors.New("disarm predecessor invalid")
+1930: 			}
+1931: 			if r.Events[len(r.Events)-2].State == "C_DURABLE" {
+1932: 				if e = checkExactCDurable(p); e != nil {
+1933: 					return "", e
+1934: 				}
+1935: 			}
+1936: 		}
+1937: 		holds, e := openPlanHolds(p)
+1938: 		if e != nil {
+1939: 			return "", e
+1940: 		}
+1941: 		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
+1942: 		if e = checkAncestorControl(p, holds); e != nil {
+1943: 			return "", e
+1944: 		}
+1945: 		byPath := map[string]FileIdentity{}
+1946: 		for _, h := range holds {
+1947: 			byPath[strings.ToLower(h.path)] = h.identity
+1948: 		}
+1949: 		for _, t := range p.Targets {
+1950: 			x := byPath[strings.ToLower(t.File.Path)]
+1951: 			if !identityCoreEqual(x, t.File) || (x.SecurityDescriptor != t.File.SecurityDescriptor && x.SecurityDescriptor != t.InstalledSD) {
+1952: 				return "", errors.New("disarm target differs from exact before/installed descriptor")
+1953: 			}
+1954: 		}
+1955: 		if state != "DISARMING" {
+1956: 			if e = appendEvent(p, r.Events, "DISARMING"); e != nil {
+1957: 				return "", e
+1958: 			}
+1959: 		}
+1960: 		for _, t := range p.Targets {
+1961: 			x := byPath[strings.ToLower(t.File.Path)]
+1962: 			if x.SecurityDescriptor == t.File.SecurityDescriptor {
+1963: 				continue
+1964: 			}
+1965: 			expected := t.File
+1966: 			expected.SecurityDescriptor = t.InstalledSD
+1967: 			if e = setTargetDescriptor(expected, t.File.SecurityDescriptor); e != nil {
+1968: 				return "", e
+1969: 			}
+1970: 			h, e := openNative(t.File.Path, false, true)
+1971: 			if e != nil {
+1972: 				return "", e
+1973: 			}
+1974: 			ok := identityEqual(t.File, h.identity)
+1975: 			closeErr := windows.CloseHandle(h.handle)
+1976: 			if closeErr != nil {
+1977: 				return "", closeErr
+1978: 			}
+1979: 			if !ok {
+1980: 				return "", errors.New("disarm exact descriptor readback mismatch")
+1981: 			}
+1982: 		}
+1983: 		r, e = readRecord(p)
+1984: 		if e != nil {
+1985: 			return "", e
+1986: 		}
+1987: 		if e = appendEvent(p, r.Events, "CLOSED"); e != nil {
+1988: 			return "", e
+1989: 		}
+1990: 		return "CLOSED", nil
+1991: 	}
+1992: 	return "", errors.New("unreachable boundary phase")
+1993: }
+1994: 
+1995: func checkExactCDurable(p EntryFencePlan) error {
+1996: 	path := filepath.Join(p.DataRoot.Path, "host", qualificationmaintenancejournal.QualificationNamespace, p.OperationID, "plan.json")
+1997: 	raw, e := os.ReadFile(path)
+1998: 	if e != nil || len(raw) > 256<<10 {
+1999: 		return errors.New("C journal plan unavailable")
+2000: 	}
+2001: 	var view struct {
+2002: 		PlanHash string `json:"plan_hash"`
+2003: 	}
+2004: 	if e = json.Unmarshal(raw, &view); e != nil {
+2005: 		return e
+2006: 	}
+2007: 	_, status, e := qualificationmaintenancejournal.OpenOwnInspection(p.DataRoot.Path, qualificationmaintenancejournal.QualificationNamespace, p.OperationID, view.PlanHash)
+2008: 	if e != nil {
+2009: 		return e
+2010: 	}
+2011: 	if status.State != "DURABLE" || !status.Terminal || !status.Applied {
+2012: 		return errors.New("exact C operation not durable")
+2013: 	}
+2014: 	return qualificationmaintenancejournal.CheckOrdinary(p.DataRoot.Path)
+2015: }
+main_nonwindows.go
+//go:build !windows
+
+package main
+
+import (
+	"encoding/json"
+	"os"
+)
+
+func main() {
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
+		"schema": "researchos.recovery-boundary-helper-result.v1",
+		"error":  "qualification recovery boundary is unsupported outside Windows",
+	})
+	os.Exit(1)
+}
+main_windows_test.go
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestCLIOnlyFixedPhasesAndExactSelector(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	for _, args := range [][]string{
+		nil, {"server"}, {"arm", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha, "--sql", "delete"},
+		{"arm", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef"},
+		{"status", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha, "extra"},
+	} {
+		if _, _, _, _, err := parse(args); err == nil {
+			t.Fatalf("invalid selector accepted: %q", args)
+		}
+	}
+	phase, root, operation, plan, err := parse([]string{"status", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha})
+	if err != nil || phase != "status" || root != "C:\\fixture" || operation != "0123456789abcdef0123456789abcdef" || plan != sha {
+		t.Fatalf("fixed status parse: %q %q %q %q %v", phase, root, operation, plan, err)
+	}
+	if _, err := run(context.Background(), []string{"plan", "--data-root", "relative", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha}); err == nil {
+		t.Fatal("relative root reached helper")
+	}
+}
+main_windows.go
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+
+	"researchos.local/research-os/internal/recoveryboundary"
+)
+
+type result struct {
+	Schema string `json:"schema"`
+	State  string `json:"state,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+func parse(args []string) (phase, root, operation, plan string, err error) {
+	if len(args) == 0 {
+		return "", "", "", "", errors.New("one fixed phase required")
+	}
+	phase = args[0]
+	if phase != "plan" && phase != "arm" && phase != "observe" && phase != "status" && phase != "disarm-request" {
+		return "", "", "", "", errors.New("unsupported phase")
+	}
+	f := flag.NewFlagSet(phase, flag.ContinueOnError)
+	f.SetOutput(os.Stderr)
+	f.StringVar(&root, "data-root", "", "frozen data root")
+	f.StringVar(&operation, "operation-id", "", "frozen operation")
+	f.StringVar(&plan, "plan-sha256", "", "frozen boundary plan digest")
+	if err = f.Parse(args[1:]); err != nil {
+		return
+	}
+	if len(f.Args()) != 0 || root == "" || operation == "" || plan == "" {
+		err = errors.New("exact data-root, operation-id and plan-sha256 required")
+	}
+	return
+}
+
+func run(ctx context.Context, args []string) (string, error) {
+	phase, root, operation, plan, err := parse(args)
+	if err != nil {
+		return "", err
+	}
+	return recoveryboundary.RunPhase(ctx, phase, root, operation, plan)
+}
+
+func main() {
+	state, err := run(context.Background(), os.Args[1:])
+	out := result{Schema: "researchos.recovery-boundary-helper-result.v1", State: state}
+	if err != nil {
+		out.Error = err.Error()
+	}
+	if e := json.NewEncoder(os.Stdout).Encode(out); e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		os.Exit(2)
+	}
+	if err != nil {
+		os.Exit(1)
+	}
+}
+1: //go:build windows
+2: 
+3: package recoveryboundary
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"encoding/json"
+9: 	"errors"
+10: 	"io"
+11: 	"os"
+12: 	"os/exec"
+13: 	"path/filepath"
+14: 	"runtime"
+15: 	"strings"
+16: 	"testing"
+17: 	"time"
+18: 	"unsafe"
+19: 
+20: 	"golang.org/x/sys/windows"
+21: 	_ "modernc.org/sqlite"
+22: 	rt "researchos.local/research-os/adapters/runtime"
+23: )
+24: 
+25: func TestRestartWitnessStrictDecreaseAndWindow(t *testing.T) {
+26: 	sha := strings.Repeat("a", 64)
+27: 	pre := BootWitness{Schema: WitnessSchema, OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, HelperSHA256: sha, FenceSHA256: sha,
+28: 		UTC: time.Date(2026, 10, 25, 7, 0, 0, 0, time.UTC), UptimeMilliseconds: 900000,
+29: 		LastBootUTC: time.Date(2026, 10, 25, 6, 45, 0, 0, time.UTC), RestartApps: 1,
+30: 		BusinessEnabledSIDsSHA256: sha, BusinessPrivilegesSHA256: sha, BusinessElevationType: 3, BusinessIntegritySID: "S-1-16-8192", BusinessLogonSID: "S-1-5-5-1-2",
+31: 		BusinessProcessPID: 100, BusinessProcessCreatedUTC: time.Date(2026, 10, 25, 6, 50, 0, 0, time.UTC), BusinessProcessImageSHA256: sha}
+32: 	post := pre
+33: 	post.UTC = pre.UTC.Add(5 * time.Minute)
+34: 	post.LastBootUTC = pre.UTC.Add(30 * time.Second)
+35: 	post.UptimeMilliseconds = 270000
+36: 	post.FullRestartEvidenceSHA256 = sha
+37: 	post.BusinessSessionID = 9
+38: 	post.BusinessLogonSID = "S-1-5-5-9-10"
+39: 	post.BusinessProcessPID = 200
+40: 	post.BusinessProcessCreatedUTC = post.LastBootUTC.Add(time.Minute)
+41: 	if err := ValidateRestart(pre, post); err != nil {
+42: 		t.Fatalf("valid bounded witness: %v", err)
+43: 	}
+44: 	cases := map[string]func(*BootWitness){
+45: 		"same boot":            func(x *BootWitness) { x.LastBootUTC = pre.LastBootUTC },
+46: 		"uptime equal":         func(x *BootWitness) { x.UptimeMilliseconds = pre.UptimeMilliseconds },
+47: 		"uptime too long":      func(x *BootWitness) { x.UptimeMilliseconds = uint64(MaxPostUptime / time.Millisecond) },
+48: 		"UTC expired":          func(x *BootWitness) { x.UTC = pre.UTC.Add(MaxElapsed + time.Second) },
+49: 		"negative UTC":         func(x *BootWitness) { x.UTC = pre.UTC.Add(-time.Second) },
+50: 		"plan drift":           func(x *BootWitness) { x.PlanSHA256 = strings.Repeat("b", 64) },
+51: 		"boot after post":      func(x *BootWitness) { x.LastBootUTC = x.UTC.Add(time.Second) },
+52: 		"unknown RestartApps":  func(x *BootWitness) { x.RestartApps = 2 },
+53: 		"business group drift": func(x *BootWitness) { x.BusinessEnabledSIDsSHA256 = strings.Repeat("b", 64) },
+54: 		"business IL drift":    func(x *BootWitness) { x.BusinessIntegritySID = "S-1-16-12288" },
+55: 		"stale source process": func(x *BootWitness) { x.BusinessProcessCreatedUTC = pre.LastBootUTC },
+56: 	}
+57: 	for name, mutate := range cases {
+58: 		t.Run(name, func(t *testing.T) {
+59: 			x := post
+60: 			mutate(&x)
+61: 			if err := ValidateRestart(pre, x); err == nil {
+62: 				t.Fatal("invalid witness accepted")
+63: 			}
+64: 		})
+65: 	}
+66: }
+67: 
+68: func TestBoundaryEventSequenceRejectsGapAndReplay(t *testing.T) {
+69: 	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64)}
+70: 	e := BoundaryEvent{Schema: EventSchema, Sequence: 1, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, State: "PREPARED", UTC: time.Now().UTC()}
+71: 	e.SHA256 = digest([]byte(strings.Join([]string{e.Schema, "1", "", e.OperationID, e.PlanSHA256, e.State, e.UTC.Format(time.RFC3339Nano)}, "\x00")))
+72: 	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err != nil {
+73: 		t.Fatal(err)
+74: 	}
+75: 	if err := ValidateEvents([]BoundaryEvent{e, e}, p.OperationID, p.PlanSHA256); err == nil {
+76: 		t.Fatal("replayed sequence accepted")
+77: 	}
+78: 	e.State = "ARMED"
+79: 	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err == nil {
+80: 		t.Fatal("phase skip accepted")
+81: 	}
+82: }
+83: 
+84: func TestAppendOnlyBoundaryCrashSequence(t *testing.T) {
+85: 	base := t.TempDir()
+86: 	t.Setenv("ProgramData", base)
+87: 	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64), DataRoot: FileIdentity{Path: `C:\fixture`, FinalUTF16: `\\?\C:\fixture`, FileID: strings.Repeat("1", 32)}}
+88: 	dir, err := stateRoot(p)
+89: 	if err != nil {
+90: 		t.Fatal(err)
+91: 	}
+92: 	if err := os.MkdirAll(dir, 0700); err != nil {
+93: 		t.Fatal(err)
+94: 	}
+95: 	if err := appendEvent(p, nil, "PREPARED"); err != nil {
+96: 		t.Fatal(err)
+97: 	}
+98: 	if err := appendEvent(p, nil, "PREPARED"); err == nil {
+99: 		t.Fatal("duplicate create replaced historical event")
+100: 	}
+101: 	raw, err := os.ReadFile(filepath.Join(dir, "event-01.json"))
+102: 	if err != nil {
+103: 		t.Fatal(err)
+104: 	}
+105: 	var first BoundaryEvent
+106: 	if err := json.Unmarshal(raw, &first); err != nil {
+107: 		t.Fatal(err)
+108: 	}
+109: 	if err := appendEvent(p, []BoundaryEvent{first}, "ARMED"); err == nil {
+110: 		t.Fatal("crash phase skip accepted")
+111: 	}
+112: 	if err := appendEvent(p, []BoundaryEvent{first}, "APPLYING"); err != nil {
+113: 		t.Fatal(err)
+114: 	}
+115: 	secondRaw, err := os.ReadFile(filepath.Join(dir, "event-02.json"))
+116: 	if err != nil {
+117: 		t.Fatal(err)
+118: 	}
+119: 	var second BoundaryEvent
+120: 	if err := json.Unmarshal(secondRaw, &second); err != nil {
+121: 		t.Fatal(err)
+122: 	}
+123: 	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err != nil {
+124: 		t.Fatal(err)
+125: 	}
+126: 	second.PreviousSHA256 = ""
+127: 	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err == nil {
+128: 		t.Fatal("broken predecessor accepted")
+129: 	}
+130: }
+131: 
+132: func TestOnlineBackupGateRequiresRestorationAndIndependentIssuer(t *testing.T) {
+133: 	sha := strings.Repeat("a", 64)
+134: 	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, ManagementSID: "S-1-5-21-1"}
+135: 	core, err := PlanCoreSHA256(p)
+136: 	if err != nil {
+137: 		t.Fatal(err)
+138: 	}
+139: 	proof := BoundaryAttestation{Schema: "researchos.boundary-attestation.v1", Kind: "online-backup", Status: "ACCEPTED", OperationID: p.OperationID, PlanCoreSHA256: core, Issuer: "independent-review", EvidenceSHA256: sha, RecordedUTC: time.Now().UTC(), BackupID: "backup-1", RestoreTestSHA256: sha, CredentialProbeSHA256: sha}
+140: 	if err := validateAttestation(p, "online-backup", proof); err != nil {
+141: 		t.Fatal(err)
+142: 	}
+143: 	proof.RestoreTestSHA256 = ""
+144: 	if err := validateAttestation(p, "online-backup", proof); err == nil {
+145: 		t.Fatal("static backup claim passed without restore test")
+146: 	}
+147: 	proof.RestoreTestSHA256 = sha
+148: 	proof.Issuer = p.ManagementSID
+149: 	if err := validateAttestation(p, "online-backup", proof); err == nil {
+150: 		t.Fatal("manager self acceptance passed")
+151: 	}
+152: }
+153: 
+154: func TestBoundaryPlanDigestBindsAttestationFilesWithoutCycle(t *testing.T) {
+155: 	p := EntryFencePlan{Schema: PlanSchema, OperationID: "0123456789abcdef0123456789abcdef", SourceAcceptanceSHA256: strings.Repeat("1", 64), NativeAcceptanceSHA256: strings.Repeat("2", 64)}
+156: 	core, err := PlanCoreSHA256(p)
+157: 	if err != nil {
+158: 		t.Fatal(err)
+159: 	}
+160: 	full, err := ComputePlanSHA256(p)
+161: 	if err != nil {
+162: 		t.Fatal(err)
+163: 	}
+164: 	p.PlanSHA256 = full
+165: 	p.SourceAcceptanceSHA256 = strings.Repeat("3", 64)
+166: 	coreAfter, err := PlanCoreSHA256(p)
+167: 	if err != nil {
+168: 		t.Fatal(err)
+169: 	}
+170: 	fullAfter, err := ComputePlanSHA256(p)
+171: 	if err != nil {
+172: 		t.Fatal(err)
+173: 	}
+174: 	if coreAfter != core || fullAfter == full {
+175: 		t.Fatal("plan core/receipt digest separation broken")
+176: 	}
+177: 	if err := ValidatePlan(p); err == nil {
+178: 		t.Fatal("modified attestation reference retained old plan hash")
+179: 	}
+180: }
+181: 
+182: func TestNativeHoldSurvivesGCAndBlocksReplacement(t *testing.T) {
+183: 	dir := t.TempDir()
+184: 	path := filepath.Join(dir, "entry.exe")
+185: 	if err := os.WriteFile(path, []byte("fixture-entry"), 0600); err != nil {
+186: 		t.Fatal(err)
+187: 	}
+188: 	h, err := openNative(path, false, true)
+189: 	if err != nil {
+190: 		t.Fatal(err)
+191: 	}
+192: 	if h.identity.FileID == "" || h.identity.Volume == 0 || h.identity.FinalUTF16 == "" || h.identity.SecurityDescriptor == "" || h.identity.SHA256 != digest([]byte("fixture-entry")) {
+193: 		t.Fatal("native identity incomplete")
+194: 	}
+195: 	runtime.GC()
+196: 	runtime.GC()
+197: 	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err == nil {
+198: 		t.Fatal("rename succeeded while no-delete native hold live")
+199: 	}
+200: 	if err := checkHolds([]nativeHold{h}); err != nil {
+201: 		t.Fatal(err)
+202: 	}
+203: 	if err := windows.CloseHandle(h.handle); err != nil {
+204: 		t.Fatal(err)
+205: 	}
+206: 	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err != nil {
+207: 		t.Fatalf("rename after release: %v", err)
+208: 	}
+209: }
+210: 
+211: func withFixtureSD(x FileIdentity, sd string) FileIdentity { x.SecurityDescriptor = sd; return x }
+212: 
+213: func TestDisposableExecutableFenceReadbackAndRestore(t *testing.T) {
+214: 	dir := t.TempDir()
+215: 	path := filepath.Join(dir, "boot-fixture.exe")
+216: 	if err := os.WriteFile(path, []byte("fixture-only"), 0600); err != nil {
+217: 		t.Fatal(err)
+218: 	}
+219: 	before, err := openNative(path, false, true)
+220: 	if err != nil {
+221: 		t.Fatal(err)
+222: 	}
+223: 	defer windows.CloseHandle(before.handle)
+224: 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+225: 	if err != nil {
+226: 		t.Fatal(err)
+227: 	}
+228: 	installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(), u.User.Sid.String(), "executable")
+229: 	if err != nil {
+230: 		t.Fatal(err)
+231: 	}
+232: 	if installed == before.identity.SecurityDescriptor {
+233: 		t.Fatal("fence did not change descriptor")
+234: 	}
+235: 	if err = setTargetDescriptor(before.identity, installed); err != nil {
+236: 		t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+237: 	}
+238: 	restoredInBody := false
+239: 	defer func() {
+240: 		if restoredInBody {
+241: 			return
+242: 		}
+243: 		if err := setTargetDescriptor(withFixtureSD(before.identity, installed), before.identity.SecurityDescriptor); err != nil {
+244: 			t.Errorf("fixture descriptor restore: %v", err)
+245: 		}
+246: 	}()
+247: 	after, err := openNative(path, false, true)
+248: 	if err != nil {
+249: 		t.Fatal(err)
+250: 	}
+251: 	if !identityCoreEqual(before.identity, after.identity) || after.identity.SecurityDescriptor != installed {
+252: 		t.Errorf("installed native identity/readback mismatch: core=%v expectedSD=%q actualSD=%q", identityCoreEqual(before.identity, after.identity), installed, after.identity.SecurityDescriptor)
+253: 	}
+254: 	if err := windows.CloseHandle(after.handle); err != nil {
+255: 		t.Fatal(err)
+256: 	}
+257: 	w, err := windows.UTF16PtrFromString(path)
+258: 	if err != nil {
+259: 		t.Fatal(err)
+260: 	}
+261: 	h, err := windows.CreateFile(w, windows.FILE_EXECUTE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+262: 	if err == nil {
+263: 		windows.CloseHandle(h)
+264: 		t.Fatal("business SID execute opened through fence")
+265: 	}
+266: 	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+267: 		t.Fatalf("execute rejection differs: %v", err)
+268: 	}
+269: 	if err = setTargetDescriptor(withFixtureSD(before.identity, installed), before.identity.SecurityDescriptor); err != nil {
+270: 		t.Fatal(err)
+271: 	}
+272: 	restoredInBody = true
+273: 	restored, err := openNative(path, false, true)
+274: 	if err != nil {
+275: 		t.Fatal(err)
+276: 	}
+277: 	if !identityEqual(before.identity, restored.identity) {
+278: 		t.Error("original descriptor not restored exactly")
+279: 	}
+280: 	if err := windows.CloseHandle(restored.handle); err != nil {
+281: 		t.Fatal(err)
+282: 	}
+283: }
+284: 
+285: func TestDistinctManagerPlanTransfersOwnerAndDeniesFenceTamper(t *testing.T) {
+286: 	path := filepath.Join(t.TempDir(), "managed-entry.exe")
+287: 	if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
+288: 		t.Fatal(err)
+289: 	}
+290: 	h, err := openNative(path, false, true)
+291: 	if err != nil {
+292: 		t.Fatal(err)
+293: 	}
+294: 	defer windows.CloseHandle(h.handle)
+295: 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+296: 	if err != nil {
+297: 		t.Fatal(err)
+298: 	}
+299: 	manager := "S-1-5-32-544" // descriptor-construction fixture only; no privileged owner change
+300: 	installed, err := denyDescriptor(h.identity.SecurityDescriptor, u.User.Sid.String(), manager, "executable")
+301: 	if err != nil {
+302: 		t.Fatal(err)
+303: 	}
+304: 	sd, err := windows.SecurityDescriptorFromString(installed)
+305: 	if err != nil {
+306: 		t.Fatal(err)
+307: 	}
+308: 	owner, _, err := sd.Owner()
+309: 	if err != nil || owner.String() != manager {
+310: 		t.Fatalf("management owner absent: %v %v", owner, err)
+311: 	}
+312: 	acl, _, err := sd.DACL()
+313: 	if err != nil {
+314: 		t.Fatal(err)
+315: 	}
+316: 	var ace *windows.ACCESS_ALLOWED_ACE
+317: 	if err = windows.GetAce(acl, 0, &ace); err != nil {
+318: 		t.Fatal(err)
+319: 	}
+320: 	want := uint32(windows.FILE_EXECUTE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.DELETE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA)
+321: 	if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE || uint32(ace.Mask)&want != want || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() != u.User.Sid.String() {
+322: 		t.Fatal("exact business SID anti-tamper deny absent")
+323: 	}
+324: }
+325: 
+326: func TestManagedStateRejectsCustomBusinessGroupACE(t *testing.T) {

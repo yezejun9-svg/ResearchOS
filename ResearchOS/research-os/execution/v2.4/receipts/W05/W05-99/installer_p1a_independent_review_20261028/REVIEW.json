@@ -1,0 +1,152 @@
+{
+  "schema": "researchos.installer-p1a-independent-source-static-review.v1",
+  "status": "NEEDS_REVISION",
+  "at": "2026-10-28T07:42:49.360451+00:00",
+  "reviewer": "codex:/root/installer_p1a_independent_review",
+  "model_selection": "Inherited parent model; no override; independent reviewer agent, same OS user, not a protected holdout",
+  "formal_increment": 0,
+  "parent_acceptance": false,
+  "formal_acceptance": false,
+  "integration_approved": false,
+  "candidate": {
+    "scope_sha256": "64d7670422ded2533826feeba61bdf64a793e3e9bcb7dbd5a93a943b163233f7",
+    "author_sha256": "9dbf53f83e2d5b6d3fba152450887541b256dcf523b35ca3ccca7d7b12b2bdf1",
+    "head": "6cf0457072bdd1d730dae961474d4d885a2cdd1b",
+    "tree": "7af2395a271731f1159c367fc0ab24d69bb26751",
+    "diff": [
+      "A\tops/release/product_installer/build.py",
+      "A\tops/release/product_installer/finalize/main.go",
+      "A\tops/release/product_installer/finalize/main_test.go",
+      "A\tops/release/product_installer/payload.schema.json",
+      "A\ttests/release/product_installer_build_test.py"
+    ],
+    "source_files": [
+      {
+        "path": "ops/release/product_installer/build.py",
+        "sha256": "b366848944e139cdb9094a05f47c08b22de7a33e86e280dec0459eab81f9b6f4",
+        "bytes": 11133
+      },
+      {
+        "path": "ops/release/product_installer/payload.schema.json",
+        "sha256": "1aebb4ffc7b7cb72086ef547657baf6f61124b52eb3be043b9d538235af61452",
+        "bytes": 2546
+      },
+      {
+        "path": "ops/release/product_installer/finalize/main.go",
+        "sha256": "495daaee879eb131e5e5c2190a01e2d8da61fae8411894adbf120dc0e70725e5",
+        "bytes": 11439
+      },
+      {
+        "path": "ops/release/product_installer/finalize/main_test.go",
+        "sha256": "c29d1f8a17905b42375d58db1d98b1e0c411ff72b40004989bcbc2ffc5e5cb19",
+        "bytes": 7241
+      },
+      {
+        "path": "tests/release/product_installer_build_test.py",
+        "sha256": "a85009c30151567372db76e5ba1f773b74b4f43de9be70ffd2c0cafc131d080f",
+        "bytes": 1342
+      }
+    ],
+    "clean": true
+  },
+  "findings": [
+    {
+      "id": "P1A-R1",
+      "priority": "P1",
+      "title": "marker commit is not atomic create-new",
+      "file": "ops/release/product_installer/finalize/main.go",
+      "lines": [
+        352,
+        358
+      ],
+      "evidence": [
+        "go-tests.stdout.raw",
+        "independent_test.go"
+      ],
+      "observed": "Windows os.Rename(temp, existing) returned nil and replaced existing content. Production finalizer checks Lstat then invokes the same replacing primitive, leaving a check/use gap. This is a demonstrated primitive plus source-path proof; an orchestrated race of the complete finalizer was not claimed.",
+      "impact": "A marker created after Lstat can be overwritten, violating the explicit create-new/atomic-last requirement. Author concurrency caveat cannot satisfy this requirement.",
+      "minimal_fix": "Replace the marker commit with a Windows no-replace rename/move operation that fails if destination exists, preserve marker-last publication, and add an independent existing-destination/no-clobber test plus an injected or controlled race test. Keep temp and target on the same staged filesystem.",
+      "required_paths": [
+        "ops/release/product_installer/finalize/main.go",
+        "ops/release/product_installer/finalize/main_test.go"
+      ]
+    },
+    {
+      "id": "P1A-R2",
+      "priority": "P1",
+      "title": "builder output containment accepts dotdot escape",
+      "file": "ops/release/product_installer/build.py",
+      "lines": [
+        143,
+        149
+      ],
+      "evidence": [
+        "builder-containment-observation.json",
+        "relocation_probe.py"
+      ],
+      "observed": "Path.absolute retained .local/../../escape-review; is_relative_to(worktree/.local) returned true, while resolve() placed it outside that .local. No escaped build/write was executed. Source also does not validate existing output-parent ancestors for reparse redirection; the latter is source review, not independently exercised builder-junction evidence.",
+      "impact": "The declared output-isolated-under-worktree-.local condition is bypassable by supplied path spelling; a build can create outputs outside its allowed root.",
+      "minimal_fix": "Reject noncanonical input paths and validate canonical resolved output/receipt containment against authorized roots before mkdir or any failure write. Validate every existing ancestor for Windows symlink/reparse redirection and reject source/output/receipts overlap. Add dotdot and junction-parent boundary cases within disposable test roots.",
+      "required_paths": [
+        "ops/release/product_installer/build.py",
+        "tests/release/product_installer_build_test.py"
+      ]
+    },
+    {
+      "id": "P1A-R3",
+      "priority": "P2",
+      "title": "failure handler writes into unowned preexisting receipts",
+      "file": "ops/release/product_installer/build.py",
+      "lines": [
+        216,
+        220
+      ],
+      "evidence": [
+        "preexisting-receipts-result.json",
+        "preexisting-receipts.stderr.raw",
+        "write_boundary_probe.py"
+      ],
+      "observed": "An isolated directory containing sentinel.txt was supplied as --receipts. build refused with output and receipts must be create-new, exit 1, but the top-level except added failed.json to that already-existing directory.",
+      "impact": "Create-new refusal itself mutates a directory this invocation never acquired, violating preservation and receipt ownership.",
+      "minimal_fix": "Track receipt ownership only after successful create-new acquisition; write failure evidence only to that owned canonical directory. On early admission failure use stderr or an explicitly separate owned diagnostic destination. Add a preexisting-receipts snapshot test asserting no changes.",
+      "required_paths": [
+        "ops/release/product_installer/build.py",
+        "tests/release/product_installer_build_test.py"
+      ]
+    }
+  ],
+  "verified": [
+    "Exact HEAD 6cf0457072bdd1d730dae961474d4d885a2cdd1b / tree 7af2395a271731f1159c367fc0ab24d69bb26751; clean candidate and exact five added paths against authorized base; committed blobs and file hashes agree.",
+    "Scope and author manifest exact expected SHA256; pinned Python/Go/Node hashes checked before execution.",
+    "Original frozen source marker and all 133 inventory files checked by freeze; only position-specific verifier metadata removed to yield 132 payload files. All payload files, five binary roles, source/protocol/schema/build/tool metadata and runtime/contracts/licenses inventory preserved.",
+    "All four extra source cache db files are unchanged, listed and omitted. Source marker/extras were not modified or removed.",
+    "Deterministic freeze reproduces exact trusted payload manifest bytes SHA256 2e2586650b06de5c52627374337b96da8e382c4cbfd70499ddc6aeb53094091c.",
+    "Independent pinned module-mode rebuild produces exact finalizer SHA256 5bb69149ddb8ccc3a81bc5c940498534af53322ad99c3eb1978862500284179d. Initial GO111MODULE=off mismatch retained and explained; matching build configuration rerun is byte-identical.",
+    "Compiled author finalizer rejects whitespace-mutated manifest before any staged-root write. Development/unbound manifest rejection exercised by Go tests.",
+    "Author Go tests and 16 independently added path/metadata guards pass; Windows hardlink/junction rejection exercised; uppercase drive and exact component spelling/extra/missing/tamper rejection exercised.",
+    "Both author finalized roots independently fully rehashed. Two additional fresh Unicode/space roots finalized with the exact shipped binary; each has 133 inventory files plus marker, correct final verifier executable/hash, same payload digest and distinct installation identities.",
+    "Real committed JavaScript product-layout loadProductLayout executed read-only on all four roots with isolated LOCALAPPDATA; full inventory/roles and identities accepted and no data folder created.",
+    "Go consumer productIdentity/productInventoryIdentity/productMarker and loadProductLayout contract inspected from exact committed source; field ordering, serialization types, five role order, protocol/schema, file ordering and 256 MiB per-file constraints match the actual artifact. Go consumer binary/full loader was not run.",
+    "Existing marker refusal preserves sentinel in sequential test; success leaves no temp marker. Verifier metadata written before marker and full tree verified before marker preparation. Atomic no-replace remains FAILED as P1A-R1."
+  ],
+  "limitations_and_skips": [
+    "File symlink creation skipped by Windows missing privilege (one explicit Go subtest SKIP); junction and hardlink branches do run.",
+    "No product CLI/Electron/Core native startup, registry, installer/NSIS, installation, data migration, user data writes, upgrade/rollback/uninstall, C57 replacement, live provider or formal acceptance.",
+    "No protected holdout isolation: independent agent uses same Windows user and shared read-only candidate.",
+    "Full native Go product loader not executed; Go compatibility conclusion is source-contract inspection plus independent digest reconstruction, while JS loader is executed.",
+    "No concurrent mutation, crash/power-loss durability, installation journal or maintenance gate qualification. This does not waive explicit atomic-create-new requirement.",
+    "No all-repository fsck/gc/repack run. Only selected commit/tree/blob objects read with git -c gc.auto=0 -c maintenance.auto=false. Prior author bad-tree auto-gc event remains unresolved.",
+    "Scratch cleanup blocked by execution policy; caches and copied fixture payloads remain only under this reviewer receipt root. No policy bypass attempted."
+  ],
+  "required_revision_scope": [
+    "ops/release/product_installer/build.py",
+    "ops/release/product_installer/finalize/main.go",
+    "ops/release/product_installer/finalize/main_test.go",
+    "tests/release/product_installer_build_test.py"
+  ],
+  "evidence_manifest": {
+    "path": "EVIDENCE-MANIFEST.json",
+    "sha256": "4a785009ce4c1afccbbf3dc84bdaf3fe9360aa01f50ef20231144df874fca273"
+  },
+  "static_artifact_result": "PASS for exact hash/inventory/relocation/JS compatibility under tested sequential scenarios; source safety contract fails three findings; do not integrate as accepted P1a."
+}

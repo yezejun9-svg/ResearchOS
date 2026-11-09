@@ -1,0 +1,162 @@
+diff --git a/tests/runtime/cli_contract/v2verbs.go b/tests/runtime/cli_contract/v2verbs.go
+index a66241a4..b170bb05 100644
+--- a/tests/runtime/cli_contract/v2verbs.go
++++ b/tests/runtime/cli_contract/v2verbs.go
+@@ -19,12 +19,14 @@ import (
+ )
+ 
+ type probe struct {
+-	server  *http.Server
+-	ln      net.Listener
+-	url     string
+-	mode    string
+-	seen    []map[string]any
+-	healths int
++	server            *http.Server
++	ln                net.Listener
++	url               string
++	mode              string
++	seen              []map[string]any
++	healths           int
++	configurePhase    bool
++	configureRevision int
+ }
+ 
+ // wireMethods records every method name that reached any probe host during this run, so the command table's own
+@@ -79,12 +81,24 @@ func strictVerdict(env map[string]any) string {
+ 		}
+ 	}
+ 	if method == "host.configure" {
+-		_, hasModel := pl["model_id"]
+-		_, hasProvider := pl["provider_id"]
+-		if (hasModel || hasProvider) && env["writer_epoch"] == nil {
+-			return "MODEL_CHANGE_WITHOUT_EPOCH"
++		if env["session_id"] == nil {
++			for _, key := range []string{"project_id", "session_id", "expected_revision", "writer_epoch"} {
++				if env[key] != nil {
++					return "INVALID_CONFIGURE_SCOPE"
++				}
++			}
++		} else {
++			if env["writer_epoch"] == nil {
++				return "MODEL_CHANGE_WITHOUT_EPOCH"
++			}
++			for _, key := range []string{"project_id", "session_id", "expected_revision", "writer_epoch"} {
++				if env[key] == nil {
++					return "INVALID_CONFIGURE_SCOPE"
++				}
++			}
+ 		}
+ 	}
++
+ 	if strictEmptyPayload[method] && len(pl) > 0 {
+ 		return "UNEXPECTED_PAYLOAD_KEYS"
+ 	}
+@@ -181,12 +195,34 @@ func (p *probe) handle(w http.ResponseWriter, r *http.Request) {
+ 				"status": "COMPLETED", "session_id": nil, "revision": nil, "error_code": nil, "error": nil,
+ 				"result": map[string]any{"host_instance_id": "fixture-host", "core_build_id": "fixture-build",
+ 					"protocol_versions": []string{"researchos-client/2"}, "host_state": "READY", "client_id": env["client_id"],
+-					"authenticated_principal_ref": "fixture-principal", "config_revision": 0,
++					"authenticated_principal_ref": "fixture-principal", "config_revision": p.configureRevision,
+ 					"model_configurations": []any{}, "credentials": []any{}, "workspaces": []any{},
+ 					"supported_methods": []string{"host.status"}, "operating_mode": "LOCAL_USER_HOST"},
+ 			})
+ 			return
+ 		}
++		if method == "host.configure" {
++			pl := payloadOf(env)
++			revision := any(nil)
++			if env["session_id"] != nil {
++				revision = env["expected_revision"].(float64) + 1
++			}
++			reply := map[string]any{"protocol_version": "researchos-client/2", "command_id": commandID, "method": method, "status": "COMPLETED", "session_id": env["session_id"], "revision": revision, "error_code": nil, "error": nil, "result": map[string]any{"model_config_ref": "mc-probe-opaque-4", "config_revision": pl["config_revision"], "provider_id": pl["provider_id"], "model_id": pl["model_id"], "base_url": pl["base_url"], "credential_ref": pl["credential_ref"], "verified_at": nil}}
++			if p.mode == "configure-busy" {
++				reply["status"] = "REJECTED"
++				reply["revision"] = env["expected_revision"]
++				reply["error_code"] = "SESSION_BUSY"
++				reply["result"] = nil
++				reply["error"] = map[string]any{"code": "SESSION_BUSY", "message": "fixture session remains busy", "retryable": false, "recovery": "WAIT_FOR_SETTLEMENT", "current_revision": env["expected_revision"], "current_writer_epoch": env["writer_epoch"], "resource_request_id": nil, "retry_after_ms": nil, "correlation_id": commandID}
++			} else if n, ok := pl["config_revision"].(float64); !p.configurePhase || !ok || int(n) != p.configureRevision+1 {
++				w.Write([]byte(`{"invalid_configure_cas":true}`))
++				return
++			} else {
++				p.configureRevision = int(n)
++			}
++			json.NewEncoder(w).Encode(reply)
++			return
++		}
+ 		// The published envelope carries a session only for the operations that act on one, so the fixture mirrors
+ 		// the protocol instead of answering every command with an id the CLI would be entitled to adopt.
+ 		sessionID := ""
+@@ -456,10 +492,13 @@ func v2VerbPhase(repo string) {
+ 
+ 	// Model switching, split so each half of the gate is reachable: the flag, then the recorded settled run,
+ 	// then the positive control that actually changes the model.
++	p.configurePhase = true
++	p.configureRevision = 3
++	writeCfg(`{"config_revision":3,"model":"vendor/old","settled_run_id":"run-settled","workspace_ref":"D:/ws","project_id":"proj-probe","session_id":"sess-strict","session_revision":7,"writer_epoch":2}`)
+ 	noFlag := call(base(), "config", "set-model", "--model", "vendor/new", "--config-revision", "3")
+ 	ok("W0503-MODEL-CHANGE-NEEDS-SETTLED-FLAG", noFlag.code == 1 &&
+ 		str(jsonOf(noFlag)["reason"]) == "SETTLED_FLAG_REQUIRED", "code", noFlag.code, jsonOf(noFlag))
+-	writeCfg(`{"config_revision":3,"model":"vendor/old","workspace_ref":"D:/ws","project_id":"proj-probe"}`)
++	writeCfg(`{"config_revision":3,"model":"vendor/old","workspace_ref":"D:/ws","project_id":"proj-probe","session_id":"sess-strict","session_revision":7,"writer_epoch":2}`)
+ 	noRun := call(base(), "config", "set-model", "--model", "vendor/new", "--config-revision", "3", "--settled")
+ 	ok("W0503-MODEL-CHANGE-NEEDS-SETTLED-RUN-RECORDED", noRun.code == 1 &&
+ 		str(jsonOf(noRun)["reason"]) == "SETTLED_RUN_UNRECORDED" &&
+@@ -485,21 +524,21 @@ func v2VerbPhase(repo string) {
+ 		"--expected-revision", "7", "--project", "proj-probe")
+ 	ok("W0503-SETTLED-MODEL-CHANGE-SENDS-HOST-CONFIGURE", done.code == 0 &&
+ 		str(p.last()["method"]) == "host.configure" && str(jsonOf(done)["method_sent"]) == "host.configure" &&
+-		str(payloadOf(p.last())["model_id"]) == "vendor/new" &&
++		str(payloadOf(p.last())["model_id"]) == "new" &&
+ 		str(p.last()["writer_epoch"]) == "2",
+ 		"code", done.code, "envelope", p.last(), jsonOf(done))
+ 	ok("W0503-MODEL-CHANGE-CARRIES-THE-OBSERVED-EPOCH", str(p.last()["writer_epoch"]) == "2" &&
+ 		p.last()["writer_epoch"] != nil,
+-		"a model switch without writer_epoch is refused by the core itself (client_protocol.go:152), so the field has " +
++		"a model switch without writer_epoch is refused by the core itself (client_protocol.go:152), so the field has "+
+ 			"to be on the wire; the round-2 review captured 5/5 envelopes with it absent", "envelope", p.last())
+ 	after := call(base(), "config", "show")
+ 	ok("W0503-SETTLED-MODEL-CHANGE-COMPLETES", done.code == 0 &&
+-		str(jsonOf(done)["model"]) == "vendor/new" && str(jsonOf(after)["config"].(map[string]any)["model"]) == "vendor/new",
++		str(jsonOf(done)["model"]) == "mc-probe-opaque-4" && str(jsonOf(after)["config"].(map[string]any)["model"]) == "mc-probe-opaque-4",
+ 		"code", done.code, jsonOf(done), jsonOf(after))
+ 	// And the mirror: with no epoch anywhere the CLI refuses before the request is built, so a switch can neither
+ 	// land silently nor arrive at the host as an unexplained rejection.
+ 	p.seen = nil
+-	writeCfg(`{"config_revision":4,"model":"vendor/new","workspace_ref":"D:/ws","project_id":"proj-probe",` +
++	writeCfg(`{"config_revision":4,"model":"mc-probe-opaque-4","workspace_ref":"D:/ws","project_id":"proj-probe","session_id":"sess-strict","session_revision":7,` +
+ 		`"settled_run_id":"run-verified"}`)
+ 	noEpoch := call(base(), "config", "set-model", "--model", "vendor/other", "--config-revision", "4", "--settled",
+ 		"--base-url", "https://provider.invalid", "--credential-ref", "cred-1", "--expected-revision", "7",
+@@ -507,7 +546,7 @@ func v2VerbPhase(repo string) {
+ 	stillOld := call(base(), "config", "show")
+ 	ok("W0503-MODEL-CHANGE-WITHOUT-EPOCH-REFUSES-BEFORE-THE-HOST", noEpoch.code == 2 &&
+ 		str(jsonOf(noEpoch)["reason"]) == "MODEL_CHANGE_WITHOUT_EPOCH" && len(p.seen) == 0 &&
+-		str(jsonOf(stillOld)["config"].(map[string]any)["model"]) == "vendor/new",
++		str(jsonOf(stillOld)["config"].(map[string]any)["model"]) == "mc-probe-opaque-4",
+ 		"code", noEpoch.code, jsonOf(noEpoch), "envelopes", len(p.seen), jsonOf(stillOld))
+ 	// The strict fixture validates the envelope instead of answering a method name. The same verbs that pass
+ 	// against the agreeable host are re-driven against one that mirrors DecodeEnvelope, so a stripped CAS field, a
+@@ -609,7 +648,10 @@ func v2VerbPhase(repo string) {
+ 
+ 	// A switch the host itself refuses must not have changed the local configuration. The CLI-side gate refusal is
+ 	// covered elsewhere; this is the branch that only a live answer can reach.
+-	p.mode = "rejected"
++	p.mode = "configure-busy"
++	p.configurePhase = true
++	p.configureRevision = 3
++	p.seen = nil
+ 	writeCfg(`{"config_revision":3,"model":"vendor/old","settled_run_id":"run-settled","workspace_ref":"D:/ws",` +
+ 		`"project_id":"proj-probe","session_id":"sess-probe","session_revision":7,"writer_epoch":2}`)
+ 	hostRefused := call(base(), "config", "set-model", "--model", "vendor/sneaky", "--config-revision", "3",
+@@ -618,7 +660,8 @@ func v2VerbPhase(repo string) {
+ 	afterRefusal := call(base(), "config", "show")
+ 	shownAfter, _ := jsonOf(afterRefusal)["config"].(map[string]any)
+ 	ok("W0503-HOST-REFUSED-SWITCH-LEAVES-THE-PREVIOUS-MODEL", hostRefused.code == 1 &&
+-		str(shownAfter["model"]) == "vendor/old" && str(shownAfter["config_revision"]) == "3",
++		str(shownAfter["model"]) == "vendor/old" && str(shownAfter["config_revision"]) == "3" &&
++		str(p.last()["method"]) == "host.configure" && str(jsonOf(hostRefused)["reason"]) == "HOST_REJECTED:SESSION_BUSY",
+ 		"code", hostRefused.code, jsonOf(hostRefused), shownAfter)
+ 	p.mode = "complete"
+ 

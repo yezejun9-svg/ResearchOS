@@ -1,0 +1,452 @@
+1d3cc504da79df5bf0f69755011738d5adb827b0
+be0c58bc3d0d103434663d53bf4b03d94ad25580
+diff --git a/adapters/runtime/bridge_windows.go b/adapters/runtime/bridge_windows.go
+index 11aac5fb..a88c3841 100644
+--- a/adapters/runtime/bridge_windows.go
++++ b/adapters/runtime/bridge_windows.go
+@@ -582,7 +582,9 @@ func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+ 		}
+ 	}
+ 	if err != nil {
+-		w.journal.Reason = err.Error()
++		if w.journal.Reason == "" {
++			w.journal.Reason = err.Error()
++		}
+ 	}
+ 	w.err = errors.Join(err, w.persist())
+ }
+@@ -611,8 +613,10 @@ func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
+ }
+ func (w *Bridge) Cancel(reason string) {
+ 	w.mu.Lock()
++	if !w.journal.Cancelled {
++		w.journal.Reason = reason
++	}
+ 	w.journal.Cancelled = true
+-	w.journal.Reason = reason
+ 	w.persist()
+ 	w.mu.Unlock()
+ 	w.mu.Lock()
+diff --git a/internal/domain/runtime_broker_windows.go b/internal/domain/runtime_broker_windows.go
+index 3614ec24..390c930e 100644
+--- a/internal/domain/runtime_broker_windows.go
++++ b/internal/domain/runtime_broker_windows.go
+@@ -147,6 +147,15 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
+ 	if e != nil {
+ 		return nil, e
+ 	}
++	rejection, e := c.qualificationFirstGateRejectionTx(tx, route, run, dispatch, bridge, frame, payload)
++	if e != nil {
++		tx.Rollback()
++		return nil, e
++	}
++	if rejection != nil {
++		tx.Rollback()
++		return nil, rejection
++	}
+ 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
+ 	if e != nil {
+ 		tx.Rollback()
+diff --git a/internal/domain/runtime_command_queue_windows.go b/internal/domain/runtime_command_queue_windows.go
+index dd30a7b0..e8a6edff 100644
+--- a/internal/domain/runtime_command_queue_windows.go
++++ b/internal/domain/runtime_command_queue_windows.go
+@@ -5,6 +5,7 @@ package domain
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
+ 	rt "researchos.local/research-os/adapters/runtime"
+ 	"strings"
+@@ -423,7 +424,7 @@ func (c *RuntimeCoordinator) ingestClientQueueFrame(ctx context.Context, route R
+ 
+ // Effects may block on a model/tool. Only this flow owns ACK order; a bounded
+ // result pump lets the same coordinator receive SDK receipts and send controls.
+-func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) error {
++func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, cancelBroker context.CancelFunc, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) (qualificationBrokerDrain, error) {
+ 	type completion struct {
+ 		seq      int64
+ 		response any
+@@ -431,6 +432,7 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 	}
+ 	results := make(chan completion, 32)
+ 	ready := map[int64]completion{}
++	registry := newQualificationBrokerRegistry()
+ 	inflight := 0
+ 	next := int64(1)
+ 	frames := bridge.Frames()
+@@ -439,24 +441,70 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 	var initialized time.Time
+ 	var cancelSent time.Time
+ 	var deferredError error
++	var firstError error
++	var closing bool
++	ctxDone := ctx.Done()
++	var fence *time.Timer
++	var fenceExpired <-chan time.Time
++	defer func() {
++		if fence != nil {
++			fence.Stop()
++		}
++	}()
++	closeAdmission := func(cause error, rejectedSeq int64) {
++		if firstError == nil {
++			firstError = cause
++		}
++		if closing {
++			if rejectedSeq > 0 {
++				registry.disqualify()
++			}
++			return
++		}
++		closing = true
++		registry.close(rejectedSeq)
++		cancelBroker()
++		if rejectedSeq > 0 {
++			bridge.Cancel("qualification first dispatch gate denied TOOL")
++		} else {
++			bridge.Cancel("protocol reconciliation failed")
++		}
++		fence = time.NewTimer(15 * time.Second)
++		fenceExpired = fence.C
++	}
+ 	for frames != nil || inflight > 0 {
+ 		select {
+ 		case observation := <-bridge.ModelObservations():
++			if closing {
++				registry.disqualify()
++				continue
++			}
+ 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+ 			if err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+ 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+ 		case frame, ok := <-frames:
+ 			if !ok {
+ 				frames = nil
+ 				continue
+ 			}
++			if closing {
++				registry.disqualify()
++				continue
++			}
+ 			if frame.Type == "effect.request" {
+ 				if inflight >= 16 {
+-					return Fail(409, "GATE_FAILED", "effect concurrency exceeds bound")
++					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
++					continue
++				}
++				if !registry.admit(frame) {
++					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
++					continue
+ 				}
+ 				inflight++
+ 				go func(f rt.BridgeFrame) {
+@@ -471,7 +519,8 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 					if err == nil && frame.Type == "command.accepted" {
+ 						payload, e := Decode(frame.Payload)
+ 						if e != nil {
+-							return e
++							closeAdmission(e, 0)
++							continue
+ 						}
+ 						if payload["initialized"] == true {
+ 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+@@ -484,26 +533,57 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 					mutation.Unlock()
+ 				}
+ 				if err != nil {
+-					return err
++					closeAdmission(err, 0)
++					continue
+ 				}
+ 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+ 			}
+ 		case done := <-results:
++			if closing {
++				registry.disqualify()
++			}
++			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
++				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
++				continue
++			}
+ 			inflight--
+ 			if done.err != nil {
++				var rejection *qualificationPreEffectRejection
++				if errors.As(done.err, &rejection) {
++					closeAdmission(done.err, done.seq)
++					continue
++				}
++				if closing {
++					registry.disqualify()
++					continue
++				}
+ 				var fenced int
+ 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+-					return done.err
++					closeAdmission(done.err, 0)
++					continue
+ 				}
+ 				deferredError = done.err
+ 			}
+-			ready[done.seq] = done
++			if !closing {
++				ready[done.seq] = done
++			}
+ 		case <-tick.C:
++			if closing {
++				continue
++			}
+ 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				continue
+ 			}
+-		case <-ctx.Done():
+-			return ctx.Err()
++		case <-ctxDone:
++			closeAdmission(ctx.Err(), 0)
++			ctxDone = nil
++		case <-fenceExpired:
++			registry.disqualify()
++			return registry.snapshot(), errors.Join(firstError, Fail(409, "GATE_FAILED", "broker drain timed out"))
++		}
++		if closing {
++			continue
+ 		}
+ 		for {
+ 			done, ok := ready[next]
+@@ -511,19 +591,24 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
+ 				break
+ 			}
+ 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+-				return err
++				closeAdmission(err, 0)
++				break
+ 			}
+ 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+ 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+-					return err
++					closeAdmission(err, 0)
++					break
+ 				}
+ 			}
+ 			delete(ready, next)
+ 			next++
+ 		}
+ 	}
++	if closing {
++		return registry.snapshot(), firstError
++	}
+ 	if len(ready) != 0 {
+-		return Fail(409, "GATE_FAILED", "protocol receipt gap")
++		return registry.snapshot(), Fail(409, "GATE_FAILED", "protocol receipt gap")
+ 	}
+-	return deferredError
++	return registry.snapshot(), deferredError
+ }
+diff --git a/internal/domain/runtime_coordinator_windows.go b/internal/domain/runtime_coordinator_windows.go
+index e282ae35..af32e645 100644
+--- a/internal/domain/runtime_coordinator_windows.go
++++ b/internal/domain/runtime_coordinator_windows.go
+@@ -662,11 +662,28 @@ func (c *RuntimeCoordinator) RunAdmitted(ctx context.Context, route RuntimeCoord
+ 			}
+ 		}
+ 	}()
+-	protocolError := c.runCommandBridge(child, brokerContext, route, runID, lease, epoch, locator, bridge, &mutation)
++	drain, protocolError := c.runCommandBridge(child, brokerContext, cancelBroker, route, runID, lease, epoch, locator, bridge, &mutation)
+ 	if protocolError != nil {
+ 		bridge.Cancel("protocol reconciliation failed")
+ 	}
+ 	<-bridge.Done()
++	var qualificationRejection *qualificationPreEffectRejection
++	if errors.As(protocolError, &qualificationRejection) {
++		cancelBroker()
++		cancel()
++		<-heartbeatDone
++		select {
++		case heartbeatFailure := <-heartbeatError:
++			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "heartbeat changed before qualification closure")
++			return errors.Join(protocolError, heartbeatFailure)
++		default:
++		}
++		if e := c.closeOnlineQualificationFailure(context.Background(), route, runID, epoch, locator, bridge, qualificationRejection, drain); e != nil {
++			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "qualification failure proof incomplete")
++			return errors.Join(protocolError, e)
++		}
++		return protocolError
++	}
+ 	if protocolError != nil {
+ 		cancel()
+ 		<-heartbeatDone
+diff --git a/internal/domain/runtime_command_queue_windows_test.go b/internal/domain/runtime_command_queue_windows_test.go
+index d8f0f95c..7e91287a 100644
+--- a/internal/domain/runtime_command_queue_windows_test.go
++++ b/internal/domain/runtime_command_queue_windows_test.go
+@@ -354,3 +354,58 @@ func testRuntimeClientQueueActual(t *testing.T, cancelActive bool, raceOrder ...
+ 	})
+ 	t.Logf("actual pinned Mu SDK, one original Task/Run/process, accepted=2 consumed=2 sealed=2 model_calls=%d (qualification included), provider=loopback FIXTURE", calls.Load())
+ }
++
++func TestQualificationBrokerDrainRequiresEveryAdmittedCompletion(t *testing.T) {
++	r := newQualificationBrokerRegistry()
++	for _, seq := range []int64{2, 3} {
++		if !r.admit(rt.BridgeFrame{Sequence: seq, Type: "effect.request", Capability: "MODEL"}) {
++			t.Fatalf("admit %d", seq)
++		}
++	}
++	if !r.complete(2, "model-confirmed") {
++		t.Fatal("MODEL completion lost")
++	}
++	r.close(3)
++	before := r.snapshot()
++	if !before.closed || before.disqualified || before.accepted != 2 || before.completed != 1 || before.pending != 1 {
++		t.Fatalf("premature drain: %+v", before)
++	}
++	var wg sync.WaitGroup
++	block := make(chan struct{})
++	wg.Add(1)
++	go func() { defer wg.Done(); <-block; r.complete(3, "tool-denied") }()
++	if r.snapshot().pending != 1 {
++		t.Fatal("blocked broker counted complete")
++	}
++	close(block)
++	wg.Wait()
++	after := r.snapshot()
++	if !after.closed || after.disqualified || after.pending != 0 || after.completed != 2 || after.rejectedSeq != 3 {
++		t.Fatalf("drain incomplete: %+v", after)
++	}
++	if r.admit(rt.BridgeFrame{Sequence: 4}) {
++		t.Fatal("suffix frame admitted after fence")
++	}
++	if !r.snapshot().disqualified {
++		t.Fatal("suffix failed to disqualify closed proof")
++	}
++}
++
++func TestQualificationBrokerDrainDuplicateAndMissingCompletion(t *testing.T) {
++	r := newQualificationBrokerRegistry()
++	if r.complete(2, "unadmitted") || !r.snapshot().disqualified {
++		t.Fatal("unadmitted completion accepted")
++	}
++	r = newQualificationBrokerRegistry()
++	if !r.admit(rt.BridgeFrame{Sequence: 2}) || !r.complete(2, "first") || r.complete(2, "duplicate") || !r.snapshot().disqualified {
++		t.Fatal("duplicate completion was accepted")
++	}
++	r = newQualificationBrokerRegistry()
++	if !r.admit(rt.BridgeFrame{Sequence: 3}) {
++		t.Fatal("admission failed")
++	}
++	r.close(3)
++	if r.snapshot().pending != 1 {
++		t.Fatal("worker exit or closed flag fabricated completion")
++	}
++}
+463: func TestQualificationFailureCompletedMarkerReplayExactEntry(t *testing.T) {
+464: 	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+465: 	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err == nil {
+466: 		t.Fatal("expected first-gate denial")
+467: 	}
+468: 	epoch, err := Num(r.run, "lease_epoch")
+469: 	if err != nil {
+470: 		t.Fatal(err)
+471: 	}
+472: 	var locator string
+473: 	if err := r.f.db.QueryRow(`SELECT journal_locator FROM runtime_dispatches WHERE project=? AND run=?`, r.f.project, r.run["id"]).Scan(&locator); err != nil {
+474: 		t.Fatal(err)
+475: 	}
+476: 	directory := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+477: 	raw, err := os.ReadFile(filepath.Join(directory, "qualification-rejection-00000000000000000003.json"))
+478: 	if err != nil {
+479: 		t.Fatal(err)
+480: 	}
+481: 	receipt, err := Decode(raw)
+482: 	if err != nil {
+483: 		t.Fatal(err)
+484: 	}
+485: 	denial := &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: errors.New("expected first gate")}
+486: 	// A completed Bridge has no exported reopen constructor. Only its Directory
+487: 	// field is read before the completed-marker replay branch returns.
+488: 	bridge := new(rt.Bridge)
+489: 	field := reflect.ValueOf(bridge).Elem().FieldByName("directory")
+490: 	if !field.IsValid() || !field.CanAddr() {
+491: 		t.Fatal("Bridge directory test seam unavailable")
+492: 	}
+493: 	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetString(directory)
+494: 	census := func() map[string]int {
+495: 		t.Helper()
+496: 		queries := map[string]string{
+497: 			"domain_versions":       `SELECT count(*) FROM domain_versions WHERE project=?`,
+498: 			"domain_objects":        `SELECT count(*) FROM domain_objects WHERE project=?`,
+499: 			"domain_refs":           `SELECT count(*) FROM domain_refs WHERE project=?`,
+500: 			"uploaded_content":      `SELECT count(*) FROM uploaded_content WHERE project=?`,
+501: 			"runtime_observations":  `SELECT count(*) FROM runtime_observations WHERE project=?`,
+502: 			"runtime_dispatches":    `SELECT count(*) FROM runtime_dispatches WHERE project=?`,
+503: 			"outbox":                `SELECT count(*) FROM outbox WHERE project=?`,
+504: 			"event_state_snapshots": `SELECT count(*) FROM event_state_snapshots WHERE project=?`,
+505: 			"idempotency":           `SELECT count(*) FROM idempotency WHERE project=?`,
+506: 			"resource_effects":      `SELECT count(*) FROM resource_effects WHERE project=?`,
+507: 			"runtime_uploads":       `SELECT count(*) FROM runtime_uploads WHERE project=?`,
+508: 			"artifact_uses":         `SELECT count(*) FROM artifact_uses WHERE project=?`,
+509: 			"artifact_use_proofs":   `SELECT count(*) FROM artifact_use_proofs WHERE project=?`,
+510: 		}
+511: 		counts := make(map[string]int, len(queries))
+512: 		for name, query := range queries {
+513: 			var count int
+514: 			if err := r.f.db.QueryRow(query, r.f.project).Scan(&count); err != nil {
+515: 				t.Fatal(err)
+516: 			}
+517: 			counts[name] = count
+518: 		}
+519: 		return counts
+520: 	}
+521: 	before := census()
+522: 	if err := c.closeOnlineQualificationFailure(context.Background(), route, Str(r.run, "id"), epoch, locator, bridge, denial, qualificationBrokerDrain{}); err != nil {
+523: 		t.Fatalf("completed-marker exact replay failed: %v", err)
+524: 	}
+525: 	if after := census(); !reflect.DeepEqual(after, before) || calls.Load() != 1 {
+526: 		t.Fatalf("completed-marker replay changed logical tables: before=%v after=%v calls=%d", before, after, calls.Load())
+527: 	}
+528: 	wrong := Object{}
+529: 	for key, value := range receipt {
+530: 		wrong[key] = value
+531: 	}
+532: 	wrong["task_id"] = ID()
+533: 	if err := c.closeOnlineQualificationFailure(context.Background(), route, Str(r.run, "id"), epoch, locator, bridge, &qualificationPreEffectRejection{receipt: wrong, digest: Hash(wrong)}, qualificationBrokerDrain{}); err == nil {
+534: 		t.Fatal("wrong replay subject accepted")
+535: 	}
+536: 	var markerRaw string
+537: 	if err := r.f.db.QueryRow(`SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure'`, r.f.project).Scan(&markerRaw); err != nil {
+538: 		t.Fatal(err)
+539: 	}
+540: 	tx, err := r.f.db.Begin()
+541: 	if err != nil {
+542: 		t.Fatal(err)
+543: 	}
+544: 	qualificationDropTableTriggers(t, tx, "idempotency")
+545: 	if _, err := tx.Exec(`UPDATE idempotency SET body=json_set(body,'$.proof_ref.id','forged') WHERE project=? AND operation='host:qualification-failure-closure'`, r.f.project); err != nil {
+546: 		t.Fatal(err)
+547: 	}
+548: 	if err := tx.Commit(); err != nil {
+549: 		t.Fatal(err)
+550: 	}
+551: 	if err := c.closeOnlineQualificationFailure(context.Background(), route, Str(r.run, "id"), epoch, locator, bridge, denial, qualificationBrokerDrain{}); err == nil {
+552: 		t.Fatal("wrong completed marker accepted")
+553: 	}
+554: 	if _, err := r.f.db.Exec(`UPDATE idempotency SET body=? WHERE project=? AND operation='host:qualification-failure-closure'`, markerRaw, r.f.project); err != nil {
+555: 		t.Fatal(err)
+556: 	}
+557: 	if after := census(); !reflect.DeepEqual(after, before) {
+558: 		t.Fatalf("rejected replay changed logical tables: before=%v after=%v", before, after)
+559: 	}
+560: }
+561: 
+562: func TestQualificationFailurePrivateConsumerRejectsTampering(t *testing.T) {

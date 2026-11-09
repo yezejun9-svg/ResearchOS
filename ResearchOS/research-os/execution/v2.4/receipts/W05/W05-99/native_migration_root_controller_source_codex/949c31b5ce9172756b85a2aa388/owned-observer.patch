@@ -1,0 +1,77 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\integration_codex\independent-cli-list-scopes-r308\windows_owned_process.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_migration_root_controller_source_codex\949c31b5ce9172756b85a2aa388\windows_owned_observed.py
+@@ -6,6 +6,7 @@
+ """
+ 
+ import ctypes
++import copy
+ from ctypes import wintypes
+ import math
+ import os
+@@ -56,7 +57,7 @@
+     raise RuntimeError('Windows module inventory changed repeatedly; no stable bounded inventory')
+ 
+ 
+-def run_owned(argv, cwd, env, stdout, stderr, timeout, stdin=None, creation_flags=0):
++def run_owned_observed(argv, cwd, env, stdout, stderr, timeout, stdin=None, creation_flags=0, on_observation=None, cancel_requested=None):
+     """Return JSON-safe observations, including on preparation/launch failure.
+ 
+     timeout covers preparation through the primary process AND Job becoming idle.
+@@ -96,6 +97,16 @@
+     def error_text(exc):
+         return type(exc).__name__ + ': ' + str(exc)
+ 
++    def emit_observation(event):
++        if on_observation is not None:
++            snapshot = copy.deepcopy(result)
++            snapshot['stage'] = stage
++            on_observation(event, snapshot)
++
++    def check_cancel():
++        if cancel_requested is not None and cancel_requested():
++            raise RuntimeError('Root requested owned case cancellation')
++
+     def record_error(exc):
+         text = error_text(exc)
+         result['error'] = text if result['error'] is None else result['error'] + '; ' + text
+@@ -124,6 +135,11 @@
+             if key.upper() in folded:
+                 raise ValueError('case-insensitive duplicate environment key')
+             folded.add(key.upper())
++        if on_observation is not None and not callable(on_observation):
++            raise ValueError('on_observation must be callable')
++        if cancel_requested is not None and not callable(cancel_requested):
++            raise ValueError('cancel_requested must be callable')
++        check_cancel()
+         import msvcrt
+ 
+         stage = 'RESOLVE_WINDOWS_API'
+@@ -258,6 +274,7 @@
+         command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+         environment = ctypes.create_unicode_buffer('\0'.join(k + '=' + env[k] for k in sorted(env, key=str.upper)) + '\0\0')
+         pi = PROCESS_INFORMATION()
++        check_cancel()
+         stage = 'CREATE_SUSPENDED'
+         # EXTENDED_STARTUPINFO_PRESENT is required for the explicit HANDLE_LIST.
+         # No default NO_WINDOW, DETACHED_PROCESS or NEW_PROCESS_GROUP flag.
+@@ -274,6 +291,8 @@
+         require(assign(job, process))
+         assigned = True
+         cleanup['assigned_before_resume'] = True
++        emit_observation('assigned-before-resume')
++        check_cancel()
+         if time.monotonic() - started >= timeout:
+             result['timed_out'] = True
+         else:
+@@ -284,8 +303,11 @@
+             if prior != 1:
+                 raise RuntimeError('Unexpected suspended thread count: ' + str(prior))
+             result['resumed'] = True
++            emit_observation('resumed')
+             stage = 'WAIT_PRIMARY_AND_JOB_IDLE'
+             while not observe():
++                check_cancel()
++                emit_observation('live')
+                 remaining = timeout - (time.monotonic() - started)
+                 if remaining <= 0:
+                     result['timed_out'] = True

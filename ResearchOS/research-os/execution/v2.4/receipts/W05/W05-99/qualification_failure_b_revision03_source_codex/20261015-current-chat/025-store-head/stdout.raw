@@ -1,0 +1,55 @@
+package domain
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
+	"strconv"
+	"strings"
+	"time"
+	_ "time/tzdata"
+)
+
+type Service struct {
+	DB        *sql.DB
+	Contracts *Contracts
+	Protected protectedstore.Provider
+	// Fixed by a trusted constructor, never by a request or environment selector.
+	projectBindingRoute string
+	// Supplied only by a trusted local Root witness integration; nil fails closed.
+	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
+}
+type Fault struct {
+	Status        int
+	Code, Message string
+	Current       any
+}
+
+func (f *Fault) Error() string { return f.Code + ": " + f.Message }
+func Fail(status int, code, msg string) error {
+	return &Fault{Status: status, Code: code, Message: msg}
+}
+
+// NewCurrentMu is the installed current host's fixed construction policy. New
+// remains the legacy constructor so existing stored projects and fixtures keep
+// their historical binding semantics. Children inherit their stored parent.
+func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+		return nil, err
+	}
+	s, err := New(db, contractsDir, migrationFile)
+	if err != nil {
+		return nil, err
+	}
+	s.projectBindingRoute = "MU_FORK"
+	return s, nil
+}
+
+func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	c, e := LoadContracts(contractsDir)

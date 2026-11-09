@@ -1,0 +1,90 @@
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:122:        save(self.out/'manifest.json',{p.relative_to(self.out).as_posix():sha(p) for p in sorted(self.out.rglob('*')) if p.is_file()})
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:135:    save(g.out/'clean-source-manifest.json',{rel:sha(stage/rel) for rel in files})
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:191:    manifest=read(g.source('third_party/mu.MANIFEST.json'))
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:192:    entries=manifest['entries'];bad=[rel for rel,item in entries.items() if not (ROOT/rel).is_file() or sha(ROOT/rel)!=item['sha256']]
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:207:    manifest=read(prior/'manifest.json')
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:208:    if any(sha(prior/p)!=h for p,h in manifest.items()):raise ValueError('PRIOR_RAW_DRIFT')
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:218:                    'raw_manifest_sha256':sha(prior/'manifest.json'),'original_detail':found['detail'],
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:219:                    'reason':'Only source-materialization inventory and Mu manifest reader changed; inputs to this passed check unchanged'})
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:230:            for field in ('executable_tool','argv','cwd','platforms','required_env','allowed_env','timeout_seconds'):
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:244:                          'selectors':entry.get('selectors',{}),'platforms':entry.get('platforms',[])})
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:272:            {'inherited_mapping':special,'restricted_scope':'Explicit UNBOUND until W17 provisioning under separate OS identity; no formal labels read/written'})
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:273:    mapping=read(g.source('execution/v2.4/client_mapping.json'))
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:276:    mapped_methods={r['method'] for r in mapping['method_map']}
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:277:    g.check('CLIENT_MAP_COVERAGE',methods==mapped_methods and len(mapping['event_map'])==14 and all(r.get('owner_card') for r in mapping['method_map']),
+execution/v2.4/receipts/W02/W02-99/parent_driver.py:278:            {'methods':len(methods),'events':len(mapping['event_map']),'protocol':mapping['protocol'],'historical_statuses':'PLANNED labels retained, not upgraded by this structural check'})
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:56:def verify_manifest(folder,expected,audit):
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:57:    manifest=folder/'manifest.json'
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:58:    require(sha(manifest)==expected,'MANIFEST_HASH_CHANGED')
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:59:    rows=read(manifest)
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:61:    actual={p.relative_to(folder).as_posix() for p in folder.rglob('*') if p.is_file() and p!=manifest}
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:67:    audit.append({'path':str(manifest),'sha256':expected,'kind':'original_manifest'})
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:150:    require(read(primary/'clean-source-manifest.json')==sources,'CLEAN_SOURCE_VECTOR_CHANGED')
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:155:    verify_manifest(partial,partial_pin['manifest_sha256'],audit)
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:158:    require(read(partial/'clean-source-manifest.json')==inputs['build_sources'],'PARTIAL_SOURCE_VECTOR_CHANGED')
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:222:    require(sha(ROOT/'third_party/mu.MANIFEST.json')==pins['component_manifest_sha256'],'MU_MANIFEST_DRIFT')
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:296:    verify_manifest(primary,pin['manifest_sha256'],audit)
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:309:            'source_manifest_sha256':pin['manifest_sha256'],'source_assertion_ids':pin['assertion_ids'],
+execution/v2.4/receipts/W02/W02-99/evidence_reuse.py:335:    save(out/'manifest.json',{p.name:sha(p) for p in out.iterdir() if p.is_file()})
+        raise ValueError('PATH_OUTSIDE_WORKSPACE')
+    return path
+
+
+def resolve_registry(root, key, spec):
+    legacy = root / 'execution/commands.json'
+    v24 = root / 'execution/v2.4/commands.json'
+    if spec == 'v2.0':
+        return legacy, 'v2.0'
+    if spec == 'v2.4':
+        if not v24.is_file():
+            raise ValueError('V24_REGISTRY_ABSENT')
+        return v24, 'v2.4'
+    if spec != 'auto':
+        raise ValueError('UNKNOWN_SPEC:' + str(spec))
+    if v24.is_file():
+        try:
+            data = read(v24)
+        except (OSError, ValueError):
+            data = {}
+        if key in (data.get('commands') or {}):
+            pointer = root / 'execution/v2.4/current_spec.json'
+            if pointer.is_file():
+                try:
+                    pdata = read(pointer)
+                except (OSError, ValueError):
+                    pdata = {}
+                if pdata.get('pointer') == 'v2.4' and pdata.get('plan_sha256') == read(v24).get('plan_sha256'):
+                    return v24, 'v2.4'
+    return legacy, 'v2.0'
+
+
+def execute(key, selectors=None, *, root=ROOT, spec='auto'):
+    selectors = selectors or {}
+    invocation = str(uuid.uuid4())
+    output = within(root, 'execution/invocations') / invocation
+    output.mkdir(parents=True, exist_ok=False)
+    receipt = dict(invocation_id=invocation, command_key=key, started_at=now(),
+                   status='ERROR', exit_code=1, child_exit_code=None, assertion_ids=[],
+                   selectors=selectors, scope='CONSTRUCTION_CHECK_NOT_PRODUCT_ACCEPTANCE',
+                   stdout_sanitized=True, stderr_sanitized=True)
+    stdout, stderr = b'', b''
+    secrets = [v.encode() for k, v in os.environ.items()
+               if re.search(r'(TOKEN|SECRET|PASSWORD|API_KEY)', k, re.I) and len(v) >= 4]
+
+    def fail(status, code=1):
+        receipt.update(status=status, exit_code=code)
+
+    try:
+        registry_path, registry_spec = resolve_registry(root, key, spec)
+        registry = read(registry_path)
+        receipt['registry_spec'] = registry_spec
+        receipt['registered_command_revision'] = sha(registry_path)
+        entry = registry['commands'].get(key)
+        if not entry or entry['state'] != 'BOUND':
+            fail('NOT_IMPLEMENTED', 3)
+        elif platform.system() not in entry['platforms']:
+            fail('UNSUPPORTED_PLATFORM', 4)
+        elif any(value and '*' not in entry.get('selectors', {}).get(name, [])
+                 and value not in entry.get('selectors', {}).get(name, [])
+                 for name, value in selectors.items()):
+            fail('NOT_IMPLEMENTED', 3)

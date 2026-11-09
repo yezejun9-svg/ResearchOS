@@ -1,0 +1,307 @@
+	expires, e := time.Parse(time.RFC3339Nano, Str(r, "lease_expires_at"))
+	task, te := load(tx, project, "Task", Str(r, "task_id"))
+	if e != nil || te != nil || !time.Now().Before(expires) || r["executor_principal_id"] != p.ID || task["active_run_id"] != r["id"] {
+		return Fail(409, "LEASE_EXPIRED", "run is not current")
+	}
+	return nil
+}
+func (s *Service) runtimeUpload(tx *sql.Tx, p Principal, project string, b []byte) (Object, error) {
+	r, e := activeExecutorRun(tx, p, project)
+	if e != nil {
+		return nil, e
+	}
+	if e = s.currentDispatchedRun(tx, project, r, "upload"); e != nil {
+		return nil, e
+	}
+	o, e := s.upload(tx, p, project, b)
+	if e != nil {
+		return nil, e
+	}
+	_, e = tx.Exec("INSERT INTO runtime_uploads(storage_key,project,run,epoch) VALUES(?,?,?,?)", o["storage_key"], project, r["id"], r["lease_epoch"])
+	return o, e
+}
+func (s *Service) runtimeSeal(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
+	r, e := currentRun(tx, p, project, Str(b, "run_id"))
+	if e != nil {
+		return nil, e
+	}
+	if e = validExecutorRun(tx, p, project, r); e != nil {
+		return nil, e
+	}
+	if e = s.currentDispatchedRun(tx, project, r, "seal"); e != nil {
+		return nil, e
+	}
+	var count int
+	if e = tx.QueryRow("SELECT count(*) FROM runtime_uploads WHERE storage_key=? AND project=? AND run=? AND epoch=?", b["storage_key"], project, r["id"], r["lease_epoch"]).Scan(&count); e != nil {
+		return nil, e
+	}
+	if count != 1 || r["executor_principal_id"] != p.ID || runTerminal(r) {
+		return nil, Fail(403, "FORBIDDEN", "upload is not bound to current run")
+	}
+	return s.seal(tx, p, project, b)
+}
+			return nil, e
+		}
+		if e = s.taskContext(tx, project, task); e != nil {
+			return nil, e
+		}
+	}
+	var found int
+	if e := tx.QueryRow("SELECT count(*) FROM auth_principals WHERE id=? AND revoked=0", b["recipient_id"]).Scan(&found); e != nil {
+		return nil, e
+	}
+	if found != 1 {
+		return nil, Fail(422, "GATE_FAILED", "recipient unavailable")
+	}
+	var recipientRoles string
+	if e := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", b["recipient_id"]).Scan(&recipientRoles); e != nil {
+		return nil, e
+	}
+	recipient := Principal{ID: Str(b, "recipient_id")}
+	if e := json.Unmarshal([]byte(recipientRoles), &recipient.Roles); e != nil {
+		return nil, e
+	}
+	rows, e := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", recipient.ID)
+	if e != nil {
+		return nil, e
+	}
+	for rows.Next() {
+		var g Grant
+		if e = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		recipient.Grants = append(recipient.Grants, g)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return nil, e
+	}
+	if !recipient.Allowed(project, Str(b, "task_id"), Str(b, "run_id"), false) || !s.visible(tx, recipient, project, b) {
+		return nil, Fail(403, "FORBIDDEN", "recipient cannot read this message scope")
+	}
+	o := Merge(Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now()}, b)
+	o["sender_id"] = p.ID
+	o["dedup_key"] = Hash([]any{p.ID, project, b})
+	o["receipt_hash"] = Receipt(o)
+	return o, s.put(tx, "AgentMessage", o)
+}
+func (s *Service) impactLink(tx *sql.Tx, project string, b Object) (Object, error) {
+	for _, k := range []string{"from_ref", "to_ref"} {
+		if _, e := version(tx, project, b[k].(map[string]any)); e != nil {
+			return nil, e
+		}
+	}
+	o := Merge(Base(project), b)
+	o["status"] = "ACTIVE"
+	return o, s.put(tx, "ImpactLink", o)
+}
+func (s *Service) closure(tx *sql.Tx, project string, roots []Object) ([]any, []any, error) {
+	rows, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.status')='ACTIVE'", project)
+	if e != nil {
+		return nil, nil, e
+	}
+	links := []Object{}
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			rows.Close()
+			return nil, nil, e
+		}
+		o, e := Decode([]byte(raw))
+	}
+	if _, err = s.actGoal(tx, project, Str(goal, "id"), Object{"action": "ACTIVATE", "reason": "Offline host preparation of the explicitly selected local model; no Run is authorized or dispatched by preparation"}); err != nil {
+		return result, err
+	}
+	task, err := s.createTask(tx, project, Object{"goal_id": goal["id"], "title": "Qualify selected local model runtime", "task_type": "runtime_qualification", "stage": "verification", "dependency_task_ids": Empty(), "requirement_refs": []any{Ref(requirement, "Requirement")}, "input_refs": []any{profileRef}, "acceptance_contract": contract, "origin_problem_id": routeID, "candidate_id": record.Ref, "stop_policy": Object{"wall_time_seconds": 90, "max_attempts": 1, "max_parallel_runs": 1, "stop_conditions": []any{"one bounded call", "configuration drift", "unknown effect requires reconciliation"}}})
+	if err != nil {
+		return result, err
+	}
+	state, err := singleton(tx, project, "ProjectState")
+	if err != nil {
+		return result, err
+	}
+	if _, err = s.createContext(tx, p, project, Object{"task_id": task["id"], "expected_project_state_revision": state["revision"]}); err != nil {
+		return result, err
+	}
+	if err = s.registerRuntimeQualificationPlanTx(tx, p, project, Str(task, "id"), Str(runtime, "id"), profileRef, []any{"start", "context_rebuild"}, 24*time.Hour, ""); err != nil {
+		return result, err
+	}
+	if err = s.event(tx, project, "RuntimeRegistration", runtime, p.ID, ID(), "PROJECT_UPDATED"); err != nil {
+		return result, err
+	}
+	result = RuntimeSetupResult{ProjectID: project, ModelRef: record.Ref, RuntimeID: Str(runtime, "id"), TaskID: Str(task, "id"), ProfileRef: profileRef}
+	return result, nil
+}
+
+func (s *Service) sealRuntimeSetupProfile(tx *sql.Tx, p Principal, project string, body Object) (Object, error) {
+	upload, err := s.upload(tx, p, project, Bytes(body))
+	if err != nil {
+		return nil, err
+	}
+	b := Object{"kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "media_type": "application/json", "storage_key": upload["storage_key"], "content_hash": upload["content_hash"], "byte_size": upload["byte_size"], "produced_by": p.ID, "run_id": nil, "input_refs": Empty(), "source_refs": Empty(), "access_class": "PROJECT"}
+	if err = s.Contracts.Validate("CreateArtifactRequest", b); err != nil {
+		return nil, fmt.Errorf("runtime profile seal: %w", err)
+	}
+	return s.seal(tx, p, project, b)
+}
+
+// EnsureRuntimeSetupPrincipal provisions only host-owned scheduler/executor
+// roles. Their lineage is the Owner's root, so neither can pass as an independent
+// verifier. Existing revoked or changed identities are never recreated.
+func (s *Service) EnsureRuntimeSetupPrincipal(ctx context.Context, ownerToken, project, role string) (string, error) {
+	if role != "SCHEDULER" && role != "EXECUTOR" {
+		return "", Fail(403, "FORBIDDEN", "runtime setup cannot provision this role")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	p, err := authenticate(tx, ownerToken)
+	if err != nil || !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
+		tx.Rollback()
+		return "", Fail(403, "FORBIDDEN", "current project Owner required")
+	}
+	ownerRoot, err := authorityRoot(tx, p.ID)
+	if err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	id := "local-" + strings.ToLower(role) + "-" + strings.TrimPrefix(Hash([]any{p.ID, project, role}), "sha256:")[:32]
+	var count int
+	err = tx.QueryRow("SELECT count(*) FROM auth_principals WHERE id=?", id).Scan(&count)
+	if err == nil && count != 0 {
+		current, e := clientAuthenticatedPrincipal(ctx, tx, id)
+		if e != nil || len(current.Roles) != 1 || !current.HasRole(role) || current.CanCreateProject {
+			err = Fail(403, "FORBIDDEN", "host runtime principal is revoked or changed")
+		} else if e = runtimeSetupGrants(tx, current, project, role); e != nil {
+			err = e
+		}
+	}
+	tx.Rollback()
+		if h != Receipt(o) {
+			return Fail(422, "CONTENT_HASH_MISMATCH", "receipt hash mismatch")
+		}
+		hash = h
+		immutable = 1
+	} else if kind == "Artifact" {
+		hash = o["content_hash"]
+	}
+	if _, e = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)", project, kind, id, rev, string(Bytes(o)), hash); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body,content_hash=excluded.content_hash", project, kind, id, rev, string(Bytes(o)), hash, immutable); e != nil {
+		return e
+	}
+	return s.refs(tx, project, kind, id, rev, "", o)
+}
+func (s *Service) refs(tx *sql.Tx, project, kind, id string, rev int64, path string, value any) error {
+	switch v := value.(type) {
+	case map[string]any:
+		if _, ok := v["entity_type"]; ok {
+			if e := s.Contracts.Validate("VersionRef", v); e != nil {
+				return Fail(400, "INVALID_REQUEST", "invalid reference")
+			}
+			version, e := Num(v, "revision")
+			if e != nil {
+				return e
+			}
+			return s.ref(tx, project, kind, id, rev, path, project, Str(v, "entity_type"), Str(v, "id"), version, v["content_hash"], true)
+		}
+		for field, x := range v {
+			if field == "id" || field == "project_id" {
+				continue
+			}
+			target := relationKind(kind, field)
+			if field == "supersedes_id" {
+				target = kind
+			}
+			if field == "parent_policy_id" {
+				target = kind
+			}
+			if target != "" && x != nil {
+				values := []any{x}
+				if a, ok := x.([]any); ok {
+					values = a
+				}
+				for _, a := range values {
+					tid, ok := a.(string)
+					if !ok {
+						return Fail(400, "INVALID_REQUEST", "invalid relation")
+					}
+					tp := project
+					if field == "parent_policy_id" {
+						var found int
+						tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind=? AND id=?", project, target, tid).Scan(&found)
+						if found == 0 {
+							tp = ""
+						}
+					}
+					obj, e := load(tx, tp, target, tid)
+					if e != nil {
+						return Fail(422, "GATE_FAILED", "related object unavailable")
+					}
+					version, e := Num(obj, "revision")
+					if e != nil {
+						return e
+					}
+					if e = s.ref(tx, project, kind, id, rev, path+"/"+field, tp, target, tid, version, nil, false); e != nil {
+						return e
+					}
+				}
+			} else if e := s.refs(tx, project, kind, id, rev, path+"/"+field, x); e != nil {
+				return e
+			}
+		}
+	case []any:
+		for i, x := range v {
+			if e := s.refs(tx, project, kind, id, rev, fmt.Sprintf("%s/%d", path, i), x); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+func (s *Service) ref(tx *sql.Tx, project, kind, id string, rev int64, path, tp, tk, tid string, tr int64, hash any, exact bool) error {
+	var current int64
+	var h sql.NullString
+	e := tx.QueryRow("SELECT revision,content_hash FROM domain_objects WHERE project=? AND kind=? AND id=?", tp, tk, tid).Scan(&current, &h)
+	if e != nil {
+		return Fail(422, "GATE_FAILED", "reference unavailable")
+	}
+	history := kind == "Conflict" || kind == "Artifact" || kind == "ContextBundle" || kind == "DecisionReceipt" || kind == "AcceptanceReceipt" || kind == "AgentMessage" || kind == "ImpactLink" || kind == "ChangeProposal" || kind == "EventEnvelope" || kind == "SkillVersion" || ((kind == "Task" || kind == "Goal") && rev > 1)
+	if exact && kind == "ResearchCycle" && path == "/profile_ref" && tk == "ProjectProfile" && tp == project && rev > 1 {
+		var priorRaw, currentRaw string
+		e = tx.QueryRow("SELECT prior.body,current.body FROM domain_versions prior JOIN domain_versions current ON current.project=prior.project AND current.kind=prior.kind AND current.id=prior.id AND current.revision=prior.revision+1 WHERE prior.project=? AND prior.kind='ResearchCycle' AND prior.id=? AND prior.revision=?", project, id, rev-1).Scan(&priorRaw, &currentRaw)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "cycle cancellation needs its previous version")
+		}
+		prior, err := Decode([]byte(priorRaw))
+		if err != nil {
+			return err
+		}
+		currentCycle, err := Decode([]byte(currentRaw))
+		if err != nil {
+			return err
+		}
+		history = currentCycle["status"] == "CANCELLED" && Hash(currentCycle["profile_ref"]) == Hash(prior["profile_ref"])
+	}
+	if exact && history {
+		e = tx.QueryRow("SELECT revision,content_hash FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?", tp, tk, tid, tr).Scan(&current, &h)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "historical reference unavailable")
+		}
+	}
+	if exact && current != tr {
+		return Fail(412, "STALE_INPUT", "reference revision changed")
+	}
+	if exact && ((h.Valid && hash != h.String) || (!h.Valid && hash != nil)) {
+		return Fail(422, "CONTENT_HASH_MISMATCH", "reference hash mismatch")
+	}
+	_, e = tx.Exec("INSERT INTO domain_refs(project,kind,id,revision,field,target_project,target_kind,target_id,target_revision) VALUES(?,?,?,?,?,?,?,?,?)", project, kind, id, rev, path, tp, tk, tid, tr)
+	return e
+}
+func (s *Service) invariants(kind string, o Object) error {
+	if tz := Str(o, "timezone"); tz != "" {
+		if _, e := time.LoadLocation(tz); e != nil {

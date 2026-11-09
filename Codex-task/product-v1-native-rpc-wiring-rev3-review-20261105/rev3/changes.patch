@@ -1,0 +1,75 @@
+diff --git a/internal/domain/runtime_harness_windows_test.go b/internal/domain/runtime_harness_windows_test.go
+index 18b8e39..394bcb2 100644
+--- a/internal/domain/runtime_harness_windows_test.go
++++ b/internal/domain/runtime_harness_windows_test.go
+@@ -526,8 +526,57 @@ func harnessRPCTurnFixture(t *testing.T) (*fixture, *RuntimeCoordinator, *Worksp
+ 	return f, c, b, d
+ }
+ 
++// Replace the live runtime binding with a newly sealed, individually valid
++// profile. The original Run's dispatch snapshot must still reject the turn.
++func harnessRPCRebindSealedProfile(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
++	t.Helper()
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		run, err := load(tx, f.project, "Run", d.launch.RunID)
++		if err != nil {
++			return err
++		}
++		runtime, err := load(tx, f.project, "RuntimeRegistration", Str(run, "runtime_id"))
++		if err != nil {
++			return err
++		}
++		prior, artifact, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
++		if err != nil {
++			return err
++		}
++		profile, err := runtimeProfileBody(tx, f.project, artifact)
++		if err != nil {
++			return err
++		}
++		profile["consent_expires_at"] = time.Now().UTC().Add(23 * time.Hour).Format(time.RFC3339Nano)
++		if !harnessPolicyMatches(profile, rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash)) {
++			return errors.New("replacement profile lost canonical RPC seal")
++		}
++		owner, err := authenticate(tx, f.token)
++		if err != nil {
++			return err
++		}
++		newArtifact, err := f.s.sealRuntimeSetupProfile(tx, owner, f.project, profile)
++		if err != nil {
++			return err
++		}
++		newRef := Ref(newArtifact, "Artifact")
++		if Hash(newRef) == Hash(prior) {
++			return errors.New("replacement binding did not change")
++		}
++		_, err = tx.Exec("UPDATE runtime_bindings SET profile_ref=?,profile_hash=? WHERE project=? AND runtime=?", string(Bytes(newRef)), Hash(newRef), f.project, runtime["id"])
++		if err != nil {
++			return err
++		}
++		current, _, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
++		if err != nil || Hash(current) != Hash(newRef) {
++			return errors.New("replacement profile is not the live valid binding")
++		}
++		return nil
++	})
++}
++
+ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+-	for _, mode := range []string{"one_turn", "duplicate", "owner", "source_rebind", "source_revision", "policy_seal", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
++	for _, mode := range []string{"one_turn", "duplicate", "owner", "source_rebind", "source_revision", "policy_readiness", "sealed_binding", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			f, c, b, d := harnessRPCTurnFixture(t)
+ 			caps, err := c.HarnessV1().Capabilities(context.Background(), f.token)
+@@ -577,8 +626,10 @@ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+ 					b.Revision++
+ 					return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
+ 				})
+-			case "policy_seal":
++			case "policy_readiness":
+ 				d.snapshot.PolicyIdentity = rt.CodexRPCPolicyIdentity("sha256:stale-binary")
++			case "sealed_binding":
++				harnessRPCRebindSealedProfile(t, f, d)
+ 			case "auth_metadata":
+ 				d.descriptor.AuthState = "LOGGED_OUT"
+ 			case "lease_epoch":

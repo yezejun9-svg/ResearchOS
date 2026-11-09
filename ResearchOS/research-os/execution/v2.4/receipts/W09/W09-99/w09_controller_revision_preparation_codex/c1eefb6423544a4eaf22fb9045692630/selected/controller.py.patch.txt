@@ -1,0 +1,63 @@
+--- original/controller.py
++++ candidate/controller.py
+@@ -42,9 +42,9 @@
+   self.environment.update(TMP=str(out/'testtmp'),TEMP=str(out/'testtmp'),PATH=str(Path(g['tools']['cmd']['path']).parent),GOROOT=str(self.goroot),GOTOOLCHAIN='local',GOENV='off',GOWORK='off',GOPROXY='off',GOSUMDB='off',CGO_ENABLED='0',GOFLAGS='-mod=readonly -buildvcs=false -p=1',GOCACHE=str(out/'gocache'),GOTMPDIR=str(out/'gotmpdir'),GOPATH=str(out/'gopath'),GOMODCACHE=str(self.modcache),GOMAXPROCS='2')
+   self.tree=out/'source';self.tool_images=[g['tools']['go']]+g['go_tool_images']
+   self.ledger.add([r['path'] for r in g['resource_files']],'root-pinned-public-resource-universe')
+-  self.ledger.add([r['path'] for r in g['controller_refs']]+[g['spec_ref']['path']],'controller-spec')
++  self.ledger.add([r['path'] for r in g['controller_refs']]+[r['path'] for r in g['_authorization_input_refs']],'controller-spec-actual-authority')
+   write_json(out/'runtime.before.json',runtime_snapshot(self.debug,g['resource_files']))
+- def run(self,label,argv,cwd,timeout,process_cap,images,env=None,allow_nonzero=False):
++ def run(self,label,argv,cwd,timeout,process_cap,images,env=None):
+   self.serial+=1
+   if self.serial>128:raise Stop('Total native invocation cap')
+   self.ledger.check('%03d-%s-before'%(self.serial,label))
+@@ -54,7 +54,7 @@
+    primary=file_ref(argv[0]);pins=[{'path':r['path'],'sha256':r['sha256'],'bytes':r['bytes']} for r in images]
+    if label.startswith('case-'):
+     worker=self.s['case_worker_ref'];python=self.g['tools']['python']
+-    request=write_json(d/'case-request.json',{'schema':'researchos.w09.owned-case-request.v1','authorized_by_controller':True,'source_commit':CANDIDATE,'self_ref':worker,'python_ref':python,'debug_helper_ref':self.g['debug_helper_ref'],'argv':argv,'cwd':str(cwd),'env':env,'output_dir':str(d),'timeout':120,'process_cap':process_cap,'images':pins,'allowed_module_files':[r['ref'] for r in self.ledger.rows.values()],'expected_image':{'sha256':primary['sha256'],'bytes':primary['bytes']}})
++    request=write_json(d/'case-request.json',{'schema':'researchos.w09.owned-case-request.v1','authorized_by_controller':True,'root_grant_ref':self.g['_grant_ref'],'spec_ref':self.g['spec_ref'],'source_commit':CANDIDATE,'self_ref':worker,'python_ref':python,'debug_helper_ref':self.g['debug_helper_ref'],'argv':argv,'cwd':str(cwd),'env':env,'output_dir':str(d),'timeout':120,'process_cap':process_cap,'images':pins,'allowed_module_files':[r['ref'] for r in self.ledger.rows.values()],'expected_image':{'sha256':primary['sha256'],'bytes':primary['bytes']}})
+     wrapperargv=[python['path'],*FLAGS,worker['path'],'--request',request['path'],'--sha256',request['sha256']]
+     with (d/'wrapper.stdout.raw').open('xb') as so,(d/'wrapper.stderr.raw').open('xb') as se:
+      wrapper=self.normal.run_owned(wrapperargv,str(PREP),self.environment,so,se,150)
+@@ -68,11 +68,7 @@
+    if any((d/name).stat().st_size>rawlimit for name in ['stdout.raw','stderr.raw']):raise Stop('Native raw bound exceeded')
+    invocation={'actualargv':argv,'cwd':str(cwd),'environment':self.environment if env is None else env,'started_at_unix':started,'ended_at_unix':time.time(),'actual_native_exit':None if result is None else result.get('actual_exit'),'owned_result':result,'stdout_ref':file_ref(d/'stdout.raw'),'stderr_ref':file_ref(d/'stderr.raw')}
+    write_json(d/'invocation.json',invocation)
+-   if allow_nonzero and result and result.get('actual_exit')!=0:
+-    # Resource failure only. Still require actual exit/idle/handles and complete observed runtime.
+-    adjusted=dict(result);adjusted['actual_exit']=0
+-    require_job(adjusted,True)
+-   else:require_job(result,True)
++   require_job(result,True)
+    module_paths=[]
+    for item in result['debug_capture']['modules']:
+     p=item['path_from_actual_file_handle']
+@@ -168,19 +164,19 @@
+     s=(a/'outside').lstat()
+     if not stat.S_ISLNK(s.st_mode):raise Stop('Actual symlink branch mode mismatch')
+     self.resource['symlink']='AVAILABLE'
+-   except OSError as e:self.resource['symlink']='HOLD_RESOURCE';write_json(root/'failure.json',{'actual_native_exit':None,'exception_type':type(e).__name__,'message':str(e),'qualification':'NOT_RUN_RESOURCE_HOLD'})
++   except OSError as e:
++    write_json(root/'failure.json',{'actual_native_exit':None,'exception_type':type(e).__name__,'message':str(e),'qualification':'STOP_UNEXPECTED_RESOURCE_FAILURE'})
++    raise
+   if self.g['resources']['junction'] is True:
+    root=self.out/'junction-resource';root.mkdir();a=root/'A';b=root/'B';a.mkdir();b.mkdir()
+    for p in [a/'same.txt',b/'same.txt']:write_bytes(p,b'owned-public-marker')
+    link=a/'outside'
+    if any(c in str(root) for c in '"%&|<>^!\r\n'):raise Stop('Unsafe cmd resource path')
+    cmd=self.g['tools']['cmd'];command='mklink /J "'+str(link)+'" "'+str(b)+'"'
+-   d,result=self.run('junction-resource',[cmd['path'],'/D','/V:OFF','/S','/C',command],root,15,1,[cmd],allow_nonzero=True)
+-   if result['actual_exit']!=0:self.resource['junction']='HOLD_RESOURCE_UNEXPLAINED_NATIVE_FAILURE'
+-   else:
+-    s=link.lstat()
+-    if not getattr(s,'st_file_attributes',0)&0x400 or link.resolve()!=b.resolve():raise Stop('Wrong actual junction/target')
+-    self.resource['junction']='AVAILABLE';self.link=root
++   d,result=self.run('junction-resource',[cmd['path'],'/D','/V:OFF','/S','/C',command],root,15,1,[cmd])
++   s=link.lstat()
++   if not getattr(s,'st_file_attributes',0)&0x400 or link.resolve()!=b.resolve():raise Stop('Wrong actual junction/target')
++   self.resource['junction']='AVAILABLE';self.link=root
+   write_json(self.out/'resource-status.json',self.resource)
+  def cases(self):
+   result=[]

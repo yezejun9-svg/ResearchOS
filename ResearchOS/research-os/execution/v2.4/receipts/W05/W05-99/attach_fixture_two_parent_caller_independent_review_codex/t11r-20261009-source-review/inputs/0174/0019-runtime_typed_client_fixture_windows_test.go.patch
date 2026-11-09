@@ -1,0 +1,364 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\typed_runtime_goal_fixture_jsonl_digest_revision_codex\794a6ecddad942d69e6f8fb19bcc2e49\candidate-root\internal\domain\runtime_typed_client_fixture_windows_test.go
++++ candidate-root/internal/domain/runtime_typed_client_fixture_windows_test.go
+@@ -563,14 +563,353 @@
+ 	return coordinator, route, runtime, &calls
+ }
+ 
+-func attachTypedRuntimeFixture(t *testing.T, f *fixture, service *ClientService, created *Response, client string) {
++type typedRuntimeFixtureWriter struct {
++	ClientID string `json:"client_id"`
++	Epoch int64 `json:"epoch"`
++	ExpiresAt string `json:"expires_at"`
++}
++
++type typedRuntimeFixtureSnapshot struct {
++	ProjectID string `json:"project_id"`
++	SessionID string `json:"session_id"`
++	WorkspaceRef string `json:"workspace_ref"`
++	ModelConfigRef string `json:"model_config_ref"`
++	NativeSessionRef string `json:"native_session_ref"`
++	CoreBuildID string `json:"core_build_id"`
++	ProtocolVersion string `json:"protocol_version"`
++	Revision int64 `json:"revision"`
++	EventSequence int64 `json:"event_sequence"`
++	RunID *string `json:"active_run_id"`
++	Writer *typedRuntimeFixtureWriter `json:"writer"`
++	Preserved string `json:"-"`
++}
++
++type typedRuntimeFixtureBinding struct {
++	ProjectID, SessionID, OwnerClientID, LeaseExpiresAt string
++	WorkspaceRef, ModelConfigRef, NativeSessionRef string
++	Revision, WriterEpoch int64
++}
++
++// The production schema validates the complete snapshot before this typed
++// projection. JSON -> int64 preserves integer values without a float64 cast.
++func typedRuntimeFixtureSnapshotBinding(doc *SchemaDoc, raw map[string]any) (typedRuntimeFixtureSnapshot, error) {
++	var snapshot typedRuntimeFixtureSnapshot
++	if doc == nil {
++		return snapshot, fmt.Errorf("typed snapshot schema required")
++	}
++	if err := doc.ValidateDef("SessionSnapshot", normalizeNumbers(raw)); err != nil {
++		return snapshot, err
++	}
++	encoded, err := json.Marshal(raw)
++	if err != nil {
++		return snapshot, err
++	}
++	if err = json.Unmarshal(encoded, &snapshot); err != nil {
++		return snapshot, err
++	}
++	if snapshot.ProjectID == "" || snapshot.SessionID == "" || snapshot.WorkspaceRef == "" ||
++		snapshot.ModelConfigRef == "" || snapshot.NativeSessionRef == "" || snapshot.CoreBuildID == "" ||
++		snapshot.ProtocolVersion != ProtocolV2 || snapshot.Revision < 1 || snapshot.EventSequence < 0 ||
++		(snapshot.Writer != nil && (snapshot.Writer.ClientID == "" || snapshot.Writer.Epoch < 1)) {
++		return snapshot, fmt.Errorf("typed snapshot binding incomplete")
++	}
++	var preserved map[string]json.RawMessage
++	if err = json.Unmarshal(encoded, &preserved); err != nil {
++		return snapshot, err
++	}
++	// These are the only snapshot fields that a synchronous ownership change
++	// may alter. Goal/run/queue/resume flags and all identity bindings remain.
++	for _, name := range []string{"revision", "writer", "event_sequence", "updated_at"} {
++		delete(preserved, name)
++	}
++	snapshot.Preserved = Digest(Bytes(preserved))
++	return snapshot, nil
++}
++
++func typedRuntimeFixtureAttachSnapshot(doc *SchemaDoc, env *Envelope, reply *Response) (typedRuntimeFixtureSnapshot, error) {
++	var empty typedRuntimeFixtureSnapshot
++	if env == nil || reply == nil || deref(env.CommandID) == "" ||
++		deref(env.Method) != "session.attach" || deref(reply.Status) != "COMPLETED" ||
++		deref(reply.Method) != "session.attach" || deref(reply.ProtocolVersion) != ProtocolV2 ||
++		deref(reply.CommandID) != deref(env.CommandID) || deref(reply.SessionID) != deref(env.SessionID) ||
++		reply.ErrorCode != nil || reply.Error != nil || reply.Revision == nil || *reply.Revision < 1 {
++		return empty, fmt.Errorf("attach original terminal identity mismatch")
++	}
++	if doc == nil {
++		return empty, fmt.Errorf("attach result schema required")
++	}
++	if err := ValidateResultAgainstMethod("session.attach", reply, doc); err != nil {
++		return empty, err
++	}
++	acquired, ok := reply.Result["write_owner_acquired"].(bool)
++	if !ok || !acquired {
++		return empty, fmt.Errorf("attach has no completed write ownership")
++	}
++	raw, ok := reply.Result["snapshot"].(map[string]any)
++	if !ok {
++		return empty, fmt.Errorf("attach snapshot missing")
++	}
++	snapshot, err := typedRuntimeFixtureSnapshotBinding(doc, raw)
++	if err != nil {
++		return empty, err
++	}
++	if snapshot.ProjectID != deref(env.ProjectID) || snapshot.SessionID != deref(env.SessionID) ||
++		snapshot.Revision != *reply.Revision || snapshot.Writer == nil ||
++		snapshot.Writer.ClientID != deref(env.ClientID) {
++		return empty, fmt.Errorf("attach snapshot differs from original command")
++	}
++	return snapshot, nil
++}
++
++// This fixture is for ordinary (not restored) synchronous attach. It neither
++// manufactures settlement nor converts an ACK/read-only response to completion.
++func typedRuntimeFixtureAttachTransition(before, after typedRuntimeFixtureSnapshot, client string, started, finished time.Time) (bool, error) {
++	if before.Writer == nil || after.Writer == nil || client == "" || finished.Before(started) ||
++		before.ProjectID != after.ProjectID || before.SessionID != after.SessionID ||
++		before.WorkspaceRef != after.WorkspaceRef || before.ModelConfigRef != after.ModelConfigRef ||
++		before.NativeSessionRef != after.NativeSessionRef || before.CoreBuildID != after.CoreBuildID ||
++		before.ProtocolVersion != ProtocolV2 || after.ProtocolVersion != ProtocolV2 ||
++		before.Revision < 1 || after.Revision < 1 || before.Writer.Epoch < 1 || after.Writer.Epoch < 1 ||
++		before.EventSequence < 0 || after.EventSequence < 0 || before.Preserved == "" || before.Preserved != after.Preserved ||
++		after.Writer.ClientID != client {
++		return false, fmt.Errorf("attach changed fixture identity or protected snapshot state")
++	}
++	oldExpiry, oldErr := time.Parse(time.RFC3339Nano, before.Writer.ExpiresAt)
++	newExpiry, newErr := time.Parse(time.RFC3339Nano, after.Writer.ExpiresAt)
++	if oldErr != nil || newErr != nil || !newExpiry.After(finished) {
++		return false, fmt.Errorf("attach writer lease is not valid")
++	}
++	if after.Writer.Epoch == before.Writer.Epoch {
++		if before.Writer.ClientID != client || !started.Before(oldExpiry) ||
++			after.Revision != before.Revision || after.EventSequence != before.EventSequence {
++			return false, fmt.Errorf("lease renewal changed generation or used an expired owner")
++		}
++		return false, nil
++	}
++	if after.Writer.Epoch-before.Writer.Epoch != 1 || after.Revision-before.Revision != 2 ||
++		after.EventSequence-before.EventSequence != 1 ||
++		(before.Writer.ClientID == client && finished.Before(oldExpiry)) {
++		return false, fmt.Errorf("attach did not perform one permitted synchronous transfer")
++	}
++	return true, nil
++}
++
++func typedRuntimeFixtureReadSnapshot(t *testing.T, f *fixture, service *ClientService, session, client string) (*Response, typedRuntimeFixtureSnapshot) {
+ 	t.Helper()
+-	if created.SessionID == nil || created.Revision == nil {
++	reply := muClientCall(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()),
++		ClientID: &client, ProjectID: &f.project, SessionID: &session, Method: strptr("session.get"), Payload: Bytes(Object{})})
++	snapshot, err := typedRuntimeFixtureSnapshotBinding(service.Doc, reply.Result)
++	if err != nil || snapshot.ProjectID != f.project || snapshot.SessionID != session ||
++		reply.Revision == nil || *reply.Revision != snapshot.Revision {
++		t.Fatalf("typed fixture public snapshot mismatch: %v", err)
++	}
++	return reply, snapshot
++}
++
++func typedRuntimeFixtureReadAttachEvents(t *testing.T, f *fixture, service *ClientService, session, client string, after int64) (*Response, ClientEventPage) {
++	t.Helper()
++	reply := muClientCall(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()),
++		ClientID: &client, ProjectID: &f.project, SessionID: &session, Method: strptr("session.events"),
++		Payload: Bytes(Object{"after_sequence": after, "limit": 2})})
++	var page ClientEventPage
++	if err := json.Unmarshal(Bytes(reply.Result), &page); err != nil {
++		t.Fatal(err)
++	}
++	return reply, page
++}
++
++func attachTypedRuntimeFixture(t *testing.T, f *fixture, service *ClientService, created *Response, client string) typedRuntimeFixtureBinding {
++	t.Helper()
++	if created == nil || created.SessionID == nil || created.Revision == nil ||
++		deref(created.Status) != "COMPLETED" || deref(created.Method) != "session.create" {
+ 		t.Fatal("typed fixture creation lacks Session identity")
+ 	}
+-	reply := muClientCall(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: created.SessionID, ExpectedRevision: created.Revision, Method: strptr("session.attach"), Payload: Bytes(Object{"after_sequence": 0, "request_write_owner": true})})
+-	if reply.SessionID == nil || *reply.SessionID != *created.SessionID || reply.Revision == nil || *reply.Revision != *created.Revision {
+-		t.Fatal("same-owner attach changed typed fixture Session or revision")
+-	}
+-}
+-
++	creation, err := typedRuntimeFixtureSnapshotBinding(service.Doc, created.Result)
++	if err != nil || creation.ProjectID != f.project || creation.SessionID != deref(created.SessionID) || creation.Revision != *created.Revision {
++		t.Fatalf("typed fixture creation binding invalid: %v", err)
++	}
++	_, before := typedRuntimeFixtureReadSnapshot(t, f, service, creation.SessionID, client)
++	if before.WorkspaceRef != creation.WorkspaceRef || before.ModelConfigRef != creation.ModelConfigRef ||
++		before.NativeSessionRef != creation.NativeSessionRef || before.CoreBuildID != creation.CoreBuildID {
++		t.Fatal("typed fixture creation bindings changed before attach")
++	}
++	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client,
++		ProjectID: &f.project, SessionID: created.SessionID, ExpectedRevision: revPtr(before.Revision),
++		Method: strptr("session.attach"), Payload: Bytes(Object{"after_sequence": before.EventSequence, "request_write_owner": true})}
++	started := time.Now().UTC()
++	reply := muClientCall(t, f, service, env)
++	finished := time.Now().UTC()
++	after, err := typedRuntimeFixtureAttachSnapshot(service.Doc, env, reply)
++	if err != nil {
++		t.Fatal(err)
++	}
++	transferred, err := typedRuntimeFixtureAttachTransition(before, after, client, started, finished)
++	if err != nil {
++		t.Fatal(err)
++	}
++	current, currentBinding := typedRuntimeFixtureReadSnapshot(t, f, service, after.SessionID, client)
++	if !bytes.Equal(Bytes(reply.Result["snapshot"]), Bytes(current.Result)) ||
++		currentBinding.Revision != after.Revision || currentBinding.Writer == nil || *currentBinding.Writer != *after.Writer {
++		t.Fatal("attach terminal differs from actual public Session state")
++	}
++	eventsReply, page := typedRuntimeFixtureReadAttachEvents(t, f, service, after.SessionID, client, before.EventSequence)
++	if page.HasMore || page.HighWatermark != after.EventSequence || page.NextSequence != after.EventSequence {
++		t.Fatal("attach public journal cursor differs from terminal")
++	}
++	if !transferred {
++		if len(page.Events) != 0 {
++			t.Fatal("lease-only renewal emitted a handoff")
++		}
++	} else {
++		if len(page.Events) != 1 {
++			t.Fatal("writer transfer lacks its unique committed CLIENT_HANDOFF")
++		}
++		event := page.Events[0]
++		if deref(event.Kind) != "CLIENT_HANDOFF" || deref(event.CommandID) != deref(env.CommandID) ||
++			deref(event.SessionID) != after.SessionID || deref(event.RunID) != deref(after.RunID) ||
++			deref(event.ProtocolVersion) != ProtocolV2 || event.Sequence == nil || *event.Sequence != after.EventSequence {
++			t.Fatal("handoff event differs from the exact attach command")
++		}
++		var payload struct {
++			PreviousClientID string `json:"previous_client_id"`
++			TargetClientID string `json:"target_client_id"`
++			PreviousEpoch int64 `json:"previous_epoch"`
++			Writer *typedRuntimeFixtureWriter `json:"writer"`
++			EffectiveAt string `json:"effective_at"`
++		}
++		decoder := json.NewDecoder(bytes.NewReader(event.Payload))
++		decoder.DisallowUnknownFields()
++		if err := decoder.Decode(&payload); err != nil {
++			t.Fatal(err)
++		}
++		var trailing any
++		if err := decoder.Decode(&trailing); err != io.EOF {
++			t.Fatal("handoff payload contains trailing data")
++		}
++		effective, parseErr := time.Parse(time.RFC3339Nano, payload.EffectiveAt)
++		if parseErr != nil || effective.Before(started) || effective.After(finished) ||
++			payload.PreviousClientID != before.Writer.ClientID || payload.PreviousEpoch != before.Writer.Epoch ||
++			payload.TargetClientID != client || payload.Writer == nil || *payload.Writer != *after.Writer {
++			t.Fatal("handoff payload differs from actual writer transition")
++		}
++	}
++	again, replay := handlerCommand(t, f, service, env)
++	if !replay || !bytes.Equal(Bytes(reply), Bytes(again)) {
++		t.Fatal("attach original command did not replay its exact terminal")
++	}
++	postReplay, _ := typedRuntimeFixtureReadSnapshot(t, f, service, after.SessionID, client)
++	replayedEvents, _ := typedRuntimeFixtureReadAttachEvents(t, f, service, after.SessionID, client, before.EventSequence)
++	if !bytes.Equal(Bytes(current.Result), Bytes(postReplay.Result)) || !bytes.Equal(Bytes(eventsReply.Result), Bytes(replayedEvents.Result)) {
++		t.Fatal("attach replay repeated a lease write or journal transfer")
++	}
++	return typedRuntimeFixtureBinding{ProjectID: after.ProjectID, SessionID: after.SessionID,
++		OwnerClientID: after.Writer.ClientID, LeaseExpiresAt: after.Writer.ExpiresAt,
++		WorkspaceRef: after.WorkspaceRef, ModelConfigRef: after.ModelConfigRef, NativeSessionRef: after.NativeSessionRef,
++		Revision: after.Revision, WriterEpoch: after.Writer.Epoch}
++}
++
++// These additional fixture checks use ordinary typed transaction fixtures or
++// pure binding tuples. They grant no native or restored-positive authority.
++func TestTypedRuntimeFixtureAttachRejectsAlteredTerminal(t *testing.T) {
++	f := contextFixture(t)
++	client := "typed-binding-client"
++	service, sid, _ := handlerTypedSession(t, f, client)
++	_, before := typedRuntimeFixtureReadSnapshot(t, f, service, sid, client)
++	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client,
++		ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(before.Revision),
++		Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": before.EventSequence})}
++	started := time.Now().UTC()
++	real := muClientCall(t, f, service, env)
++	finished := time.Now().UTC()
++	binding, err := typedRuntimeFixtureAttachSnapshot(service.Doc, env, real)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if transfer, err := typedRuntimeFixtureAttachTransition(before, binding, client, started, finished); err != nil || transfer {
++		t.Fatalf("ordinary actual lease renewal rejected: transfer=%v err=%v", transfer, err)
++	}
++	for _, mode := range []string{"ack", "readonly", "wrong-command", "wrong-method", "wrong-project", "wrong-session",
++		"wrong-owner", "wrong-revision", "unknown-result", "unknown-snapshot", "invalid-lease", "expired-lease",
++		"wrong-native", "wrong-workspace", "wrong-model", "epoch-jump", "missing-writer"} {
++		t.Run(mode, func(t *testing.T) {
++			var altered Response
++			if err := json.Unmarshal(Bytes(real), &altered); err != nil { t.Fatal(err) }
++			snapshot := altered.Result["snapshot"].(map[string]any)
++			writer := snapshot["writer"].(map[string]any)
++			switch mode {
++			case "ack": altered.Status = strptr("ACKNOWLEDGED")
++			case "readonly": altered.Result["write_owner_acquired"] = false
++			case "wrong-command": altered.CommandID = strptr(ID())
++			case "wrong-method": altered.Method = strptr("session.get")
++			case "wrong-project": snapshot["project_id"] = ID()
++			case "wrong-session": snapshot["session_id"] = ID()
++			case "wrong-owner": writer["client_id"] = "other-client"
++			case "wrong-revision": altered.Revision = revPtr(*real.Revision + 1)
++			case "unknown-result": altered.Result["unpublished"] = true
++			case "unknown-snapshot": snapshot["unpublished"] = true
++			case "invalid-lease": writer["expires_at"] = "unknown"
++			case "expired-lease": writer["expires_at"] = started.Add(-time.Minute).Format(time.RFC3339Nano)
++			case "wrong-native": snapshot["native_session_ref"] = ID()
++			case "wrong-workspace": snapshot["workspace_ref"] = "other-workspace"
++			case "wrong-model": snapshot["model_config_ref"] = "other-model"
++			case "epoch-jump": writer["epoch"] = before.Writer.Epoch + 2
++			case "missing-writer": snapshot["writer"] = nil
++			}
++			rebound, err := typedRuntimeFixtureAttachSnapshot(service.Doc, env, &altered)
++			if err == nil {
++				_, err = typedRuntimeFixtureAttachTransition(before, rebound, client, started, finished)
++			}
++			if err == nil { t.Fatalf("%s weakened original attach completion or binding", mode) }
++		})
++	}
++}
++
++func TestTypedRuntimeFixtureAttachTransitionUsesExactGeneration(t *testing.T) {
++	now := time.Now().UTC()
++	before := typedRuntimeFixtureSnapshot{ProjectID:"project",SessionID:"session",WorkspaceRef:"workspace",
++		ModelConfigRef:"model",NativeSessionRef:"native",CoreBuildID:"core",ProtocolVersion:ProtocolV2,
++		Revision:int64(9007199254741007),EventSequence:int64(9007199254741013),Preserved:"unchanged-snapshot",
++		Writer:&typedRuntimeFixtureWriter{ClientID:"owner",Epoch:int64(9007199254740993),ExpiresAt:now.Add(time.Hour).Format(time.RFC3339Nano)}}
++	copySnapshot := func(value typedRuntimeFixtureSnapshot) typedRuntimeFixtureSnapshot {
++		writer := *value.Writer
++		value.Writer = &writer
++		return value
++	}
++	renewed := copySnapshot(before)
++	if transferred, err := typedRuntimeFixtureAttachTransition(before, renewed, "owner", now, now); err != nil || transferred {
++		t.Fatalf("exact int64 renewal tuple refused: %v %v", transferred, err)
++	}
++	moved := copySnapshot(before)
++	moved.Writer.ClientID = "new-owner"
++	moved.Writer.Epoch++
++	moved.Revision += 2
++	moved.EventSequence++
++	if transferred, err := typedRuntimeFixtureAttachTransition(before, moved, "new-owner", now, now); err != nil || !transferred {
++		t.Fatalf("one-transfer tuple refused: %v %v", transferred, err)
++	}
++	expired := copySnapshot(before)
++	expired.Writer.ExpiresAt = now.Add(-time.Minute).Format(time.RFC3339Nano)
++	reacquired := copySnapshot(moved)
++	reacquired.Writer.ClientID = "owner"
++	if transferred, err := typedRuntimeFixtureAttachTransition(expired, reacquired, "owner", now, now); err != nil || !transferred {
++		t.Fatalf("expired-owner reacquisition tuple refused: %v %v", transferred, err)
++	}
++	for _, mode := range []string{"stale-revision","stale-epoch","missing-journal","double-generation","same-owner-live-transfer","expired-owner-no-transfer","changed-protected-state"} {
++		t.Run(mode, func(t *testing.T) {
++			old, after, client := copySnapshot(before), copySnapshot(moved), "new-owner"
++			switch mode {
++			case "stale-revision": after.Revision = before.Revision
++			case "stale-epoch": after.Writer.Epoch = before.Writer.Epoch
++			case "missing-journal": after.EventSequence = before.EventSequence
++			case "double-generation": after.Writer.Epoch++
++			case "same-owner-live-transfer": after.Writer.ClientID, client = "owner", "owner"
++			case "expired-owner-no-transfer": old, after, client = copySnapshot(expired), copySnapshot(renewed), "owner"
++			case "changed-protected-state": after.Preserved = "changed-resume-or-queue-state"
++			}
++			if _, err := typedRuntimeFixtureAttachTransition(old, after, client, now, now); err == nil {
++				t.Fatalf("%s accepted a stale or fabricated generation tuple", mode)
++			}
++		})
++	}
++}
++

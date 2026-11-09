@@ -1,0 +1,467 @@
+290: func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
+291: 	if err := validateBackupHostConfiguration(db); err != nil {
+292: 		return err
+293: 	}
+294: 	if err := validateBackupQueue(db); err != nil {
+295: 		return err
+296: 	}
+297: 	if policy != nil && policy.validate != nil {
+298: 		if e := policy.validate(db); e != nil {
+299: 			return e
+300: 		}
+301: 	}
+302: 	var result string
+303: 	if e := db.QueryRow("PRAGMA integrity_check").Scan(&result); e != nil {
+304: 		return e
+305: 	}
+306: 	if result != "ok" {
+307: 		return fmt.Errorf("BACKUP_DB_INTEGRITY")
+308: 	}
+309: 	rows, e := db.Query("PRAGMA foreign_key_check")
+310: 	if e != nil {
+311: 		return e
+312: 	}
+313: 	bad := rows.Next()
+314: 	e = rows.Err()
+315: 	rows.Close()
+316: 	if e != nil {
+317: 		return e
+318: 	}
+319: 	if bad {
+320: 		return fmt.Errorf("BACKUP_DANGLING_REFERENCE")
+321: 	}
+322: 	// Every version, including historical accepted evidence, must retain its bytes.
+323: 	arts, e := backupObjects(db, "SELECT body FROM domain_versions WHERE kind='Artifact'")
+324: 	if e != nil {
+325: 		return e
+326: 	}
+327: 	for _, o := range arts {
+328: 		if o["access_class"] != "PROJECT" {
+329: 			if policy == nil || policy.allowProtected == nil {
+330: 				return fmt.Errorf("PROTECTED_BACKUP_REQUIRES_W17")
+331: 			}
+332: 			if e = policy.allowProtected(db, o); e != nil {
+333: 				return e
+334: 			}
+335: 			continue
+336: 		}
+337: 		var raw []byte
+338: 		var hash string
+339: 		var sealed int
+340: 		if e = db.QueryRow("SELECT bytes,content_hash,sealed FROM uploaded_content WHERE storage_key=? AND project=?", o["storage_key"], o["project_id"]).Scan(&raw, &hash, &sealed); e != nil {
+341: 			return fmt.Errorf("BACKUP_ARTIFACT_MISSING")
+342: 		}
+343: 		if sealed != 1 || Digest(raw) != hash || hash != o["content_hash"] {
+344: 			return fmt.Errorf("BACKUP_ARTIFACT_HASH")
+345: 		}
+346: 	}
+347: 	receipts, e := backupObjects(db, "SELECT body FROM domain_versions WHERE json_type(body,'$.receipt_hash')='text'")
+348: 	if e != nil {
+349: 		return e
+350: 	}
+351: 	for _, o := range receipts {
+352: 		if o["receipt_hash"] != Receipt(o) {
+353: 			return fmt.Errorf("BACKUP_RECEIPT_HASH")
+354: 		}
+355: 	}
+356: 	return nil
+357: }
+358: 
+359: // CreateBackup uses a transactional SQLite snapshot, including WAL commits and
+360: // sealed BLOBs in the same consistency window. Files are derived ONLY from that
+361: // closed snapshot. Publication happens after all hashes and the manifest pass.
+362: func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
+363: 	return s.createBackupPolicy(ctx, destination, key, nil)
+364: }
+365: func (s *Service) createBackupPolicy(ctx context.Context, destination string, key []byte, policy *backupPolicy, sources ...WorkspaceBackupSource) (BackupManifest, error) {
+366: 	m := BackupManifest{Format: backupFormat(policy), ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
+367: 	if policy != nil {
+368: 		m.Purpose = policy.purpose
+369: 	}
+370: 	a, e := backupCipher(key)
+371: 	if e != nil {
+372: 		return m, e
+373: 	}
+374: 	stage, e := backupNewStage(destination)
+375: 	if e != nil {
+376: 		return m, e
+377: 	}
+378: 	defer backupDiscard(stage)
+379: 	plain := filepath.Join(stage, "snapshot.sqlite")
+380: 	if _, e = s.DB.ExecContext(ctx, "VACUUM INTO ?", plain); e != nil {
+381: 		return m, e
+382: 	}
+383: 	m.SnapshotCompleted = Now()
+384: 	db, e := store.Open(plain)
+385: 	if e != nil {
+386: 		return m, e
+387: 	}
+388: 	defer db.Close()
+389: 	if e = backupIntegrityPolicy(db, policy); e != nil {
+390: 		return m, e
+391: 	}
+392: 	if m.Migrations, e = backupMigrations(db); e != nil {
+393: 		return m, e
+394: 	}
+395: 	if m.SchemaHash, e = backupSchema(db); e != nil {
+396: 		return m, e
+397: 	}
+398: 	if m.Runtime, e = backupRuntime(db); e != nil {
+399: 		return m, e
+400: 	}
+401: 	if m.Inventory, e = backupInventory(db); e != nil {
+402: 		return m, e
+403: 	}
+404: 	files := map[string][]byte{}
+405: 	rows, e := db.Query("SELECT storage_key,bytes,content_hash FROM uploaded_content WHERE sealed=1 ORDER BY storage_key")
+406: 	if e != nil {
+407: 		return m, e
+408: 	}
+409: 	for rows.Next() {
+410: 		var k, h string
+411: 		var b []byte
+412: 		if e = rows.Scan(&k, &b, &h); e != nil {
+413: 			rows.Close()
+414: 			return m, e
+415: 		}
+416: 		if Digest(b) != h {
+417: 			rows.Close()
+418: 			return m, fmt.Errorf("BACKUP_CONTENT_HASH")
+419: 		}
+420: 		files["content-"+strings.TrimPrefix(Digest([]byte(k)), "sha256:")+".bin"] = b
+421: 	}
+422: 	e = rows.Err()
+423: 	rows.Close()
+424: 	if e != nil {
+425: 		return m, e
+426: 	}
+427: 	if policy == nil {
+428: 		objects, e := backupPortable(db)
+429: 		if e != nil {
+430: 			return m, e
+431: 		}
+432: 		queue, err := backupQueueState(db)
+433: 		if err != nil {
+434: 			return m, err
+435: 		}
+436: 		if queue != nil {
+437: 			files["command-queue.json"] = Bytes(queue)
+438: 		}
+439: 		files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
+440: 		var source WorkspaceBackupSource
+441: 		if len(sources) != 0 {
+442: 			source = sources[0]
+443: 		}
+444: 		workspaceFiles, count, err := backupWorkspaceFiles(ctx, db, source, destination)
+445: 		if err != nil {
+446: 			return m, err
+447: 		}
+448: 		for name, raw := range workspaceFiles {
+449: 			files[name] = raw
+450: 		}
+451: 		if count != 0 {
+452: 			m.CachePolicy = "SQLite FTS cache included; authorized workspaces encrypted and bounded; external worker/context caches rebuilt from sealed content"
+453: 		}
+454: 	}
+455: 	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
+456: 		return m, e
+457: 	}
+458: 	if e = db.Close(); e != nil {
+459: 		return m, e
+460: 	}
+461: 	files["state.sqlite"], e = os.ReadFile(plain)
+462: 	if e != nil {
+463: 		return m, e
+464: 	}
+465: 	for name, raw := range files {
+466: 		encrypted, e := backupEncrypt(a, m.ID, name, raw)
+467: 		if e != nil {
+468: 			return m, e
+469: 		}
+470: 		if e = backupWrite(filepath.Join(stage, name+".enc"), encrypted); e != nil {
+471: 			return m, e
+472: 		}
+473: 		m.Files = append(m.Files, BackupFile{Name: name, Hash: Digest(raw), Size: len(raw)})
+474: 	}
+475: 	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Name < m.Files[j].Name })
+476: 	m.MAC = backupMAC(m, key)
+477: 	if e = backupWrite(filepath.Join(stage, "manifest.json"), Bytes(m)); e != nil {
+478: 		return m, e
+479: 	}
+480: 	for _, suffix := range []string{"", "-wal", "-shm"} {
+481: 		if e = os.Remove(plain + suffix); e != nil && !os.IsNotExist(e) {
+482: 			return m, e
+483: 		}
+484: 	}
+485: 	if e = ctx.Err(); e != nil {
+486: 		return m, e
+487: 	}
+488: 	if e = os.Rename(stage, destination); e != nil {
+489: 		return m, e
+490: 	}
+491: 	return m, nil
+492: }
+493: 
+OPS_BACKUP ops/backup/main.go
+// backup is a local administrative command; it starts no server or worker.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/internal/domain"
+	hostboundary "researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+	"strconv"
+	"strings"
+)
+
+func main() {
+	if e := run(); e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		os.Exit(1)
+	}
+}
+func run() error {
+	if len(os.Args) < 2 {
+		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+	}
+	command := os.Args[1]
+	f := flag.NewFlagSet(command, flag.ContinueOnError)
+	source := f.String("db", "", "existing source SQLite database")
+	backup := f.String("backup", "", "existing encrypted backup directory")
+	out := f.String("out", "", "new destination (must not exist)")
+	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
+	root := f.String("root", ".", "matching application repository root")
+	asDataRoot := f.Bool("as-data-root", false, "restore an operational data root (researchos.sqlite plus fresh Host bindings)")
+	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
+	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
+    handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+    handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+	if e := f.Parse(os.Args[2:]); e != nil {
+		return e
+	}
+	if f.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments")
+	}
+	if *keyfile == "" {
+		return fmt.Errorf("--key-file required")
+	}
+	if command == "keygen" {
+		key := make([]byte, 32)
+		if _, e := rand.Read(key); e != nil {
+			return e
+		}
+		f, e := os.OpenFile(*keyfile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if e != nil {
+			return e
+		}
+		defer f.Close()
+		if _, e = f.Write(key); e != nil {
+			return e
+		}
+		if e = f.Sync(); e != nil {
+			return e
+		}
+		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
+		return nil
+	}
+	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+		return fmt.Errorf("unknown command")
+	}
+	if *out == "" {
+		return fmt.Errorf("--out required")
+	}
+    if command == "upgrade-prepared-backup" {
+        r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
+            Upgrade: domain.LocalUpgradeOptions{
+                Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+                SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+                TargetProgram: *targetProgram, Plan: *plan,
+            },
+            BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+        })
+        if e != nil { return e }
+        return json.NewEncoder(os.Stdout).Encode(r)
+    }
+	if command == "upgrade-local" {
+		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+			TargetProgram: *targetProgram, Plan: *plan,
+		})
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
+	}
+	keyPath, e := filepath.Abs(*keyfile)
+	if e != nil {
+		return e
+	}
+	for _, dir := range []string{*out, *backup} {
+		if dir == "" {
+			continue
+		}
+		abs, e := filepath.Abs(dir)
+		if e != nil {
+			return e
+		}
+		rel, e := filepath.Rel(abs, keyPath)
+		if e == nil && filepath.IsLocal(rel) {
+			return fmt.Errorf("KEY_MUST_BE_OUTSIDE_BACKUP_AND_RESTORE")
+		}
+	}
+	key, e := os.ReadFile(*keyfile)
+	if e != nil || len(key) != 32 {
+		return fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+	}
+	defer clear(key)
+	contracts, e := domain.LoadContracts(filepath.Join(*root, "spec/v2.0/contracts"))
+	if e != nil {
+		return e
+	}
+	ctx := context.Background()
+	hostConfig := func(db *sql.DB, dataRoot string) hostboundary.Config {
+		return hostboundary.Config{DB: db, Dir: filepath.Join(dataRoot, "host"),
+			ContractsDir:  filepath.Join(*root, "spec", "v2.0", "contracts"),
+			MigrationFile: filepath.Join(*root, "migrations", "sqlite", "0002_domain.sql"),
+			SchemaDir:     filepath.Join(*root, "internal", "api", "contracts")}
+	}
+	if command == "restore" {
+		if *backup == "" {
+			return fmt.Errorf("--backup required")
+		}
+		files, e := filepath.Glob(filepath.Join(*root, "migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql"))
+		if e != nil {
+			return e
+		}
+		versions := []int{}
+		for _, file := range files {
+			v, e := strconv.Atoi(filepath.Base(file)[:4])
+			if e != nil {
+				return e
+			}
+			versions = append(versions, v)
+		}
+		target := func(ctx context.Context, destination string, requests []domain.WorkspaceRestoreRequest) ([]domain.WorkspaceRestorePin, error) {
+			restored, err := store.Open(filepath.Join(destination, "researchos.sqlite"))
+			if err != nil {
+				return nil, err
+			}
+			defer restored.Close()
+			h, err := hostboundary.New(hostConfig(restored, destination))
+			if err != nil {
+				return nil, err
+			}
+			if _, err := h.BootstrapOwner(ctx); err != nil {
+				return nil, err
+			}
+			pins := make([]domain.WorkspaceRestorePin, 0, len(requests))
+			for _, request := range requests {
+				pin, err := h.PinRestoredWorkspace(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				pins = append(pins, pin)
+			}
+			return pins, nil
+		}
+		options := domain.RestoreOptions{Key: key, SupportedMigrations: versions, Contracts: contracts}
+		if *asDataRoot {
+			options.WorkspaceTarget = target
+			options.DatabaseName = "researchos.sqlite"
+		}
+		r, e := domain.RestoreBackup(ctx, *backup, *out, options)
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
+	}
+	if *source == "" {
+		return fmt.Errorf("--db required")
+	}
+	st, e := os.Stat(*source)
+	if e != nil || !st.Mode().IsRegular() {
+		return fmt.Errorf("existing regular source database required")
+	}
+	// Refuse ambiguous URI DSNs; --db is an ordinary local file path.
+	if strings.Contains(*source, "?") {
+		return fmt.Errorf("SQLite URI parameters prohibited")
+	}
+	db, e := store.Open(*source)
+	if e != nil {
+		return e
+	}
+	defer db.Close()
+	s := &domain.Service{DB: db, Contracts: contracts}
+	var active int
+	if e := db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.status')=?`,
+		domain.KindWorkspaceBinding, domain.WorkspaceActive).Scan(&active); e != nil {
+		return e
+	}
+	var m domain.BackupManifest
+	if active == 0 {
+		m, e = s.CreateBackup(ctx, *out, key)
+	} else {
+		h, hostErr := hostboundary.New(hostConfig(db, filepath.Dir(*source)))
+		if hostErr != nil {
+			return hostErr
+		}
+		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+	}
+	if e != nil {
+		return e
+	}
+	return json.NewEncoder(os.Stdout).Encode(m)
+}
+
+CALLERS
+ops/backup\main.go:208:		m, e = s.CreateBackup(ctx, *out, key)
+ops/backup\main.go:214:		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+internal/host\backup_other.go:12:func (h *Host) SnapshotWorkspace(context.Context, domain.WorkspaceBinding, string, domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+internal/host\backup_windows.go:14:// SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+internal/host\backup_windows.go:17:func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+internal/domain\backup.go:362:func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
+internal/domain\backup_workspace.go:46:	SnapshotWorkspace(context.Context, WorkspaceBinding, string, BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error)
+internal/domain\backup_workspace.go:88:func (s *Service) CreateBackupWithWorkspaces(ctx context.Context, destination string, key []byte, source WorkspaceBackupSource) (BackupManifest, error) {
+internal/domain\backup_workspace.go:190:		snapshot, err := source.SnapshotWorkspace(ctx, b, destination, BackupWorkspaceLimits{MaxFiles: remainingFiles, MaxDirs: remainingDirs, MaxBytes: remainingBytes, MaxFileBytes: BackupWorkspaceMaxFileBytes})
+internal/domain\evolution_execution.go:478:	manifest, e := s.CreateBackup(ctx, backupPath, recoveryKey)
+BOOTSTRAP-LOCKS
+ops/backup\main.go:151:			restored, err := store.Open(filepath.Join(destination, "researchos.sqlite"))
+ops/backup\main.go:195:	db, e := store.Open(*source)
+ops/backup\main.go:208:		m, e = s.CreateBackup(ctx, *out, key)
+ops/backup\main.go:214:		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+apps/control\main.go:103:	lease, err := rt.AcquireDataRootLease(dataDir)
+apps/control\main.go:119:	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
+apps/control\main.go:144:		fixture, e := protectedstore.OpenCanary(boot.FixtureStore)
+internal/domain\backup.go:359:// CreateBackup uses a transactional SQLite snapshot, including WAL commits and
+internal/domain\backup.go:362:func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
+internal/domain\backup.go:384:	db, e := store.Open(plain)
+internal/domain\backup.go:618:	db, e := store.Open(filepath.Join(stage, databaseName))
+internal/domain\backup.go:809:		finalDB, openErr := store.Open(filepath.Join(destination, databaseName))
+apps/control\replay_command.go:157:	db, err := store.Open(path)
+internal/domain\backup_configuration_upgrade.go:81:	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+internal/domain\backup_migration.go:14:// This is a read-only domain guard; store.Open may already have selected WAL.
+internal/domain\backup_prepared_abandonment_upgrade.go:318:    db, err := store.Open(filepath.Join(stage, "template.sqlite"))
+internal/domain\backup_prepared_abandonment_upgrade_windows.go:24:    lease, err := runtimeadapter.AcquireDataRootLease(root)
+internal/domain\backup_queue_upgrade.go:73:	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+internal/domain\backup_upgrade.go:195:	db, e := store.Open(path)
+internal/domain\backup_upgrade.go:216:	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+internal/domain\backup_workspace.go:88:func (s *Service) CreateBackupWithWorkspaces(ctx context.Context, destination string, key []byte, source WorkspaceBackupSource) (BackupManifest, error) {
+internal/domain\evolution_control_projection.go:61:		source, err = store.Open(sourcePath)
+internal/domain\evolution_control_projection.go:76:	target, err := store.Open(path)
+internal/domain\evolution_control_projection.go:220:	db, err := store.Open(path)
+internal/domain\evolution_control_projection.go:233:	baseline, err := store.Open(filepath.Join(work, "expected-schema.sqlite"))
+internal/domain\evolution_execution.go:478:	manifest, e := s.CreateBackup(ctx, backupPath, recoveryKey)
+internal/domain\evolution_release_cutover_windows.go:118:	p, e := protectedstore.OpenCanary(privateRoot)
+internal/domain\evolution_release_windows.go:36:	return filepath.Join(releaseStateRoot(h), "backups", operation)
+{"source_input_index": {"path": "execution/v2.4/receipts/W05/W05-99/online_backup_source_resource_map_codex/20261015-current-chat/source-input-index.json", "sha256": "13a43a3c347d335d38ecce2f6f83a5876c66bffeef806ddc710b85ca5616c6d1", "bytes": 11575}, "source_count": 8}

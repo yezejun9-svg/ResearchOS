@@ -1,0 +1,108 @@
+diff --git a/internal/domain/runtime_broker_windows.go b/internal/domain/runtime_broker_windows.go
+index 372f3b23..3614ec24 100644
+--- a/internal/domain/runtime_broker_windows.go
++++ b/internal/domain/runtime_broker_windows.go
+@@ -181,14 +181,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
+ 		}
+ 	}
+ 	if provider.Capability == "MODEL" {
+-		var effective map[string]any
+-		effective, e = runtimepolicy.Effective(dispatch["manifest"].(map[string]any), Str(task, "task_type"))
+-		if e == nil {
+-			_, e = validateRuntimeModelRequest(effective, payload)
+-		}
+-		if e == nil {
+-			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, effective)
+-		}
++		e = validateModelEffectBeforePrepare(tx, route.ProjectID, runID, task, dispatch["manifest"].(map[string]any), frame.Key, payload)
+ 		if e != nil {
+ 			tx.Rollback()
+ 			return nil, e
+@@ -323,6 +316,20 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
+ 	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
+ }
+ 
++// This is the last MODEL authority gate before prepareEffectTx writes the
++// first durable effect. Keeping all three checks together lets a fixture prove
++// that a rejected projection cannot create a reservation or provider request.
++func validateModelEffectBeforePrepare(tx *sql.Tx, project, runID string, task Object, manifest map[string]any, effectKey string, payload Object) error {
++	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
++	if err != nil {
++		return err
++	}
++	if _, err = validateRuntimeModelRequest(effective, payload); err != nil {
++		return err
++	}
++	return runtimeModelCallGate(tx, project, runID, effectKey, effective)
++}
++
+ const runtimeFactMaxBytes = 4*1024*1024 + 128*1024
+ 
+ func writeRuntimeFact(path string, raw []byte) error {
+diff --git a/internal/domain/runtime_drain_windows.go b/internal/domain/runtime_drain_windows.go
+index cfa80b20..70c97d74 100644
+--- a/internal/domain/runtime_drain_windows.go
++++ b/internal/domain/runtime_drain_windows.go
+@@ -224,10 +224,6 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
+ 	if Hash(frozen) != Hash(profile) {
+ 		return bad("profile bytes")
+ 	}
+-	effective, e := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+-	if e != nil {
+-		return bad("qualification projection")
+-	}
+ 	effect, e := latestEffect(tx, project, Str(run, "id"), Str(ledger, "provider_request_id"))
+ 	if e != nil {
+ 		return e
+@@ -239,7 +235,7 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
+ 	if effect["state"] != "CONFIRMED" || effect["project_id"] != project || effect["task_id"] != task["id"] || effect["run_id"] != run["id"] || effect["context_bundle_id"] != run["context_bundle_id"] || Hash(effect["epoch"]) != Hash(run["lease_epoch"]) || request["route"] != config["route"] || receipt["state"] != "CONFIRMED" || receipt["key"] != effect["key"] || receipt["run_id"] != run["id"] || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) || receipt["model_transport"] != true || receipt["actual_cost"] != nil {
+ 		return bad("confirmed effect binding")
+ 	}
+-	if _, e = validateRuntimeModelRequest(effective, payload); e != nil {
++	if e = validateCompletedLocalModelRequest(manifest, task, payload); e != nil {
+ 		return e
+ 	}
+ 	bound := 0
+@@ -331,3 +327,14 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
+ 	}
+ 	return nil
+ }
++
++// Desktop exit checks the same effective request as the live broker before it
++// can classify a fully completed local MODEL liability as safe to leave UNKNOWN.
++func validateCompletedLocalModelRequest(manifest map[string]any, task Object, payload Object) error {
++	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
++	if err != nil {
++		return errors.New("desktop exit requires complete original local MODEL evidence: qualification projection; cost remains unknown")
++	}
++	_, err = validateRuntimeModelRequest(effective, payload)
++	return err
++}
+diff --git a/internal/runtimepolicy/qualification_projection.go b/internal/runtimepolicy/qualification_projection.go
+index 6c2072e9..cfe118b4 100644
+--- a/internal/runtimepolicy/qualification_projection.go
++++ b/internal/runtimepolicy/qualification_projection.go
+@@ -155,6 +155,23 @@ func Prepare(manifest map[string]any, taskType string) error {
+ 	if _, exists := manifest[ProjectionField]; exists {
+ 		return errors.New("projection marker already present")
+ 	}
++	// A native-offline runtime can execute a runtime_qualification Task without
++	// a model. Its verified admission is complete without model_config, so keep
++	// that original dispatch unmarked. Only the Mu backend reaches projection.
++	admission, ok := manifest["admission"].(map[string]any)
++	if !ok {
++		return errors.New("projection admission missing")
++	}
++	profile, ok := admission["profile"].(map[string]any)
++	if !ok {
++		return errors.New("projection profile missing")
++	}
++	if profile["backend"] == "native-offline" && profile["model"] == "none" {
++		return nil
++	}
++	if profile["backend"] != "mu-sdk-broker-v1" {
++		return errors.New("unsupported projection backend")
++	}
+ 	admission, profile, config, permission, err := projectionInput(manifest)
+ 	if err != nil {
+ 		partialAdmission, _ := manifest["admission"].(map[string]any)

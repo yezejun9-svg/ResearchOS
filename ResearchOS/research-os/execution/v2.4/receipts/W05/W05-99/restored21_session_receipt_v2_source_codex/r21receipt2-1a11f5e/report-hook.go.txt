@@ -1,0 +1,27 @@
+
+// Report-only data is separate from the authenticated backup purpose. Old plans
+// leave the hook nil and never enter this fixed-profile publication branch.
+func upgradeRestored21PublishEvidence(policy *backupPolicy, recovery Object) error {
+ if policy == nil || policy.restored21SessionEvidence == nil { return nil }
+ plan, ok := policy.purpose["plan"].(Object)
+ if !ok || policy.format != localUpgradeFormat || plan["id"] != Restored21SessionUpgradePlan {
+  return fmt.Errorf("RESTORE_RESTORED21_REPORT_POLICY_MISMATCH")
+ }
+ evidence := policy.restored21SessionEvidence
+ if recovery == nil || !upgradeQueueFields(evidence,"source_schema_hash session_schema_hash before_rows_hash after_rows_hash numbered_ledger_unchanged old_typed_rows_unchanged client_sessions_created_empty restore_fence_preserved restored_barriers_refreshed external_actions_dispatched") {
+  return fmt.Errorf("RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID")
+ }
+ for _, name := range []string{"source_schema_hash","session_schema_hash","before_rows_hash","after_rows_hash"} {
+  value, ok := evidence[name].(string)
+  if !ok || len(value) != 71 || value[:7] != "sha256:" { return fmt.Errorf("RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID") }
+  for _, c := range value[7:] { if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) { return fmt.Errorf("RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID") } }
+ }
+ for _, name := range []string{"numbered_ledger_unchanged","old_typed_rows_unchanged","client_sessions_created_empty","restore_fence_preserved"} {
+  value, ok := evidence[name].(bool); if !ok || !value { return fmt.Errorf("RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID") }
+ }
+ refreshed, ok := evidence["restored_barriers_refreshed"].(bool)
+ actions, typed := evidence["external_actions_dispatched"].(int)
+ if !ok || refreshed || !typed || actions != 0 { return fmt.Errorf("RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID") }
+ recovery["restored21_session_initialization"] = evidence
+ return nil
+}

@@ -1,0 +1,152 @@
+{
+  "schema": "researchos.mu-m0-v4-independent-review/1",
+  "at": "2026-10-12T15:39:04.538Z",
+  "verdict": "REQUEST_CHANGES",
+  "reviewer": "codex:/root/mu_m0_v2_independent_review",
+  "independent": true,
+  "source_worktree": "C:/Users/yqyyds/.codex/researchos-build-worktrees/mu-pause-checkpoint-m0-v2-20261012",
+  "base_commit": "7ec619a16a932ae02daa7c2e6132d266528a1da8",
+  "source_manifest_sha256": "5cce995763c14174992c265303d3f5962733fab1ada95d9aaa575956d73031ff",
+  "source_patch_sha256": "f03377018fa9f66cf7dae43f50aaf8ff2f54ccc7f03a84e245d070c1c93a73af",
+  "scope_sha256": "b131e121626091719682de3ef452c6616b31efbe4eea60d11617340fe954ad27",
+  "findings": [
+    {
+      "id": "M0-V4-R1",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Checkpoint messages and queue payloads lack the promised typed allowlist",
+      "path": "packages/agent/src/agent.ts",
+      "line": 237,
+      "related_lines": [
+        176,
+        197,
+        240,
+        258,
+        803,
+        807,
+        889,
+        890
+      ],
+      "tests": [
+        "V4-G",
+        "V4-I"
+      ],
+      "actual": "An undeclared extensionState object containing a synthetic refresh token survives export verbatim. restore accepts an invalid thinkingLevel, user content=42, undeclared role and queued message role=42/content=null. No real credential was used.",
+      "impact": "Undeclared sensitive extension data can enter durable checkpoints, and malformed nested data is accepted into Agent state instead of rejecting before work.",
+      "cause": "Root/runtime/continuation key allowlists coexist with a recursive field-name denylist and role-string-only message checks; queue payload validation checks only truthiness and thinkingLevel is assigned without enum validation.",
+      "suggestion": "Implement one versioned, recursively typed checkpoint DTO with explicit extension data registration; validate all transcript/runtime/prepared/pending/queue locations plus enums before export/restore. Preserve valid SDK custom messages using trusted schemas, and reject undeclared necessary data rather than silently stripping it.",
+      "evidence": "boundary.stdout.txt"
+    },
+    {
+      "id": "M0-V4-R2",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Model identity is not revalidated between restore and actual resume dispatch",
+      "path": "packages/agent/src/agent.ts",
+      "line": 1138,
+      "related_lines": [
+        1117,
+        1131,
+        1140,
+        1154
+      ],
+      "tests": [
+        "V4-F",
+        "V4-F-control"
+      ],
+      "actual": "Changing the registered selected model baseUrl before restore is rejected, but making the identical change after successful restore permits a mock provider dispatch with the changed URL. restore itself has zero dispatches.",
+      "impact": "A restored run can use model/provider configuration that no longer matches its checkpoint binding; a later binding or checkpoint error would be too late to prevent that request.",
+      "cause": "restore stores a reference to the mutable registered Model; resumeRuntime checks config and tools but returns activePauseRuntime.model without verifying its recorded model binding.",
+      "suggestion": "Retain the immutable selected model binding; resolve/verify it at resume and immediately before each restored-flow provider dispatch, including after preparation hooks. Freeze or copy trusted descriptors as appropriate; never reconstruct secrets/headers from checkpoint data.",
+      "evidence": "boundary.stdout.txt; boundary-controls.stdout.txt"
+    },
+    {
+      "id": "M0-V4-R3",
+      "priority": "P2",
+      "severity": "must_fix",
+      "title": "Prepared request rejects a legitimate tool selected from pauseToolRegistry",
+      "path": "packages/agent/src/agent.ts",
+      "line": 823,
+      "related_lines": [
+        158,
+        1058,
+        1066,
+        1129
+      ],
+      "tests": [
+        "V4-E",
+        "V4-E-corrected-control"
+      ],
+      "actual": "A tool registered only in pauseToolRegistry is selected by prepareRequest. The prepared-request checkpoint exports successfully with root toolNames=[] and runtime toolNames=[registered_only], but restore throws Agent pause request continuation is invalid. The corrected no-pause control executes that tool exactly once.",
+      "impact": "The new documented registry option produces checkpoints that cannot be restored at a supported pause boundary even though the same run works without pause.",
+      "cause": "Request-stage validation requires every continuation tool name to occur in state.toolNames, despite resolvePauseTools correctly supporting state.tools plus pauseToolRegistry.",
+      "suggestion": "Validate continuation against the original effective runtime subset and trusted full registry rather than against only public state.tools. Keep exact signature/version verification and duplicate/unknown rejection.",
+      "evidence": "boundary.stdout.txt; boundary-registered-control.stdout.txt"
+    }
+  ],
+  "verification": {
+    "author_freeze_source9": true,
+    "author_bundles_verified": 9,
+    "author_compilation_inputs_verified": 2128,
+    "independent_compiled_inputs": 2130,
+    "independent_source_resolution": "pi-agent-core aliases to C candidate source; installed D SDK never used as agent-core",
+    "candidate": "41/41 PASS",
+    "original_agent": "40/40 PASS",
+    "worker": "2/2 PASS",
+    "targeted_tsgo": 0,
+    "new_boundary_suite": {
+      "tests": 5,
+      "pass": 1,
+      "fail": 4,
+      "passing_matrix_cases": 17
+    },
+    "boundary_controls": {
+      "original": "2 PASS plus 1 harness failure",
+      "corrected_registered_tool_control": "1/1 PASS"
+    },
+    "prior_v3_findings": "original model/context and restricted-tool-subset counterexamples now PASS",
+    "source_unchanged": true,
+    "frozen_v3_source9_unchanged": true
+  },
+  "harness_accounting": [
+    {
+      "issue": "Initial prepare used .meta.json instead of the actual .metafile.json filename; corrected before tests. No source finding."
+    },
+    {
+      "issue": "Initial PowerShell fixture creation had an extra parenthesis and wrote nothing; corrected before tests. No source finding."
+    },
+    {
+      "issue": "First no-pause registered-tool control assumed provider Context.tools, but this SDK conveys declarations differently; preserved failure raw. Separate corrected control proves actual tool execution once. Not a source finding.",
+      "raw": "boundary-controls.stdout.txt",
+      "corrected": "boundary-registered-control.stdout.txt"
+    },
+    {
+      "issue": "First boundary census filename was reused by control compile; final union reconstructed from every retained esbuild metafile and compared with retained primary compile hashes plus source freeze. Original bundles/tests/raw remain unchanged."
+    }
+  ],
+  "repair_contract": {
+    "path": "state-contract-v4-addendum.md",
+    "sha256": "4f66a101e65b17be2ce6a4b3238fdbe0e39ed0b57b91a93b5138c64360229a7b"
+  },
+  "prior_review": {
+    "path": "C:/Users/yqyyds/.codex/researchos-build-worktrees/mu-m0-v3-independent-review-20261012/report.json",
+    "sha256": "a7f62fb1839a29bab524649004f4de41bd6a05c4427ad49e0873c579a9dcff4b",
+    "old_raw_preserved": true
+  },
+  "limits": {
+    "source_modified": false,
+    "root_canon_modified": false,
+    "installed_sdk_modified": false,
+    "actual_model_calls": 0,
+    "external_tool_calls": 0,
+    "network_calls": 0,
+    "sqlite_access": false,
+    "real_credentials": 0,
+    "fixtures": "synthetic only; no sensitive placeholder values reproduced in report",
+    "formal_increment": 0,
+    "parent_acceptance": false,
+    "all_22_obligations": "OPEN",
+    "formal_cases": "0/42"
+  },
+  "formal_mirror_requested": "execution/v2.4/receipts/W12/W12-02/mu_m0_v4_independent_review_codex/20261012-current-chat (Root may mirror small report/manifest/seal/addendum; full raw and build remain C)"
+}

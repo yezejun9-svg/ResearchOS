@@ -1,0 +1,50 @@
+package domain
+
+import (
+ "context"
+ "encoding/json"
+ "io"
+ "net/http/httptest"
+ "testing"
+ "time"
+)
+
+func TestVerifierIntegerOverflow(t *testing.T) {
+ f:=setup(t); f.createProject()
+ p:=Principal{ID:"verifier-overflow-executor",Roles:[]string{"EXECUTOR"},Grants:[]Grant{{ProjectID:f.project}}}
+ if e:=f.s.ProvisionPrincipal(context.Background(),p);e!=nil{t.Fatal(e)}
+ token,e:=f.s.IssueCredential(context.Background(),p.ID,time.Minute);if e!=nil{t.Fatal(e)};f.token=token
+ upload:=f.expect(201,"POST",f.path("/content"),ID(),"",[]byte{})
+ body:=Object{"run_id":nil,"kind":"REPORT","evidence_kind":"GENERATED","measurement_mode":"FIXTURE","content_hash":upload["content_hash"],"storage_key":upload["storage_key"],"media_type":"text/plain","byte_size":json.Number("1e21"),"input_refs":Empty(),"source_refs":Empty(),"produced_by":p.ID,"access_class":"PROJECT"}
+ before:=f.stateTag()
+ status,_,_:=f.request("POST",f.path("/artifacts"),ID(),before,body)
+ if status!=400{t.Fatalf("overflow status=%d, want400",status)}
+ var count int
+ if e:=f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE kind='Artifact'").Scan(&count);e!=nil{t.Fatal(e)}
+ if count!=0||f.stateTag()!=before{t.Fatal("rejected overflow left persistent changes")}
+}
+
+func TestVerifierCursorQuery(t *testing.T) {
+ f:=setup(t);f.createProject();f.requirement()
+ page:=f.expect(200,"GET",f.path("/events?limit=1&after_sequence=0"),"","",nil)
+ cursor:=Str(page,"next_cursor");if cursor==""{t.Fatal("missing cursor")}
+ for _,query:=range []string{"after_sequence=100&limit=1","after_sequence=0&limit=2"}{
+  status,_,_:=f.request("GET",f.path("/events?"+query+"&cursor="+cursor),"","",nil)
+  if status!=400{t.Fatalf("changed query accepted: %s status%d",query,status)}
+ }
+ f.expect(200,"GET",f.path("/events?after_sequence=0&limit=1&cursor="+cursor),"","",nil)
+}
+
+type verifierWaitBody struct{started,release chan struct{}}
+func(b *verifierWaitBody)Read(p []byte)(int,error){close(b.started);<-b.release;return 0,io.EOF}
+func(b *verifierWaitBody)Close()error{return nil}
+func TestVerifierSlowBody(t *testing.T) {
+ f:=setup(t);f.createProject();body:=&verifierWaitBody{make(chan struct{}),make(chan struct{})}
+ first:=httptest.NewRequest("GET",f.path("/state"),nil);first.Body=body;first.Header.Set("Authorization","Bearer "+f.token)
+ done:=make(chan struct{});go func(){defer close(done);f.h.ServeHTTP(httptest.NewRecorder(),first)}()
+ <-body.started;defer func(){close(body.release);<-done}()
+ ctx,cancel:=context.WithTimeout(context.Background(),150*time.Millisecond);defer cancel()
+ second:=httptest.NewRequest("GET",f.path("/state"),nil).WithContext(ctx);second.Header.Set("Authorization","Bearer "+f.token)
+ w:=httptest.NewRecorder();f.h.ServeHTTP(w,second)
+ if w.Code!=200{t.Fatalf("slow body blocked DB read: status%d",w.Code)}
+}

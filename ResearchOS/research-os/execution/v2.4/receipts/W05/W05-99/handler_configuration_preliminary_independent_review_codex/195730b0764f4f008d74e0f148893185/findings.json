@@ -1,0 +1,101 @@
+{
+  "schema": "researchos.handler.preliminary-independent-static-findings.v1",
+  "reviewer": "codex:/root/command_queue_impl",
+  "implementation_author": "codex:/root/sources_parent_impl",
+  "verdict": "PRELIMINARY_FINDINGS_REQUIRING_AUTHOR_RESPONSE_NOT_FINAL_SOURCE_ACCEPTANCE",
+  "basis": {
+    "path": "input.before.json",
+    "sha256": "aaf69751b86ce645617831e792d49b9234d4e43e6cf6cbe381c7aa4754718526",
+    "bytes": 18746
+  },
+  "findings": [
+    {
+      "id": "P1-01",
+      "priority": "P1",
+      "title": "合法未送入 SDK 的 CANCEL_FENCE 队列终态被配置收敛检查永久拒绝",
+      "status": "STATIC_CONFIRMED_BRANCH_MISMATCH_NOT_EXECUTED",
+      "location": {
+        "path": "internal/domain/client_protocol_configuration.go",
+        "lines": [
+          1094,
+          1107
+        ]
+      },
+      "source_sha256": "2139047fe178c93cd96061ff5182724616ae84ef4094230a9f3a30c42101f933",
+      "cause": "configurationSettled requires every DROPPED last receipt kind to be command.cleared. The existing fenceClientTask producer changes ENQUEUED to DROPPED and records CANCEL_FENCE, without delivery to the SDK. That original cancellation can already complete in the same initial transaction for noRun Tasks, so no later SDK cleared receipt will replace it.",
+      "impact": "A settled Session with a legitimately cancelled never-delivered queued message remains SESSION_BUSY for scoped host.configure, despite confirmed control/noRun cancellation.",
+      "existing_causal_entry": "TestClientQueueRestoredNoRunCannotHideUnknownWithNewTurn lines173-184 already constructs STEER then noRun CANCEL COMPLETED; its later deliberate UNKNOWN mutation is outside the proposed new rebind positive.",
+      "minimal_fix_direction": "Recognize the exact original ENQUEUED→DROPPED CANCEL_FENCE producer proof with actual project/generation/command/body/chain and cancellation facts. Retain strict command.cleared proof for SDK delivery paths; do not allow arbitrary DROPPED or merely receipt kind/hash flags.",
+      "needed_validation": [
+        "Actual original noRun/ENQUEUED cancel completes then settled scoped configure succeeds with original refs preserved",
+        "Forged/wrong transition, other generation or command, missing control/receipt, unresolved SDK/UNKNOWN state still rejects",
+        "Real SDK-cleared branch stays strict"
+      ],
+      "executed_cases": 0
+    },
+    {
+      "id": "P1-02",
+      "priority": "P1",
+      "title": "删除新命令原始请求 header 可落入旧协议分支",
+      "status": "STATIC_CONTROL_FLOW_CONTRADICTION_NOT_EXECUTED",
+      "location": {
+        "path": "internal/domain/client_command_identity.go",
+        "lines": [
+          186,
+          196
+        ]
+      },
+      "secondary_locations": [
+        {
+          "path": "internal/domain/client_command_identity.go",
+          "lines": [
+            233,
+            253
+          ]
+        },
+        {
+          "path": "internal/domain/backup_host_configuration.go",
+          "lines": [
+            239,
+            260
+          ]
+        }
+      ],
+      "cause": "Empty/{} or a JSON object lacking all three private header keys returns known=false. lookup still decodes against the retry request even when the global identity exists; backup skips the full original-envelope checks on the same condition. No independent positive legacy classification is consulted in these branches.",
+      "impact": "A new successful session.create or host.status journal with retained legitimate identity/response/Session facts can have its original header removed and take the legacy branch. Static checks do not reject this loss of mandatory new original bytes. This contradicts the registered requirement that removing a new header never creates an exemption. No actual corrupted DB or backup was run here.",
+      "test_gap": "TestHandlerRejectedOriginalProofBackupTampering remove-original uses a REJECTED unknown Session. Its absence causes the non-known branch Session-existence guard to reject, which does not establish rejection for a successful command with an existing Session or null host scope.",
+      "minimal_fix_direction": "Require positive, immutable causal evidence distinguishing supported old headerless journal records from new records. Do not globally classify every identity as new: foundation already supports old journals/global identity, and historical compatibility must remain explicit. If the existing fields cannot distinguish them, report a precise scope/design prerequisite instead of inferring legacy from missing header or using mutable latest head/time.",
+      "needed_validation": [
+        "Successful new session.create and host.status header-only removal is rejected by replay and typed backup for missing new original proof",
+        "Unrelated-header/all-three-key removal variants cannot downgrade new records",
+        "Genuine preexisting headerless history retains exact replay/backup, with no reserve/backfill and explicit causal qualification",
+        "Original full header/raw bytes remain unchanged on semantic-equivalent replay"
+      ],
+      "executed_cases": 0
+    },
+    {
+      "id": "P2-03",
+      "priority": "P2",
+      "title": "域层 TLS 夹具会把父进程环境误认为独立子进程",
+      "status": "STATIC_TEST_ISOLATION_GAP_NOT_EXECUTED",
+      "location": {
+        "path": "internal/domain/runtime_configuration_binding_windows_test.go",
+        "lines": [
+          138,
+          163
+        ]
+      },
+      "cause": "The test only checks strings.Contains(GODEBUG,\"x509usefallbackroots=1\") before deciding whether to launch an exact-case child. A full parent suite inheriting that setting runs this test inline and installs process-wide fallback roots. The substring also does not prove the exact effective environment setting.",
+      "impact": "The r291 mandatory exact-case isolated-process fixture boundary is not enforced for that valid parent environment; test order/global roots can affect other tests. This is a test isolation finding, not an observed production TLS bypass.",
+      "minimal_fix_direction": "Use an explicit exact-test child sentinel as the CLI queueCLIExactTLSChild helper does, preserve other GODEBUG entries, and validate the effective desired entry before installing roots.",
+      "needed_validation": [
+        "Parent with preexisting x509usefallbackroots=1 still launches its own exact-case child",
+        "Parent unrelated GODEBUG entries preserved; child case/sentinel exact",
+        "No external requests or truststore edits; original hostname/certificate negative checks retained"
+      ],
+      "executed_cases": 0
+    }
+  ],
+  "no_product_test_execution": true,
+  "independence_boundary": "Reviewer did not author this handler diff. Reviewer did author the earlier foundation5; this review does not independently certify that foundation or final composed release."
+}

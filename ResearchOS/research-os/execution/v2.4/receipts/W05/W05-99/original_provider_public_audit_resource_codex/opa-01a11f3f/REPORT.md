@@ -1,0 +1,59 @@
+# 原 OpenCode Go 请求与计费审计：公开资源核查
+
+结论：公开资料可以定位后续只读入口，**不能凭这些入口和旧 console 源码证明原 300 秒试跑的请求与成本全覆盖**。原 trial 的 provider_requests / actual_cost 继续为 NULL，financial OPEN。没有执行账户查询、模型调用、试跑、账务变更或原 DataRoot 读取。
+
+本轮固定官方仓库 anomalyco/opencode 提交 **388406238bd5ca15564a762840a2362c3a45bd9c**（GitHub 公共 ref API HTTP 200），只取有限小文件。源码是该提交的公开实现证据，不是原账户部署版本或请求发生时版本证明。原试跑范围沿用已封存独立审查：2026-10-08T16:56:27.158744Z 至 17:01:27.158744Z；本轮未打开其数据库或凭据。输入引用见 input-pins.json。
+
+## 已证实入口及限度
+
+| 入口 | 公开实现证实 | 对原 trial 的限度 |
+|---|---|---|
+| GET /zen/go/v1/usage | legacy 分支以 Bearer key 找 workspace/user，返回 rolling / weekly / monthly 的 status、percent、resetsAt；没有 request 列表、token 明细、余额或逐笔货币成本 | 当前滚动窗口不能重建历史单请求；不能证明请求数量为零 |
+| /workspace/{id}/usage 的 usage.list server function | getUsageInfo -> withActor -> Billing.usages(page,50)，按 timeCreated DESC，offset 分页；显示时间、model、tokens、cost、session 后8位 | 只列已入 UsageTable 的用量；无稳定快照游标/总数/时间过滤；翻页完整也不是所有请求完整 |
+| /workspace/{id}/billing 的 billing.get | withActor -> Billing.get 获取 workspace billing balance、monthlyUsage、subscription/lite.useBalance 等；金额按 1e8 单位折算显示 | 余额当前值不等于某次 trial 净扣费；禁止通过开启 Use balance、充值或改配置补证 |
+| payment.list | Billing.payments 按时间降序，最多100条 PaymentTable 记录 | 充值/订阅/退款记录与模型逐请求费用不是同一账；超过100条的历史覆盖未由本入口保证 |
+
+源码：[usage API](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/app/src/routes/zen/go/v1/usage.ts#L11-L160)、[usage UI](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/app/src/routes/workspace/%5Bid%5D/usage/usage-section.tsx#L11-L70)、[Billing 查询](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/core/src/billing.ts#L35-L65)、[billing.get 投影](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/app/src/routes/workspace/common.tsx#L96-L125)。这些是 SolidStart server functions 的源码标识，不应猜测或硬编码为公开 REST URL。页面内请求的实际 URL/方法应由 Root 后续同登录浏览器观察；本轮未调用。
+
+## 为什么 usage 不能替代 request audit
+
+[UsageTable](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/core/src/schema/billing.sql.ts#L114-L137) 有 workspace/id/timestamps、model、provider、input/output/reasoning/cache tokens、cost、keyID、sessionID 和 enrichment.plan/costMultiplier。没有显式 provider request ID、HTTP status、错误/取消/超时状态、完成时间、idempotency key、逐笔币种、扣款/退款交易关联或最终结算状态。生成的 usage id 不是上游 request id。
+
+[handler](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/app/src/routes/zen/util/handler.ts) 127–136 读取 session/request/User-Agent 做日志指标；325–333、379–400 只有取得 usage 时才 trackUsage；1126–1146 写 UsageTable 时不写 request ID，sessionID 截断为前30字符，页面又只显示其后8字符。因此：
+- 一条 usage 可以提供一次已计量操作的正面证据，但不能简单等同于唯一一次上游 attempt（路由/重试语义未核验）。
+- 没有 usage row 不能排除曾发出的错误、超时、无 usage 响应或未落账请求。
+- 后台日志指标的存在，不等于原账户可读取该日志，更不证明日志保留期限或完整性。
+
+同文件1067–1068 的响应 cost 仅 balance 来源按金额返回，其余来源返回字符串0；UsageTable 仍可保存用于额度计算的 cost，lite 还包含 costMultiplier。故 subscription/Go 包含用量、额度消耗、现金增量扣款必须分别保留；不能把 cost=0 解读成没有请求，也不能直接把 usage.cost 当现金扣费。原始响应未在本轮获取。
+
+## 必须保留的迁移不确定性
+
+usage API 在 legacy 查询前调用 proxyInference。[inference-proxy](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/console/app/src/lib/inference-proxy.ts#L7-L99) 将该路径映射为 /go/v1/usage；oc_sk_ 新 key 或已迁移 workspace 走 Resource.ConsoleMigration.inferenceUrl，使用目标服务的认证与计费。它还把 x-opencode-request / x-opencode-request-id 归一化转发。
+
+本轮没有读取任何 key，也没有确定原 workspace 是否 migrated、现网 upstream 版本/数据表、原时段的实际路径或账号可用审计 API。旧 console 的字段不足是已证实源码事实；“原账户现网必定也缺这些字段”不是已证实事实。本轮不把 dev HEAD 当原试跑版本。
+
+[Issue #44189](https://github.com/anomalyco/opencode/issues/44189) 的作者主张 API-key 无法取得余额，建议给 usage 增加 balance 或另加 /zen/v1/balance；本轮公共 API 快照仍为 Open。这是用户提案。公开 legacy usage 源码印证其没有 balance 字段，但不能据此断言所有新服务都没有余额 API。
+
+## Custom client 的正式要求
+
+[官方 Go 文档](https://docs.opencode.ai/docs/go/#where-can-i-use-it) 及同提交 [go.mdx 106–144](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/web/src/content/docs/go.mdx#L106-L144) 明确要求典型 coding-agent 流量、自己的 User-Agent、每会话稳定的 x-opencode-session。文档说明 Claude Code 的 native session header 已被识别，DeepSeek Harness 则仍有部分 adapter 不发送 session。后两项是官方文档陈述；本轮没有审计新 inference 服务的 native-header alias 解析代码，也没有核验任一安装版本运行时发出的 header。不能声称 Claude/DSH 任意版本全部符合，或移植其 loop 就自动符合。
+
+现有 ResearchOS Main internal/domain/runtime_model_windows.go 87–93 在 Go broker 中只显式设置 Content-Type、Accept、Authorization；没有显式自定义 User-Agent / x-opencode-session / x-opencode-request。这仅说明当前所读文件的缺口，不证明原试跑已走到 HTTP 或发出了不合规请求。该原 trial 的历史独立审查指出 audited invocation 未到 coordinator dispatch；本轮保持外部总数未知。Mu/Pi 的内部 model runtime 即使支持 headers，最终网络由 Go broker 发出，不能把 Pi 文档的合规结论直接转给这个代理边界。
+
+## Root 后续可取得的最小原账户证据包（本轮未执行）
+
+1. 保持原 account/workspace/route；使用已有同登录浏览器只读观察实际 Usage/Billing 页面及其 server query。记录公开部署/路由线索、脱敏 workspace 与原 key identity 指纹（不导出 key/cookie/token）；先区分 legacy 与 migrated。无需为缺失 request ID 新建请求。
+2. 对原 UTC 时间窗，加上明确且有限的 clock-skew 与 late-finalization 覆盖，保存所有页的原始安全字段及来源/获取时间、分页终止与保留期证明。优先安全的结构化网络结果而非仅屏幕后8位 session；去掉认证头、完整 session payload、支付方式、用户邮箱等无关资料。并发新增使 offset 翻页变化时，单次“翻到末页”仍不足以证明快照完整。
+3. 若原账户确有公开/现有权限下的 request/audit API，只读取得 request/attempt ID、时间、终态（含 error/timeout/cancel）、route/model/key/session 关联、usage、charge/currency、finality、退款/调整关联及全部分页。此类入口的可用性仍 OPEN；本研究不提供猜测 URL，不授权新认证 API 调用或对外询问。
+4. 同时记录 Go 包含用量、Zen balance fallback 当时状态和现金账。余额前后差、月度额度百分比或无 usage 只能作辅助。若供应方不能给完整请求审计及最终计费覆盖，结论仍 UNKNOWN，financial OPEN。即使外部证据补齐，现有 prepared-abandonment 合同仍不提供把 financial_closed 改成 true 的路径；须由 Root 另行定位合法已有对账导入合同，不能制造 effect 或零成本 ledger。
+
+## Tool loop 复用：只给一个最小边界
+
+不增加另一套 Claude/DeepSeek tool loop；当前 Mu/Pi -> Go broker 已持有模型/工具调度路径。唯一后续候选是 **现有 Go broker 的请求元数据与回执映射 adapter**：在冻结 provider 配置中承载本产品 User-Agent、会话标识与请求关联标识，并把供应方已有响应/审计字段映射为带来源的可选回执；缺失成本保持 NULL。先在本地离线协议夹具比较 header 投影与回执字段，不触碰原 trial、不发模型请求、不换供应商、不让 SDK 重试或取得工具执行权。本轮仅建议，未实现或跑夹具。
+
+此选择基于当前 Main broker、worker customTools/noTools: builtin，以及已封存 DeepSeek Harness commit 5badb15009ae1756c3afe0ae0cef1faafc290ccc 的候选审查。后者维持 WATCH/设计参考，不重复整库下载、不重新导入 registry/terminal/loop。Claude SDK 的 Messages wire 契约与当前 frozen openai-completions 不同，已有资源审查已指出需要独立 adapter；本轮没有新增适配验证。SDK 或 loop 无法补回既往缺失的计费审计。
+
+## 执行与证据
+
+写入仅本次 original_provider_public_audit_resource_codex/opa-01a11f3f。网络仅官方 GitHub/API/raw 与官方公开文档 GET；没有账户认证、模型推理、购买、消息外发或产品执行。Source 小文件含抓取 URL、HTTP 状态、SHA-256、大小，汇总 primary-sources.json。失败原文保留：928（单次 shell 只读探测缺 parent AGENTS，exit1）、929（一个 web open 调用含两个 inaccessible 子结果，numeric exits NULL）、931（官方 Edit 链接被 robots 拒绝，numeric exits NULL）；后续成功不覆盖原失败。最终 HDF/MF/postseal 只封存资源核查，不授予产品/账务/正式验收权限。STOP_FINAL。
+

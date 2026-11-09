@@ -1,0 +1,113 @@
+adapters/runtime\process_windows.go:20:func PrivateDirectory(path string) (string, error) {
+143:func load(tx *sql.Tx, project, kind, id string) (Object, error) {
+375:func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, correlation, eventType string) error {
+	denied := func() (string, error) {
+		return "", Fail(403, "FORBIDDEN", "authority principal or registered lineage is missing, revoked or changed")
+	}
+	if id == "" {
+		return denied()
+	}
+	var anchorHash, anchorRaw, anchorProject string
+	var anchors int
+	if e := tx.QueryRow(`SELECT count(*) FROM idempotency WHERE principal=? AND operation='host:managed-verifier-lineage' AND key=?`, id, id).Scan(&anchors); e != nil {
+		return "", e
+	}
+	if anchors > 1 {
+		return denied()
+	}
+	err := tx.QueryRow(`SELECT project,request_hash,body FROM idempotency WHERE principal=? AND operation='host:managed-verifier-lineage' AND key=?`, id, id).Scan(&anchorProject, &anchorHash, &anchorRaw)
+	var anchor Object
+	if err == nil {
+		anchor, err = Decode([]byte(anchorRaw))
+		if err != nil || Hash(anchor) != anchorHash || anchor["schema"] != "researchos.managed-verifier-lineage.v1" || anchor["principal"] != id || Str(anchor, "root") == "" || anchorProject == "" || anchor["project_id"] != anchorProject || Str(anchor, "registered_by") == "" {
+			return denied()
+		}
+	} else if err != sql.ErrNoRows {
+		return "", err
+	}
+	var root string
+	var parent sql.NullString
+	err = tx.QueryRow(`SELECT root,parent FROM orchestration_identity WHERE principal=?`, id).Scan(&root, &parent)
+	if err == sql.ErrNoRows {
+		var revoked int
+		if anchor != nil || tx.QueryRow(`SELECT revoked FROM auth_principals WHERE id=?`, id).Scan(&revoked) != nil || revoked != 0 {
+			return denied()
+		}
+		return id, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if root == "" || (anchor != nil && (anchor["root"] != root || !parent.Valid || parent.String != root)) {
+		return denied()
+	}
+	seen := map[string]bool{}
+	for current := id; ; {
+		if current == "" || seen[current] || len(seen) >= 256 {
+			return denied()
+		}
+		seen[current] = true
+		var revoked int
+		if tx.QueryRow(`SELECT revoked FROM auth_principals WHERE id=?`, current).Scan(&revoked) != nil || revoked != 0 {
+			return denied()
+		}
+		var actualRoot string
+		var actualParent sql.NullString
+		if tx.QueryRow(`SELECT root,parent FROM orchestration_identity WHERE principal=?`, current).Scan(&actualRoot, &actualParent) != nil || actualRoot != root {
+			return denied()
+		}
+		if !actualParent.Valid {
+			if current != root {
+				return denied()
+			}
+			return root, nil
+		}
+		if current == root {
+			return denied()
+		}
+		current = actualParent.String
+	}
+}
+
+func contractDigest(c Object) string {
+	v := Object{}
+	for k, x := range c {
+		if k != "contract_hash" {
+			v[k] = x
+		}
+	}
+	return Hash(v)
+}
+
+func freezeTaskContract(tx *sql.Tx, project string, task Object) error {
+	c := task["acceptance_contract"].(map[string]any)
+	if c["contract_hash"] != contractDigest(c) || c["require_independent_verifier"] != true || c["version_policy"] != "EXACT" {
+		return Fail(422, "GATE_FAILED", "exact independent contract hash required")
+	}
+	required := 0
+	ids := map[string]bool{}
+	for _, v := range Arr(c, "checks") {
+		check := v.(map[string]any)
+		id := Str(check, "check_id")
+		if ids[id] {
+			return Fail(422, "GATE_FAILED", "duplicate frozen check")
+		}
+		ids[id] = true
+		if check["required"] == true {
+			required++
+		}
+	}
+	if required == 0 {
+		return Fail(422, "GATE_FAILED", "at least one mandatory acceptance check required")
+	}
+	var old string
+	e := tx.QueryRow("SELECT contract FROM orchestration_contracts WHERE project=? AND task=?", project, task["id"]).Scan(&old)
+	if e == nil {
+		c0, _ := Decode([]byte(old))
+		if Hash(c0) != Hash(c) {
+			return Fail(422, "GATE_FAILED", "acceptance contract cannot change after submission")
+		}
+		return nil
+	}
+	if e != sql.ErrNoRows {
+		return e

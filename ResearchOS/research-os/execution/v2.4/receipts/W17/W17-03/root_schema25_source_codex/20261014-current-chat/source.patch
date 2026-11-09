@@ -1,0 +1,1006 @@
+diff --git a/internal/domain/backup.go b/internal/domain/backup.go
+index 1772149e..a55ea0a4 100644
+--- a/internal/domain/backup.go
++++ b/internal/domain/backup.go
+@@ -282,12 +282,22 @@ func backupInventory(db *sql.DB) (Object, error) {
+ 	if configuration != nil {
+ 		inventory["host_configuration_digest"] = Hash(configuration)
+ 	}
++	pause, err := backupPauseState(db)
++	if err != nil {
++		return nil, err
++	}
++	if pause != nil {
++		inventory["runtime_pause_digest"] = Hash(pause)
++	}
+ 	return inventory, nil
+ }
+ func backupIntegrity(db *sql.DB) error {
+ 	return backupIntegrityPolicy(db, nil)
+ }
+ func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
++	if err := validateBackupPause(db); err != nil {
++		return err
++	}
+ 	if err := validateBackupHostConfiguration(db); err != nil {
+ 		return err
+ 	}
+diff --git a/internal/domain/backup_host_configuration.go b/internal/domain/backup_host_configuration.go
+index 624e3881..481c8804 100644
+--- a/internal/domain/backup_host_configuration.go
++++ b/internal/domain/backup_host_configuration.go
+@@ -79,7 +79,7 @@ func configurationBackupRows(db configurationBackupQuery, query string, args ...
+ // derived from the fixed SQL23 bytes; no runtime database can redefine it.
+ func backupConfigurationPresent(db *sql.DB) (bool, error) {
+ 	versions, e := backupMigrations(db)
+-	if e != nil || len(versions) == 0 || len(versions) > 24 {
++	if e != nil || len(versions) == 0 || len(versions) > 25 {
+ 		return false, fmt.Errorf("BACKUP_CONFIGURATION_VERSION")
+ 	}
+ 	for i, v := range versions {
+@@ -92,6 +92,14 @@ func backupConfigurationPresent(db *sql.DB) (bool, error) {
+ 			return false, e
+ 		}
+ 	}
++	if len(versions) == 25 {
++		if e = backupPauseSchema(db); e != nil {
++			return false, e
++		}
++		if e = backupPreparedAbandonmentFingerprint(db); e != nil {
++			return false, e
++		}
++	}
+ 	schema, e := configurationBackupRows(db, `SELECT type,name,tbl_name,sql FROM sqlite_master WHERE (tbl_name IN ('client_command_identities','host_model_configurations','host_model_config_heads') OR name='client_identity_receipt_request') AND sql IS NOT NULL ORDER BY type,name`)
+ 	if e != nil {
+ 		return false, e
+diff --git a/internal/domain/backup_migration.go b/internal/domain/backup_migration.go
+index 6dd0deb4..67a93191 100644
+--- a/internal/domain/backup_migration.go
++++ b/internal/domain/backup_migration.go
+@@ -58,7 +58,7 @@ func CheckMigrationSafety(db *sql.DB, files []string) error {
+ }
+ 
+ func checkMigrationInventory(db *sql.DB, files []string) (int, error) {
+-	if len(files) == 0 || len(files) > 24 {
++	if len(files) == 0 || len(files) > 25 {
+ 		return 0, fmt.Errorf("MIGRATION_SOURCE_INVENTORY")
+ 	}
+ 	for i, file := range files {
+diff --git a/internal/domain/backup_pause_upgrade.go b/internal/domain/backup_pause_upgrade.go
+new file mode 100644
+index 00000000..534c792d
+--- /dev/null
++++ b/internal/domain/backup_pause_upgrade.go
+@@ -0,0 +1,265 @@
++package domain
++
++import (
++	"database/sql"
++	_ "embed"
++	"encoding/json"
++	"fmt"
++	"sort"
++	"sync"
++)
++
++// This is the new storage contract only. A populated original schema24 database
++// still requires matching-program backup and a separate reviewed upgrade entry.
++const pauseUpgradeSQLHash = "sha256:6f3f90671170df80dcb4a8f6e8c8679f85cd03802399e821ed5478dde49e2ac0"
++
++//go:embed contracts/runtime_pause_activations.sql
++var backupPauseSQL []byte
++
++var pauseTables = []string{"runtime_pause_intents", "runtime_checkpoint_activations", "runtime_pause_receipts"}
++var pauseSchemaOnce sync.Once
++var pauseSchemaExpected []Object
++var pauseSchemaError error
++
++const pauseSchemaQuery = `SELECT type,name,tbl_name,sql FROM sqlite_master
++WHERE tbl_name IN ('runtime_pause_intents','runtime_checkpoint_activations','runtime_pause_receipts')
++OR name LIKE 'runtime_pause_%' OR name LIKE 'runtime_checkpoint_activation_%'
++ORDER BY type,name`
++
++func backupPauseSchema(db *sql.DB) error {
++	if err := preparedUpgradeVersions(db, 25); err != nil {
++		return err
++	}
++	pauseSchemaOnce.Do(func() {
++		if Digest(backupPauseSQL) != pauseUpgradeSQLHash {
++			pauseSchemaError = fmt.Errorf("BACKUP_PAUSE_SQL_HASH")
++			return
++		}
++		template, err := sql.Open("sqlite", ":memory:")
++		if err != nil {
++			pauseSchemaError = err
++			return
++		}
++		defer template.Close()
++		template.SetMaxOpenConns(1)
++		_, err = template.Exec(`CREATE TABLE runtime_dispatches(project TEXT,run TEXT,epoch INTEGER,PRIMARY KEY(project,run,epoch));
++CREATE TABLE client_queue_fences(generation TEXT PRIMARY KEY,state TEXT,restore_fenced INTEGER);
++CREATE TABLE domain_objects(project TEXT,kind TEXT,id TEXT,body TEXT);`)
++		if err == nil {
++			_, err = template.Exec(string(backupPauseSQL))
++		}
++		if err == nil {
++			pauseSchemaExpected, err = configurationBackupRows(template, pauseSchemaQuery)
++		}
++		pauseSchemaError = err
++	})
++	if pauseSchemaError != nil {
++		return pauseSchemaError
++	}
++	actual, err := configurationBackupRows(db, pauseSchemaQuery)
++	if err != nil {
++		return err
++	}
++	if Hash(actual) != Hash(pauseSchemaExpected) {
++		return fmt.Errorf("BACKUP_PAUSE_SCHEMA")
++	}
++	return nil
++}
++
++func backupPausePresent(db *sql.DB) (bool, error) {
++	versions, err := backupMigrations(db)
++	if err != nil {
++		return false, err
++	}
++	if len(versions) == 0 || len(versions) > 25 {
++		return false, fmt.Errorf("BACKUP_PAUSE_VERSION")
++	}
++	for i, version := range versions {
++		if version != i+1 {
++			return false, fmt.Errorf("BACKUP_PAUSE_VERSION")
++		}
++	}
++	if len(versions) < 25 {
++		rows, err := configurationBackupRows(db, pauseSchemaQuery)
++		if err != nil {
++			return false, err
++		}
++		if len(rows) != 0 {
++			return false, fmt.Errorf("BACKUP_PAUSE_PREMATURE_SCHEMA")
++		}
++		return false, nil
++	}
++	if err := backupPauseSchema(db); err != nil {
++		return false, err
++	}
++	return true, nil
++}
++
++func backupPauseState(db *sql.DB) (Object, error) {
++	present, err := backupPausePresent(db)
++	if err != nil || !present {
++		return nil, err
++	}
++	state := Object{"format": "RESEARCHOS_RUNTIME_PAUSE_V1"}
++	for _, table := range pauseTables {
++		rows, err := configurationBackupRows(db, "SELECT * FROM "+table)
++		if err != nil {
++			return nil, err
++		}
++		sort.Slice(rows, func(i, j int) bool { return Hash(rows[i]) < Hash(rows[j]) })
++		state[table] = rows
++	}
++	return state, nil
++}
++
++func validateBackupPause(db *sql.DB) error {
++	state, err := backupPauseState(db)
++	if err != nil || state == nil {
++		return err
++	}
++	queries := []string{
++		`SELECT count(*) FROM runtime_pause_intents p WHERE
++NOT EXISTS(SELECT 1 FROM domain_objects t WHERE t.project=p.project AND t.kind='Task' AND t.id=p.task)
++OR NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=p.project AND r.kind='Run' AND r.id=p.run AND json_extract(r.body,'$.task_id')=p.task AND json_extract(r.body,'$.lease_epoch')>=p.epoch)
++OR NOT EXISTS(SELECT 1 FROM client_sessions s WHERE s.project_id=p.project AND s.id=p.session_id)
++OR NOT EXISTS(SELECT 1 FROM client_queue_fences f WHERE f.project=p.project AND f.task_id=p.task AND f.session_id=p.session_id AND f.generation=p.generation)
++OR NOT EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=p.project AND d.run=p.run AND d.epoch=p.epoch AND d.dispatch_key=p.dispatch_key AND d.manifest_hash=p.manifest_hash)
++OR NOT EXISTS(SELECT 1 FROM auth_principals a WHERE a.id=p.principal)`,
++		`SELECT count(*) FROM runtime_pause_intents p WHERE p.checkpoint_hash IS NOT NULL AND
++(NOT EXISTS(SELECT 1 FROM artifact_uses u JOIN uploaded_content c ON c.storage_key=u.storage_key
++ WHERE u.project=p.project AND u.artifact=p.checkpoint_artifact AND u.run=p.run AND u.epoch=p.epoch
++ AND u.principal=p.checkpoint_use_principal AND u.receipt_hash=p.checkpoint_use_receipt_hash
++ AND c.project=p.project AND c.sealed=1 AND c.content_hash=p.checkpoint_hash AND length(c.bytes)=p.checkpoint_bytes)
++ OR p.queue_cut>(SELECT f.accepted_through FROM client_queue_fences f WHERE f.generation=p.generation))`,
++		`SELECT count(*) FROM runtime_checkpoint_activations a WHERE
++NOT EXISTS(SELECT 1 FROM runtime_pause_intents p WHERE p.project=a.project AND p.pause_id=a.pause_id
++ AND p.task=a.task AND p.run=a.run AND p.epoch=a.previous_epoch AND p.successor_epoch=a.epoch
++ AND p.session_id=a.session_id AND p.generation=a.generation AND p.checkpoint_artifact=a.checkpoint_artifact
++ AND p.checkpoint_hash=a.checkpoint_hash AND p.checkpoint_use_receipt_hash=a.checkpoint_use_receipt_hash
++ AND p.checkpoint_use_principal=a.checkpoint_use_principal AND p.original_input_hash=a.original_input_hash
++ AND p.native_session_ref=a.native_session_ref AND p.sdk_session_id=a.sdk_session_id AND p.queue_cut=a.queue_cut
++ AND p.model_calls=a.model_calls AND p.tool_calls=a.tool_calls)
++OR NOT EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=a.project AND d.run=a.run AND d.epoch=a.epoch AND d.dispatch_key=a.dispatch_key AND d.manifest_hash=a.manifest_hash)
++OR NOT EXISTS(SELECT 1 FROM auth_principals p WHERE p.id=a.principal)
++OR NOT EXISTS(SELECT 1 FROM auth_principals p WHERE p.id=a.carry_use_principal)
++OR NOT EXISTS(SELECT 1 FROM artifact_uses u WHERE u.project=a.project AND u.artifact=a.checkpoint_artifact AND u.run=a.run AND u.epoch=a.epoch AND u.receipt_hash=a.carry_use_receipt_hash AND u.principal=a.carry_use_principal)
++OR NOT EXISTS(SELECT 1 FROM resource_checkpoint_carries c JOIN artifact_uses u
++ ON u.project=c.project AND u.run=c.run AND u.epoch=c.epoch AND u.artifact=a.checkpoint_artifact
++ AND u.receipt_hash=a.carry_use_receipt_hash AND u.principal=a.carry_use_principal
++ WHERE c.project=a.project AND c.run=a.run AND c.epoch=a.epoch
++ AND json_extract(c.body,'$.actor')=a.principal
++ AND json_extract(c.body,'$.artifact_ref.entity_type')='Artifact'
++ AND json_extract(c.body,'$.artifact_ref.id')=a.checkpoint_artifact
++ AND json_extract(c.body,'$.artifact_ref.content_hash')=a.checkpoint_hash
++ AND json_extract(c.body,'$.new_upload_key')=u.storage_key
++ AND json_extract(c.body,'$.reason')='CHECKPOINT_CARRY_NOT_NEW_RESULT'
++ AND json_extract(c.body,'$.from_use_receipt_hash')=a.checkpoint_use_receipt_hash
++ AND json_extract(c.body,'$.from_epoch')=a.previous_epoch AND json_extract(c.body,'$.to_epoch')=a.epoch)`,
++		`SELECT count(*) FROM runtime_pause_intents p WHERE p.state IN ('RESUME_PREPARED','RESUMED') AND
++NOT EXISTS(SELECT 1 FROM runtime_checkpoint_activations a WHERE a.project=p.project AND a.pause_id=p.pause_id AND a.run=p.run AND a.epoch=p.successor_epoch)`,
++		`SELECT count(*) FROM runtime_pause_receipts r WHERE
++NOT EXISTS(SELECT 1 FROM runtime_pause_intents p WHERE p.project=r.project AND p.pause_id=r.pause_id)
++OR (r.sequence=1 AND r.previous_receipt_hash IS NOT NULL)
++OR (r.sequence>1 AND NOT EXISTS(SELECT 1 FROM runtime_pause_receipts p WHERE p.project=r.project AND p.pause_id=r.pause_id AND p.sequence=r.sequence-1 AND p.body_hash=r.previous_receipt_hash))`,
++	}
++	for _, query := range queries {
++		var count int
++		if err := db.QueryRow(query).Scan(&count); err != nil {
++			return err
++		}
++		if count != 0 {
++			return fmt.Errorf("BACKUP_PAUSE_BINDING: %d invalid rows", count)
++		}
++	}
++	witnesses := map[string]Object{}
++	for _, receipt := range state["runtime_pause_receipts"].([]Object) {
++		var body Object
++		if json.Unmarshal([]byte(Str(receipt, "body")), &body) != nil || Hash(body) != Str(receipt, "body_hash") {
++			return fmt.Errorf("BACKUP_PAUSE_RECEIPT_HASH")
++		}
++		if Str(body, "project") != Str(receipt, "project") || Str(body, "pause_id") != Str(receipt, "pause_id") || Str(body, "kind") != Str(receipt, "kind") || Hash(body["sequence"]) != Hash(receipt["sequence"]) {
++			return fmt.Errorf("BACKUP_PAUSE_RECEIPT_IDENTITY")
++		}
++		if Str(body, "kind") == "STATE_TRANSITION" {
++			key := Hash([]any{body["project"], body["pause_id"], body["revision"]})
++			if _, exists := witnesses[key]; exists {
++				return fmt.Errorf("BACKUP_PAUSE_DUPLICATE_WITNESS")
++			}
++			witnesses[key] = body
++		}
++	}
++	for _, intent := range state["runtime_pause_intents"].([]Object) {
++		// Backup observes a committed transaction: every current state must have
++		// a witness of the complete stored projection. A revision trigger alone
++		// does not prove the future Core's expected-state CAS or native stop.
++		witness := witnesses[Hash([]any{intent["project"], intent["pause_id"], intent["revision"]})]
++		if witness == nil || Str(witness, "state") != Str(intent, "state") || Str(witness, "intent_hash") != Hash(intent) {
++			return fmt.Errorf("BACKUP_PAUSE_STATE_WITNESS")
++		}
++		var identity string
++		if err := db.QueryRow(`SELECT identity FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, intent["project"], intent["run"], intent["epoch"]).Scan(&identity); err != nil {
++			return err
++		}
++		var value Object
++		if json.Unmarshal([]byte(identity), &value) != nil || Hash(value) != Str(intent, "process_identity_hash") {
++			return fmt.Errorf("BACKUP_PAUSE_PROCESS_IDENTITY")
++		}
++		if Str(intent, "checkpoint_hash") != "" {
++			if err := backupPauseUse(db, intent["project"], intent["run"], intent["epoch"],
++				intent["checkpoint_artifact"], intent["checkpoint_hash"], intent["checkpoint_use_receipt_hash"], Str(intent, "checkpoint_use_principal")); err != nil {
++				return err
++			}
++		}
++	}
++	for _, activation := range state["runtime_checkpoint_activations"].([]Object) {
++		if err := backupPauseUse(db, activation["project"], activation["run"], activation["epoch"],
++			activation["checkpoint_artifact"], activation["checkpoint_hash"], activation["carry_use_receipt_hash"], Str(activation, "carry_use_principal")); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// A matching hash column alone is insufficient: retain the sealed bytes and
++// recompute the existing artifact-use receipt with its original binding.
++func backupPauseUse(db *sql.DB, project, run, epoch, artifact, contentHash, receiptHash any, expectedPrincipal string) error {
++	rows, err := db.Query(`SELECT u.principal,u.storage_key,u.body,c.bytes FROM artifact_uses u
++JOIN uploaded_content c ON c.storage_key=u.storage_key
++JOIN domain_objects a ON a.project=u.project AND a.kind='Artifact' AND a.id=u.artifact
++WHERE u.project=? AND u.run=? AND u.epoch=? AND u.artifact=? AND u.receipt_hash=?
++AND c.project=u.project AND c.principal=u.principal AND c.sealed=1 AND c.content_hash=?
++AND json_extract(a.body,'$.kind')='CHECKPOINT' AND json_extract(a.body,'$.content_hash')=?`,
++		project, run, epoch, artifact, receiptHash, contentHash, contentHash)
++	if err != nil {
++		return err
++	}
++	defer rows.Close()
++	count := 0
++	for rows.Next() {
++		var principal, storage, raw string
++		var content []byte
++		if err := rows.Scan(&principal, &storage, &raw, &content); err != nil {
++			return err
++		}
++		count++
++		var use Object
++		if json.Unmarshal([]byte(raw), &use) != nil || Receipt(use) != receiptHash || use["receipt_hash"] != receiptHash ||
++			use["project_id"] != project || use["run_id"] != run || use["principal_id"] != principal || use["storage_key"] != storage ||
++			Hash(use["lease_epoch"]) != Hash(epoch) || use["content_hash"] != contentHash || Digest(content) != contentHash ||
++			(expectedPrincipal != "" && principal != expectedPrincipal) {
++			return fmt.Errorf("BACKUP_PAUSE_USE_PROOF")
++		}
++		artifactRef, ok := use["artifact_ref"].(map[string]any)
++		byteCount, sizeErr := Num(use, "byte_size")
++		if !ok || artifactRef["id"] != artifact || artifactRef["entity_type"] != "Artifact" || artifactRef["content_hash"] != contentHash || sizeErr != nil || byteCount != int64(len(content)) {
++			return fmt.Errorf("BACKUP_PAUSE_USE_CONTENT")
++		}
++	}
++	if err := rows.Err(); err != nil {
++		return err
++	}
++	if count != 1 {
++		return fmt.Errorf("BACKUP_PAUSE_USE_CARDINALITY")
++	}
++	return nil
++}
+diff --git a/internal/domain/backup_pause_upgrade_test.go b/internal/domain/backup_pause_upgrade_test.go
+new file mode 100644
+index 00000000..96d58cff
+--- /dev/null
++++ b/internal/domain/backup_pause_upgrade_test.go
+@@ -0,0 +1,378 @@
++package domain
++
++import (
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	"researchos.local/research-os/internal/store"
++)
++
++func pauseStorageExec(t *testing.T, db *sql.DB, query string, args ...any) {
++	t.Helper()
++	if _, err := db.Exec(query, args...); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func pauseStorageSeed(t *testing.T) *sql.DB {
++	t.Helper()
++	db, _ := configurationDB(t, 25, true)
++	pauseStorageExec(t, db, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Run','r',1,'{"status":"RUNNING","task_id":"t","lease_epoch":1}')`)
++	pauseStorageExec(t, db, `INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES('p','r',1,'d1','{}','m1','OBSERVED','now','now')`)
++	pauseStorageExec(t, db, `INSERT INTO client_queue_fences(project,task_id,session_id,generation,state) VALUES('p','t','s','g','OPEN')`)
++	pauseStorageExec(t, db, `INSERT INTO runtime_pause_intents(project,pause_id,task,run,epoch,session_id,generation,principal,request_key,request_hash,runtime,dispatch_key,manifest_hash,process_identity_hash,original_input_hash,state,created_at,updated_at)
++VALUES('p','pause','t','r',1,'s','g','actor','pause-command','request','runtime','d1','m1','identity','input','PAUSE_REQUESTED','now','now')`)
++	return db
++}
++
++func pauseStorageSeal(t *testing.T, db *sql.DB) {
++	t.Helper()
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='CHECKPOINT_SEALED',revision=revision+1,
++checkpoint_sequence=6,checkpoint_artifact='a',checkpoint_use_receipt_hash='use1',checkpoint_use_principal='executor',
++checkpoint_hash='content',checkpoint_bytes=123,native_session_ref='native',sdk_session_id='sdk',queue_cut=0,
++command_ledger_hash='ledger',sdk_watermarks_json='{}',model_calls=1,tool_calls=2,journal_checkpoint_hash='journal',updated_at='sealed'
++WHERE project='p' AND pause_id='pause'`)
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='PAUSED_CONFIRMED',revision=revision+1 WHERE project='p' AND pause_id='pause'`)
++}
++
++func TestPauseStorageSchemaAndLegacyBackup(t *testing.T) {
++	raw, err := os.ReadFile("../../migrations/sqlite/0025_runtime_pause_activations.sql")
++	if err != nil || Digest(raw) != pauseUpgradeSQLHash || Digest(raw) != Digest(backupPauseSQL) {
++		t.Fatal("migration/embed/hash mismatch", err)
++	}
++	for _, version := range []int{22, 23, 24, 25} {
++		db, _ := configurationDB(t, version, true)
++		if err := validateBackupHostConfiguration(db); err != nil {
++			t.Fatalf("host configuration schema%d: %v", version, err)
++		}
++		if err := validateBackupPause(db); err != nil {
++			t.Fatalf("pause schema%d: %v", version, err)
++		}
++		state, err := backupPauseState(db)
++		if err != nil || (state != nil) != (version == 25) {
++			t.Fatalf("wrong version projection %d: %v", version, err)
++		}
++		if version == 25 && backupPreparedAbandonmentSchema(db) == nil {
++			t.Fatal("old exact24 upgrade gate weakened")
++		}
++	}
++}
++
++func TestPauseStorageIsolated24To25Rehearsal(t *testing.T) {
++	source, _ := configurationDB(t, 24, true)
++	pauseStorageExec(t, source, `INSERT INTO auth_principals(id,roles,can_create_project) VALUES('retained-owner','["OWNER"]',1)`)
++	pauseStorageExec(t, source, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Task','history',9,'{ "failure_count":9007199254740993, "status":"FAILED" }')`)
++	before, err := preparedUpgradeSnapshot(source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	copyPath := filepath.Join(t.TempDir(), "isolated25.sqlite")
++	pauseStorageExec(t, source, "VACUUM INTO ?", copyPath)
++	copyDB, err := store.Open(copyPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer copyDB.Close()
++	tx, err := copyDB.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer tx.Rollback()
++	if _, err = tx.Exec(string(backupPauseSQL)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = tx.Exec("INSERT INTO schema_migrations(version) VALUES(25)"); err != nil {
++		t.Fatal(err)
++	}
++	if err = tx.Commit(); err != nil {
++		t.Fatal(err)
++	}
++	afterSource, err := preparedUpgradeSnapshot(source)
++	if err != nil || !reflect.DeepEqual(before, afterSource) {
++		t.Fatal("source database changed", err)
++	}
++	afterCopy, err := preparedUpgradeSnapshot(copyDB)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for name, rows := range before {
++		if name != "schema_migrations" && !reflect.DeepEqual(rows, afterCopy[name]) {
++			t.Fatalf("existing storage changed: %s", name)
++		}
++	}
++	if err := backupPauseSchema(copyDB); err != nil {
++		t.Fatal(err)
++	}
++	// Source authority cannot be upgraded by simply opening a newer release.
++	files, err := filepath.Glob("../../migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := CheckMigrationSafety(source, files); err == nil || !strings.Contains(err.Error(), "MIGRATION_PREBACKUP_REQUIRED") {
++		t.Fatalf("populated original24 opened for automatic migration: %v", err)
++	}
++}
++
++func TestPauseStorageSnapshotAndCancelFences(t *testing.T) {
++	db := pauseStorageSeed(t)
++	for _, query := range []string{
++		`UPDATE runtime_pause_intents SET state='PAUSED_CONFIRMED',revision=2`,
++		`UPDATE runtime_pause_intents SET epoch=2,revision=2`,
++		`UPDATE runtime_pause_intents SET revision=3`,
++		`DELETE FROM runtime_pause_intents`,
++	} {
++		if _, err := db.Exec(query); err == nil {
++			t.Fatalf("invalid original pause mutation accepted: %s", query)
++		}
++	}
++	pauseStorageSeal(t, db)
++	for _, field := range []string{"model_calls=0", "checkpoint_hash='other'", "sdk_watermarks_json='{" + `"cleared":true` + "}'", "checkpoint_use_principal='other'", "journal_checkpoint_hash='other'"} {
++		if _, err := db.Exec(`UPDATE runtime_pause_intents SET revision=revision+1,` + field); err == nil {
++			t.Fatalf("sealed state mutated: %s", field)
++		}
++	}
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='CANCELLED',revision=revision+1`)
++	if _, err := db.Exec(`UPDATE runtime_pause_intents SET state='PAUSED_CONFIRMED',revision=revision+1`); err == nil {
++		t.Fatal("cancelled pause resurrected")
++	}
++}
++
++func TestPauseStorageSuccessorAndReceiptCAS(t *testing.T) {
++	db := pauseStorageSeed(t)
++	pauseStorageSeal(t, db)
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='RESUME_PREPARED',successor_epoch=2,revision=revision+1`)
++	pauseStorageExec(t, db, `INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES('p','r',2,'d2','{}','m2','PREPARED','now','now')`)
++	activation := `INSERT INTO runtime_checkpoint_activations(project,run,epoch,previous_epoch,pause_id,task,session_id,generation,principal,request_key,request_hash,dispatch_key,manifest_hash,checkpoint_artifact,checkpoint_hash,checkpoint_use_receipt_hash,checkpoint_use_principal,carry_use_receipt_hash,carry_use_principal,original_input_hash,native_session_ref,sdk_session_id,queue_cut,model_calls,tool_calls,created_at)
++VALUES('p','r',2,1,'pause','t','s','g','actor','resume-command','resume-request','d2','m2','a','content','use1','executor','use2','executor','input','native','sdk',0,1,2,'now')`
++	pauseStorageExec(t, db, activation)
++	if _, err := db.Exec(activation); err == nil {
++		t.Fatal("second successor accepted")
++	}
++	if _, err := db.Exec(`UPDATE runtime_checkpoint_activations SET model_calls=0`); err == nil {
++		t.Fatal("activation counter reset")
++	}
++	for sequence := 1; sequence <= 2; sequence++ {
++		body := Object{"project": "p", "pause_id": "pause", "kind": "OBSERVED", "sequence": sequence}
++		var previous any
++		if sequence == 2 {
++			previous = Hash(Object{"project": "p", "pause_id": "pause", "kind": "OBSERVED", "sequence": 1})
++		}
++		pauseStorageExec(t, db, `INSERT INTO runtime_pause_receipts(receipt_id,project,pause_id,sequence,kind,body,body_hash,previous_receipt_hash,created_at) VALUES(?,'p','pause',?,'OBSERVED',?,?,?,'now')`, string(rune('a'+sequence)), sequence, string(Bytes(body)), Hash(body), previous)
++	}
++	if _, err := db.Exec(`INSERT INTO runtime_pause_receipts(receipt_id,project,pause_id,sequence,kind,body,body_hash,previous_receipt_hash,created_at) VALUES('gap','p','pause',4,'OBSERVED','{}','gap-hash','wrong','now')`); err == nil {
++		t.Fatal("receipt gap accepted")
++	}
++	for _, query := range []string{`UPDATE runtime_pause_receipts SET body='{}'`, `DELETE FROM runtime_pause_receipts`} {
++		if _, err := db.Exec(query); err == nil {
++			t.Fatal("append-only receipt changed")
++		}
++	}
++	// Storage constraints cannot certify fake artifact references as backup proof.
++	if err := validateBackupPause(db); err == nil {
++		t.Fatal("unbound synthetic checkpoint passed backup integrity")
++	}
++}
++
++func TestPauseStorageRejectsSchemaDrift(t *testing.T) {
++	db, _ := configurationDB(t, 25, true)
++	pauseStorageExec(t, db, `DROP TRIGGER runtime_pause_snapshot_frozen`)
++	if err := backupPauseSchema(db); err == nil {
++		t.Fatal("weakened schema fingerprint accepted")
++	}
++	old, _ := configurationDB(t, 24, true)
++	pauseStorageExec(t, old, string(backupPauseSQL))
++	if _, err := backupPauseState(old); err == nil {
++		t.Fatal("unversioned pause schema accepted")
++	}
++}
++
++func TestPauseStorageSealedUseProof(t *testing.T) {
++	db, _ := configurationDB(t, 25, true)
++	content := []byte(`{"session":"original-sdk","leaseEpoch":1,"followUp":["retained"]}`)
++	contentHash := Digest(content)
++	use := Object{"project_id": "p", "run_id": "r", "lease_epoch": 1, "principal_id": "executor",
++		"storage_key": "checkpoint-upload", "content_hash": contentHash, "byte_size": len(content),
++		"artifact_ref": Object{"entity_type": "Artifact", "id": "a", "content_hash": contentHash, "revision": 1}}
++	use["receipt_hash"] = Receipt(use)
++	pauseStorageExec(t, db, `INSERT INTO auth_principals(id,roles,can_create_project) VALUES('executor','["EXECUTOR"]',0)`)
++	pauseStorageExec(t, db, `INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES('checkpoint-upload','p','executor',?,?,'2099-01-01T00:00:00Z',1)`, content, contentHash)
++	pauseStorageExec(t, db, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Artifact','a',1,?)`, string(Bytes(Object{"kind": "CHECKPOINT", "content_hash": contentHash})))
++	pauseStorageExec(t, db, `INSERT INTO artifact_uses(project,artifact,run,epoch,principal,storage_key,receipt_hash,body) VALUES('p','a','r',1,'executor','checkpoint-upload',?,?)`, use["receipt_hash"], string(Bytes(use)))
++	if err := backupPauseUse(db, "p", "r", int64(1), "a", contentHash, use["receipt_hash"], "executor"); err != nil {
++		t.Fatal("bound original use rejected", err)
++	}
++	if err := backupPauseUse(db, "p", "r", int64(2), "a", contentHash, use["receipt_hash"], "executor"); err == nil {
++		t.Fatal("old checkpoint relabelled as new epoch")
++	}
++	if err := backupPauseUse(db, "p", "r", int64(1), "a", contentHash, use["receipt_hash"], "another-principal"); err == nil {
++		t.Fatal("wrong contribution principal accepted")
++	}
++	configurationBackupMutation(t, db, `UPDATE uploaded_content SET bytes=? WHERE storage_key='checkpoint-upload'`, []byte(strings.Repeat("x", len(content))))
++	if err := backupPauseUse(db, "p", "r", int64(1), "a", contentHash, use["receipt_hash"], "executor"); err == nil {
++		t.Fatal("stored hash columns hid corrupted same-size checkpoint bytes")
++	}
++}
++
++// Positive history and rejection regressions adapted from the independent review.
++func pauseStorageValidHistory(t *testing.T) (*sql.DB, string, string) {
++	db, _ := configurationDB(t, 25, true)
++	pauseStorageExec(t, db, `INSERT INTO auth_principals(id,roles) VALUES('actor','["OWNER"]'),('executor','["EXECUTOR"]'),('other-executor','["EXECUTOR"]')`)
++	pauseStorageExec(t, db, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Task','t',1,'{}'),('p','Run','r',1,'{"status":"RUNNING","task_id":"t","lease_epoch":2,"executor_principal_id":"executor"}')`)
++	pauseStorageExec(t, db, `INSERT INTO client_sessions(id,project_id,revision,created_at,updated_at,task_id,run_id,writer_epoch,writer_client_id,event_watermark,upstream_session_id) VALUES('s','p',1,'now','now','t','r',1,'client',0,'native')`)
++	pauseStorageExec(t, db, `INSERT INTO client_queue_fences(project,task_id,session_id,generation,state) VALUES('p','t','s','g','OPEN')`)
++	pauseStorageExec(t, db, `INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,identity,prepared_at,updated_at) VALUES('p','r',1,'d1','{}','m1','OBSERVED','{}','now','now'),('p','r',2,'d2','{}','m2','PREPARED','{}','now','now')`)
++	pauseStorageExec(t, db, `INSERT INTO runtime_pause_intents(project,pause_id,task,run,epoch,session_id,generation,principal,request_key,request_hash,runtime,dispatch_key,manifest_hash,process_identity_hash,original_input_hash,state,created_at,updated_at) VALUES('p','pause','t','r',1,'s','g','actor','pause-command','request','runtime','d1','m1',?,'input','PAUSE_REQUESTED','now','now')`, Hash(Object{}))
++	content := []byte(`{"session":"sdk","leaseEpoch":1}`)
++	contentHash := Digest(content)
++	pauseStorageExec(t, db, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Artifact','a',1,?)`, string(Bytes(Object{"kind": "CHECKPOINT", "content_hash": contentHash})))
++	hashes := []string{}
++	for i, principal := range []string{"executor", "other-executor"} {
++		storage := []string{"old-upload", "new-upload"}[i]
++		use := Object{"project_id": "p", "run_id": "r", "lease_epoch": i + 1, "principal_id": principal, "storage_key": storage, "content_hash": contentHash, "byte_size": len(content), "artifact_ref": Object{"entity_type": "Artifact", "id": "a", "content_hash": contentHash, "revision": 1}}
++		use["receipt_hash"] = Receipt(use)
++		hashes = append(hashes, Str(use, "receipt_hash"))
++		pauseStorageExec(t, db, `INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,'p',?,?,?,'2099-01-01T00:00:00Z',1)`, storage, principal, content, contentHash)
++		pauseStorageExec(t, db, `INSERT INTO artifact_uses(project,artifact,run,epoch,principal,storage_key,receipt_hash,body) VALUES('p','a','r',?,?,?,?,?)`, i+1, principal, storage, use["receipt_hash"], string(Bytes(use)))
++	}
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='CHECKPOINT_SEALED',revision=revision+1,checkpoint_sequence=1,checkpoint_artifact='a',checkpoint_use_receipt_hash=?,checkpoint_use_principal='executor',checkpoint_hash=?,checkpoint_bytes=?,native_session_ref='native',sdk_session_id='sdk',queue_cut=0,command_ledger_hash='ledger',sdk_watermarks_json='{}',model_calls=1,tool_calls=2,journal_checkpoint_hash='journal'`, hashes[0], contentHash, len(content))
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='PAUSED_CONFIRMED',revision=revision+1`)
++	pauseStorageWitness(t, db)
++	if err := validateBackupPause(db); err != nil {
++		t.Fatal("valid paused fixture", err)
++	}
++	return db, hashes[0], hashes[1]
++}
++
++func pauseStorageActivate(t *testing.T, db *sql.DB, oldUse, newUse, actor string) error {
++	pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='RESUME_PREPARED',successor_epoch=2,revision=revision+1`)
++	pauseStorageExec(t, db, `INSERT INTO resource_checkpoint_carries(project,run,epoch,body) VALUES('p','r',2,?)`, string(Bytes(Object{"actor": "actor", "artifact_ref": Object{"entity_type": "Artifact", "id": "a", "content_hash": pauseStorageCheckpointHash(t, db)}, "from_use_receipt_hash": oldUse, "from_epoch": 1, "to_epoch": 2, "new_upload_key": "new-upload", "reason": "CHECKPOINT_CARRY_NOT_NEW_RESULT"})))
++	_, err := db.Exec(`INSERT INTO runtime_checkpoint_activations(project,run,epoch,previous_epoch,pause_id,task,session_id,generation,principal,request_key,request_hash,dispatch_key,manifest_hash,checkpoint_artifact,checkpoint_hash,checkpoint_use_receipt_hash,checkpoint_use_principal,carry_use_receipt_hash,carry_use_principal,original_input_hash,native_session_ref,sdk_session_id,queue_cut,model_calls,tool_calls,created_at)
++ SELECT project,run,2,epoch,pause_id,task,session_id,generation,?,'resume-command','resume-request','d2','m2',checkpoint_artifact,checkpoint_hash,checkpoint_use_receipt_hash,checkpoint_use_principal,?,'other-executor',original_input_hash,native_session_ref,sdk_session_id,queue_cut,model_calls,tool_calls,'now' FROM runtime_pause_intents`, actor, newUse)
++	if err == nil {
++		pauseStorageWitness(t, db)
++	}
++	return err
++}
++
++func pauseStorageCheckpointHash(t *testing.T, db *sql.DB) string {
++	t.Helper()
++	var hash string
++	if err := db.QueryRow(`SELECT checkpoint_hash FROM runtime_pause_intents WHERE pause_id='pause'`).Scan(&hash); err != nil {
++		t.Fatal(err)
++	}
++	return hash
++}
++
++func pauseStorageWitness(t *testing.T, db *sql.DB) {
++	t.Helper()
++	rows, err := configurationBackupRows(db, `SELECT * FROM runtime_pause_intents WHERE project='p' AND pause_id='pause'`)
++	if err != nil || len(rows) != 1 {
++		t.Fatal(rows, err)
++	}
++	intent := rows[0]
++	var count int
++	if err := db.QueryRow(`SELECT count(*) FROM runtime_pause_receipts WHERE project='p' AND pause_id='pause'`).Scan(&count); err != nil {
++		t.Fatal(err)
++	}
++	var previous any
++	if count > 0 {
++		var hash string
++		if err := db.QueryRow(`SELECT body_hash FROM runtime_pause_receipts WHERE project='p' AND pause_id='pause' AND sequence=?`, count).Scan(&hash); err != nil {
++			t.Fatal(err)
++		}
++		previous = hash
++	}
++	body := Object{"project": "p", "pause_id": "pause", "kind": "STATE_TRANSITION", "sequence": count + 1, "state": intent["state"], "revision": intent["revision"], "intent_hash": Hash(intent)}
++	pauseStorageExec(t, db, `INSERT INTO runtime_pause_receipts(receipt_id,project,pause_id,sequence,kind,body,body_hash,previous_receipt_hash,created_at) VALUES(?,'p','pause',?,'STATE_TRANSITION',?,?,?,'now')`, fmt.Sprintf("witness-%d", count+1), count+1, string(Bytes(body)), Hash(body), previous)
++}
++
++func TestPauseStorageCancelRequestedRejectsSuccessor(t *testing.T) {
++	db, oldUse, newUse := pauseStorageValidHistory(t)
++	pauseStorageExec(t, db, `UPDATE domain_objects SET body=json_set(body,'$.status','CANCEL_REQUESTED') WHERE kind='Run'`)
++	if err := pauseStorageActivate(t, db, oldUse, newUse, "actor"); err == nil {
++		t.Fatal("cancel-requested execution acquired successor")
++	}
++}
++
++func TestPauseStorageActivationAndCarryProvenance(t *testing.T) {
++	for _, mutation := range []string{"", "missing-actor", "carry-actor", "carry-upload", "carry-artifact", "carry-hash", "carry-principal", "upload-principal"} {
++		name := mutation
++		if name == "" {
++			name = "valid"
++		}
++		t.Run(name, func(t *testing.T) {
++			db, oldUse, newUse := pauseStorageValidHistory(t)
++			actor := "actor"
++			if mutation == "missing-actor" {
++				actor = "absent"
++			}
++			if err := pauseStorageActivate(t, db, oldUse, newUse, actor); err != nil {
++				t.Fatal(err)
++			}
++			switch mutation {
++			case "carry-actor":
++				pauseStorageExec(t, db, `UPDATE resource_checkpoint_carries SET body=json_set(body,'$.actor','absent')`)
++			case "carry-upload":
++				pauseStorageExec(t, db, `UPDATE resource_checkpoint_carries SET body=json_set(body,'$.new_upload_key','absent')`)
++			case "carry-artifact":
++				pauseStorageExec(t, db, `UPDATE resource_checkpoint_carries SET body=json_set(body,'$.artifact_ref.id','absent')`)
++			case "carry-hash":
++				pauseStorageExec(t, db, `UPDATE resource_checkpoint_carries SET body=json_set(body,'$.artifact_ref.content_hash','wrong')`)
++			case "carry-principal":
++				configurationBackupMutation(t, db, `UPDATE artifact_uses SET principal='executor' WHERE epoch=2`)
++			case "upload-principal":
++				configurationBackupMutation(t, db, `UPDATE uploaded_content SET principal='executor' WHERE storage_key='new-upload'`)
++			}
++			err := validateBackupPause(db)
++			if mutation == "" && err != nil {
++				t.Fatal("valid historical carry rejected", err)
++			}
++			if mutation != "" && err == nil {
++				t.Fatal("invalid provenance accepted", mutation)
++			}
++		})
++	}
++}
++
++func TestPauseStorageCurrentStateWitnessRequired(t *testing.T) {
++	for _, mutation := range []string{"missing", "stale", "intent-hash", "state", "sequence"} {
++		t.Run(mutation, func(t *testing.T) {
++			db, _, _ := pauseStorageValidHistory(t)
++			if mutation == "missing" {
++				configurationBackupMutation(t, db, `DELETE FROM runtime_pause_receipts`)
++			}
++			if mutation == "stale" {
++				pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET revision=revision+1,updated_at='later'`)
++			}
++			if mutation == "intent-hash" || mutation == "state" || mutation == "sequence" {
++				rows, err := configurationBackupRows(db, `SELECT * FROM runtime_pause_receipts WHERE sequence=1`)
++				if err != nil {
++					t.Fatal(err)
++				}
++				var body Object
++				if err := json.Unmarshal([]byte(Str(rows[0], "body")), &body); err != nil {
++					t.Fatal(err)
++				}
++				if mutation == "intent-hash" {
++					body["intent_hash"] = "wrong"
++				}
++				if mutation == "state" {
++					body["state"] = "PAUSE_REQUESTED"
++				}
++				if mutation == "sequence" {
++					body["sequence"] = 7
++				}
++				configurationBackupMutation(t, db, `UPDATE runtime_pause_receipts SET body=?,body_hash=? WHERE sequence=1`, string(Bytes(body)), Hash(body))
++			}
++			if err := validateBackupPause(db); err == nil {
++				t.Fatal("missing or mismatched state witness accepted", mutation)
++			}
++		})
++	}
++}
+diff --git a/internal/domain/backup_prepared_abandonment_upgrade.go b/internal/domain/backup_prepared_abandonment_upgrade.go
+index 2afef502..ccb8ac53 100644
+--- a/internal/domain/backup_prepared_abandonment_upgrade.go
++++ b/internal/domain/backup_prepared_abandonment_upgrade.go
+@@ -557,6 +557,12 @@ ORDER BY type,name`
+ // This validates exactly the table, autoindexes and six triggers from SQL24.
+ func backupPreparedAbandonmentSchema(db *sql.DB) error {
+     if err := preparedUpgradeVersions(db, 24); err != nil { return err }
++    return backupPreparedAbandonmentFingerprint(db)
++}
++
++// The fixed23-to24 entry retains its version gate; schema25 separately validates
++// its own exact version before reusing the unchanged additive24 fingerprint.
++func backupPreparedAbandonmentFingerprint(db *sql.DB) error {
+     backupPreparedAbandonmentSchemaOnce.Do(func() {
+         if Digest(backupPreparedAbandonmentSQL) != preparedUpgradeSQLHash {
+             backupPreparedAbandonmentSchemaError = fmt.Errorf("BACKUP_PREPARED_ABANDONMENT_SQL_HASH")
+diff --git a/internal/domain/backup_prepared_abandonment_upgrade_test.go b/internal/domain/backup_prepared_abandonment_upgrade_test.go
+index 11118c23..e686b468 100644
+--- a/internal/domain/backup_prepared_abandonment_upgrade_test.go
++++ b/internal/domain/backup_prepared_abandonment_upgrade_test.go
+@@ -208,11 +208,13 @@ func TestPreparedUpgradeBackupRecognizesOnlyExact24Schema(t *testing.T) {
+     if _, err = backupConfigurationPresent(db); err == nil || !strings.Contains(err.Error(), "BACKUP_PREPARED_ABANDONMENT_SCHEMA") { t.Fatal("altered24 accepted", err) }
+ }
+ 
+-func TestPreparedUpgradeBackupRejectsFuture25(t *testing.T) {
++func TestPreparedUpgradeBackupRejectsFuture26(t *testing.T) {
+     db, raw, schemas := preparedUpgradeTestDB(t)
+     before, err := preparedUpgradeSnapshot(db)
+     if err != nil { t.Fatal(err) }
+     if err = preparedUpgradeRehearseDDL(context.Background(), db, raw, before, schemas.Source23, schemas.Original24); err != nil { t.Fatal(err) }
+     if _, err = db.Exec("INSERT INTO schema_migrations(version) VALUES(25)"); err != nil { t.Fatal(err) }
+-    if _, err = backupConfigurationPresent(db); err == nil || !strings.Contains(err.Error(), "BACKUP_CONFIGURATION_VERSION") { t.Fatal("future25 accepted", err) }
++    if _, err = backupConfigurationPresent(db); err == nil || !strings.Contains(err.Error(), "BACKUP_PAUSE_SCHEMA") { t.Fatal("malformed25 accepted", err) }
++    if _, err = db.Exec("INSERT INTO schema_migrations(version) VALUES(26)"); err != nil { t.Fatal(err) }
++    if _, err = backupConfigurationPresent(db); err == nil || !strings.Contains(err.Error(), "BACKUP_CONFIGURATION_VERSION") { t.Fatal("future26 accepted", err) }
+ }
+diff --git a/internal/domain/contracts/runtime_pause_activations.sql b/internal/domain/contracts/runtime_pause_activations.sql
+new file mode 100644
+index 00000000..af418f3d
+--- /dev/null
++++ b/internal/domain/contracts/runtime_pause_activations.sql
+@@ -0,0 +1,117 @@
++-- Internal pause authority. Public Run enums and the original queue generation stay unchanged.
++CREATE TABLE runtime_pause_intents (
++ project TEXT NOT NULL, pause_id TEXT NOT NULL, task TEXT NOT NULL, run TEXT NOT NULL,
++ epoch INTEGER NOT NULL CHECK(epoch>0), session_id TEXT NOT NULL, generation TEXT NOT NULL,
++ principal TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
++ runtime TEXT NOT NULL, dispatch_key TEXT NOT NULL, manifest_hash TEXT NOT NULL,
++ process_identity_hash TEXT NOT NULL, original_input_hash TEXT NOT NULL,
++ state TEXT NOT NULL CHECK(state IN ('PAUSE_REQUESTED','CHECKPOINT_SEALED','PAUSED_CONFIRMED','RESUME_PREPARED','RESUMED','CANCELLED','RECONCILING')),
++ revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
++ checkpoint_sequence INTEGER CHECK(checkpoint_sequence>0),
++ checkpoint_artifact TEXT, checkpoint_use_receipt_hash TEXT, checkpoint_use_principal TEXT, checkpoint_hash TEXT,
++ checkpoint_bytes INTEGER CHECK(checkpoint_bytes>0 AND checkpoint_bytes<=12582912),
++ native_session_ref TEXT, sdk_session_id TEXT,
++ queue_cut INTEGER CHECK(queue_cut>=0), command_ledger_hash TEXT,
++ sdk_watermarks_json TEXT CHECK(sdk_watermarks_json IS NULL OR (json_valid(sdk_watermarks_json) AND json_type(sdk_watermarks_json)='object')),
++ model_calls INTEGER CHECK(model_calls>=0), tool_calls INTEGER CHECK(tool_calls>=0),
++ journal_checkpoint_hash TEXT, successor_epoch INTEGER CHECK(successor_epoch=epoch+1),
++ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
++ PRIMARY KEY(project,pause_id), UNIQUE(project,run,epoch), UNIQUE(principal,project,request_key),
++ FOREIGN KEY(project,run,epoch) REFERENCES runtime_dispatches(project,run,epoch),
++ FOREIGN KEY(generation) REFERENCES client_queue_fences(generation),
++ CHECK((checkpoint_hash IS NULL AND checkpoint_sequence IS NULL AND checkpoint_artifact IS NULL
++  AND checkpoint_use_receipt_hash IS NULL AND checkpoint_use_principal IS NULL AND checkpoint_bytes IS NULL AND native_session_ref IS NULL
++  AND sdk_session_id IS NULL AND queue_cut IS NULL AND command_ledger_hash IS NULL
++  AND sdk_watermarks_json IS NULL AND model_calls IS NULL AND tool_calls IS NULL AND journal_checkpoint_hash IS NULL)
++ OR (checkpoint_hash IS NOT NULL AND checkpoint_sequence IS NOT NULL AND checkpoint_artifact IS NOT NULL
++  AND checkpoint_use_receipt_hash IS NOT NULL AND checkpoint_use_principal IS NOT NULL AND checkpoint_bytes IS NOT NULL AND native_session_ref IS NOT NULL
++  AND sdk_session_id IS NOT NULL AND queue_cut IS NOT NULL AND command_ledger_hash IS NOT NULL
++  AND sdk_watermarks_json IS NOT NULL AND model_calls IS NOT NULL AND tool_calls IS NOT NULL AND journal_checkpoint_hash IS NOT NULL)),
++ CHECK(state IN ('PAUSE_REQUESTED','RECONCILING','CANCELLED') OR checkpoint_hash IS NOT NULL),
++ CHECK(state NOT IN ('RESUME_PREPARED','RESUMED') OR successor_epoch IS NOT NULL),
++ CHECK(successor_epoch IS NULL OR state IN ('RESUME_PREPARED','RESUMED','RECONCILING','CANCELLED'))
++);
++CREATE INDEX runtime_pause_active ON runtime_pause_intents(project,task,state);
++CREATE TRIGGER runtime_pause_identity_frozen BEFORE UPDATE OF project,pause_id,task,run,epoch,session_id,generation,principal,request_key,request_hash,runtime,dispatch_key,manifest_hash,process_identity_hash,original_input_hash,created_at
++ON runtime_pause_intents BEGIN SELECT RAISE(ABORT,'pause original identity immutable'); END;
++CREATE TRIGGER runtime_pause_revision BEFORE UPDATE ON runtime_pause_intents
++WHEN NEW.revision<>OLD.revision+1 BEGIN SELECT RAISE(ABORT,'pause revision must advance once'); END;
++CREATE TRIGGER runtime_pause_no_delete BEFORE DELETE ON runtime_pause_intents
++BEGIN SELECT RAISE(ABORT,'pause history retained'); END;
++CREATE TRIGGER runtime_pause_snapshot_frozen BEFORE UPDATE ON runtime_pause_intents
++WHEN OLD.checkpoint_hash IS NOT NULL AND
++ (NEW.checkpoint_sequence IS NOT OLD.checkpoint_sequence OR NEW.checkpoint_artifact IS NOT OLD.checkpoint_artifact
++ OR NEW.checkpoint_use_receipt_hash IS NOT OLD.checkpoint_use_receipt_hash OR NEW.checkpoint_use_principal IS NOT OLD.checkpoint_use_principal OR NEW.checkpoint_hash IS NOT OLD.checkpoint_hash
++ OR NEW.checkpoint_bytes IS NOT OLD.checkpoint_bytes OR NEW.native_session_ref IS NOT OLD.native_session_ref
++ OR NEW.sdk_session_id IS NOT OLD.sdk_session_id OR NEW.queue_cut IS NOT OLD.queue_cut
++ OR NEW.command_ledger_hash IS NOT OLD.command_ledger_hash OR NEW.sdk_watermarks_json IS NOT OLD.sdk_watermarks_json
++ OR NEW.model_calls IS NOT OLD.model_calls OR NEW.tool_calls IS NOT OLD.tool_calls
++ OR NEW.journal_checkpoint_hash IS NOT OLD.journal_checkpoint_hash)
++BEGIN SELECT RAISE(ABORT,'sealed pause snapshot immutable'); END;
++CREATE TRIGGER runtime_pause_successor_frozen BEFORE UPDATE ON runtime_pause_intents
++WHEN OLD.successor_epoch IS NOT NULL AND NEW.successor_epoch IS NOT OLD.successor_epoch
++BEGIN SELECT RAISE(ABORT,'pause successor immutable'); END;
++CREATE TRIGGER runtime_pause_transition BEFORE UPDATE ON runtime_pause_intents
++WHEN NOT (NEW.state=OLD.state OR NEW.state='CANCELLED'
++ OR (OLD.state='PAUSE_REQUESTED' AND NEW.state IN ('CHECKPOINT_SEALED','RECONCILING'))
++ OR (OLD.state='CHECKPOINT_SEALED' AND NEW.state IN ('PAUSED_CONFIRMED','RECONCILING'))
++ OR (OLD.state='PAUSED_CONFIRMED' AND NEW.state IN ('RESUME_PREPARED','RECONCILING'))
++ OR (OLD.state='RESUME_PREPARED' AND NEW.state IN ('RESUMED','RECONCILING'))
++ OR (OLD.state='RECONCILING' AND NEW.state IN ('CHECKPOINT_SEALED','PAUSED_CONFIRMED','RESUME_PREPARED','RESUMED')))
++ OR (OLD.state='CANCELLED' AND NEW.state<>'CANCELLED')
++BEGIN SELECT RAISE(ABORT,'invalid pause transition'); END;
++
++-- One immutable activation per successor epoch. Later process observations are receipts.
++CREATE TABLE runtime_checkpoint_activations (
++ project TEXT NOT NULL, run TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch>1),
++ previous_epoch INTEGER NOT NULL CHECK(previous_epoch>0 AND epoch=previous_epoch+1),
++ pause_id TEXT NOT NULL, task TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
++ principal TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
++ dispatch_key TEXT NOT NULL, manifest_hash TEXT NOT NULL,
++ checkpoint_artifact TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, checkpoint_use_receipt_hash TEXT NOT NULL, checkpoint_use_principal TEXT NOT NULL,
++ carry_use_receipt_hash TEXT NOT NULL, carry_use_principal TEXT NOT NULL, original_input_hash TEXT NOT NULL,
++ native_session_ref TEXT NOT NULL, sdk_session_id TEXT NOT NULL,
++ queue_cut INTEGER NOT NULL CHECK(queue_cut>=0), model_calls INTEGER NOT NULL CHECK(model_calls>=0),
++ tool_calls INTEGER NOT NULL CHECK(tool_calls>=0), created_at TEXT NOT NULL,
++ PRIMARY KEY(project,run,epoch), UNIQUE(project,run,previous_epoch), UNIQUE(principal,project,request_key),
++ FOREIGN KEY(project,pause_id) REFERENCES runtime_pause_intents(project,pause_id),
++ FOREIGN KEY(project,run,epoch) REFERENCES runtime_dispatches(project,run,epoch),
++ FOREIGN KEY(generation) REFERENCES client_queue_fences(generation)
++);
++CREATE TRIGGER runtime_checkpoint_activation_no_update BEFORE UPDATE ON runtime_checkpoint_activations
++BEGIN SELECT RAISE(ABORT,'checkpoint activation immutable'); END;
++CREATE TRIGGER runtime_checkpoint_activation_no_delete BEFORE DELETE ON runtime_checkpoint_activations
++BEGIN SELECT RAISE(ABORT,'checkpoint activation durable'); END;
++CREATE TRIGGER runtime_checkpoint_activation_binding BEFORE INSERT ON runtime_checkpoint_activations
++WHEN NOT EXISTS(SELECT 1 FROM runtime_pause_intents p WHERE p.project=NEW.project AND p.pause_id=NEW.pause_id
++ AND p.run=NEW.run AND p.epoch=NEW.previous_epoch AND p.successor_epoch=NEW.epoch
++ AND p.task=NEW.task AND p.session_id=NEW.session_id AND p.generation=NEW.generation
++ AND p.state='RESUME_PREPARED' AND p.checkpoint_artifact=NEW.checkpoint_artifact
++ AND p.checkpoint_hash=NEW.checkpoint_hash AND p.checkpoint_use_receipt_hash=NEW.checkpoint_use_receipt_hash
++ AND p.checkpoint_use_principal=NEW.checkpoint_use_principal AND p.original_input_hash=NEW.original_input_hash AND p.native_session_ref=NEW.native_session_ref
++ AND p.sdk_session_id=NEW.sdk_session_id AND p.queue_cut=NEW.queue_cut
++ AND p.model_calls=NEW.model_calls AND p.tool_calls=NEW.tool_calls)
++ OR EXISTS(SELECT 1 FROM client_queue_fences f WHERE f.generation=NEW.generation
++ AND (f.state<>'OPEN' OR f.restore_fenced<>0))
++ OR NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=NEW.project AND r.kind='Run' AND r.id=NEW.run
++ AND json_extract(r.body,'$.status') NOT IN ('CANCEL_REQUESTED','CANCELLED','FAILED','SETTLED'))
++BEGIN SELECT RAISE(ABORT,'successor activation requires original paused authority'); END;
++
++CREATE TABLE runtime_pause_receipts (
++ receipt_id TEXT PRIMARY KEY, project TEXT NOT NULL, pause_id TEXT NOT NULL,
++ sequence INTEGER NOT NULL CHECK(sequence>0), kind TEXT NOT NULL,
++ body TEXT NOT NULL CHECK(json_valid(body) AND json_type(body)='object'), body_hash TEXT NOT NULL,
++ previous_receipt_hash TEXT, created_at TEXT NOT NULL,
++ UNIQUE(project,pause_id,sequence), UNIQUE(project,pause_id,body_hash),
++ FOREIGN KEY(project,pause_id) REFERENCES runtime_pause_intents(project,pause_id)
++);
++CREATE TRIGGER runtime_pause_receipt_chain BEFORE INSERT ON runtime_pause_receipts
++WHEN (NEW.sequence=1 AND NEW.previous_receipt_hash IS NOT NULL)
++ OR (NEW.sequence>1 AND NOT EXISTS(SELECT 1 FROM runtime_pause_receipts p
++ WHERE p.project=NEW.project AND p.pause_id=NEW.pause_id AND p.sequence=NEW.sequence-1
++ AND p.body_hash=NEW.previous_receipt_hash))
++BEGIN SELECT RAISE(ABORT,'pause receipt predecessor required'); END;
++CREATE TRIGGER runtime_pause_receipt_no_update BEFORE UPDATE ON runtime_pause_receipts
++BEGIN SELECT RAISE(ABORT,'append-only pause receipt'); END;
++CREATE TRIGGER runtime_pause_receipt_no_delete BEFORE DELETE ON runtime_pause_receipts
++BEGIN SELECT RAISE(ABORT,'durable pause receipt'); END;
+diff --git a/migrations/sqlite/0025_runtime_pause_activations.sql b/migrations/sqlite/0025_runtime_pause_activations.sql
+new file mode 100644
+index 00000000..af418f3d
+--- /dev/null
++++ b/migrations/sqlite/0025_runtime_pause_activations.sql
+@@ -0,0 +1,117 @@
++-- Internal pause authority. Public Run enums and the original queue generation stay unchanged.
++CREATE TABLE runtime_pause_intents (
++ project TEXT NOT NULL, pause_id TEXT NOT NULL, task TEXT NOT NULL, run TEXT NOT NULL,
++ epoch INTEGER NOT NULL CHECK(epoch>0), session_id TEXT NOT NULL, generation TEXT NOT NULL,
++ principal TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
++ runtime TEXT NOT NULL, dispatch_key TEXT NOT NULL, manifest_hash TEXT NOT NULL,
++ process_identity_hash TEXT NOT NULL, original_input_hash TEXT NOT NULL,
++ state TEXT NOT NULL CHECK(state IN ('PAUSE_REQUESTED','CHECKPOINT_SEALED','PAUSED_CONFIRMED','RESUME_PREPARED','RESUMED','CANCELLED','RECONCILING')),
++ revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
++ checkpoint_sequence INTEGER CHECK(checkpoint_sequence>0),
++ checkpoint_artifact TEXT, checkpoint_use_receipt_hash TEXT, checkpoint_use_principal TEXT, checkpoint_hash TEXT,
++ checkpoint_bytes INTEGER CHECK(checkpoint_bytes>0 AND checkpoint_bytes<=12582912),
++ native_session_ref TEXT, sdk_session_id TEXT,
++ queue_cut INTEGER CHECK(queue_cut>=0), command_ledger_hash TEXT,
++ sdk_watermarks_json TEXT CHECK(sdk_watermarks_json IS NULL OR (json_valid(sdk_watermarks_json) AND json_type(sdk_watermarks_json)='object')),
++ model_calls INTEGER CHECK(model_calls>=0), tool_calls INTEGER CHECK(tool_calls>=0),
++ journal_checkpoint_hash TEXT, successor_epoch INTEGER CHECK(successor_epoch=epoch+1),
++ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
++ PRIMARY KEY(project,pause_id), UNIQUE(project,run,epoch), UNIQUE(principal,project,request_key),
++ FOREIGN KEY(project,run,epoch) REFERENCES runtime_dispatches(project,run,epoch),
++ FOREIGN KEY(generation) REFERENCES client_queue_fences(generation),
++ CHECK((checkpoint_hash IS NULL AND checkpoint_sequence IS NULL AND checkpoint_artifact IS NULL
++  AND checkpoint_use_receipt_hash IS NULL AND checkpoint_use_principal IS NULL AND checkpoint_bytes IS NULL AND native_session_ref IS NULL
++  AND sdk_session_id IS NULL AND queue_cut IS NULL AND command_ledger_hash IS NULL
++  AND sdk_watermarks_json IS NULL AND model_calls IS NULL AND tool_calls IS NULL AND journal_checkpoint_hash IS NULL)
++ OR (checkpoint_hash IS NOT NULL AND checkpoint_sequence IS NOT NULL AND checkpoint_artifact IS NOT NULL
++  AND checkpoint_use_receipt_hash IS NOT NULL AND checkpoint_use_principal IS NOT NULL AND checkpoint_bytes IS NOT NULL AND native_session_ref IS NOT NULL
++  AND sdk_session_id IS NOT NULL AND queue_cut IS NOT NULL AND command_ledger_hash IS NOT NULL
++  AND sdk_watermarks_json IS NOT NULL AND model_calls IS NOT NULL AND tool_calls IS NOT NULL AND journal_checkpoint_hash IS NOT NULL)),
++ CHECK(state IN ('PAUSE_REQUESTED','RECONCILING','CANCELLED') OR checkpoint_hash IS NOT NULL),
++ CHECK(state NOT IN ('RESUME_PREPARED','RESUMED') OR successor_epoch IS NOT NULL),
++ CHECK(successor_epoch IS NULL OR state IN ('RESUME_PREPARED','RESUMED','RECONCILING','CANCELLED'))
++);
++CREATE INDEX runtime_pause_active ON runtime_pause_intents(project,task,state);
++CREATE TRIGGER runtime_pause_identity_frozen BEFORE UPDATE OF project,pause_id,task,run,epoch,session_id,generation,principal,request_key,request_hash,runtime,dispatch_key,manifest_hash,process_identity_hash,original_input_hash,created_at
++ON runtime_pause_intents BEGIN SELECT RAISE(ABORT,'pause original identity immutable'); END;
++CREATE TRIGGER runtime_pause_revision BEFORE UPDATE ON runtime_pause_intents
++WHEN NEW.revision<>OLD.revision+1 BEGIN SELECT RAISE(ABORT,'pause revision must advance once'); END;
++CREATE TRIGGER runtime_pause_no_delete BEFORE DELETE ON runtime_pause_intents
++BEGIN SELECT RAISE(ABORT,'pause history retained'); END;
++CREATE TRIGGER runtime_pause_snapshot_frozen BEFORE UPDATE ON runtime_pause_intents
++WHEN OLD.checkpoint_hash IS NOT NULL AND
++ (NEW.checkpoint_sequence IS NOT OLD.checkpoint_sequence OR NEW.checkpoint_artifact IS NOT OLD.checkpoint_artifact
++ OR NEW.checkpoint_use_receipt_hash IS NOT OLD.checkpoint_use_receipt_hash OR NEW.checkpoint_use_principal IS NOT OLD.checkpoint_use_principal OR NEW.checkpoint_hash IS NOT OLD.checkpoint_hash
++ OR NEW.checkpoint_bytes IS NOT OLD.checkpoint_bytes OR NEW.native_session_ref IS NOT OLD.native_session_ref
++ OR NEW.sdk_session_id IS NOT OLD.sdk_session_id OR NEW.queue_cut IS NOT OLD.queue_cut
++ OR NEW.command_ledger_hash IS NOT OLD.command_ledger_hash OR NEW.sdk_watermarks_json IS NOT OLD.sdk_watermarks_json
++ OR NEW.model_calls IS NOT OLD.model_calls OR NEW.tool_calls IS NOT OLD.tool_calls
++ OR NEW.journal_checkpoint_hash IS NOT OLD.journal_checkpoint_hash)
++BEGIN SELECT RAISE(ABORT,'sealed pause snapshot immutable'); END;
++CREATE TRIGGER runtime_pause_successor_frozen BEFORE UPDATE ON runtime_pause_intents
++WHEN OLD.successor_epoch IS NOT NULL AND NEW.successor_epoch IS NOT OLD.successor_epoch
++BEGIN SELECT RAISE(ABORT,'pause successor immutable'); END;
++CREATE TRIGGER runtime_pause_transition BEFORE UPDATE ON runtime_pause_intents
++WHEN NOT (NEW.state=OLD.state OR NEW.state='CANCELLED'
++ OR (OLD.state='PAUSE_REQUESTED' AND NEW.state IN ('CHECKPOINT_SEALED','RECONCILING'))
++ OR (OLD.state='CHECKPOINT_SEALED' AND NEW.state IN ('PAUSED_CONFIRMED','RECONCILING'))
++ OR (OLD.state='PAUSED_CONFIRMED' AND NEW.state IN ('RESUME_PREPARED','RECONCILING'))
++ OR (OLD.state='RESUME_PREPARED' AND NEW.state IN ('RESUMED','RECONCILING'))
++ OR (OLD.state='RECONCILING' AND NEW.state IN ('CHECKPOINT_SEALED','PAUSED_CONFIRMED','RESUME_PREPARED','RESUMED')))
++ OR (OLD.state='CANCELLED' AND NEW.state<>'CANCELLED')
++BEGIN SELECT RAISE(ABORT,'invalid pause transition'); END;
++
++-- One immutable activation per successor epoch. Later process observations are receipts.
++CREATE TABLE runtime_checkpoint_activations (
++ project TEXT NOT NULL, run TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch>1),
++ previous_epoch INTEGER NOT NULL CHECK(previous_epoch>0 AND epoch=previous_epoch+1),
++ pause_id TEXT NOT NULL, task TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
++ principal TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
++ dispatch_key TEXT NOT NULL, manifest_hash TEXT NOT NULL,
++ checkpoint_artifact TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, checkpoint_use_receipt_hash TEXT NOT NULL, checkpoint_use_principal TEXT NOT NULL,
++ carry_use_receipt_hash TEXT NOT NULL, carry_use_principal TEXT NOT NULL, original_input_hash TEXT NOT NULL,
++ native_session_ref TEXT NOT NULL, sdk_session_id TEXT NOT NULL,
++ queue_cut INTEGER NOT NULL CHECK(queue_cut>=0), model_calls INTEGER NOT NULL CHECK(model_calls>=0),
++ tool_calls INTEGER NOT NULL CHECK(tool_calls>=0), created_at TEXT NOT NULL,
++ PRIMARY KEY(project,run,epoch), UNIQUE(project,run,previous_epoch), UNIQUE(principal,project,request_key),
++ FOREIGN KEY(project,pause_id) REFERENCES runtime_pause_intents(project,pause_id),
++ FOREIGN KEY(project,run,epoch) REFERENCES runtime_dispatches(project,run,epoch),
++ FOREIGN KEY(generation) REFERENCES client_queue_fences(generation)
++);
++CREATE TRIGGER runtime_checkpoint_activation_no_update BEFORE UPDATE ON runtime_checkpoint_activations
++BEGIN SELECT RAISE(ABORT,'checkpoint activation immutable'); END;
++CREATE TRIGGER runtime_checkpoint_activation_no_delete BEFORE DELETE ON runtime_checkpoint_activations
++BEGIN SELECT RAISE(ABORT,'checkpoint activation durable'); END;
++CREATE TRIGGER runtime_checkpoint_activation_binding BEFORE INSERT ON runtime_checkpoint_activations
++WHEN NOT EXISTS(SELECT 1 FROM runtime_pause_intents p WHERE p.project=NEW.project AND p.pause_id=NEW.pause_id
++ AND p.run=NEW.run AND p.epoch=NEW.previous_epoch AND p.successor_epoch=NEW.epoch
++ AND p.task=NEW.task AND p.session_id=NEW.session_id AND p.generation=NEW.generation
++ AND p.state='RESUME_PREPARED' AND p.checkpoint_artifact=NEW.checkpoint_artifact
++ AND p.checkpoint_hash=NEW.checkpoint_hash AND p.checkpoint_use_receipt_hash=NEW.checkpoint_use_receipt_hash
++ AND p.checkpoint_use_principal=NEW.checkpoint_use_principal AND p.original_input_hash=NEW.original_input_hash AND p.native_session_ref=NEW.native_session_ref
++ AND p.sdk_session_id=NEW.sdk_session_id AND p.queue_cut=NEW.queue_cut
++ AND p.model_calls=NEW.model_calls AND p.tool_calls=NEW.tool_calls)
++ OR EXISTS(SELECT 1 FROM client_queue_fences f WHERE f.generation=NEW.generation
++ AND (f.state<>'OPEN' OR f.restore_fenced<>0))
++ OR NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=NEW.project AND r.kind='Run' AND r.id=NEW.run
++ AND json_extract(r.body,'$.status') NOT IN ('CANCEL_REQUESTED','CANCELLED','FAILED','SETTLED'))
++BEGIN SELECT RAISE(ABORT,'successor activation requires original paused authority'); END;
++
++CREATE TABLE runtime_pause_receipts (
++ receipt_id TEXT PRIMARY KEY, project TEXT NOT NULL, pause_id TEXT NOT NULL,
++ sequence INTEGER NOT NULL CHECK(sequence>0), kind TEXT NOT NULL,
++ body TEXT NOT NULL CHECK(json_valid(body) AND json_type(body)='object'), body_hash TEXT NOT NULL,
++ previous_receipt_hash TEXT, created_at TEXT NOT NULL,
++ UNIQUE(project,pause_id,sequence), UNIQUE(project,pause_id,body_hash),
++ FOREIGN KEY(project,pause_id) REFERENCES runtime_pause_intents(project,pause_id)
++);
++CREATE TRIGGER runtime_pause_receipt_chain BEFORE INSERT ON runtime_pause_receipts
++WHEN (NEW.sequence=1 AND NEW.previous_receipt_hash IS NOT NULL)
++ OR (NEW.sequence>1 AND NOT EXISTS(SELECT 1 FROM runtime_pause_receipts p
++ WHERE p.project=NEW.project AND p.pause_id=NEW.pause_id AND p.sequence=NEW.sequence-1
++ AND p.body_hash=NEW.previous_receipt_hash))
++BEGIN SELECT RAISE(ABORT,'pause receipt predecessor required'); END;
++CREATE TRIGGER runtime_pause_receipt_no_update BEFORE UPDATE ON runtime_pause_receipts
++BEGIN SELECT RAISE(ABORT,'append-only pause receipt'); END;
++CREATE TRIGGER runtime_pause_receipt_no_delete BEFORE DELETE ON runtime_pause_receipts
++BEGIN SELECT RAISE(ABORT,'durable pause receipt'); END;

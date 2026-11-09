@@ -1,0 +1,71 @@
+HOST_ROOT_SELECTED_CROSSWALK {"top_level_keys": ["version", "roots"], "selected_path_matches": [{"ref": "ws-1-1791809357937942400", "real_path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\w05-own-cli-product-agent-20261012", "access": "READ_WRITE", "volume_id": "ee413c31", "file_id": 1125899911390212, "final_path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\w05-own-cli-product-agent-20", "revoked": false}], "previous_g08_ref_only_empty_is_not_absence": true, "root_ref_crosswalk_verified": true, "samehandle_native_identity_accepted": false}
+SOURCE_SNAPSHOT_ROOT_LOOKUP package host
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"researchos.local/research-os/internal/domain"
+)
+
+// SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+// current OS principal originally authorized. It rejects, rather than skips,
+// links, special files and any item outside the explicit resource bounds.
+func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+	var out domain.BackupWorkspaceSnapshot
+	if _, err := h.reverify(); err != nil {
+		return out, err
+	}
+	if h.boundPrincipal() == "" || h.boundPrincipal() != binding.PrincipalID || binding.Status != domain.WorkspaceActive {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_OWNER_DENIED")
+	}
+	if limits.MaxFiles < 0 || limits.MaxDirs < 0 || limits.MaxBytes < 0 || limits.MaxFileBytes < 1 || limits.MaxFileBytes > domain.BackupWorkspaceMaxFileBytes {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_LIMIT_INVALID")
+	}
+	var pinned *RootBinding
+	for _, root := range h.roots.List() {
+		if root.Revoked || !strings.EqualFold(filepath.Clean(root.RealPath), filepath.Clean(binding.RealPath)) {
+			continue
+		}
+		if binding.Access == AccessReadWrite && root.Access != AccessReadWrite {
+			return out, fmt.Errorf("BACKUP_WORKSPACE_ACCESS_MISMATCH")
+		}
+		if pinned != nil {
+			return out, fmt.Errorf("BACKUP_WORKSPACE_AMBIGUOUS_ROOT")
+		}
+		pinned = root
+	}
+	if pinned == nil {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_NOT_PINNED")
+	}
+	// A restored workspace lives under its new data root by design. Allow only
+	// that exact, currently pinned ref and path; every other data-root overlap
+	// remains recursive/unsafe, as does any backup output inside the workspace.
+	dataRoot := filepath.Dir(h.dir)
+	if backupPathsOverlap(binding.RealPath, destination) ||
+		(backupPathsOverlap(binding.RealPath, dataRoot) && !backupRestoredWorkspacePath(dataRoot, binding.AuthorizedRef, pinned)) {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
+	}
+	vol, id, _, err := fileIdentity(pinned.RealPath)
+	if err != nil || vol != pinned.VolumeID || id != pinned.FileID {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_PIN_CHANGED")
+	}
+	if reparse, err := chainHasReparsePoint(pinned.RealPath); err != nil || reparse {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_REPARSE")
+	}
+	root, err := os.OpenRoot(pinned.RealPath)
+	if err != nil {
+		return out, err
+	}
+	defer root.Close()
+	out.Directories = []string{}
+	out.Files = []domain.BackupWorkspaceFile{}
+	var total int64
+	err = filepath.WalkDir(pinned.RealPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+OBSERVER_CLOSURE {"final_observer_metadata": [{"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\live\\current-chat-normal-desktop-first-use-20261012\\data", "exists": true, "size": 4096, "mtime_ns": 1792057259011333100, "ctime_ns": 1791802253732860100, "mode": 16895, "attributes": 16, "native_aux_64bit_fileindex": 2533274794950932, "is_symlink": false}, {"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\live\\current-chat-normal-desktop-first-use-20261012\\data\\researchos.sqlite", "exists": true, "size": 59432960, "mtime_ns": 1792075523344507400, "ctime_ns": 1791802253733905200, "mode": 33206, "attributes": 32, "native_aux_64bit_fileindex": 2533274794950934, "is_symlink": false}, {"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\live\\current-chat-normal-desktop-first-use-20261012\\data\\researchos.sqlite-wal", "exists": true, "size": 4185952, "mtime_ns": 1792075570200883700, "ctime_ns": 1791920316532612400, "mode": 33206, "attributes": 32, "native_aux_64bit_fileindex": 562949958139103, "is_symlink": false}, {"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\live\\current-chat-normal-desktop-first-use-20261012\\data\\researchos.sqlite-shm", "exists": true, "size": 32768, "mtime_ns": 1792057258667366100, "ctime_ns": 1791920316532612400, "mode": 33206, "attributes": 32, "native_aux_64bit_fileindex": 281474981428587, "is_symlink": false}], "all_sqlite_observer_connections_explicitly_closed": true, "no_observer_process_left_running": true, "no_key_or_credentials_material_read": true, "no_original_backup_or_mutation_operation": true, "mutable_live_source_not_snapshot": true}
+G09_FINITE_COLLECTION_CLOSED

@@ -1,0 +1,72 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\handler38_independent_replay_codex\c09-a0163b5c32ed44f7aca7730f3834e009\overlay\handler_configuration_independent_review_test.go
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\handler38_independent_replay_codex\c09-attach-correction-r304-0acd8177a821441395e8902ba16def0c\overlay\handler_configuration_independent_review_test.go
+@@ -141,6 +141,7 @@
+ func independentC09Command(t *testing.T, db *sql.DB, s *ClientService, principal string, env *Envelope, dir, label string) (*Response, bool) {
+ 	t.Helper()
+ 	raw := Bytes(env)
++	independentC09Write(t, dir, label+".request.json", Object{"raw_request_base64": base64.StdEncoding.EncodeToString(raw), "raw_sha256": Digest(raw), "raw_bytes": len(raw)})
+ 	decoded, e := DecodeEnvelope(raw)
+ 	if e != nil {
+ 		t.Fatal(e)
+@@ -151,9 +152,12 @@
+ 	}
+ 	defer tx.Rollback()
+ 	r, replay, e := s.Execute(context.Background(), tx, decoded, principal)
+-	if e != nil {
+-		t.Fatal(e)
+-	}
++	if e != nil { t.Fatal(e) }
++	if r == nil || deref(r.CommandID) != deref(env.CommandID) || deref(r.Method) != deref(env.Method) || deref(r.SessionID) != deref(env.SessionID) { t.Fatal("response original identity mismatch") }
++	var generic map[string]any
++	if e = json.Unmarshal(Bytes(r), &generic); e != nil { t.Fatal(e) }
++	if e = s.Doc.ValidateDef("CommandResponse", generic); e != nil { t.Fatal(e) }
++	if e = ValidateResultAgainstMethod(deref(env.Method), r, s.Doc); e != nil { t.Fatal(e) }
+ 	if e = tx.Commit(); e != nil {
+ 		t.Fatal(e)
+ 	}
+@@ -250,7 +254,9 @@
+ 			if e != nil {
+ 				t.Fatal(e)
+ 			}
+-			attach := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &project, SessionID: &sid, ExpectedRevision: &rev, WriterEpoch: &epoch, Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true})}
++			watermark, e := Num(sess, "event_watermark")
++			if e != nil || watermark < 0 { t.Fatalf("invalid original watermark: %v", e) }
++			attach := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &project, SessionID: &sid, ExpectedRevision: &rev, WriterEpoch: nil, Method: strptr("session.attach"), Payload: Bytes(Object{"after_sequence": watermark, "request_write_owner": true})}
+ 			ar, replayed := independentC09Command(t, db, clientService, principal, attach, dir, "02.actual-attach")
+ 			if replayed || deref(ar.Status) != "ACKNOWLEDGED" {
+ 				t.Fatalf("attach prerequisite %s", Bytes(ar))
+@@ -261,6 +267,34 @@
+ 			}
+ 			attached := independentC09StateRead(t, db)
+ 			independentC09Write(t, dir, "03.post-attach.fullrows.json", attached)
++			// Actual caller-transaction takeover is ACK only. Prove its real
++			// lease/journal and immutable replay; never manufacture COMPLETED.
++			if ar.Revision == nil || *ar.Revision != rev+2 || ar.ErrorCode != nil || ar.Error != nil { t.Fatal("attach typed ACK fields") }
++			accepted, e := time.Parse(time.RFC3339Nano, Str(ar.Result, "accepted_at")); if e != nil { t.Fatal(e) }
++			returnedSequence, e := Num(ar.Result, "after_sequence"); if e != nil || returnedSequence != watermark+1 || ar.Result["operation_id"] != "op-"+deref(attach.CommandID) || ar.Result["related_resource_ref"] != nil { t.Fatal("attach PendingResult") }
++			independentC09Exact(t, before, attached, map[string]bool{"client_sessions":true,"outbox":true,"idempotency":true,"client_command_identities":true})
++			if len(before["client_sessions"]) != len(attached["client_sessions"]) { t.Fatal("attach changed Session count") }
++			for i, old := range before["client_sessions"] {
++				want := Object{}; for k,v := range old { want[k]=v }
++				if old["id"] == sid { want["writer_epoch"]=epoch+1; want["revision"]=rev+2; want["event_watermark"]=watermark+1; want["lease_expires_at"]=actualAttach["lease_expires_at"]; want["updated_at"]=actualAttach["updated_at"] }
++				if !reflect.DeepEqual(want,attached["client_sessions"][i]) { t.Fatal("unexpected actual attach Session field mutation") }
++			}
++			newAttachEvent := independentC09Append(t,before["outbox"],attached["outbox"],1)[0]
++			event, e := Decode([]byte(Str(newAttachEvent,"body"))); if e != nil { t.Fatal(e) }
++			if event["kind"] != "CLIENT_HANDOFF" || event["command_id"] != deref(attach.CommandID) || event["session_id"] != sid || event["protocol_version"] != ProtocolV2 || event["core_build_id"] != clientService.Host.CoreBuildID || newAttachEvent["project"] != project { t.Fatal("actual handoff event identity") }
++			eventSequence,e := Num(event,"sequence"); if e != nil || eventSequence != returnedSequence { t.Fatal("handoff event sequence") }
++			decodedEvent,e := DecodeEvent([]byte(Str(newAttachEvent,"body"))); if e != nil { t.Fatal(e) }; if e=ValidateEventPayload(doc,decodedEvent);e!=nil{t.Fatal(e)}
++			handoff := independentC09Object(t,event,"payload"); writer := independentC09Object(t,handoff,"writer")
++			previousEpoch,e:=Num(handoff,"previous_epoch");if e!=nil{t.Fatal(e)};newEpoch,e:=Num(writer,"epoch");if e!=nil{t.Fatal(e)}
++			if handoff["previous_client_id"] != client || handoff["target_client_id"] != client || previousEpoch != epoch || writer["client_id"] != client || newEpoch != epoch+1 || handoff["effective_at"] != ar.Result["accepted_at"] || writer["expires_at"] != actualAttach["lease_expires_at"] { t.Fatal("actual handoff ownership facts") }
++			lease,e:=time.Parse(time.RFC3339Nano,Str(writer,"expires_at"));if e!=nil||!lease.Equal(accepted.Add(clientService.Host.LeaseTTL)){t.Fatal("actual handoff configured TTL")}
++			attachJournal:=independentC09Append(t,before["idempotency"],attached["idempotency"],1)[0];attachIdentity:=independentC09Append(t,before["client_command_identities"],attached["client_command_identities"],1)[0]
++			if attachJournal["key"] != deref(attach.CommandID) || attachIdentity["command_id"] != deref(attach.CommandID) || attachJournal["principal"] != principal || attachIdentity["principal"] != principal || attachJournal["project"] != project || attachIdentity["project"] != project || attachJournal["operation"] != "v2:session.attach" || attachIdentity["operation"] != "v2:session.attach" || attachIdentity["method"] != "session.attach" || attachJournal["request_hash"] != attachIdentity["request_hash"] || Str(attachJournal,"body") != string(Bytes(ar)) { t.Fatal("attach sole original response/identity") }
++			attachHeader,known,e:=readClientCommandEnvelope(doc,Str(attachJournal,"headers"));if e!=nil||!known||attachHeader.hash!=attachJournal["request_hash"]||!bytes.Equal(attachHeader.env.originalRaw,Bytes(attach)){t.Fatal("attach private original bytes/hash")}
++			attachMetadataCalls:=metadata.calls
++			attachReplay,isAttachReplay:=independentC09Command(t,db,clientService,principal,attach,dir,"03a.exact-attach-replay")
++			afterAttachReplay:=independentC09StateRead(t,db);independentC09Write(t,dir,"03b.post-attach-replay.fullrows.json",afterAttachReplay)
++			if !isAttachReplay || deref(attachReplay.Status)!="ACKNOWLEDGED" || !bytes.Equal(Bytes(attachReplay),Bytes(ar)) || metadata.calls!=attachMetadataCalls || !reflect.DeepEqual(attached,afterAttachReplay) {t.Fatal("attach replay changed ACK/state/metadata")}
+ 			tx, e := db.Begin()
+ 			if e != nil {
+ 				t.Fatal(e)

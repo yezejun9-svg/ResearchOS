@@ -1,0 +1,92 @@
+{
+  "anchors": [
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_mu_bundle_provenance_review_codex\\20261015-current-chat\\git-build-292ad.stdout.raw",
+        "bytes": 4286,
+        "sha256": "9411e13e59a227abf0a4c497253ccf006c4d5962a5374c1f254c05d18cd0f575"
+      },
+      "start_line": 8,
+      "end_line": 23,
+      "excerpt": "const here = dirname(fileURLToPath(import.meta.url));\nconst worktree = resolve(here, \"../../..\");\nconst commonRaw = execFileSync(\"git\", [\"rev-parse\", \"--git-common-dir\"], { cwd: worktree, encoding: \"utf8\" }).trim();\nconst commonDir = isAbsolute(commonRaw) ? commonRaw : resolve(worktree, commonRaw);\nconst mainRepo = dirname(commonDir);\nconst mu = join(mainRepo, \"third_party\", \"mu\");\nconst dependencies = join(mu, \"node_modules\");\nconst FIXED_MU_COMMIT = \"8dfebe36508ac0c2508735bb866756dab9283e74\";\nconst componentLock = JSON.parse(await readFile(join(mainRepo, \"execution\", \"v2.4\", \"component_lock.json\"), \"utf8\"));\nconst vendorOrigin = await readFile(join(mainRepo, \"third_party\", \"VENDORED_FROM.md\"), \"utf8\");\nconst manifest = JSON.parse(await readFile(join(mainRepo, \"third_party\", \"mu.MANIFEST.json\"), \"utf8\"));\nif (componentLock.mu?.commit !== FIXED_MU_COMMIT || componentLock.mu?.file_count !== 5083 ||\n    !vendorOrigin.split(/\\r?\\n/).includes(`Commit: ${FIXED_MU_COMMIT}`) ||\n    manifest.files !== 5083 || !manifest.entries || Object.keys(manifest.entries).length !== 5083) {\n  throw new Error(\"vendored Mu provenance differs from fixed W02 source commit\");\n}",
+      "meaning": "worktree versus mainRepo, third_party/mu, FIXED_MU_COMMIT and 5083 manifest constraint"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_mu_bundle_provenance_review_codex\\20261015-current-chat\\git-build-292ad.stdout.raw",
+        "bytes": 4286,
+        "sha256": "9411e13e59a227abf0a4c497253ccf006c4d5962a5374c1f254c05d18cd0f575"
+      },
+      "start_line": 24,
+      "end_line": 38,
+      "excerpt": "const vendoredEntries = Object.entries(manifest.entries);\nlet nextEntry = 0;\nawait Promise.all(Array.from({ length: 16 }, async () => {\n  while (nextEntry < vendoredEntries.length) {\n    const [relative, expected] = vendoredEntries[nextEntry++];\n    if (!relative.startsWith(\"third_party/mu/\") || relative.includes(\"..\")) throw new Error(\"invalid Mu source manifest path\");\n    const path = join(mainRepo, relative);\n    const info = await lstat(path);\n    if (!info.isFile() || info.size !== expected.size) throw new Error(`Mu source size/type drift: ${relative}`);\n    const raw = await readFile(path);\n    if (createHash(\"sha256\").update(raw).digest(\"hex\") !== expected.sha256) {\n      throw new Error(`Mu source hash drift: ${relative}`);\n    }\n  }\n}));",
+      "meaning": "All 5083 vendor regular-file size/hash checks occur before esbuild"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_mu_bundle_provenance_review_codex\\20261015-current-chat\\git-build-292ad.stdout.raw",
+        "bytes": 4286,
+        "sha256": "9411e13e59a227abf0a4c497253ccf006c4d5962a5374c1f254c05d18cd0f575"
+      },
+      "start_line": 39,
+      "end_line": 49,
+      "excerpt": "const require = createRequire(import.meta.url);\nconst esbuild = require(join(dependencies, \"esbuild\"));\nconst packageVersion = JSON.parse(await readFile(join(mu, \"packages\", \"coding-agent\", \"package.json\"), \"utf8\")).version;\nconst aiVersion = JSON.parse(await readFile(join(mu, \"packages\", \"ai\", \"package.json\"), \"utf8\")).version;\nif (packageVersion !== \"0.87.1\" || aiVersion !== \"0.87.1\" || esbuild.version !== \"0.28.2\") {\n  throw new Error(\"Mu SDK or esbuild version differs from pinned local references\");\n}\nfor (const path of [\n  join(mu, \"packages\", \"coding-agent\", \"dist\", \"index.js\"),\n  join(mu, \"packages\", \"ai\", \"dist\", \"api\", \"openai-completions.js\"),\n]) await readFile(path);",
+      "meaning": "esbuild resolved under vendor node_modules; versions pinned; generated dist entry checks"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_mu_bundle_provenance_review_codex\\20261015-current-chat\\git-build-292ad.stdout.raw",
+        "bytes": 4286,
+        "sha256": "9411e13e59a227abf0a4c497253ccf006c4d5962a5374c1f254c05d18cd0f575"
+      },
+      "start_line": 56,
+      "end_line": 81,
+      "excerpt": "await esbuild.build({\n  entryPoints: [join(here, \"worker.mjs\")],\n  bundle: true,\n  platform: \"node\",\n  format: \"esm\",\n  target: \"node24\",\n  nodePaths: [dependencies],\n  banner: { js: \"import { createRequire as createRequireForMuWorker } from 'node:module'; const require = createRequireForMuWorker(import.meta.url);\" },\n  outfile: output,\n  logLevel: \"warning\",\n});\nconst bundle = await readFile(output);\nconst source = await readFile(join(here, \"worker.mjs\"));\nconst metadata = {\n  bundle: output,\n  bundle_sha256: createHash(\"sha256\").update(bundle).digest(\"hex\"),\n  bundle_bytes: bundle.length,\n  source_sha256: createHash(\"sha256\").update(source).digest(\"hex\"),\n  sdk_version: packageVersion,\n  ai_version: aiVersion,\n  esbuild_version: esbuild.version,\n  mu_commit: FIXED_MU_COMMIT,\n  vendored_files_verified: vendoredEntries.length,\n};\nawait writeFile(`${output}.build.json`, `${JSON.stringify(metadata, null, 2)}\\n`);\nprocess.stdout.write(`${JSON.stringify(metadata)}\\n`);",
+      "meaning": "ResearchOS wrapper entryPoint, output bytes hash, source wrapper hash, and SDK commit are separate fields"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_mu_bundle_provenance_review_codex\\20261015-current-chat\\git-wrapper-292ad.stdout.raw",
+        "bytes": 48557,
+        "sha256": "0d50cea351f325f28ca5ee377eac36833768a28be42cf48ec0e50834c0ff6517"
+      },
+      "start_line": 1,
+      "end_line": 10,
+      "excerpt": "import { createHash } from \"node:crypto\";\nimport { readFile, writeFile } from \"node:fs/promises\";\nimport { dirname, join, resolve } from \"node:path\";\nimport { createInterface } from \"node:readline\";\nimport { Transform } from \"node:stream\";\nimport { gunzipSync } from \"node:zlib\";\nimport { fileURLToPath } from \"node:url\";\nimport { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from \"@earendil-works/pi-coding-agent\";\nimport { streamSimple as streamSimpleOpenAICompletions } from \"@earendil-works/pi-ai/api/openai-completions\";\n",
+      "meaning": "ResearchOS wrapper imports vendored coding-agent and AI API packages"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\approved_attach_combined_desktop_build_codex\\20261014-current-chat\\assemble-attach.py",
+        "bytes": 12108,
+        "sha256": "2d5e119b2c92ab437231902dd9a267868bbbbd0736624d8d620a5f14621d8099"
+      },
+      "start_line": 19,
+      "end_line": 19,
+      "excerpt": "SCOPE = MAIN / \"execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261014-current-chat/continuation-cp451/combined-attach-package-scope.json\"",
+      "meaning": "Explicit missing JSON edge: attach OLD_COMP -> readlane composition"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\approved_readlane_combined_desktop_build_codex\\20261012-current-chat\\assemble-readlane.py",
+        "bytes": 12375,
+        "sha256": "8ea5b3abc81b6d455bb6f8c6dbc991a62cfc97ff1a0443545304649349619acf"
+      },
+      "start_line": 13,
+      "end_line": 17,
+      "excerpt": "OLD = Path(r\"C:/Users/yqyyds/.codex/researchos-resource-cache/normal-first-use-combined-c381-20261012\")\nMU = MAIN / \".local/builds/current-chat-runtime-assets-20261012\"\nDEST = Path(r\"C:/Users/yqyyds/.codex/researchos-resource-cache/normal-readlane-combined-91218bdd-20261012\")\nHERE = Path(__file__).resolve().parent\nOLD_HERE = MAIN / \"execution/v2.4/receipts/W05/W05-99/approved_combined_desktop_build_codex/20261012-current-chat\"",
+      "meaning": "readlane MU and OLD_HERE -> combined builder"
+    },
+    {
+      "ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\approved_combined_desktop_build_codex\\20261012-current-chat\\assemble-combined.py",
+        "bytes": 10458,
+        "sha256": "da0289259fdc96488006c758dc3509cfc56041f71981a31df63a8959e8853a01"
+      },
+      "start_line": 13,
+      "end_line": 23,
+      "excerpt": "MU = MAIN / \".local/builds/current-chat-runtime-assets-20261012\"\nPUBLIC_REFERENCE = MAIN / \".local/builds/current-chat-installed-runtime-components-20261012/public-host-root\"\nDEST = Path(r\"C:/Users/yqyyds/.codex/researchos-resource-cache/normal-first-use-combined-c381-20261012\")\nHERE = Path(__file__).resolve().parent\nSCOPE = MAIN / \"execution/v2.4/receipts/W05/W05-99/resume_cp398_codex/20261012-current-chat/continuation-cp436/combined-desktop-package-scope.json\"\nCB = \"cb3646d384dcaee1670f3ca4c4891cd0fd12a2c8\"\nMAIN_COMMIT = \"c381cf0d8e8f3ae2bcd437a6e0866b38d7bd9ec0\"\nMU_COMMIT = \"8dfebe36508ac0c2508735bb866756dab9283e74\"\nMU_HASHES = {\"node.exe\": \"5f364598aa3017130b22908ff7c3db0fd05bd42d39fd65b79fd6bd3f73c73da6\",\n             \"mu-worker.mjs\": \"2a8e70132a914affc6122c1f1db29cfa315b655c93d4200145852ebbc853d441\",\n             \"mu-worker.mjs.build.json\": \"ce85112575850403492a0d00a26100ff678d64f21e852af2f7530bb7a6b7613a\"}",
+      "meaning": "combined MU root and exact original asset hashes"
+    }
+  ]
+}

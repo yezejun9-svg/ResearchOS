@@ -1,0 +1,218 @@
+// Append to the proposed internal/domain/client_cancel_finalization.go.
+// Required imports added by the receipt assembler: sort, strconv and jsonschema.
+// No SQL, Service, Host, filesystem, environment, clock or random call occurs.
+
+type f08SourceRule struct { mask string; unique [][]int }
+type f08Sources struct { rows map[string][][]any }
+type f08ProofValidator struct { protocol, entities *SchemaDoc }
+type f08Version struct {
+	project, kind, id string
+	revision int64
+	contentHash any
+	raw []byte
+	body map[string]any
+}
+
+func f08NewProofValidator(protocol *SchemaDoc, external []byte) (*f08ProofValidator,error) {
+	if protocol==nil || f08RawHash(external)!=f08ExternalHash { return nil,f08Schema }
+	// Never reuse the shared backup schema cache or caller's mutable schema.
+	parsed,err:=Decode(bytes.Clone(external)); if err!=nil{return nil,f08Schema}
+	id,ok:=parsed["$id"].(string);if !ok || id=="" {return nil,f08Schema}
+	n,checks,err:=neutralizePatterns(parsed);if err!=nil{return nil,f08Schema}
+	c:=jsonschema.NewCompiler();c.UseLoader(localOnly{});c.AssertFormat();c.DefaultDraft(jsonschema.Draft2020)
+	if err=c.AddResource(id,parsed);err!=nil{return nil,f08Schema}
+	defs,ok:=parsed["$defs"].(map[string]any);if !ok{return nil,f08Schema}
+	d:=&SchemaDoc{byName:map[string]*jsonschema.Schema{},writeOnly:map[string]bool{},pathProps:map[string]bool{},defChecks:checks,Location:id,NeutralizedPatterns:n}
+	collectWriteOnly(parsed,d.writeOnly);collectPathProps(parsed,d.pathProps)
+	for name:=range defs {
+		schema,err:=c.Compile(id+"#/$defs/"+name);if err!=nil{return nil,f08Schema}
+		d.byName[name]=schema;d.defNames=append(d.defNames,name)
+	}
+	return &f08ProofValidator{protocol,d},nil
+}
+
+func f08Equal(a,b any) bool {
+	ab,e:=f08Encode(a);if e!=nil{return false};bb,e:=f08Encode(b);if e!=nil{return false}
+	_,ac,e:=f08Strict(ab);if e!=nil{return false};_,bc,e:=f08Strict(bb)
+	return e==nil && bytes.Equal(ac,bc)
+}
+func f08Key(v any)(string,error){b,e:=f08Encode(v);if e!=nil{return "",e};_,c,e:=f08Strict(b);return string(c),e}
+func f08Number(n int64) json.Number{return json.Number(strconv.FormatInt(n,10))}
+func f08StringValue(v any)(string,bool){s,ok:=v.(string);return s,ok}
+func f08Hex(v any)([]byte,error){
+	s,ok:=v.(string);if !ok || len(s)%2!=0{return nil,f08Shape}
+	b,e:=hex.DecodeString(s);if e!=nil || strings.ToUpper(hex.EncodeToString(b))!=s{return nil,f08Shape}
+	return b,nil
+}
+func f08RawObject(v any)(map[string]any,[]byte,error){
+	b,e:=f08Hex(v);if e!=nil{return nil,nil,e};x,_,e:=f08Strict(b);if e!=nil{return nil,nil,e}
+	m,ok:=x.(map[string]any);if !ok{return nil,nil,f08Shape};return m,b,nil
+}
+func f08Array(v any)([]any,error){a,ok:=v.([]any);if !ok{return nil,f08Shape};return a,nil}
+
+func f08DecodeSources(value any)(*f08Sources,error){
+	wire,err:=f08Array(value);if err!=nil{return nil,err}
+	rules:=f08SourceRules();s:=&f08Sources{rows:map[string][][]any{}}
+	seen:=map[string]map[string]bool{}
+	for _,item:=range wire {
+		pair,err:=f08Array(item);if err!=nil || len(pair)!=2{return nil,f08Shape}
+		category,ok:=pair[0].(string);if !ok{return nil,f08Shape}
+		rule,ok:=rules[category];if !ok{return nil,f08Shape}
+		row,err:=f08Array(pair[1]);if err!=nil || len(row)!=len(rule.mask){return nil,f08Shape}
+		for i,k:=range rule.mask {
+			v:=row[i]
+			if v==nil && k>='A' && k<='Z'{continue}
+			switch k {
+			case 's','S':if _,ok:=v.(string);!ok{return nil,f08StorageClass}
+			case 'i','I':if _,e:=f08Integer(v,-1<<63);e!=nil{return nil,f08StorageClass}
+			case 'h','H':if _,e:=f08Hex(v);e!=nil{return nil,e}
+			default:return nil,f08Shape
+			}
+		}
+		for keyIndex,columns:=range rule.unique {
+			key:=[]any{};nullKey:=false
+			for _,i:=range columns {if row[i]==nil{nullKey=true};key=append(key,row[i])}
+			// SQLite rowid-table nullable PRIMARY/UNIQUE keys do not collide.
+			if nullKey{continue}
+			encoded,e:=f08Key(key);if e!=nil{return nil,e}
+			group:=category+":"+strconv.Itoa(keyIndex)
+			if seen[group]==nil{seen[group]=map[string]bool{}}
+			if seen[group][encoded]{return nil,f08Binding};seen[group][encoded]=true
+		}
+		// domain_refs has no unique key: repeated rows are retained verbatim.
+		s.rows[category]=append(s.rows[category],row)
+	}
+	return s,nil
+}
+
+func (s *f08Sources) selectRows(category string, columns []int, values []any)[][]any{
+	var found [][]any
+	for _,row:=range s.rows[category]{
+		matches:=len(columns)==len(values)
+		for i,column:=range columns{if !f08Equal(row[column],values[i]){matches=false;break}}
+		if matches{found=append(found,row)}
+	}
+	return found
+}
+func (s *f08Sources) one(category string, columns []int, values []any)([]any,error){
+	rows:=s.selectRows(category,columns,values);if len(rows)!=1{return nil,f08Binding};return rows[0],nil
+}
+func (v *f08ProofValidator) version(s *f08Sources,project string,reference any)(f08Version,error){
+	var zero f08Version
+	r,err:=f08Object(reference,"entity_type","id","revision","content_hash");if err!=nil{return zero,err}
+	if err=v.entities.ValidateDefInput("VersionRef",r);err!=nil{return zero,f08Schema}
+	kind,err:=f08String(r["entity_type"]);if err!=nil{return zero,err}
+	id,err:=f08String(r["id"]);if err!=nil{return zero,err}
+	revision,err:=f08Integer(r["revision"],1);if err!=nil{return zero,err}
+	row,err:=s.one("domain_versions",[]int{0,1,2,3},[]any{project,kind,id,f08Number(revision)});if err!=nil{return zero,err}
+	if !f08Equal(row[5],r["content_hash"]){return zero,f08Binding}
+	body,raw,err:=f08RawObject(row[4]);if err!=nil{return zero,err}
+	if err=v.entities.ValidateDefInput(kind,body);err!=nil{return zero,f08Schema}
+	if body["id"]!=id || body["project_id"]!=project || !f08Equal(body["revision"],r["revision"]){return zero,f08Binding}
+	if receipt,ok:=body["receipt_hash"];ok {
+		if receipt!=Receipt(Object(body)) || !f08Equal(receipt,row[5]){return zero,f08Binding}
+	} else if kind=="Artifact" {
+		if !f08Equal(body["content_hash"],row[5]){return zero,f08Binding}
+	} else if row[5]!=nil{return zero,f08Binding}
+	return f08Version{project,kind,id,revision,row[5],raw,body},nil
+}
+func (o f08Version) ref() map[string]any{return map[string]any{"entity_type":o.kind,"id":o.id,"revision":f08Number(o.revision),"content_hash":o.contentHash}}
+func (o f08Version) anchor() map[string]any{return map[string]any{"project":o.project,"version_ref":o.ref(),"body_digest":f08RawHash(o.raw)}}
+func (v *f08ProofValidator) head(s *f08Sources,project,kind,id string)(f08Version,error){
+	var zero f08Version
+	r,e:=s.one("domain_objects",[]int{0,1,2},[]any{project,kind,id});if e!=nil{return zero,e}
+	o,e:=v.version(s,project,map[string]any{"entity_type":kind,"id":id,"revision":r[3],"content_hash":r[5]});if e!=nil{return zero,e}
+	raw,e:=f08Hex(r[4]);if e!=nil || !bytes.Equal(raw,o.raw){return zero,f08Binding};return o,nil
+}
+
+type f08ReferenceOccurrence struct {field,targetKind,targetID string; exact map[string]any; globalFallback bool}
+func (v *f08ProofValidator) occurrences(owner f08Version,path string,value any)([]f08ReferenceOccurrence,error){
+	var result []f08ReferenceOccurrence
+	switch x:=value.(type){
+	case map[string]any:
+		if _,ok:=x["entity_type"];ok {
+			if err:=v.entities.ValidateDefInput("VersionRef",x);err!=nil{return nil,f08Schema}
+			return []f08ReferenceOccurrence{{path,x["entity_type"].(string),x["id"].(string),x,false}},nil
+		}
+		keys:=make([]string,0,len(x));for key:=range x{keys=append(keys,key)};sort.Strings(keys)
+		for _,field:=range keys {
+			if field=="id" || field=="project_id"{continue}
+			value:=x[field];kind:=relationKind(owner.kind,field)
+			if field=="supersedes_id" || field=="parent_policy_id"{kind=owner.kind}
+			if kind!="" && value!=nil {
+				values:=[]any{value};if a,ok:=value.([]any);ok{values=a}
+				for _,item:=range values{id,err:=f08String(item);if err!=nil{return nil,err};result=append(result,f08ReferenceOccurrence{path+"/"+field,kind,id,nil,field=="parent_policy_id"})}
+			} else {nested,err:=v.occurrences(owner,path+"/"+field,value);if err!=nil{return nil,err};result=append(result,nested...)}
+		}
+	case []any:
+		for i,item:=range x{nested,err:=v.occurrences(owner,path+"/"+strconv.Itoa(i),item);if err!=nil{return nil,err};result=append(result,nested...)}
+	}
+	return result,nil
+}
+
+// Derives R1 from real immutable owner/version/ref rows. ID-only relations
+// resolve retained original tuples, never current target heads. Captured
+// historical closure must subsequently be compared in full by the caller.
+func (v *f08ProofValidator) referenceClosure(s *f08Sources,roots []f08Version)([]any,[]any,error){
+	pending:=append([]f08Version(nil),roots...);visited:=map[string]bool{};anchors:=map[string]any{};closures:=map[string]any{}
+	for len(pending)>0 {
+		owner:=pending[0];pending=pending[1:]
+		key,e:=f08Key([]any{owner.project,owner.ref()});if e!=nil{return nil,nil,e}
+		if visited[key]{continue};visited[key]=true;anchors[key]=owner.anchor()
+		rows:=s.selectRows("domain_refs",[]int{0,1,2,3},[]any{owner.project,owner.kind,owner.id,f08Number(owner.revision)})
+		occurrences,e:=v.occurrences(owner,"",owner.body);if e!=nil{return nil,nil,e}
+		if len(rows)!=len(occurrences){return nil,nil,f08Binding}
+		used:=make([]bool,len(rows));targets:=map[string]any{};sameID:=map[string]string{}
+		for _,occurrence:=range occurrences{
+			matched:=-1
+			for i,row:=range rows {
+				if used[i] || row[4]!=occurrence.field || row[6]!=occurrence.targetKind || row[7]!=occurrence.targetID {continue}
+				tp,ok:=row[5].(string);if !ok{return nil,nil,f08Shape}
+				if tp!=owner.project && !(occurrence.globalFallback && tp=="" && (occurrence.targetKind=="BudgetPolicy" || occurrence.targetKind=="RunPolicy")){continue}
+				if occurrence.exact!=nil && !f08Equal(row[8],occurrence.exact["revision"]){continue}
+				matched=i;break
+			}
+			if matched<0{return nil,nil,f08Binding}
+			used[matched]=true;row:=rows[matched]
+			targetRow,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{row[5],row[6],row[7],row[8]});if e!=nil{return nil,nil,e}
+			if occurrence.exact!=nil && !f08Equal(targetRow[5],occurrence.exact["content_hash"]){return nil,nil,f08Binding}
+			target,e:=v.version(s,row[5].(string),map[string]any{"entity_type":row[6],"id":row[7],"revision":row[8],"content_hash":targetRow[5]});if e!=nil{return nil,nil,e}
+			destination,e:=f08Key([]any{target.project,target.ref()});if e!=nil{return nil,nil,e}
+			// All repeated ID-only occurrences from one producer resolve the same tuple.
+			if occurrence.exact==nil {
+				shape,_:=f08Key([]any{occurrence.field,occurrence.targetKind,occurrence.targetID})
+				if old,ok:=sameID[shape];ok && old!=destination{return nil,nil,f08Binding};sameID[shape]=destination
+			}
+			targets[destination]=target.anchor();anchors[destination]=target.anchor();pending=append(pending,target)
+		}
+		rowValues:=make([]any,len(rows));for i,row:=range rows{rowValues[i]=row}
+		f08SortTuples(rowValues)
+		closures[key]=map[string]any{"owner_project":owner.project,"owner_ref":owner.ref(),"owner_body_digest":f08RawHash(owner.raw),"rows":rowValues,"targets":f08SortedAnchors(targets)}
+	}
+	result:=make([]any,0,len(closures));for _,item:=range closures{result=append(result,item)}
+	sort.Slice(result,func(i,j int)bool{
+		x:=result[i].(map[string]any);y:=result[j].(map[string]any);xr:=x["owner_ref"].(map[string]any);yr:=y["owner_ref"].(map[string]any)
+		return f08TupleLess([]any{x["owner_project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["owner_project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})
+	})
+	return result,f08SortedAnchors(anchors),nil
+}
+
+// SQL tuple lexicographic ordering compares scalar columns, not encoded JSON
+// strings (which would put numeric revision10 before2). String order is UTF8.
+func f08ScalarCompare(a,b any) int {
+	if a==nil{if b==nil{return 0};return -1};if b==nil{return 1}
+	if x,ok:=a.(json.Number);ok {
+		if y,ok:=b.(json.Number);ok{xr,_:=new(big.Rat).SetString(string(x));yr,_:=new(big.Rat).SetString(string(y));return xr.Cmp(yr)}
+	}
+	x,xok:=a.(string);y,yok:=b.(string);if xok && yok{return strings.Compare(x,y)}
+	xk,_:=f08Key(a);yk,_:=f08Key(b);return strings.Compare(xk,yk)
+}
+func f08TupleLess(a,b []any)bool{for i:=0;i<len(a)&&i<len(b);i++{c:=f08ScalarCompare(a[i],b[i]);if c!=0{return c<0}};return len(a)<len(b)}
+func f08SortTuples(rows []any){sort.Slice(rows,func(i,j int)bool{return f08TupleLess(rows[i].([]any),rows[j].([]any))})}
+func f08SortedAnchors(values map[string]any)[]any{
+	a:=make([]any,0,len(values));for _,v:=range values{a=append(a,v)}
+	sort.Slice(a,func(i,j int)bool{
+		x:=a[i].(map[string]any);y:=a[j].(map[string]any);xr:=x["version_ref"].(map[string]any);yr:=y["version_ref"].(map[string]any)
+		return f08TupleLess([]any{x["project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})
+	});return a
+}

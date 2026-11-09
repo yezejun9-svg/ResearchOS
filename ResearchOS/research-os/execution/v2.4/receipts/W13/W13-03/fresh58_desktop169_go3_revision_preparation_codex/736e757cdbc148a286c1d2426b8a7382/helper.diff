@@ -1,0 +1,70 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\fresh58_desktop169_go3_controller_preparation_codex\52998fc9c4d64166b10aa02e6eca11e4\windows_debug_job_tree.future_images.final.proposed.py
++++ windows_debug_job_tree.future_images.deadline.proposed.py
+@@ -61,7 +61,7 @@
+     raise RuntimeError('Windows module inventory changed repeatedly; no stable bounded inventory')
+ 
+ 
+-def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, allowed_images, allowed_module_files, process_cap, stdin=None, creation_flags=0, future_images=None, future_context=None):
++def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, allowed_images, allowed_module_files, process_cap, stdin=None, creation_flags=0, future_images=None, future_context=None, absolute_deadline=None):
+     """Return JSON-safe observations, including on preparation/launch failure.
+ 
+     timeout covers preparation through the primary process AND Job becoming idle.
+@@ -147,6 +147,18 @@
+             raise ValueError('cwd must name an existing absolute directory')
+         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+             raise ValueError('timeout must be a finite positive number')
++        if isinstance(absolute_deadline,bool) or not isinstance(absolute_deadline,(int,float)) or not math.isfinite(absolute_deadline):
++            raise ValueError('Explicit Root absolute helper deadline required')
++        result['requested_process_timeout_seconds']=timeout
++        result['absolute_deadline']=absolute_deadline
++        result['success_finalization_reserve_seconds']=25
++        result['failure_cleanup_reserve_seconds']=5
++        remaining=absolute_deadline-started
++        timeout=min(timeout,remaining-25.0-5.0)
++        result['effective_process_timeout_seconds']=timeout
++        result['remaining_at_helper_entry_seconds']=remaining
++        if timeout<=0:
++            raise TimeoutError('No process budget remains after finalization and cleanup reservation')
+         if isinstance(creation_flags, bool) or not isinstance(creation_flags, int) or not 0 <= creation_flags <= 0xFFFFFFFF:
+             raise ValueError('creation_flags must be a DWORD integer')
+         if creation_flags & (0x01000000 | 0x00000001 | 0x00000002):
+@@ -648,7 +660,7 @@
+                         cleanup['unassigned_suspended_child_termination_requested'] = True
+                         cleanup['unassigned_suspended_child_termination_succeeded'] = bool(terminate_process(process, requested))
+                         require(cleanup['unassigned_suspended_child_termination_succeeded'])
+-                    deadline = time.monotonic() + 5.0
++                    deadline = min(time.monotonic() + 5.0, absolute_deadline)
+                     while not observe() and time.monotonic() < deadline:
+                         pump(20, cleanup_mode=True)
+                     if not cleanup['primary_exit_confirmed'] or (assigned and not cleanup['job_idle_confirmed']):
+@@ -660,8 +672,10 @@
+                 record_error(exc)
+         if process is not None and api is not None:
+             try:
+-                finalization_deadline = time.monotonic() + 25.0
++                finalization_deadline = min(time.monotonic() + 25.0, absolute_deadline)
++                result['evidence_finalization_deadline'] = finalization_deadline
+                 result['evidence_finalization_timeout_seconds'] = 25
++                deadline_check(finalization_deadline, 'evidence finalization entry')
+                 if result['error'] is not None or result['timed_out']:
+                     raise RuntimeError('Evidence finalization incomplete after earlier failure; no success')
+                 for retained, fact in loaded_files:
+@@ -669,6 +683,7 @@
+                     if fact['after'] != fact['before']:
+                         raise RuntimeError('Loaded module bytes changed on the retained file handle')
+                 for proc in generations:
++                    deadline_check(finalization_deadline, 'process generation evidence')
+                     ph = HANDLE(proc['held_process_handle'])
+                     if wait(ph, 0) != 0:
+                         raise RuntimeError('Process generation exit not independently signaled')
+@@ -716,4 +731,10 @@
+         cleanup['explicit_owned_handle_close_successes'] = closed_owned
+         cleanup['handles_closed'] = not close_failed and len(handles)==closed_owned
+         result['elapsed_seconds'] = time.monotonic() - started
++        if isinstance(absolute_deadline,(int,float)) and not isinstance(absolute_deadline,bool) and math.isfinite(absolute_deadline):
++            try:deadline_check(absolute_deadline, 'helper final owned-handle closure')
++            except BaseException as exc:
++                debug['complete']=False
++                cleanup['errors'].append(error_text(exc))
++                record_error(exc)
+     return result

@@ -1,0 +1,9 @@
+# W09 formal profile Source candidate
+
+Two proposed fixed-target files are sealed in this packet. `formal_case_index.after.py` adds the W09 trusted loader and registered owner path after the byte prefix required by W07. `formal_profile_w09.after.py` checks the six frozen W09 routes, replayed Native evidence, independently qualified mode, both cases' GLOBAL files, and non-author Root-observed issuance before returning an accepted owner context.
+
+This is Source only. The current `execution/v2.4/commands.json` still lacks W09-G01/G02 and A06 bindings, and the sample historical Native tool-run referred to a report absent from the current working tree. No actual W09 formal route, product Native run, model call or case acceptance was performed by this packet. Current formal acceptance remains 0/42 as reported by Root's separate current-state work; this packet does not remeasure it.
+
+The Source controls passed AST parsing, the exact W07 compatibility prefix, frozen six-route matching, and three synthetic negative locator/hash/scope controls. These are `SYNTHETIC_NONAUTHORITATIVE`; they are not product acceptance evidence. Root must independently review the after files and the source contract, then adopt both fixed targets atomically only after the W05 freeze is lifted. The future context, review and issuance documents must be actual Root-registered receipts. Missing or stale input, absent Native graphs, missing GLOBAL files, an unbound dispatcher, non-Windows G02 evidence, or self-review must reject.
+
+The exact original index bytes are in `formal_case_index.before.py`; the W09 profile did not exist before this packet. Forward and inverse textual diffs accompany the byte backup. `failure-origin-958.txt` and `failure-origin-unassigned-native-report-read.txt` preserve the two original tool failures without upgrading their evidence status.

@@ -1,0 +1,54 @@
+--- a/internal/domain/retrieval_test.go
++++ b/internal/domain/retrieval_test.go
+@@ -570,20 +570,41 @@
+ 	if err = store.Bootstrap(context.Background(), db, "../../migrations/sqlite/0001_bootstrap.sql"); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	legacy, err := os.ReadFile("../../migrations/sqlite/0007_retrieval.sql")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if _, err = db.Exec(string(legacy)); err != nil {
+-		t.Fatal(err)
++	// Build the actual contiguous pre-identity schema in this isolated unit
++	// fixture. A ledger entry is recorded only after its real SQL succeeds.
++	for version := 2; version <= 8; version++ {
++		files, readErr := filepath.Glob(fmt.Sprintf("../../migrations/sqlite/%04d_*.sql", version))
++		if readErr != nil || len(files) != 1 {
++			t.Fatalf("legacy migration %d inventory: %v %v", version, files, readErr)
++		}
++		raw, readErr := os.ReadFile(files[0])
++		if readErr != nil {
++			t.Fatal(readErr)
++		}
++		if _, err = db.Exec(string(raw)); err != nil {
++			t.Fatal(err)
++		}
++		if _, err = db.Exec("INSERT INTO schema_migrations(version) VALUES(?)", version); err != nil {
++			t.Fatal(err)
++		}
+ 	}
+ 	if _, err = db.Exec("INSERT INTO retrieval_roots(project,id,path,revision) VALUES('legacy','old','C:/prior-root',1)"); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if _, err = db.Exec("INSERT INTO schema_migrations(version) VALUES(7)"); err != nil {
+-		t.Fatal(err)
+-	}
+-	if _, err = New(db, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql"); err != nil {
++	// A populated old database still needs a verified pre-upgrade backup.
++	// This test observes the production refusal before testing migration 9's
++	// root-revocation SQL directly; it grants no public upgrade authority.
++	if _, err = New(db, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql"); err == nil || !strings.Contains(err.Error(), "MIGRATION_PREBACKUP_REQUIRED") {
++		t.Fatalf("legacy authority bypassed pre-backup gate: %v", err)
++	}
++	identityMigration, err := os.ReadFile("../../migrations/sqlite/0009_retrieval_root_identity.sql")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(string(identityMigration)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec("INSERT INTO schema_migrations(version) VALUES(9)"); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	var identity string

@@ -1,0 +1,117 @@
+//go:build windows
+
+package domain
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type runtimeRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f runtimeRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestRuntimeCoordinatorChild(t *testing.T) {
+	child := false
+	for _, arg := range os.Args {
+		if arg == "--coordinator-child" {
+			child = true
+		}
+	}
+	if !child {
+		return
+	}
+	raw, e := os.ReadFile(os.Args[len(os.Args)-1])
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		os.Exit(70)
+	}
+	if os.Getenv("RUNTIME_SECRET_SENTINEL") != "" {
+		os.Exit(71)
+	}
+	fmt.Printf("{\"sequence\":1,\"type\":\"context.ready\",\"payload\":{\"input_hash\":%q}}\n", Digest(raw))
+	request, e := Decode(raw)
+	if e != nil {
+		os.Exit(73)
+	}
+	sequence := 2
+	checkpointMode := false
+	for _, arg := range os.Args {
+		if arg == "--wait-heartbeat" && request["task_type"] != "runtime_qualification" {
+			time.Sleep(19 * time.Second)
+		}
+		if arg == "--exit-one" && request["task_type"] != "runtime_qualification" {
+			os.Exit(1)
+		}
+		if arg == "--checkpoint" {
+			checkpointMode = true
+		}
+	}
+	if checkpointMode && request["task_type"] != "runtime_qualification" {
+		if request["checkpoint_artifact_id"] == nil || request["checkpoint_artifact_id"] == "" {
+			fmt.Printf("{\"sequence\":2,\"type\":\"checkpoint\",\"payload\":{\"cursor\":\"durable-fixture-position\"}}\n")
+			line, err := bufio.NewReader(os.Stdin).ReadBytes('\n')
+			if err != nil {
+				os.Exit(76)
+			}
+			reply, err := Decode(line)
+			if err != nil || reply["type"] != "checkpoint.sealed" {
+				os.Exit(77)
+			}
+			fmt.Println(`{"sequence":3,"type":"turn.paused"}`)
+			os.Exit(0)
+		}
+		checkpoint, err := os.ReadFile(filepath.Join(filepath.Dir(os.Args[len(os.Args)-1]), "checkpoint.json"))
+		if err != nil || string(checkpoint) != `{"cursor":"durable-fixture-position"}` {
+			os.Exit(78)
+		}
+	}
+	effectMode := false
+	for _, arg := range os.Args {
+		if arg == "--effect" {
+			effectMode = true
+		}
+	}
+	if effectMode && request["task_type"] != "runtime_qualification" {
+		reader := bufio.NewReader(os.Stdin)
+		for repeat := 0; repeat < 2; repeat++ {
+			fmt.Printf("{\"sequence\":%d,\"type\":\"effect.request\",\"key\":\"single-fixture-effect\",\"route\":\"fixture-echo\",\"capability\":\"fixture.echo\",\"payload\":{\"value\":\"approved\"}}\n", sequence)
+			line, e := reader.ReadBytes('\n')
+			if e != nil {
+				os.Exit(74)
+			}
+			reply, e := Decode(line)
+			if e != nil || reply["state"] != "CONFIRMED" || reply["payload"].(map[string]any)["echo"] != "approved" {
+				os.Exit(75)
+			}
+			sequence++
+		}
+	}
+	if e = os.WriteFile("result.json", []byte(`{"result":"verified"}`), 0600); e != nil {
+		os.Exit(72)
+	}
+	fmt.Printf("{\"sequence\":%d,\"type\":\"turn.completed\"}\n", sequence)
+	os.Exit(0)
+}
+
+func coordinatorFixture(t *testing.T) (*RuntimeCoordinator, RuntimeCoordinatorRoute, *runtimeFixture) {
+	return coordinatorFixtureMode(t, false)
+}
+func coordinatorFixtureMode(t *testing.T, effect bool) (*RuntimeCoordinator, RuntimeCoordinatorRoute, *runtimeFixture) {
+	return coordinatorFixtureOptions(t, effect, false)
+}
+func coordinatorFixtureOptions(t *testing.T, effect, checkpoint bool, flags ...string) (*RuntimeCoordinator, RuntimeCoordinatorRoute, *runtimeFixture) {
+	return coordinatorFixtureProgram(t, effect, checkpoint, nil, flags...)
+}
+

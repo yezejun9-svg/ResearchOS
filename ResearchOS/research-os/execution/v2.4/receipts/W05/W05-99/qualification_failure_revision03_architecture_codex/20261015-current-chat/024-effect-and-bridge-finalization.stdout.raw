@@ -1,0 +1,71 @@
+4f4023c956f84d65743f39ce77d6c8899a21ada1:internal/domain/durability.go:27:func effectsReconciled(tx *sql.Tx, project, run string) error {
+
+EXIT 0
+FILE adapters/runtime/bridge_windows.go
+493: func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+494: 	defer close(w.done)
+495: 	defer close(w.frames)
+496: 	defer w.lock.Close()
+497: 	finished := make(chan struct{})
+498: 	go func() {
+499: 		ticker := time.NewTicker(50 * time.Millisecond)
+500: 		defer ticker.Stop()
+501: 		for {
+502: 			select {
+503: 			case <-finished:
+504: 				return
+505: 			case <-ticker.C:
+506: 				w.mu.Lock()
+507: 				expired := time.Now().After(w.deadline) || time.Now().UTC().After(w.wallDeadline)
+508: 				w.mu.Unlock()
+509: 				if expired {
+510: 					w.Cancel("lease expired")
+511: 					return
+512: 				}
+513: 			case <-ctx.Done():
+514: 				w.Cancel("coordinator control channel closed")
+515: 				return
+516: 			}
+517: 		}
+518: 	}()
+519: 	receipt, err := w.process.Wait(context.Background())
+520: 	close(finished)
+521: 	w.mu.Lock()
+522: 	defer w.mu.Unlock()
+523: 	w.journal.Receipt = receipt
+524: 	w.journal.Ended = now()
+525: 	err = errors.Join(err, w.stdout.Close(), w.stderr.Close())
+526: 	w.journal.StdoutHash = Hash(receipt.Stdout)
+527: 	w.journal.StderrHash = Hash(receipt.Stderr)
+528: 	if len(w.pending) != 0 {
+529: 		err = errors.Join(err, errors.New("unterminated protocol frame"))
+530: 	}
+531: 	if err != nil || !receipt.Stopped || !receipt.StreamsDrained || !receipt.OutputCopied || !receipt.CleanupComplete {
+532: 		w.journal.State = "UNKNOWN"
+533: 	} else if receipt.ExitCode != 0 || receipt.TimedOut || w.journal.Cancelled || !w.journal.ProtocolComplete || !w.journal.ContextReady {
+534: 		w.journal.State = "FAILED"
+535: 	} else if w.journal.Paused {
+536: 		w.journal.State = "PAUSED"
+537: 	} else {
+538: 		w.journal.State = "EXITED"
+539: 	}
+540: 	if !w.journal.Cancelled {
+541: 		for _, stream := range w.modelStreams {
+542: 			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+543: 				err = errors.Join(err, errors.New("MODEL stream closure not reconciled"))
+544: 				w.journal.State = "UNKNOWN"
+545: 			}
+546: 		}
+547: 	}
+548: 	if w.journal.State == "EXITED" {
+549: 		outputs, _ := profile["outputs"].([]any)
+550: 		var total int64
+551: 		for _, v := range outputs {
+552: 			relative, ok := v.(string)
+553: 			if !ok || !filepath.IsLocal(relative) {
+554: 				err = errors.New("invalid output path")
+555: 				break
+556: 			}
+557: 			path := filepath.Join(w.directory, "output", relative)
+558: 			actual, e := filepath.EvalSymlinks(path)
+559: 			if e != nil || !strings.EqualFold(actual, path) {

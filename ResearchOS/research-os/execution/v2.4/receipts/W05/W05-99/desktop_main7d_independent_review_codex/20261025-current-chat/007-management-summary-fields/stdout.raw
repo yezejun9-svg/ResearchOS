@@ -1,0 +1,61 @@
+apps/desktop/main/lib/desktop-management.js
+196: class DesktopManagement {
+197:   constructor(options) {
+198:     this.options = options;
+199:     this.fsImpl = options.fsImpl || fs;
+200:     this.observe = options.observeProcess || (pid => observeWindowsProcess(pid, this.fsImpl));
+201:     this.spawn = options.spawn || childProcess.spawn;
+202:     this.state = 'NOT_STARTED';
+203:     this.child = null; this.hostId = null; this.identity = null;
+204:     this.parentIdentity = null; this.pending = null; this.consentPending = false;
+205:     this.intent = null; this.codingIntent = null;
+206:     this.retiredIntents = []; this.retiredCodingIntents = [];
+207:     this.buffer = Buffer.alloc(0); this.ready = null; this.failure = null;
+208:     this.exitPromise = null; this.resolveExit = null; this.shutdownAccepted = false; this.childExited = true;
+209:   }
+210:   hasUnconfirmedChild() { return !!this.child && !this.childExited; }
+211:   codingSummary() {
+212:     const intent = this.codingIntent;
+213:     const base = this.summary();
+214:     if (!intent) return { available: base.available, state: base.state, reason: base.reason || null };
+215:     const selected = this.sameSelection(intent.projectId, intent.sessionId);
+216:     const sameGeneration = this.sameCodingGeneration(intent);
+217:     if (!intent.requestId) return { available: intent.state === 'PREPARE_REJECTED' &&
+218:         base.available && selected && sameGeneration,
+219:       state: intent.state === 'PREPARE_REJECTED' ? 'CODING_PREPARE_REJECTED' : 'CODING_PREPARE_UNRESOLVED',
+220:       reason: base.reason || (intent.state === 'PREPARE_REJECTED' ? 'CODING_PREPARE_REJECTED' :
+221:         'CODING_ORIGINAL_PREPARE_UNRESOLVED') };
+222:     return { available: base.available && selected && sameGeneration,
+223:       state: !selected || !sameGeneration ? 'CONTEXT_CHANGED_PENDING' :
+224:       !base.available ? base.state : intent.state,
+225:       reason: base.reason || null,
+226:       expires_at: intent.expiresAt, consumed: intent.confirmSent,
+227:       scope: { read_paths: intent.scope.read_paths, write_paths: intent.scope.write_paths,
+228:         max_read_bytes: intent.scope.max_read_bytes, max_write_bytes: intent.scope.max_write_bytes,
+229:         max_tool_calls: intent.scope.max_tool_calls, max_output_tokens: intent.scope.max_output_tokens,
+230:         checks: intent.scope.checks.map(check => ({ id: check.id, package: check.package,
+231:           test_pattern: check.test_pattern, source_paths: check.source_paths,
+232:           timeout_seconds: check.timeout_seconds, process_limit: check.process_limit,
+233:           memory_mib: check.memory_mib, max_text_bytes: check.max_text_bytes,
+234:           toolchain_selected: !!check.toolchain_root, vendor_selected: !!check.vendor_root })) },
+235:       frozen_checks: intent.frozenChecks.map(check => ({ id: check.id, package: check.package,
+apps/desktop/main/main.js
+180:     const kept = bytes.subarray(0, remaining);
+181:     managementDiagnostic.chunks.push(kept); managementDiagnostic.bytes += kept.length;
+182:   }
+183:   if (bytes.length > remaining) managementDiagnostic.truncated = true;
+184: };
+185: const desktopManagement = createDesktopManagement({
+186:   fsImpl: fs, spawn: childProcess.spawn, httpImpl: http, discoveryFile: DISCOVERY,
+187:   dataRoot, controlExe: coreExecutable, verifierManifest, runtimeAssetsDir,
+188:   webDir: WEB_DIST, cwd: REPO, context: qualificationContext,
+189:   codingResourceGeneration: () => codingDirectories.generation,
+190:   diagnostic: captureManagementDiagnostic,
+191: });
+192: const v2Deps = Object.assign({}, deps, {
+193:   v2Transport: validatedV2Transport,
+194:   clientId: 'desktop-shell',
+195:   commandIdFor: () => crypto.randomUUID(),
+196:   sessionState,
+197: });
+198: 

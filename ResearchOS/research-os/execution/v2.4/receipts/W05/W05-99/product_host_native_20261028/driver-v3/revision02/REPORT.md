@@ -1,0 +1,9 @@
+# Native wrapper revision02 preparation
+
+Revision01 remains unchanged. This revision addresses its remaining post-spawn guard gap: after a successful `Popen`, `run-owned.py` assigns the returned `Popen` object to the module-level `OWNED_CONTROLLER` in the next statement. The precomputed spawn record and every later receipt write, console output, wait, and stream close run inside an exception boundary. Any exception moves to `hold_postspawn`, which keeps the same handle, retries only the missing spawn receipt without overwriting mismatched evidence, waits for the controller's natural terminal status, and then enters the existing Root reconciliation loop. It does not stop or restart the controller.
+
+The Root release contract and self-scan in revision01 are unchanged: the scanner includes every installed bundle EXE basename **or** a known product PID, and a reused known PID blocks release. The wrapper must derive known identities from the controller's `UNRESOLVED.json`; absent or invalid evidence remains a release blocker. A successful controller exit returns 0 only if the post-spawn receipt, wait, streams, and exit receipt all complete. Any post-spawn failure, including one after a controller exit of 0, requires Root reconciliation.
+
+`lifecycle.mjs`, `choose-owned-folder.ps1`, and `close-owned-window.ps1` are byte identical to driver-v2. Five pure mock tests passed: spawn receipt failure, wait exception, stream-close failure, holder retry of a transient receipt failure followed by a wait exception, and known-PID reuse/exact-bundle blockers. Python AST parse and Node syntax check passed. No Electron, Core, CLI, installer, model, or native pipe was run.
+
+The source and test hashes are recorded in `PREPARATION.json`. Execution still requires a fresh Root sealed scope whose `bound_files` pin all four revision02 driver files. No shared checkpoint was changed.

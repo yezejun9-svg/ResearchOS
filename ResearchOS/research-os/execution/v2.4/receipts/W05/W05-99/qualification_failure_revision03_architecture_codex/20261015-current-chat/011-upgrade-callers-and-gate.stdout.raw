@@ -1,0 +1,158 @@
+	root := filepath.Join(dataRoot, "host", replacementJournal)
+	if _, e := os.Lstat(root); os.IsNotExist(e) {
+		return head, nil
+	} else if e != nil {
+		return head, e
+	}
+	if _, e := replacementIdentity(root, true); e != nil {
+		return head, e
+	}
+	if e := replacementACL(root, true, true); e != nil {
+		return head, e
+	}
+	guards, e := guardWriteDirectories(root)
+	if e != nil {
+		return head, e
+	}
+	defer closeWriteGuards(guards)
+	entries, e := os.ReadDir(root)
+	if e != nil {
+		return head, e
+	}
+	type terminal struct {
+		P          replacementPlan
+		E          replacementEvent
+		PlanSHA256 string
+	}
+	var all []terminal
+	for _, entry := range entries {
+		if !entry.IsDir() || !replacementID(entry.Name()) {
+			return head, errors.New("replacement journal malformed; explicit recover required")
+		}
+		if entry.Name() == excludeOperation {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		raw, e := replacementRead(filepath.Join(dir, "plan.json"), 256<<10)
+		if e != nil {
+			return head, fmt.Errorf("replacement unfinished; explicit recover required: %w", e)
+		}
+		var p replacementPlan
+		if decodeRuntimeManaged(raw, &p) != nil || replacementPlanValid(p) != nil || p.OperationID != entry.Name() || p.DataRoot != dataRoot {
+			return head, errors.New("replacement plan invalid; explicit recover required")
+		}
+		v, e := replacementReadJournal(dir, p, raw)
+		if e != nil {
+			return head, e
+		}
+		if len(v.Events) == 0 {
+			return head, errors.New("replacement unfinished; explicit recover required")
+		}
+		last := v.Events[len(v.Events)-1]
+		switch last.State {
+		case "COMMITTED":
+			if !bytes.Equal(v.Files["actual-backup.bin"], p.OldBytes) || v.Files["stage.bin"] != nil {
+				return head, errors.New("committed backup/stage invalid")
+			}
+		case "ABORTED":
+			if v.Files["actual-backup.bin"] != nil {
+				return head, errors.New("aborted journal has publication evidence")
+			}
+		default:
+			return head, errors.New("replacement unfinished; use --runtime-verifier-replacement recover")
+		}
+		all = append(all, terminal{p, last, domain.Digest(raw)})
+	}
+	if len(all) == 0 {
+		return head, nil
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].P.HistorySequence < all[j].P.HistorySequence })
+	for _, t := range all {
+		if !replacementExtendsHead(t.P, head) {
+			return head, errors.New("causal history fork, cycle, missing predecessor or digest drift")
+		}
+		record := t.P.OldSHA256
+		if t.E.State == "COMMITTED" {
+			record = t.P.NewSHA256
+		}
+		head = replacementHistoryHead{Sequence: t.P.HistorySequence, OperationID: t.P.OperationID, PlanSHA256: t.PlanSHA256, TerminalHash: t.E.Hash, RecordSHA256: record}
+	}
+	return head, nil
+}
+// Token deliberately has no exported fields, serialization or arbitrary-key
+// constructor. Copies share one state. A zero value rejects all operations.
+type Token struct { state *tokenState }
+type tokenState struct {
+    mu sync.Mutex
+    adoption Adoption
+    native *nativeSession
+    proof string
+    phase string
+}
+func (t Token) Adoption() (Adoption,error) {
+    if t.state==nil { return Adoption{},errors.New("AUTHORITY_ZERO_TOKEN") }
+    t.state.mu.Lock(); defer t.state.mu.Unlock()
+    var a Adoption; err:=strict(encoded(t.state.adoption),&a); return a,err
+}
+func (t Token) Check(root,database,proof string) error {
+    if t.state==nil { return errors.New("AUTHORITY_ZERO_TOKEN") }
+    s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="CLOSED" || s.native==nil || root!=s.adoption.Root || database!=s.adoption.Database || !validHash(proof) || (s.proof!="" && proof!=s.proof) { return errors.New("AUTHORITY_TOKEN_BINDING") }
+    if err:=ValidateAdoption(s.adoption); err!=nil { return err }
+    return s.native.check()
+}
+func (t Token) Begin(proof string) error {
+    if t.state==nil { return errors.New("AUTHORITY_ZERO_TOKEN") }
+    s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase!="READY" || !validHash(proof) || (s.proof!="" && s.proof!=proof) { return errors.New("AUTHORITY_ONE_USE") }
+    if err:=s.native.check(); err!=nil { return err }
+    s.proof=proof; s.phase="INFLIGHT"; return nil
+}
+func (t Token) Finish(committed bool) {
+    if t.state==nil { return }; s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="INFLIGHT" { if committed { s.phase="COMMITTED" } else { s.phase="READY" } }
+}
+func (t Token) Close() error {
+    if t.state==nil { return nil }; s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="INFLIGHT" { return fmt.Errorf("AUTHORITY_TRANSACTION_INFLIGHT") }
+    if s.phase=="CLOSED" { return nil }; s.phase="CLOSED"; return s.native.close()
+}
+type MigrationToken struct { state *migrationState }
+type migrationState struct { mu sync.Mutex; native *nativeSession; grant MigrationGrant; phase string }
+func (t MigrationToken) Binding() (MigrationBinding,error) {
+    if t.state==nil { return MigrationBinding{},errors.New("AUTHORITY_ZERO_MIGRATION_TOKEN") }
+    t.state.mu.Lock(); defer t.state.mu.Unlock(); return t.state.grant.Binding,nil
+}
+func (t MigrationToken) Options() ([]byte,error) {
+    if t.state==nil { return nil,errors.New("AUTHORITY_ZERO_MIGRATION_TOKEN") }
+    t.state.mu.Lock(); defer t.state.mu.Unlock(); return append([]byte(nil),t.state.grant.Options...),nil
+}
+// RequirePin proves this exact raw member is already covered by the issuer's
+// grant and retained by native deny-write handles. It cannot append authority.
+func (t MigrationToken) RequirePin(pin RawPin) error {
+    if t.state==nil { return errors.New("AUTHORITY_ZERO_MIGRATION_TOKEN") }
+    s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="CLOSED" || s.native==nil { return errors.New("AUTHORITY_MIGRATION_CLOSED") }
+    for _,approved:=range s.grant.Pins { if bytes.Equal(encoded(pin),encoded(approved)) { return nil } }
+    return errors.New("AUTHORITY_MIGRATION_REQUIRED_RAW_PIN_ABSENT")
+}
+func (t MigrationToken) Check(binding MigrationBinding) error {
+    if t.state==nil { return errors.New("AUTHORITY_ZERO_MIGRATION_TOKEN") }
+    s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="CLOSED" || s.native==nil || !bytes.Equal(encoded(binding),encoded(s.grant.Binding)) || !validInterval(s.grant.IssuedUTC,s.grant.ExpiresUTC,time.Now(),5*time.Minute) { return errors.New("AUTHORITY_MIGRATION_TOKEN_BINDING") }
+    return s.native.check()
+}
+func (t MigrationToken) Begin(binding MigrationBinding) error {
+    if t.state==nil { return errors.New("AUTHORITY_ZERO_MIGRATION_TOKEN") }
+    s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase!="READY" || !bytes.Equal(encoded(binding),encoded(s.grant.Binding)) { return errors.New("AUTHORITY_MIGRATION_ONE_USE") }
+    if e:=s.native.check(); e!=nil { return e }; s.phase="INFLIGHT"; return nil
+}
+func (t MigrationToken) Finish(committed bool) {
+    if t.state==nil { return }; s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="INFLIGHT" { if committed { s.phase="COMMITTED" } else { s.phase="READY" } }
+}
+func (t MigrationToken) Close() error {
+    if t.state==nil { return nil }; s:=t.state; s.mu.Lock(); defer s.mu.Unlock()
+    if s.phase=="INFLIGHT" { return errors.New("AUTHORITY_MIGRATION_INFLIGHT") }; if s.phase=="CLOSED" { return nil }; s.phase="CLOSED"; return s.native.close()
+}

@@ -1,0 +1,28 @@
+import json,hashlib,os
+from datetime import datetime,timezone
+from pathlib import Path
+ROOT=Path('D:/作品集/ResearchOS/research-os');HERE=Path(__file__).resolve().parent;CONTROL=HERE/'product-v1-owned-verification-20261104';OUT=ROOT/'execution/product-v1/receipts/single-harness-20261104/progress-cp624'
+def read(p):return json.loads(p.read_bytes())
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def put(p,v):
+ t=p.with_name(p.name+'.new');assert not t.exists();t.write_bytes((json.dumps(v,ensure_ascii=False,indent=2)+'\n').encode('utf8'));os.replace(t,p)
+cpf=ROOT/'execution/v2.4/checkpoint.json';raw=cpf.read_bytes();cp=read(cpf);assert cp['revision']==623 and len(cp['failure_counters'])==2515
+if OUT.exists():assert {p.name for p in OUT.iterdir()}=={'checkpoint.cp623.before.json','scope.json','independent-review.json'} and (OUT/'checkpoint.cp623.before.json').read_bytes()==raw
+scope=CONTROL/'scopes/product-v1-tree-diagnostic-03.json';assert sha(scope)=='aff6bda55fb83813b1ecf54582b42b3bc4f8c89cecece4806fa2d3fbbfd1b179' and not (CONTROL/'runs/product-v1-tree-diagnostic-03').exists()
+review=ROOT/'execution/product-v1/receipts/single-harness-20261104/tree-diagnostic-controller01/reviews/report.json';assert sha(review)=='580a77677909e18711646d311b8c01a31ced64a75621e492dd075987a5e4586f';r=read(review)
+OUT.mkdir(exist_ok=True)
+for name,data in [('checkpoint.cp623.before.json',raw),('scope.json',scope.read_bytes()),('independent-review.json',review.read_bytes())]:
+ p=OUT/name
+ if p.exists():assert p.read_bytes()==data
+ else:p.write_bytes(data)
+now=datetime.now(timezone.utc).isoformat();known={x.get('origin_key') for x in cp['failure_counters']}
+events=list(r.get('diagnostic_events',[]))+[dict(origin_key='root-tree-registrar-preparation-errors',classification='ROOT_C_METADATA_PRELAUNCH',attempts=3,detail='Read guessed diagnostic filename absent; inline Python registrar derivation failed PowerShell parsing before execution; initial apply_patch AddFile typo rejected before write. Correct file list/literal patch used; final C registrar generated875c1a and fresh D registration4dba51 succeeded. No GUI/model/old-source mutation in these preparation errors.')]
+events.append(dict(origin_key='root-diag-checkpoint-duplicate-attempt-key',classification='ROOT_C_METADATA_PRECHECKPOINT',detail='Initial CP624 writer stopped on duplicate attempts keyword before checkpoint/state/handoff writes. Three immutable receipt preamble files remained; actual readback proved CP623/2515 and baseline identical. Explicitly reconciled same preamble, fixed dictionary merge, preserved original failure; no GUI/model launched.'))
+for e in events:
+ if e['origin_key'] not in known:cp['failure_counters'].append({'at':now,'attempts':1,'counter_reset':False,**e});known.add(e['origin_key'])
+progress=dict(checkpoint_revision=624,at=now,status='OWNED_DIALOG_TREE_DIAGNOSTIC03_REGISTERED_ZERO_TASK_MODEL',main_head=cp['current_Main_HEAD'],scope_ref=str(scope),scope_sha256=sha(scope),scope_status='REGISTERED_NOT_EXECUTED',source_review_sha256=sha(review),task_budget=0,model_budget=0,automatic_retry=0,read_scope='Only validated owned native dialog Tree metadata(max16), Win32 child handle/class/PID/visible/enabled(max32) if zero Trees, then mandatory normal owned IDCANCEL. No navigation/OK/workspace grant/task/model.',prior_real_flows='01 and02 consumed at0DOM/0model and retained; 02 normal ownedCancel/fullJobzero proven.',cli_caps_branch='P2 synthetic exceptional output logging found before any live call; author revision02 retains only stream hashes/bytes and closed public summary, pending independent review, NOT_RUN.',real_model_requests=0,product_journeys_accepted=0,product_journeys_required=13,historical_records=len(cp['failure_counters']),old_records_reset=False,next='Execute only new diagnostic03 under exact f13, inspect actual bounded Tree snapshot and final owned Cancel/Job stop. Then choose evidence-based UI selector or report genuine operator/resource requirement; do not guess or loosen ownership/path proof. Independently reviewed CLI caps revision02 can proceed separately after new scope registration.')
+put(OUT/'RESUME.json',progress)
+sf=ROOT/'execution/product-v1/state.json';old=sf.read_bytes();s=read(sf);(OUT/'state.before.json').write_bytes(old);s.update(revision=s['revision']+1,updated_at=now,status=progress['status'],last_progress_ref=str((OUT/'RESUME.json').relative_to(ROOT)),next=progress['next']);put(sf,s)
+cp.update(revision=624,expected_previous_revision=623,updated_at=now,next_command=progress['next']+' Read '+str((OUT/'RESUME.json').relative_to(ROOT)));cp['current_implementation']=dict(status=progress['status'],at=now,resume_ref=str((OUT/'RESUME.json').relative_to(ROOT)),formal_increment=0);assert cpf.read_bytes()==raw;put(cpf,cp)
+hf=ROOT/'execution/v2.4/HANDOFF_RESUME_PACK.md';old=hf.read_bytes();(OUT/'handoff.before.md').write_bytes(old);tmp=hf.with_name(hf.name+'.cp624.new');assert not tmp.exists();tmp.write_bytes(('# Current resume CP624 — OWNED DIALOG DIAGNOSTIC03 REGISTERED; TASK/MODEL BUDGET0\n\nRead '+str((OUT/'RESUME.json').relative_to(ROOT))+'. C-only diagnostic independently approved: owned dialog metadata then mandatory IDCANCEL, no OK/navigation/model/task paths. New scope03 NOT_RUN, prior01/02 consumed and retained at0submit. CLI caps revision02 pending separate source review. Source23e33e9/build05 intact. V1 journeys0/13, histories/UNKNOWN preserved.\n\n').encode('utf8')+old);os.replace(tmp,hf)
+print(json.dumps(dict(checkpoint=624,scope_sha256=sha(scope),historical_records=len(cp['failure_counters']),task_budget=0,model_budget=0)))

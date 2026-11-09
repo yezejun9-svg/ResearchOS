@@ -1,0 +1,67 @@
+--- D:/作品集/ResearchOS/research-os/.local/worktrees/codex-w0599-native-harness43-d74319468b584322b516e3b8b3aee4f2/internal/domain/client_workspace_test.go
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/workspace_epoch_fixture_source_codex/fa7c40fcaeed4dd5bdb649c9a77d393c/candidate-root/internal/domain/client_workspace_test.go
+@@ -56,6 +56,16 @@
+ }
+ func clientWorkspaceFixtureFor(t *testing.T, f *fixture) (*fixture, *ClientService, *clientWorkspacePort, *WorkspaceBinding, string) {
+ 	t.Helper()
++	return clientWorkspaceFixtureForEpoch(t, f, 1)
++}
++
++// Synthetic mapped current-state fixture, not accepted historical handoff proof.
++// MapClientSession persists epoch, writer and lease on the same Session row.
++func clientWorkspaceFixtureForEpoch(t *testing.T, f *fixture, writerEpoch int64) (*fixture, *ClientService, *clientWorkspacePort, *WorkspaceBinding, string) {
++	t.Helper()
++	if writerEpoch < 1 {
++		t.Fatal("workspace fixture requires a positive writer epoch")
++	}
+ 	b := &WorkspaceBinding{AuthorizedRef: "workspace-test", DisplayName: "fixture", DisplayPath: "fixture", RealPath: t.TempDir(), Access: "READ_ONLY", ProjectID: &f.project, Revision: 2, Status: WorkspaceActive, PrincipalID: f.owner, ClientID: "workspace-client", HostPrincipalRef: "fixture", CreatedAt: Now()}
+ 	port := &clientWorkspacePort{raw: []byte("精确字节\r\n")}
+ 	svc := &ClientService{Domain: f.s, Doc: clientHistoryDoc(t), WorkspaceAuthority: clientWorkspaceAuthority{}, WorkspaceFiles: port, Host: ClientHostInfo{CoreBuildID: "workspace-fixture"}}
+@@ -66,7 +76,7 @@
+ 		}
+ 		now := time.Now().UTC()
+ 		expires := now.Add(time.Hour)
+-		return MapClientSession(context.Background(), tx, ClientSession{ID: sid, ProjectID: f.project, Revision: 1, WriterEpoch: 1, WriterClientID: b.ClientID, WorkspaceRef: &b.AuthorizedRef, UpstreamSession: ID(), CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: &expires, Protocol: ProtocolV2})
++		return MapClientSession(context.Background(), tx, ClientSession{ID: sid, ProjectID: f.project, Revision: 1, WriterEpoch: writerEpoch, WriterClientID: b.ClientID, WorkspaceRef: &b.AuthorizedRef, UpstreamSession: ID(), CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: &expires, Protocol: ProtocolV2})
+ 	})
+ 	return f, svc, port, b, sid
+ }
+@@ -174,9 +184,21 @@
+ 	}
+ }
+ func TestClientWorkspaceImportExactBytesReplayAndEpoch(t *testing.T) {
+-	f, svc, port, b, sid := clientWorkspaceFixture(t)
++	const currentEpoch int64 = 2
++	const oldEpoch int64 = 1
++	f, svc, port, b, sid := clientWorkspaceFixtureForEpoch(t, contextFixture(t), currentEpoch)
++	var mappedEpoch, mappedRevision int64
++	var mappedWriter, mappedProject, mappedWorkspace, mappedLease string
++	if err := f.db.QueryRow("SELECT writer_epoch,revision,writer_client_id,project_id,workspace_ref,lease_expires_at FROM client_sessions WHERE id=?", sid).Scan(&mappedEpoch, &mappedRevision, &mappedWriter, &mappedProject, &mappedWorkspace, &mappedLease); err != nil {
++		t.Fatal(err)
++	}
++	expires, leaseErr := time.Parse(time.RFC3339Nano, mappedLease)
++	if leaseErr != nil || !expires.After(time.Now().UTC()) || mappedEpoch != currentEpoch || mappedRevision != 1 || mappedWriter != b.ClientID || mappedProject != f.project || mappedWorkspace != b.AuthorizedRef {
++		t.Fatalf("mapped current writer fixture is not coherent: epoch=%d revision=%d writer=%q project=%q workspace=%q lease_error=%v", mappedEpoch, mappedRevision, mappedWriter, mappedProject, mappedWorkspace, leaseErr)
++	}
+ 	body := Object{"workspace_ref": b.AuthorizedRef, "relative_path": "source.txt", "expected_content_hash": Digest([]byte("stale")), "purpose": "ATTACHMENT"}
+ 	env := workspaceTestEnvelope(f, sid, "artifact.import", body)
++	env.WriterEpoch = revPtr(currentEpoch)
+ 	res, _ := executeWorkspaceTest(t, f, svc, env)
+ 	if deref(res.ErrorCode) != "CONTENT_CONFLICT" {
+ 		t.Fatalf("stale file imported: %s", Bytes(res))
+@@ -188,13 +210,14 @@
+ 	}
+ 	body["expected_content_hash"] = Digest(port.raw)
+ 	env = workspaceTestEnvelope(f, sid, "artifact.import", body)
+-	env.WriterEpoch = revPtr(0)
++	env.WriterEpoch = revPtr(oldEpoch)
+ 	before := port.calls
+ 	res, _ = executeWorkspaceTest(t, f, svc, env)
+ 	if deref(res.ErrorCode) != "STALE_WRITER_EPOCH" || port.calls != before {
+ 		t.Fatalf("old writer reached file: %s", Bytes(res))
+ 	}
+ 	env = workspaceTestEnvelope(f, sid, "artifact.import", body)
++	env.WriterEpoch = revPtr(currentEpoch)
+ 	res, replay := executeWorkspaceTest(t, f, svc, env)
+ 	if deref(res.Status) != "COMPLETED" || replay || derefI64(res.Revision, 0) != 2 {
+ 		t.Fatalf("import: %s", Bytes(res))

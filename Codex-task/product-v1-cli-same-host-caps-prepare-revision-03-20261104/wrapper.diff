@@ -1,0 +1,64 @@
+--- freeze02/same-host-caps.mjs
++++ freeze03/same-host-caps.mjs
+@@ -10,12 +10,12 @@
+ const TASK=path.dirname(HERE);
+ const BASE=path.join(TASK,'product-v1-real-electron-harness-prepare-revision-04');
+ const BASE_SHA='68458e0ff59d091d2481356f19bec7d557a3dc9924ee3f91cc8c47e77b1d450b';
+-const BUNDLE='D:/作品集/ResearchOS/research-os/.local/worktrees/product-v1-build-05-20261104/.local/desktop-v1-build-05';
++const BUNDLE='D:/作品集/ResearchOS/research-os/.local/worktrees/product-v1-build-06-20261104/.local/desktop-v1-build-06';
+ const CLI='D:/作品集/ResearchOS/research-os/.local/worktrees/product-v1-build-03-20261104/.local/cli-v1-artifact-01/bin/researchos.exe';
+ const CLI_SHA='881e26a2784cab412c21e3f6b3e562d031d9f10479911953a83ef5888a7a4da7';
+-const MANIFEST_SHA='b630a2222faeed08c98259bfadd3c4d5196be9afec8508bd97ae4a9ec28ab1a9';
++const MANIFEST_SHA='b3f62e359609b8cc698ddc4934e2f9e6cf2b3e1ddfb0a454ac315a70968a4f39';
+ const LAUNCH_SHA='63c0b49e5f237f8137baf50909af3269106f697f4a5b98d7307e7650dd4912af';
+-const CONTROL_SHA='9874ea065e12822683e45e71350cd7c9874cfc87346c0625c826eda1094e0694';
++const CONTROL_SHA='9822351e13584757e3122d5f78ae0ba3d98cc6eb5e33c9b51a0710146804cb98';
+ const F13='f13f630d21548bf8bbb9f1bdaf08b78adc41546d32f00216c05f6ae3664a218c';
+ const SHA=p=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+ const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
+@@ -27,6 +27,11 @@
+   .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|credential)(?:["'])?\s*[=:]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;}]+)/gi,'$1"[REDACTED]"').slice(0,16384);
+ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ async function within(work,ms,label){let timer;try{return await Promise.race([work(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(Error(label),{code:label})),ms);})]);}finally{clearTimeout(timer);}}
++export function withDerivedSystemDrive(env){
++  const drive=path.parse(env.SystemRoot).root.replace(/[\\/]+$/,'');
++  need(/^[A-Za-z]:$/.test(drive),'WINDOWS_DRIVE_ROOT_REQUIRED');
++  return {...env,SystemDrive:drive};
++}
+ function validateSDK(sdk){
+   pin(sdk.inventory_path,sdk.inventory_sha256);
+   const inv=JSON.parse(fs.readFileSync(sdk.inventory_path,'utf8')),rows=[];
+@@ -63,7 +68,9 @@
+ }
+ 
+ export async function run(scopeFile,expectedSHA){
+-  need(process.platform==='win32','WINDOWS_REQUIRED');pin(scopeFile,expectedSHA);
++  need(process.platform==='win32','WINDOWS_REQUIRED');
++  need(path.isAbsolute(BUNDLE)&&/^[a-f0-9]{64}$/.test(MANIFEST_SHA)&&/^[a-f0-9]{64}$/.test(CONTROL_SHA),'BUILD06_PINS_PENDING');
++  pin(scopeFile,expectedSHA);
+   const scope=JSON.parse(fs.readFileSync(scopeFile,'utf8'));
+   need(scope.schema==='researchos.same-host-cli-caps/1'&&scope.status==='ROOT_APPROVED_SINGLE_CAPS','PREPARATION_ONLY');
+   need(scope.root_supervision?.controller_sha256===F13&&scope.root_supervision?.required===true,'ROOT_F13_REQUIRED');
+@@ -82,9 +89,9 @@
+   validateSDK(scope.playwright);
+   need(scope.playwright.version==='1.62.1','SDK_VERSION');
+   // Reuse the reviewed R04 explicit environment exactly, replacing only the new
+-  // run root and fixed build05 paths. No R04 run()/picker/project/submit is called.
+-  need(same(scope.bundle.root,BUNDLE),'FIXED_BUILD05');
+-  const env=Object.freeze(makeEnvironment(scope));
++  // run root and fixed build06 paths. No R04 run()/picker/project/submit is called.
++  need(same(scope.bundle.root,BUNDLE),'FIXED_BUILD06');
++  const env=Object.freeze(withDerivedSystemDrive(makeEnvironment(scope)));
+   need(same(env.RESEARCHOS_CLI_DISCOVERY,path.join(scope.run_root,'discovery.json'))&&env.RESEARCHOS_SHARED_HOST_LOCATOR_DISABLED==='1','EXPLICIT_SAME_HOST_DISCOVERY');
+   need(!Object.keys(env).some(k=>/^(OPENAI_|ANTHROPIC_|AZURE_|CODEX_|NODE_|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$)/i.test(k)),'NO_AMBIENT_AUTH_OR_PROXY');
+   fs.mkdirSync(scope.run_root);
+@@ -106,7 +113,8 @@
+   }}catch{state.malformed_main_report=true;}}
+   try{
+     const {_electron}=await import(pathToFileURL(path.join(scope.playwright.root,'index.mjs')).href);
+-    guard();app=await _electron.launch({executablePath:path.join(BUNDLE,'runtime/electron/electron.exe'),args:[path.join(BUNDLE,'apps/desktop')],cwd:BUNDLE,env,timeout:Math.min(45000,until-Date.now())});
++    // Electron cwd only. The product still launches its Core with cwd=REPO.
++    guard();app=await _electron.launch({executablePath:path.join(BUNDLE,'runtime/electron/electron.exe'),args:[path.join(BUNDLE,'apps/desktop')],cwd:scope.run_root,env,timeout:Math.min(45000,until-Date.now())});
+     app.on('console',m=>observe(m.text()));
+     const desktop=app.process();state.playwright_launcher_pid=desktop?.pid||null;
+     const decoder=new StringDecoder('utf8');let pending='';

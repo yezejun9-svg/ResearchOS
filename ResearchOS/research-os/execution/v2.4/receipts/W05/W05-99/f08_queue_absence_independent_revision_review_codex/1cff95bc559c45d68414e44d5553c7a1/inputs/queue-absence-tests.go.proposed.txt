@@ -1,0 +1,73 @@
+// These tests consume complete typed queue/fence/receipt/Session tuples and
+// full frozen-schema Task/Goal bodies, not hand-waved empty bindings. They test
+// the two shared absence callsites. They do not replace the still-open complete
+// modes 0 -> 7 -> 1 -> 5 journal/response fixtures or SQL24 integration controls.
+func f08AbsenceValidator(t *testing.T) *f08ProofValidator {
+	t.Helper()
+	d, e := LoadSchemaWithExternals(backupConfigurationProtocol, map[string][]byte{"domain.schema.json":backupConfigurationDomain}); if e != nil { t.Fatal(e) }
+	v, e := f08NewProofValidator(d, backupConfigurationDomain); if e != nil { t.Fatal(e) }; return v
+}
+func f08AbsenceFixture(t *testing.T, other bool) []any {
+	t.Helper()
+	when := "2026-01-01T00:00:00Z"
+	binding := map[string]any{"route":"MU_FORK","upstream_project_id":nil,"upstream_goal_id":nil,"upstream_task_id":nil}
+	contract := map[string]any{"contract_hash":"sha256:"+strings.Repeat("a",64),"contract_revision":f08Number(1),"checks":[]any{map[string]any{"check_id":"check","kind":"DETERMINISTIC","required":true,"expected":"finite fixture","command_key":"fixture","rubric_ref":nil,"qualification_id":nil,"not_applicable_reason":nil}},"require_independent_verifier":true,"version_policy":"EXACT","frozen_at":when}
+	rows := []any{}
+	addVersion := func(kind string, body map[string]any) {
+		rows = append(rows, []any{"domain_versions",[]any{"p",kind,body["id"],f08Number(1),f08ProofTestHex(t,body),nil}}, []any{"domain_objects",[]any{"p",kind,body["id"],f08Number(1),f08ProofTestHex(t,body),nil,f08Number(0)}})
+	}
+	for _, id := range []string{"A","B"} {
+		task := map[string]any{"id":id,"project_id":"p","revision":f08Number(1),"created_at":when,"updated_at":when,"goal_id":"goal-"+id,"title":"fixture","task_type":"fixture","stage":"review","status":"DRAFT","dependency_task_ids":[]any{},"requirement_refs":[]any{},"input_refs":[]any{},"context_bundle_id":nil,"acceptance_contract":contract,"assigned_principal_id":nil,"active_run_id":nil,"output_artifact_ids":[]any{},"acceptance_id":nil,"blocking_conflict_ids":[]any{},"no_progress_record_id":"progress-"+id,"stop_policy":map[string]any{"wall_time_seconds":f08Number(1),"max_attempts":f08Number(1),"max_parallel_runs":f08Number(1),"stop_conditions":[]any{"fixture"}},"binding":binding}
+		goal := map[string]any{"id":"goal-"+id,"project_id":"p","revision":f08Number(1),"created_at":when,"updated_at":when,"title":"fixture","original_intent":"fixture","scope":"PROJECT","status":"ACTIVE","requirement_refs":[]any{map[string]any{"entity_type":"Requirement","id":"requirement-"+id,"revision":f08Number(1),"content_hash":nil}},"problem_ids":[]any{"problem-"+id},"task_ids":[]any{id},"deliverables":[]any{"fixture"},"acceptance_contract":contract,"budget_policy_id":"budget-"+id,"outcome":nil,"acceptance_id":nil,"binding":binding}
+		addVersion("Task",task); addVersion("Goal",goal)
+	}
+	if other {
+		content := map[string]any{"text":"unrelated B","attachments":[]any{}}; contentRaw:=f08TestJSON(t,content)
+		body := map[string]any{"task_id":"B","from":"ENQUEUED","to":"DROPPED"}; raw:=f08TestJSON(t,body)
+		rows=append(rows,
+			[]any{"sessions",[]any{"session-B","p",f08Number(1),when,when,"goal-B","B",nil,f08Number(1),"client-B",when,f08Number(0),"native-B",nil,nil,nil,nil,nil,nil,nil,f08Number(0),nil,nil,ProtocolV2}},
+			[]any{"fences",[]any{"p","B","session-B","generation-B","CANCEL_FENCED",f08Number(1),f08Number(1),nil,nil,nil,nil,nil,f08Number(0),f08Number(2)}},
+			[]any{"queue",[]any{"principal-B","p","command-B","session-B","B","goal-B","generation-B",f08Number(1),"sha256:"+strings.Repeat("b",64),"message-B",f08Number(1),"STEER",strings.ToUpper(hex.EncodeToString(contentRaw)),f08RawHash(contentRaw),"DROPPED",f08Number(2),"receipt-B",when}},
+			[]any{"receipts",[]any{"receipt-B","p","generation-B","command-B","CANCEL_FENCE",strings.ToUpper(hex.EncodeToString(raw)),f08RawHash(raw),nil,when}})
+	}
+	return rows
+}
+func f08AbsenceDecode(t *testing.T, rows []any) *f08Sources {
+	t.Helper(); s,e:=f08DecodeSources(rows); if e!=nil { t.Fatal(e) }
+	v:=f08AbsenceValidator(t)
+	for _,r:=range s.rows["domain_versions"] { b,_,e:=f08RawObject(r[4]);if e!=nil{t.Fatal(e)}; if e=v.entities.ValidateDefInput(r[1].(string),b);e!=nil{t.Fatal("fixture schema",e)} }
+	return s
+}
+func f08AbsenceRow(rows []any, category string) []any {
+	for _, pair:=range rows { p:=pair.([]any);if p[0]==category{return p[1].([]any)} };panic("missing fixture category")
+}
+func f08AbsenceReceiptBody(t *testing.T, rows []any, body map[string]any) {
+	t.Helper(); r:=f08AbsenceRow(rows,"receipts");raw:=f08TestJSON(t,body);r[5]=strings.ToUpper(hex.EncodeToString(raw));r[6]=f08RawHash(raw)
+}
+func TestF08NoSessionAbsenceFullTypedSources(t *testing.T) {
+	v:=f08AbsenceValidator(t)
+	for _, other:=range []bool{false,true} {
+		t.Run(fmt.Sprintf("positive_unrelated_history_%v",other),func(t *testing.T){s:=f08AbsenceDecode(t,f08AbsenceFixture(t,other));q,e:=v.queueAdmission(s,"p","A");if e!=nil||q["variant"]!="NO_SESSION"{t.Fatal(q,e)};final,e:=v.emptyQueueFinal(s,"p","A",q);if e!=nil||!f08EmptyArray(final["entry_refs"])||!f08EmptyArray(final["receipt_refs"]){t.Fatal(final,e)}})
+	}
+	t.Run("positive_unrelated_receipt_not_current_pointer",func(t *testing.T){rows:=f08AbsenceFixture(t,true);f08AbsenceRow(rows,"queue")[16]=nil;s:=f08AbsenceDecode(t,rows);q,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",q);e!=nil{t.Fatal(e)}})
+	for _,state:=range []string{"ENQUEUED","SENDING","SDK_ACCEPTED","UNKNOWN","CONSUMED","DROP_REQUESTED","DROPPED"} {
+		t.Run("cross_task_generation_"+state,func(t *testing.T){rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[4]="A";q[14]=state;s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("generation FK hid Task A queue")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("final omitted Task A history")}})
+	}
+	cases:=[]struct{name string; mutate func([]any)}{
+		{"receipt_task_changed_rehash",func(rows []any){f08AbsenceReceiptBody(t,rows,map[string]any{"task_id":"A","from":"ENQUEUED","to":"DROPPED"})}},
+		{"orphan_generation_rehash",func(rows []any){f08AbsenceRow(rows,"receipts")[2]="missing-generation"}},
+		{"orphan_command",func(rows []any){f08AbsenceRow(rows,"receipts")[3]="missing-command"}},
+		{"null_command",func(rows []any){f08AbsenceRow(rows,"receipts")[3]=nil}},
+		{"cross_project_receipt",func(rows []any){f08AbsenceRow(rows,"receipts")[1]="other-project"}},
+		{"cross_session_queue",func(rows []any){f08AbsenceRow(rows,"queue")[3]="other-session"}},
+		{"cross_goal_queue",func(rows []any){f08AbsenceRow(rows,"queue")[5]="goal-A"}},
+		{"receipt_cycle",func(rows []any){f08AbsenceRow(rows,"receipts")[7]="receipt-B"}},
+		{"missing_predecessor",func(rows []any){f08AbsenceRow(rows,"receipts")[7]="missing-receipt"}},
+		{"receipt_content_hash",func(rows []any){f08AbsenceRow(rows,"receipts")[6]="sha256:"+strings.Repeat("0",64)}},
+		{"queue_content_hash",func(rows []any){f08AbsenceRow(rows,"queue")[13]="sha256:"+strings.Repeat("0",64)}},
+		{"invalid_transition_rehash",func(rows []any){f08AbsenceReceiptBody(t,rows,map[string]any{"task_id":"B","from":"SENDING","to":"DROPPED"})}},
+		{"unknown_kind_not_absence",func(rows []any){f08AbsenceRow(rows,"receipts")[4]="UNCLASSIFIED"}},
+	}
+	for _,tc:=range cases {t.Run(tc.name,func(t *testing.T){rows:=f08AbsenceFixture(t,true);f08AbsenceRow(rows,"queue")[16]=nil;tc.mutate(rows);s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("admission accepted corrupt association")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("final accepted corrupt association")}})}
+	t.Run("receipt_only_task_A_correct_raw_hash",func(t *testing.T){rows:=f08AbsenceFixture(t,true);filtered:=[]any{};for _,x:=range rows{if x.([]any)[0]!="queue"{filtered=append(filtered,x)}};f08AbsenceReceiptBody(t,filtered,map[string]any{"task_id":"A","from":"SENDING","to":"DROP_REQUESTED"});s:=f08AbsenceDecode(t,filtered);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("receipt-only Task A hidden")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("receipt-only final")}})
+}

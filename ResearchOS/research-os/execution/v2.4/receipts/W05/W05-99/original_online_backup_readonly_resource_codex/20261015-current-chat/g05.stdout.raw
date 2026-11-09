@@ -1,0 +1,284 @@
+SOURCE runtime_model_stream.go 1 140 package domain
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
+)
+
+const modelStreamMaxRaw = 2 * 1024 * 1024
+const modelStreamMaxSecretLanes = 4096
+
+const modelObservationKind = "MODEL_STREAM_OBSERVATION_V1"
+
+func modelPublicMessageID(binding Object) string {
+	return "model-stream-" + strings.TrimPrefix(Str(binding, "stream_id"), "sha256:")
+}
+
+type modelStreamQuery interface {
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
+}
+type modelObservedPart struct {
+	index int64
+	text  string
+	ended bool
+}
+type modelObservedStream struct {
+	binding                              Object
+	sequence, offset, watermark, ordinal int64
+	digest                               string
+	parts                                []*modelObservedPart
+	ended                                bool
+	eventIDs                             []string
+}
+
+func modelExactKeys(value Object, keys ...string) bool {
+	if len(value) != len(keys) {
+		return false
+	}
+	for _, key := range keys {
+		if _, ok := value[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// Reconstruct host observations without granting authority to any REPORT label.
+// Both normal finalization and portable restore call this same readonly verifier.
+func modelStreamEvidence(db modelStreamQuery, project, run string) ([]*modelObservedStream, error) {
+	rows, err := db.Query(`SELECT receipt_id,project,generation,command_id,body,body_hash,previous_receipt_id FROM client_control_receipts WHERE kind=? AND (?='' OR project=?) AND (?='' OR json_extract(body,'$.observation.binding.run_id')=?) ORDER BY rowid`, modelObservationKind, project, project, run, run)
+	if err != nil {
+		return nil, err
+	}
+	entries := []Object{}
+	for rows.Next() {
+		var id, p, g, body, hash string
+		var command, previous sql.NullString
+		if err = rows.Scan(&id, &p, &g, &command, &body, &hash, &previous); err != nil {
+			break
+		}
+		if command.Valid || previous.Valid || Digest([]byte(body)) != hash {
+			err = historyInvalid("model receipt columns or hash")
+			break
+		}
+		v, e := Decode([]byte(body))
+		if e != nil {
+			err = e
+			break
+		}
+		entries = append(entries, Object{"id": id, "project": p, "generation": g, "value": v})
+		if len(entries) > 262144*32 {
+			err = historyInvalid("model receipt global bound")
+			break
+		}
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	ordered := []*modelObservedStream{}
+	byID := map[string]*modelObservedStream{}
+	workers := map[string]int{}
+	seenEvents := map[string]bool{}
+	for _, entry := range entries {
+		v := entry["value"].(Object)
+		f, ok := v["observation"].(map[string]any)
+		if !ok || !modelExactKeys(v, "version", "observation", "journal_event_ids", "session_watermark") || Hash(v["version"]) != Hash(1) || !modelExactKeys(f, "version", "type", "binding", "sequence", "offset", "digest", "payload") || f["version"] != "MODEL_SSE_V1" || f["type"] != "stream.observe" {
+			return nil, historyInvalid("model receipt shape")
+		}
+		b, ok := f["binding"].(map[string]any)
+		if !ok || !modelExactKeys(b, "project_id", "session_id", "task_id", "run_id", "runtime_epoch", "queue_generation", "dispatch_key", "manifest_hash", "process_identity", "effect_sequence", "effect_key", "request_hash", "stream_id") {
+			return nil, historyInvalid("model binding shape")
+		}
+		copy := Merge(Object{}, b)
+		delete(copy, "stream_id")
+		id := Str(b, "stream_id")
+		if id != Hash(copy) || b["project_id"] != entry["project"] || b["queue_generation"] != entry["generation"] {
+			return nil, historyInvalid("model stream identity")
+		}
+		p, ok := f["payload"].(map[string]any)
+		if !ok || !modelExactKeys(p, "event", "message_ordinal", "text_part", "sdk_content_index", "text") {
+			return nil, historyInvalid("model observation payload")
+		}
+		seq, e1 := Num(f, "sequence")
+		off, e2 := Num(f, "offset")
+		wm, e3 := Num(v, "session_watermark")
+		ordinal, e4 := Num(p, "message_ordinal")
+		part, e5 := Num(p, "text_part")
+		index, e6 := Num(p, "sdk_content_index")
+		text, validText := p["text"].(string)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil || e6 != nil || seq < 1 || off < 0 || off > modelStreamMaxRaw || wm < 0 || ordinal < 1 || ordinal > 32 || part < 0 || part >= 64 || index < 0 || index >= 4096 || !validText || !utf8.ValidString(text) || len(text) > 8192 || utf8.RuneCountInString(text) > 16384 || entry["id"] != fmt.Sprintf("%s:observation:%d", id, seq) {
+			return nil, historyInvalid("model observation bounds")
+		}
+		worker := Hash([]any{b["dispatch_key"], b["process_identity"]})
+		workers[worker]++
+		if workers[worker] > 262144 {
+			return nil, historyInvalid("model worker record bound")
+		}
+		stream := byID[id]
+		if stream == nil {
+			if seq != 1 {
+				return nil, historyInvalid("model first observation gap")
+			}
+			stream = &modelObservedStream{binding: b, digest: Digest(nil), ordinal: ordinal}
+			byID[id] = stream
+			ordered = append(ordered, stream)
+			if err = modelStreamAuthority(db, b); err != nil {
+				return nil, err
+SOURCE runtime_model_stream.go 245 280 			return historyInvalid("model delivered initialization binding")
+		}
+	}
+	if err = db.QueryRow(`SELECT body FROM client_control_receipts WHERE receipt_id=? AND project=? AND generation=? AND kind='command.accepted'`, fmt.Sprintf("%s:%d", key, seq), b["project_id"], b["queue_generation"]).Scan(&accepted); err != nil {
+		return err
+	}
+	a, e := Decode([]byte(accepted))
+	if e != nil || a["initialized"] != true {
+		return historyInvalid("model canonical initialization")
+	}
+	for _, k := range []string{"project_id", "session_id", "task_id", "run_id", "runtime_epoch", "queue_generation", "dispatch_key", "manifest_hash", "process_identity"} {
+		if Hash(a[k]) != Hash(b[k]) {
+			return historyInvalid("model accepted initialization binding")
+		}
+	}
+	var effect string
+	if err = db.QueryRow(`SELECT body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence DESC LIMIT 1`, b["project_id"], b["run_id"], b["effect_key"]).Scan(&effect); err != nil {
+		return err
+	}
+	intent, e := Decode([]byte(effect))
+	if e != nil || intent["request_hash"] != b["request_hash"] || Hash(intent["epoch"]) != Hash(b["runtime_epoch"]) {
+		return historyInvalid("model effect binding")
+	}
+	request, ok := intent["payload"].(map[string]any)
+	if !ok || request["capability"] != "MODEL" {
+		return historyInvalid("model effect capability")
+	}
+	return nil
+}
+
+func validateModelStreamBackup(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+SOURCE runtime_model_stream.go 470 570 	current := false
+	for pos, item := range messages {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, nil, historyInvalid("model SDK message")
+		}
+		if m["role"] == "user" {
+			text, valid := muText(m["content"])
+			if valid {
+				p, e := Decode([]byte(text))
+				if e == nil && p["run_id"] == run["id"] && p["task_id"] == run["task_id"] {
+					if current {
+						return nil, nil, historyInvalid("duplicate model prompt")
+					}
+					current = true
+				}
+			}
+			continue
+		}
+		if !current {
+			continue
+		}
+		if m["role"] == "custom" {
+			if m["customType"] != "researchos.command.v1" {
+				return nil, nil, historyInvalid("unbound SDK custom message")
+			}
+			details, ok := m["details"].(map[string]any)
+			if !ok || !modelExactKeys(details, "command_id", "queue_generation", "queue_sequence", "content_hash") {
+				return nil, nil, historyInvalid("model command details")
+			}
+			command := Str(details, "command_id")
+			if used[command] {
+				return nil, nil, historyInvalid("duplicate SDK command")
+			}
+			used[command] = true
+			var id, content, hash, state, receiptID string
+			var sequence int64
+			err = tx.QueryRow(`SELECT message_id,content,content_hash,state,queue_sequence,last_receipt_id FROM client_command_queue WHERE project=? AND generation=? AND command_id=?`, project, details["queue_generation"], command).Scan(&id, &content, &hash, &state, &sequence, &receiptID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if state != "CONSUMED" || hash != Digest([]byte(content)) || details["content_hash"] != hash || Hash(sequence) != Hash(details["queue_sequence"]) {
+				return nil, nil, historyInvalid("SDK command not canonically consumed")
+			}
+			var rec string
+			if err = tx.QueryRow(`SELECT body FROM client_control_receipts WHERE receipt_id=? AND project=? AND generation=? AND command_id=? AND kind='command.consumed'`, receiptID, project, details["queue_generation"], command).Scan(&rec); err != nil {
+				return nil, nil, err
+			}
+			receipt, e := Decode([]byte(rec))
+			if e != nil || receipt["message_id"] != id || receipt["content_hash"] != hash || receipt["run_id"] != run["id"] {
+				return nil, nil, historyInvalid("SDK consumption receipt binding")
+			}
+			parsed, e := Decode([]byte(content))
+			if e != nil {
+				return nil, nil, e
+			}
+			parts := []any{Object{"type": "text", "text": parsed["text"]}}
+			for _, v := range Arr(parsed, "attachments") {
+				attachment, ok := v.(map[string]any)
+				if !ok {
+					return nil, nil, historyInvalid("command attachment")
+				}
+				parts = append(parts, Object{"type": "text", "text": attachment["text"]})
+			}
+			if Hash(parts) != Hash(m["content"]) {
+				return nil, nil, historyInvalid("SDK consumed command bytes")
+			}
+			order[id] = pos
+			continue
+		}
+		if m["role"] != "assistant" {
+			continue
+		}
+		ordinal++
+		if ordinal > len(streams) {
+			return nil, nil, historyInvalid("SDK assistant lacks model observation")
+		}
+		stream := streams[ordinal-1]
+		if stream.ordinal != int64(ordinal) || !stream.ended {
+			return nil, nil, historyInvalid("model observations incomplete")
+		}
+		intent, e := latestEffect(tx, project, Str(run, "id"), Str(stream.binding, "effect_key"))
+		if e != nil {
+			return nil, nil, e
+		}
+		receipt, _ := intent["receipt"].(map[string]any)
+		response, _ := receipt["payload"].(map[string]any)
+		responseRaw := Str(response, "body")
+		if intent["state"] != "CONFIRMED" || receipt["state"] != "CONFIRMED" || receipt["model_transport"] != true || receipt["actual_cost"] != nil || receipt["run_id"] != run["id"] || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) || receipt["key"] != stream.binding["effect_key"] || receipt["receipt_id"] != Digest([]byte(responseRaw)) || response["content_type"] != "text/event-stream" || Hash(response["status"]) != Hash(200) || len(responseRaw) > modelStreamMaxRaw || !completeRuntimeModelSSE([]byte(responseRaw)) {
+			return nil, nil, historyInvalid("model confirmed SSE receipt")
+		}
+		expected, e := muResponse(responseRaw)
+		actual, ae := muSDKAssistant(m)
+		if e != nil || ae != nil || Hash(actual) != Hash(expected) || m["model"] != config["model"] || m["provider"] != config["provider"] || m["api"] != config["api"] || m["errorMessage"] != nil {
+			return nil, nil, historyInvalid("SDK differs from original confirmed SSE")
+		}
+		content := Arr(m, "content")
+		text := ""
+		for _, part := range stream.parts {
+			if !part.ended || part.index >= int64(len(content)) {
+				return nil, nil, historyInvalid("model part incomplete")
+COST_RELATED_SCHEMA_NAMES ['ResourceRequest', 'BudgetLedgerEntry', 'CreateResourceRequest', 'ResolveResourceRequest', 'CostEntryRequest']
+PUBLIC_SCHEMA ResourceRequest {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}, "project_id": {"$ref": "#/$defs/Id"}, "revision": {"$ref": "#/$defs/Revision"}, "created_at": {"$ref": "#/$defs/UtcTime"}, "updated_at": {"$ref": "#/$defs/UtcTime"}, "category": {"type": "string", "enum": ["RATE_LIMIT", "QUOTA", "CREDENTIAL", "DEVICE", "PERMISSION", "BUSINESS_CHOICE"]}, "account_ref": {"anyOf": [{"$ref": "#/$defs/Id"}, {"type": "null"}]}, "reason_code": {"type": "string", "minLength": 1}, "summary": {"type": "string", "minLength": 1}, "dedup_key": {"$ref": "#/$defs/Digest"}, "status": {"type": "string", "enum": ["OPEN", "ACKNOWLEDGED", "RESOLVED", "CANCELLED"]}, "blocked_task_ids": {"type": "array", "items": {"$ref": "#/$defs/Id"}, "minItems": 0}, "continuable_task_ids": {"type": "array", "items": {"$ref": "#/$defs/Id"}, "minItems": 0}, "completed_artifact_refs": {"type": "array", "items": {"$ref": "#/$defs/VersionRef"}, "minItems": 0}, "requested_capability": {"type": "string", "minLength": 1}, "estimated_cost": {"anyOf": [{"$ref": "#/$defs/Money"}, {"type": "null"}]}, "cost_known": {"type": "boolean"}, "resume_checkpoint_ref": {"anyOf": [{"$ref": "#/$defs/VersionRef"}, {"type": "null"}]}, "resolved_by": {"anyOf": [{"$ref": "#/$defs/Id"}, {"type": "null"}]}}, "required": ["id", "project_id", "revision", "created_at", "updated_at", "category", "account_ref", "reason_code", "summary", "dedup_key", "status", "blocked_task_ids", "continuable_task_ids", "completed_artifact_refs", "requested_capability", "estimated_cost", "cost_known", "resume_checkpoint_ref", "resolved_by"], "additionalProperties": false}
+PUBLIC_SCHEMA BudgetLedgerEntry {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}, "project_id": {"$ref": "#/$defs/Id"}, "revision": {"const": 1}, "created_at": {"$ref": "#/$defs/UtcTime"}, "receipt_hash": {"$ref": "#/$defs/Digest"}, "policy_id": {"$ref": "#/$defs/Id"}, "run_id": {"$ref": "#/$defs/Id"}, "operation": {"type": "string", "enum": ["RESERVE", "COMMIT", "RELEASE", "RECONCILE", "UNKNOWN"]}, "money": {"anyOf": [{"$ref": "#/$defs/Money"}, {"type": "null"}]}, "provider_request_id": {"type": "string", "minLength": 1}, "provider_event_id": {"type": "string", "minLength": 1}, "reservation_id": {"anyOf": [{"$ref": "#/$defs/Id"}, {"type": "null"}]}, "cost_basis": {"type": "string", "enum": ["UPPER_BOUND", "ESTIMATE", "ACTUAL", "UNKNOWN"]}, "occurred_at": {"$ref": "#/$defs/UtcTime"}}, "required": ["id", "project_id", "revision", "created_at", "receipt_hash", "policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"], "additionalProperties": false, "allOf": [{"if": {"properties": {"operation": {"const": "UNKNOWN"}}, "required": ["operation"]}, "then": {"properties": {"money": {"type": "null"}, "cost_basis": {"const": "UNKNOWN"}}}, "else": {"properties": {"money": {"$ref": "#/$defs/Money"}}}}]}
+PUBLIC_SCHEMA CreateResourceRequest {"type": "object", "properties": {"category": {"type": "string", "enum": ["RATE_LIMIT", "QUOTA", "CREDENTIAL", "DEVICE", "PERMISSION", "BUSINESS_CHOICE"]}, "account_ref": {"anyOf": [{"$ref": "#/$defs/Id"}, {"type": "null"}]}, "reason_code": {"type": "string", "minLength": 1}, "summary": {"type": "string", "minLength": 1}, "blocked_task_ids": {"type": "array", "items": {"$ref": "#/$defs/Id"}, "minItems": 0}, "continuable_task_ids": {"type": "array", "items": {"$ref": "#/$defs/Id"}, "minItems": 0}, "completed_artifact_refs": {"type": "array", "items": {"$ref": "#/$defs/VersionRef"}, "minItems": 0}, "requested_capability": {"type": "string", "minLength": 1}, "estimated_cost": {"anyOf": [{"$ref": "#/$defs/Money"}, {"type": "null"}]}, "cost_known": {"type": "boolean"}, "resume_checkpoint_ref": {"anyOf": [{"$ref": "#/$defs/VersionRef"}, {"type": "null"}]}}, "required": ["category", "account_ref", "reason_code", "summary", "blocked_task_ids", "continuable_task_ids", "completed_artifact_refs", "requested_capability", "estimated_cost", "cost_known", "resume_checkpoint_ref"], "additionalProperties": false}
+PUBLIC_SCHEMA ResolveResourceRequest {"type": "object", "properties": {"resolution_evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/VersionRef"}, "minItems": 1}, "reason": {"type": "string", "minLength": 1}}, "required": ["resolution_evidence_refs", "reason"], "additionalProperties": false}
+PUBLIC_SCHEMA CostEntryRequest {"type": "object", "properties": {"policy_id": {"$ref": "#/$defs/Id"}, "run_id": {"$ref": "#/$defs/Id"}, "operation": {"type": "string", "enum": ["RESERVE", "COMMIT", "RELEASE", "RECONCILE", "UNKNOWN"]}, "money": {"anyOf": [{"$ref": "#/$defs/Money"}, {"type": "null"}]}, "provider_request_id": {"type": "string", "minLength": 1}, "provider_event_id": {"type": "string", "minLength": 1}, "reservation_id": {"anyOf": [{"$ref": "#/$defs/Id"}, {"type": "null"}]}, "cost_basis": {"type": "string", "enum": ["UPPER_BOUND", "ESTIMATE", "ACTUAL", "UNKNOWN"]}, "occurred_at": {"$ref": "#/$defs/UtcTime"}}, "required": ["policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"], "additionalProperties": false}
+G05_SOURCE_HISTORY_FIELDS_COMPLETE

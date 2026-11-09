@@ -1,0 +1,13 @@
+Source03 candidate fixes original1201 COPIED22_LOGICAL_STATE.
+
+The only product-caller delta adds validate_working22 and replaces the incompatible schema digest comparison in execute. The current observation is retained before validation. All other function ASTs match Source02; the recorded inverse reconstructs its exact bytes. The Source02 inputs are copied byte for byte, including every original raw reference spelling.
+
+The isolated working-copy probe found 83 tables with identical counts and row digests. The retained pre-v3 observation hashes sqlite_master after excluding names matching SQLite LIKE sqlite_%; v3 hashes every row and coalesces SQL NULL. The current complete schema hash 2f91574c52b3f6d5e5c4610bab175209cb80c9a38e6696c2bdfd7c9d423320cf equals the original Native backup manifest. Its historical projection reproduces bfc98c568af73d276aad92b26d96ec5708f3cd26da7261d3c907161ad901792b exactly. Working bytes remained unchanged. The original source database and private recovery key were not opened by this probe; credential row values were never emitted.
+
+The new validator requires exact all-table equality, working/retained byte digest and size equality, exact ledger 1..22 in all three documents, v3 schema self-consistency and Native manifest binding, and the exact old schema projection digest. A non-internal empty SQL string is rejected because the v3 coalesced representation cannot distinguish historical NULL. No schema/table mismatch is waived. The prior original1025 and original1201 failures remain failures.
+
+Twelve new in-memory controls passed, including changes to table digest/set, byte digest/size, ledger, claimed complete hash, manifest hash, retained old hash and internal schema rows. The tests use synthetic objects; they are not a product acceptance. The actual working-copy probe separately establishes the real discrepancy. Successful previous controls, 144/149 review prefixes and old SQL validation suites were not replayed.
+
+Original1205 is an author build-script path-spelling assertion: a Path converted a slash-form leaf ref to backslashes. The raw I/O and host result are preserved. The successful candidate-build prefix was retained; a separate tail script compared the original ref spelling with exact SHA/bytes and executed only the still-unrun controls. Source raw-ref equality rules were unchanged.
+
+No new Native child, Main/Canon/Scope write, Root stage, dispatcher, Go, TP or model call occurred. The consumed Source02 Scope must never execute again. This candidate requires independent Full Source review, then new Root registration, fresh current4 and a finite lease. Source author remains codex:/root/attach_restore_independent_review. Formal and parent acceptance remain false.

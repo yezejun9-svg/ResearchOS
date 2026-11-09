@@ -1,0 +1,149 @@
+--- internal/domain/client_cancel_finalization_i17_integration_test.go
++++ /dev/null
+@@ -1,146 +0,0 @@
+-package domain
+-
+-// SOURCE PREPARATION ONLY. Future Root-owned worktree uses this exact file in
+-// internal/domain together with the unchanged reviewed v3 source and v4 tests.
+-// No public export or sqlite->domain dependency is introduced. Each selector
+-// requires its own controlled process; no t.Parallel or subprocess is started.
+-import (
+- "bytes"
+- "context"
+- "crypto/sha256"
+- "database/sql"
+- "database/sql/driver"
+- "encoding/hex"
+- "encoding/json"
+- "errors"
+- "fmt"
+- "os"
+- "path/filepath"
+- "strings"
+- "testing"
+- "time"
+-
+- "modernc.org/sqlite"
+-)
+-
+-var f08I17Names = [3]string{"researchos_f08_cancel_request_v1", "researchos_f08_cancel_response_v1", "researchos_f08_proof_v1"}
+-type f08I17Ref struct {Path string `json:"path"`; SHA256 string `json:"sha256"`; Bytes int64 `json:"bytes"`}
+-type f08I17Arg struct {Kind string `json:"kind"`; Ref f08I17Ref `json:"ref"`; Integer int64 `json:"integer"`; Text string `json:"text"`}
+-type f08I17Vector struct {
+- ID string `json:"id"`; Function string `json:"function"`
+- Valid []f08I17Arg `json:"valid"`; Corrupt []f08I17Arg `json:"corrupt"`
+- CorruptKind string `json:"corrupt_kind"`; FixedCallbackError string `json:"fixed_callback_error"`
+- ExpectedSQLitePrimaryCode int `json:"expected_sqlite_primary_code"`
+-}
+-type f08I17Manifest struct {
+- Schema string `json:"schema"`; Names [3]string `json:"names"`
+- SourceRef f08I17Ref `json:"source_ref"`; ProducerRef f08I17Ref `json:"producer_ref"`
+- Vectors []f08I17Vector `json:"vectors"`
+-}
+-// Root records this ONLY after independent source/vector approval, an actual
+-// source/resource lease, and controlled fresh module closure. This declaration
+-// cannot itself prove those facts; the external controller must authenticate it.
+-type f08I17Resource struct {
+- Schema string `json:"schema"`; OwnerRoot string `json:"owner_root"`; LeaseID string `json:"lease_id"`
+- ControlledWorktree string `json:"controlled_worktree"`; VectorManifest f08I17Ref `json:"vector_manifest"`
+- ApprovedSource f08I17Ref `json:"approved_source"`; ApprovedProducerTests f08I17Ref `json:"approved_producer_tests"`
+- ApprovedHarness f08I17Ref `json:"approved_harness"`; DriverSource f08I17Ref `json:"driver_source"`
+- IndependentReview f08I17Ref `json:"independent_review"`
+-}
+-func f08I17Read(t *testing.T, r f08I17Ref) []byte {
+- t.Helper()
+- if !filepath.IsAbs(r.Path)||r.Bytes<=0||len(r.SHA256)!=64{t.Fatal("I17 FATAL_OPEN: pinned absolute resource ref required")}
+- raw,err:=os.ReadFile(r.Path);if err!=nil{t.Fatal(err)};h:=sha256.Sum256(raw)
+- if int64(len(raw))!=r.Bytes||hex.EncodeToString(h[:])!=r.SHA256{t.Fatal("I17 resource bytes/hash changed")}
+- return raw
+-}
+-func f08I17Load(t *testing.T) f08I17Manifest {
+- t.Helper();p:=os.Getenv("F08_I17_RESOURCE_APPROVAL")
+- if !filepath.IsAbs(p){t.Fatal("I17 FATAL_OPEN: independent Root source/resource lease and exact resource manifest absent")}
+- raw,err:=os.ReadFile(p);if err!=nil{t.Fatal(err)};var resource f08I17Resource
+- if err=json.Unmarshal(raw,&resource);err!=nil{t.Fatal(err)}
+- if resource.Schema!="researchos.f08.i17.root-resource.v1"||resource.OwnerRoot==""||resource.LeaseID==""||!filepath.IsAbs(resource.ControlledWorktree){t.Fatal("I17 FATAL_OPEN: Root resource declaration incomplete")}
+- cwd,err:=os.Getwd();if err!=nil{t.Fatal(err)}
+- // Expected selector cwd is controlled_worktree/internal/domain. The external
+- // controller must supply exact go.mod/replace/driver/source hashes and actual
+- // Job/process/close proofs; this test never claims to authenticate that lease.
+- want:=filepath.Join(resource.ControlledWorktree,"internal","domain")
+- if !strings.EqualFold(filepath.Clean(cwd),filepath.Clean(want)){t.Fatal("I17 FATAL_OPEN: selector outside approved domain worktree")}
+- if resource.ApprovedSource.SHA256!="73fe76a6b83ebed9e84db090a479a87b87760f714164f6c3220e5ccfd3c9d603"||resource.DriverSource.SHA256!="0eea393caed04ad05ff9a8ca2a1e81d6dc3ad519728ebfcd62fec66b1101e2cb"{t.Fatal("I17 FATAL_OPEN: real v3/fork source pin mismatch")}
+- for _,r:=range []f08I17Ref{resource.ApprovedSource,resource.ApprovedProducerTests,resource.ApprovedHarness,resource.DriverSource,resource.IndependentReview}{f08I17Read(t,r)}
+- var manifest f08I17Manifest
+- if err=json.Unmarshal(f08I17Read(t,resource.VectorManifest),&manifest);err!=nil{t.Fatal(err)}
+- if manifest.Schema!="researchos.f08.i17.vector-manifest.v1"||manifest.Names!=f08I17Names||manifest.SourceRef.SHA256!=resource.ApprovedSource.SHA256||manifest.ProducerRef.SHA256!="55c2e4a806475a6ff4498e18994e9f4d036fa72131ce9357f42e0d503bfce5a5"||len(manifest.Vectors)==0{t.Fatal("I17 manifest binding incomplete")}
+- return manifest
+-}
+-func f08I17Args(t *testing.T, values []f08I17Arg) []driver.Value {
+- t.Helper();args:=make([]driver.Value,len(values))
+- for i,a:=range values{switch a.Kind{
+- case "BLOB":args[i]=f08I17Read(t,a.Ref)
+- case "NULL":args[i]=nil
+- case "INTEGER":args[i]=a.Integer
+- case "TEXT":args[i]=a.Text
+- default:t.Fatal("I17 unsupported raw argument kind")
+- }};return args
+-}
+-func f08I17SQLArgs(values []driver.Value) []any {a:=make([]any,len(values));for i,v:=range values{a[i]=v};return a}
+-func f08I17SQLError(t *testing.T, err error, primary int, fixed string) {
+- t.Helper();var native *sqlite.Error
+- if err==nil||!errors.As(err,&native)||(native.Code()&255)!=primary||!strings.Contains(err.Error(),fixed){t.Fatalf("I17 callback SQL error contract: expected primary=%d fixed=%q got %T %v",primary,fixed,err,err)}
+-}
+-func f08I17Oracle(t *testing.T,ctx context.Context,c *sql.Conn,name string,arity int) {
+- t.Helper();rows,err:=c.QueryContext(ctx,"SELECT name,builtin,type,enc,narg,flags FROM pragma_function_list WHERE name=?",name)
+- if err!=nil{t.Fatal(err)};defer func(){if err:=rows.Close();err!=nil{t.Error(err)}}();count:=0
+- for rows.Next(){var n,kind,enc string;var builtin,narg,flags int;if err:=rows.Scan(&n,&builtin,&kind,&enc,&narg,&flags);err!=nil{t.Fatal(err)};count++
+-  if n!=name||builtin!=0||kind!="s"||enc!="utf8"||narg!=arity||flags!=2099200{t.Fatal("I17 real domain registration name/arity/scalar/flags mismatch")}
+- };if err:=rows.Err();err!=nil{t.Fatal(err)};if count!=1{t.Fatal("I17 real domain registration missing or duplicated")}
+-}
+-func TestF08I17DomainBindings(t *testing.T) {
+- manifest:=f08I17Load(t)
+- functions,err:=f08BuildCallbacks(backupConfigurationProtocol,backupConfigurationDomain);if err!=nil{t.Fatal(err)}
+- ctx,cancel:=context.WithTimeout(context.Background(),90*time.Second);defer cancel()
+- db,err:=sql.Open("sqlite",":memory:");if err!=nil{t.Fatal(err)};db.SetMaxOpenConns(1);db.SetMaxIdleConns(1)
+- defer func(){if err:=db.Close();err!=nil{t.Error(err)}}()
+- c,err:=db.Conn(ctx);if err!=nil{t.Fatal(err)};defer func(){if err:=c.Close();err!=nil{t.Error(err)}}()
+- if _,err:=c.ExecContext(ctx,"PRAGMA trusted_schema=OFF");err!=nil{t.Fatal(err)};var trusted int
+- if err:=c.QueryRowContext(ctx,"PRAGMA trusted_schema").Scan(&trusted);err!=nil||trusted!=0{t.Fatal("I17 trusted_schema OFF required",err)}
+- seen:=map[string]bool{}
+- for i,name:=range f08I17Names{
+-  arity:=[]int{2,5,2}[i];f08I17Oracle(t,ctx,c,name,arity)
+-  cols,marks:=[]string{},[]string{};for j:=0;j<arity;j++{cols=append(cols,fmt.Sprintf("a%d",j));marks=append(marks,"?")}
+-  table:=fmt.Sprintf("f08_i17_%d",i)
+-  if _,err:=c.ExecContext(ctx,"CREATE TABLE "+table+"("+strings.Join(cols,",")+",CHECK("+name+"("+strings.Join(cols,",")+")=1))");err!=nil{t.Fatal(err)}
+-  count:=int64(0)
+-  for _,v:=range manifest.Vectors{if v.Function!=name{continue};if seen[v.ID]||v.ID==""{t.Fatal("I17 duplicate vector")};seen[v.ID]=true
+-   valid,bad:=f08I17Args(t,v.Valid),f08I17Args(t,v.Corrupt)
+-   if len(valid)!=arity||len(bad)!=arity||v.CorruptKind!="CALLBACK_ERROR"||v.FixedCallbackError==""||v.ExpectedSQLitePrimaryCode!=1{t.Fatal("I17 vector/error contract incomplete")}
+-   direct,e:=functions[i](nil,valid);if e!=nil||direct!=int64(1){t.Fatalf("I17 valid direct %s result=%T error=%v",v.ID,direct,e)}
+-   direct,e=functions[i](nil,bad);if direct!=nil||e==nil||e.Error()!=v.FixedCallbackError{t.Fatalf("I17 corrupt direct %s result=%T error=%v",v.ID,direct,e)}
+-   query:="SELECT "+name+"("+strings.Join(marks,",")+")";var value int64
+-   if err:=c.QueryRowContext(ctx,query,f08I17SQLArgs(valid)...).Scan(&value);err!=nil||value!=1{t.Fatalf("I17 valid SQL %s result=%d err=%v",v.ID,value,err)}
+-   var rejected any;err=c.QueryRowContext(ctx,query,f08I17SQLArgs(bad)...).Scan(&rejected);f08I17SQLError(t,err,1,v.FixedCallbackError)
+-   insert:="INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")"
+-   if _,err:=c.ExecContext(ctx,insert,f08I17SQLArgs(valid)...);err!=nil{t.Fatal(err)};count++
+-   _,err=c.ExecContext(ctx,insert,f08I17SQLArgs(bad)...);f08I17SQLError(t,err,1,v.FixedCallbackError)
+-   var after int64;if err:=c.QueryRowContext(ctx,"SELECT count(*) FROM "+table).Scan(&after);err!=nil||after!=count{t.Fatal("I17 bad INSERT changed rowcount",err)}
+-  };if count==0{t.Fatal("I17 no genuine positive vector for actual callback",name)}
+- }
+- if len(seen)!=len(manifest.Vectors){t.Fatal("I17 unknown function vector omitted")}
+- // Generic CHECK exercises SQL binding only. Actual v5 view/trigger/34-source
+- // provenance, authorization, histories and SQL24 remain separately FATAL_OPEN.
+-}
+-func TestF08I17ProducerFreeze(t *testing.T) {
+- manifest:=f08I17Load(t)
+- frozen:=map[string]f08I17Vector{};for _,v:=range manifest.Vectors{frozen[v.ID]=v}
+- for _,ack:=range []bool{false,true}{for _,bodyType:=range []string{"text","blob"}{
+-  data:=f08FullJournalDataFixture(t,ack,bodyType) // never callback/evaluate
+-  prefix:=fmt.Sprintf("ack_%v_%s",ack,bodyType)
+-  if len(data.frames)<20{t.Fatal("I17 raw fixture has incomplete transition sequence")}
+-  for i,frame:=range data.frames{
+-   v,ok:=frozen[prefix+"-"+fmt.Sprint(i)];if !ok{t.Fatal("I17 missing frozen producer frame")}
+-   args:=f08I17Args(t,v.Valid)
+-   if len(args)!=2||args[0]!=frame.Mode||!bytes.Equal(args[1].([]byte),frame.Raw){t.Fatal("I17 independent materialization differs from genuine Go data producer")}
+-  }
+- }}
+- // Callbacks are tested in the separate selector after raw producer equality.
+-}

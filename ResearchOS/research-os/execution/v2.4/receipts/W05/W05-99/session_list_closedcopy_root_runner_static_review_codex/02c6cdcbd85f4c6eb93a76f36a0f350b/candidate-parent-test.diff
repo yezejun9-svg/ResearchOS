@@ -1,0 +1,133 @@
+--- 534857db99fa5e694987f877af74c322eaa2a0b3
++++ a5d6d16ffaf129de0361470c3a1570228bd259a2
+@@ -12,6 +12,7 @@
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
+@@ -757,6 +758,34 @@
+ 	}
+ 	sessionListJSON(t, f.dir, fmt.Sprintf("journal-%02d.json", f.calls), domain.Object{"principal": principal, "project": project, "command_id": env["command_id"], "request_hash": hash, "status": status, "body": body, "headers": headers, "created_at": created, "protocol": protocol, "method": method, "operation": operation})
+ }
++
++// readonlyCopyOpen is only for a fully closed, standalone evidence copy.
++// URL.Path escapes spaces, non-ASCII characters and URI metacharacters.
++func readonlyCopyOpen(path string) (*sql.DB, error) {
++	absolute, err := filepath.Abs(path)
++	if err != nil {
++		return nil, err
++	}
++	uriPath := filepath.ToSlash(absolute)
++	if !strings.HasPrefix(uriPath, "/") {
++		uriPath = "/" + uriPath
++	}
++	u := url.URL{Scheme: "file", Path: uriPath}
++	u.RawQuery = url.Values{"mode": {"ro"}, "immutable": {"1"}}.Encode()
++	db, err := sql.Open("sqlite", u.String())
++	if err != nil {
++		return nil, err
++	}
++	db.SetMaxOpenConns(1)
++	if err = db.Ping(); err != nil {
++		if closeErr := db.Close(); closeErr != nil {
++			return nil, fmt.Errorf("open readonly copy: %v; close: %w", err, closeErr)
++		}
++		return nil, err
++	}
++	return db, nil
++}
++
+ func (f *sessionListFixture) closeEvidence(t *testing.T) {
+ 	t.Helper()
+ 	if f.server != nil {
+@@ -781,36 +810,63 @@
+ 		}
+ 		return out
+ 	}
++	sidecarsAbsent := func(path, receipt string) bool {
++		facts := domain.Object{}
++		absent := true
++		for _, suffix := range []string{"-wal", "-shm"} {
++			_, err := os.Lstat(path + suffix)
++			if os.IsNotExist(err) {
++				facts[suffix] = domain.Object{"exists": false, "error": nil}
++			} else if err != nil {
++				facts[suffix] = domain.Object{"exists": nil, "error": err.Error()}
++				absent = false
++				t.Error(err)
++			} else {
++				facts[suffix] = domain.Object{"exists": true, "error": nil}
++				absent = false
++				t.Errorf("standalone closed evidence has sidecar %s", path+suffix)
++			}
++		}
++		sessionListJSON(t, f.dir, receipt, facts)
++		return absent
++	}
+ 	sessionListJSON(t, f.dir, "before-close.files.json", fileHashes())
+ 	if e := f.db.Close(); e != nil {
+ 		t.Error(e)
+ 		return
+ 	}
+ 	sessionListJSON(t, f.dir, "closed-original.files.json", fileHashes())
++	if !sidecarsAbsent(f.dbPath, "closed-original.sidecars.json") {
++		return
++	}
+ 	raw, e := os.ReadFile(f.dbPath)
+ 	if e != nil {
+ 		t.Error(e)
+ 		return
+ 	}
++	// sessionListSave uses O_EXCL: never reuse an earlier evidence copy.
+ 	sessionListSave(t, f.dir, "closed.sqlite", raw)
+-	for _, s := range []string{"-wal", "-shm"} {
+-		b, e := os.ReadFile(f.dbPath + s)
+-		if e == nil {
+-			sessionListSave(t, f.dir, "closed.sqlite"+s, b)
+-		} else if !os.IsNotExist(e) {
+-			t.Error(e)
+-		}
+-	}
+ 	closedPath := filepath.Join(f.dir, "closed.sqlite")
+-	db, e := sql.Open("sqlite", "file:"+filepath.ToSlash(closedPath)+"?mode=ro")
++	if !sidecarsAbsent(closedPath, "closed-copy.before.sidecars.json") {
++		return
++	}
++	db, e := readonlyCopyOpen(closedPath)
+ 	if e != nil {
+ 		t.Error(e)
++		sidecarsAbsent(closedPath, "closed-copy.after.sidecars.json")
+ 		return
+ 	}
+-	closed := sessionListCaptureRows(t, db)
+-	if e = db.Close(); e != nil {
+-		t.Error(e)
+-	}
++	var closed sessionListRows
++	copySidecarsAbsent := false
++	func() {
++		defer func() {
++			if e := db.Close(); e != nil {
++				t.Error(e)
++			}
++			copySidecarsAbsent = sidecarsAbsent(closedPath, "closed-copy.after.sidecars.json")
++		}()
++		closed = sessionListCaptureRows(t, db)
++	}()
+ 	sessionListJSON(t, f.dir, "closed.rows.json", closed)
+ 	equal := reflect.DeepEqual(open, closed)
+ 	after, e := os.ReadFile(closedPath)
+@@ -818,8 +874,8 @@
+ 		t.Error(e)
+ 	}
+ 	byteEqual := bytes.Equal(raw, after)
+-	sessionListJSON(t, f.dir, "closed-proof.json", domain.Object{"all_table_schema_multisets_equal": equal, "closed_copy_bytes_unchanged_by_read": byteEqual, "closed_copy_sha256": sessionListDigest(after), "HTTP_calls_including_setup": f.calls, "SDK_worker_model_external_paid": 0, "fixture_ports": "SYNTHETIC_METADATA_AND_BINDING_ONLY", "case_failed": t.Failed()})
+-	if !equal || !byteEqual {
++	sessionListJSON(t, f.dir, "closed-proof.json", domain.Object{"all_table_schema_multisets_equal": equal, "closed_copy_bytes_unchanged_by_read": byteEqual, "closed_copy_sha256": sessionListDigest(after), "closed_copy_sidecars_absent": copySidecarsAbsent, "HTTP_calls_including_setup": f.calls, "SDK_worker_model_external_paid": 0, "fixture_ports": "SYNTHETIC_METADATA_AND_BINDING_ONLY", "case_failed": t.Failed()})
++	if !equal || !byteEqual || !copySidecarsAbsent {
+ 		t.Error("closed SQLite evidence drift")
+ 	}
+ }

@@ -1,0 +1,38 @@
+-- Additive, Root-reviewed local pre-dispatch failure proof. No old row changes.
+-- The existing PREPARED row is retained; an immutable tombstone fences launch.
+CREATE TABLE runtime_prepared_abandonments (
+    project TEXT NOT NULL,
+    task TEXT NOT NULL,
+    run TEXT NOT NULL,
+    runtime TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK(epoch>0),
+    dispatch_key TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    owner_root TEXT NOT NULL,
+    proof_hash TEXT NOT NULL,
+    proof_json TEXT NOT NULL CHECK(json_valid(proof_json)),
+    outcome TEXT NOT NULL CHECK(outcome='FAILED_NOT_DISPATCHED_ACCOUNTING_UNKNOWN'),
+    financial_closed INTEGER NOT NULL CHECK(financial_closed=0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(project,run,epoch),
+    UNIQUE(project,task),
+    FOREIGN KEY(project,run,epoch) REFERENCES runtime_dispatches(project,run,epoch)
+);
+CREATE TRIGGER runtime_prepared_abandonments_immutable BEFORE UPDATE ON runtime_prepared_abandonments
+BEGIN SELECT RAISE(ABORT,'immutable prepared-run abandonment'); END;
+CREATE TRIGGER runtime_prepared_abandonments_no_delete BEFORE DELETE ON runtime_prepared_abandonments
+BEGIN SELECT RAISE(ABORT,'durable prepared-run abandonment'); END;
+CREATE TRIGGER runtime_dispatch_abandoned_no_update BEFORE UPDATE ON runtime_dispatches
+WHEN EXISTS(SELECT 1 FROM runtime_prepared_abandonments a WHERE a.project=OLD.project AND a.run=OLD.run AND a.epoch=OLD.epoch)
+BEGIN SELECT RAISE(ABORT,'abandoned dispatch cannot launch or change'); END;
+CREATE TRIGGER runtime_prepared_abandonment_terminal_insert BEFORE INSERT ON runtime_prepared_abandonments
+WHEN NOT EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=NEW.project AND d.run=NEW.run AND d.epoch=NEW.epoch AND d.state='PREPARED' AND d.worker='' AND d.journal_locator='' AND d.identity='{}' AND d.observation_sequence=0 AND d.observation_hash='')
+ OR NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=NEW.project AND r.kind='Run' AND r.id=NEW.run AND json_extract(r.body,'$.status')='FAILED')
+ OR NOT EXISTS(SELECT 1 FROM domain_objects t WHERE t.project=NEW.project AND t.kind='Task' AND t.id=NEW.task AND json_extract(t.body,'$.status')='FAILED' AND json_extract(t.body,'$.active_run_id')=NEW.run)
+BEGIN SELECT RAISE(ABORT,'abandonment requires terminal Run and Task with unstarted dispatch'); END;
+CREATE TRIGGER runtime_prepared_abandoned_run_immutable BEFORE UPDATE ON domain_objects
+WHEN OLD.kind='Run' AND EXISTS(SELECT 1 FROM runtime_prepared_abandonments a WHERE a.project=OLD.project AND a.run=OLD.id)
+BEGIN SELECT RAISE(ABORT,'abandoned Run immutable'); END;
+CREATE TRIGGER runtime_prepared_abandoned_task_no_restart BEFORE UPDATE ON domain_objects
+WHEN OLD.kind='Task' AND EXISTS(SELECT 1 FROM runtime_prepared_abandonments a WHERE a.project=OLD.project AND a.task=OLD.id) AND json_extract(NEW.body,'$.status')<>'FAILED'
+BEGIN SELECT RAISE(ABORT,'abandoned qualification Task cannot resume'); END;

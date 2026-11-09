@@ -1,0 +1,992 @@
+--- Main/internal/domain/runtime_tools.go
++++ frozen/internal/domain/runtime_tools.go
+@@ -5,6 +5,7 @@
+ // RuntimeToolRequest is an in-process host port. WorkspacePath and Policy are
+ // resolved from current session authority and frozen profile, never child input.
+ type RuntimeToolRequest struct {
++	codingCapture *runtimeToolCaptureContext
+ 	WorkspacePath string
+ 	Access        string
+ 	Name          string
+--- Main/internal/domain/runtime_tools_capture.go
++++ frozen/internal/domain/runtime_tools_capture.go
+@@ -0,0 +1,75 @@
++package domain
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++	"unicode/utf8"
++)
++
++const runtimeToolCaptureSchema = "researchos.coding-private-capture-context.v1"
++
++// RuntimeCodingCaptureView is provenance, not authority. Decoding this value
++// cannot opt a request in. There is no production producer in this slice.
++type RuntimeCodingCaptureView struct {
++	Schema           string `json:"schema"`
++	ProjectID        string `json:"project_id"`
++	TaskID           string `json:"task_id"`
++	RunID            string `json:"run_id"`
++	LeaseEpoch       string `json:"lease_epoch"`
++	CheckID          string `json:"check_id"`
++	SuiteRef         string `json:"suite_ref"`
++	SuiteHash        string `json:"suite_hash"`
++	BindingHash      string `json:"binding_hash"`
++	TaskContractHash string `json:"task_contract_hash"`
++	GoalContractHash string `json:"goal_contract_hash"`
++	PolicyHash       string `json:"policy_hash"`
++	ToolchainHash    string `json:"toolchain_hash"`
++	GoModHash        string `json:"go_mod_hash"`
++	TestHash         string `json:"test_hash"`
++}
++
++// ValidateShape checks integrity only. Candidate content is deliberately absent:
++// the current check's Host staging manifest, after editing, freezes its bytes.
++func (v RuntimeCodingCaptureView) ValidateShape() error {
++	bad := func() error { return fmt.Errorf("CODING_CAPTURE_CONTEXT_INVALID") }
++	if v.Schema != runtimeToolCaptureSchema || v.SuiteRef != "coding.pure-scalar-bundle-v1" {
++		return bad()
++	}
++	for _, s := range []string{v.ProjectID, v.TaskID, v.RunID, v.CheckID} {
++		if len(s) > 256 || !utf8.ValidString(s) || strings.TrimSpace(s) == "" || strings.ContainsRune(s, 0) {
++			return bad()
++		}
++	}
++	n, err := strconv.ParseInt(v.LeaseEpoch, 10, 64)
++	if err != nil || n <= 0 || strconv.FormatInt(n, 10) != v.LeaseEpoch {
++		return bad()
++	}
++	for _, h := range []string{v.SuiteHash, v.BindingHash, v.TaskContractHash, v.GoalContractHash, v.PolicyHash, v.ToolchainHash, v.GoModHash, v.TestHash} {
++		if !codingDeliveryHash(h) {
++			return bad()
++		}
++	}
++	if v.TaskContractHash == v.GoalContractHash {
++		return bad()
++	}
++	return nil
++}
++
++// Only a future domain factory, after real binding/authority/origin/plan checks,
++// may fill this private concrete carrier. No JSON, policy marker, exported
++// setter or context.WithValue bridge mints it.
++type runtimeToolCaptureContext struct{ view RuntimeCodingCaptureView }
++
++// CodingCapture returns nil only for an ordinary request. Malformed nonnil
++// never falls back. Scalar-only views are copied and cannot mutate the carrier.
++func (r RuntimeToolRequest) CodingCapture() (*RuntimeCodingCaptureView, error) {
++	if r.codingCapture == nil {
++		return nil, nil
++	}
++	v := r.codingCapture.view
++	if err := v.ValidateShape(); err != nil {
++		return nil, err
++	}
++	return &v, nil
++}
+--- Main/internal/domain/runtime_tools_capture_test.go
++++ frozen/internal/domain/runtime_tools_capture_test.go
+@@ -0,0 +1,82 @@
++package domain
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func captureTestView() RuntimeCodingCaptureView {
++	h := func(s string) string { return Digest([]byte(s)) }
++	return RuntimeCodingCaptureView{Schema: runtimeToolCaptureSchema, ProjectID: "fixture-project", TaskID: "fixture-task", RunID: "fixture-run", LeaseEpoch: "9223372036854775807", CheckID: "fixture-check", SuiteRef: "coding.pure-scalar-bundle-v1", SuiteHash: h("suite"), BindingHash: h("binding"), TaskContractHash: h("task"), GoalContractHash: h("goal"), PolicyHash: h("policy"), ToolchainHash: h("toolchain"), GoModHash: h("mod"), TestHash: h("test")}
++}
++func TestRuntimeToolCaptureJSONCannotOptIn(t *testing.T) {
++	for _, key := range []string{"codingCapture", "CodingCapture", "coding_capture", "capture", "context", "runtimeToolCaptureContext"} {
++		t.Run(key, func(t *testing.T) {
++			raw, _ := json.Marshal(map[string]any{key: captureTestView(), "Name": "run_check", "Arguments": Object{"check_id": "coding.pure-scalar-bundle-v1"}, "Policy": Object{"capture": true}})
++			var r RuntimeToolRequest
++			if err := json.Unmarshal(raw, &r); err != nil {
++				t.Fatal(err)
++			}
++			if v, err := r.CodingCapture(); v != nil || err != nil {
++				t.Fatal("JSON minted private carrier", err)
++			}
++		})
++	}
++}
++func TestRuntimeToolCapturePrivateView(t *testing.T) {
++	if v, e := (RuntimeToolRequest{}).CodingCapture(); v != nil || e != nil {
++		t.Fatal("nil compatibility")
++	}
++	original := captureTestView()
++	r := RuntimeToolRequest{codingCapture: &runtimeToolCaptureContext{view: original}}
++	first, err := r.CodingCapture()
++	if err != nil || *first != original {
++		t.Fatal(err)
++	}
++	first.CheckID = "mutated"
++	first.BindingHash = "bad"
++	again, err := r.CodingCapture()
++	if err != nil || *again != original || again.LeaseEpoch != "9223372036854775807" {
++		t.Fatal("view aliases or loses epoch", err)
++	}
++}
++func TestRuntimeToolCaptureInvalidNeverFallsBack(t *testing.T) {
++	cases := map[string]func(*RuntimeCodingCaptureView){
++		"schema":         func(v *RuntimeCodingCaptureView) { v.Schema = "unknown" },
++		"suite":          func(v *RuntimeCodingCaptureView) { v.SuiteRef = "unknown" },
++		"project":        func(v *RuntimeCodingCaptureView) { v.ProjectID = "" },
++		"task":           func(v *RuntimeCodingCaptureView) { v.TaskID = "" },
++		"run":            func(v *RuntimeCodingCaptureView) { v.RunID = "" },
++		"check":          func(v *RuntimeCodingCaptureView) { v.CheckID = "" },
++		"utf8":           func(v *RuntimeCodingCaptureView) { v.TaskID = string([]byte{255}) },
++		"nul":            func(v *RuntimeCodingCaptureView) { v.CheckID = "a\x00b" },
++		"size":           func(v *RuntimeCodingCaptureView) { v.RunID = strings.Repeat("x", 257) },
++		"zero_epoch":     func(v *RuntimeCodingCaptureView) { v.LeaseEpoch = "0" },
++		"negative_epoch": func(v *RuntimeCodingCaptureView) { v.LeaseEpoch = "-1" },
++		"alias_epoch":    func(v *RuntimeCodingCaptureView) { v.LeaseEpoch = "01" },
++		"overflow_epoch": func(v *RuntimeCodingCaptureView) { v.LeaseEpoch = "9223372036854775808" },
++		"suite_hash":     func(v *RuntimeCodingCaptureView) { v.SuiteHash = "bad" },
++		"binding":        func(v *RuntimeCodingCaptureView) { v.BindingHash = "" },
++		"task_contract":  func(v *RuntimeCodingCaptureView) { v.TaskContractHash = "bad" },
++		"goal_contract":  func(v *RuntimeCodingCaptureView) { v.GoalContractHash = "bad" },
++		"policy":         func(v *RuntimeCodingCaptureView) { v.PolicyHash = "bad" },
++		"toolchain":      func(v *RuntimeCodingCaptureView) { v.ToolchainHash = "bad" },
++		"fixed_mod":      func(v *RuntimeCodingCaptureView) { v.GoModHash = "bad" },
++		"fixed_test":     func(v *RuntimeCodingCaptureView) { v.TestHash = "bad" },
++		"same_contract":  func(v *RuntimeCodingCaptureView) { v.GoalContractHash = v.TaskContractHash },
++	}
++	for name, change := range cases {
++		t.Run(name, func(t *testing.T) {
++			v := captureTestView()
++			change(&v)
++			r := RuntimeToolRequest{codingCapture: &runtimeToolCaptureContext{view: v}}
++			if got, err := r.CodingCapture(); err == nil || got != nil {
++				t.Fatal("invalid downgraded")
++			}
++		})
++	}
++	if _, err := (RuntimeToolRequest{codingCapture: &runtimeToolCaptureContext{}}).CodingCapture(); err == nil {
++		t.Fatal("zero carrier")
++	}
++}
+--- Main/internal/host/runtime_check_windows.go
++++ frozen/internal/host/runtime_check_windows.go
+@@ -464,6 +464,15 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	captureView, err := request.CodingCapture()
++	if err != nil {
++		return nil, err
++	}
++	if captureView != nil {
++		if err := runtimeCaptureCheck(*captureView, check, domain.Hash(request.Policy)); err != nil {
++			return nil, err
++		}
++	}
+ 	// source_paths is the check-specific frozen read permission. If the same
+ 	// policy also grants ordinary read, never let the check exceed that list.
+ 	if _, present := request.Policy["read_paths"]; present {
+@@ -548,8 +557,27 @@
+ 	// A failed launch may still have started a process. Keep it UNKNOWN unless
+ 	// the sandbox returns a complete receipt.
+ 	beforeLaunch = false
+-	receipt, err := sandbox.Run(ctx, sandbox.Command{Executable: filepath.Join(goDir, "bin", "go.exe"), Args: argv, InputDirectory: input, OutputDirectory: output, Timeout: check.timeout, ProcessLimit: check.processLimit, MemoryMiB: check.memoryMiB,
+-		Env: map[string]string{"GOROOT": goDir, "GOPATH": filepath.Join(output, "gopath"), "GOCACHE": filepath.Join(output, "gocache"), "GOTMPDIR": output, "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOENV": "off", "GOWORK": "off", "CGO_ENABLED": "0"}})
++	var receipt sandbox.Receipt
++	var captured *runtimeCandidateCapture
++	if captureView == nil {
++		receipt, err = sandbox.Run(ctx, sandbox.Command{Executable: filepath.Join(goDir, "bin", "go.exe"), Args: argv, InputDirectory: input, OutputDirectory: output, Timeout: check.timeout, ProcessLimit: check.processLimit, MemoryMiB: check.memoryMiB,
++			Env: map[string]string{"GOROOT": goDir, "GOPATH": filepath.Join(output, "gopath"), "GOCACHE": filepath.Join(output, "gocache"), "GOTMPDIR": output, "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOENV": "off", "GOWORK": "off", "CGO_ENABLED": "0"}})
++	} else {
++		command := sandbox.Command{Executable: filepath.Join(goDir, "bin", "go.exe"), Args: argv, InputDirectory: input, OutputDirectory: output, Timeout: check.timeout, ProcessLimit: check.processLimit, MemoryMiB: check.memoryMiB,
++			Env: map[string]string{"GOROOT": goDir, "GOPATH": filepath.Join(output, "gopath"), "GOCACHE": filepath.Join(output, "gocache"), "GOTMPDIR": output, "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOENV": "off", "GOWORK": "off", "CGO_ENABLED": "0"}}
++		process, startErr := sandbox.Start(ctx, command, sandbox.StartOptions{
++			BeforeResume: func(identity sandbox.Identity) error {
++				var captureErr error
++				captured, captureErr = captureRuntimeCandidate(ctx, *captureView, check, domain.Hash(request.Policy), sourceManifest, identity)
++				return captureErr
++			},
++		})
++		err = startErr
++		if err == nil {
++			// Match Run: ownership includes termination, drain and staging cleanup.
++			receipt, err = process.Wait(context.Background())
++		}
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -559,6 +587,13 @@
+ 	details := domain.Object{"check_id": check.id, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "source_manifest_hash": domain.Hash(sourceManifest), "source_count": len(sourceManifest), "frozen_policy_hash": domain.Hash(request.Policy), "toolchain_hash": toolchainHash, "vendor_hash": check.vendorHash, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete}
+ 	full := domain.Object{"check_id": check.id, "workspace_path": request.WorkspacePath, "frozen_policy_hash": domain.Hash(request.Policy), "argv_template": check.argv, "source_manifest": sourceManifest, "source_manifest_hash": domain.Hash(sourceManifest), "toolchain_manifest": toolchainManifest, "toolchain_hash": toolchainHash, "build_hash": buildHash, "vendor_manifest": vendorManifest, "vendor_hash": check.vendorHash,
+ 		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": strconv.FormatInt(receipt.Created, 10), "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_raw_bytes": len(receipt.Stdout), "stderr_raw_bytes": len(receipt.Stderr), "stdout_raw": receipt.Stdout, "stderr_raw": receipt.Stderr}}
++	if captureView != nil {
++		proof, captureErr := captured.evidence(receipt)
++		if captureErr != nil {
++			return nil, captureErr
++		}
++		full["candidate_capture"] = proof
++	}
+ 	if err := runtimeCheckEvidenceBound(full); err != nil {
+ 		return nil, err
+ 	}
+--- Main/internal/host/runtime_check_delivery_windows.go
++++ frozen/internal/host/runtime_check_delivery_windows.go
+@@ -0,0 +1,390 @@
++//go:build windows
++
++package host
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++	"researchos.local/research-os/internal/deliverygate"
++	"researchos.local/research-os/internal/domain"
++	sandbox "researchos.local/research-os/ops/experiment_sandbox"
++)
++
++const runtimeCandidateCaptureSchema = "researchos.coding-private-candidate-capture.v1"
++const runtimeCaptureFixedLimit = 1 << 20
++
++var runtimeCapturePaths = [3]string{"go.mod", "pkg/solution.go", "pkg/solution_test.go"}
++
++type runtimeCaptureEntry struct {
++	path, hash, mode string
++	size             int64
++}
++
++// Owns an exact before-resume candidate snapshot. It does not attest later
++// compiler reads, final toolchain/vendor copies, same-user exclusion or business
++// correctness. The context is trusted-port provenance, not an auth credential.
++type runtimeCandidateCapture struct {
++	view         domain.RuntimeCodingCaptureView
++	identity     sandbox.Identity
++	entries      [3]runtimeCaptureEntry
++	source       *deliverygate.ValidatedSource
++	manifestHash string
++	argv         []string
++}
++
++func runtimeCaptureCheck(v domain.RuntimeCodingCaptureView, c frozenRuntimeCheck, policyHash string) error {
++	if err := v.ValidateShape(); err != nil {
++		return err
++	}
++	if v.CheckID != c.id || v.PolicyHash != policyHash || v.ToolchainHash != c.toolchainHash ||
++		c.vendorRoot != "" || c.vendorHash != "" || len(c.sources) != 3 || len(c.argv) != 8 ||
++		c.argv[0] != "-C" || c.argv[1] != "${SOURCE}" || c.argv[2] != "test" ||
++		c.argv[3] != "-p=2" || c.argv[4] != "-count=1" || c.argv[5] != "-run" || c.argv[7] != "./pkg" {
++		return toolDenied("private capture differs from frozen check")
++	}
++	for i, p := range runtimeCapturePaths {
++		if c.sources[i].path != p {
++			return toolDenied("private capture requires exact roster")
++		}
++	}
++	if c.sources[0].expected != v.GoModHash || c.sources[1].expected != "" || c.sources[2].expected != v.TestHash {
++		return toolDenied("private capture fixed inputs differ")
++	}
++	return nil
++}
++func runtimeCaptureManifest(raw []any, v domain.RuntimeCodingCaptureView) ([3]runtimeCaptureEntry, error) {
++	var entries [3]runtimeCaptureEntry
++	if len(raw) != 3 {
++		return entries, toolDenied("private capture staging manifest invalid")
++	}
++	for i, item := range raw {
++		row, ok := item.(map[string]any)
++		if !ok || len(row) != 4 || row["path"] != runtimeCapturePaths[i] {
++			return entries, toolDenied("private capture staging manifest invalid")
++		}
++		size, err := domain.Num(row, "size_bytes")
++		hash, ok := row["sha256"].(string)
++		mode := "fixed"
++		limit := int64(runtimeCaptureFixedLimit)
++		if i == 1 {
++			mode = "current"
++			limit = deliverygate.MaxSourceBytes
++		}
++		if err != nil || size <= 0 || size > limit || !ok || !runtimeCheckHash(hash) || row["mode"] != mode ||
++			i == 0 && hash != v.GoModHash || i == 2 && hash != v.TestHash {
++			return entries, toolDenied("private capture staging manifest invalid")
++		}
++		entries[i] = runtimeCaptureEntry{runtimeCapturePaths[i], hash, mode, size}
++	}
++	return entries, nil
++}
++func runtimeCaptureIdentity(id sandbox.Identity) error {
++	volume := filepath.VolumeName(id.StagingDirectory)
++	if id.PID == 0 || id.Created <= 0 || id.Job == "" || id.SID == "" || id.Profile == "" ||
++		!filepath.IsAbs(id.StagingDirectory) || filepath.Clean(id.StagingDirectory) != id.StagingDirectory ||
++		len(id.StagingDirectory) > 4096 || len(volume) != 2 || strings.ContainsAny(id.StagingDirectory, "/\x00") {
++		return toolDenied("private capture native identity invalid")
++	}
++	if volume[1] != ':' {
++		return toolDenied("private capture local volume required")
++	}
++	for _, part := range strings.Split(strings.TrimPrefix(id.StagingDirectory, volume+"\\"), "\\") {
++		if part == "" || part == "." || part == ".." || strings.TrimRight(part, ". ") != part || strings.Contains(part, ":") {
++			return toolDenied("private capture staging spelling invalid")
++		}
++	}
++	return nil
++}
++func runtimeCaptureHandle(f *os.File, dir bool) error {
++	var info windows.ByHandleFileInformation
++	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
++		return err
++	}
++	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 ||
++		(info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != dir || !dir && info.NumberOfLinks != 1 {
++		return toolDenied("private capture reparse, alias or file type refused")
++	}
++	stat, err := f.Stat()
++	if err != nil {
++		return err
++	}
++	if dir && !stat.IsDir() || !dir && !stat.Mode().IsRegular() {
++		return toolDenied("private capture regular handle required")
++	}
++	return nil
++}
++
++// Relative NT opens do not re-open an absolute path after a weak Lstat check.
++// Held directories deny deletion; files deny writes/deletion during this read.
++func runtimeCaptureOpen(parent *os.File, name string, dir bool) (*os.File, error) {
++	switch name {
++	case "input", "source", "pkg", "go.mod", "solution.go", "solution_test.go":
++	default:
++		return nil, toolDenied("private capture literal path required")
++	}
++	nt, err := windows.NewNTUnicodeString(name)
++	if err != nil {
++		return nil, err
++	}
++	oa := windows.OBJECT_ATTRIBUTES{RootDirectory: windows.Handle(parent.Fd()), ObjectName: nt, Attributes: windows.OBJ_DONT_REPARSE}
++	oa.Length = uint32(unsafe.Sizeof(oa))
++	options := uint32(windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT)
++	share := uint32(windows.FILE_SHARE_READ)
++	if dir {
++		options |= windows.FILE_DIRECTORY_FILE
++		share |= windows.FILE_SHARE_WRITE
++	} else {
++		options |= windows.FILE_NON_DIRECTORY_FILE
++	}
++	var handle windows.Handle
++	var status windows.IO_STATUS_BLOCK
++	if err = windows.NtCreateFile(&handle, windows.GENERIC_READ|windows.SYNCHRONIZE, &oa, &status, nil, 0, share, windows.FILE_OPEN, options, 0, 0); err != nil {
++		return nil, toolDenied("private capture relative open refused")
++	}
++	f := os.NewFile(uintptr(handle), name)
++	if f == nil {
++		windows.CloseHandle(handle)
++		return nil, toolDenied("private capture handle invalid")
++	}
++	if err = runtimeCaptureHandle(f, dir); err != nil {
++		f.Close()
++		return nil, err
++	}
++	return f, nil
++}
++
++// Enumerate actual names, including otherwise missed empty dirs and case/8.3
++// aliases. Source/pkɡ have a complete roster; input's other namespaces are not
++// compiler-input attestation and are only bounded while locating literal source.
++func runtimeCaptureNames(ctx context.Context, f *os.File, exact bool, names ...string) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	limit := len(names)
++	if !exact {
++		limit = 8
++	}
++	entries, err := f.ReadDir(limit + 1)
++	if err != nil && !errors.Is(err, io.EOF) {
++		return err
++	}
++	if len(entries) > limit || exact && len(entries) != len(names) {
++		return toolDenied("private capture exact inventory required")
++	}
++	seen := map[string]bool{}
++	for _, entry := range entries {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		found := false
++		for _, name := range names {
++			if strings.EqualFold(entry.Name(), name) {
++				if entry.Name() != name || seen[name] {
++					return toolDenied("private capture exact spelling required")
++				}
++				seen[name] = true
++				found = true
++			}
++		}
++		if exact && !found {
++			return toolDenied("private capture extra entry refused")
++		}
++	}
++	if len(seen) != len(names) {
++		return toolDenied("private capture missing entry")
++	}
++	return nil
++}
++func runtimeCaptureRead(ctx context.Context, f *os.File, limit int64, keep bool) ([]byte, string, int64, error) {
++	stat, err := f.Stat()
++	if err != nil {
++		return nil, "", 0, err
++	}
++	if stat.Size() <= 0 || stat.Size() > limit {
++		return nil, "", 0, toolDenied("private capture byte limit")
++	}
++	hash := sha256.New()
++	var owned []byte
++	if keep {
++		owned = make([]byte, 0, int(stat.Size()))
++	}
++	buffer := make([]byte, 4096)
++	var size int64
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, "", 0, err
++		}
++		n, readErr := f.Read(buffer)
++		if n > 0 {
++			size += int64(n)
++			if size > limit {
++				return nil, "", 0, toolDenied("private capture byte limit")
++			}
++			hash.Write(buffer[:n])
++			if keep {
++				owned = append(owned, buffer[:n]...)
++			}
++		}
++		if errors.Is(readErr, io.EOF) {
++			break
++		}
++		if readErr != nil {
++			return nil, "", 0, toolDenied("private capture read failed")
++		}
++		if n == 0 {
++			return nil, "", 0, io.ErrNoProgress
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, "", 0, err
++	}
++	if size != stat.Size() {
++		return nil, "", 0, toolDenied("private capture file changed")
++	}
++	return owned, "sha256:" + hex.EncodeToString(hash.Sum(nil)), size, nil
++}
++func captureRuntimeCandidate(ctx context.Context, v domain.RuntimeCodingCaptureView, check frozenRuntimeCheck, policyHash string, manifest []any, id sandbox.Identity) (*runtimeCandidateCapture, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err := runtimeCaptureCheck(v, check, policyHash); err != nil {
++		return nil, err
++	}
++	entries, err := runtimeCaptureManifest(manifest, v)
++	if err != nil {
++		return nil, err
++	}
++	if err = runtimeCaptureIdentity(id); err != nil {
++		return nil, err
++	}
++	// Unlike chainHasReparsePoint, this helper fails on every open error and
++	// retains no-delete handles throughout the read.
++	guards, err := guardWriteDirectories(id.StagingDirectory)
++	if err != nil {
++		return nil, toolDenied("private capture ancestry refused")
++	}
++	defer closeWriteGuards(guards)
++	if reparse, err := isReparsePoint(filepath.VolumeName(id.StagingDirectory) + "\\"); err != nil || reparse {
++		return nil, toolDenied("private capture volume refused")
++	}
++	wide, err := windows.UTF16PtrFromString(id.StagingDirectory)
++	if err != nil {
++		return nil, err
++	}
++	h, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
++	if err != nil {
++		return nil, toolDenied("private capture staging open refused")
++	}
++	stage := os.NewFile(uintptr(h), id.StagingDirectory)
++	defer stage.Close()
++	if err = runtimeCaptureHandle(stage, true); err != nil {
++		return nil, err
++	}
++	if err = runtimeCaptureNames(ctx, stage, false, "input"); err != nil {
++		return nil, err
++	}
++	input, err := runtimeCaptureOpen(stage, "input", true)
++	if err != nil {
++		return nil, err
++	}
++	defer input.Close()
++	if err = runtimeCaptureNames(ctx, input, false, "source"); err != nil {
++		return nil, err
++	}
++	source, err := runtimeCaptureOpen(input, "source", true)
++	if err != nil {
++		return nil, err
++	}
++	defer source.Close()
++	if err = runtimeCaptureNames(ctx, source, true, "go.mod", "pkg"); err != nil {
++		return nil, err
++	}
++	pkg, err := runtimeCaptureOpen(source, "pkg", true)
++	if err != nil {
++		return nil, err
++	}
++	defer pkg.Close()
++	if err = runtimeCaptureNames(ctx, pkg, true, "solution.go", "solution_test.go"); err != nil {
++		return nil, err
++	}
++	c := &runtimeCandidateCapture{view: v, identity: id, entries: entries, manifestHash: domain.Hash(manifest), argv: append([]string(nil), check.argv...)}
++	for i, entry := range entries {
++		parent, name := pkg, "solution.go"
++		if i == 0 {
++			parent, name = source, "go.mod"
++		} else if i == 2 {
++			name = "solution_test.go"
++		}
++		f, err := runtimeCaptureOpen(parent, name, false)
++		if err != nil {
++			return nil, err
++		}
++		limit := int64(runtimeCaptureFixedLimit)
++		if i == 1 {
++			limit = deliverygate.MaxSourceBytes
++		}
++		raw, hash, size, readErr := runtimeCaptureRead(ctx, f, limit, i == 1)
++		closeErr := f.Close()
++		if readErr != nil || closeErr != nil {
++			return nil, errors.Join(readErr, closeErr)
++		}
++		if hash != entry.hash || size != entry.size {
++			return nil, toolDenied("private capture final copy differs from current staging")
++		}
++		if i == 1 {
++			c.source, err = deliverygate.Validate(raw)
++			if err != nil {
++				return nil, toolDenied("private capture candidate outside structural language")
++			}
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	return c, nil
++}
++func (c *runtimeCandidateCapture) evidence(r sandbox.Receipt) (domain.Object, error) {
++	if c == nil || c.source == nil {
++		return nil, toolDenied("private capture missing")
++	}
++	id := c.identity
++	if r.PID != id.PID || r.Created != id.Created || r.Job != id.Job || r.SID != id.SID || r.Profile != id.Profile ||
++		len(r.Capabilities) != 0 || !r.Stopped || !r.StreamsDrained || !r.CleanupComplete || !r.OutputCopied ||
++		r.Directory != filepath.Join(id.StagingDirectory, "output") || r.Executable != filepath.Join(id.StagingDirectory, "input", "go", "bin", "go.exe") {
++		return nil, toolDenied("private capture complete receipt identity mismatch")
++	}
++	argv := append([]string(nil), c.argv...)
++	argv[1] = filepath.Join(id.StagingDirectory, "input", "source")
++	if len(r.Args) != len(argv) {
++		return nil, toolDenied("private capture argv mismatch")
++	}
++	for i, s := range argv {
++		if r.Args[i] != s {
++			return nil, toolDenied("private capture argv mismatch")
++		}
++	}
++	inventory := make([]any, 0, 3)
++	for _, e := range c.entries {
++		inventory = append(inventory, domain.Object{"path": e.path, "sha256": e.hash, "size_bytes": e.size, "mode": e.mode})
++	}
++	raw := c.source.Bytes()
++	if err := c.source.Verify(raw); err != nil {
++		return nil, err
++	}
++	return domain.Object{"schema": runtimeCandidateCaptureSchema, "phase": "BEFORE_RESUME", "context": c.view, "context_hash": domain.Hash(c.view),
++		"source_manifest_hash": c.manifestHash, "inventory": inventory,
++		"candidate":          domain.Object{"path": "pkg/solution.go", "sha256": domain.Digest(raw), "size_bytes": len(raw), "bytes": raw},
++		"structural_witness": domain.Object{"validator": "pure-scalar-v1", "source_sha256": "sha256:" + c.source.SHA256(), "semantic_acceptance": false},
++		"native_identity":    domain.Object{"pid": id.PID, "process_created_ns": strconv.FormatInt(id.Created, 10), "job": id.Job, "appcontainer_sid": id.SID, "profile": id.Profile},
++		"execution_outcome":  domain.Object{"exit_code": r.ExitCode, "timed_out": r.TimedOut}}, nil
++}
+--- Main/internal/host/runtime_check_delivery_windows_test.go
++++ frozen/internal/host/runtime_check_delivery_windows_test.go
+@@ -0,0 +1,361 @@
++//go:build windows
++
++package host
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"golang.org/x/sys/windows"
++	"researchos.local/research-os/internal/domain"
++	sandbox "researchos.local/research-os/ops/experiment_sandbox"
++)
++
++const captureFixtureSource = "package candidate\nfunc Clamp(value, lower, upper int32) int32 { if value < lower { return lower }; if value > upper { return upper }; return value }\n"
++const captureFixtureMod = "module fixture.invalid/MOD_SENTINEL\n"
++const captureFixtureTest = "package candidate\n// FIXED_TEST_SENTINEL_NEVER_SERIALIZE\n"
++
++type candidateFixture struct {
++	policyHash string
++	view       domain.RuntimeCodingCaptureView
++	check      frozenRuntimeCheck
++	id         sandbox.Identity
++	manifest   []any
++	source     string
++}
++
++func newCandidateFixture(t *testing.T) candidateFixture {
++	t.Helper()
++	stage := filepath.Join(t.TempDir(), "stage")
++	source := filepath.Join(stage, "input", "source")
++	if err := os.MkdirAll(filepath.Join(source, "pkg"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	for p, s := range map[string]string{"go.mod": captureFixtureMod, "pkg/solution.go": captureFixtureSource, "pkg/solution_test.go": captureFixtureTest} {
++		captureWrite(t, filepath.Join(source, filepath.FromSlash(p)), s)
++	}
++	h := func(s string) string { return domain.Digest([]byte(s)) }
++	v := domain.RuntimeCodingCaptureView{Schema: "researchos.coding-private-capture-context.v1", ProjectID: "synthetic-project", TaskID: "synthetic-task", RunID: "synthetic-run", LeaseEpoch: "7", CheckID: "synthetic-check", SuiteRef: "coding.pure-scalar-bundle-v1", SuiteHash: h("suite"), BindingHash: h("binding"), TaskContractHash: h("task"), GoalContractHash: h("goal"), PolicyHash: h("policy"), ToolchainHash: h("toolchain"), GoModHash: h(captureFixtureMod), TestHash: h(captureFixtureTest)}
++	f := candidateFixture{view: v, policyHash: v.PolicyHash, source: source, id: sandbox.Identity{PID: 17, Created: 23, Job: "synthetic-job", SID: "synthetic-sid", Profile: "synthetic-profile", StagingDirectory: stage},
++		check: frozenRuntimeCheck{id: v.CheckID, toolchainHash: v.ToolchainHash, argv: []string{"-C", "${SOURCE}", "test", "-p=2", "-count=1", "-run", "^TestFixture$", "./pkg"}, sources: []runtimeCheckSource{{"go.mod", v.GoModHash}, {"pkg/solution.go", ""}, {"pkg/solution_test.go", v.TestHash}}}}
++	f.snapshot(t)
++	return f
++}
++func captureWrite(t *testing.T, p, s string) {
++	t.Helper()
++	if err := os.WriteFile(p, []byte(s), 0600); err != nil {
++		t.Fatal(err)
++	}
++}
++func (f *candidateFixture) snapshot(t *testing.T) {
++	t.Helper()
++	root, err := os.OpenRoot(f.source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer root.Close()
++	f.manifest, err = runtimeCheckSnapshot(context.Background(), root, f.check.sources, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++func (f candidateFixture) capture(ctx context.Context) (*runtimeCandidateCapture, error) {
++	return captureRuntimeCandidate(ctx, f.view, f.check, f.policyHash, f.manifest, f.id)
++}
++func (f candidateFixture) receipt() sandbox.Receipt {
++	argv := append([]string(nil), f.check.argv...)
++	argv[1] = f.source
++	return sandbox.Receipt{PID: f.id.PID, Created: f.id.Created, Job: f.id.Job, SID: f.id.SID, Profile: f.id.Profile, Directory: filepath.Join(f.id.StagingDirectory, "output"), Executable: filepath.Join(f.id.StagingDirectory, "input", "go", "bin", "go.exe"), Args: argv, Stopped: true, StreamsDrained: true, CleanupComplete: true, OutputCopied: true}
++}
++func captureRejected(t *testing.T, f candidateFixture) {
++	t.Helper()
++	if c, err := f.capture(context.Background()); err == nil || c != nil {
++		t.Fatal("invalid snapshot accepted")
++	}
++}
++func TestRuntimeCandidateCaptureCurrentBytesAndDefensiveSeal(t *testing.T) {
++	f := newCandidateFixture(t)
++	// Authorized edit A -> B precedes this check's staging snapshot.
++	b := strings.Replace(captureFixtureSource, "return value", "return  value", 1)
++	captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), b)
++	f.snapshot(t)
++	hash := domain.Hash(f.manifest)
++	c, err := f.capture(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.view.BindingHash = "consumer change"
++	f.manifest[1].(domain.Object)["sha256"] = "consumer change"
++	e, err := c.evidence(f.receipt())
++	if err != nil {
++		t.Fatal(err)
++	}
++	candidate := e["candidate"].(domain.Object)
++	if e["source_manifest_hash"] != hash || !bytes.Equal(candidate["bytes"].([]byte), []byte(b)) || candidate["sha256"] != domain.Digest([]byte(b)) {
++		t.Fatal("not exact B")
++	}
++	for _, sentinel := range []string{"MOD_SENTINEL", "FIXED_TEST_SENTINEL_NEVER_SERIALIZE"} {
++		if bytes.Contains(domain.Bytes(e), []byte(sentinel)) {
++			t.Fatal("fixed source leaked")
++		}
++	}
++	candidate["bytes"].([]byte)[0] = 'X'
++	e["inventory"].([]any)[0].(domain.Object)["path"] = "mutation"
++	e2, err := c.evidence(f.receipt())
++	if err != nil || !bytes.Equal(e2["candidate"].(domain.Object)["bytes"].([]byte), []byte(b)) || e2["inventory"].([]any)[0].(domain.Object)["path"] != "go.mod" {
++		t.Fatal("aliases capture", err)
++	}
++	captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), "after capture")
++	e3, err := c.evidence(f.receipt())
++	if err != nil || domain.Hash(e3) != domain.Hash(e2) {
++		t.Fatal("seal reread mutable path", err)
++	}
++}
++func TestRuntimeCandidateCaptureRejectsInventoryAndBytes(t *testing.T) {
++	cases := map[string]func(*testing.T, *candidateFixture){
++		"B_to_C": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), captureFixtureSource+"\n")
++		},
++		"fixed_mod": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "go.mod"), "wrong fixed")
++		},
++		"fixed_test": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "solution_test.go"), "wrong fixed")
++		},
++		"extra_file": func(t *testing.T, f *candidateFixture) { captureWrite(t, filepath.Join(f.source, "extra.go"), "x") },
++		"extra_pkg": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "extra.go"), "x")
++		},
++		"empty_dir": func(t *testing.T, f *candidateFixture) {
++			if err := os.Mkdir(filepath.Join(f.source, "empty"), 0700); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"vendor": func(t *testing.T, f *candidateFixture) {
++			if err := os.Mkdir(filepath.Join(f.source, "vendor"), 0700); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"missing": func(t *testing.T, f *candidateFixture) {
++			if err := os.Remove(filepath.Join(f.source, "pkg", "solution_test.go")); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"case_file": func(t *testing.T, f *candidateFixture) {
++			if err := os.Rename(filepath.Join(f.source, "go.mod"), filepath.Join(f.source, "GO.MOD")); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"case_pkg": func(t *testing.T, f *candidateFixture) {
++			if err := os.Rename(filepath.Join(f.source, "pkg"), filepath.Join(f.source, "PKG")); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"case_source": func(t *testing.T, f *candidateFixture) {
++			if err := os.Rename(f.source, filepath.Join(filepath.Dir(f.source), "SOURCE")); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"case_input": func(t *testing.T, f *candidateFixture) {
++			if err := os.Rename(filepath.Dir(f.source), filepath.Join(f.id.StagingDirectory, "INPUT")); err != nil {
++				t.Fatal(err)
++			}
++		},
++		"invalid_ast": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), "package candidate\nfunc init(){}")
++			f.snapshot(t)
++		},
++		"invalid_utf8": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), string([]byte{255}))
++			f.snapshot(t)
++		},
++		"oversize": func(t *testing.T, f *candidateFixture) {
++			captureWrite(t, filepath.Join(f.source, "pkg", "solution.go"), strings.Repeat("x", 16385))
++			f.snapshot(t)
++		},
++		"hardlink": func(t *testing.T, f *candidateFixture) {
++			if err := os.Link(filepath.Join(f.source, "pkg", "solution.go"), filepath.Join(f.id.StagingDirectory, "alias")); err != nil {
++				t.Fatal(err)
++			}
++		},
++	}
++	for name, change := range cases {
++		t.Run(name, func(t *testing.T) { f := newCandidateFixture(t); change(t, &f); captureRejected(t, f) })
++	}
++}
++
++// Windows junction fixture: filesystem operations only, no shell/process and no
++// symlink privilege assumption. Both junction and target remain under TempDir.
++func captureJunction(t *testing.T, p, target string) {
++	t.Helper()
++	if err := os.Mkdir(p, 0700); err != nil {
++		t.Fatal(err)
++	}
++	sub, _ := windows.UTF16FromString("\\??\\" + target)
++	printName, _ := windows.UTF16FromString(target)
++	paths := append(append([]uint16(nil), sub...), printName...)
++	data := make([]byte, 16+len(paths)*2)
++	binary.LittleEndian.PutUint32(data, 0xa0000003)
++	binary.LittleEndian.PutUint16(data[4:], uint16(len(data)-8))
++	binary.LittleEndian.PutUint16(data[10:], uint16((len(sub)-1)*2))
++	binary.LittleEndian.PutUint16(data[12:], uint16(len(sub)*2))
++	binary.LittleEndian.PutUint16(data[14:], uint16((len(printName)-1)*2))
++	for i, v := range paths {
++		binary.LittleEndian.PutUint16(data[16+i*2:], v)
++	}
++	wide, _ := windows.UTF16PtrFromString(p)
++	h, err := windows.CreateFile(wide, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer windows.CloseHandle(h)
++	var returned uint32
++	if err = windows.DeviceIoControl(h, 0x000900a4, &data[0], uint32(len(data)), nil, 0, &returned, nil); err != nil {
++		t.Fatal(err)
++	}
++}
++func TestRuntimeCandidateCaptureRejectsReparse(t *testing.T) {
++	for _, where := range []string{"stage", "input", "source", "pkg"} {
++		t.Run(where, func(t *testing.T) {
++			f := newCandidateFixture(t)
++			p := f.id.StagingDirectory
++			switch where {
++			case "input":
++				p = filepath.Dir(f.source)
++			case "source":
++				p = f.source
++			case "pkg":
++				p = filepath.Join(f.source, "pkg")
++			}
++			target := p + "-original"
++			if err := os.Rename(p, target); err != nil {
++				t.Fatal(err)
++			}
++			captureJunction(t, p, target)
++			captureRejected(t, f)
++		})
++	}
++}
++func TestRuntimeCandidateCaptureContextAndManifestRefusals(t *testing.T) {
++	cases := map[string]func(*candidateFixture){
++		"schema":          func(f *candidateFixture) { f.view.Schema = "unknown" },
++		"suite":           func(f *candidateFixture) { f.view.SuiteRef = "unknown" },
++		"check":           func(f *candidateFixture) { f.view.CheckID = "other" },
++		"policy":          func(f *candidateFixture) { f.view.PolicyHash = domain.Digest([]byte("other")) },
++		"toolchain":       func(f *candidateFixture) { f.view.ToolchainHash = domain.Digest([]byte("other")) },
++		"vendor":          func(f *candidateFixture) { f.check.vendorRoot = "ignored-not-allowed" },
++		"candidate_fixed": func(f *candidateFixture) { f.check.sources[1].expected = domain.Digest([]byte(captureFixtureSource)) },
++		"fixed":           func(f *candidateFixture) { f.check.sources[0].expected = domain.Digest([]byte("other")) },
++		"roster":          func(f *candidateFixture) { f.check.sources[0].path = "GO.MOD" },
++		"package":         func(f *candidateFixture) { f.check.argv[7] = "../escape" },
++		"manifest_extra":  func(f *candidateFixture) { f.manifest = append(f.manifest, f.manifest[0]) },
++		"manifest_escape": func(f *candidateFixture) { f.manifest[1].(domain.Object)["path"] = "../solution.go" },
++		"manifest_ads":    func(f *candidateFixture) { f.manifest[1].(domain.Object)["path"] = "pkg/solution.go:stream" },
++		"manifest_mode":   func(f *candidateFixture) { f.manifest[1].(domain.Object)["mode"] = "fixed" },
++		"manifest_size":   func(f *candidateFixture) { f.manifest[1].(domain.Object)["size_bytes"] = -1 },
++		"pid":             func(f *candidateFixture) { f.id.PID = 0 },
++		"created":         func(f *candidateFixture) { f.id.Created = 0 },
++		"job":             func(f *candidateFixture) { f.id.Job = "" },
++		"sid":             func(f *candidateFixture) { f.id.SID = "" },
++		"profile":         func(f *candidateFixture) { f.id.Profile = "" },
++		"relative":        func(f *candidateFixture) { f.id.StagingDirectory = "relative" },
++		"alias":           func(f *candidateFixture) { f.id.StagingDirectory += string(os.PathSeparator) + ".." },
++	}
++	for name, change := range cases {
++		t.Run(name, func(t *testing.T) { f := newCandidateFixture(t); change(&f); captureRejected(t, f) })
++	}
++}
++
++type captureCancelContext struct {
++	context.Context
++	remaining int
++}
++
++func (c *captureCancelContext) Err() error {
++	c.remaining--
++	if c.remaining <= 0 {
++		return context.Canceled
++	}
++	return nil
++}
++func TestRuntimeCandidateCaptureCancellation(t *testing.T) {
++	f := newCandidateFixture(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := f.capture(ctx); !errors.Is(err, context.Canceled) {
++		t.Fatal(err)
++	}
++	file, err := os.Open(filepath.Join(f.source, "pkg", "solution_test.go"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer file.Close()
++	if _, _, _, err = runtimeCaptureRead(&captureCancelContext{Context: context.Background(), remaining: 2}, file, runtimeCaptureFixedLimit, false); !errors.Is(err, context.Canceled) {
++		t.Fatal("read cancellation", err)
++	}
++}
++func TestRuntimeCandidateCaptureCompleteReceiptOnly(t *testing.T) {
++	f := newCandidateFixture(t)
++	c, err := f.capture(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	cases := map[string]func(*sandbox.Receipt){
++		"pid": func(r *sandbox.Receipt) { r.PID++ }, "created": func(r *sandbox.Receipt) { r.Created++ }, "job": func(r *sandbox.Receipt) { r.Job += "x" },
++		"sid": func(r *sandbox.Receipt) { r.SID += "x" }, "profile": func(r *sandbox.Receipt) { r.Profile += "x" },
++		"capability": func(r *sandbox.Receipt) { r.Capabilities = []string{"network"} }, "cwd": func(r *sandbox.Receipt) { r.Directory = f.id.StagingDirectory },
++		"exe": func(r *sandbox.Receipt) { r.Executable = "go.exe" }, "args": func(r *sandbox.Receipt) { r.Args[1] = "old-source" },
++		"arg_count": func(r *sandbox.Receipt) { r.Args = append(r.Args, "extra") }, "stopped": func(r *sandbox.Receipt) { r.Stopped = false },
++		"streams": func(r *sandbox.Receipt) { r.StreamsDrained = false }, "cleanup": func(r *sandbox.Receipt) { r.CleanupComplete = false }, "output": func(r *sandbox.Receipt) { r.OutputCopied = false },
++	}
++	for name, change := range cases {
++		t.Run(name, func(t *testing.T) {
++			r := f.receipt()
++			change(&r)
++			if _, err := c.evidence(r); err == nil {
++				t.Fatal("bad receipt accepted")
++			}
++		})
++	}
++	for _, timed := range []bool{false, true} {
++		r := f.receipt()
++		r.ExitCode = 1
++		r.TimedOut = timed
++		e, err := c.evidence(r)
++		if err != nil || e["structural_witness"].(domain.Object)["semantic_acceptance"] != false || bytes.Contains(domain.Bytes(e), []byte("PASS")) {
++			t.Fatal("capture became business PASS", err)
++		}
++	}
++	if _, err := (*runtimeCandidateCapture)(nil).evidence(f.receipt()); err == nil {
++		t.Fatal("missing callback")
++	}
++}
++func TestRuntimeCandidateCaptureEvidenceBoundAndNilSelector(t *testing.T) {
++	f := newCandidateFixture(t)
++	c, err := f.capture(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	e, err := c.evidence(f.receipt())
++	if err != nil {
++		t.Fatal(err)
++	}
++	full := domain.Object{"padding": strings.Repeat("x", (4<<20)-64)}
++	if err := runtimeCheckEvidenceBound(full); err != nil {
++		t.Fatal("control must fit", err)
++	}
++	full["candidate_capture"] = e
++	if err := runtimeCheckEvidenceBound(full); err == nil {
++		t.Fatal("encoded overhead ignored")
++	}
++	r := domain.RuntimeToolRequest{Name: "run_check", Arguments: domain.Object{"check_id": "coding.pure-scalar-bundle-v1"}, Policy: domain.Object{"capture": true}}
++	if v, err := r.CodingCapture(); v != nil || err != nil {
++		t.Fatal("worker opted in")
++	}
++}

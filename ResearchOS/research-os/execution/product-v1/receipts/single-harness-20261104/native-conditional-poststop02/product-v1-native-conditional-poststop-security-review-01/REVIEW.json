@@ -1,0 +1,109 @@
+{
+  "schema": "researchos.independent-security-review.v1",
+  "decision": "BLOCKED",
+  "formal_increment": 0,
+  "product_increment": 0,
+  "candidate_manifest_sha256": "bcb8dabb26384a26a2e33dbb771cdf9a9a1cdc374c6487ee0018ac9f3573ea21",
+  "source_sha256": {
+    "verify-poststop.mjs": "8a86cb3674848d31a199ccc3180d08e599b9ef6ddab92fea1e61daac251b9f13",
+    "scope.template.json": "ab4580fb7184e55a5030d0ec569fe9d34cbf9f8541be61c6f690e1191db3622e"
+  },
+  "source2_final_manifest_sha256": "e842cc69ca0486b666392ec205ccb36d46b1ed95abe8a4a735bcdc98b26ec9e3",
+  "production_source_sha256": {
+    "adapters/runtime/codex_qualification_windows.go": "7af3347a194a66455f962d38fc1918b0752a30ca4138ef46734ebd2fdc20bd24",
+    "adapters/runtime/codex_qualification_capture_windows.go": "a664f9c24feaf752ba784bb370d3a650d81232f8e449ccb45ca6138a16f9eb59",
+    "internal/qualificationprobe/plan.go": "0005183086beade6418afb14c507cf39ea81f3003ef957188c92c8b9d2109aea",
+    "cmd/researchos-qualification-helper/main_windows.go": "efc13ad7476d262c21e8cdf8167600d1b6bbc54f8d7f6f6ec550ca00abc97378"
+  },
+  "pending_blockers": [
+    {
+      "id": "POST-F1",
+      "origin_key": "native-poststop-verifier:outer-inner-scope-conflation",
+      "priority": "HIGH",
+      "locations": [
+        "verify-poststop.mjs:161",
+        "verify-poststop.mjs:167",
+        "verify-poststop.mjs:168",
+        "verify-poststop.mjs:180",
+        "scope.template.json:run_scope_sha256"
+      ],
+      "detail": "The same run_scope_sha256 is required to equal the f13 RESULT.scope_sha256 and runner.scope_sha256; the file at that hash must also be ROOT_APPROVED_REAL_RUN. f13 hashes its outer researchos.owned-windows-run/1 scope, while the GUI runner hashes the separate inner real-flow scope supplied via --scope/--scope-sha256. These are different files/schemas/hashes. A normal original Job result cannot satisfy this verifier.",
+      "minimal_fix": "Add separately pinned outer_scope_path/outer_scope_sha256 and inner runner scope path/hash. Bind f13 RESULT to outer scope, validate outer ID/schema and exact reviewed Node/runner argv plus input pin for the inner scope, then bind runner result to the inner hash. Preserve the original Job-stop gate before qualification receipt reads."
+    },
+    {
+      "id": "POST-F2",
+      "origin_key": "native-poststop-verifier:uppercase-probe-json-schema",
+      "priority": "HIGH",
+      "locations": [
+        "verify-poststop.mjs:87",
+        "verify-poststop.mjs:88",
+        "verify-poststop.mjs:108",
+        "verify-poststop.mjs:121",
+        "internal/qualificationprobe/plan.go:20",
+        "internal/qualificationprobe/plan.go:29"
+      ],
+      "detail": "validatePlan and validateTranscript require capitalized Go field names (Schema, Source, Phase, etc.). Pinned production Plan/Event explicitly use lowercase JSON tags: schema/source/working/denied/nonce/port/cases and schema/phase/case/errno/opened/digest/bytes/bitmap. The actual helper json.Marshal emits lowercase. Every real plan/transcript is rejected.",
+      "minimal_fix": "Use exact lowercase wire keys and field access throughout both validators, including COMPLETE. Keep ordered cases, canonical-byte, hash, bitmap and value checks; do not change production or accept both invented and actual schema silently."
+    },
+    {
+      "id": "POST-F3",
+      "origin_key": "native-poststop-verifier:nil-slices-rejected",
+      "priority": "HIGH",
+      "locations": [
+        "verify-poststop.mjs:128",
+        "verify-poststop.mjs:210",
+        "verify-poststop.mjs:211",
+        "adapters/runtime/codex_qualification_windows.go:569",
+        "adapters/runtime/codex_qualification_windows.go:696",
+        "adapters/runtime/codex_qualification_capture_windows.go:558"
+      ],
+      "detail": "The production receipt initializes neither CaseResults nor FindingCodes. Prelaunch copies them unchanged, so both serialize as null. On complete success final CaseResults has seven rows, but FindingCodes remains nil because record(\"\") returns without appending; it serializes null. The verifier requires arrays for all three empty-list checks and therefore rejects genuine successful evidence.",
+      "minimal_fix": "Match the producer's explicit wire semantics: accept null (and, if intentionally supported, an empty array) for these empty-slice positions while rejecting missing fields, objects, scalars and nonempty findings/prelaunch results. Final case_results must still be the exact seven-element array."
+    }
+  ],
+  "diagnostic_events": [
+    {
+      "origin_key": "native-poststop-verifier:outer-inner-scope-conflation",
+      "classification": "SOURCE_COMPATIBILITY_BLOCKER_NOT_EXECUTED",
+      "detail": "Separate actual f13 outer scope from runner inner scope and cross-bind them."
+    },
+    {
+      "origin_key": "native-poststop-verifier:uppercase-probe-json-schema",
+      "classification": "SOURCE_COMPATIBILITY_BLOCKER_NOT_EXECUTED",
+      "detail": "Pinned Go json tags are lowercase; candidate expects uppercase."
+    },
+    {
+      "origin_key": "native-poststop-verifier:nil-slices-rejected",
+      "classification": "SOURCE_COMPATIBILITY_BLOCKER_NOT_EXECUTED",
+      "detail": "Pinned successful producer serializes empty nil slices as null."
+    }
+  ],
+  "focused_pure_cases": [
+    "Positive source-derived receipt fixture with distinct outer/inner hashes, actual lowercase Plan/Event keys, null prelaunch empty slices and null final findings must reach the finite-case result without any OS/Native launch.",
+    "Swap outer/inner hash, omit the inner input pin, change argv --scope path/hash, or use a different outer ID: reject before any qualification receipt read.",
+    "Uppercase or missing plan/event key, changed nonce/port/path, out-of-order or missing case, extra event, non-127 COMPLETE bitmap: reject.",
+    "Allow only explicit permitted empty representation for prelaunch results/findings and final findings; reject missing fields, nonempty values or wrong types; final results require seven exact rows.",
+    "Mutate one immutable intent/final identity, raw stdout hash/bytes, PID creation token, Job limits/stop/drain, stderr nonempty, or a single expected Win32/Winsock denial: reject.",
+    "Original f13 nonzero active count, timeout, force or unproved stop: a file-read spy must show no qualification intent/capture/raw stream access."
+  ],
+  "verified_boundaries": [
+    "Candidate manifest and declared files match; final Source2 manifest and both production files independently hash-match the supplied pins.",
+    "Expected receipt filenames derive only from authoritative Run/epoch beneath fixed qualification root; no directory walk or normal-home/auth/config reads.",
+    "Normal-home comparison is string-only. Hash-pinned outer evidence is intended to gate qualification reads; F1 must be fixed for correct cross-binding.",
+    "Expected Task/Run/epoch, Host boot, source/native/helper/build/template/environment and immutable plan/argv fields are compared across intent and final context.",
+    "Job flags 8712 (0x2208), 16 processes and 2 GiB match the production qualification Job, distinct from other runtime Job configurations.",
+    "Capture fields, linked intent digest/path, exact stdout/stderr partial paths, raw digest/prefix comparison, clean stop/drain and ordered seven finite outcomes correspond to production aside from F2/F3.",
+    "Verdict claims finite observations only, formal/product zero, no READY grant or permission graph proof; it does not write into Host qualification authority."
+  ],
+  "runtime_prerequisites": [
+    "Fresh independently reviewed post-stop scope must pin the actual outer Job/inner runner relationship and current Task/Run. Do not derive fresh provenance merely by copying the receipt being verified.",
+    "Root still supplies independently reviewed current Host boot, source binding, build/template/environment and rendered argv evidence; this static review establishes none of those live values.",
+    "Current candidate is a strict successful-Job finite-case verifier, not a general failed-run diagnostic parser. Preserve failed original runs separately; never retry an actual Task to obtain passing evidence."
+  ],
+  "review_limits": {
+    "method": "Static source/JSON/manifest reads and SHA comparisons only. No verifier import/entrypoint, tests, App, helper, Native, CLI, model or Go executed. C report writes only; original controller review and all candidates unchanged.",
+    "actual_execution": "NOT_RUN",
+    "fixture_cases_above": "PROPOSED_NOT_EXECUTED",
+    "product_readiness": "NOT_ESTABLISHED"
+  }
+}

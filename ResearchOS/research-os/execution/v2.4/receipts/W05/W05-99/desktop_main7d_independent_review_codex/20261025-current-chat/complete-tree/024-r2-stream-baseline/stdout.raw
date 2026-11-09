@@ -1,0 +1,77 @@
+apps/desktop/launch-development.mjs
+215: export function prepareDevelopmentLaunch({ bundle, state, smoke = false, ambient = process.env }) {
+216:   const inspected = validateBundle(bundle);
+217:   const fresh = validateStatePath(state, inspected.bundle);
+218:   const env = buildChildEnv(ambient, inspected.bundle, fresh, smoke);
+219:   return { bundle: inspected.bundle, state: fresh,
+220:     executable: path.join(inspected.bundle, 'runtime/electron/electron.exe'),
+221:     argv: [path.join(inspected.bundle, 'apps/desktop')], cwd: inspected.bundle,
+222:     env, manifest_sha256: hashFile(path.join(inspected.bundle, 'development-manifest.json')),
+223:     inventory_count: inspected.fileCount, smoke };
+224: }
+225: 
+226: export async function executeDevelopmentLaunch(options, spawnImpl = spawn) {
+227:   const prepared = prepareDevelopmentLaunch(options);
+228:   if (options.dryRun) return { mode: 'DRY_RUN_NO_STATE_NO_SPAWN', executable: prepared.executable,
+229:     argv: prepared.argv, cwd: prepared.cwd, state: prepared.state,
+230:     env_keys: Object.keys(prepared.env).sort(), manifest_sha256: prepared.manifest_sha256,
+231:     inventory_count: prepared.inventory_count };
+232:   fs.mkdirSync(prepared.state, { recursive: false });
+233:   for (const relative of ['data', 'electron-user-data', 'profile/AppData/Roaming', 'profile/AppData/Local', 'tmp'])
+234:     fs.mkdirSync(path.join(prepared.state, relative), { recursive: true });
+235:   const child = spawnImpl(prepared.executable, prepared.argv, { cwd: prepared.cwd, env: prepared.env,
+236:     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+237:   const reports = [];
+238:   let pending = '', bytes = 0;
+239:   child.stdout.on('data', part => {
+240:     process.stdout.write(part);
+241:     bytes += part.length;
+242:     if (bytes > 1 << 20) return;
+243:     pending += part.toString('utf8');
+244:     for (;;) {
+245:       const end = pending.indexOf('\n');
+246:       if (end < 0) break;
+247:       const line = pending.slice(0, end).trim(); pending = pending.slice(end + 1);
+248:       if (line.startsWith('ROS_DESKTOP_REPORT ')) {
+249:         try { reports.push(JSON.parse(line.slice('ROS_DESKTOP_REPORT '.length))); }
+250:         catch { reports.push({ event: 'malformed_report' }); }
+251:       }
+252:     }
+253:   });
+254:   child.stderr.on('data', part => process.stderr.write(part));
+255:   const code = await new Promise((resolve, reject) => {
+256:     child.once('error', reject);
+257:     child.once('close', (exit, signal) => signal ? reject(refusal('DESKTOP_SIGNALLED')) : resolve(exit));
+258:   });
+259:   if (bytes > 1 << 20) throw refusal('SMOKE_REPORT_TOO_LARGE');
+260:   if (prepared.smoke) return validateSmokeReports(reports, code);
+261:   return { status: code === 0 ? 'DEVELOPMENT_EXITED' : 'DEVELOPMENT_FAILED', exit_code: code };
+262: }
+263: 
+264: function cli(argv) {
+265:   const options = {};
+266:   for (let i = 0; i < argv.length; i++) {
+267:     const arg = argv[i];
+268:     if (arg === '--bundle' || arg === '--state') {
+269:       if (options[arg.slice(2)] || !argv[i + 1]) throw refusal('CLI_ARGUMENTS');
+270:       options[arg.slice(2)] = argv[++i];
+271:     } else if (arg === '--dry-run' || arg === '--launch' || arg === '--smoke') {
+272:       if (options[arg.slice(2)]) throw refusal('CLI_ARGUMENTS');
+273:       options[arg.slice(2)] = true;
+274:     } else throw refusal('CLI_ARGUMENTS');
+275:   }
+276:   if (!options.bundle || !options.state || options['dry-run'] === options.launch ||
+277:       options.smoke && !options.launch) throw refusal('CLI_ARGUMENTS');
+278:   return { bundle: options.bundle, state: options.state, dryRun: !!options['dry-run'], smoke: !!options.smoke };
+279: }
+280: 
+281: if (process.argv[1] && folded(fileURLToPath(import.meta.url)) === folded(path.resolve(process.argv[1]))) {
+282:   try {
+283:     const result = await executeDevelopmentLaunch(cli(process.argv.slice(2)));
+284:     process.stdout.write(JSON.stringify(result) + '\n');
+285:     if (result.status === 'DEVELOPMENT_FAILED') process.exitCode = result.exit_code || 2;
+286:   } catch (error) {
+287:     process.stderr.write(`development launcher refused: ${error.code || error.message}\n`);
+288:     process.exitCode = 2;
+289:   }
+290: }

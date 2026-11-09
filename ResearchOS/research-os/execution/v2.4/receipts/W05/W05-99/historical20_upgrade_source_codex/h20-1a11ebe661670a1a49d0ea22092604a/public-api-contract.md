@@ -1,0 +1,19 @@
+# Explicit history20 to21 local upgrade
+
+Additive plan identifier: `schema20-to21-research-pending-windows-v1` (`History20SchemaUpgradePlan`). Existing `UpgradeLocal(ctx, LocalUpgradeOptions)` and `backup upgrade-local --plan ...` dispatch to the new fixed handler. No HTTP endpoint, schema enum, numbered migration, or historical template is changed.
+
+The caller supplies `Source`, new `Snapshot`, new `Destination`, separate 32-byte `KeyFile`, exact `SourceRoot` (numbered migrations 1..20), exact `TargetRoot` (1..21), and preserved `SourceProgram` / reviewed `TargetProgram` paths. Existing canonical-path, alias, overlap, and exclusive-source-lock checks apply. Release manifests hash exact numbered SQL and two domain contracts; program bytes are hashed and rechecked. This is not an attestation that arbitrary program bytes belong to a release. Matching historical and target executable qualification remains a caller acceptance requirement.
+
+Authorization remains the existing local administrative contract: local OS access, separate recovery key, and exclusive SQLite ownership. The source may contain Product Owner rows and credentials. Their presence is not authentication of the caller. This Source-only submission does not prove a real historical Owner login or possession of that Owner's credential.
+
+Only the exact historical numbered schema20 base (A) is accepted. No additive `client_sessions` installation or repair is allowed. The B shape with historical additive sessions is rejected by the exact source schema check. A previous restored schema with additional barriers is also outside this fixed source shape.
+
+The plan retains a full encrypted backup and restores into an unpublished isolated directory. The snapshot rows must equal the complete original row inventory. Before migration, recovery changes are validated separately: credentials revoked, registered source roots relocated, active Runs fenced with audit rows, unfinished effects marked unknown, and restore barriers installed. Migration then executes exactly the pinned 0021 DDL and inserts version21 in the same transaction, preserving all existing rows and requiring an empty new `research_pending_windows` table. Final checks validate target schema, restricted row differences, workspace identities, unchanged source rows, unchanged release manifests and program hashes, and the existing backup integrity/protection checks before publication.
+
+Failures discard the unpublished candidate and retain the encrypted backup. The original source database remains the rollback authority. Source binary usability after failure and actual native locking require runtime validation.
+
+`RESTORED_RECONCILIATION_REQUIRED` is the existing success result. It is an isolated schema21 candidate, not cutover or a runnable current schema24 database. The current startup guard remains unchanged and must refuse implicit 20→21/24 migration of populated authority. Starting the current program on this pure schema21 candidate is not an accepted continuation.
+
+The full historical20→24 route remains OPEN: historical source/Owner execution, independently qualified target21 binary, legal explicit additive-session transition, compatibility with the existing exact21→22 template, 22→23→24 runtime qualification, and explicit reviewed single-writer cutover are not delivered here. Existing 21/22/23 plan templates and current production files are unchanged.
+
+Five test parents are supplied as Source, with four negative subcases under the release/source rejection parent. Public fixtures build numbered SQL and call existing `ProvisionPrincipal` / `IssueCredential`; placeholder program files are explicitly synthetic. These tests are neither historical executable evidence nor Product Owner authorization evidence. No Go test or SQL execution was performed by this author.

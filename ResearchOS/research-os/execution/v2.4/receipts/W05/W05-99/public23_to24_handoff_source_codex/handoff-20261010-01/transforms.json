@@ -1,0 +1,117 @@
+{
+  "backup_go": [
+    {
+      "old": "\tpreservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error",
+      "new": "\tpreservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error\n\tpublicPreparedAbandonmentHandoff bool"
+    },
+    {
+      "old": "func backupFormat(policy *backupPolicy) string {",
+      "new": "// Ordinary public validation remains mandatory for the fixed handoff policy.\nfunc backupOrdinaryPublicPolicy(policy *backupPolicy) bool {\n    return policy == nil || policy.publicPreparedAbandonmentHandoff\n}\n\nfunc backupFormat(policy *backupPolicy) string {"
+    },
+    {
+      "old": "(policy == nil && files[\"portable.json\"] == nil)",
+      "new": "(backupOrdinaryPublicPolicy(policy) && files[\"portable.json\"] == nil)"
+    },
+    {
+      "old": "if policy != nil && files[\"portable.json\"] != nil {",
+      "new": "if !backupOrdinaryPublicPolicy(policy) && files[\"portable.json\"] != nil {"
+    },
+    {
+      "old": "if policy == nil {\n\t\tif e = backupWorkspaceRestorePaths",
+      "new": "if backupOrdinaryPublicPolicy(policy) {\n\t\tif e = backupWorkspaceRestorePaths"
+    },
+    {
+      "old": "if policy == nil {\n\t\tqueue, err := backupQueueState",
+      "new": "if backupOrdinaryPublicPolicy(policy) {\n\t\tqueue, err := backupQueueState"
+    },
+    {
+      "old": "\t\tif !ok || policy.format != localUpgradeFormat || plan[\"id\"] != PreparedAbandonmentSchemaUpgradePlan {\n\t\t\treturn r, fmt.Errorf(\"RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH\")\n\t\t}",
+      "new": "        fixedLocal := ok && policy.format == localUpgradeFormat && plan[\"id\"] == PreparedAbandonmentSchemaUpgradePlan\n        fixedPublic := policy.publicPreparedAbandonmentHandoff && policy.format == \"RESEARCHOS_BACKUP_V1\" &&\n            len(policy.purpose) == 0 && policy.allowProtected == nil\n        if !fixedLocal && !fixedPublic {\n            return r, fmt.Errorf(\"RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH\")\n        }"
+    }
+  ],
+  "cli_go": [
+    {
+      "old": "keygen|create|export|restore|upgrade-local [flags]",
+      "new": "keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]"
+    },
+    {
+      "old": "\tif e := f.Parse(os.Args[2:]); e != nil {",
+      "new": "    handoffBinding := f.String(\"handoff-binding\", \"\", \"upgrade-prepared-backup: externally reviewed and pinned producer binding\")\n    handoffSHA256 := f.String(\"handoff-binding-sha256\", \"\", \"upgrade-prepared-backup: expected sha256: digest of binding\")\n\tif e := f.Parse(os.Args[2:]); e != nil {"
+    },
+    {
+      "old": "command != \"upgrade-local\" {",
+      "new": "command != \"upgrade-local\" && command != \"upgrade-prepared-backup\" {"
+    },
+    {
+      "old": "\tif command == \"upgrade-local\" {",
+      "new": "    if command == \"upgrade-prepared-backup\" {\n        r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{\n            Upgrade: domain.LocalUpgradeOptions{\n                Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,\n                SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,\n                TargetProgram: *targetProgram, Plan: *plan,\n            },\n            BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,\n        })\n        if e != nil { return e }\n        return json.NewEncoder(os.Stdout).Encode(r)\n    }\n\tif command == \"upgrade-local\" {"
+    }
+  ],
+  "new_coordinator_initial_transforms": [
+    {
+      "old": "func upgradePreparedAbandonmentLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier)",
+      "new": "func upgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions, verifier upgradeVerifier)"
+    },
+    {
+      "old": "    report = RestoreReport{Started: Now(), Status: \"FAILED\"}",
+      "new": "    opt := handoff.Upgrade\n    report = RestoreReport{Started: Now(), Status: \"FAILED\"}"
+    },
+    {
+      "old": "upgradePaths(&opt)",
+      "new": "preparedHandoffPaths(&opt, &handoff)"
+    },
+    {
+      "old": "    contracts, err := LoadContracts",
+      "new": "    binding, err := preparedHandoffCheck(opt, handoff)\n    if err != nil { return report, err }\n    contracts, err := LoadContracts"
+    },
+    {
+      "old": "    defer clear(key)",
+      "new": "    defer clear(key)\n    if err = preparedHandoffVerifyBackup(opt, key, binding); err != nil { return report, err }"
+    },
+    {
+      "old": "    if err != nil || schema != schemas.Source23 { return report, fmt.Errorf(\"PREPARED_UPGRADE_SOURCE_SCHEMA\") }",
+      "new": "    if err != nil { return report, err }\n    sourceSchema, targetSchema := schema, schemas.Original24\n    if schema == schemas.Restored23 {\n        targetSchema = schemas.Restored24\n    } else if schema != schemas.Source23 {\n        return report, fmt.Errorf(\"PREPARED_UPGRADE_SOURCE_SCHEMA\")\n    }"
+    },
+    {
+      "old": "Schema: \"researchos.prepared-abandonment-schema-rehearsal.v1\"",
+      "new": "Schema: \"researchos.prepared-abandonment-public-backup-rehearsal.v1\""
+    },
+    {
+      "old": "\"SAME_HOST_PREPARED_ABANDONMENT_SCHEMA_REHEARSAL\"",
+      "new": "\"SAME_HOST_PUBLIC23_TO24_BACKUP_HANDOFF\""
+    },
+    {
+      "old": "    receipt.BackupPurpose = purpose",
+      "new": "    purpose[\"source_provenance\"] = \"EXTERNALLY_REVIEWED_OBSERVATION_INPUT_NOT_JSON_AUTHORITY\"\n    purpose[\"handoff_binding_sha256\"] = handoff.BindingSHA256\n    purpose[\"producer_observation\"] = binding.ProducerObservation\n    purpose[\"producer_stdout\"] = binding.ProducerStdout\n    purpose[\"existing_public_backup_consumed\"] = true\n    purpose[\"old_program_executed_by_target\"] = false\n    receipt.BackupPurpose = purpose"
+    },
+    {
+      "old": "    policy := &backupPolicy{format: localUpgradeFormat, databaseName: \"researchos.sqlite\", purpose: purpose,\n        validate: guard.refresh, allowProtected: guard.artifact}",
+      "new": "    // Retain ordinary public backup MAC/portable/queue/protected-artifact gates.\n    // This private flag only permits fixed same-host preservation and late DDL.\n    policy := &backupPolicy{format: \"RESEARCHOS_BACKUP_V1\", databaseName: \"researchos.sqlite\",\n        validate: guard.refresh, publicPreparedAbandonmentHandoff: true}"
+    },
+    {
+      "old": "        return ctx.Err()",
+      "new": "        currentBinding, err := preparedHandoffCheck(opt, handoff)\n        if err != nil || Hash(currentBinding) != Hash(binding) { return fmt.Errorf(\"PREPARED_HANDOFF_INPUT_CHANGED\") }\n        if err = preparedHandoffVerifyBackup(opt, key, binding); err != nil { return err }\n        return ctx.Err()"
+    },
+    {
+      "old": "    if _, err = (&Service{DB: db, Contracts: contracts}).createBackupPolicy(ctx, opt.Snapshot, key, policy); err != nil { return report, err }\n",
+      "new": ""
+    },
+    {
+      "old": "    // No skipRecovery and no migration callback in generic RestoreOptions.",
+      "new": "    // Consume the already-observed old-program output. Never recreate it.\n    // The beforeRecovery hook rejects stale/mixed snapshots before late DDL.\n    // No skipRecovery and no migration callback in generic RestoreOptions."
+    },
+    {
+      "old": "\"ISOLATED_REHEARSAL_COMPLETE_ORIGINAL_UNCHANGED\"",
+      "new": "\"ISOLATED_PUBLIC_BACKUP_HANDOFF_COMPLETE_ORIGINAL_UNCHANGED\""
+    },
+    {
+      "old": "    report.Recovery[\"prepared_abandonment_rehearsal_receipt\"]",
+      "new": "    report.Recovery[\"prepared_abandonment_public_backup_handoff_receipt\"]"
+    },
+    {
+      "old": "    report.Recovery[\"prepared_abandonment_public_backup_handoff_receipt\"] = Object",
+      "new": "    report.Recovery[\"local_upgrade\"] = purpose\n    report.Recovery[\"source_provenance_authority\"] = \"EXTERNAL_INDEPENDENT_REVIEW_REQUIRED\"\n    report.Recovery[\"prepared_abandonment_public_backup_handoff_receipt\"] = Object"
+    }
+  ],
+  "additional_global_replacements_documented": true
+}

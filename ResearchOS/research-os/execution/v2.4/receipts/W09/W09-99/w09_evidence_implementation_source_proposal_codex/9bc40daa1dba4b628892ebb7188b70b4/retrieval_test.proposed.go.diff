@@ -1,0 +1,203 @@
+--- a/internal/domain/retrieval_test.go
++++ b/internal/domain/retrieval_test.go
+@@ -16,7 +16,9 @@
+ 
+ func w09Assertion(t *testing.T, id string, evidence Object) {
+ 	t.Helper()
+-	line, _ := json.Marshal(Object{"assertion_id": id, "status": "PASS", "evidence": evidence})
++	value := Object{"assertion_id": id, "status": "PASS", "evidence": evidence}
++	if pin := w09ExportEvent(t, "assertion-"+id, Object{"assertion_id": id, "expected": w09Expected(id), "actual": evidence, "status": "PASS"}); pin != nil { value["owned_export_ref"] = pin }
++	line, _ := json.Marshal(value)
+ 	fmt.Println("W09_ASSERTION " + string(line))
+ }
+ 
+@@ -90,6 +92,7 @@
+ 	ids = append(ids, Str(unknown, "id"))
+ 	for i := 0; i < 20; i++ {
+ 		text := []byte(fmt.Sprintf("simulated agent opinion %d", i))
++		w09ExportRaw(t, fmt.Sprintf("simulated-opinion-%02d", i), text)
+ 		u := f.expect(201, "POST", f.path("/content"), ID(), "", text)
+ 		a := f.expect(201, "POST", f.path("/artifacts"), ID(), f.stateTag(), Object{"run_id": nil, "kind": "SOURCE_SNAPSHOT", "evidence_kind": "SIMULATED", "measurement_mode": "FIXTURE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "text/plain", "byte_size": len(text), "input_refs": Empty(), "source_refs": Empty(), "produced_by": f.owner, "access_class": "PROJECT"})
+ 		ev := f.expect(201, "POST", f.path("/evidence"), ID(), f.stateTag(), Object{"claim": claim, "stance": "SUPPORT", "evidence_kind": "SIMULATED", "source_kind": "SIMULATION", "canonical_url": nil, "publisher": nil, "upstream_revision": nil, "published_at": nil, "modified_at": nil, "retrieved_at": Now(), "time_status": "UNKNOWN", "snapshot_artifact_ref": Ref(a, "Artifact"), "locator": fmt.Sprintf("opinion-%d", i), "independence_key": Hash(fmt.Sprintf("simulation-%d", i)), "origin_evidence_id": nil, "discovery_urls": Empty(), "license_status": "UNKNOWN", "license_expression": nil})
+@@ -102,9 +105,14 @@
+ 	if summary["independent_observed_count"] != 2 || summary["simulated_count"] != 20 || summary["unknown_count"] != 1 || len(Arr(summary, "records")) != 27 {
+ 		t.Fatal("incorrect independent support", summary)
+ 	}
++	w09ExportEvent(t, "c19-complete-graph-before", Object{"records": summary["records"], "counts": summary, "evidence_ids": ids, "root_id": rootID})
++	w09ExportOriginRows(t, f, "c19-before")
++	for _, name := range []string{"original.txt", "experiment.txt", "repost-0.txt", "repost-1.txt", "repost-2.txt", "repost-3.txt", "unknown.txt"} { w09ExportFile(t, "c19-before-"+name, filepath.Join(rootPath, name), rootID) }
++	w09ExportState(t, f, "c19-before", rootID)
+ 	if err = f.s.RecordEvidenceOrigin(context.Background(), f.token, f.project, Str(unknown, "id"), Str(original, "id"), Str(copyArtifact, "id"), rootID, "unknown.txt"); err == nil {
+ 		t.Fatal("same-content body without explicit source citation was falsely linked")
+ 	}
++	w09ExportEvent(t, "c19-unsupported-relation-rejection", Object{"unknown_id": unknown["id"], "proposed_origin_id": original["id"], "actual_error": err.Error()})
+ 	w09Assertion(t, "C19-01", Object{"reposts": 4, "retained_records": len(Arr(summary, "records")), "explicit_origin_id": original["id"]})
+ 	w09Assertion(t, "C19-02", Object{"reviewed_independent_roots": summary["independent_observed_count"], "simulated": summary["simulated_count"], "experiment_source_kind": "EXPERIMENT"})
+ 	w09Assertion(t, "C19-03", Object{"unknown": summary["unknown_count"], "same_bytes": copyArtifact["id"] == first["id"], "unsupported_relation_rejected": true})
+@@ -113,6 +121,10 @@
+ 	if err != nil || summary["independent_observed_count"] != 1 || summary["unknown_count"] != 6 || len(Arr(summary, "records")) != 27 {
+ 		t.Fatal("invalidated primary still counted", err, summary)
+ 	}
++	w09ExportFile(t, "c19-primary-changed", filepath.Join(rootPath, "original.txt"), rootID)
++	w09ExportEvent(t, "c19-complete-graph-after", Object{"records": summary["records"], "counts": summary, "evidence_ids": ids, "root_id": rootID})
++	w09ExportOriginRows(t, f, "c19-after")
++	w09ExportState(t, f, "c19-after", rootID)
+ 	w09Assertion(t, "C19-04", Object{"primary_changed": true, "remaining_independent_roots": 1, "retained_records": 27})
+ }
+ 
+@@ -149,6 +161,8 @@
+ 	if err = annotate(a, leaf, Str(middle, "id"), "leaf.txt"); err != nil {
+ 		t.Fatal(err)
+ 	}
++	for _, name := range []string{"primary.txt", "middle.txt", "leaf.txt"} { w09ExportFile(t, "chain-before-"+name, filepath.Join(rootPath, name), rootID) }
++	w09ExportOriginRows(t, f, "chain-before")
+ 	before, err := f.s.EvidenceSupportSummary(context.Background(), f.token, f.project, []string{Str(leaf, "id")})
+ 	if err != nil || before["independent_observed_count"] != 1 {
+ 		t.Fatal("valid chain unavailable", err, before)
+@@ -171,6 +185,10 @@
+ 	if err != nil || after["independent_observed_count"] != 0 || after["unknown_count"] != 1 {
+ 		t.Fatal("stale intermediate still counted after refresh", err, after)
+ 	}
++	w09ExportFile(t, "chain-middle-removed", filepath.Join(rootPath, "middle.txt"), rootID)
++	w09ExportEvent(t, "chain-before-after", Object{"before": before, "after": after, "primary_id": primary["id"], "middle_id": middle["id"], "leaf_id": leaf["id"]})
++	w09ExportOriginRows(t, f, "chain-after")
++	w09ExportState(t, f, "chain-after", rootID)
+ 	w09Assertion(t, "C19-05", Object{"before": before, "after": after, "new_relation_rejected": true, "intermediate_validity": f.read("evidence", Str(middle, "id"))["validity"]})
+ }
+ 
+@@ -194,11 +212,15 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "a06-initial-authorized", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportFile(t, "a06-initial-denied", filepath.Join(bRoot, "same.txt"), "")
++	w09ExportState(t, f, "a06-before-capture", rootID)
+ 	artifact, evidence := w09LocalEvidence(t, f, rootID, "same.txt", "alpha current v1")
+ 	for _, escape := range []string{"../B/same.txt", filepath.Join(bRoot, "same.txt")} {
+ 		if _, err = f.s.CaptureLocalSnapshot(context.Background(), f.token, f.project, rootID, escape); err == nil {
+ 			t.Fatal("escaped root", escape)
+ 		}
++		w09ExportEvent(t, "a06-escape-rejection", Object{"attempted_path": escape, "actual_error": err.Error(), "accepted": false})
+ 	}
+ 	state := f.state()
+ 	query := Object{"query": "alpha", "snapshot_ids": []any{artifact["id"]}, "limit": 10, "expected_state_revision": state["revision"]}
+@@ -224,6 +246,8 @@
+ 	if err = os.WriteFile(filepath.Join(aRoot, "same.txt"), []byte("beta changed v2"), 0600); err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "a06-modified", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportState(t, f, "a06-modified-before-refresh", rootID)
+ 	// Even before the maintenance projection, the old key must not replay v1.
+ 	if code, reply, _ := f.request("POST", f.path("/search"), key, "", query); code != 412 || strings.Contains(string(Bytes(reply)), "alpha current v1") {
+ 		t.Fatal("old idempotency body replayed", code, reply)
+@@ -257,6 +281,9 @@
+ 	if err = os.Rename(filepath.Join(aRoot, "same.txt"), filepath.Join(bRoot, "moved-out.txt")); err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "a06-moved-source-absent", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportFile(t, "a06-moved-destination", filepath.Join(bRoot, "moved-out.txt"), "")
++	w09ExportState(t, f, "a06-moved-before-refresh", rootID)
+ 	state = f.state()
+ 	moveQuery := Object{"query": "beta", "snapshot_ids": []any{newArtifact["id"]}, "limit": 10, "expected_state_revision": state["revision"]}
+ 	if got := f.expect(200, "POST", f.path("/search"), ID(), "", moveQuery); len(Arr(got, "hits")) != 0 {
+@@ -276,6 +303,8 @@
+ 	if err = os.Remove(filepath.Join(aRoot, "same.txt")); err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "a06-deleted", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportState(t, f, "a06-deleted-before-refresh", rootID)
+ 	state = f.state()
+ 	deleteQuery := Object{"query": "gamma", "snapshot_ids": []any{deletedArtifact["id"]}, "limit": 10, "expected_state_revision": state["revision"]}
+ 	if got := f.expect(200, "POST", f.path("/search"), ID(), "", deleteQuery); len(Arr(got, "hits")) != 0 {
+@@ -311,6 +340,8 @@
+ 	if got := f.expect(200, "POST", f.path("/search"), ID(), "", query); len(Arr(got, "hits")) != 0 {
+ 		t.Fatal("revoked source returned", got)
+ 	}
++	w09ExportFile(t, "a06-revoked-body", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportState(t, f, "a06-revoked", rootID)
+ 	w09Assertion(t, "A06-01", Object{"modified_stale": true, "moved_stale": true, "deleted_stale": true, "revoked": true, "new_bundle_excludes_old": true, "old_materialization_rejected": true})
+ 	w09Assertion(t, "A06-02", Object{"http_path_traversal_rejected": true, "secret_marker_leaks": 0})
+ }
+@@ -339,6 +370,8 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "a06-fts-file-1", filepath.Join(root, "same.txt"), rootID)
++	w09ExportFile(t, "a06-fts-file-2", filepath.Join(root, "nested", "same.txt"), rootID)
+ 	if first["id"] == second["id"] {
+ 		t.Fatal("different same-named files collapsed")
+ 	}
+@@ -353,6 +386,8 @@
+ 			t.Fatal("FTS path not exercised", raw)
+ 		}
+ 	}
++	w09ExportEvent(t, "a06-indexed-result", Object{"result": indexed, "first_artifact": first, "second_artifact": second})
++	w09ExportState(t, f, "a06-fts-indexed", rootID)
+ 	if _, err = f.db.Exec("DROP TABLE retrieval_fts"); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -365,6 +400,8 @@
+ 			t.Fatal("candidate failure did not fall back", raw)
+ 		}
+ 	}
++	w09ExportEvent(t, "a06-fallback-result", Object{"result": fallback, "retrieval_fts_table_dropped": true})
++	w09ExportState(t, f, "a06-fts-fallback", rootID)
+ 	w09Assertion(t, "A06-03", Object{"indexed_hits": 2, "fallback_hits": 2, "backend": "bounded-scan", "same_named_paths_distinct": first["id"] != second["id"]})
+ }
+ 
+@@ -389,6 +426,8 @@
+ 	if len(hits) != 1 || hits[0].(map[string]any)["locator"] != "line:2" || !strings.Contains(Str(hits[0].(map[string]any), "excerpt"), "needle") {
+ 		t.Fatal("casefold changed source byte offset", result)
+ 	}
++	w09ExportFile(t, "g02-unicode-input", filepath.Join(root, "unicode.txt"), rootID)
++	w09ExportState(t, f, "g02-unicode", rootID)
+ 	w09Assertion(t, "W09-G02-UNICODE-LOCATOR", Object{"locator": "line:2", "content_hash": a["content_hash"]})
+ }
+ 
+@@ -415,6 +454,9 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	w09ExportFile(t, "g02-authorized-before-replacement", filepath.Join(aRoot, "same.txt"), rootID)
++	w09ExportFile(t, "g02-denied-before-replacement", filepath.Join(bRoot, "same.txt"), "")
++	w09ExportState(t, f, "g02-before-replacement", rootID)
+ 	if err = os.Rename(aRoot, filepath.Join(base, "A-original")); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -438,6 +480,10 @@
+ 	if err != nil || changed != 1 {
+ 		t.Fatal("replacement not invalidated", changed, err)
+ 	}
++	w09ExportFile(t, "g02-replacement-path", aRoot, rootID)
++	w09ExportFile(t, "g02-denied-target", filepath.Join(bRoot, "same.txt"), "")
++	w09ExportState(t, f, "g02-replacement-after-refresh", rootID)
++	w09ExportEvent(t, "g02-os-branch", Object{"goos": runtime.GOOS, "goarch": runtime.GOARCH, "junction_branch": runtime.GOOS == "windows"})
+ 	w09Assertion(t, "W09-G02-ROOT-REPLACEMENT", Object{"capture_denied": true, "search_leaks": 0, "content_denied": true, "invalidated": true})
+ }
+ 
+@@ -465,6 +511,8 @@
+ 	if !containsSnapshot(Arr(bundle, "authorized_snapshot_ids"), Str(a, "id")) {
+ 		t.Fatal("initial source not bound")
+ 	}
++	w09ExportFile(t, "g02-stale-input-before-delete", filepath.Join(source, "input.txt"), rootID)
++	w09ExportState(t, f, "g02-before-delete", rootID)
+ 	if err = os.Remove(filepath.Join(source, "input.txt")); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -487,6 +535,9 @@
+ 	if err != nil || strings.Contains(string(Bytes(manifest)), "v1 stale input body") {
+ 		t.Fatal("new bundle retained deleted bytes", err, manifest)
+ 	}
++	w09ExportFile(t, "g02-stale-input-after-delete", filepath.Join(source, "input.txt"), rootID)
++	w09ExportState(t, f, "g02-after-delete", rootID)
++	w09ExportEvent(t, "g02-clean-context-manifest", manifest)
+ 	w09Assertion(t, "W09-G02-STALE-INPUT-BODY", Object{"new_context_refused_for_stale_task": true, "old_materialize_denied": true, "get_content_denied": true, "new_task_context_clean": true})
+ }
+ 
+@@ -523,5 +574,6 @@
+ 	if identity != "" || revoked != 1 || revision != 2 {
+ 		t.Fatalf("legacy root kept authority: identity=%q revoked=%d revision=%d", identity, revoked, revision)
+ 	}
++	w09ExportEvent(t, "g02-legacy-sql-observation", Object{"root_identity": identity, "revoked": revoked, "revision": revision, "source": "SELECT root_identity,revoked,revision FROM retrieval_roots"})
+ 	w09Assertion(t, "W09-G02-LEGACY-ROOT", Object{"old_root_revoked": true, "identity_unknown": true})
+ }

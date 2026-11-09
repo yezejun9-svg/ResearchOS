@@ -1,0 +1,364 @@
+--- C6/controller.py
++++ C5/controller.py
+@@ -14,23 +14,13 @@
+ SOURCE_COMMIT="adc460c2138528f163f7fdab5e8d81dde157b7fb"
+ LIMITS={"maximum_provider_requests":3,"requested_output_tokens_total":8192,"total_wall_seconds":300}
+ HERE=Path(__file__).resolve().parent
+-CANONICAL_TRANSACTION_REF={'path':str(HERE/"canonical_transactions.py"),
+-    'sha256':'094e1a97fb00d01412b4e71e2d740b800accfce00e607c6853cb634280b12ba9',
+-    'bytes':6877}
+-JOB_WATCHDOG_REF={'path':str(HERE/"job_deadline_watchdog.py"),
+-    'sha256':'6af03123b3d8c47f07f9aa1a65d0b1b8bdc2c020244d36e51e4cc6568df035ba',
+-    'bytes':2953}
+-CLEANUP_PRODUCER_REF={'path':str(HERE/"held_job_cleanup_producer.py"),
+-    'sha256':'17ebea83cedcb443b5e5c3669eb9d9d7178b376c3d90557e008aaf3965e58cee',
+-    'bytes':9499}
++CANONICAL_TRANSACTION_REF={'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\mu_sdk_controller_revision_v5_codex\\e5953a6723c44426a05b5bb540186cdc\\canonical_transactions.py', 'sha256': '094e1a97fb00d01412b4e71e2d740b800accfce00e607c6853cb634280b12ba9', 'bytes': 6877}
++JOB_WATCHDOG_REF={'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\mu_sdk_controller_revision_v5_codex\\e5953a6723c44426a05b5bb540186cdc\\job_deadline_watchdog.py', 'sha256': '6af03123b3d8c47f07f9aa1a65d0b1b8bdc2c020244d36e51e4cc6568df035ba', 'bytes': 2953}
+ 
+ SOURCE_READ_GUARD_REF={'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\source_read_guard_revision_v2_codex\\d6d10c192b1940ed9c11a957411aecd9\\source_read_guard.py', 'sha256': 'e75ae31b45cf9bbe82b3930173a068e66f012dfa0468a2ed36cfd9e359115b85', 'bytes': 11404}
+ PINNED_PYTHON_REF={'path': 'C:\\Users\\yqyyds\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe', 'sha256': 'cce21c0e8710e304273e98ac4b2b0f5aceb639acbcd2343cbaa5c4e81619c45b', 'bytes': 106328}
+ BASE_OWNED_PROCESS_REF={'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\integration_codex\\independent-cli-list-scopes-r308\\windows_owned_process.py', 'sha256': '6a4fa13d7a69bd6dc33b10a667253906193bf105f8370db9f6665cd76837b3ad', 'bytes': 18901}
+-OBSERVER_SOURCE_REF={'path':str(Path('D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_sdk_job_observer_revision_v4_codex/cbb82ea19cf84175baf61427251b983c/mu_sdk_job_observer.v4.proposed.py')),
+-    'sha256':'15495afc9b17b2e1a4e54a7f4fbace2fc4f8c5d00a2897dcc939892eb5045011',
+-    'bytes':33114}
+-_RESIDENT_OWNER_ATTR="_researchos_mu_sdk_resident_source_owner_v2"
++_RESIDENT_OWNER_ATTR="_researchos_mu_sdk_resident_source_owner_v1"
+ 
+ def require(ok,message):
+     if not ok: raise RuntimeError(message)
+@@ -111,39 +101,6 @@
+             all(c.get(k) is True for k in
+                 ("primary_exit_confirmed","job_idle_confirmed","handles_closed")))
+ 
+-def expected_source_provenance(context):
+-    """Fixed authorship facts for the exact tuple; review data cannot grant itself authority."""
+-    roles={
+-        "controller":("controller_source",["codex:/root/live_resource_lookup"]),
+-        "observer":("observer_source",["codex:/root/w05_merge_review"]),
+-        "hooks":("hooks_source",["codex:/root"]),
+-        "phase_worker":("phase_worker_source",["codex:/root"]),
+-        "runner":("runner_source",["codex:/root"]),
+-        "canonical_transactions":("canonical_transactions_source",["codex:/root"]),
+-        "job_watchdog":("job_watchdog_source",["codex:/root"]),
+-        "source_guard":("source_guard_source",["codex:/root/live_resource_lookup"]),
+-        "base_owned":("base_owned_process_source",["codex:/root"]),
+-        "cleanup_producer":("cleanup_producer_source",["codex:/root/live_resource_lookup"]),
+-        "python_binary":("python_binary",[])}
+-    return {"schema":"researchos.mu-sdk-source-author-provenance.v1",
+-            "sources":{role:{"source_ref":context[key],"authors":authors}
+-                       for role,(key,authors) in roles.items()}}
+-
+-def require_non_author(actor,context):
+-    provenance=expected_source_provenance(context)
+-    authors={author for item in provenance["sources"].values()
+-             for author in item["authors"]}
+-    require(actor not in (None,"","ACTOR",*authors),
+-            "independent review actor is a Source author")
+-
+-def validate_review_actor(review,context):
+-    provenance=expected_source_provenance(context)
+-    require(review.get("source_provenance")==provenance,
+-            "independent review source provenance differs from fixed tuple")
+-    require(review.get("actor_id")!="program:researchos.mu-sdk-job-observer.v1",
+-            "automatic observer cannot review its own Source")
+-    require_non_author(review.get("actor_id"),context)
+-
+ class ResidentSourceOwner:
+     """Process-resident strong references; no cross-process persistence claim."""
+     def __init__(self):
+@@ -157,8 +114,7 @@
+         with self._lock:
+             require(run_uuid not in self._records,"run UUID already has resident Source ownership")
+             self._records[run_uuid]={"run_uuid":run_uuid,"owner_pid":self.owner_pid,
+-                "guard":guard,"watchdog":None,"producer":None,"job_identity":None,
+-                "guard_released":False,"state":"PRE_NATIVE",
++                "guard":guard,"watchdog":None,"state":"PRE_NATIVE",
+                 "native_invoked":False,"retained_monotonic":None,"reason":None}
+ 
+     def record(self,run_uuid):
+@@ -177,25 +133,6 @@
+             record=self._records[run_uuid]
+             require(record["state"]=="NATIVE_INVOKED","watchdog ownership without native invocation")
+             record["watchdog"]=watchdog
+-
+-    def attach_producer(self,run_uuid,producer):
+-        with self._lock:
+-            record=self._records[run_uuid]
+-            require(record["state"]=="NATIVE_INVOKED" and record["producer"] is None,
+-                    "cleanup producer ownership without native invocation")
+-            record["producer"]=producer
+-
+-    def bind_job_identity(self,run_uuid,identity):
+-        with self._lock:
+-            record=self._records[run_uuid]
+-            require(record["job_identity"] is None and
+-                    identity.get("captured_before_resume") is True and
+-                    identity.get("run_uuid")==run_uuid and
+-                    identity.get("owner_pid")==self.owner_pid and
+-                    identity.get("held_job_handle") is True and
+-                    identity.get("held_primary_handle") is True,
+-                    "actual held Job binding unavailable")
+-            record["job_identity"]=dict(identity)
+ 
+     def retain(self,run_uuid,reason):
+         with self._lock:
+@@ -222,9 +159,6 @@
+                 "native_invoked":record["native_invoked"],
+                 "retained_handles_count":retained,
+                 "watchdog_object_retained":record["watchdog"] is not None,
+-                "cleanup_producer_retained":record["producer"] is not None,
+-                "job_binding_id":(record["job_identity"] or {}).get("job_binding_id"),
+-                "guard_released":record["guard_released"],
+                 "owner_process_resident_required":True,"cross_process_persistence":False}
+ 
+ def get_resident_source_owner():
+@@ -233,11 +167,9 @@
+     if owner is None:
+         owner=ResidentSourceOwner()
+         setattr(sys,_RESIDENT_OWNER_ATTR,owner)
+-    require(isinstance(owner,ResidentSourceOwner) and
+-            getattr(owner,"owner_pid",None)==os.getpid() and
++    require(getattr(owner,"owner_pid",None)==os.getpid() and
+             callable(getattr(owner,"reserve",None)) and
+-            callable(getattr(owner,"record",None)) and
+-            callable(getattr(owner,"attach_producer",None)),
++            callable(getattr(owner,"record",None)),
+             "resident Source owner belongs to a different process or contract")
+     return owner
+ 
+@@ -255,8 +187,8 @@
+     record=source_owner.record(run_uuid)
+     return source_owner.observation(run_uuid) if record is not None else None
+ 
+-def reconcile_retained_sources(run_uuid,owner_pid,source_owner):
+-    """Use the held kernel handles to prove current cleanup before Source release."""
++def reconcile_retained_sources(run_uuid,owner_pid,source_owner,fresh_cleanup_probe=None):
++    """Release only after a fresh Root-owned Job probe confirms strict cleanup."""
+     _require_source_owner(source_owner)
+     require(type(owner_pid) is int and owner_pid==os.getpid()==source_owner.owner_pid,
+             "reconcile owner PID differs from the resident parent")
+@@ -266,31 +198,21 @@
+     proof_observation={"run_uuid":run_uuid,"owner_pid":owner_pid,
+                        "native_invoked":record["native_invoked"],
+                        "strict_current_cleanup_confirmed":False}
+-    if record["native_invoked"] and not record["guard_released"]:
+-        producer=record["producer"]
+-        identity=record["job_identity"]
+-        require(producer is not None and identity is not None,
+-                "actual held Job producer unavailable")
+-        call_start=time.monotonic()
+-        proof=producer.observe_current()
+-        call_end=time.monotonic()
+-        require(call_end-call_start<=2 and call_start>=record["retained_monotonic"] and
+-                type(proof) is dict and proof.get("schema")=="researchos.held-job-cleanup-observation.v1" and
++    if record["native_invoked"]:
++        require(callable(fresh_cleanup_probe),"fresh owned-Job cleanup probe required")
++        proof=fresh_cleanup_probe(run_uuid=run_uuid,owner_pid=owner_pid,
++                                  watchdog=record["watchdog"])
++        require(type(proof) is dict and proof.get("run_uuid")==run_uuid and
++                type(proof.get("owner_pid")) is int and proof["owner_pid"]==owner_pid and
+                 type(proof.get("observed_monotonic")) in (int,float) and
+-                call_start<=proof["observed_monotonic"]<=call_end and
+-                all(proof.get(k)==identity[k] for k in
+-                    ("run_uuid","owner_pid","runner_pid","creation_time_100ns","job_binding_id")) and
+-                proof.get("captured_before_resume") is True and
+-                proof.get("held_job_handle") is True and
+-                proof.get("held_primary_handle") is True and
+-                proof.get("pid_match") is True and proof.get("creation_match") is True and
+-                type(proof.get("active_processes")) is int and proof["active_processes"]==0 and
+-                proof.get("primary_exit_confirmed") is True and proof.get("errors")==[],
+-                "fresh matching held Job cleanup remains unconfirmed")
++                proof["observed_monotonic"]>=record["retained_monotonic"] and
++                cleanup_confirmed(proof.get("native_result")),
++                "fresh matching owned-Job cleanup remains unconfirmed")
+         proof_observation.update({"observed_monotonic":proof["observed_monotonic"],
+-                                  "job_binding_id":identity["job_binding_id"],
+-                                  "strict_current_cleanup_confirmed":True,
+-                                  "native_observation":proof})
++                                  "strict_current_cleanup_confirmed":True})
++    else:
++        require(fresh_cleanup_probe is None,
++                "no native invocation occurred; Job cleanup probe must be absent")
+     watchdog=record["watchdog"]
+     watchdog_observation=None
+     if watchdog is not None:
+@@ -304,14 +226,11 @@
+                 run_uuid,"watchdog duplicate cleanup unconfirmed"),
+                 "watchdog_observation":watchdog_observation,
+                 "current_cleanup_proof":proof_observation}
+-    if record["guard_released"]:
+-        guard_observation={"closed":True,"retained_handles_count":0,"errors":[]}
+-    else:
+-        try:
+-            guard_observation=record["guard"].close()
+-        except BaseException as cleanup_error:
+-            guard_observation={"closed":False,"retained_handles_count":None,
+-                               "errors":[repr(cleanup_error)]}
++    try:
++        guard_observation=record["guard"].close()
++    except BaseException as cleanup_error:
++        guard_observation={"closed":False,"retained_handles_count":None,
++                           "errors":[repr(cleanup_error)]}
+     if (guard_observation.get("closed") is not True or
+             guard_observation.get("retained_handles_count")!=0):
+         return {"state":"RETAINED_UNCONFIRMED","source":source_owner.retain(
+@@ -319,21 +238,10 @@
+             "watchdog_observation":watchdog_observation,
+             "source_guard_observation":guard_observation,
+             "current_cleanup_proof":proof_observation}
+-    record["guard_released"]=True
+-    producer_observation=None
+-    if record["producer"] is not None:
+-        producer_observation=record["producer"].close()
+-        if producer_observation.get("closed") is not True:
+-            return {"state":"RETAINED_UNCONFIRMED","source":source_owner.retain(
+-                run_uuid,"held Job duplicate close unconfirmed"),
+-                "source_guard_observation":guard_observation,
+-                "producer_observation":producer_observation,
+-                "current_cleanup_proof":proof_observation}
+     source_owner.release(run_uuid)
+     return {"state":"RELEASED_AFTER_CONFIRMED_CLEANUP","run_uuid":run_uuid,
+             "owner_pid":owner_pid,"watchdog_observation":watchdog_observation,
+             "source_guard_observation":guard_observation,
+-            "producer_observation":producer_observation,
+             "current_cleanup_proof":proof_observation}
+ 
+ def close_canonical_lease(doc,phase_dir,native_result,error,transaction_module=None):
+@@ -421,28 +329,21 @@
+     input_path=phase_dir/"input.execute.json"
+     stop_heartbeat=threading.Event();heartbeat_thread=None;activated=False;result=None;error=None
+     watchdog_module=module(JOB_WATCHDOG_REF,"root_independent_job_deadline")
+-    producer_module=module(CLEANUP_PRODUCER_REF,"reviewed_held_job_cleanup_producer")
+-    producer=None;producer_observation=None
+     watchdog=None;watchdog_observation=None;source_guard_observation=None
+     require(engine.cli_environment(doc)==basis["child_environment"],"Root environment differs from sealed basis")
+     argv=[str(pinned(seed["python_binary"])[0]),"-I","-S","-X","utf8",str(HERE/"phase_worker.py"),str(input_path)]
+     exclusive_json(phase_dir/"phase-launch.intent.json",{"argv":argv,"environment":public_env,
+         "cwd":str(ROOT),"deadline_monotonic":deadline,"limits":LIMITS,
+         "controller_source_ref":controller_ref,"observer_source_ref":seed["observer_source"],
+-        "hooks_source_ref":pin(HERE/"owned_job_hooks.py"),"phase_worker_ref":pin(HERE/"phase_worker.py"),
+-        "cleanup_producer_source_ref":CLEANUP_PRODUCER_REF})
++        "hooks_source_ref":pin(HERE/"owned_job_hooks.py"),"phase_worker_ref":pin(HERE/"phase_worker.py")})
+     def before_resume(actual):
+-        nonlocal activated,heartbeat_thread,watchdog,producer
++        nonlocal activated,heartbeat_thread,watchdog
++        watchdog=watchdog_module.JobDeadlineWatchdog(actual["job_handle"],actual["absolute_deadline_monotonic"])
++        source_owner.attach_watchdog(doc["run_uuid"],watchdog)
++        watchdog.start()
+         require(actual["assigned_before_resume"] and actual["kill_on_job_close_configured"] and
+                 not actual["resumed"] and actual["absolute_deadline_monotonic"]<=deadline,
+                 "actual bounded suspended Job preconditions failed")
+-        producer=producer_module.HeldJobCleanupProducer(doc["run_uuid"],os.getpid())
+-        source_owner.attach_producer(doc["run_uuid"],producer)
+-        held_identity=producer.capture_before_resume(actual)
+-        source_owner.bind_job_identity(doc["run_uuid"],held_identity)
+-        watchdog=watchdog_module.JobDeadlineWatchdog(actual["job_handle"],actual["absolute_deadline_monotonic"])
+-        source_owner.attach_watchdog(doc["run_uuid"],watchdog)
+-        watchdog.start()
+         pid=actual["runner_pid"]
+         outer={"schema":"researchos.mu-sdk-trial-outer-job.v1","run_uuid":doc["run_uuid"],
+                "runner_pid":pid,"kill_on_close":True,"owns_child_tree":True,"wall_seconds":300,
+@@ -450,7 +351,6 @@
+                "absolute_deadline_monotonic":deadline,
+                "actual_owned_runner_deadline_monotonic":actual["absolute_deadline_monotonic"],
+                "actual_creation_time_100ns":actual["creation_time_100ns"]}
+-        outer["held_job_binding"]=held_identity
+         doc["outer_job_contract"]=exclusive_json(phase_dir/"outer-job.json",outer)
+         doc["controller_source"]=controller_ref
+         canonical=activate_canonical_lease(doc,doc["owner_lease"],seed["parent_checkpoint"],seed["parent_ownership"],phase_dir)
+@@ -468,25 +368,14 @@
+                  "controller_source":controller_ref,"hooks_source":pin(HERE/"owned_job_hooks.py"),
+                  "observer_source":seed["observer_source"],"independent_source_review":seed["controller_source_review"],
+                  "phase_dir":str(phase_dir),"public_environment":public_env,
+-                 "phase_worker_source":pin(HERE/"phase_worker.py"),"python_binary":seed["python_binary"],
+-                 "cleanup_producer_source":CLEANUP_PRODUCER_REF}
++                 "phase_worker_source":pin(HERE/"phase_worker.py"),"python_binary":seed["python_binary"]}
+         observed=observer.observe_assigned_before_resume(context,
+             process_handle=actual["process_handle"],thread_handle=actual["thread_handle"],
+             job_handle=actual["job_handle"],pid=pid,creation_filetime=actual["creation_time_100ns"])
+         doc["job_probe_receipt"]=observed["job_probe"];doc["controller_review"]=observed["controller_review"]
+         doc["root_review"]=observed["nonauthor_review"]
+         review_doc=json.loads(pinned(doc["root_review"])[1])
+-        provenance_context={"controller_source":controller_ref,"observer_source":seed["observer_source"],
+-            "hooks_source":pin(HERE/"owned_job_hooks.py"),"phase_worker_source":pin(HERE/"phase_worker.py"),
+-            "runner_source":seed["runner_source"],"canonical_transactions_source":CANONICAL_TRANSACTION_REF,
+-            "job_watchdog_source":JOB_WATCHDOG_REF,"source_guard_source":SOURCE_READ_GUARD_REF,
+-            "base_owned_process_source":BASE_OWNED_PROCESS_REF,
+-            "cleanup_producer_source":CLEANUP_PRODUCER_REF,"python_binary":seed["python_binary"]}
+-        # Re-read the independently issued record under the held Source guard.
+-        # The observer's generated nonauthor receipt is a separate actor record.
+-        validate_review_actor(
+-            json.loads(pinned(seed["controller_source_review"])[1]),provenance_context)
+-        require_non_author(review_doc.get("actor_id"),provenance_context)
++        require(review_doc["actor_id"] not in ("codex:/root",reg["owner"]),"automatic observer lacks independent author provenance")
+         grant={"schema":"researchos.mu-sdk-trial-root-grant.v1","actor_id":"codex:/root",
+                "decision":"ALLOW_ISOLATED_MU_SDK_TRIAL","phase":phase,"run_uuid":doc["run_uuid"],
+                "registration_ref":doc["root_registration"],"review_ref":doc["root_review"],
+@@ -546,18 +435,7 @@
+             if (source_guard_observation.get("closed") is True and
+                     source_guard_observation.get("retained_handles_count")==0 and
+                     not source_guard_observation.get("errors")):
+-                source_owner.record(doc["run_uuid"])["guard_released"]=True
+-                if producer is not None:
+-                    try:
+-                        producer_observation=producer.close()
+-                    except BaseException as cleanup_error:
+-                        producer_observation={"closed":False,"errors":[repr(cleanup_error)]}
+-                if producer_observation is None or producer_observation.get("closed") is True:
+-                    source_owner.release(doc["run_uuid"])
+-                else:
+-                    error=error or "held Job duplicate close unconfirmed"
+-                    _append_cleanup_error(result,error)
+-                    source_owner.retain(doc["run_uuid"],error)
++                source_owner.release(doc["run_uuid"])
+             else:
+                 error=error or "source guard cleanup unconfirmed"
+                 _append_cleanup_error(result,error)
+@@ -589,7 +467,6 @@
+             "stdout_ref":pin(phase_dir/"phase.stdout.raw") if (phase_dir/"phase.stdout.raw").exists() else None,
+             "stderr_ref":pin(phase_dir/"phase.stderr.raw") if (phase_dir/"phase.stderr.raw").exists() else None,
+             "watchdog_observation":watchdog_observation,"source_guard_observation":source_guard_observation,
+-            "cleanup_producer_observation":producer_observation,
+             "source_runtime_qualification":False,"formal_acceptance":False})
+         if activated:close_canonical_lease(doc,phase_dir,result,error,transaction_module)
+     if error is not None:raise RuntimeError(error)
+@@ -600,35 +477,23 @@
+     """Hold the reviewed Sources and interpreter across every path consumer."""
+     _require_source_owner(source_owner)
+     require(seed["phase_ready_for_execution"] is True,"phase preparation is not ready")
+-    require(seed["observer_source"]==OBSERVER_SOURCE_REF,
+-            "observer Source differs from reviewed O4")
+     _,review_raw=pinned(seed["controller_source_review"])
+     review=json.loads(review_raw)
+     require(review.get("schema")=="researchos.mu-sdk-controller-observer-independent-source-review.v2" and
+             review.get("decision")=="READY_SOURCE_ONLY" and
++            review.get("actor_id") not in (None,"","codex:/root","codex:/root/w05_merge_review") and
+             review.get("formal_acceptance") is False,"independent exact Source review required before import")
+     require(review.get("runner_source_ref")==seed["runner_source"] and
+             review.get("observer_source_ref")==seed["observer_source"] and
+             review.get("python_binary_ref")==seed["python_binary"]==PINNED_PYTHON_REF and
+             Path(review["controller_source_ref"]["path"])==Path(__file__).resolve() and
+             Path(review["hooks_source_ref"]["path"])==HERE/"owned_job_hooks.py" and
+-            Path(review["phase_worker_source_ref"]["path"])==HERE/"phase_worker.py" and
+-            review.get("cleanup_producer_source_ref")==CLEANUP_PRODUCER_REF,
++            Path(review["phase_worker_source_ref"]["path"])==HERE/"phase_worker.py",
+             "guarded Source tuple differs from independent review")
+-    tuple_context={"controller_source":review["controller_source_ref"],
+-        "observer_source":seed["observer_source"],"hooks_source":review["hooks_source_ref"],
+-        "phase_worker_source":review["phase_worker_source_ref"],
+-        "runner_source":seed["runner_source"],
+-        "canonical_transactions_source":CANONICAL_TRANSACTION_REF,
+-        "job_watchdog_source":JOB_WATCHDOG_REF,"source_guard_source":SOURCE_READ_GUARD_REF,
+-        "base_owned_process_source":BASE_OWNED_PROCESS_REF,
+-        "cleanup_producer_source":CLEANUP_PRODUCER_REF,"python_binary":seed["python_binary"]}
+-    validate_review_actor(review,tuple_context)
+     references=[review[k] for k in ("controller_source_ref","observer_source_ref","hooks_source_ref",
+                 "runner_source_ref","phase_worker_source_ref","python_binary_ref")]
+     references += [seed["controller_source_review"],SOURCE_READ_GUARD_REF,
+-                   CANONICAL_TRANSACTION_REF,JOB_WATCHDOG_REF,BASE_OWNED_PROCESS_REF,
+-                   CLEANUP_PRODUCER_REF]
++                   CANONICAL_TRANSACTION_REF,JOB_WATCHDOG_REF,BASE_OWNED_PROCESS_REF]
+     guard_module=module(SOURCE_READ_GUARD_REF,"reviewed_source_read_guard")
+     guard=guard_module.SourceReadGuard()
+     run_uuid=seed["input_doc"]["run_uuid"]

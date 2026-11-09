@@ -1,0 +1,469 @@
+--- v6/mu_sdk_trial.v6.graph.proposed.py
++++ v5/mu_sdk_trial.v5.final.proposed.py
+@@ -166,7 +166,7 @@
+         commands = {
+             "cli-init": [cli, "init", doc["workspace"]],
+             "cli-goal": [cli, "goal", doc["goal_objective"], "--project",
+-                         "<CLI_INIT_PROJECT_ID>", "--draft"],
++                         "<CLI_INIT_PROJECT_ID>"],
+         }
+     else:
+         commands = {
+@@ -209,158 +209,14 @@
+     doc["_pre_child_config_raw"] = config[1]
+ 
+ 
+-def original_cli_summary_stream(label, parsed):
+-    """Validate each original outJSON record, including live event streaming."""
+-    name = "goal" if label == "cli-goal" else "run"
+-    require(isinstance(parsed, list) and 1 <= len(parsed) <= 65537 and
+-            all(isinstance(item, dict) for item in parsed),
+-            "CLI_JSONL_STREAM_SHAPE")
+-    summary = parsed[-1]
+-    require(summary.get("command") == name and "type" not in summary and
+-            type(summary.get("exit_code")) is int and summary["exit_code"] == 0 and
+-            len([item for item in parsed if "command" in item]) == 1,
+-            "CLI_FINAL_SUMMARY_NOT_UNIQUE_OR_LAST")
+-    operations = summary.get("operations")
+-    require(isinstance(operations, list) and operations and
+-            all(isinstance(item, dict) for item in operations),
+-            "CLI_FINAL_OPERATIONS_INVALID")
+-    first_method = operations[0].get("method")
+-    if first_method in ("session.create", "session.get"):
+-        first_result = operations[0].get("result")
+-        require(isinstance(first_result, dict), "CLI_FIRST_OPERATION_RESULT_INVALID")
+-        first_snapshot = first_result.get("snapshot", first_result)
+-        require(isinstance(first_snapshot, dict) and
+-                type(first_snapshot.get("event_sequence")) is int and
+-                first_snapshot["event_sequence"] >= 0,
+-                "CLI_EVENT_INITIAL_CURSOR_INVALID")
+-        cursor = first_snapshot["event_sequence"]
+-    else:
+-        require(name == "goal" and first_method == "goal.start",
+-                "CLI_EVENT_INITIAL_OPERATION_INVALID")
+-        cursor = 0
+-    final_snapshot = summary.get("last_verified_session_snapshot")
+-    execution = summary.get("execution")
+-    require(isinstance(final_snapshot, dict) and isinstance(execution, dict) and
+-            execution.get("status") == "EXECUTION_REPORTED" and
+-            type(execution.get("exit_code")) is int and execution["exit_code"] == 0 and
+-            execution.get("independent_acceptance") == "NOT_EVALUATED" and
+-            execution.get("reason") == "HOST_EXECUTION_SETTLED" and
+-            isinstance(execution.get("run_id"), str) and execution["run_id"] and
+-            isinstance(summary.get("admission_command_id"), str) and
+-            summary["admission_command_id"] and
+-            execution.get("project_id") == final_snapshot.get("project_id") and
+-            execution.get("session_id") == summary.get("session_id") ==
+-            final_snapshot.get("session_id"),
+-            "CLI_FINAL_EXECUTION_SCOPE_INVALID")
+-    last_result = operations[-1].get("result")
+-    require(isinstance(last_result, dict), "CLI_ADMISSION_RESULT_INVALID")
+-    if name == "run":
+-        require(last_result.get("message_id") == execution.get("message_id") and
+-                isinstance(execution.get("message_id"), str) and execution["message_id"] and
+-                (not last_result.get("run_id") or
+-                 last_result.get("run_id") == execution["run_id"]),
+-                "CLI_RUN_ADMISSION_IDENTITY_MISMATCH")
+-    else:
+-        require(last_result.get("goal_id") == execution.get("goal_id") and
+-                isinstance(execution.get("goal_id"), str) and execution["goal_id"],
+-                "CLI_GOAL_ADMISSION_IDENTITY_MISMATCH")
+-    build = final_snapshot.get("core_build_id")
+-    protocol = final_snapshot.get("protocol_version")
+-    require(isinstance(build, str) and build and isinstance(protocol, str) and protocol,
+-            "CLI_FINAL_SNAPSHOT_BUILD_OR_PROTOCOL_ABSENT")
+-    admitted = last_result.get("snapshot", last_result)
+-    require(isinstance(admitted, dict) and
+-            admitted.get("project_id") == execution["project_id"] and
+-            admitted.get("session_id") == execution["session_id"] and
+-            admitted.get("protocol_version") == protocol and
+-            admitted.get("core_build_id") == build and
+-            type(admitted.get("event_sequence")) is int and
+-            0 <= admitted["event_sequence"] <= final_snapshot.get("event_sequence", -1),
+-            "CLI_ADMISSION_SNAPSHOT_STREAM_SCOPE_CHANGED")
+-    if first_method in ("session.create", "session.get"):
+-        require(first_snapshot.get("project_id") == execution["project_id"] and
+-                first_snapshot.get("session_id") == execution["session_id"] and
+-                first_snapshot.get("protocol_version") == protocol and
+-                first_snapshot.get("core_build_id") == build,
+-                "CLI_INITIAL_SNAPSHOT_STREAM_SCOPE_CHANGED")
+-    seen = set()
+-    for item in parsed[:-1]:
+-        kind = item.get("type")
+-        if kind == "session.snapshot":
+-            snapshot = item.get("snapshot")
+-            require(set(item) == {"type", "snapshot", "reason"} and
+-                    item.get("reason") == "EVENT_RESYNC_REQUIRED" and
+-                    isinstance(snapshot, dict) and
+-                    snapshot.get("session_id") == summary.get("session_id") and
+-                    snapshot.get("project_id") == execution.get("project_id") and
+-                    snapshot.get("protocol_version") == protocol,
+-                    "CLI_RESYNC_SNAPSHOT_SHAPE_OR_SCOPE_CHANGED")
+-            # The actual producer sets responseExit=exitNotImplemented here.
+-            raise ValueError("CLI_RESYNC_SNAPSHOT_CANNOT_QUALIFY_SUCCESS")
+-        require(set(item) == {"type", "event"} and kind == "session.event",
+-                "CLI_UNKNOWN_STREAM_RECORD")
+-        event = item.get("event")
+-        require(isinstance(event, dict) and type(event.get("sequence")) is int and
+-                event["sequence"] == cursor + 1 and
+-                isinstance(event.get("event_id"), str) and event["event_id"] and
+-                event["event_id"] not in seen and
+-                isinstance(event.get("kind"), str) and event["kind"] and
+-                isinstance(event.get("payload"), dict) and
+-                event.get("session_id") == summary.get("session_id") and
+-                event.get("protocol_version") == protocol and
+-                event.get("core_build_id") == build and
+-                (event.get("project_id") in (None, execution["project_id"])) and
+-                (event.get("run_id") in (None, "", execution["run_id"])),
+-                "CLI_EVENT_SCOPE_SEQUENCE_OR_SHAPE_CHANGED")
+-        seen.add(event["event_id"])
+-        cursor = event["sequence"]
+-    require(type(execution.get("event_sequence")) is int and
+-            execution["event_sequence"] == cursor and
+-            type(final_snapshot.get("event_sequence")) is int and
+-            final_snapshot["event_sequence"] == cursor,
+-            "CLI_EVENT_CURSOR_FINAL_MISMATCH")
+-    report = execution.get("host_execution")
+-    require(isinstance(report, dict) and report.get("status") == "SETTLED" and
+-            type(report.get("revision")) is int and
+-            report.get("children_stopped") is True and report.get("queue_empty") is True and
+-            isinstance(report.get("runtime_settled_at"), str) and
+-            report["runtime_settled_at"] and
+-            isinstance(report.get("execution_report"), str) and
+-            report["execution_report"].strip() and
+-            isinstance(report.get("result_artifact_ids"), list) and
+-            len(report["result_artifact_ids"]) >= 1 and
+-            all(isinstance(value, str) and value for value in report["result_artifact_ids"]),
+-            "CLI_TERMINAL_HOST_REPORT_INVALID")
+-    events = [item["event"] for item in parsed[:-1]]
+-    states = [event["payload"] for event in events
+-              if event.get("kind") == "RUN_STATE" and
+-              event.get("run_id") == execution["run_id"] and
+-              event["payload"].get("run_id") == execution["run_id"]]
+-    require(bool(states) and states[-1].get("revision") == report["revision"] and
+-            states[-1].get("status") == report["status"] and
+-            states[-1].get("children_stopped") is True and
+-            states[-1].get("queue_empty") is True and
+-            states[-1].get("settled_at") == report["runtime_settled_at"],
+-            "CLI_TERMINAL_LATEST_RUN_STATE_MISMATCH")
+-    artifacts = {event["payload"].get("artifact_ref", {}).get("id")
+-                 for event in events if event.get("kind") == "ARTIFACT" and
+-                 event.get("run_id") == execution["run_id"] and
+-                 event["payload"].get("availability") == "AVAILABLE" and
+-                 isinstance(event["payload"].get("artifact_ref"), dict)}
+-    require(set(report["result_artifact_ids"]).issubset(artifacts),
+-            "CLI_TERMINAL_RESULT_ARTIFACT_EVENT_ABSENT")
+-    return summary, {"original_jsonl_records": len(parsed),
+-                     "session_event_count": len(parsed) - 1,
+-                     "initial_cursor": cursor - (len(parsed) - 1),
+-                     "final_cursor": cursor}
+-
+-
+ def verified_cli_context_transition(label, old, parsed, post_raw):
+     """One original CLI JSONL record + final validated snapshot + saved bytes."""
+     require(label in ("cli-goal", "cli-run") and isinstance(old, dict),
+             "CONTEXT_PREIMAGE_INVALID")
+     name = "goal" if label == "cli-goal" else "run"
+-    row, stream_evidence = original_cli_summary_stream(label, parsed)
++    rows = [row for row in parsed if row.get("command") == name]
++    require(len(rows) == len(parsed) == 1, "CLI_CONTEXT_JSONL_NOT_UNIQUE")
++    row = rows[0]
+     require(row.get("exit_code") == 0 and "context_save_error" not in row,
+             "CLI_CONTEXT_SAVE_NOT_SUCCESSFUL")
+     ops = row.get("operations")
+@@ -407,55 +263,9 @@
+     expected.update(saved)
+     post = strict_consumed_json(post_raw, "CLI context postimage")
+     require(post == expected, "CLI_CONTEXT_POSTIMAGE_NOT_DERIVED")
+-    return {"original_jsonl_command": name, "stream_evidence": stream_evidence,
+-            "admission_method": methods[-1],
++    return {"original_jsonl_command": name, "admission_method": methods[-1],
+             "saved_context": saved, "final_snapshot_revision": final["revision"],
+             "postimage_fields": sorted(expected)}
+-
+-
+-def verified_cli_draft_goal_transition(doc, old, parsed, post_raw):
+-    """Project-level --draft creates one Session and Goal without a Task/Run."""
+-    require(len(parsed) == 1 and isinstance(parsed[0], dict),
+-            "CLI_DRAFT_STREAM_NOT_SINGLE_SUMMARY")
+-    row = parsed[0]
+-    require(row.get("command") == "goal" and row.get("status") == "GOAL_DRAFT_CREATED" and
+-            type(row.get("exit_code")) is int and row["exit_code"] == 0 and
+-            "context_save_error" not in row and "last_verified_session_snapshot" not in row and
+-            row.get("execution") == {"status": "NOT_STARTED", "independent_acceptance": "NOT_EVALUATED"},
+-            "CLI_DRAFT_NOT_A_NO_EXECUTION_RESULT")
+-    ops = row.get("operations")
+-    require(isinstance(ops, list) and len(ops) == 1 and isinstance(ops[0], dict) and
+-            ops[0].get("method") == "goal.start" and ops[0].get("status") == "COMPLETED" and
+-            type(ops[0].get("exit_code")) is int and ops[0]["exit_code"] == 0,
+-            "CLI_DRAFT_OPERATION_NOT_GOAL_START")
+-    result = ops[0].get("result")
+-    require(isinstance(result, dict) and isinstance(result.get("snapshot"), dict),
+-            "CLI_DRAFT_TYPED_RESULT_ABSENT")
+-    snap = result["snapshot"]
+-    writer = snap.get("writer")
+-    saved = row.get("saved_context")
+-    require(isinstance(writer, dict) and isinstance(saved, dict) and
+-            set(saved) == {"project_id", "session_id", "session_revision",
+-                           "writer_epoch", "updated_by"} and
+-            isinstance(result.get("goal_id"), str) and result["goal_id"] and
+-            result.get("goal_status") == snap.get("goal_status") == "DRAFT" and
+-            result["goal_id"] == snap.get("goal_id") == row.get("goal", {}).get("goal_id") and
+-            result.get("goal_revision") == row.get("goal", {}).get("goal_revision") and
+-            type(saved.get("session_revision")) is int and saved["session_revision"] >= 1 and
+-            type(saved.get("writer_epoch")) is int and saved["writer_epoch"] >= 1 and
+-            saved["project_id"] == old.get("project_id") == doc.get("_init_project_id") == snap.get("project_id") and
+-            saved["session_id"] == row.get("session_id") == snap.get("session_id") and
+-            old.get("session_id") == "" and saved["session_revision"] == snap.get("revision") and
+-            saved["writer_epoch"] == writer.get("epoch") and
+-            saved["updated_by"] == row.get("client_id") == writer.get("client_id"),
+-            "CLI_DRAFT_CONTEXT_OR_GOAL_MISMATCH")
+-    expected = dict(old)
+-    expected.update(saved)
+-    require(strict_consumed_json(post_raw, "CLI draft postimage") == expected,
+-            "CLI_DRAFT_CONFIG_POSTIMAGE_NOT_DERIVED")
+-    return {"goal_id": result["goal_id"], "goal_status": "DRAFT",
+-            "session_id": saved["session_id"], "saved_context": saved,
+-            "provider_requests_from_goal_command": 0}
+ 
+ 
+ def after_child_consumed_states(doc, label, parsed):
+@@ -502,9 +312,7 @@
+         require(label in ("cli-goal", "cli-run") and prior["exists"] and
+                 isinstance(old, dict) and config[0]["exists"],
+                 "CLI_CONTEXT_PREIMAGE_CHANGED")
+-        context_evidence = (verified_cli_draft_goal_transition(doc, old, parsed, config[1])
+-                            if label == "cli-goal" else
+-                            verified_cli_context_transition(label, old, parsed, config[1]))
++        context_evidence = verified_cli_context_transition(label, old, parsed, config[1])
+         if config[0] == prior:
+             context_evidence["unchanged_original_bytes"] = True
+     doc["_expected_config_state"] = config[0]
+@@ -709,11 +517,9 @@
+             "revision": artifact["revision"], "content_hash": artifact["content_hash"]}
+ 
+ 
+-def budget_chain(db, project, goal_id, expected_status="ACTIVE"):
++def budget_chain(db, project, goal_id):
+     goal = object_by_id(db, "Goal", goal_id, project)
+-    require(expected_status in ("ACTIVE", "DRAFT") and
+-            goal.get("status") == expected_status,
+-            "goal status differs from the authorized phase")
++    require(goal.get("status") == "ACTIVE", "goal is not ACTIVE")
+     current = goal.get("budget_policy_id")
+     policies = []
+     seen = set()
+@@ -736,60 +542,6 @@
+             for p in policies]
+ 
+ 
+-def verify_ordinary_goal_graph(db, doc, before, original_summary, prior_snapshot,
+-                               admitted, draft_policies):
+-    """Tie the original CLI admission and host report to exact new domain rows."""
+-    execution = original_summary["execution"]
+-    host = execution.get("host_execution")
+-    require(isinstance(host, dict), "original host report absent")
+-    project = doc["project_id"]
+-    after = {kind: {row[0] for row in db.execute(
+-        "SELECT id FROM domain_objects WHERE project=? AND kind=?", (project, kind))}
+-             for kind in ("Goal", "Task", "Run")}
+-    created = {kind: after[kind] - before[kind] for kind in before}
+-    require(all(len(created[kind]) == 1 for kind in ("Goal", "Task", "Run")),
+-            "ordinary turn must add exactly one Goal, Task and Run")
+-    new_goal_id = next(iter(created["Goal"]))
+-    task_id = next(iter(created["Task"]))
+-    run_id = next(iter(created["Run"]))
+-    run = object_by_id(db, "Run", run_id, project)
+-    task = object_by_id(db, "Task", task_id, project)
+-    goal = object_by_id(db, "Goal", new_goal_id, project)
+-    require(prior_snapshot.get("goal_id") == doc["goal_id"] and
+-            new_goal_id != doc["goal_id"] and
+-            new_goal_id == execution.get("goal_id") == admitted.get("goal_id") and
+-            task_id == execution.get("task_id") == run.get("task_id") and
+-            run_id == execution.get("run_id") == task.get("active_run_id") and
+-            task.get("goal_id") == new_goal_id and goal.get("status") == "ACTIVE" and
+-            run.get("runtime_id") == doc["runtime_id"] and
+-            task.get("status") == "EXECUTION_REPORTED" and
+-            run.get("status") == host.get("status") == "SETTLED" and
+-            run.get("revision") == host.get("revision") and
+-            run.get("children_stopped") is host.get("children_stopped") is True and
+-            run.get("queue_empty") is host.get("queue_empty") is True and
+-            run.get("runtime_settled_at") == host.get("runtime_settled_at") and
+-            run.get("execution_report") == host.get("execution_report") and
+-            run.get("exit_code") == execution.get("exit_code") == 0,
+-            "ordinary original response and new Goal/Task/Run graph differ")
+-    ids = host.get("result_artifact_ids")
+-    require(isinstance(ids, list) and ids and
+-            len(ids) == len(set(ids)) and
+-            all(isinstance(identity, str) and identity for identity in ids) and
+-            run.get("result_artifact_ids") == ids and
+-            task.get("output_artifact_ids") == ids,
+-            "host artifact IDs differ from Run or Task")
+-    for identity in ids:
+-        artifact = object_by_id(db, "Artifact", identity, project)
+-        require(artifact.get("id") == identity,
+-                "original host artifact absent from this project")
+-    policies = budget_chain(db, project, new_goal_id, "ACTIVE")
+-    require([p["id"] for p in policies[1:]] ==
+-            [p["id"] for p in draft_policies[1:]] and
+-            policies[0]["id"] != draft_policies[0]["id"],
+-            "new Goal budget ancestry differs from frozen parent chain")
+-    return new_goal_id, task_id, run_id, policies
+-
+-
+ def effects(db, project, run_id):
+     rows = db.execute("SELECT rowid,effect_key,sequence,body FROM resource_effects WHERE project=? AND run=? ORDER BY rowid",
+                       (project, run_id))
+@@ -813,7 +565,7 @@
+     return result
+ 
+ 
+-def model_ledgers(db, project, run_id, model_effects, expected_policy_id):
++def model_ledgers(db, project, run_id, model_effects):
+     rows = [json.loads(row[0]) for row in db.execute(
+         "SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?",
+         (project, run_id))]
+@@ -824,9 +576,8 @@
+             {row.get("provider_request_id") for row in unknown} == set(effect_keys) and
+             all(row.get("operation") == "UNKNOWN" for row in unknown),
+             "one UNKNOWN ledger per exact MODEL effect required")
+-    require(all(row.get("money") is None and row.get("cost_basis") == "UNKNOWN" and
+-                row.get("policy_id") == expected_policy_id for row in unknown),
+-            "UNKNOWN cost or new Goal policy was misattributed")
++    require(all(row.get("money") is None and row.get("cost_basis") == "UNKNOWN" for row in unknown),
++            "UNKNOWN cost was coerced to a number")
+     return [{"id": row["id"], "provider_request_id": row["provider_request_id"],
+              "money": None, "cost_basis": "UNKNOWN"} for row in unknown]
+ 
+@@ -1091,9 +842,6 @@
+     task = object_by_id(db, "Task", task_id, project)
+     run = object_by_id(db, "Run", run_id, project)
+     runtime = object_by_id(db, "RuntimeRegistration", runtime_id, project)
+-    qualification_policies = budget_chain(db, project, task["goal_id"], "ACTIVE")
+-    require(task["goal_id"] != doc["goal_id"],
+-            "qualification cannot borrow the bootstrap DRAFT Goal")
+     marker = markers[0]
+     require(task.get("task_type") == "runtime_qualification" and task.get("status") == "ACCEPTED" and
+             task.get("active_run_id") == run_id and
+@@ -1203,8 +951,7 @@
+     require(counts(effects(db, project, run_id)) == {"MODEL": 1, "TOOL": 0} and
+             len(model_rows) == 1 and model_rows[0].get("state") == "CONFIRMED",
+             "qualification MODEL effect not exact and confirmed")
+-    return model_rows, model_ledgers(db, project, run_id, model_rows,
+-                                     qualification_policies[0]["id"])
++    return model_rows, model_ledgers(db, project, run_id, model_rows)
+ 
+ 
+ def wait_qualification(db, doc, deadline):
+@@ -1304,7 +1051,7 @@
+                 require(db.execute("SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'").fetchone()[0] == 0,
+                         "isolated bootstrap DB already has a project")
+             else:
+-                budget_chain(db, doc["project_id"], doc["goal_id"], "DRAFT")
++                budget_chain(db, doc["project_id"], doc["goal_id"])
+         print(json.dumps({"status": "SOURCE_PRECHECK_PASSED", "phase": mode,
+                           "provider_requests": 0, "qualification": None}, sort_keys=True))
+         return
+@@ -1330,25 +1077,13 @@
+         project_ids = [row.get("project_id") for row in init_rows if row.get("project_id")]
+         require(len(set(project_ids)) == 1, "CLI init project identity missing")
+         doc["_init_project_id"] = project_ids[0]
+-        goal, goal_rows = command_once(doc, [cli, "goal", doc["goal_objective"], "--project", project_ids[0], "--draft"],
++        goal, goal_rows = command_once(doc, [cli, "goal", doc["goal_objective"], "--project", project_ids[0]],
+                                        cwd, env, output, "cli-goal", deadline)
+         with readonly_db(db_path) as db:
+             goals = [json.loads(row[0]) for row in db.execute(
+                 "SELECT body FROM domain_objects WHERE project=? AND kind='Goal'", (project_ids[0],))]
+-            require(len(goals) == 1 and goals[0].get("status") == "DRAFT",
+-                    "exactly one DRAFT Goal required")
+-            require(all(db.execute("SELECT count(*) FROM domain_objects WHERE project=? AND kind=?",
+-                                   (project_ids[0], kind)).fetchone()[0] == 0
+-                        for kind in ("Task", "Run", "BudgetLedgerEntry")) and
+-                    db.execute("SELECT count(*) FROM resource_effects WHERE project=?",
+-                               (project_ids[0],)).fetchone()[0] == 0,
+-                    "draft bootstrap started work or charged a provider")
+-            summary = goal_rows[-1]
+-            require(len(goal_rows) == 1 and
+-                    summary["goal"]["goal_id"] == goals[0]["id"] and
+-                    summary["execution"]["status"] == "NOT_STARTED",
+-                    "DRAFT Goal DB row differs from original CLI response")
+-            policies = budget_chain(db, project_ids[0], goals[0]["id"], "DRAFT")
++            require(len(goals) == 1, "exactly one new Goal required")
++            policies = budget_chain(db, project_ids[0], goals[0]["id"])
+         guard_deadline(deadline, "bootstrap receipt")
+         put_json(output / "bootstrap.result.json", {"stage": "BOOTSTRAP_ONLY", "project_id": project_ids[0],
+                  "goal_id": goals[0]["id"], "policies": policies, "cli_init_ref": pin_path(output / "cli-init.invocation.json"),
+@@ -1358,33 +1093,28 @@
+ 
+     guard_deadline(deadline, "qualification DB read")
+     with readonly_db(db_path) as db:
+-        draft_policies = budget_chain(db, doc["project_id"], doc["goal_id"], "DRAFT")
+-        before = {kind: {row[0] for row in db.execute(
+-            "SELECT id FROM domain_objects WHERE project=? AND kind=?", (doc["project_id"], kind))}
+-                  for kind in ("Goal", "Task", "Run")}
++        policies = budget_chain(db, doc["project_id"], doc["goal_id"])
++        before = {row[0] for row in db.execute(
++            "SELECT id FROM domain_objects WHERE project=? AND kind='Run'", (doc["project_id"],))}
+         qualification_models, qualification_ledgers = wait_qualification(db, doc, deadline)
+     config_argv = [cli, "config", "set-model", "--model", PROVIDER + "/" + MODEL,
+                    "--base-url", BASE, "--config-revision", str(doc["config_revision"]),
+                    "--credential-ref", CREDENTIAL_REF, "--default"]
+     command_once(doc, config_argv, cwd, env, output, "cli-config", deadline)
+-    run_invocation, run_rows = command_once(
+-        doc, [cli, "run", doc["prompt"], "--project", doc["project_id"], "--output", "jsonl"],
+-        cwd, env, output, "cli-run", deadline)
+-    original_summary = run_rows[-1]
+-    original_execution = original_summary["execution"]
+-    prior_snapshot = original_summary["operations"][0]["result"]
+-    prior_snapshot = prior_snapshot.get("snapshot", prior_snapshot)
+-    admitted = original_summary["operations"][-1]["result"]
+-    admitted = admitted.get("snapshot", admitted)
+-    require(original_summary["operations"][0]["method"] == "session.get" and
+-            prior_snapshot.get("goal_id") == doc["goal_id"] and
+-            admitted.get("goal_id") == original_execution.get("goal_id") and
+-            admitted["goal_id"] != doc["goal_id"],
+-            "ordinary admission did not create a new Goal from the draft Session")
++    command_once(doc, [cli, "run", doc["prompt"], "--project", doc["project_id"], "--output", "jsonl"],
++                 cwd, env, output, "cli-run", deadline)
+     guard_deadline(deadline, "ordinary Run DB read")
+     with readonly_db(db_path) as db:
+-        new_goal_id, task_id, run_id, policies = verify_ordinary_goal_graph(
+-            db, doc, before, original_summary, prior_snapshot, admitted, draft_policies)
++        after = {row[0] for row in db.execute(
++            "SELECT id FROM domain_objects WHERE project=? AND kind='Run'", (doc["project_id"],))}
++        created = after - before
++        require(len(created) == 1, "exactly one ordinary Run required")
++        run_id = next(iter(created))
++        run = object_by_id(db, "Run", run_id, doc["project_id"])
++        task = object_by_id(db, "Task", run["task_id"], doc["project_id"])
++        require(run.get("runtime_id") == doc["runtime_id"] and
++                task.get("goal_id") == doc["goal_id"] and task.get("status") == "EXECUTION_REPORTED",
++                "ordinary turn did not settle under the pinned Goal")
+         ordinary = effects(db, doc["project_id"], run_id)
+         require([row.get("payload", {}).get("capability") for row in ordinary] ==
+                 ["MODEL", "TOOL", "MODEL"] and
+@@ -1394,22 +1124,19 @@
+         require(doc["workspace_witness"] in json.dumps(ordinary, ensure_ascii=False),
+                 "real workspace read witness absent from tool effect")
+         ordinary_models = [row for row in ordinary if row.get("payload", {}).get("capability") == "MODEL"]
+-        ordinary_ledgers = model_ledgers(db, doc["project_id"], run_id, ordinary_models,
+-                                         policies[0]["id"])
++        ordinary_ledgers = model_ledgers(db, doc["project_id"], run_id, ordinary_models)
+         originals = fact_refs(data_root, db, doc["project_id"],
+                               {doc["qualification_run_id"]: qualification_models, run_id: ordinary_models},
+                               deadline)
+     guard_deadline(deadline, "final trial observation")
+     put_json(output / "trial.result.json", {"schema": "researchos.mu-sdk-trial.observation.v1",
+              "stage": "OBSERVED_NOT_INDEPENDENTLY_ACCEPTED", "project_id": doc["project_id"],
+-             "bootstrap_draft_goal_id": doc["goal_id"], "ordinary_goal_id": new_goal_id,
+-             "ordinary_task_id": task_id, "qualification_run_id": doc["qualification_run_id"],
++             "goal_id": doc["goal_id"], "qualification_run_id": doc["qualification_run_id"],
+              "ordinary_run_id": run_id, "provider_requests": 3, "model_effects": 3,
+              "tool_effects": 1, "requested_output_tokens_ceiling": MAX_OUTPUT_TOKENS_PER_REQUEST * 3,
+              "actual_billed_tokens": None, "actual_cost": None, "cost_basis": "UNKNOWN",
+              "policies": policies, "qualification_ledgers": qualification_ledgers,
+              "ordinary_ledgers": ordinary_ledgers, "original_fact_refs": originals,
+-             "draft_policies": draft_policies, "ordinary_invocation_ref": pin_path(output / "cli-run.invocation.json"),
+              "cancel_fixture_ref": doc["cancel_fixture_receipt"], "formal_acceptance": None})
+ 
+ 

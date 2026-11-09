@@ -1,0 +1,131 @@
+70: 		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {
+71: 			return nil, e
+72: 		}
+73: 		return nil, Fail(409, "STATE_CONFLICT", "model outcome UNKNOWN; automatic retry prohibited")
+74: 	}
+75: 	notDispatched := func() (Object, error) {
+76: 		// Credential resolution failed before HTTP request construction. This is a
+77: 		// known absent provider operation, unlike a transport failure after send.
+78: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
+79: 	}
+80: 	if provider.MeasurementMode == "LIVE" && clientConfigurationLoopbackModelEndpoint(provider.Endpoint) && (provider.CredentialRef != "" || provider.CredentialRevision != "none" || provider.BearerToken != "") {
+81: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "local model route contains credential material; no provider request was sent")
+82: 	}
+83: 	if provider.CredentialRef != "" {
+84: 		if c.config.ModelCredential == nil {
+85: 			return notDispatched()
+86: 		}
+87: 		material, err := c.config.ModelCredential(ctx, provider)
+88: 		if err != nil || len(material) == 0 {
+89: 			return notDispatched()
+90: 		}
+91: 		provider.BearerToken = string(material)
+92: 		for i := range material {
+93: 			material[i] = 0
+94: 		}
+95: 	}
+96: 	req, e := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint, bytes.NewReader(Bytes(body)))
+97: 	if e != nil {
+98: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "model request construction failed before dispatch")
+99: 	}
+100: 	req.Header.Set("Content-Type", "application/json")
+101: 	req.Header.Set("Accept", "text/event-stream")
+102: 	if provider.BearerToken != "" {
+103: 		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+104: 	}
+105: 	client := &http.Client{Timeout: 90 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("model redirect prohibited") }}
+106: 	defer client.CloseIdleConnections()
+107: 	response, e := client.Do(req)
+108: 	if e != nil {
+109: 		return unknown("model transport ended without complete response")
+110: 	}
+111: 	defer response.Body.Close()
+112: 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+113: 		return unknown("model returned invalid SSE headers")
+114: 	}
+115: 	var raw, withheld []byte
+116: 	if bridge.Read().QueueRequired {
+117: 		binding, err := c.modelStreamBinding(ctx, route, runID, lease, epoch, bridge, frame, intent)
+118: 		if err != nil {
+119: 			return unknown("model stream initialization authority unavailable")
+120: 		}
+121: 		stream, err = bridge.OpenModelStream(ctx, binding)
+122: 		if err != nil {
+123: 			return unknown("model stream could not open")
+124: 		}
+125: 		quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken)
+126: 		if err != nil {
+127: 			return unknown("model quarantine unavailable")
+128: 		}
+129: 		chunk := make([]byte, 8192)
+130: 		for {
+131: 			n, readErr := response.Body.Read(chunk)
+132: 			if n > 0 {
+133: 				released, gateErr := quarantine.Feed(chunk[:n])
+134: 				if gateErr != nil {
+135: 					return unknown("model response rejected by quarantine")
+136: 				}
+137: 				if len(released) > 0 {
+138: 					if err = stream.Send(ctx, released, false); err != nil {
+139: 						return unknown("model stream transport failed")
+140: 					}
+141: 				}
+142: 			}
+143: 			if readErr == io.EOF {
+144: 				break
+145: 			}
+146: 			if readErr != nil {
+147: 				return unknown("model transport interrupted")
+148: 			}
+149: 		}
+150: 		raw, withheld, err = quarantine.Finish()
+151: 		if err != nil {
+152: 			return unknown("model returned no complete bounded SSE response")
+153: 		}
+154: 	} else {
+155: 		raw, e = io.ReadAll(io.LimitReader(response.Body, runtimeModelMaxSSEBytes+1))
+156: 		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+157: 			return unknown("model returned no complete bounded SSE response")
+158: 		}
+159: 		for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+160: 			if secret != "" && bytes.Contains(raw, []byte(secret)) {
+161: 				return unknown("model response contained host credential material")
+162: 			}
+163: 		}
+164: 	}
+165: 	result := Object{"status": response.StatusCode, "content_type": "text/event-stream", "body": string(raw)}
+166: 	// A received response proves the operation completed, not what it cost.
+167: 	// Retain the original upper-bound reservation until a real billing fact arrives.
+168: 	receipt := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": result}
+169: 	var reply Object
+170: 	if stream == nil {
+171: 		reply, e = runtimeEffectWireReply(frame, receipt)
+172: 	}
+173: 	if e != nil {
+174: 		return unknown("encoded model response exceeds bridge frame limit")
+175: 	}
+176: 	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+177: 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+178: 		return unknown("model response persistence failed")
+179: 	}
+180: 	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+181: 		return nil, e
+182: 	}
+183: 	// Late responses may update billing/effect facts, but never regain execution authority.
+184: 	tx, _, _, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+185: 	if e != nil {
+186: 		return nil, e
+187: 	}
+188: 	tx.Rollback()
+189: 	if stream != nil {
+190: 		if e = stream.Send(ctx, withheld, true); e != nil {
+191: 			return nil, e
+192: 		}
+193: 		summary, err := stream.Terminal(ctx, Digest(raw))
+194: 		if err != nil {
+195: 			return nil, err
+196: 		}
+197: 		reply = Object{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": summary}
+198: 	}
+199: 	return reply, nil
+200: }

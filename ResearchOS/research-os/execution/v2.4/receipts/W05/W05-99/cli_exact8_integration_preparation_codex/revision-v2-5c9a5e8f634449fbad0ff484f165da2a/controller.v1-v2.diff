@@ -1,0 +1,41 @@
+--- integrate_cli8.py
++++ integrate_cli8.v2.py
+@@ -330,12 +330,37 @@
+                 'Full protected public input paths mismatch')
+         config=run('local-config-names',['config','--local','--no-includes','--name-only','--list']).decode()
+         require(not any(x.lower().startswith(('filter.','include.','includeif.')) for x in config.splitlines()), 'External Git commands not approved')
++        attribute_proof=document(scope['root_attributes_proof_ref'])
++        require(set(attribute_proof)=={'schema','base_commit','cli_commit','base_tree_ref','cli_tree_ref','raw_ref','git_row'} and
++                attribute_proof['schema']=='researchos.cli8-original-root-attributes-proof.v1' and
++                attribute_proof['base_commit']==BASE and attribute_proof['cli_commit']==CLI,
++                'Only the original root attribute proof is allowed')
++        attribute_ref=attribute_proof['raw_ref']
++        require(bounded(attribute_ref['path'])==ROOT/'.gitattributes' and
++                attribute_ref['sha256']=='705fd4d6451a31d36b3df7de96f83f30ac976c9b4a6d1e51671d8e2f33e2d0da' and
++                attribute_ref['bytes']==8,'Exact root attribute identity')
++        attribute_raw=verify(attribute_ref)
++        require(attribute_raw==b'* -text\n','Original root attribute bytes')
++        attribute_row={'mode':'100644','kind':'blob','blob':'fa1385d99a319b43c06f5309d1aae9fdd3adea46'}
++        require(attribute_proof['git_row']==attribute_row and
++                tree(verify(attribute_proof['base_tree_ref']))['.gitattributes']==attribute_row and
++                tree(verify(attribute_proof['cli_tree_ref']))['.gitattributes']==attribute_row and
++                base_tree['.gitattributes']==old_tree['.gitattributes']==attribute_row and
++                hashlib.sha1(b'blob '+str(len(attribute_raw)).encode()+b'\0'+attribute_raw).hexdigest()==attribute_row['blob'],
++                'Root attributes must retain the exact base/candidate Git blob')
++        attribute_pins=[x for x in protected if path(x['path']).absolute()==ROOT/'.gitattributes']
++        require(len(attribute_pins)==1 and attribute_pins[0]['sha256']==attribute_ref['sha256'] and
++                attribute_pins[0]['bytes']==attribute_ref['bytes'],'Root attributes absent from immutable protected vector')
+         attrs={ROOT/'.git/info/attributes',ROOT/'.gitattributes'}
+         for item in exact:
+             p=(ROOT/item['path']).parent
+             while p!=ROOT:attrs.add(p/'.gitattributes');p=p.parent
+         for p in attrs:
+-            if p.exists():require(not any(x.strip() and not x.lstrip().startswith(b'#') for x in read(p).splitlines()), 'Checkout attributes need scope')
++            if p.exists():
++                if p==ROOT/'.gitattributes':
++                    require(read(p)==verify(attribute_ref)==attribute_raw,'Original root attribute bytes changed')
++                else:
++                    require(not any(x.strip() and not x.lstrip().startswith(b'#') for x in read(p).splitlines()), 'Checkout attributes need scope')
+         patch=verify(scope['patch_ref'])
+         generated=run('patch-from-source',['diff','--binary','--full-index','--no-ext-diff',CLI_PARENT,CLI,'--']+names)
+         require(generated==patch,'Patch does not match exact immutable CLI commit')

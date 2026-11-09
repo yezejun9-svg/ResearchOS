@@ -1,0 +1,257 @@
+FILE ops/owned_core_stop/main_nonwindows.go SHA256 126aab563b2085cdbbd3d557934c9583dd8ac374e9055779e37a3dbf7729f5a8
+1: //go:build !windows
+2: 
+3: package main
+4: 
+5: import (
+6: 	"fmt"
+7: 	"os"
+8: )
+9: 
+10: func main() {
+11: 	fmt.Fprintln(os.Stderr, "STOP_UNAVAILABLE: exact retained Windows handles required")
+12: 	os.Exit(3)
+13: }
+FILE ops/owned_core_stop/main_windows.go SHA256 e7cb62f2bc727413466f24d0130ce72fd42eeef4a3ded2b40e87074d8529aae3
+1: //go:build windows
+2: 
+3: package main
+4: 
+5: import (
+6: 	"context"
+7: 	"encoding/json"
+8: 	"errors"
+9: 	"fmt"
+10: 	"os"
+11: 	"strings"
+12: 	"time"
+13: 
+14: 	"researchos.local/research-os/internal/ownedcorestop"
+15: )
+16: 
+17: func main() { os.Exit(run(os.Args[1:])) }
+18: 
+19: func parseCommand(args []string) (string, map[string]string, error) {
+20: 	if len(args) == 0 {
+21: 		return "", nil, errors.New("one action required")
+22: 	}
+23: 	action := args[0]
+24: 	var required []string
+25: 	switch action {
+26: 	case "preflight":
+27: 		required = []string{"--input", "--operation-id", "--out"}
+28: 	case "commit":
+29: 		required = []string{"--plan", "--expect-plan-sha256"}
+30: 	case "inspect":
+31: 		required = []string{"--plan"}
+32: 	default:
+33: 		return "", nil, errors.New("unknown action")
+34: 	}
+35: 	if len(args) != 1+2*len(required) {
+36: 		return "", nil, errors.New("exact action flags required")
+37: 	}
+38: 	allowed := make(map[string]bool, len(required))
+39: 	for _, k := range required {
+40: 		allowed[k] = true
+41: 	}
+42: 	parsed := make(map[string]string, len(required))
+43: 	for i := 1; i < len(args); i += 2 {
+44: 		key, value := args[i], args[i+1]
+45: 		_, seen := parsed[key]
+46: 		if !allowed[key] || seen || value == "" || strings.HasPrefix(value, "--") || strings.ContainsRune(value, '\x00') {
+47: 			return "", nil, errors.New("mixed, duplicate, or malformed flags")
+48: 		}
+49: 		parsed[key] = value
+50: 	}
+51: 	if len(parsed) != len(required) {
+52: 		return "", nil, errors.New("missing action flag")
+53: 	}
+54: 	return action, parsed, nil
+55: }
+56: 
+57: func run(args []string) int {
+58: 	action, flags, parseErr := parseCommand(args)
+59: 	if parseErr != nil {
+60: 		fmt.Fprintln(os.Stderr, parseErr)
+61: 		return 2
+62: 	}
+63: 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+64: 	defer cancel()
+65: 	var result any
+66: 	var err error
+67: 	switch action {
+68: 	case "preflight":
+69: 		var plan ownedcorestop.Plan
+70: 		var sha string
+71: 		plan, sha, err = ownedcorestop.Preflight(ctx, flags["--input"], flags["--operation-id"], flags["--out"])
+72: 		if err == nil {
+73: 			result = struct {
+74: 				Plan       ownedcorestop.Plan `json:"plan"`
+75: 				PlanSHA256 string             `json:"plan_sha256"`
+76: 			}{plan, sha}
+77: 		}
+78: 	case "commit":
+79: 		result, err = ownedcorestop.Commit(ctx, flags["--plan"], flags["--expect-plan-sha256"])
+80: 	case "inspect":
+81: 		result, err = ownedcorestop.Inspect(flags["--plan"])
+82: 	}
+83: 	if err != nil {
+84: 		fmt.Fprintln(os.Stderr, err)
+85: 		return 1
+86: 	}
+87: 	if err = json.NewEncoder(os.Stdout).Encode(result); err != nil {
+88: 		fmt.Fprintln(os.Stderr, err)
+89: 		return 1
+90: 	}
+91: 	if r, ok := result.(ownedcorestop.Result); ok && r.State != "STOPPED_LEASE_VERIFIED" && r.State != "PREFLIGHT_COMPLETE" {
+92: 		return 3
+93: 	}
+94: 	return 0
+95: }
+FILE ops/owned_core_stop/main_windows_test.go SHA256 0f57d62765bcd9b40a8aeb0c82cc70ff4415215e4823dbecf3203ae6db9b54bd
+1: //go:build windows
+2: 
+3: package main
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"os"
+9: 	"os/exec"
+10: 	"path/filepath"
+11: 	"testing"
+12: 	"time"
+13: 
+14: 	_ "modernc.org/sqlite"
+15: 	rt "researchos.local/research-os/adapters/runtime"
+16: 	"researchos.local/research-os/internal/store"
+17: 	"researchos.local/research-os/ops/supervisor"
+18: )
+19: 
+20: func waitFixtureFile(t *testing.T, path string) {
+21: 	t.Helper()
+22: 	for deadline := time.Now().Add(6 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+23: 		if _, e := os.Stat(path); e == nil {
+24: 			return
+25: 		}
+26: 	}
+27: 	t.Fatalf("fixture marker absent: %s", path)
+28: }
+29: 
+30: func TestOwnedCoreControlledCrashWALAndLease(t *testing.T) {
+31: 	fixture := os.Getenv("RESEARCHOS_OWNED_STOP_FIXTURE_EXE")
+32: 	if fixture == "" {
+33: 		t.Fatal("built new owned fixture exe required; no skip")
+34: 	}
+35: 	root := filepath.Join(t.TempDir(), "data")
+36: 	if err := os.Mkdir(root, 0700); err != nil {
+37: 		t.Fatal(err)
+38: 	}
+39: 	dbPath := filepath.Join(root, "researchos.sqlite")
+40: 	db, err := sql.Open("sqlite", dbPath)
+41: 	if err != nil {
+42: 		t.Fatal(err)
+43: 	}
+44: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`); err != nil {
+45: 		db.Close()
+46: 		t.Fatal(err)
+47: 	}
+48: 	if err = db.Close(); err != nil {
+49: 		t.Fatal(err)
+50: 	}
+51: 	out := t.TempDir()
+52: 	ready := filepath.Join(out, "ready")
+53: 	attempt := filepath.Join(out, "attempt")
+54: 	attempted := filepath.Join(out, "attempted")
+55: 	cmd := exec.Command(fixture, "--root", root, "--ready", ready, "--attempt", attempt, "--attempted", attempted)
+56: 	if err = cmd.Start(); err != nil {
+57: 		t.Fatal(err)
+58: 	}
+59: 	defer cmd.Wait()
+60: 	waitFixtureFile(t, ready)
+61: 	baseline, backupHash, err := store.OnlineOwnedStopBackup(context.Background(), dbPath, filepath.Join(out, "backup.sqlite"))
+62: 	if err != nil || backupHash == "" || baseline.Rows != 1 {
+63: 		t.Fatalf("WAL online backup failed: %+v %q %v", baseline, backupHash, err)
+64: 	}
+65: 	identity, err := supervisor.ObserveOwnedCoreReadOnly(uint32(cmd.Process.Pid))
+66: 	if err != nil {
+67: 		t.Fatal(err)
+68: 	}
+69: 	h, err := supervisor.OpenOwnedCoreRetained(identity)
+70: 	if err != nil {
+71: 		t.Fatal(err)
+72: 	}
+73: 	defer h.Close()
+74: 	barrier, err := store.AcquireOwnedStopBarrier(context.Background(), dbPath)
+75: 	if err != nil {
+76: 		t.Fatal(err)
+77: 	}
+78: 	defer barrier.Close()
+79: 	current, err := barrier.Census(context.Background())
+80: 	if err != nil || current != baseline {
+81: 		t.Fatalf("baseline differs before signal: %+v %v", current, err)
+82: 	}
+83: 	if err = os.WriteFile(attempt, []byte("go"), 0600); err != nil {
+84: 		t.Fatal(err)
+85: 	}
+86: 	waitFixtureFile(t, attempted)
+87: 	// The fixture has a deferred transaction attempting a write. The reserved
+88: 	// writer lock prevents its durable PREPARED/row commit before the crash.
+89: 	exit, err := h.TerminateOnceAndWait(5 * time.Second)
+90: 	if err != nil || exit.TerminateCalls != 1 || !exit.ExitObserved || exit.ExitCode != supervisor.OwnedCoreMaintenanceExitCode {
+91: 		t.Fatalf("exact controlled crash unavailable: %+v %v", exit, err)
+92: 	}
+93: 	if err = barrier.Close(); err != nil {
+94: 		t.Fatal(err)
+95: 	}
+96: 	lease, err := rt.AcquireDataRootLease(root)
+97: 	if err != nil {
+98: 		t.Fatalf("native exit did not release real root lease: %v", err)
+99: 	}
+100: 	defer lease.Close()
+101: 	if !lease.Held() {
+102: 		t.Fatal("poststop real lease not held")
+103: 	}
+104: 	post, err := store.ReadOwnedStopCensus(context.Background(), dbPath)
+105: 	if err != nil || post != baseline {
+106: 		t.Fatalf("committed WAL lost or in-flight row escaped: %+v %v", post, err)
+107: 	}
+108: 	read, err := sql.Open("sqlite", dbPath)
+109: 	if err != nil {
+110: 		t.Fatal(err)
+111: 	}
+112: 	defer read.Close()
+113: 	var committed, inflight int
+114: 	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='committed'`).Scan(&committed); err != nil {
+115: 		t.Fatal(err)
+116: 	}
+117: 	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='inflight'`).Scan(&inflight); err != nil {
+118: 		t.Fatal(err)
+119: 	}
+120: 	if committed != 1 || inflight != 0 {
+121: 		t.Fatalf("wrong crash durability: committed=%d inflight=%d", committed, inflight)
+122: 	}
+123: }
+124: 
+125: func TestOwnedCoreCLIRequiresExactArguments(t *testing.T) {
+126: 	if got := run([]string{"commit", "--plan", "missing"}); got != 2 {
+127: 		t.Fatalf("commit accepted missing reviewed SHA: %d", got)
+128: 	}
+129: 	if got := run([]string{"preflight", "--input", "missing", "--operation-id", "a"}); got != 2 {
+130: 		t.Fatalf("preflight accepted missing new out: %d", got)
+131: 	}
+132: 	if got := run([]string{"inspect"}); got != 2 {
+133: 		t.Fatalf("inspect accepted missing plan: %d", got)
+134: 	}
+135: 	for _, args := range [][]string{
+136: 		{"commit", "--plan", "x", "--plan", "y"},
+137: 		{"commit", "--plan", "x", "--expect-plan-sha256", "a", "--out", "z"},
+138: 		{"preflight", "--input", "a", "--operation-id", "b", "--out", "c", "commit"},
+139: 		{"inspect", "--plan", "x", "--expect-plan-sha256", "a"},
+140: 		{"inspect", "--plan", "x", "--plan", "y"},
+141: 	} {
+142: 		if got := run(args); got != 2 {
+143: 			t.Fatalf("mixed or duplicate flags accepted: %q exit=%d", args, got)
+144: 		}
+145: 	}
+146: }

@@ -1,0 +1,218 @@
+internal/domain/runtime_broker_windows.go
+360: 		if e == nil && bytes.Equal(old, raw) {
+361: 			os.Remove(temp)
+362: 			return nil
+363: 		}
+364: 		return errors.New("immutable host fact already exists")
+365: 	}
+366: 	return os.Rename(temp, path)
+367: }
+368: 
+369: // A late receipt settles the original reservation and recorded epoch, without
+370: // acquiring execution authority or extending any lease.
+371: func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) error {
+372: 	if len(Bytes(fact)) > runtimeFactMaxBytes {
+373: 		return errors.New("encoded host fact exceeds persistence bound")
+374: 	}
+375: 	project, run, key := Str(fact, "project_id"), Str(fact, "run_id"), Str(fact, "effect_key")
+376: 	tx, e := c.service.DB.BeginTx(ctx, nil)
+377: 	if e != nil {
+378: 		return e
+379: 	}
+380: 	defer tx.Rollback()
+381: 	if e = resourceWriteLock(tx); e != nil {
+382: 		return e
+383: 	}
+384: 	dispatch, e := runtimeDispatch(tx, project, run, fact["epoch"])
+385: 	if e != nil {
+386: 		return e
+387: 	}
+388: 	if fact["dispatch_key"] != dispatch["dispatch_key"] || fact["manifest_hash"] != dispatch["manifest_hash"] {
+389: 		return Fail(422, "GATE_FAILED", "effect receipt dispatch mismatch")
+390: 	}
+391: 	intent, e := latestEffect(tx, project, run, key)
+392: 	if e != nil {
+393: 		return e
+394: 	}
+395: 	if intent["request_hash"] != fact["request_hash"] || intent["reservation_id"] != fact["reservation_id"] || Hash(intent["epoch"]) != Hash(fact["epoch"]) {
+396: 		return Fail(422, "GATE_FAILED", "effect receipt epoch or intent mismatch")
+397: 	}
+398: 	receipt, ok := fact["receipt"].(map[string]any)
+399: 	if !ok {
+400: 		return errors.New("trusted effect receipt required")
+401: 	}
+402: 	if receipt["key"] != key || receipt["run_id"] != run || Hash(receipt["epoch"]) != Hash(fact["epoch"]) || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+403: 		return Fail(422, "GATE_FAILED", "effect receipt identity or outcome mismatch")
+404: 	}
+405: 	request, _ := intent["payload"].(map[string]any)
+406: 	if request["capability"] == "MODEL" || request["capability"] == "TOOL" {
+407: 		result, valid := receipt["payload"].(map[string]any)
+408: 		if !valid {
+409: 			return Fail(422, "GATE_FAILED", "host effect result missing")
+410: 		}
+411: 		wantHash := Digest(Bytes(result))
+412: 		if request["capability"] == "MODEL" && receipt["state"] == "CONFIRMED" {
+413: 			raw := []byte(Str(result, "body"))
+414: 			if receipt["model_transport"] != true || receipt["actual_cost"] != nil || result["content_type"] != "text/event-stream" || Hash(result["status"]) != Hash(200) || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+415: 				return Fail(422, "GATE_FAILED", "model transport receipt invalid")
+416: 			}
+417: 			wantHash = Digest(raw)
+418: 		}
+419: 		if wantHash != fact["provider_response_hash"] || wantHash != receipt["receipt_id"] {
+420: 			return Fail(422, "GATE_FAILED", "host effect response hash mismatch")
+421: 		}
+422: 		if receipt["state"] == "NOT_APPLIED" {
+423: 			money, _ := receipt["actual_cost"].(map[string]any)
+424: 			amount, err := moneyAmount(money)
+425: 			if result["dispatched"] != false || result["witness"] != "HOST_PRE_EFFECT_REFUSAL" || err != nil || amount.Sign() != 0 {
+426: 				return Fail(422, "GATE_FAILED", "known unissued effect witness required")
+427: 			}
+428: 		} else if request["capability"] == "TOOL" {
+429: 			payload, _ := request["payload"].(map[string]any)
+430: 			if receipt["host_tool"] != payload["name"] {
+431: 				return Fail(422, "GATE_FAILED", "host tool receipt name mismatch")
+432: 			}
+433: 		}
+434: 	}
+435: 	if evidence := fact["host_tool_evidence"]; evidence != nil && (request["capability"] != "TOOL" || len(Bytes(evidence)) > 4*1024*1024 || fact["host_tool_evidence_hash"] != Hash(evidence)) {
+436: 		return Fail(422, "GATE_FAILED", "host tool evidence hash or bound mismatch")
+437: 	}
+438: 	if intent["state"] == receipt["state"] && Hash(intent["receipt"]) == Hash(receipt) {
+439: 		current, err := load(tx, project, "Run", run)
+440: 		if err != nil {
+441: 			return err
+442: 		}
+443: 		if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+444: 			return err
+445: 		}
+446: 		return tx.Commit()
+447: 	}
+448: 	if intent["state"] != "STARTED" && intent["state"] != "UNKNOWN" {
+449: 		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
+450: 	}
+internal/domain/durability.go
+215: 	}
+216: 	o["state"] = "STARTED"
+217: 	o["epoch"] = run["lease_epoch"]
+218: 	if e = effectAppend(tx, project, runID, key, o); e != nil {
+219: 		return nil, e
+220: 	}
+221: 	return o, nil
+222: }
+223: 
+224: // ObserveEffect is the trusted worker/provider reconciliation boundary, like
+225: // ObserveRuntime. No public HTTP endpoint accepts invented provider outcomes.
+226: func (s *Service) ObserveEffect(ctx context.Context, project, runID, key, state string, receipt Object) error {
+227: 	if (state != "CONFIRMED" && state != "UNKNOWN" && state != "NOT_APPLIED") || len(receipt) == 0 {
+228: 		return Fail(400, "INVALID_REQUEST", "trusted outcome and receipt required")
+229: 	}
+230: 	tx, e := s.DB.BeginTx(ctx, nil)
+231: 	if e != nil {
+232: 		return e
+233: 	}
+234: 	defer tx.Rollback()
+235: 	if e = resourceWriteLock(tx); e != nil {
+236: 		return e
+237: 	}
+238: 	o, e := latestEffect(tx, project, runID, key)
+239: 	if e != nil {
+240: 		return e
+241: 	}
+242: 	if o["state"] == state && Hash(o["receipt"]) == Hash(receipt) {
+243: 		return nil
+244: 	}
+245: 	if o["state"] == "CONFIRMED" || o["state"] == "NOT_APPLIED" || o["state"] == "PREPARED" {
+246: 		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
+247: 	}
+248: 	o["state"] = state
+249: 	o["receipt"] = receipt
+250: 	if e = effectAppend(tx, project, runID, key, o); e != nil {
+251: 		return e
+252: 	}
+253: 	return tx.Commit()
+254: }
+255: 
+256: // ResumeCheckpoint rebuilds current context after trusted process/effect
+257: // reconciliation. It retains Run identity and all provider keys, rotating only
+258: // the execution lease so old callbacks cannot change the resumed run.
+259: func (s *Service) ResumeCheckpoint(ctx context.Context, token, project, runID, key string, expectedRevision int64) (Object, error) {
+260: 	tx, e := s.DB.BeginTx(ctx, nil)
+261: 	if e != nil {
+262: 		return nil, e
+263: 	}
+264: 	defer tx.Rollback()
+265: 	if e = resourceWriteLock(tx); e != nil {
+266: 		return nil, e
+267: 	}
+268: 	p, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+internal/domain/runtime_model_windows.go
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"bytes"
+7: 	"context"
+8: 	"errors"
+9: 	"io"
+10: 	"net/http"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"strings"
+14: 	"time"
+15: 
+16: 	rt "researchos.local/research-os/adapters/runtime"
+17: 	"researchos.local/research-os/internal/runtimepolicy"
+18: )
+19: 
+20: func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs map[string][]byte) error {
+21: 	manifest := dispatch["manifest"].(map[string]any)
+22: 	profile := manifest["admission"].(map[string]any)["profile"].(map[string]any)
+23: 	if profile["backend"] != runtimeMuBackend {
+24: 		return nil
+25: 	}
+26: 	if e := validateRuntimeModelConfig(profile); e != nil {
+27: 		return e
+28: 	}
+29: 	effective, e := runtimepolicy.Effective(manifest, "")
+30: 	if e != nil {
+31: 		return e
+32: 	}
+33: 	if !filepath.IsAbs(route.BundleFile) {
+34: 		return errors.New("host Mu bundle binding required")
+35: 	}
+36: 	actual, e := filepath.EvalSymlinks(route.BundleFile)
+37: 	if e != nil || !strings.EqualFold(actual, filepath.Clean(route.BundleFile)) {
+38: 		return errors.New("Mu bundle reparse rejected")
+39: 	}
+40: 	info, e := os.Stat(actual)
+41: 	if e != nil || !info.Mode().IsRegular() || info.Size() > 32*1024*1024 {
+42: 		return errors.New("bounded Mu bundle required")
+43: 	}
+44: 	raw, e := os.ReadFile(actual)
+45: 	if e != nil || Digest(raw) != profile["bundle_hash"] {
+46: 		return errors.New("Mu bundle differs from frozen profile")
+47: 	}
+48: 	inputs["mu-worker.mjs"] = raw
+49: 	inputs["worker.json"] = Bytes(effective)
+50: 	return nil
+51: }
+52: 
+53: func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+54: 	manifest := dispatch["manifest"].(map[string]any)
+55: 	effective, e := runtimepolicy.Effective(manifest, provider.Purpose)
+56: 	if e != nil {
+57: 		return nil, e
+58: 	}
+59: 	body, e := validateRuntimeModelRequest(effective, payload)
+60: 	if e != nil {
+61: 		return nil, e
+62: 	}
+63: 	var stream *rt.ModelStream
+64: 	unknown := func(reason string) (Object, error) {
+65: 		if stream != nil {
+66: 			stop, cancel := context.WithTimeout(context.Background(), time.Second)
+67: 			stream.Fail(stop)
+68: 			cancel()
+69: 		}
+70: 		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {

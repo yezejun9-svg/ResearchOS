@@ -1,0 +1,35 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	rt "researchos.local/research-os/adapters/runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+func bindClientRunQueue(tx *sql.Tx, project string, run Object) (bool, error) {
+	installed, err := clientQueueInstalled(tx)
+	if err != nil || !installed {
+		return false, err
+	}
+	var session string
+	err = tx.QueryRow(`SELECT id FROM client_sessions WHERE project_id=? AND task_id=?`, project, run["task_id"]).Scan(&session)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = ensureClientQueue(tx, project, session, Str(run, "task_id")); err != nil {
+		return false, err
+	}
+	d, err := runtimeDispatch(tx, project, Str(run, "id"), run["lease_epoch"])
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.Exec(`UPDATE client_queue_fences SET run_id=?,runtime_epoch=?,dispatch_key=?,manifest_hash=?,revision=revision+1 WHERE project=? AND task_id=? AND state='OPEN' AND restore_fenced=0 AND (run_id IS NULL OR (run_id=? AND runtime_epoch=?))`, run["id"], run["lease_epoch"], d["dispatch_key"], d["manifest_hash"], project, run["task_id"], run["id"], run["lease_epoch"])

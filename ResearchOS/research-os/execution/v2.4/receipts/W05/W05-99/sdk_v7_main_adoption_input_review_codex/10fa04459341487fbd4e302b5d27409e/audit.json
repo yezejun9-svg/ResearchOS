@@ -1,0 +1,1672 @@
+{
+  "schema": "researchos.sdk-v7-main-adoption-input-audit.v1",
+  "reviewer_id": "codex:/root/w05_merge_review",
+  "source_handoff_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/handoff.json",
+    "sha256": "b3b7fa96aa5fb3cd19dae1f9114643af8a5462eee5b3db884b062d2293c89f9a",
+    "bytes": 4357
+  },
+  "independent_source_review_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_independent_source_review_codex/cd8b3f9a43c9483695d4efc72e2cb7d8/review.json",
+    "sha256": "672ed781c56e3790a48250a201f1662835818de7ab7918c65a423e9e393523f1",
+    "bytes": 5156
+  },
+  "mapping": [
+    {
+      "target": "internal/host/vault.go",
+      "base_ref": {
+        "bytes": 6435,
+        "path": "D:\\作品集\\ResearchOS\\research-os\\internal\\host\\vault.go",
+        "sha256": "75c00d534582c933839305c6e2e55190b82706111f2d33e3abe62e4f51c6a94c"
+      },
+      "current_ref": {
+        "path": "internal/host/vault.go",
+        "sha256": "75c00d534582c933839305c6e2e55190b82706111f2d33e3abe62e4f51c6a94c",
+        "bytes": 6435
+      },
+      "selected_proposal_ref": {
+        "bytes": 12082,
+        "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+        "sha256": "5bcf6aed6515bd991e5e7222999994e3d9192a6bd8f5a32b4669d4c67c0a6b50"
+      },
+      "current_equals_declared_base": true,
+      "already_integrated": false,
+      "byte_conflict": false,
+      "forward_ref": {
+        "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/internal_host_vault.v5.proposed.go.main-to-proposal.diff",
+        "sha256": "673434686e02b659c8201ab3fefbb95f5932a0d27ce4433909bd148c0ef09b2d",
+        "bytes": 6905
+      },
+      "inverse_complete_text": "--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go\n+++ internal/host/vault.go\n@@ -56,139 +56,6 @@\n type Vault struct {\n \tdir  string\n \tpath string\n-\treadOnly bool\n-\tallowedRef string\n-\tallowedProvider string\n-}\n-\n-// openVaultReadOnly references one existing sealed record without copying,\n-// importing, revoking or changing the original vault directory.\n-func openVaultReadOnly(hostDir, ref, provider string) (*Vault, error) {\n-\tif !filepath.IsAbs(hostDir) || ref == \"\" || provider == \"\" {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n-\tresolved, err := filepath.EvalSymlinks(hostDir)\n-\tif err != nil || !strings.EqualFold(resolved, filepath.Clean(hostDir)) {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n-\td := filepath.Join(resolved, \"credentials\")\n-\tinfo, err := os.Lstat(d)\n-\tif err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n-\tcanonicalCredentials, err := filepath.EvalSymlinks(d)\n-\tif err != nil || !strings.EqualFold(canonicalCredentials, filepath.Clean(d)) {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n-\tfor _, name := range []string{\"index.json\", ref + \".dpapi\"} {\n-\t\tpath := filepath.Join(d, name)\n-\t\tentry, err := os.Lstat(path)\n-\t\tif err != nil || !entry.Mode().IsRegular() || entry.Mode()&os.ModeSymlink != 0 {\n-\t\t\treturn nil, ErrUnknownCredential\n-\t\t}\n-\t}\n-\tv := &Vault{dir: d, path: filepath.Join(d, \"index.json\"), readOnly: true,\n-\t\tallowedRef: ref, allowedProvider: provider}\n-\tidx, err := v.load()\n-\tif err != nil {\n-\t\treturn nil, err\n-\t}\n-\tfound := false\n-\tfor _, known := range idx.Records {\n-\t\tif known == ref { found = true }\n-\t}\n-\tif !found { return nil, ErrUnknownCredential }\n-\trecord, err := v.record(ref)\n-\tif err != nil || record.Revoked || record.Provider != provider {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n-\treturn v, nil\n-}\n-\n-// ValidateTrialVaultIsolation runs before any trial data-root lease, database open,\n-// migration or host mkdir. Both roots must exist as ordinary directories. EvalSymlinks\n-// rejects path aliases/reparse ancestors; SameFile catches Windows spelling aliases.\n-// The new data root must be disjoint from the entire old protected resource root,\n-// not merely from its host/credentials child.\n-func ValidateTrialVaultIsolation(dataRoot, oldHostDir string) error {\n-    if !filepath.IsAbs(dataRoot) || !filepath.IsAbs(oldHostDir) {\n-        return ErrUnknownCredential\n-    }\n-    clean := func(path string) (string, error) {\n-        path = filepath.Clean(path)\n-        for current := path; ; current = filepath.Dir(current) {\n-            info, err := os.Lstat(current)\n-            if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {\n-                return \"\", ErrUnknownCredential\n-            }\n-            resolved, err := filepath.EvalSymlinks(current)\n-            if err != nil || !strings.EqualFold(resolved, current) {\n-                return \"\", ErrUnknownCredential\n-            }\n-            if filepath.Dir(current) == current { break }\n-        }\n-        return path, nil\n-    }\n-    data, err := clean(dataRoot)\n-    if err != nil { return err }\n-    hostDir, err := clean(oldHostDir)\n-    if err != nil { return err }\n-    protected, err := clean(filepath.Dir(hostDir))\n-    if err != nil { return err }\n-    sameAncestor := func(target, descendant string) bool {\n-        wanted, err := os.Stat(target)\n-        if err != nil { return true }\n-        for current := descendant; ; current = filepath.Dir(current) {\n-            actual, err := os.Stat(current)\n-            if err != nil || os.SameFile(wanted, actual) { return true }\n-            if filepath.Dir(current) == current { break }\n-        }\n-        return false\n-    }\n-    if sameAncestor(data, protected) || sameAncestor(protected, data) {\n-        return ErrUnknownCredential\n-    }\n-    return nil\n-}\n-\n-// ValidateTrialStorageLayout checks the actual child paths before lease, DB\n-// creation or Host.New privateDir work. A missing host/DB leaf is allowed only\n-// below an already verified ordinary data-root directory.\n-func ValidateTrialStorageLayout(dataRoot, newHostDir, oldHostDir string) error {\n-    if err := ValidateTrialVaultIsolation(dataRoot, oldHostDir); err != nil {\n-        return err\n-    }\n-    expectedHost := filepath.Join(filepath.Clean(dataRoot), \"host\")\n-    if !filepath.IsAbs(newHostDir) || !strings.EqualFold(filepath.Clean(newHostDir), expectedHost) {\n-        return ErrUnknownCredential\n-    }\n-    checkLeaf := func(path string, wantDir bool) error {\n-        info, err := os.Lstat(path)\n-        if os.IsNotExist(err) { return nil }\n-        if err != nil || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {\n-            return ErrUnknownCredential\n-        }\n-        if wantDir != info.IsDir() {\n-            return ErrUnknownCredential\n-        }\n-        resolved, err := filepath.EvalSymlinks(path)\n-        if err != nil || !strings.EqualFold(resolved, filepath.Clean(path)) {\n-            return ErrUnknownCredential\n-        }\n-        old, err := os.Stat(oldHostDir)\n-        if err != nil { return ErrUnknownCredential }\n-        actual, err := os.Stat(path)\n-        if err != nil || os.SameFile(actual, old) { return ErrUnknownCredential }\n-        oldDB := filepath.Join(filepath.Dir(oldHostDir), \"researchos.sqlite\")\n-        original, err := os.Stat(oldDB)\n-        if err != nil && !os.IsNotExist(err) { return ErrUnknownCredential }\n-        if err == nil && os.SameFile(actual, original) {\n-            return ErrUnknownCredential\n-        }\n-        return nil\n-    }\n-    if err := checkLeaf(newHostDir, true); err != nil { return err }\n-    return checkLeaf(filepath.Join(filepath.Clean(dataRoot), \"researchos.sqlite\"), false)\n }\n \n func openVault(dir string) (*Vault, error) {\n@@ -235,7 +102,6 @@\n \t\t\tmaterial[i] = 0\n \t\t}\n \t}()\n-\tif v.readOnly { return \"\", ErrCredentialProtected }\n \tif len(material) == 0 || len(material) > MaxCredentialBytes {\n \t\treturn \"\", ErrCredentialTooLarge\n \t}\n@@ -287,12 +153,11 @@\n }\n \n func (v *Vault) record(ref string) (*vaultRecord, error) {\n-\tif v.readOnly && ref != v.allowedRef { return nil, ErrUnknownCredential }\n \tvar rec vaultRecord\n \tif err := readPrivate(v.dir, ref+\".dpapi\", &rec); err != nil {\n \t\treturn nil, err\n \t}\n-\tif rec.Ref == \"\" || rec.Ref != ref || v.readOnly && rec.Provider != v.allowedProvider {\n+\tif rec.Ref == \"\" || rec.Ref != ref {\n \t\treturn nil, fmt.Errorf(\"%w: %s\", ErrUnknownCredential, ref)\n \t}\n \treturn &rec, nil\n@@ -313,7 +178,6 @@\n // Revoke marks a record revoked and destroys its wrapped bytes, so a later reference lookup\n // reports REVOKED and no path can recover the material.\n func (v *Vault) Revoke(ref string) error {\n-\tif v.readOnly { return ErrCredentialProtected }\n \trec, err := v.record(ref)\n \tif err != nil {\n \t\treturn err\n"
+    },
+    {
+      "target": "internal/host/host.go",
+      "base_ref": {
+        "bytes": 7714,
+        "path": "D:\\作品集\\ResearchOS\\research-os\\internal\\host\\host.go",
+        "sha256": "65848ad3476ccaf6dd2e76cf0753cf8c7257e2762bc9f115dcd0d1675aeb02cd"
+      },
+      "current_ref": {
+        "path": "internal/host/host.go",
+        "sha256": "65848ad3476ccaf6dd2e76cf0753cf8c7257e2762bc9f115dcd0d1675aeb02cd",
+        "bytes": 7714
+      },
+      "selected_proposal_ref": {
+        "bytes": 8703,
+        "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+        "sha256": "6387df33f531be14d32c439095f9ebcf079fb7ae2c27697c98cdc9a554fb5dc7"
+      },
+      "current_equals_declared_base": true,
+      "already_integrated": false,
+      "byte_conflict": false,
+      "forward_ref": {
+        "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/internal_host_host.v5.proposed.go.main-to-proposal.diff",
+        "sha256": "24aaff3886f3afa93c072af546039c33ba926778a27f58e79d2bd65e1b80f58e",
+        "bytes": 2219
+      },
+      "inverse_complete_text": "--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go\n+++ internal/host/host.go\n@@ -55,10 +55,6 @@\n type Config struct {\n \tDB            *sql.DB\n \tDir           string\n-\t// Trial-only read access to one existing DPAPI record; the new DB stays isolated.\n-\tReadOnlyModelVaultDir string\n-\tReadOnlyModelCredentialRef string\n-\tReadOnlyModelProvider string\n \tContractsDir  string\n \tMigrationFile string\n \tSessionTTL    time.Duration\n@@ -108,15 +104,6 @@\n \tif cfg.DB == nil || cfg.Dir == \"\" || cfg.ContractsDir == \"\" || cfg.MigrationFile == \"\" || cfg.SchemaDir == \"\" {\n \t\treturn nil, fmt.Errorf(\"%w: db, dir, contracts, migration and schema are required\", ErrBadState)\n \t}\n-\tif cfg.ReadOnlyModelVaultDir != \"\" {\n-\t\tif cfg.ReadOnlyModelCredentialRef == \"\" || cfg.ReadOnlyModelProvider == \"\" ||\n-\t\t\tfilepath.Base(cfg.Dir) != \"host\" ||\n-            ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {\n-\t\t\treturn nil, ErrUnknownCredential\n-\t\t}\n-\t} else if cfg.ReadOnlyModelCredentialRef != \"\" || cfg.ReadOnlyModelProvider != \"\" {\n-\t\treturn nil, ErrUnknownCredential\n-\t}\n \tttl := cfg.SessionTTL\n \tif ttl <= 0 || ttl > MaxSessionTTL {\n \t\tttl = DefaultSessionTTL\n@@ -134,10 +121,6 @@\n \t}\n \tif err := os.MkdirAll(cfg.Dir, 0o700); err != nil {\n \t\treturn nil, err\n-\t}\n-\tif cfg.ReadOnlyModelVaultDir != \"\" &&\n-\t\tValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {\n-\t\treturn nil, ErrUnknownCredential\n \t}\n \tif err := privateDir(cfg.Dir); err != nil {\n \t\treturn nil, fmt.Errorf(\"private host directory refused: %w\", err)\n@@ -159,12 +142,7 @@\n \tif h.protocolVersion == \"\" {\n \t\th.protocolVersion = nativeProtocolVersion\n \t}\n-\tif cfg.ReadOnlyModelVaultDir != \"\" {\n-\t\tif h.vault, err = openVaultReadOnly(cfg.ReadOnlyModelVaultDir,\n-\t\t\tcfg.ReadOnlyModelCredentialRef, cfg.ReadOnlyModelProvider); err != nil {\n-\t\t\treturn nil, err\n-\t\t}\n-\t} else if h.vault, err = openVault(cfg.Dir); err != nil {\n+\tif h.vault, err = openVault(cfg.Dir); err != nil {\n \t\treturn nil, err\n \t}\n \tif h.roots, err = openRootRegistry(cfg.Dir); err != nil {\n"
+    },
+    {
+      "target": "apps/control/main.go",
+      "base_ref": {
+        "bytes": 11748,
+        "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\control\\main.go",
+        "sha256": "1f22bf62899b122d319cacd6cd1b6e2cee3f3995824367e21d94b12a483eaedc"
+      },
+      "current_ref": {
+        "path": "apps/control/main.go",
+        "sha256": "1f22bf62899b122d319cacd6cd1b6e2cee3f3995824367e21d94b12a483eaedc",
+        "bytes": 11748
+      },
+      "selected_proposal_ref": {
+        "bytes": 12674,
+        "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+        "sha256": "9a519be38a1c09a819864073eedf0eaf9941c4c75f95ded0c3e89143012da9b1"
+      },
+      "current_equals_declared_base": true,
+      "already_integrated": false,
+      "byte_conflict": false,
+      "forward_ref": {
+        "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/apps_control_main.v5.proposed.go.main-to-proposal.diff",
+        "sha256": "7e4d0f10ab50852266e988042193f80c437aced570242af93078bc4c709bc87d",
+        "bytes": 2820
+      },
+      "inverse_complete_text": "--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go\n+++ apps/control/main.go\n@@ -46,9 +46,6 @@\n \tprovision := flag.String(\"provision-principal\", \"\", \"trusted local administration: principal JSON to provision\")\n \tissue := flag.String(\"issue-credential\", \"\", \"trusted local administration: existing principal ID\")\n \tcoordinatorFile := flag.String(\"runtime-coordinator-config\", \"\", \"private host configuration for the single runtime coordinator\")\n-\ttrialVault := flag.String(\"trial-readonly-model-vault-dir\", \"\", \"trial-only exact existing sealed host vault directory\")\n-\ttrialCredential := flag.String(\"trial-readonly-credential-ref\", \"\", \"trial-only single protected credential reference\")\n-\ttrialProvider := flag.String(\"trial-readonly-provider\", \"\", \"trial-only provider identity\")\n \tdiscoveryFile := flag.String(\"discovery-file\", \"\", \"local host discovery output; defaults to data-root/discovery.json\")\n \tflag.Parse()\n \tadminActions := 0\n@@ -61,14 +58,6 @@\n \t\tlog.Fatal(\"choose one local administrative action\")\n \t}\n \tdataDir := setting(\"RESEARCHOS_DATA_DIR\", filepath.Join(\".local\", \"data\"))\n-\tif *trialVault != \"\" {\n-\t\tif adminActions != 0 || *coordinatorFile == \"\" || *trialCredential == \"\" || *trialProvider == \"\" ||\n-\t\t\thostboundary.ValidateTrialStorageLayout(dataDir, filepath.Join(dataDir, \"host\"), *trialVault) != nil {\n-\t\t\tlog.Fatal(\"trial readonly vault requires an isolated existing data root and exact coordinator/ref/provider\")\n-\t\t}\n-\t} else if *trialCredential != \"\" || *trialProvider != \"\" {\n-\t\tlog.Fatal(\"partial trial readonly vault configuration\")\n-\t}\n \twebDir := setting(\"RESEARCHOS_WEB_DIR\", filepath.Join(\"apps\", \"web\", \"dist\"))\n \tif _, err := os.Stat(filepath.Join(webDir, \"index.html\")); err != nil && adminActions == 0 {\n \t\tlog.Fatalf(\"web build unavailable: %v\", err)\n@@ -183,7 +172,7 @@\n \t}\n \tctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)\n \tdefer stop()\n-\tlocalHost, err := hostboundary.New(hostboundary.Config{DB: db, Dir: filepath.Join(dataDir, \"host\"), ContractsDir: filepath.Join(\"spec\", \"v2.0\", \"contracts\"), MigrationFile: filepath.Join(\"migrations\", \"sqlite\", \"0002_domain.sql\"), SchemaDir: filepath.Join(\"internal\", \"api\", \"contracts\"), ReadOnlyModelVaultDir: *trialVault, ReadOnlyModelCredentialRef: *trialCredential, ReadOnlyModelProvider: *trialProvider})\n+\tlocalHost, err := hostboundary.New(hostboundary.Config{DB: db, Dir: filepath.Join(dataDir, \"host\"), ContractsDir: filepath.Join(\"spec\", \"v2.0\", \"contracts\"), MigrationFile: filepath.Join(\"migrations\", \"sqlite\", \"0002_domain.sql\"), SchemaDir: filepath.Join(\"internal\", \"api\", \"contracts\")})\n \tif err != nil {\n \t\tlog.Fatalf(\"local host boundary unavailable: %v\", err)\n \t}\n"
+    },
+    {
+      "target": "internal/domain/runtime_qualification.go",
+      "base_ref": {
+        "bytes": 14702,
+        "path": "D:\\作品集\\ResearchOS\\research-os\\internal\\domain\\runtime_qualification.go",
+        "sha256": "4b376196886f7202fa05f2e54d4083531651a459970276e05ac6c8203a879111"
+      },
+      "current_ref": {
+        "path": "internal/domain/runtime_qualification.go",
+        "sha256": "4b376196886f7202fa05f2e54d4083531651a459970276e05ac6c8203a879111",
+        "bytes": 14702
+      },
+      "selected_proposal_ref": {
+        "bytes": 16400,
+        "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+        "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54"
+      },
+      "current_equals_declared_base": true,
+      "already_integrated": false,
+      "byte_conflict": false,
+      "forward_ref": {
+        "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/runtime_qualification.unlimited.v5.proposed.go.main-to-proposal.diff",
+        "sha256": "6acdd43bb9f854d5e5d1130c7fa15a397ad0c2d9e13ea1b911f497a18d395896",
+        "bytes": 4543
+      },
+      "inverse_complete_text": "--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go\n+++ internal/domain/runtime_qualification.go\n@@ -15,33 +15,6 @@\n \treturn Hash([]any{t[\"goal_id\"], t[\"task_type\"], t[\"input_refs\"], t[\"requirement_refs\"], t[\"context_bundle_id\"], t[\"dependency_task_ids\"], t[\"acceptance_contract\"], t[\"stop_policy\"]})\n }\n \n-// qualificationUnlimitedPolicies is the explicit default-policy exception to\n-// the LIVE upper-bound reservation. It never admits a CAPPED ancestor, even an\n-// accounting-only one, and never reinterprets unknown cost as zero.\n-func qualificationUnlimitedPolicies(policies []Object) error {\n-\tif len(policies) == 0 {\n-\t\treturn Fail(422, \"GATE_FAILED\", \"active budget ancestry required\")\n-\t}\n-\tfor _, p := range policies {\n-\t\tif p[\"mode\"] != \"UNLIMITED_AMOUNT\" || p[\"cap\"] != nil || p[\"unknown_cost_action\"] != \"ALLOW_AND_RECORD\" {\n-\t\t\treturn Fail(422, \"GATE_FAILED\", \"LIVE unknown cost requires unlimited active ancestry\")\n-\t\t}\n-\t}\n-\treturn nil\n-}\n-\n-func qualificationUnlimitedGoal(tx *sql.Tx, project, goalID string) error {\n-\tgoal, e := load(tx, project, \"Goal\", goalID)\n-\tif e != nil {\n-\t\treturn e\n-\t}\n-\tpolicies, e := budgetChain(tx, project, Str(goal, \"budget_policy_id\"))\n-\tif e != nil {\n-\t\treturn e\n-\t}\n-\treturn qualificationUnlimitedPolicies(policies)\n-}\n-\n // RegisterRuntimeQualificationPlan is a trusted local host decision, not an HTTP operation.\n // Its immutable profile is an ordinary sealed Artifact included in the Task inputs.\n func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, project, taskID, runtimeID string, profileRef Object, requiredCapabilities []any, maxValidity time.Duration, resumeCheckID string) error {\n@@ -92,19 +65,9 @@\n \t\treturn e\n \t}\n \tif r[\"measurement_mode\"] == \"LIVE\" {\n-\t\tmaxCost, declared := profileBody[\"max_cost\"]\n-\t\tif !declared {\n-\t\t\treturn Fail(422, \"GATE_FAILED\", \"LIVE qualification cost basis must be declared\")\n-\t\t}\n-\t\tif maxCost == nil {\n-\t\t\tif e = qualificationUnlimitedGoal(tx, project, Str(t, \"goal_id\")); e != nil {\n-\t\t\t\treturn e\n-\t\t\t}\n-\t\t} else {\n-\t\t\tcost, err := moneyAmount(maxCost)\n-\t\t\tif err != nil || cost.Sign() <= 0 || Str(maxCost.(map[string]any), \"currency\") == \"\" {\n-\t\t\t\treturn Fail(422, \"GATE_FAILED\", \"LIVE qualification needs positive frozen cost bound\")\n-\t\t\t}\n+\t\tcost, err := moneyAmount(profileBody[\"max_cost\"])\n+\t\tif err != nil || cost.Sign() <= 0 || Str(profileBody[\"max_cost\"].(map[string]any), \"currency\") == \"\" {\n+\t\t\treturn Fail(422, \"GATE_FAILED\", \"LIVE qualification needs positive frozen cost bound\")\n \t\t}\n \t}\n \tfound := false\n@@ -232,35 +195,19 @@\n \tif e != nil {\n \t\treturn e\n \t}\n-\ttask, e := load(tx, project, \"Task\", Str(run, \"task_id\"))\n-\tif e != nil {\n-\t\treturn e\n-\t}\n-\tgoal, e := load(tx, project, \"Goal\", Str(task, \"goal_id\"))\n-\tif e != nil {\n-\t\treturn e\n-\t}\n-\trequestID := \"qualification-dispatch/\" + Str(run, \"id\")\n-\tif profileBody[\"max_cost\"] == nil {\n-\t\tif runtime[\"measurement_mode\"] != \"LIVE\" {\n-\t\t\treturn Fail(422, \"GATE_FAILED\", \"LIVE unknown cost path required\")\n-\t\t}\n-\t\tpolicies, _, err := runBudgetScopes(tx, project, Str(run, \"id\"))\n-\t\tif err != nil {\n-\t\t\treturn err\n-\t\t}\n-\t\tif err = qualificationUnlimitedPolicies(policies); err != nil {\n-\t\t\treturn err\n-\t\t}\n-\t\t// The actual MODEL effect records UNKNOWN/money=nil in brokerEffect.\n-\t\t// Do not create a second unresolved qualification-dispatch liability.\n-\t\treturn nil\n-\t}\n \tcost, e := moneyAmount(profileBody[\"max_cost\"])\n \tif e != nil || cost.Sign() <= 0 {\n \t\treturn Fail(422, \"GATE_FAILED\", \"LIVE qualification cost bound missing\")\n \t}\n-\t_, e = s.appendBudget(tx, project, Object{\"policy_id\": goal[\"budget_policy_id\"], \"run_id\": run[\"id\"], \"operation\": \"RESERVE\", \"money\": profileBody[\"max_cost\"], \"provider_request_id\": requestID, \"provider_event_id\": requestID, \"reservation_id\": nil, \"cost_basis\": \"UPPER_BOUND\", \"occurred_at\": Now()})\n+\ttask, e := load(tx, project, \"Task\", Str(run, \"task_id\"))\n+\tif e != nil {\n+\t\treturn e\n+\t}\n+\tgoal, e := load(tx, project, \"Goal\", Str(task, \"goal_id\"))\n+\tif e != nil {\n+\t\treturn e\n+\t}\n+\t_, e = s.appendBudget(tx, project, Object{\"policy_id\": goal[\"budget_policy_id\"], \"run_id\": run[\"id\"], \"operation\": \"RESERVE\", \"money\": profileBody[\"max_cost\"], \"provider_request_id\": \"qualification-dispatch/\" + Str(run, \"id\"), \"provider_event_id\": \"qualification-dispatch/\" + Str(run, \"id\"), \"reservation_id\": nil, \"cost_basis\": \"UPPER_BOUND\", \"occurred_at\": Now()})\n \treturn e\n }\n \n"
+    },
+    {
+      "target": "apps/cli/cli_stream.go",
+      "base_ref": {
+        "path": "D:/作品集/ResearchOS/research-os/apps/cli/cli_stream.go",
+        "sha256": "58d541c2a7a07a2c55dc1af693f94f39067efb9440e48488dcf1352bfbd62eec",
+        "bytes": 29826
+      },
+      "current_ref": {
+        "path": "apps/cli/cli_stream.go",
+        "sha256": "58d541c2a7a07a2c55dc1af693f94f39067efb9440e48488dcf1352bfbd62eec",
+        "bytes": 29826
+      },
+      "selected_proposal_ref": {
+        "bytes": 30399,
+        "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+        "sha256": "87bfbd69972e674ae5255455ed26ce82ece167d8bb67155beed0cd52c05b9e6f"
+      },
+      "current_equals_declared_base": true,
+      "already_integrated": false,
+      "byte_conflict": false,
+      "forward_ref": {
+        "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/cli_stream.context_receipt.v5.proposed.go.main-to-proposal.diff",
+        "sha256": "267ebae9981c99595365cfd9d4afcf5e0d3b64e72e8669946a8c5486165ea061",
+        "bytes": 1577
+      },
+      "inverse_complete_text": "--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go\n+++ apps/cli/cli_stream.go\n@@ -110,7 +110,6 @@\n \treadInterrupt        *cliReadInterrupt\n \tresponseExit         int\n \ttransportUnreachable bool\n-\tlastVerifiedSessionSnapshot map[string]any\n }\n \n func (f *cliFlow) interrupt() {\n@@ -275,7 +274,6 @@\n \tif snap[\"project_id\"] != f.c.projectID || snap[\"session_id\"] != f.c.sessionID || snap[\"protocol_version\"] != clientProtocol {\n \t\treturn nil, \"SNAPSHOT_SCOPE_MISMATCH\", exitNotImplemented\n \t}\n-\tf.lastVerifiedSessionSnapshot = snap\n \treturn snap, \"\", 0\n }\n \n@@ -755,9 +753,6 @@\n \tout[\"operations\"], out[\"requests_sent\"] = f.operations, c.requestLog\n \tout[\"admission_command_id\"] = f.admissionCommand\n \tout[\"session_id\"], out[\"reason\"], out[\"detail\"] = c.sessionID, reason, detail\n-\tif f.lastVerifiedSessionSnapshot != nil && !readOnly {\n-\t\tout[\"last_verified_session_snapshot\"] = f.lastVerifiedSessionSnapshot\n-\t}\n \treturn out, code\n }\n \n@@ -838,13 +833,6 @@\n \t\t\tcode = exitFailed\n \t\t\tout[\"status\"], out[\"exit_code\"] = \"REJECTED\", code\n \t\t}\n-\t} else if c.sessionID != \"\" && c.projectID != \"\" && c.revision >= 1 {\n-\t\t// Original JSONL reports the exact persisted context after a successful save.\n-\t\tout[\"saved_context\"] = map[string]any{\n-\t\t\t\"project_id\": cfg.ProjectID, \"session_id\": cfg.SessionID,\n-\t\t\t\"session_revision\": cfg.Revision, \"writer_epoch\": cfg.WriterEpoch,\n-\t\t\t\"updated_by\": cfg.UpdatedBy,\n-\t\t}\n \t}\n \toutJSON(out)\n \treturn code\n"
+    }
+  ],
+  "input_refs": [
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/source_inverse.json",
+      "sha256": "0e02445a0c7f917a1af0e7eaa65cef2b83cea240a5cf3096f13dabca6f7bb035",
+      "bytes": 5626
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/handoff.json",
+      "sha256": "9ff39f669179399b62be320ea8c46c3107fc168dbfecaaa6ba0dd8dbb0c489db",
+      "bytes": 7430
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/report.json",
+      "sha256": "050b2151511520def6938b2f1e25e5e47380853e1a12dcbf578cb2efe86a8af6",
+      "bytes": 5079
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/report.json",
+      "sha256": "35a5dd9dc5c68fe121b83be6aebe4b92ee291dde7d7b17138cf951803c09e24d",
+      "bytes": 9714
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/source-inverse.json",
+      "sha256": "dcca439953c409ec18d332ccb89c23a958fed47c93dc36dec48726250bc833af",
+      "bytes": 8516
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/source-inverse.final.json",
+      "sha256": "9a3cb00478badb18b267b00f7569cf912de859e43fee7de35375e27f5ab01efc",
+      "bytes": 5056
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/source-inverse.json",
+      "sha256": "f1b608daeaed55e95682b16bc24ea27824cac85dbac79444a6c90037d9332b39",
+      "bytes": 3253
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/handoff.json",
+      "sha256": "b3b7fa96aa5fb3cd19dae1f9114643af8a5462eee5b3db884b062d2293c89f9a",
+      "bytes": 4357
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.proposed.go",
+      "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54",
+      "bytes": 16400
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.patch",
+      "sha256": "ff8afcc39c693046ca55992b93ba56e1d4629db18a247a97b08846b9a36b9852",
+      "bytes": 4397
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.proposed.go.inverse.patch",
+      "sha256": "c475d3c84865cfcd50549448f0e0d9a2f5aa5a06b88c354ac93032b1acb80841",
+      "bytes": 4397
+    },
+    {
+      "path": "internal/domain/runtime_qualification.go",
+      "sha256": "4b376196886f7202fa05f2e54d4083531651a459970276e05ac6c8203a879111",
+      "bytes": 14702
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.proposed.go",
+      "sha256": "393f4272eaafa218238421f1afc3caa6aebe01f810945f2853d6e69493cc4144",
+      "bytes": 8271
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.patch",
+      "sha256": "99719890e6fa92789966795250cbb214fc069e4c8d1340d6581c79020b45d0f3",
+      "bytes": 2855
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.proposed.go.inverse.patch",
+      "sha256": "1310265e46daaefaf4449fb2721711d560aaddcfe72150f5b33af0b27e7e3242",
+      "bytes": 2855
+    },
+    {
+      "path": "internal/host/vault.go",
+      "sha256": "75c00d534582c933839305c6e2e55190b82706111f2d33e3abe62e4f51c6a94c",
+      "bytes": 6435
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.proposed.go",
+      "sha256": "52df3013a5b14093cc3bb60e77b5bb86c8a9bfe7553658ed133cccffbf04f786",
+      "bytes": 8102
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.patch",
+      "sha256": "f81da37dac45f222a6936e02d5a4afd34ccc76dec84ec4152509fe950fc88596",
+      "bytes": 907
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.proposed.go.inverse.patch",
+      "sha256": "ad1608a90f6e4378730422256a951fa9e1184567493b975a323b39cd1dacee84",
+      "bytes": 907
+    },
+    {
+      "path": "internal/host/host.go",
+      "sha256": "65848ad3476ccaf6dd2e76cf0753cf8c7257e2762bc9f115dcd0d1675aeb02cd",
+      "bytes": 7714
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.proposed.go",
+      "sha256": "fd4e5f10e9cd87ea135e2d771a51a6d9129e2028d10abebb09fd5e46a1ababec",
+      "bytes": 12644
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.patch",
+      "sha256": "4ae5bc51a3cb31a6812d98bf6f61105839452f51d982eba1bc03dadef1fe6a51",
+      "bytes": 2259
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.proposed.go.inverse.patch",
+      "sha256": "adc53d00da34ab3757e9736d622dee47699a79c00632c4fc5f5bce4486355a40",
+      "bytes": 2259
+    },
+    {
+      "path": "apps/control/main.go",
+      "sha256": "1f22bf62899b122d319cacd6cd1b6e2cee3f3995824367e21d94b12a483eaedc",
+      "bytes": 11748
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go",
+      "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54",
+      "bytes": 16400
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go",
+      "sha256": "1994a00fe224ddd9f4a5d064a029356304ea5aaee118a096fabaee7418fd7e0e",
+      "bytes": 10235
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go",
+      "sha256": "58a1c6b6ceeb57a852560e759ba6e06a2db5acade97a1b400a83fbd6bb07826a",
+      "bytes": 8512
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go",
+      "sha256": "3ec7e36ac5f7d3b711b85350f882f82da4b77c3f3241daef5651969ae952c058",
+      "bytes": 12643
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py",
+      "sha256": "6f03caf4885f2d85012549e1790aab8896cc2980e90fdcc6668e7aad263aaec2",
+      "bytes": 43194
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-001.json",
+      "sha256": "a449ca1c1246f8f3080fd25abb43a921aaa360ba8bbde5497b8bcd4dfc510520",
+      "bytes": 2825
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-002.json",
+      "sha256": "773560b30a903b5157febcb834b15be972b585642fd830989f19c43aa2776dcb",
+      "bytes": 703
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-003.json",
+      "sha256": "89bf36b5350cfbc31964c0c3300c22d37aa1bec7f2fafa2f8ee97db3c35b0488",
+      "bytes": 2541
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go.patch",
+      "sha256": "ff8afcc39c693046ca55992b93ba56e1d4629db18a247a97b08846b9a36b9852",
+      "bytes": 4397
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go.inverse.patch",
+      "sha256": "c475d3c84865cfcd50549448f0e0d9a2f5aa5a06b88c354ac93032b1acb80841",
+      "bytes": 4397
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go.patch",
+      "sha256": "b702ed60d0f14518652a6cd0f9562a8ab501be472cb4fb130d2eeb77a6511f96",
+      "bytes": 4865
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go.inverse.patch",
+      "sha256": "82edf27ac1824a559a3f3cb642f665403d0123cccdeb22ec949935db90e2641d",
+      "bytes": 4865
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go.patch",
+      "sha256": "9c62f6c3f9ed07c47d05a4b71c7600f2f4b40aeb3422908f3ed8bc7d202117da",
+      "bytes": 1655
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go.inverse.patch",
+      "sha256": "56f08966b933398440201cdee28557f965d681bb19d3cf2f7f244b3793dc5d7a",
+      "bytes": 1655
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go.patch",
+      "sha256": "00332cbe7470fe55cb08319ad65b0b496e599a66b1f46cdd711f80b097966193",
+      "bytes": 2637
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go.inverse.patch",
+      "sha256": "da76c8ecf34ff49ce9033e28e0b4e6246631330a37ff46a232a84b0a6748cc08",
+      "bytes": 2637
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/input.v2.template.json",
+      "sha256": "a6cbb9fd2ad001645e37bf08943de91c04790c92eb2a1db1c3e7ffcd24842f1f",
+      "bytes": 1746
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/manifest.json",
+      "sha256": "ca6cc301a0671d1612458400ab95e34e6b76c5c0637b33e455a26c25c76c352e",
+      "bytes": 8879
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/precheck-results.seal.json",
+      "sha256": "45c712ebe3cc628d4604b150c54c42c3c7206276b38ffbb4fdb9f678c9123241",
+      "bytes": 667
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py.patch",
+      "sha256": "793d8bacd81e62ba84c6b1294044dbaaa7c781eb6d00661c16052619da5bb177",
+      "bytes": 39255
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py.inverse.patch",
+      "sha256": "4f970e67384c48954efa6c83c018d1478feb39b579d227b38a68b5cf19f8aafd",
+      "bytes": 39255
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/mu_sdk_trial.proposed.py",
+      "sha256": "690621499a4a64e80a8cde472ef9653856af2fabc3bb55d8bed7ea379872989d",
+      "bytes": 22960
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_independent_source_review_codex/33477ff3f8a94e57b4d9fdaabf3aa19e/review.json",
+      "sha256": "e21645fd05b1d4266ce4a30a326c4796e93b8065b5bce446965aa4bb864deb8d",
+      "bytes": 15110
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py.patch",
+      "sha256": "669fcad63f1650b0f50dea4a7064de7b975343592665914b3d92978cb40092dd",
+      "bytes": 19929
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py.inverse.patch",
+      "sha256": "82fd2fde1fb2a399807ba006569be8b63aa7923f77e2beaf06e3827145f7b6e8",
+      "bytes": 19929
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py",
+      "sha256": "626b8aba72cdcbad3afc50bccb83f08ec96475ae45c608677033f3f174ac246a",
+      "bytes": 53047
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go.patch",
+      "sha256": "454d16652fa7ae33d1cba5653147d858a1aed14a3298d7f25e44089344d3b5c3",
+      "bytes": 2146
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go.inverse.patch",
+      "sha256": "96ab71d906fd4548bb94cac51157dcbfed6a5f784a05fc6176851db55565776a",
+      "bytes": 2146
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go",
+      "sha256": "5bcf6aed6515bd991e5e7222999994e3d9192a6bd8f5a32b4669d4c67c0a6b50",
+      "bytes": 12082
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go.patch",
+      "sha256": "ce1a6c0d22c5d7a1ba74e324906a826f59208345ffc9c9808b3f5cfe5fb398e9",
+      "bytes": 982
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go.inverse.patch",
+      "sha256": "b3c91aa2556188f14d66ccbd590d536f3745c2eebc400806d700f8dffd831470",
+      "bytes": 982
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go",
+      "sha256": "6387df33f531be14d32c439095f9ebcf079fb7ae2c27697c98cdc9a554fb5dc7",
+      "bytes": 8703
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go.patch",
+      "sha256": "aa80420a7100165207eb090131acc9d0fdb829f64da1d14016d97677c311eb6a",
+      "bytes": 663
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go.inverse.patch",
+      "sha256": "21bf2b8cabb3663162e216e863522559b2bdb586237ca391a94cd8ba4c284ea6",
+      "bytes": 663
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go",
+      "sha256": "9a519be38a1c09a819864073eedf0eaf9941c4c75f95ded0c3e89143012da9b1",
+      "bytes": 12674
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go.inverse.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go",
+      "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54",
+      "bytes": 16400
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-001.json",
+      "sha256": "ecfdc7170a08f0d191b5e43da84349d23fbab2dfa638dcc076cedb239127dbbd",
+      "bytes": 3034
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-002.json",
+      "sha256": "e8d28dd2b7e552d6bda379390dcd5a35c120515aa32fa1cc41f630afec672d0f",
+      "bytes": 2334
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-003.json",
+      "sha256": "041f57bc545324295600fb93dad608a4a2974bb49e2082ca12b08d2f504221cd",
+      "bytes": 2191
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/precheck.v3.final.json",
+      "sha256": "67473c7d36e5e8869d646aa51b9e4c2640fb50d91600ac098f2834f8a3819606",
+      "bytes": 672
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_independent_source_review_codex/e0b3e659af91457c82383c12bd374851/review.json",
+      "sha256": "8d4608706e4cc70287a6f711fccaa208fbdc90075ee79cfcb2eee1992ca2fa88",
+      "bytes": 17544
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py",
+      "sha256": "216d7a68504a4d0028028627a39e029060b3299dfc81c2347eb53d97501e6def",
+      "bytes": 61699
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py.patch",
+      "sha256": "dae8cec021f51aae1d8795a4f2970812e8d4c50809501f01d4067930daf72617",
+      "bytes": 15384
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py.inverse.patch",
+      "sha256": "730ecb0b02eeca6107c5a60a8a6a9871e7ae0176c04d5e0582a222b93cc8fb80",
+      "bytes": 15384
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go",
+      "sha256": "5bcf6aed6515bd991e5e7222999994e3d9192a6bd8f5a32b4669d4c67c0a6b50",
+      "bytes": 12082
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go.inverse.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go",
+      "sha256": "6387df33f531be14d32c439095f9ebcf079fb7ae2c27697c98cdc9a554fb5dc7",
+      "bytes": 8703
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go.inverse.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go",
+      "sha256": "9a519be38a1c09a819864073eedf0eaf9941c4c75f95ded0c3e89143012da9b1",
+      "bytes": 12674
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go.inverse.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go",
+      "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54",
+      "bytes": 16400
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go.inverse.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json",
+      "sha256": "ff25624fdeaf0d314afa86a886a2504d6eecd28bc58cab06a3ba83b61e0f85aa",
+      "bytes": 1840
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/input.v3.template.json",
+      "sha256": "dfbb0425edace4dc9d8f9aff40c63acd971c9f89edceb486366c88969aab9c37",
+      "bytes": 1773
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json.patch",
+      "sha256": "a831f73339bd86cf98d32cef0fa5b751c981bb153f102c39be78190119e47256",
+      "bytes": 328
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json.inverse.patch",
+      "sha256": "773fb070bd9a93f8bc45eaf7ebecd08e8fda99f15417d6d5c1761b48b7aa842a",
+      "bytes": 328
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/mu_sdk_trial.v5.final.proposed.py",
+      "sha256": "2fecc76ffe1630df50f5e382bb9bce68dc791cefa4736ecee16e2fdb53251fbd",
+      "bytes": 65611
+    },
+    {
+      "path": "apps/cli/cli_stream.go",
+      "sha256": "58d541c2a7a07a2c55dc1af693f94f39067efb9440e48488dcf1352bfbd62eec",
+      "bytes": 29826
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+      "sha256": "87bfbd69972e674ae5255455ed26ce82ece167d8bb67155beed0cd52c05b9e6f",
+      "bytes": 30399
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runner.v4-to-v5.diff",
+      "sha256": "e06dd0c7a651cb212899335735746c0aac8b58979ec0ae100cb32a925d5e5ab9",
+      "bytes": 5673
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.main-to-v5.diff",
+      "sha256": "764c177332cbf657a869f96e7d92734ba8e2b044add60abb78e8de27df2c1a22",
+      "bytes": 1413
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "sha256": "5bcf6aed6515bd991e5e7222999994e3d9192a6bd8f5a32b4669d4c67c0a6b50",
+      "bytes": 12082
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "sha256": "6387df33f531be14d32c439095f9ebcf079fb7ae2c27697c98cdc9a554fb5dc7",
+      "bytes": 8703
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "sha256": "9a519be38a1c09a819864073eedf0eaf9941c4c75f95ded0c3e89143012da9b1",
+      "bytes": 12674
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "sha256": "420aaec664f877806af079d47cf5e5a0cc4950f2cdc42b8ae1dc16ef7a4c5c54",
+      "bytes": 16400
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v6_source_codex/e8d350ed0ed34a2c939f8cb894de2feb/mu_sdk_trial.v6.graph.proposed.py",
+      "sha256": "c4ad0061e6e62a8ae50c94d0b40ccf6aa703a20010b67dcb007537719c1f53f5",
+      "bytes": 82464
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/mu_sdk_trial.v7.final.proposed.py",
+      "sha256": "d527eaf03d83208751c046d024747cb42bdc2f806474f8dda7f8ae70c2716a98",
+      "bytes": 84032
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/forward.v6-to-v7.diff",
+      "sha256": "75e0a3ab64855011e4c1e9c1c9965b6312b5c3bd42623b906b812129a2d1a237",
+      "bytes": 5874
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/inverse.v7-to-v6.diff",
+      "sha256": "74bc70ab237ea5856f4405cb62733205ba0ebad106e91c652a54e56d8354f7d9",
+      "bytes": 5874
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/manifest.json",
+      "sha256": "8bd0a26b50db351af28e9cf2353fc57f278a2d5c0cfe9dd73cd45b843557e439",
+      "bytes": 6068
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/tool-failure-origin-001.json",
+      "sha256": "84ab0975cacb933491d5bb544daf69fdeddfeb198d6f07cbe11211e171582c8f",
+      "bytes": 1022
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/tool-failure-origin-002.json",
+      "sha256": "55abb678bffdef734e518d0385fdfa4eebe9474f64e5b50092911d1b5e6529cd",
+      "bytes": 1559
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/report.final.json",
+      "sha256": "e1f5127040ad9220dd2b6414ac6a893aab4f56c89f57b0d4420fdbf724238cfd",
+      "bytes": 2325
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v6_independent_source_review_codex/ef4206a717d4407bac66097b27e3a7a5/review.json",
+      "sha256": "2e8647bb612f5224081fcca6fc01530d2041e7cd22bbddbebbffcbd6d5c7c554",
+      "bytes": 9115
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/static-audit.json",
+      "sha256": "e93dddf26e582e273841af3a6d35bdf953f5e02696891a0f089d1ab4d83189cd",
+      "bytes": 1226
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_independent_source_review_codex/cd8b3f9a43c9483695d4efc72e2cb7d8/review.json",
+      "sha256": "672ed781c56e3790a48250a201f1662835818de7ab7918c65a423e9e393523f1",
+      "bytes": 5156
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/internal_host_vault.v5.proposed.go.main-to-proposal.diff",
+      "sha256": "673434686e02b659c8201ab3fefbb95f5932a0d27ce4433909bd148c0ef09b2d",
+      "bytes": 6905
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/internal_host_host.v5.proposed.go.main-to-proposal.diff",
+      "sha256": "24aaff3886f3afa93c072af546039c33ba926778a27f58e79d2bd65e1b80f58e",
+      "bytes": 2219
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/apps_control_main.v5.proposed.go.main-to-proposal.diff",
+      "sha256": "7e4d0f10ab50852266e988042193f80c437aced570242af93078bc4c709bc87d",
+      "bytes": 2820
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/runtime_qualification.unlimited.v5.proposed.go.main-to-proposal.diff",
+      "sha256": "6acdd43bb9f854d5e5d1130c7fa15a397ad0c2d9e13ea1b911f497a18d395896",
+      "bytes": 4543
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/cli_stream.context_receipt.v5.proposed.go.main-to-proposal.diff",
+      "sha256": "267ebae9981c99595365cfd9d4afcf5e0d3b64e72e8669946a8c5486165ea061",
+      "bytes": 1577
+    },
+    {
+      "path": "execution/v2.4/receipts/W05/W05-99/main_exact38_integration_preparation_codex/revision-v2-ed1a1dab301a40b293dd6a177980cfaf/integrate_exact38.v2.py",
+      "sha256": "e2f98bded200afc15cf1afecbc73d0423dcc1ab0a16e5497ca4a1dd7e244d6ff",
+      "bytes": 28207
+    }
+  ],
+  "checks": [
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "internal/domain/runtime_qualification.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "internal/host/vault.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "internal/host/host.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "apps/control/main.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-001.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-002.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-003.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/input.v2.template.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/manifest.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/precheck-results.seal.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/report.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-001.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-002.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/tool-failure-origin-003.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/precheck-results.seal.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/apps_control_main.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_host.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/runtime_qualification.unlimited.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/mu_sdk_trial.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_executable_source_codex/1b8bc13521764e508f540dc2399ac33d/internal_host_vault.go.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_independent_source_review_codex/33477ff3f8a94e57b4d9fdaabf3aa19e/review.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/mu_sdk_trial.v2.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_vault.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/internal_host_host.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/apps_control_main.v2.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_source_codex/1ccdc0cec995488c82400608ed275029/runtime_qualification.unlimited.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-001.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-002.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/tool-failure-origin-003.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/precheck.v3.final.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_revision_independent_source_review_codex/e0b3e659af91457c82383c12bd374851/review.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/mu_sdk_trial.v3.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_vault.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/internal_host_host.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/apps_control_main.v3.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/runtime_qualification.unlimited.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v3_source_codex/06f264848e274b198f3e03a1c072e44e/input.v3.template.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/input.v4.template.json.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/mu_sdk_trial.v4.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/mu_sdk_trial.v5.final.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "apps/cli/cli_stream.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runner.v4-to-v5.diff",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.main-to-v5.diff",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_vault.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/internal_host_host.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/apps_control_main.v4.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v4_source_codex/87c5a05ce5054e3c9ffa2f62ba898c57/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v6_source_codex/e8d350ed0ed34a2c939f8cb894de2feb/mu_sdk_trial.v6.graph.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/mu_sdk_trial.v7.final.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/forward.v6-to-v7.diff",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/inverse.v7-to-v6.diff",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/mu_sdk_trial.v7.final.proposed.py",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/source-inverse.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/manifest.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/tool-failure-origin-001.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/tool-failure-origin-002.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/report.final.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v6_independent_source_review_codex/ef4206a717d4407bac66097b27e3a7a5/review.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v7_source_codex/73cdde53fe0e4da2ae29fb6898d4b7ef/static-audit.json",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "review exact pin",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "full current-target inverse restore",
+      "path": "internal/host/vault.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "full current-target inverse restore",
+      "path": "internal/host/host.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "full current-target inverse restore",
+      "path": "apps/control/main.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "full current-target inverse restore",
+      "path": "internal/domain/runtime_qualification.go",
+      "passed": true
+    },
+    {
+      "kind": "pin",
+      "path": "execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/cli_stream.context_receipt.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "full current-target inverse restore",
+      "path": "apps/cli/cli_stream.go",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\runtime_qualification.unlimited.v2.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\runtime_qualification.unlimited.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\internal_host_vault.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\internal_host_vault.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\internal_host_host.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\internal_host_host.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\apps_control_main.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "original inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_executable_source_codex\\1b8bc13521764e508f540dc2399ac33d\\apps_control_main.go.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\runtime_qualification.unlimited.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\runtime_qualification.unlimited.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\internal_host_vault.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\internal_host_vault.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\internal_host_host.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\internal_host_host.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\apps_control_main.v2.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v2 Main inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_revision_source_codex\\1ccdc0cec995488c82400608ed275029\\apps_control_main.v2.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\internal_host_vault.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\internal_host_vault.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\internal_host_host.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\internal_host_host.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\apps_control_main.v3.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\apps_control_main.v3.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\runtime_qualification.unlimited.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v3 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v3_source_codex\\06f264848e274b198f3e03a1c072e44e\\runtime_qualification.unlimited.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\internal_host_vault.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\internal_host_vault.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\internal_host_host.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\internal_host_host.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\apps_control_main.v4.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\apps_control_main.v4.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\runtime_qualification.unlimited.v5.proposed.go.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v4 inverse",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v4_source_codex\\87c5a05ce5054e3c9ffa2f62ba898c57\\runtime_qualification.unlimited.v5.proposed.go.inverse.patch",
+      "passed": true
+    },
+    {
+      "kind": "whole legacy patch",
+      "label": "v5 CLI forward",
+      "path": "execution\\v2.4\\receipts\\W05\\W05-99\\mu_model_sdk_real_trial_v5_source_codex\\39387323960a441ca81f04b9bcdecd17\\cli_stream.main-to-v5.diff",
+      "passed": true
+    },
+    {
+      "kind": "v4-v5 identical Go",
+      "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_vault.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "v4-v5 identical Go",
+      "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/internal_host_host.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "v4-v5 identical Go",
+      "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/apps_control_main.v5.proposed.go",
+      "passed": true
+    },
+    {
+      "kind": "v4-v5 identical Go",
+      "path": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_model_sdk_real_trial_v5_source_codex/39387323960a441ca81f04b9bcdecd17/runtime_qualification.unlimited.v5.proposed.go",
+      "passed": true
+    }
+  ],
+  "failed_checks": [],
+  "directly_reusable_sdk_integration_helper_matches": [],
+  "old_helper_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/main_exact38_integration_preparation_codex/revision-v2-ed1a1dab301a40b293dd6a177980cfaf/integrate_exact38.v2.py",
+    "sha256": "e2f98bded200afc15cf1afecbc73d0423dcc1ab0a16e5497ca4a1dd7e244d6ff",
+    "bytes": 28207
+  },
+  "old_helper_not_reusable_reason": "Exact38 helper hardcodes old four-commit chain, 38 paths, registration321/149/422 and historical grant/review scopes; cannot execute it for five SDK proposals.",
+  "preservation": "All five current files exactly equal their declared Main bases. No intervening edits within those five paths are observed. Preserve all other Main/dirty work, old receipt namespaces, canonical four, credential vault and SDK runner. Scope7 closed/failure namespace is independent.",
+  "integration_boundary": "Only the five Go path mappings are adoption inputs. The v7 runner remains a separately pinned source receipt; this audit grants no CLI/SDK/model execution authority.",
+  "new_failure_origin_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/sdk_v7_main_adoption_input_review_codex/10fa04459341487fbd4e302b5d27409e/failure-origin.672.original.json",
+    "sha256": "1629af82e8f0bb1f9e18bcf583cf32fa2126ef2b28349fd36e88109a859c628c",
+    "bytes": 8661
+  },
+  "new_failure_count": 1,
+  "source_controls_reexecuted": 0,
+  "Go_CLI_SDK_model_Git_CAS_calls": 0,
+  "Main_writes": 0,
+  "canonical_writes": 0
+}

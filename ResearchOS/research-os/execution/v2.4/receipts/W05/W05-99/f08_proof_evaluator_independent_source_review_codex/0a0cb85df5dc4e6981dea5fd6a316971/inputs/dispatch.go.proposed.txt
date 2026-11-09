@@ -1,0 +1,83 @@
+// Dispatch transition checks operate on actual SQL OLD/NEW/source tuples.
+// Observation INSERT remains deferred: the transition does not invent an
+// observation or grant finalization before its actual immutable row exists.
+func (v *f08ProofValidator) dispatchManifest(s *f08Sources,row []any,run,task f08Version)(map[string]any,error){
+	if e:=f08ValidateTuple("dispatches",row);e!=nil{return nil,e}
+	m,_,e:=f08RawObject(row[4]);if e!=nil{return nil,e}
+	if _,e=f08Object(m,"version","project_id","run_id","task_id","epoch","runtime_id","executor_principal_id","contract_hash","input_refs","context_bundle_id","checkpoint_artifact_id","admission","dispatch_key");e!=nil{return nil,e}
+	contract,ok:=task.body["acceptance_contract"].(map[string]any);if !ok{return nil,f08Shape}
+	if Hash(m)!=row[5] || m["project_id"]!=row[0] || m["run_id"]!=row[1] || m["dispatch_key"]!=row[3] || !f08Equal(m["epoch"],row[2]) || !f08Equal(m["version"],f08Number(1)){return nil,f08Binding}
+	if task.project!=run.project || run.project!=row[0] || run.id!=row[1] || run.body["task_id"]!=task.id || task.body["active_run_id"]!=run.id{return nil,f08Binding}
+	for key,want:=range map[string]any{"task_id":task.id,"epoch":run.body["lease_epoch"],"runtime_id":run.body["runtime_id"],"executor_principal_id":run.body["executor_principal_id"],"contract_hash":contract["contract_hash"],"input_refs":run.body["input_refs"],"context_bundle_id":run.body["context_bundle_id"],"checkpoint_artifact_id":run.body["checkpoint_artifact_id"]}{if !f08Equal(m[key],want){return nil,f08Binding}}
+	if _,ok:=m["admission"].(map[string]any);!ok{return nil,f08Shape};return m,nil
+}
+func f08Identity(rawHex any)(map[string]any,error){
+	id,_,e:=f08RawObject(rawHex);if e!=nil{return nil,e};return id,nil
+}
+func f08BoundIdentity(id map[string]any)error{
+	if _,e:=f08Object(id,"pid","process_created_ns","job","appcontainer_sid","profile","staging_directory");e!=nil{return e}
+	pid,e:=f08Integer(id["pid"],1);if e!=nil || pid>4294967295{return f08Binding}
+	created,e:=f08String(id["process_created_ns"]);if e!=nil{return e};n,e:=strconv.ParseInt(created,10,64)
+	if e!=nil || n<=0 || strconv.FormatInt(n,10)!=created{return f08Binding}
+	for _,key:=range []string{"job","appcontainer_sid","profile","staging_directory"}{if _,e=f08String(id[key]);e!=nil{return e}}
+	return nil
+}
+func f08RetainedColumns(old,row []any,mutable ...int)bool{
+	allowed:=map[int]bool{};for _,i:=range mutable{allowed[i]=true}
+	if len(old)!=len(row){return false};for i:=range row{if !allowed[i] && !f08Equal(old[i],row[i]){return false}};return true
+}
+func (v *f08ProofValidator) dispatchUpdate(s *f08Sources,old,row []any)error{
+	if e:=f08ValidateTuple("dispatches",old);e!=nil{return e};if e:=f08ValidateTuple("dispatches",row);e!=nil{return e}
+	actual,e:=s.one("dispatches",[]int{0,1,2},old[:3]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+	if !f08RetainedColumns(old,row,6,7,8,9,10,11,13,14){return f08Binding}
+	before,e:=f08Identity(old[9]);if e!=nil{return e};after,e:=f08Identity(row[9]);if e!=nil{return e}
+	oldSequence,e:=f08Integer(old[10],0);if e!=nil{return e};sequence,e:=f08Integer(row[10],0);if e!=nil{return e}
+	state0,state:=old[6].(string),row[6].(string)
+	switch {
+	case state0=="PREPARED" && state=="STARTED":
+		if old[7]!="" || old[8]!="" || len(before)!=0 || oldSequence!=0 || old[11]!="" || row[7]=="" || row[8]!=row[3] || len(after)!=0 || sequence!=0 || row[11]!="" || row[14]!=old[14]{return f08Binding}
+		run,e:=v.head(s,row[0].(string),"Run",row[1].(string));if e!=nil{return e}
+		if run.body["status"]!="RUNNING" && run.body["status"]!="QUEUED"{return f08Binding}
+		if !f08NullFields(run.body,"cancel_requested_at","cancel_confirmed_at","ended_at") || !f08Equal(run.body["lease_epoch"],row[2]){return f08Binding}
+		taskID,e:=f08String(run.body["task_id"]);if e!=nil{return e};task,e:=v.head(s,run.project,"Task",taskID);if e!=nil{return e}
+		if _,e=v.dispatchManifest(s,row,run,task);e!=nil{return e}
+		goalID,e:=f08String(task.body["goal_id"]);if e!=nil{return e};goal,e:=v.head(s,run.project,"Goal",goalID);if e!=nil || goal.body["status"]!="ACTIVE"{return f08Binding}
+		for _,member:=range s.rows["final_members"]{
+			if member[1]!=row[0]{continue};m,_,e:=f08RawObject(member[8]);if e!=nil{return e}
+			if m["proof_kind"]!="NEVER_LAUNCHED_NATIVE"{continue}
+			d,ok:=m["dispatch_final_binding"].(map[string]any);if !ok{return f08Shape}
+			if d["run_id"]==row[1] && f08Equal(d["epoch"],row[2]){return f08Binding}
+		}
+		return nil
+	case state0=="STARTED" && state=="STARTED":
+		if !f08RetainedColumns(old,row,9,13) || old[7]=="" || old[8]!=old[3] || sequence!=0 || row[11]!=""{return f08Binding}
+		if len(before)==0 {if len(after)==0{return f08Binding}} else if !f08Equal(before,after){return f08Binding}
+		return f08BoundIdentity(after)
+	case (state0=="PREPARED" || state0=="STARTED" || state0=="UNKNOWN") && state=="UNKNOWN":
+		if !f08RetainedColumns(old,row,6,13,14){return f08Binding};return nil
+	case (state0=="STARTED" || state0=="UNKNOWN" || state0=="OBSERVED") && state=="OBSERVED":
+		if !f08RetainedColumns(old,row,6,10,11,13) || row[7]=="" || row[8]!=row[3] || len(after)==0 || sequence<oldSequence || sequence<=0{return f08Binding}
+		if sequence==oldSequence && row[11]!=old[11]{return f08Binding}
+		if _,e=f08HashString(row[11]);e!=nil{return e}
+		return f08BoundIdentity(after)
+	default:return f08Binding
+	}
+}
+
+func (v *f08ProofValidator) eventFor(s *f08Sources,aggregate f08Version,eventType string)(f08Version,map[string]any,error){
+	var zero f08Version;var selected f08Version;var result map[string]any;count:=0
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=aggregate.project || row[1]!="EventEnvelope"{continue}
+		event,e:=v.version(s,aggregate.project,map[string]any{"entity_type":"EventEnvelope","id":row[2],"revision":row[3],"content_hash":row[5]});if e!=nil{return zero,nil,e}
+		if event.body["event_type"]!=eventType || !f08Equal(event.body["aggregate_ref"],aggregate.ref()){continue}
+		outbox,e:=s.one("outbox",[]int{0,1,2},[]any{aggregate.project,event.body["sequence"],event.id});if e!=nil{return zero,nil,e}
+		raw,e:=f08Hex(outbox[3]);if e!=nil || !bytes.Equal(raw,event.raw){return zero,nil,f08Binding}
+		selected=event;result=map[string]any{"version_ref":event.ref(),"outbox_id":outbox[2],"sequence":outbox[1],"body_digest":f08RawHash(raw)};count++
+	}
+	if count!=1{return zero,nil,f08Binding};return selected,result,nil
+}
+func f08VersionAnchor(version f08Version)map[string]any{return map[string]any{"ref":version.ref(),"body_digest":f08RawHash(version.raw)}}
+func (v *f08ProofValidator) resolveAnchor(s *f08Sources,project string,value any)(f08Version,error){
+	var zero f08Version;m,e:=f08Object(value,"ref","body_digest");if e!=nil{return zero,e}
+	x,e:=v.version(s,project,m["ref"]);if e!=nil || m["body_digest"]!=f08RawHash(x.raw){return zero,f08Binding};return x,nil
+}

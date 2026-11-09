@@ -1,0 +1,442 @@
+SCHEMA internal/domain/contracts/client.protocol.schema.json SHA256 8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b {
+  "type": "object",
+  "properties": {
+    "part_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string"
+    },
+    "complete": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "part_index",
+    "text",
+    "complete"
+  ],
+  "additionalProperties": false
+}
+
+FILE internal/domain/client_protocol_journal.go SHA256 75aee5bbdb4f12afbc00cd6432c46d9d73bba6cb4f6f6ff3ad4d5023aa51ca19 LINES 254-390
+254: func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, project, sessionID string) (map[string]any, error) {
+255: 	var (
+256: 		revision, wm, epoch                     int64
+257: 		createdAt, updatedAt                    string
+258: 		writerClient                            string
+259: 		goalID, taskID, runID                   sql.NullString
+260: 		leaseExpires, workspaceRef, title       sql.NullString
+261: 		modelConfigRef, coreBuildID, archivedAt sql.NullString
+262: 		resumeExplicit                          int
+263: 	)
+264: 	err := tx.QueryRowContext(ctx, `SELECT revision, event_watermark, writer_epoch, created_at, updated_at,
+265: 		goal_id, task_id, run_id, lease_expires_at, workspace_ref, title, model_config_ref, core_build_id,
+266: 		archived_at, resume_requires_explicit_user, writer_client_id, upstream_session_id
+267: 		FROM client_sessions WHERE id=? AND project_id=?`, sessionID, project).
+268: 		Scan(&revision, &wm, &epoch, &createdAt, &updatedAt, &goalID, &taskID, &runID,
+269: 			&leaseExpires, &workspaceRef, &title, &modelConfigRef, &coreBuildID,
+270: 			&archivedAt, &resumeExplicit, &writerClient, new(sql.NullString))
+271: 	if errors.Is(err, sql.ErrNoRows) {
+272: 		return nil, ErrUnknownSession
+273: 	}
+274: 	if err != nil {
+275: 		return nil, err
+276: 	}
+277: 	var upstream string
+278: 	if err := tx.QueryRowContext(ctx, `SELECT upstream_session_id FROM client_sessions WHERE id=?`, sessionID).Scan(&upstream); err != nil {
+279: 		return nil, err
+280: 	}
+281: 	for name, v := range map[string]string{"workspace_ref": workspaceRef.String, "model_config_ref": modelConfigRef.String,
+282: 		"core_build_id": coreBuildID.String, "native_session_ref": upstream} {
+283: 		if v == "" {
+284: 			return nil, fmt.Errorf("%w:%s", ErrSnapshotIncomplete, name)
+285: 		}
+286: 	}
+287: 	transcript, err := replaySessionTranscript(ctx, tx, doc, project, sessionID)
+288: 	if err != nil {
+289: 		return nil, err
+290: 	}
+291: 	transcriptRef, err := snapshotTranscriptRef(ctx, tx, project, sessionID, transcript)
+292: 	if err != nil {
+293: 		return nil, err
+294: 	}
+295: 	messages := transcript.messages
+296: 	hasEarlier := len(messages) > MaxSnapshotMessages
+297: 	start := 0
+298: 	if hasEarlier {
+299: 		start = len(messages) - MaxSnapshotMessages
+300: 		messages = messages[start:]
+301: 	}
+302: 	earliest := int64(0)
+303: 	if len(messages) > 0 {
+304: 		earliest, _ = Num(transcript.sequences[start].(Object), "start_sequence")
+305: 	}
+306: 	writer := any(nil)
+307: 	if leaseExpires.Valid {
+308: 		writer = map[string]any{"client_id": writerClient, "epoch": epoch, "expires_at": leaseExpires.String}
+309: 	}
+310: 	permissions, err := snapshotPermissions(ctx, tx, doc, project, sessionID)
+311: 	if err != nil {
+312: 		return nil, err
+313: 	}
+314: 	pending, err := clientPendingCommands(ctx, tx, project, sessionID)
+315: 	if err != nil {
+316: 		return nil, err
+317: 	}
+318: 	snap := map[string]any{
+319: 		"session_id":                    sessionID,
+320: 		"project_id":                    project,
+321: 		"workspace_ref":                 workspaceRef.String,
+322: 		"native_session_ref":            upstream,
+323: 		"core_build_id":                 coreBuildID.String,
+324: 		"protocol_version":              ProtocolV2,
+325: 		"revision":                      revision,
+326: 		"title":                         title.String,
+327: 		"archived_at":                   nullable(archivedAt),
+328: 		"created_at":                    createdAt,
+329: 		"updated_at":                    updatedAt,
+330: 		"model_config_ref":              modelConfigRef.String,
+331: 		"goal_id":                       nullable(goalID),
+332: 		"active_run_id":                 nullable(runID),
+333: 		"run_status":                    mappedStatus(ctx, tx, runID, runStatusMap),
+334: 		"goal_status":                   mappedStatus(ctx, tx, goalID, goalStatusMap),
+335: 		"writer":                        writer,
+336: 		"event_sequence":                wm,
+337: 		"earliest_event_sequence":       earliest,
+338: 		"checkpoint_artifact_ref":       nil,
+339: 		"pending_command_ids":           pending,
+340: 		"pending_permissions":           permissions,
+341: 		"resume_requires_explicit_user": resumeExplicit == 1,
+342: 		"messages":                      messages,
+343: 		"transcript_artifact_ref":       transcriptRef,
+344: 		"has_earlier_messages":          hasEarlier,
+345: 	}
+346: 	if doc != nil {
+347: 		if err := doc.ValidateDef("SessionSnapshot", normalizeNumbers(snap)); err != nil {
+348: 			return nil, fmt.Errorf("SNAPSHOT_SCHEMA:%v", err)
+349: 		}
+350: 	}
+351: 	return snap, nil
+352: }
+353: 
+354: func nullable(s sql.NullString) any {
+355: 	if s.Valid {
+356: 		return s.String
+357: 	}
+358: 	return nil
+359: }
+360: 
+361: func mappedStatus(ctx context.Context, tx *sql.Tx, ref sql.NullString, table map[string]string) any {
+362: 	if !ref.Valid {
+363: 		return nil
+364: 	}
+365: 	var body string
+366: 	if err := tx.QueryRowContext(ctx, `SELECT body FROM domain_objects WHERE id=? LIMIT 1`, ref.String).Scan(&body); err != nil {
+367: 		return nil
+368: 	}
+369: 	var m map[string]any
+370: 	if json.Unmarshal([]byte(body), &m) != nil {
+371: 		return nil
+372: 	}
+373: 	s, ok := m["status"].(string)
+374: 	if !ok {
+375: 		return nil
+376: 	}
+377: 	if mapped, ok := table[s]; ok {
+378: 		return mapped
+379: 	}
+380: 	return nil
+381: }
+382: 
+383: // normalizeNumbers round-trips through JSON so int64/string Go types become the same
+384: // generic tree the schema validator sees for a fixture.
+385: func normalizeNumbers(m map[string]any) map[string]any {
+386: 	b, _ := json.Marshal(m)
+387: 	var out map[string]any
+388: 	json.Unmarshal(b, &out)
+389: 	return out
+390: }
+
+FILE internal/domain/client_protocol_queue_control.go SHA256 38616234985ef06bba6850b1629cb1774296edff4364dee3cc211c4c13131576 LINES 1-280
+1: package domain
+2: 
+3: import (
+4: 	"context"
+5: 	"database/sql"
+6: 	"encoding/json"
+7: )
+8: 
+9: func (s *Service) cancelGoalQueueTasks(tx *sql.Tx, project, goal string) error {
+10: 	rows, err := tx.Query(`SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.goal_id')=?`, project, goal)
+11: 	if err != nil {
+12: 		return err
+13: 	}
+14: 	tasks := []Object{}
+15: 	for rows.Next() {
+16: 		var raw string
+17: 		if err = rows.Scan(&raw); err != nil {
+18: 			rows.Close()
+19: 			return err
+20: 		}
+21: 		task, e := queueObject(raw)
+22: 		if e != nil {
+23: 			rows.Close()
+24: 			return e
+25: 		}
+26: 		tasks = append(tasks, task)
+27: 	}
+28: 	err = rows.Err()
+29: 	rows.Close()
+30: 	if err != nil {
+31: 		return err
+32: 	}
+33: 	for _, task := range tasks {
+34: 		if err = fenceClientTask(tx, project, Str(task, "id")); err != nil {
+35: 			return err
+36: 		}
+37: 		if task["status"] != "CANCELLED" && task["status"] != "ACCEPTED" {
+38: 			if _, err = s.controlTask(tx, Principal{ID: "goal-control"}, project, task, Object{"action": "CANCEL", "reason": "Goal cancelled"}, ID()); err != nil {
+39: 				return err
+40: 			}
+41: 		}
+42: 	}
+43: 	return nil
+44: }
+45: 
+46: func fenceClientTask(tx *sql.Tx, project, task string) error {
+47: 	installed, err := clientQueueInstalled(tx)
+48: 	if err != nil || !installed {
+49: 		return err
+50: 	}
+51: 	var session string
+52: 	err = tx.QueryRow(`SELECT id FROM client_sessions WHERE project_id=? AND task_id=?`, project, task).Scan(&session)
+53: 	if err == sql.ErrNoRows {
+54: 		return nil
+55: 	}
+56: 	if err != nil {
+57: 		return err
+58: 	}
+59: 	if err = ensureClientQueue(tx, project, session, task); err != nil {
+60: 		return err
+61: 	}
+62: 	var generation string
+63: 	if err = tx.QueryRow(`SELECT generation FROM client_queue_fences WHERE project=? AND task_id=?`, project, task).Scan(&generation); err != nil {
+64: 		return err
+65: 	}
+66: 	if _, err = tx.Exec(`UPDATE client_queue_fences SET state='CANCEL_FENCED',revision=revision+1 WHERE generation=? AND state<>'SEALED'`, generation); err != nil {
+67: 		return err
+68: 	}
+69: 	rows, err := tx.Query(`SELECT command_id,state,last_receipt_id FROM client_command_queue WHERE generation=? AND state IN ('ENQUEUED','SENDING','SDK_ACCEPTED')`, generation)
+70: 	if err != nil {
+71: 		return err
+72: 	}
+73: 	type entry struct {
+74: 		id, state string
+75: 		prior     sql.NullString
+76: 	}
+77: 	entries := []entry{}
+78: 	for rows.Next() {
+79: 		var item entry
+80: 		if err = rows.Scan(&item.id, &item.state, &item.prior); err != nil {
+81: 			rows.Close()
+82: 			return err
+83: 		}
+84: 		entries = append(entries, item)
+85: 	}
+86: 	err = rows.Err()
+87: 	rows.Close()
+88: 	if err != nil {
+89: 		return err
+90: 	}
+91: 	for _, item := range entries {
+92: 		next := "DROP_REQUESTED"
+93: 		if item.state == "ENQUEUED" {
+94: 			next = "DROPPED"
+95: 		}
+96: 		receipt := ID()
+97: 		var previous any
+98: 		if item.prior.Valid {
+99: 			previous = item.prior.String
+100: 		}
+101: 		if err = appendClientReceipt(tx, project, generation, item.id, "CANCEL_FENCE", receipt, Object{"task_id": task, "from": item.state, "to": next}, previous); err != nil {
+102: 			return err
+103: 		}
+104: 		if _, err = tx.Exec(`UPDATE client_command_queue SET state=?,revision=revision+1,last_receipt_id=? WHERE generation=? AND command_id=?`, next, receipt, generation, item.id); err != nil {
+105: 			return err
+106: 		}
+107: 	}
+108: 	_, err = tx.Exec(`UPDATE client_sessions SET resume_requires_explicit_user=1 WHERE id=?`, session)
+109: 	return err
+110: }
+111: 
+112: func (s *ClientService) cancelClientTarget(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow, target string) (*Response, error) {
+113: 	p, err := clientPrincipal(ctx, tx, principal, sess.project, true)
+114: 	if err != nil {
+115: 		return clientFault(env, err)
+116: 	}
+117: 	var goal, task sql.NullString
+118: 	if err = tx.QueryRow(`SELECT goal_id,task_id FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, sess.project).Scan(&goal, &task); err != nil {
+119: 		return nil, err
+120: 	}
+121: 	ids := []string{}
+122: 	if target == goal.String && goal.Valid {
+123: 		rows, e := tx.Query(`SELECT id FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.goal_id')=? ORDER BY id`, sess.project, target)
+124: 		if e != nil {
+125: 			return nil, e
+126: 		}
+127: 		for rows.Next() {
+128: 			var id string
+129: 			if e = rows.Scan(&id); e != nil {
+130: 				rows.Close()
+131: 				return nil, e
+132: 			}
+133: 			ids = append(ids, id)
+134: 		}
+135: 		e = rows.Err()
+136: 		rows.Close()
+137: 		if e != nil {
+138: 			return nil, e
+139: 		}
+140: 		g, e := load(tx, sess.project, "Goal", target)
+141: 		if e != nil {
+142: 			return nil, e
+143: 		}
+144: 		if g["status"] != "CANCELLED" {
+145: 			g["status"] = "CANCELLED"
+146: 			if e = bump(g); e != nil {
+147: 				return nil, e
+148: 			}
+149: 			if e = s.Domain.put(tx, "Goal", g); e != nil {
+150: 				return nil, e
+151: 			}
+152: 		}
+153: 	} else if target == sess.runID && target != "" {
+154: 		r, e := load(tx, sess.project, "Run", target)
+155: 		if e != nil {
+156: 			return nil, e
+157: 		}
+158: 		taskID := Str(r, "task_id")
+159: 		if task.Valid && task.String != taskID {
+160: 			return NewTypedRejection(env, "NOT_FOUND", "run no longer belongs to session task"), nil
+161: 		}
+162: 		ids = append(ids, taskID)
+163: 	} else {
+164: 		return NewTypedRejection(env, "NOT_FOUND", "cancel target is not this session's Goal or Run"), nil
+165: 	}
+166: 	if len(ids) == 0 {
+167: 		return NewTypedRejection(env, "NOT_FOUND", "cancel target has no owned tasks"), nil
+168: 	}
+169: 	for _, id := range ids {
+170: 		t, e := load(tx, sess.project, "Task", id)
+171: 		if e != nil {
+172: 			return nil, e
+173: 		}
+174: 		if e = fenceClientTask(tx, sess.project, id); e != nil {
+175: 			return nil, e
+176: 		}
+177: 		if t["status"] != "CANCELLED" && t["status"] != "ACCEPTED" {
+178: 			if _, e = s.Domain.controlTask(tx, p, sess.project, t, Object{"action": "CANCEL", "reason": "Authenticated client cancellation"}, deref(env.CommandID)); e != nil {
+179: 				return clientFault(env, e)
+180: 			}
+181: 		}
+182: 		if runID := Str(t, "active_run_id"); runID != "" {
+183: 			r, e := load(tx, sess.project, "Run", runID)
+184: 			if e != nil {
+185: 				return nil, e
+186: 			}
+187: 			if r["status"] == "CANCEL_REQUESTED" {
+188: 				if e = s.journal(ctx, tx, env, sess, "RUN_STATE", Object{"run_id": runID, "status": r["status"], "revision": r["revision"], "cancel_requested_at": r["cancel_requested_at"], "cancel_confirmed_at": r["cancel_confirmed_at"], "settled_at": r["runtime_settled_at"], "children_stopped": r["children_stopped"], "queue_empty": r["queue_empty"]}); e != nil {
+189: 					return nil, e
+190: 				}
+191: 				sess.revision++
+192: 				sess.watermark++
+193: 			}
+194: 		}
+195: 	}
+196: 	hash, err := env.ContentHash()
+197: 	if err != nil {
+198: 		return nil, err
+199: 	}
+200: 	control := "ctrl-" + deref(env.CommandID)
+201: 	if _, err = tx.Exec(`INSERT INTO client_control_requests(principal,project,command_id,session_id,control_request_id,request_hash,target_id,task_ids,state,created_at) VALUES(?,?,?,?,?,?,?,?,'REQUESTED',?)`, principal, sess.project, deref(env.CommandID), sess.sessionID, control, hash, target, string(Bytes(ids)), Now()); err != nil {
+202: 		return nil, err
+203: 	}
+204: 	result, err := s.finalizeClientCancel(ctx, tx, env, principal, sess)
+205: 	if err != nil {
+206: 		return nil, err
+207: 	}
+208: 	if result != nil {
+209: 		return result, nil
+210: 	}
+211: 	return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("ACKNOWLEDGED"), SessionID: env.SessionID, Revision: revPtr(sess.revision), Result: Object{"accepted_at": Now(), "operation_id": "op-" + deref(env.CommandID), "after_sequence": sess.watermark, "related_resource_ref": nil}}, nil
+212: }
+213: 
+214: // The original ACK is retained in the control row. Only the same command hash
+215: // can advance its replay result to COMPLETED after canonical settlement.
+216: func (s *ClientService) finalizeClientCancel(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow) (*Response, error) {
+217: 	var tasks, target, control, state string
+218: 	err := tx.QueryRow(`SELECT task_ids,target_id,control_request_id,state FROM client_control_requests WHERE principal=? AND project=? AND command_id=?`, principal, deref(env.ProjectID), deref(env.CommandID)).Scan(&tasks, &target, &control, &state)
+219: 	if err == sql.ErrNoRows {
+220: 		return nil, nil
+221: 	}
+222: 	if err != nil {
+223: 		return nil, err
+224: 	}
+225: 	if state == "CONFIRMED" || state == "RECONCILING" {
+226: 		return nil, nil
+227: 	}
+228: 	var ids []string
+229: 	if err = json.Unmarshal([]byte(tasks), &ids); err != nil {
+230: 		return nil, err
+231: 	}
+232: 	for _, id := range ids {
+233: 		task, e := load(tx, deref(env.ProjectID), "Task", id)
+234: 		if e != nil {
+235: 			return nil, e
+236: 		}
+237: 		if run := Str(task, "active_run_id"); run != "" {
+238: 			r, e := load(tx, deref(env.ProjectID), "Run", run)
+239: 			if e != nil {
+240: 				return nil, e
+241: 			}
+242: 			if !runTerminal(r) || r["children_stopped"] != true || r["queue_empty"] != true || effectsReconciled(tx, deref(env.ProjectID), run) != nil || clientQueueSettled(tx, deref(env.ProjectID), run) != nil {
+243: 				return nil, nil
+244: 			}
+245: 			if r["status"] == "CANCELLED" && Str(r, "cancel_confirmed_at") == "" {
+246: 				return nil, nil
+247: 			}
+248: 		} else {
+249: 			var dispatches int
+250: 			if e = tx.QueryRow(`SELECT (SELECT count(*) FROM runtime_dispatches WHERE project=? AND json_extract(manifest,'$.task_id')=?)+(SELECT count(*) FROM domain_objects WHERE kind='Run' AND project=? AND json_extract(body,'$.task_id')=?)`, deref(env.ProjectID), id, deref(env.ProjectID), id).Scan(&dispatches); e != nil {
+251: 				return nil, e
+252: 			}
+253: 			if dispatches != 0 || task["status"] != "CANCELLED" {
+254: 				return nil, nil
+255: 			}
+256: 			var pending int
+257: 			if e = tx.QueryRow(`SELECT count(*) FROM client_command_queue WHERE project=? AND task_id=? AND state NOT IN ('CONSUMED','DROPPED')`, deref(env.ProjectID), id).Scan(&pending); e != nil {
+258: 				return nil, e
+259: 			}
+260: 			var restored int
+261: 			if e = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND task_id=? AND restore_fenced<>0`, deref(env.ProjectID), id).Scan(&restored); e != nil {
+262: 				return nil, e
+263: 			}
+264: 			if pending != 0 || restored != 0 {
+265: 				return nil, nil
+266: 			}
+267: 			if _, e = tx.Exec(`UPDATE client_queue_fences SET sealed_through=accepted_through WHERE project=? AND task_id=? AND state='CANCEL_FENCED' AND restore_fenced=0`, deref(env.ProjectID), id); e != nil {
+268: 				return nil, e
+269: 			}
+270: 		}
+271: 	}
+272: 	if sess == nil {
+273: 		sess, err = loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))
+274: 		if err != nil {
+275: 			return nil, err
+276: 		}
+277: 	}
+278: 	// Hide the pending ID only in the same transaction as the final receipt.
+279: 	if _, err = tx.Exec(`UPDATE client_control_requests SET state='CONFIRMED' WHERE principal=? AND project=? AND command_id=?`, principal, sess.project, deref(env.CommandID)); err != nil {
+280: 		return nil, err

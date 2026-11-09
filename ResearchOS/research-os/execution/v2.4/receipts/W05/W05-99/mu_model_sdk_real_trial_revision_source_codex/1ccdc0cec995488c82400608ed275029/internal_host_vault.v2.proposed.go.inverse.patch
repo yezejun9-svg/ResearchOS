@@ -1,0 +1,132 @@
+--- a/internal/host/vault.go
++++ b/internal/host/vault.go
+@@ -56,99 +56,6 @@
+ type Vault struct {
+ 	dir  string
+ 	path string
+-	readOnly bool
+-	allowedRef string
+-	allowedProvider string
+-}
+-
+-// openVaultReadOnly references one existing sealed record without copying,
+-// importing, revoking or changing the original vault directory.
+-func openVaultReadOnly(hostDir, ref, provider string) (*Vault, error) {
+-	if !filepath.IsAbs(hostDir) || ref == "" || provider == "" {
+-		return nil, ErrUnknownCredential
+-	}
+-	resolved, err := filepath.EvalSymlinks(hostDir)
+-	if err != nil || !strings.EqualFold(resolved, filepath.Clean(hostDir)) {
+-		return nil, ErrUnknownCredential
+-	}
+-	d := filepath.Join(resolved, "credentials")
+-	info, err := os.Lstat(d)
+-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+-		return nil, ErrUnknownCredential
+-	}
+-	canonicalCredentials, err := filepath.EvalSymlinks(d)
+-	if err != nil || !strings.EqualFold(canonicalCredentials, filepath.Clean(d)) {
+-		return nil, ErrUnknownCredential
+-	}
+-	for _, name := range []string{"index.json", ref + ".dpapi"} {
+-		path := filepath.Join(d, name)
+-		entry, err := os.Lstat(path)
+-		if err != nil || !entry.Mode().IsRegular() || entry.Mode()&os.ModeSymlink != 0 {
+-			return nil, ErrUnknownCredential
+-		}
+-	}
+-	v := &Vault{dir: d, path: filepath.Join(d, "index.json"), readOnly: true,
+-		allowedRef: ref, allowedProvider: provider}
+-	idx, err := v.load()
+-	if err != nil {
+-		return nil, err
+-	}
+-	found := false
+-	for _, known := range idx.Records {
+-		if known == ref { found = true }
+-	}
+-	if !found { return nil, ErrUnknownCredential }
+-	record, err := v.record(ref)
+-	if err != nil || record.Revoked || record.Provider != provider {
+-		return nil, ErrUnknownCredential
+-	}
+-	return v, nil
+-}
+-
+-// ValidateTrialVaultIsolation runs before any trial data-root lease, database open,
+-// migration or host mkdir. Both roots must exist as ordinary directories. EvalSymlinks
+-// rejects path aliases/reparse ancestors; SameFile catches Windows spelling aliases.
+-// The new data root must be disjoint from the entire old protected resource root,
+-// not merely from its host/credentials child.
+-func ValidateTrialVaultIsolation(dataRoot, oldHostDir string) error {
+-    if !filepath.IsAbs(dataRoot) || !filepath.IsAbs(oldHostDir) {
+-        return ErrUnknownCredential
+-    }
+-    clean := func(path string) (string, error) {
+-        path = filepath.Clean(path)
+-        for current := path; ; current = filepath.Dir(current) {
+-            info, err := os.Lstat(current)
+-            if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+-                return "", ErrUnknownCredential
+-            }
+-            resolved, err := filepath.EvalSymlinks(current)
+-            if err != nil || !strings.EqualFold(resolved, current) {
+-                return "", ErrUnknownCredential
+-            }
+-            if filepath.Dir(current) == current { break }
+-        }
+-        return path, nil
+-    }
+-    data, err := clean(dataRoot)
+-    if err != nil { return err }
+-    hostDir, err := clean(oldHostDir)
+-    if err != nil { return err }
+-    protected, err := clean(filepath.Dir(hostDir))
+-    if err != nil { return err }
+-    sameAncestor := func(target, descendant string) bool {
+-        wanted, err := os.Stat(target)
+-        if err != nil { return true }
+-        for current := descendant; ; current = filepath.Dir(current) {
+-            actual, err := os.Stat(current)
+-            if err != nil || os.SameFile(wanted, actual) { return true }
+-            if filepath.Dir(current) == current { break }
+-        }
+-        return false
+-    }
+-    if sameAncestor(data, protected) || sameAncestor(protected, data) {
+-        return ErrUnknownCredential
+-    }
+-    return nil
+ }
+ 
+ func openVault(dir string) (*Vault, error) {
+@@ -195,7 +102,6 @@
+ 			material[i] = 0
+ 		}
+ 	}()
+-	if v.readOnly { return "", ErrCredentialProtected }
+ 	if len(material) == 0 || len(material) > MaxCredentialBytes {
+ 		return "", ErrCredentialTooLarge
+ 	}
+@@ -247,12 +153,11 @@
+ }
+ 
+ func (v *Vault) record(ref string) (*vaultRecord, error) {
+-	if v.readOnly && ref != v.allowedRef { return nil, ErrUnknownCredential }
+ 	var rec vaultRecord
+ 	if err := readPrivate(v.dir, ref+".dpapi", &rec); err != nil {
+ 		return nil, err
+ 	}
+-	if rec.Ref == "" || rec.Ref != ref || v.readOnly && rec.Provider != v.allowedProvider {
++	if rec.Ref == "" || rec.Ref != ref {
+ 		return nil, fmt.Errorf("%w: %s", ErrUnknownCredential, ref)
+ 	}
+ 	return &rec, nil
+@@ -273,7 +178,6 @@
+ // Revoke marks a record revoked and destroys its wrapped bytes, so a later reference lookup
+ // reports REVOKED and no path can recover the material.
+ func (v *Vault) Revoke(ref string) error {
+-	if v.readOnly { return ErrCredentialProtected }
+ 	rec, err := v.record(ref)
+ 	if err != nil {
+ 		return err

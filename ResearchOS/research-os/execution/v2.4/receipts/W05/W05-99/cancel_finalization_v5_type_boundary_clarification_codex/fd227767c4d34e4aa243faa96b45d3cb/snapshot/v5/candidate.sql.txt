@@ -1,0 +1,419 @@
+-- READ-ONLY V5 CANDIDATE TEXT. NOT EXECUTED. NOT A NUMBERED MIGRATION.
+-- V5: source registry34; preserve domain_refs multiset; epoch-specific origins
+-- bind permanent birth separately from already-written current epoch facts.
+-- Complete pure evaluator algorithms: evaluator-v5.md. No producer order changes.
+-- This is a static candidate, not tested SQL or a production schema fingerprint.
+-- The three SQL-called pure-function contracts are in closed-contract.md and
+-- source-contract.md. No application-only validation substitutes for these calls.
+-- No SQLITE pragma, hidden mutable context, UDF DB read or response-size cap.
+
+CREATE TABLE f08_legacy_runs(
+ project TEXT NOT NULL,run_id TEXT NOT NULL,
+ inventory TEXT NOT NULL CHECK(typeof(inventory)='text' AND json_valid(inventory)),
+ inventory_hash TEXT NOT NULL CHECK(typeof(inventory_hash)='text'),
+ PRIMARY KEY(project,run_id)
+);
+-- Populate ONLY inside initial exact migration, before forbidding new inserts.
+INSERT INTO f08_legacy_runs(project,run_id,inventory,inventory_hash)
+SELECT project,run_id,inventory,researchos_f08_proof_v1(-1,CAST(inventory AS BLOB))
+FROM (
+ SELECT r.project,r.run_id,json_object(
+ 'format','researchos.cancel-finalization/1','source_schema_version',23,
+ 'project',r.project,'run_id',r.run_id,
+ 'versions',json((SELECT json_group_array(json_array(revision,hex(CAST(body AS BLOB)),content_hash))
+   FROM (SELECT revision,body,content_hash FROM domain_versions
+    WHERE project=r.project AND kind='Run' AND id=r.run_id ORDER BY revision))),
+ 'dispatches',json((SELECT json_group_array(json_array(epoch,dispatch_key,hex(CAST(manifest AS BLOB)),manifest_hash,state,worker,journal_locator,hex(CAST(identity AS BLOB)),observation_sequence,observation_hash,reason,prepared_at,updated_at))
+   FROM (SELECT * FROM runtime_dispatches WHERE project=r.project AND run=r.run_id ORDER BY epoch)))
+ ) inventory FROM (
+ SELECT project,id run_id FROM domain_versions WHERE kind='Run'
+ UNION SELECT project,id FROM domain_objects WHERE kind='Run'
+ UNION SELECT project,run FROM runtime_dispatches
+ ) r
+);
+CREATE TRIGGER f08_legacy_no_insert BEFORE INSERT ON f08_legacy_runs BEGIN SELECT RAISE(ABORT,'F08_LEGACY_COHORT_FROZEN'); END;
+CREATE TRIGGER f08_legacy_no_update BEFORE UPDATE ON f08_legacy_runs BEGIN SELECT RAISE(ABORT,'F08_LEGACY_COHORT_FROZEN'); END;
+CREATE TRIGGER f08_legacy_no_delete BEFORE DELETE ON f08_legacy_runs BEGIN SELECT RAISE(ABORT,'F08_LEGACY_COHORT_FROZEN'); END;
+
+CREATE TABLE f08_dispatch_origins(
+ project TEXT NOT NULL,run_id TEXT NOT NULL,epoch INTEGER NOT NULL CHECK(typeof(epoch)='integer' AND epoch>0),
+ dispatch_key TEXT NOT NULL UNIQUE,
+ document TEXT NOT NULL CHECK(typeof(document)='text' AND json_valid(document)),
+ body_hash TEXT NOT NULL CHECK(typeof(body_hash)='text'),
+ PRIMARY KEY(project,run_id,epoch),
+ UNIQUE(project,run_id,epoch,body_hash),
+ FOREIGN KEY(project,run_id,epoch) REFERENCES runtime_dispatches(project,run,epoch) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TRIGGER f08_origin_no_replace BEFORE INSERT ON f08_dispatch_origins
+WHEN EXISTS(SELECT 1 FROM f08_dispatch_origins o WHERE (o.project=NEW.project AND o.run_id=NEW.run_id AND o.epoch=NEW.epoch) OR o.dispatch_key=NEW.dispatch_key)
+BEGIN SELECT RAISE(ABORT,'F08_ORIGIN_IMMUTABLE'); END;
+CREATE TRIGGER f08_origin_legacy_reject BEFORE INSERT ON f08_dispatch_origins
+WHEN EXISTS(SELECT 1 FROM f08_legacy_runs l WHERE l.project=NEW.project AND l.run_id=NEW.run_id)
+BEGIN SELECT RAISE(ABORT,'F08_LEGACY_ORIGIN_FORBIDDEN'); END;
+CREATE TRIGGER f08_origin_no_update BEFORE UPDATE ON f08_dispatch_origins BEGIN SELECT RAISE(ABORT,'F08_ORIGIN_IMMUTABLE'); END;
+CREATE TRIGGER f08_origin_no_delete BEFORE DELETE ON f08_dispatch_origins BEGIN SELECT RAISE(ABORT,'F08_ORIGIN_IMMUTABLE'); END;
+
+CREATE TABLE f08_admitted_groups(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ operation TEXT NOT NULL CHECK(operation='v2:session.control'),
+ private_header TEXT NOT NULL CHECK(typeof(private_header)='text' AND length(CAST(private_header AS BLOB))<=1398200),
+ root_hash TEXT NOT NULL,group_hash TEXT NOT NULL,
+ document TEXT NOT NULL CHECK(typeof(document)='text' AND json_valid(document)),
+ PRIMARY KEY(principal,project,command_id,request_hash),
+ UNIQUE(principal,project,command_id),
+ UNIQUE(principal,project,command_id,request_hash,root_hash),
+ FOREIGN KEY(principal,project,operation,command_id,request_hash)
+  REFERENCES idempotency(principal,project,operation,key,request_hash) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(principal,command_id,request_hash)
+  REFERENCES client_command_identities(principal,command_id,request_hash) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_admitted_members(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ task_id TEXT NOT NULL,member_index INTEGER NOT NULL CHECK(typeof(member_index)='integer' AND member_index>=0),
+ root_hash TEXT NOT NULL,body_hash TEXT NOT NULL,
+ document TEXT NOT NULL CHECK(typeof(document)='text' AND json_valid(document)),
+ PRIMARY KEY(principal,project,command_id,request_hash,task_id),
+ UNIQUE(principal,project,command_id,request_hash,member_index),
+ UNIQUE(principal,project,command_id,request_hash,task_id,body_hash),
+ FOREIGN KEY(principal,project,command_id,request_hash,root_hash)
+  REFERENCES f08_admitted_groups(principal,project,command_id,request_hash,root_hash) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_final_groups(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ admitted_root_hash TEXT NOT NULL,root_hash TEXT NOT NULL,group_hash TEXT NOT NULL,
+ document TEXT NOT NULL CHECK(typeof(document)='text' AND json_valid(document)),
+ PRIMARY KEY(principal,project,command_id,request_hash),
+ UNIQUE(principal,project,command_id,request_hash,root_hash),
+ FOREIGN KEY(principal,project,command_id,request_hash,admitted_root_hash)
+  REFERENCES f08_admitted_groups(principal,project,command_id,request_hash,root_hash) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(principal,project,command_id,request_hash,root_hash)
+  REFERENCES f08_final_commits(principal,project,command_id,request_hash,final_root_hash) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_final_members(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ task_id TEXT NOT NULL,member_index INTEGER NOT NULL CHECK(typeof(member_index)='integer' AND member_index>=0),
+ admitted_member_hash TEXT NOT NULL,body_hash TEXT NOT NULL,
+ document TEXT NOT NULL CHECK(typeof(document)='text' AND json_valid(document)),
+ PRIMARY KEY(principal,project,command_id,request_hash,task_id),
+ UNIQUE(principal,project,command_id,request_hash,member_index),
+ FOREIGN KEY(principal,project,command_id,request_hash)
+  REFERENCES f08_final_groups(principal,project,command_id,request_hash) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(principal,project,command_id,request_hash,task_id,admitted_member_hash)
+  REFERENCES f08_admitted_members(principal,project,command_id,request_hash,task_id,body_hash) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_final_commits(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ final_root_hash TEXT NOT NULL,original_response_digest TEXT NOT NULL,final_response_digest TEXT NOT NULL,
+ PRIMARY KEY(principal,project,command_id,request_hash),
+ UNIQUE(principal,project,command_id,request_hash,final_root_hash),
+ FOREIGN KEY(principal,project,command_id,request_hash,final_root_hash)
+  REFERENCES f08_final_groups(principal,project,command_id,request_hash,root_hash) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(principal,command_id,request_hash)
+  REFERENCES client_command_identities(principal,command_id,request_hash) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_version_pins(
+ principal TEXT NOT NULL,project TEXT NOT NULL,command_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('ADMITTED','FINALIZED')),
+ target_project TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+ content_hash TEXT,
+ PRIMARY KEY(principal,project,command_id,request_hash,phase,target_project,kind,id,revision),
+ FOREIGN KEY(target_project,kind,id,revision)
+  REFERENCES domain_versions(project,kind,id,revision) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE f08_observation_obligations(
+ project TEXT NOT NULL,run_id TEXT NOT NULL,epoch INTEGER NOT NULL,sequence INTEGER NOT NULL,
+ receipt_hash TEXT NOT NULL,
+ PRIMARY KEY(project,run_id,epoch,sequence),
+ FOREIGN KEY(project,run_id,epoch,receipt_hash)
+  REFERENCES runtime_observations(project,run,epoch,receipt_hash) DEFERRABLE INITIALLY DEFERRED
+);
+
+-- Group materialization is within the root INSERT statement. There is no
+-- application-visible partially populated group and no 'ready' column.
+CREATE TRIGGER f08_admitted_materialize AFTER INSERT ON f08_admitted_groups BEGIN
+ INSERT INTO f08_admitted_members(principal,project,command_id,request_hash,task_id,member_index,root_hash,body_hash,document)
+ SELECT NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,
+  json_extract(value,'$.task_ref.id'),CAST(key AS INTEGER),NEW.root_hash,
+  researchos_f08_proof_v1(-1,CAST(value AS BLOB)),value
+ FROM json_each(NEW.document,'$.members');
+ INSERT INTO f08_version_pins(principal,project,command_id,request_hash,phase,target_project,kind,id,revision,content_hash)
+ SELECT NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,'ADMITTED',
+  json_extract(value,'$.project'),json_extract(value,'$.kind'),json_extract(value,'$.id'),json_extract(value,'$.revision'),json_extract(value,'$.content_hash')
+ FROM json_each(NEW.document,'$.pins');
+ SELECT CASE WHEN
+ (SELECT count(*) FROM f08_admitted_members m WHERE m.principal=NEW.principal AND m.project=NEW.project AND m.command_id=NEW.command_id AND m.request_hash=NEW.request_hash)
+ IS NOT json_array_length(NEW.document,'$.members') THEN RAISE(ABORT,'F08_PARTIAL_ADMISSION') END;
+END;
+CREATE TRIGGER f08_final_materialize AFTER INSERT ON f08_final_groups BEGIN
+ INSERT INTO f08_final_members(principal,project,command_id,request_hash,task_id,member_index,admitted_member_hash,body_hash,document)
+ SELECT NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,
+  json_extract(value,'$.task_admitted_ref.id'),CAST(key AS INTEGER),
+  json_extract(value,'$.admitted_member_ref.content_hash'),
+  researchos_f08_proof_v1(-1,CAST(value AS BLOB)),value
+ FROM json_each(NEW.document,'$.members');
+ INSERT INTO f08_version_pins(principal,project,command_id,request_hash,phase,target_project,kind,id,revision,content_hash)
+ SELECT NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,'FINALIZED',
+  json_extract(value,'$.project'),json_extract(value,'$.kind'),json_extract(value,'$.id'),json_extract(value,'$.revision'),json_extract(value,'$.content_hash')
+ FROM json_each(NEW.document,'$.pins');
+ SELECT CASE WHEN EXISTS(
+  SELECT task_id FROM f08_admitted_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash
+  EXCEPT SELECT task_id FROM f08_final_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash
+ ) OR EXISTS(
+  SELECT task_id FROM f08_final_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash
+  EXCEPT SELECT task_id FROM f08_admitted_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash
+ ) THEN RAISE(ABORT,'F08_FINAL_MEMBER_SET') END;
+END;
+
+-- Complete-group raw byte/hash checks independent of any supplied matching hash.
+CREATE TRIGGER f08_admission_hash BEFORE INSERT ON f08_admitted_groups BEGIN
+ SELECT CASE WHEN researchos_f08_proof_v1(-1,CAST(json_extract(NEW.document,'$.root') AS BLOB)) IS NOT NEW.root_hash
+ THEN RAISE(ABORT,'F08_ADMITTED_ROOT_HASH') END;
+ SELECT CASE WHEN researchos_f08_proof_v1(-2,CAST(NEW.private_header AS BLOB)) IS NOT json_extract(NEW.document,'$.root.private_header_digest')
+ THEN RAISE(ABORT,'F08_HEADER_HASH') END;
+ SELECT CASE WHEN json_extract(NEW.document,'$.root.member_count') IS NOT json_array_length(NEW.document,'$.members')
+ THEN RAISE(ABORT,'F08_ADMITTED_COUNT') END;
+END;
+CREATE TRIGGER f08_final_hash BEFORE INSERT ON f08_final_groups BEGIN
+ SELECT CASE WHEN researchos_f08_proof_v1(-1,CAST(json_extract(NEW.document,'$.root') AS BLOB)) IS NOT NEW.root_hash
+ THEN RAISE(ABORT,'F08_FINAL_ROOT_HASH') END;
+ SELECT CASE WHEN json_extract(NEW.document,'$.root.member_count') IS NOT json_array_length(NEW.document,'$.members')
+ THEN RAISE(ABORT,'F08_FINAL_COUNT') END;
+END;
+
+-- Native source cohort/monotonicity predicates not based on missing PID.
+CREATE TRIGGER f08_dispatch_first BEFORE INSERT ON runtime_dispatches BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM runtime_dispatches d WHERE (d.project=NEW.project AND d.run=NEW.run AND d.epoch=NEW.epoch) OR d.dispatch_key=NEW.dispatch_key)
+ THEN RAISE(ABORT,'F08_DISPATCH_NO_REPLACE') END;
+ SELECT CASE WHEN NEW.state IS NOT 'PREPARED' OR NEW.worker IS NOT '' OR NEW.journal_locator IS NOT '' OR NEW.identity IS NOT '{}' OR NEW.observation_sequence IS NOT 0 OR NEW.observation_hash IS NOT ''
+ THEN RAISE(ABORT,'F08_DISPATCH_INITIAL_STATE') END;
+ -- An old Run may still enter a genuinely authorized later epoch under the
+ -- unchanged existing admission/lease/recovery gates. It never gains origin.
+END;
+CREATE TRIGGER f08_dispatch_no_rewind BEFORE UPDATE ON runtime_dispatches BEGIN
+ SELECT CASE WHEN
+ (OLD.state='PREPARED' AND NEW.state NOT IN ('STARTED','UNKNOWN')) OR
+ (OLD.state='STARTED' AND NEW.state NOT IN ('STARTED','UNKNOWN','OBSERVED')) OR
+ (OLD.state='UNKNOWN' AND NEW.state NOT IN ('UNKNOWN','OBSERVED')) OR
+ (OLD.state='OBSERVED' AND NEW.state<>'OBSERVED')
+ THEN RAISE(ABORT,'F08_DISPATCH_REWIND') END;
+ SELECT CASE WHEN OLD.worker<>'' AND NEW.worker IS NOT OLD.worker
+ OR OLD.journal_locator<>'' AND NEW.journal_locator IS NOT OLD.journal_locator
+ OR OLD.identity<>'{}' AND CAST(NEW.identity AS BLOB) IS NOT CAST(OLD.identity AS BLOB)
+ OR NEW.observation_sequence<OLD.observation_sequence
+ OR (NEW.observation_sequence=OLD.observation_sequence AND NEW.observation_hash IS NOT OLD.observation_hash)
+ THEN RAISE(ABORT,'F08_DISPATCH_IDENTITY_RESET') END;
+ SELECT CASE WHEN NEW.state='STARTED' AND EXISTS(
+ SELECT 1 FROM f08_final_members m WHERE m.project=NEW.project
+ AND json_extract(m.document,'$.proof_kind')='NEVER_LAUNCHED_NATIVE'
+ AND json_extract(m.document,'$.run_admitted_ref.id')=NEW.run
+ AND json_extract(m.document,'$.dispatch_final_binding.epoch')=NEW.epoch)
+ THEN RAISE(ABORT,'F08_CANCELLED_LAUNCH') END;
+END;
+-- This source-order obligation permits actual observeRuntime UPDATE before
+-- INSERT observation; COMMIT still requires exact original observation tuple.
+CREATE TRIGGER f08_dispatch_observation AFTER UPDATE ON runtime_dispatches
+WHEN NEW.state='OBSERVED' AND (OLD.state<>'OBSERVED' OR NEW.observation_sequence>OLD.observation_sequence)
+BEGIN
+ INSERT INTO f08_observation_obligations(project,run_id,epoch,sequence,receipt_hash)
+ VALUES(NEW.project,NEW.run,NEW.epoch,NEW.observation_sequence,NEW.observation_hash);
+END;
+
+-- Every table below also needs BEFORE INSERT collision guard, not merely no
+-- DELETE: REPLACE's implicit deletion is not reliably caught with recursion OFF.
+CREATE TRIGGER f08_ag_no_replace BEFORE INSERT ON f08_admitted_groups WHEN EXISTS(SELECT 1 FROM f08_admitted_groups WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id) BEGIN SELECT RAISE(ABORT,'F08_ADMISSION_IMMUTABLE'); END;
+CREATE TRIGGER f08_ag_no_update BEFORE UPDATE ON f08_admitted_groups BEGIN SELECT RAISE(ABORT,'F08_ADMISSION_IMMUTABLE'); END;
+CREATE TRIGGER f08_ag_no_delete BEFORE DELETE ON f08_admitted_groups BEGIN SELECT RAISE(ABORT,'F08_ADMISSION_IMMUTABLE'); END;
+CREATE TRIGGER f08_am_no_replace BEFORE INSERT ON f08_admitted_members WHEN EXISTS(SELECT 1 FROM f08_admitted_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash AND (task_id=NEW.task_id OR member_index=NEW.member_index)) BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_am_no_update BEFORE UPDATE ON f08_admitted_members BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_am_no_delete BEFORE DELETE ON f08_admitted_members BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_fg_no_replace BEFORE INSERT ON f08_final_groups WHEN EXISTS(SELECT 1 FROM f08_final_groups WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash) BEGIN SELECT RAISE(ABORT,'F08_FINAL_IMMUTABLE'); END;
+CREATE TRIGGER f08_fg_no_update BEFORE UPDATE ON f08_final_groups BEGIN SELECT RAISE(ABORT,'F08_FINAL_IMMUTABLE'); END;
+CREATE TRIGGER f08_fg_no_delete BEFORE DELETE ON f08_final_groups BEGIN SELECT RAISE(ABORT,'F08_FINAL_IMMUTABLE'); END;
+CREATE TRIGGER f08_fm_no_replace BEFORE INSERT ON f08_final_members WHEN EXISTS(SELECT 1 FROM f08_final_members WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash AND (task_id=NEW.task_id OR member_index=NEW.member_index)) BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_fm_no_update BEFORE UPDATE ON f08_final_members BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_fm_no_delete BEFORE DELETE ON f08_final_members BEGIN SELECT RAISE(ABORT,'F08_MEMBER_IMMUTABLE'); END;
+CREATE TRIGGER f08_fc_no_replace BEFORE INSERT ON f08_final_commits WHEN EXISTS(SELECT 1 FROM f08_final_commits WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash) BEGIN SELECT RAISE(ABORT,'F08_COMMIT_IMMUTABLE'); END;
+CREATE TRIGGER f08_fc_no_update BEFORE UPDATE ON f08_final_commits BEGIN SELECT RAISE(ABORT,'F08_COMMIT_IMMUTABLE'); END;
+CREATE TRIGGER f08_fc_no_delete BEFORE DELETE ON f08_final_commits BEGIN SELECT RAISE(ABORT,'F08_COMMIT_IMMUTABLE'); END;
+CREATE TRIGGER f08_pin_no_replace BEFORE INSERT ON f08_version_pins WHEN EXISTS(SELECT 1 FROM f08_version_pins WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id AND request_hash=NEW.request_hash AND phase=NEW.phase AND target_project=NEW.target_project AND kind=NEW.kind AND id=NEW.id AND revision=NEW.revision) BEGIN SELECT RAISE(ABORT,'F08_PIN_IMMUTABLE'); END;
+CREATE TRIGGER f08_pin_no_update BEFORE UPDATE ON f08_version_pins BEGIN SELECT RAISE(ABORT,'F08_PIN_IMMUTABLE'); END;
+CREATE TRIGGER f08_pin_no_delete BEFORE DELETE ON f08_version_pins BEGIN SELECT RAISE(ABORT,'F08_PIN_IMMUTABLE'); END;
+CREATE TRIGGER f08_ob_no_replace BEFORE INSERT ON f08_observation_obligations WHEN EXISTS(SELECT 1 FROM f08_observation_obligations WHERE project=NEW.project AND run_id=NEW.run_id AND epoch=NEW.epoch AND sequence=NEW.sequence) BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_IMMUTABLE'); END;
+CREATE TRIGGER f08_ob_no_update BEFORE UPDATE ON f08_observation_obligations BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_IMMUTABLE'); END;
+CREATE TRIGGER f08_ob_no_delete BEFORE DELETE ON f08_observation_obligations BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_IMMUTABLE'); END;
+
+-- Each source tuple is a fixed positional array. All stored JSON, response,
+-- private-header and artifact bytes are hex, NEVER reparsed by SQLite first.
+-- Full rows across projects are intentional: cross-project/global-principal
+-- contradictions and reverse references must not disappear by selection.
+CREATE VIEW f08_source_rows(category,row_json) AS
+ SELECT 'domain_versions',json_array(project,kind,id,revision,hex(CAST(body AS BLOB)),content_hash) FROM domain_versions
+ UNION ALL SELECT 'domain_objects',json_array(project,kind,id,revision,hex(CAST(body AS BLOB)),content_hash,immutable) FROM domain_objects
+ UNION ALL SELECT 'domain_refs',json_array(project,kind,id,revision,field,target_project,target_kind,target_id,target_revision) FROM domain_refs
+ UNION ALL SELECT 'outbox',json_array(project,sequence,id,hex(CAST(body AS BLOB)),acknowledged) FROM outbox
+ UNION ALL SELECT 'idempotency',json_array(principal,project,operation,key,request_hash,status,hex(CAST(body AS BLOB)),hex(CAST(headers AS BLOB)),created_at,typeof(body),typeof(headers)) FROM idempotency
+ UNION ALL SELECT 'identities',json_array(principal,command_id,protocol,project,method,operation,request_hash,created_at) FROM client_command_identities
+ UNION ALL SELECT 'dispatches',json_array(project,run,epoch,dispatch_key,hex(CAST(manifest AS BLOB)),manifest_hash,state,worker,journal_locator,hex(CAST(identity AS BLOB)),observation_sequence,observation_hash,prepared_at,updated_at,reason) FROM runtime_dispatches
+ UNION ALL SELECT 'observations',json_array(project,run,epoch,receipt_hash,hex(CAST(body AS BLOB)),observed_at) FROM runtime_observations
+ UNION ALL SELECT 'effects',json_array(project,run,effect_key,sequence,hex(CAST(body AS BLOB))) FROM resource_effects
+ UNION ALL SELECT 'routes',json_array(id,project,run,hex(CAST(body AS BLOB))) FROM resource_route_history
+ UNION ALL SELECT 'uploads',json_array(storage_key,project,run,epoch) FROM runtime_uploads
+ UNION ALL SELECT 'content',json_array(storage_key,project,principal,hex(bytes),content_hash,expires_at,sealed) FROM uploaded_content
+ UNION ALL SELECT 'fences',json_array(project,task_id,session_id,generation,state,accepted_through,sealed_through,run_id,runtime_epoch,dispatch_key,manifest_hash,CASE WHEN process_identity IS NULL THEN NULL ELSE hex(CAST(process_identity AS BLOB)) END,restore_fenced,revision) FROM client_queue_fences
+ UNION ALL SELECT 'queue',json_array(principal,project,command_id,session_id,task_id,goal_id,generation,queue_sequence,request_hash,message_id,accepted_writer_epoch,delivery,hex(CAST(content AS BLOB)),content_hash,state,revision,last_receipt_id,created_at) FROM client_command_queue
+ UNION ALL SELECT 'controls',json_array(principal,project,command_id,session_id,control_request_id,request_hash,target_id,hex(CAST(task_ids AS BLOB)),state,CASE WHEN original_response IS NULL THEN NULL ELSE hex(CAST(original_response AS BLOB)) END,CASE WHEN final_response IS NULL THEN NULL ELSE hex(CAST(final_response AS BLOB)) END,created_at) FROM client_control_requests
+ UNION ALL SELECT 'receipts',json_array(receipt_id,project,generation,command_id,kind,hex(CAST(body AS BLOB)),body_hash,previous_receipt_id,created_at) FROM client_control_receipts
+ UNION ALL SELECT 'sessions',json_array(id,project_id,revision,created_at,updated_at,goal_id,task_id,run_id,writer_epoch,writer_client_id,lease_expires_at,event_watermark,upstream_session_id,upstream_log_id,upstream_log_hash,workspace_ref,title,model_config_ref,core_build_id,transcript_artifact_id,resume_requires_explicit_user,sealed_at,archived_at,protocol) FROM client_sessions
+ UNION ALL SELECT 'legacy',json_array(project,run_id,hex(CAST(inventory AS BLOB)),inventory_hash) FROM f08_legacy_runs
+ UNION ALL SELECT 'origins',json_array(project,run_id,epoch,dispatch_key,hex(CAST(document AS BLOB)),body_hash) FROM f08_dispatch_origins
+ UNION ALL SELECT 'admitted',json_array(principal,project,command_id,request_hash,operation,hex(CAST(private_header AS BLOB)),root_hash,group_hash,hex(CAST(document AS BLOB))) FROM f08_admitted_groups
+ UNION ALL SELECT 'admitted_members',json_array(principal,project,command_id,request_hash,task_id,member_index,root_hash,body_hash,hex(CAST(document AS BLOB))) FROM f08_admitted_members
+ UNION ALL SELECT 'final',json_array(principal,project,command_id,request_hash,admitted_root_hash,root_hash,group_hash,hex(CAST(document AS BLOB))) FROM f08_final_groups
+ UNION ALL SELECT 'final_members',json_array(principal,project,command_id,request_hash,task_id,member_index,admitted_member_hash,body_hash,hex(CAST(document AS BLOB))) FROM f08_final_members
+ UNION ALL SELECT 'commits',json_array(principal,project,command_id,request_hash,final_root_hash,original_response_digest,final_response_digest) FROM f08_final_commits
+ UNION ALL SELECT 'pins',json_array(principal,project,command_id,request_hash,phase,target_project,kind,id,revision,content_hash) FROM f08_version_pins
+ UNION ALL SELECT 'obligations',json_array(project,run_id,epoch,sequence,receipt_hash) FROM f08_observation_obligations
+ UNION ALL SELECT 'runtime_bindings',json_array(project,runtime,hex(CAST(profile_ref AS BLOB)),profile_hash,technical_hash,owner) FROM runtime_bindings
+ UNION ALL SELECT 'qualification_plans',json_array(project,task,runtime,hex(CAST(plan AS BLOB)),plan_hash,author,author_root) FROM runtime_qualification_plans
+ UNION ALL SELECT 'qualification_runs',json_array(project,task,run,runtime,epoch,plan_hash,profile_hash,contract_hash,input_hash,hex(CAST(context_bundle AS BLOB)),owner_root) FROM runtime_qualification_runs
+ UNION ALL SELECT 'qualification_approvals',json_array(project,runtime,revision,qualification_hash,run,hex(CAST(receipt_ref AS BLOB)),approved_at) FROM runtime_qualification_approvals
+ UNION ALL SELECT 'artifact_uses',json_array(project,artifact,run,epoch,principal,storage_key,receipt_hash,hex(CAST(body AS BLOB))) FROM artifact_uses
+ UNION ALL SELECT 'artifact_use_proofs',json_array(project,artifact,run,epoch,use_hash,hex(CAST(manifest_ref AS BLOB))) FROM artifact_use_proofs
+ UNION ALL SELECT 'checkpoint_carries',json_array(project,run,epoch,hex(CAST(body AS BLOB))) FROM resource_checkpoint_carries
+ UNION ALL SELECT 'run_dependencies',json_array(project,run,hex(CAST(snapshot AS BLOB))) FROM orchestration_run_dependencies;
+CREATE VIEW f08_sources(document) AS
+ SELECT json_group_array(json_array(category,json(row_json))) FROM f08_source_rows;
+
+CREATE TRIGGER f08_admitted_full BEFORE INSERT ON f08_admitted_groups BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(0,CAST(json_object('action','admitted.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.operation,hex(CAST(NEW.private_header AS BLOB)),NEW.root_hash,NEW.group_hash,hex(CAST(NEW.document AS BLOB))),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_final_full BEFORE INSERT ON f08_final_groups BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(1,CAST(json_object('action','final.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.admitted_root_hash,NEW.root_hash,NEW.group_hash,hex(CAST(NEW.document AS BLOB))),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_am_exact BEFORE INSERT ON f08_admitted_members BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(7,CAST(json_object('action','admitted_member.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.task_id,NEW.member_index,NEW.root_hash,NEW.body_hash,hex(CAST(NEW.document AS BLOB))),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_fm_exact BEFORE INSERT ON f08_final_members BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(7,CAST(json_object('action','final_member.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.task_id,NEW.member_index,NEW.admitted_member_hash,NEW.body_hash,hex(CAST(NEW.document AS BLOB))),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_pin_exact BEFORE INSERT ON f08_version_pins BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(7,CAST(json_object('action','pin.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.phase,NEW.target_project,NEW.kind,NEW.id,NEW.revision,NEW.content_hash),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_origin_exact BEFORE INSERT ON f08_dispatch_origins BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(2,CAST(json_object('action','origin.insert','row',json_array(NEW.project,NEW.run_id,NEW.epoch,NEW.dispatch_key,hex(CAST(NEW.document AS BLOB)),NEW.body_hash),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+-- This applies to EVERY dispatch epoch of a post24 Run. Mode8 separates
+-- permanent birth from pre-dispatch current Run; later RUN_CHANGED is not read.
+CREATE TRIGGER f08_dispatch_birth AFTER INSERT ON runtime_dispatches
+WHEN NOT EXISTS(SELECT 1 FROM f08_legacy_runs WHERE project=NEW.project AND run_id=NEW.run)
+BEGIN
+ INSERT INTO f08_dispatch_origins(project,run_id,epoch,dispatch_key,document,body_hash)
+ SELECT NEW.project,NEW.run,NEW.epoch,NEW.dispatch_key,document,researchos_f08_proof_v1(-1,CAST(document AS BLOB)) FROM (
+ SELECT researchos_f08_proof_v1(8,CAST(json_object('action','origin.derive','row',json_array(NEW.project,NEW.run,NEW.epoch,NEW.dispatch_key,hex(CAST(NEW.manifest AS BLOB)),NEW.manifest_hash,NEW.state,NEW.worker,NEW.journal_locator,hex(CAST(NEW.identity AS BLOB)),NEW.observation_sequence,NEW.observation_hash,NEW.prepared_at,NEW.updated_at,NEW.reason),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB)) document);
+END;
+CREATE TRIGGER f08_dispatch_full_update BEFORE UPDATE ON runtime_dispatches BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(4,CAST(json_object('action','dispatch.update','row',json_array(NEW.project,NEW.run,NEW.epoch,NEW.dispatch_key,hex(CAST(NEW.manifest AS BLOB)),NEW.manifest_hash,NEW.state,NEW.worker,NEW.journal_locator,hex(CAST(NEW.identity AS BLOB)),NEW.observation_sequence,NEW.observation_hash,NEW.prepared_at,NEW.updated_at,NEW.reason),'old',json_array(OLD.project,OLD.run,OLD.epoch,OLD.dispatch_key,hex(CAST(OLD.manifest AS BLOB)),OLD.manifest_hash,OLD.state,OLD.worker,OLD.journal_locator,hex(CAST(OLD.identity AS BLOB)),OLD.observation_sequence,OLD.observation_hash,OLD.prepared_at,OLD.updated_at,OLD.reason),'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_dispatch_no_delete BEFORE DELETE ON runtime_dispatches BEGIN SELECT RAISE(ABORT,'F08_DISPATCH_ANCHOR'); END;
+
+-- Preserve original default-deny UPDATE except the actual proven CANCEL.
+-- The SQL guards preserve every old column except body (including SQLite type).
+DROP TRIGGER idempotency_immutable;
+CREATE TRIGGER idempotency_immutable BEFORE UPDATE ON idempotency BEGIN
+ SELECT CASE WHEN NEW.principal IS NOT OLD.principal OR NEW.project IS NOT OLD.project OR NEW.operation IS NOT OLD.operation OR NEW.key IS NOT OLD.key OR NEW.request_hash IS NOT OLD.request_hash OR NEW.status IS NOT OLD.status OR NEW.created_at IS NOT OLD.created_at OR typeof(NEW.headers) IS NOT typeof(OLD.headers) OR CAST(NEW.headers AS BLOB) IS NOT CAST(OLD.headers AS BLOB) OR typeof(NEW.body) IS NOT typeof(OLD.body) OR CAST(NEW.body AS BLOB) IS CAST(OLD.body AS BLOB) OR NEW.operation IS NOT 'v2:session.control'
+ THEN RAISE(ABORT,'immutable replay') END;
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(5,CAST(json_object('action','journal.update','row',json_array(NEW.principal,NEW.project,NEW.operation,NEW.key,NEW.request_hash,NEW.status,hex(CAST(NEW.body AS BLOB)),hex(CAST(NEW.headers AS BLOB)),NEW.created_at,typeof(NEW.body),typeof(NEW.headers)),'old',json_array(OLD.principal,OLD.project,OLD.operation,OLD.key,OLD.request_hash,OLD.status,hex(CAST(OLD.body AS BLOB)),hex(CAST(OLD.headers AS BLOB)),OLD.created_at,typeof(OLD.body),typeof(OLD.headers)),'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_journal_initial BEFORE INSERT ON idempotency WHEN NEW.operation='v2:session.control' BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(5,CAST(json_object('action','journal.insert','row',json_array(NEW.principal,NEW.project,NEW.operation,NEW.key,NEW.request_hash,NEW.status,hex(CAST(NEW.body AS BLOB)),hex(CAST(NEW.headers AS BLOB)),NEW.created_at,typeof(NEW.body),typeof(NEW.headers)),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_journal_no_replace BEFORE INSERT ON idempotency WHEN EXISTS(SELECT 1 FROM idempotency WHERE principal=NEW.principal AND project=NEW.project AND operation=NEW.operation AND key=NEW.key) BEGIN SELECT RAISE(ABORT,'immutable replay'); END;
+CREATE TRIGGER f08_journal_no_delete BEFORE DELETE ON idempotency BEGIN SELECT RAISE(ABORT,'immutable replay'); END;
+CREATE TRIGGER f08_journal_insert_commit AFTER INSERT ON idempotency
+WHEN EXISTS(SELECT 1 FROM f08_final_groups f WHERE f.principal=NEW.principal AND f.project=NEW.project AND f.command_id=NEW.key AND f.request_hash=NEW.request_hash AND NEW.operation='v2:session.control')
+BEGIN
+ INSERT INTO f08_final_commits SELECT principal,project,command_id,request_hash,root_hash,json_extract(document,'$.root.original_response_digest'),json_extract(document,'$.root.final_response_digest') FROM f08_final_groups WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.key AND request_hash=NEW.request_hash;
+END;
+CREATE TRIGGER f08_journal_update_commit AFTER UPDATE ON idempotency BEGIN
+ INSERT INTO f08_final_commits SELECT principal,project,command_id,request_hash,root_hash,json_extract(document,'$.root.original_response_digest'),json_extract(document,'$.root.final_response_digest') FROM f08_final_groups WHERE principal=NEW.principal AND project=NEW.project AND command_id=NEW.key AND request_hash=NEW.request_hash;
+END;
+CREATE TRIGGER f08_commit_exact BEFORE INSERT ON f08_final_commits BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(5,CAST(json_object('action','commit.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.request_hash,NEW.final_root_hash,NEW.original_response_digest,NEW.final_response_digest),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_control_insert BEFORE INSERT ON client_control_requests BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM client_control_requests WHERE (principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id) OR control_request_id=NEW.control_request_id) THEN RAISE(ABORT,'F08_CONTROL_NO_REPLACE') END;
+ SELECT researchos_f08_proof_v1(6,CAST(json_object('action','control.insert','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.session_id,NEW.control_request_id,NEW.request_hash,NEW.target_id,hex(CAST(NEW.task_ids AS BLOB)),NEW.state,CASE WHEN NEW.original_response IS NULL THEN NULL ELSE hex(CAST(NEW.original_response AS BLOB)) END,CASE WHEN NEW.final_response IS NULL THEN NULL ELSE hex(CAST(NEW.final_response AS BLOB)) END,NEW.created_at),'old',NULL,'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_control_update BEFORE UPDATE ON client_control_requests BEGIN
+ SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END;
+ SELECT researchos_f08_proof_v1(6,CAST(json_object('action','control.update','row',json_array(NEW.principal,NEW.project,NEW.command_id,NEW.session_id,NEW.control_request_id,NEW.request_hash,NEW.target_id,hex(CAST(NEW.task_ids AS BLOB)),NEW.state,CASE WHEN NEW.original_response IS NULL THEN NULL ELSE hex(CAST(NEW.original_response AS BLOB)) END,CASE WHEN NEW.final_response IS NULL THEN NULL ELSE hex(CAST(NEW.final_response AS BLOB)) END,NEW.created_at),'old',json_array(OLD.principal,OLD.project,OLD.command_id,OLD.session_id,OLD.control_request_id,OLD.request_hash,OLD.target_id,hex(CAST(OLD.task_ids AS BLOB)),OLD.state,CASE WHEN OLD.original_response IS NULL THEN NULL ELSE hex(CAST(OLD.original_response AS BLOB)) END,CASE WHEN OLD.final_response IS NULL THEN NULL ELSE hex(CAST(OLD.final_response AS BLOB)) END,OLD.created_at),'sources',json((SELECT document FROM f08_sources))) AS BLOB));
+END;
+CREATE TRIGGER f08_control_no_delete BEFORE DELETE ON client_control_requests BEGIN SELECT RAISE(ABORT,'F08_CONTROL_IMMUTABLE'); END;
+
+-- Original immutable anchors: retain old UPDATE/DELETE triggers verbatim;
+-- these add the missing pre-conflict checks that REPLACE cannot bypass with
+-- recursive_triggers OFF. No collision exception relies on hashes alone.
+CREATE TRIGGER f08_versions_no_replace BEFORE INSERT ON domain_versions WHEN EXISTS(SELECT 1 FROM domain_versions WHERE project=NEW.project AND kind=NEW.kind AND id=NEW.id AND revision=NEW.revision) BEGIN SELECT RAISE(ABORT,'immutable version'); END;
+CREATE TRIGGER f08_outbox_no_replace BEFORE INSERT ON outbox WHEN EXISTS(SELECT 1 FROM outbox WHERE (project=NEW.project AND sequence=NEW.sequence) OR id=NEW.id) BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+CREATE TRIGGER f08_effect_no_replace BEFORE INSERT ON resource_effects WHEN EXISTS(SELECT 1 FROM resource_effects WHERE project=NEW.project AND run=NEW.run AND effect_key=NEW.effect_key AND sequence=NEW.sequence) BEGIN SELECT RAISE(ABORT,'immutable effect observation'); END;
+CREATE TRIGGER f08_observation_no_replace BEFORE INSERT ON runtime_observations WHEN EXISTS(SELECT 1 FROM runtime_observations WHERE project=NEW.project AND run=NEW.run AND epoch=NEW.epoch AND receipt_hash=NEW.receipt_hash) BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_COLLISION'); END;
+CREATE TRIGGER f08_observation_no_update BEFORE UPDATE ON runtime_observations BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_IMMUTABLE'); END;
+CREATE TRIGGER f08_observation_no_delete BEFORE DELETE ON runtime_observations BEGIN SELECT RAISE(ABORT,'F08_OBSERVATION_IMMUTABLE'); END;
+CREATE TRIGGER f08_route_no_replace BEFORE INSERT ON resource_route_history WHEN EXISTS(SELECT 1 FROM resource_route_history WHERE id=NEW.id) BEGIN SELECT RAISE(ABORT,'F08_ROUTE_IMMUTABLE'); END;
+CREATE TRIGGER f08_route_no_update BEFORE UPDATE ON resource_route_history BEGIN SELECT RAISE(ABORT,'F08_ROUTE_IMMUTABLE'); END;
+CREATE TRIGGER f08_route_no_delete BEFORE DELETE ON resource_route_history BEGIN SELECT RAISE(ABORT,'F08_ROUTE_IMMUTABLE'); END;
+CREATE TRIGGER f08_content_no_replace BEFORE INSERT ON uploaded_content WHEN EXISTS(SELECT 1 FROM uploaded_content WHERE storage_key=NEW.storage_key AND sealed=1) BEGIN SELECT RAISE(ABORT,'sealed bytes'); END;
+CREATE TRIGGER f08_content_no_unseal BEFORE UPDATE ON uploaded_content WHEN OLD.sealed=1 AND (NEW.sealed IS NOT OLD.sealed OR NEW.storage_key IS NOT OLD.storage_key OR NEW.principal IS NOT OLD.principal OR NEW.expires_at IS NOT OLD.expires_at) BEGIN SELECT RAISE(ABORT,'sealed bytes'); END;
+CREATE TRIGGER f08_upload_no_replace BEFORE INSERT ON runtime_uploads WHEN EXISTS(SELECT 1 FROM runtime_uploads WHERE storage_key=NEW.storage_key) BEGIN SELECT RAISE(ABORT,'F08_UPLOAD_BINDING'); END;
+CREATE TRIGGER f08_upload_no_update BEFORE UPDATE ON runtime_uploads BEGIN SELECT RAISE(ABORT,'F08_UPLOAD_BINDING'); END;
+CREATE TRIGGER f08_upload_no_delete BEFORE DELETE ON runtime_uploads BEGIN SELECT RAISE(ABORT,'F08_UPLOAD_BINDING'); END;
+CREATE TRIGGER f08_receipt_no_replace BEFORE INSERT ON client_control_receipts WHEN EXISTS(SELECT 1 FROM client_control_receipts WHERE receipt_id=NEW.receipt_id) BEGIN SELECT RAISE(ABORT,'F08_RECEIPT_IMMUTABLE'); END;
+CREATE TRIGGER f08_fence_no_replace BEFORE INSERT ON client_queue_fences WHEN EXISTS(SELECT 1 FROM client_queue_fences WHERE (project=NEW.project AND task_id=NEW.task_id) OR generation=NEW.generation) BEGIN SELECT RAISE(ABORT,'F08_FENCE_COLLISION'); END;
+CREATE TRIGGER f08_queue_no_replace BEFORE INSERT ON client_command_queue WHEN EXISTS(SELECT 1 FROM client_command_queue WHERE (principal=NEW.principal AND project=NEW.project AND command_id=NEW.command_id) OR message_id=NEW.message_id OR (generation=NEW.generation AND queue_sequence=NEW.queue_sequence)) BEGIN SELECT RAISE(ABORT,'F08_QUEUE_COLLISION'); END;
+-- domain_refs is not unique and s.refs follows s.put. Protect a pinned owner
+-- only; before the first pin its complete reference multiset is validated.
+CREATE TRIGGER f08_refs_pinned_insert BEFORE INSERT ON domain_refs WHEN EXISTS(SELECT 1 FROM f08_version_pins WHERE target_project=NEW.project AND kind=NEW.kind AND id=NEW.id AND revision=NEW.revision) OR EXISTS(SELECT 1 FROM f08_dispatch_origins o,json_each(o.document,'$.source_closure.reference_closure') c WHERE (json_extract(c.value,'$.owner_project')=NEW.project AND json_extract(c.value,'$.owner_ref.entity_type')=NEW.kind AND json_extract(c.value,'$.owner_ref.id')=NEW.id AND json_extract(c.value,'$.owner_ref.revision')=NEW.revision)) BEGIN SELECT RAISE(ABORT,'F08_PINNED_REFS'); END;
+CREATE TRIGGER f08_refs_pinned_update BEFORE UPDATE ON domain_refs WHEN EXISTS(SELECT 1 FROM f08_version_pins WHERE (target_project=OLD.project AND kind=OLD.kind AND id=OLD.id AND revision=OLD.revision) OR (target_project=NEW.project AND kind=NEW.kind AND id=NEW.id AND revision=NEW.revision)) OR EXISTS(SELECT 1 FROM f08_dispatch_origins o,json_each(o.document,'$.source_closure.reference_closure') c WHERE (json_extract(c.value,'$.owner_project')=OLD.project AND json_extract(c.value,'$.owner_ref.entity_type')=OLD.kind AND json_extract(c.value,'$.owner_ref.id')=OLD.id AND json_extract(c.value,'$.owner_ref.revision')=OLD.revision) OR (json_extract(c.value,'$.owner_project')=NEW.project AND json_extract(c.value,'$.owner_ref.entity_type')=NEW.kind AND json_extract(c.value,'$.owner_ref.id')=NEW.id AND json_extract(c.value,'$.owner_ref.revision')=NEW.revision)) BEGIN SELECT RAISE(ABORT,'F08_PINNED_REFS'); END;
+CREATE TRIGGER f08_refs_pinned_delete BEFORE DELETE ON domain_refs WHEN EXISTS(SELECT 1 FROM f08_version_pins WHERE target_project=OLD.project AND kind=OLD.kind AND id=OLD.id AND revision=OLD.revision) OR EXISTS(SELECT 1 FROM f08_dispatch_origins o,json_each(o.document,'$.source_closure.reference_closure') c WHERE (json_extract(c.value,'$.owner_project')=OLD.project AND json_extract(c.value,'$.owner_ref.entity_type')=OLD.kind AND json_extract(c.value,'$.owner_ref.id')=OLD.id AND json_extract(c.value,'$.owner_ref.revision')=OLD.revision)) BEGIN SELECT RAISE(ABORT,'F08_PINNED_REFS'); END;
+
+-- Origin/observation birth rows must not create deferred obligations on an
+-- FK-disabled connection, even for legacy-Run recovery without a new origin.
+CREATE TRIGGER f08_dispatch_fk BEFORE INSERT ON runtime_dispatches BEGIN SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END; END;
+CREATE TRIGGER f08_obligation_fk BEFORE INSERT ON f08_observation_obligations BEGIN SELECT CASE WHEN (SELECT foreign_keys FROM pragma_foreign_keys) IS NOT 1 THEN RAISE(ABORT,'F08_FOREIGN_KEYS_REQUIRED') END; END;
+
+CREATE TRIGGER f08_binding_no_replace BEFORE INSERT ON runtime_bindings WHEN EXISTS(SELECT 1 FROM runtime_bindings WHERE project=NEW.project AND runtime=NEW.runtime) BEGIN SELECT RAISE(ABORT,'runtime binding immutable'); END;
+CREATE TRIGGER f08_binding_no_delete BEFORE DELETE ON runtime_bindings BEGIN SELECT RAISE(ABORT,'runtime binding immutable'); END;
+CREATE TRIGGER f08_qplan_no_replace BEFORE INSERT ON runtime_qualification_plans WHEN EXISTS(SELECT 1 FROM runtime_qualification_plans WHERE project=NEW.project AND task=NEW.task) BEGIN SELECT RAISE(ABORT,'runtime plan immutable'); END;
+CREATE TRIGGER f08_qplan_no_delete BEFORE DELETE ON runtime_qualification_plans BEGIN SELECT RAISE(ABORT,'runtime plan immutable'); END;
+CREATE TRIGGER f08_qrun_no_replace BEFORE INSERT ON runtime_qualification_runs WHEN EXISTS(SELECT 1 FROM runtime_qualification_runs WHERE project=NEW.project AND (task=NEW.task OR run=NEW.run)) BEGIN SELECT RAISE(ABORT,'runtime qualification marker immutable'); END;
+CREATE TRIGGER f08_qrun_no_delete BEFORE DELETE ON runtime_qualification_runs BEGIN SELECT RAISE(ABORT,'runtime qualification marker immutable'); END;
+CREATE TRIGGER f08_qapproval_no_replace BEFORE INSERT ON runtime_qualification_approvals WHEN EXISTS(SELECT 1 FROM runtime_qualification_approvals WHERE project=NEW.project AND runtime=NEW.runtime AND revision=NEW.revision) BEGIN SELECT RAISE(ABORT,'runtime approval immutable'); END;
+CREATE TRIGGER f08_qapproval_no_delete BEFORE DELETE ON runtime_qualification_approvals BEGIN SELECT RAISE(ABORT,'runtime approval immutable'); END;
+CREATE TRIGGER f08_use_no_replace BEFORE INSERT ON artifact_uses WHEN EXISTS(SELECT 1 FROM artifact_uses WHERE (project=NEW.project AND artifact=NEW.artifact AND run=NEW.run AND epoch=NEW.epoch AND principal=NEW.principal) OR storage_key=NEW.storage_key) BEGIN SELECT RAISE(ABORT,'immutable artifact use'); END;
+CREATE TRIGGER f08_useproof_no_replace BEFORE INSERT ON artifact_use_proofs WHEN EXISTS(SELECT 1 FROM artifact_use_proofs WHERE project=NEW.project AND artifact=NEW.artifact AND run=NEW.run AND epoch=NEW.epoch) BEGIN SELECT RAISE(ABORT,'immutable artifact use proof'); END;
+
+-- Deliberately no blanket domain_objects BEFORE INSERT collision ban: the
+-- original s.put uses ON CONFLICT DO UPDATE for mutable heads. Proofs resolve
+-- exact pinned domain_versions plus immutable artifacts, not replaceable heads.
+-- Cross-key corruption of a mutable projection fails the source consistency
+-- check; this is not a claim to authenticate arbitrary complete DB rewrites.
+
+
+-- V5 exact category33/34 anchors. Existing SQL6/11 bytes and prior32 tuples
+-- unchanged. No normal producer uses conflict-ignore/upsert on these tables.
+-- The dependency snapshot body keeps its ordered refs including repetitions.
+CREATE TRIGGER f08_carry_no_replace BEFORE INSERT ON resource_checkpoint_carries WHEN EXISTS(SELECT 1 FROM resource_checkpoint_carries WHERE project=NEW.project AND run=NEW.run AND epoch=NEW.epoch) BEGIN SELECT RAISE(ABORT,'F08_CHECKPOINT_CARRY_IMMUTABLE'); END;
+CREATE TRIGGER f08_carry_no_update BEFORE UPDATE ON resource_checkpoint_carries BEGIN SELECT RAISE(ABORT,'F08_CHECKPOINT_CARRY_IMMUTABLE'); END;
+CREATE TRIGGER f08_carry_no_delete BEFORE DELETE ON resource_checkpoint_carries BEGIN SELECT RAISE(ABORT,'F08_CHECKPOINT_CARRY_IMMUTABLE'); END;
+CREATE TRIGGER f08_dependencies_no_replace BEFORE INSERT ON orchestration_run_dependencies WHEN EXISTS(SELECT 1 FROM orchestration_run_dependencies WHERE project=NEW.project AND run=NEW.run) BEGIN SELECT RAISE(ABORT,'F08_DEPENDENCY_SNAPSHOT_IMMUTABLE'); END;

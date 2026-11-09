@@ -1,0 +1,53 @@
+	return Object{"dispatch_key": key, "manifest": m, "manifest_hash": digest, "state": state, "worker": worker, "journal_locator": locator, "identity": id, "observation_sequence": sequence, "observation_hash": observation, "reason": reason}, nil
+}
+
+// currentDispatchAdmission rechecks authority without granting a fresh launch.
+func (s *Service) currentDispatchAdmission(tx *sql.Tx, project string, task, run, dispatch Object, operation string) (Object, error) {
+	manifest := dispatch["manifest"].(map[string]any)
+	if manifest["task_id"] != task["id"] || manifest["runtime_id"] != run["runtime_id"] || manifest["executor_principal_id"] != run["executor_principal_id"] || Hash(manifest["epoch"]) != Hash(run["lease_epoch"]) || manifest["context_bundle_id"] != run["context_bundle_id"] || Hash(manifest["input_refs"]) != Hash(run["input_refs"]) || manifest["contract_hash"] != task["acceptance_contract"].(map[string]any)["contract_hash"] {
+		return nil, Fail(412, "STALE_INPUT", "dispatch no longer binds current Run")
+	}
+	if !runtimeExecutorAllowed(tx, Str(run, "executor_principal_id"), project, Str(task, "id")) {
+		return nil, Fail(403, "FORBIDDEN", "executor dispatch role or grant revoked")
+	}
+	runtime, e := load(tx, project, "RuntimeRegistration", Str(run, "runtime_id"))
+	if e != nil {
+		return nil, e
+	}
+	prior := manifest["admission"].(map[string]any)
+	var admission Object
+	if prior["qualification_bootstrap"] == true {
+		admission, e = s.bootstrapRuntimeAdmission(tx, project, task, run, runtime)
+	} else {
+		admission, e = s.currentRuntimeAdmission(tx, project, task, runtime, Arr(prior, "requested_capabilities"), operation)
+	}
+	if e != nil {
+		return nil, e
+	}
+	// Runtime health/lifecycle revisions are not a technical identity. Every
+	// profile, permission, qualification proof and expiry fact remains exact.
+	for _, key := range []string{"mode", "profile_hash", "profile", "technical_hash", "qualification_ids", "qualification_evidence", "permission", "credential_revision", "expires_at", "requested_capabilities", "qualification_bootstrap"} {
+		if Hash(prior[key]) != Hash(admission[key]) {
+			return nil, Fail(412, "STALE_INPUT", "dispatch authority snapshot changed")
+		}
+	}
+	if e = s.taskContextForRun(tx, project, run); e != nil {
+		return nil, e
+	}
+	if _, e = s.runDependenciesCurrent(tx, project, task, run); e != nil {
+		return nil, e
+	}
+	return admission, nil
+}
+
+func (s *Service) currentDispatchedRun(tx *sql.Tx, project string, run Object, operation string) error {
+	dispatch, e := runtimeDispatch(tx, project, Str(run, "id"), run["lease_epoch"])
+	if e == sql.ErrNoRows {
+		return nil
+	} // Existing bounded fixture contracts remain compatible.
+	if e != nil {
+		return e
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return e

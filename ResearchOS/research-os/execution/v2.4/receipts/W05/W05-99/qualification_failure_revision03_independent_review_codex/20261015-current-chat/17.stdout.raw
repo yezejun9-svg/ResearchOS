@@ -1,0 +1,225 @@
+FILE execution\v2.4\receipts\W05\W05-99\qualification_failure_revision03_architecture_codex\20261015-current-chat\C-lease-addendum.md
+# C revision03 — one native source lease through every official entry
+
+DESIGN_ONLY. Replaces revision02's unresolved nested-backup lease choice and expands only the exact C interlock scope below. C's five-version transaction, current Owner/run-null proof attribution, fixed journal/crash/abort rules and no actual authority remain. B/D designs are unchanged. The extra shared replacement-history reader is necessary to make a direct typed adapter call as safe as its CLI caller without a domain→host import cycle or a caller-supplied callback/boolean.
+
+## One checked native owner and a private borrow
+
+The native file handle is owned by exactly one `*runtime.DataRootLease`. It is never serialized, exposed as an integer, reconstructed from a path/PID or accepted through JSON. `AcquireDataRootLease` and the raw coordinator `LockDataRoot` path must check BOTH qualification and verifier-replacement journals while holding the newly acquired lock before returning it. Existing ordinary callers keep the same signatures. Factor raw OS lock acquisition into a package-private primitive; do not recursively call the checked public wrapper. Partial journal, unknown file or nonterminal history denies ordinary acquisition.
+
+The two maintenance commands may use a distinct exact-operation inspection permit whose namespace+operation+plan digest are immutable private fields obtained by strict journal parsing. Under the newly held native lock, re-read and compare that exact journal and check all other operations in both namespaces. This exception bypasses discovery of only its own already-pending operation; it grants no Owner identity, SQL write, termination or execution authority. Replacement recovery cannot exempt C; C recovery cannot exempt replacement. A new commit with no pending journal uses ordinary checked acquisition. Never take a naked `skipGate bool` or caller-defined validator.
+
+Existing host replacement history code depends on host/domain types. Put the read-only replacement history grammar in `internal/qualificationmaintenancejournal/replacement_windows.go`, alongside C's journal grammar, using only bounded filesystem/ACL/native-path/hash/strict-JSON helpers and existing Windows libraries, with no domain/host imports. It must validate the SAME existing plan/events/file inventory, state transitions, immutable backups/stage absence, causal sequence/predecessor/terminal digests, and latest runtime-verifier-installation.json hash. It cannot classify only the last state string or ignore unknown fields. Existing host replacement writer/recovery retains its original checks; the combined host gate additionally uses this shared read-only result. Run positive/negative equivalence tests against the existing replacement reader on the same fixtures. This is a second exact validator at a lower dependency boundary, not a new replacement format, migration, acceptance status or authority source.
+
+Add the following Windows runtime methods in existing data_root_windows.go:
+
+```go
+func (l *DataRootLease) CheckMaintenanceReady(database string) error
+func (l *DataRootLease) BorrowMaintenanceSource(database string) (*DataRootSourceBorrow, error)
+func (b *DataRootSourceBorrow) Check(database string) error
+func (b *DataRootSourceBorrow) Release() error
+```
+
+`DataRootSourceBorrow` has only private fields and no public constructor/JSON conversion. BorrowMaintenanceSource verifies Held, canonical root/database/file identity (non-reparse, exact source under root), both journals with **no own-operation exemption**, and the parent's live generation. It reserves a single borrow under the parent mutex. Nil/zero/closed/already-borrowed/stale/released/wrong-root capability fails. Parent Close refuses while borrowed. Borrow Check revalidates parent Held/generation and pinned file/root identity; it does not acquire another OS lock. Release only releases that borrow, not the native handle. Copies share the same private state, so a released borrow cannot become valid by copying it. No source workflow receives a raw native handle.
+
+The domain Windows-only adapters are:
+
+```go
+func UpgradeLocalUnderSourceLease(ctx context.Context, opt LocalUpgradeOptions, lease *runtime.DataRootLease) (RestoreReport, error)
+func UpgradePreparedAbandonmentBackupUnderSourceLease(ctx context.Context, opt PreparedBackupHandoffOptions, lease *runtime.DataRootLease) (RestoreReport, error)
+```
+
+They normalize/validate the source path before any secret/protected-service/template/DB work, call BorrowMaintenanceSource (therefore rechecking both journals even if invoked directly), construct package-private `backupSourceLease` around the borrow, assign the unexported `LocalUpgradeOptions.sourceLease *backupSourceLease`, and delegate to existing private workflows. The field is excluded from JSON, canonical plan hashes and public DTOs; external Go callers cannot construct it. The adapter defers borrow.Release until the full workflow has returned and all its DB defers have run. The CLI remains the sole native owner and closes the outer lease only after the adapter returns.
+
+`backupSourceLease.Check(root,source)` binds the exact canonical source/root/file identity and parent generation; its fields and constructor are private. `acquirePreparedUpgradeRootLease(root, source, inherited *backupSourceLease)` returns a private wrapper over this borrow when inherited is nonnil. Its Check calls inherited.Check; its Close closes only the wrapper state, never Release and never the native handle. Any inner error follows this same rule. No second native acquire, Close/reopen gap or callback is allowed. In official workflows inherited must be nonnil; legacy internally owned behavior, if retained for existing isolated private fixtures, stays package-private and is not reachable from the public workflows or CLI. Prefer rejecting nil at the production private dispatcher before a prepared branch.
+
+The existing exported `UpgradeLocal` and `UpgradePreparedAbandonmentBackup` become explicit fail-closed compatibility entrypoints returning `UPGRADE_SOURCE_LEASE_REQUIRED` before protected providers, release/template preparation, key reads or DB access. They do not internally reopen a root, set sourceLease, or treat absent journals as permission. Official callers migrate to the two typed adapters. Direct use of the typed adapters with an ordinary but genuinely held lease is safe because BorrowMaintenanceSource itself runs the complete gate; the caller cannot claim that a gate passed. Private existing isolated algorithm fixtures are not credited as guarded-workflow tests.
+
+On non-Windows, the platform wrappers and domain adapters return `NATIVE_WINDOWS_SOURCE_LEASE_REQUIRED`; no nil/any value succeeds or masquerades as an OS capability. Common CLI code calls platform wrappers so it does not need a fabricated cross-platform native-handle type.
+
+## Exact backup dispatch coverage
+
+In ops/backup/main.go, validate command and plain paths first, then route every existing-source workflow through platform `openBackupSourceLease(source)` before reading KeyFile, calling any protected service, opening DB, loading/creating an upgrade template or building a Host. The Windows helper canonicalizes and holds exact root/file identities, acquires the one checked lease, calls host combined gate under it, and returns that opaque lease. Errors close only resources created by that helper. The outer CLI defers Close after all downstream DB/workflow defers. Keygen has no data root and stays outside this gate. Restore continues to require a new destination and reject an existing/aliased live or pending root; it cannot consume the source upgrade capability as permission to replace product data.
+
+| Entry | Domain path while same outer lease remains held |
+|---|---|
+| create / export | existing source store.Open + Service/Host backup; DB closes before outer lease |
+| upgrade-local: schema13-to14-remote-access-v1 | UpgradeLocalUnderSourceLease -> upgradeLocal target14 |
+| upgrade-local: schema13-to20-research-runtime-v1 | same adapter -> upgradeLocal target20 |
+| upgrade-local: schema21-to22-client-command-queue-v1 | same adapter -> upgradeQueueLocal |
+| upgrade-local: schema22-to23-host-model-configuration-v1 | same adapter -> upgradeConfigurationLocal |
+| upgrade-local: schema23-to24-prepared-abandonment-v1 | same adapter -> upgradePreparedAbandonmentLocal; private borrowed wrapper at existing line416 |
+| upgrade-prepared-backup | UpgradePreparedAbandonmentBackupUnderSourceLease -> upgradePreparedAbandonmentBackup; private borrowed wrapper at existing line181 |
+
+All five plan choices cross the adapter before their dispatch. Invalid plan rejects before secret/template work. No branch can fall back to the old public API. Both prepared branches pass `opt.sourceLease` explicitly; the handoff's copied opt preserves that private field while normalizing paths. Revalidate source identity after normalization and before its first DB open; an option copy must not detach the native identity. Non-prepared branch algorithms need no extra production file edits because the adapter owns their complete call lifetime; update public workflow tests to use the new real source-lease entry, not a fake option flag.
+
+## Other early entries, including release_host
+
+Normal Core calls the combined gate while holding its lease before store.Open/bootstrap/provider/protected setup. Replacement preflight/commit/recover uses the checked acquisition or its own exact-operation permit; another pending C operation blocks it. C's own preflight/commit/recover/abort checks replacement history and all other C operations before opening SQLite. The original namespace semantics and explicit NOT_APPLIED→ABORTED rules are unchanged.
+
+Inherited prepared recovery/migration already receive a token whose native session has acquired and borrowed the real lease. Central acquisition now checks both namespaces before returning the token. In apps/control/prepared_recovery_windows.go, after ReceiveInherited/ReceiveMigrationInherited and before openExclusiveRecoveryDB/PRAGMA, obtain Adoption/Binding, call token.Check with the exact bound public inputs, call the host pure combined-root validator, and call token.Check again. The token remains live across the DB operation and its existing Close owns the one native release. Do not call AcquireDataRootLease again, expose native handles, mint a new token, or add a host import to recoveryauthority.
+
+Legacy `ops/supervisor/release_host` must obtain its platform gate/lease wrapper BEFORE protectedstore.OpenCanary; the existing ordering opens Canary before its line44 lease and must be reversed. `main.go` calls `openReleaseHostSourceLease(dbPath)`, then opens Canary, then store.Open, and defers their closure in the order DB→Canary→lease. Wrapper checks exact fixture DB/root, acquires one checked lease and calls combined gate. No existing fixture public/live scope is expanded.
+
+For `--control` mode, do not retain a second parent data-root lease across a launched Core's lifetime. A platform wrapper first retains the existing strict disposable ControlFixture bindings and canonical root/data mapping; it never redirects an arbitrary --db into that branch or opens Canary/SQLite itself. Existing ControlFixtureDriver.Start/Restore/Compatible use AcquireDataRootLease before their offline DB/protected/launch work; the central two-namespace check covers those exact paths. Start releases its parent lease only as part of the existing child-start protocol; the child normal startup acquires/checks the same root before setup. Pending intent during the handoff prevents child startup, rather than silently bypassing the check. When the fixture Core is live, its held lease prevents a new C intent; when offline, driver acquisition blocks a pending intent. Existing command/release journals are not proof of absence of C/replacement journals. Source tests must demonstrate both bootstrap and existing-fixture control modes preserve these checks; any uncovered DB/protected call before checked acquisition requires an explicit allowlist revision, not an exemption.
+
+Fixture-control replay acquires/holds its exact fixture root lease and combined gate before store.Open. store.Open's pending-namespace rejection remains defense in depth and does not replace a held native lease. No new public HTTP or management entry is added. No same-root mutator may pass an arbitrary callback, `true`, raw handle or JSON approval to a gate.
+
+## Scope and acceptance
+
+Carry the complete revision02 C scope, add the reviewer's exact existing/new/test paths, plus the two justified shared replacement-reader paths and the three existing public upgrade test files whose valid calls must migrate. Full union is frozen in C-lease-exact-scope.json; no wildcards. No original spec/threshold/schema changes. The own-operation permit must not be accepted by BackupSourceBorrow: backup never inherits a C/replacement pending-operation exception.
+
+Required positive fixture: a real held native lease passes both empty/valid-complete namespaces, one adapter traverses each of five plan dispatches, each prepared inner scope succeeds without a second lock, and inner failure leaves outer Held. Borrow stays active until all source DB handles close; parent premature Close fails. Negative fixtures cover both pending namespaces at every entry before Canary/key/provider/template/store, wrong root/source identity, zero/closed/stale/released/concurrent borrow, standalone public APIs, exact-own-exception crossing namespaces, malformed completed replacement history and control/replay routes. Tests must instrument forbidden setup boundaries or use inaccessible sentinel files to prove early rejection; checking only an eventual error is insufficient.
+
+This resolves the design choice; no implementation or test has run here. Independent review must accept the concrete package boundary and complete entry matrix before C Source authority. Actual maintenance still requires accepted A/B/C/STOP, current authority and separately reviewed exact operation. Formal increment0.
+
+FILE execution\v2.4\receipts\W05\W05-99\qualification_failure_revision03_architecture_codex\20261015-current-chat\C-lease-exact-scope.json
+{
+  "schema": "researchos.C-single-native-lease-exact-scope.v3",
+  "status": "DESIGN_ONLY_REQUIRES_INDEPENDENT_REVIEW_AND_ROOT_SOURCE_CARD",
+  "base_scope_sha256": "02406c117bf68ed346479306901f40a28176ff570eaed5ad592b5ce37d28ffd0",
+  "production_existing": [
+    "apps/control/main.go",
+    "apps/control/prepared_recovery_windows.go",
+    "apps/control/replay_command.go",
+    "adapters/runtime/bridge_windows.go",
+    "adapters/runtime/data_root_windows.go",
+    "internal/host/runtime_verifier_replacement_windows.go",
+    "internal/host/runtime_verifier_replacement_journal_windows.go",
+    "internal/domain/runtime_qualification_failure_windows.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows.go",
+    "internal/store/sqlite.go",
+    "ops/backup/main.go",
+    "internal/domain/backup_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_upgrade.go",
+    "internal/domain/backup_prepared_abandonment_handoff.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_other.go",
+    "ops/supervisor/release_host/main.go"
+  ],
+  "production_new": [
+    "apps/control/qualification_failure_maintenance_windows.go",
+    "apps/control/qualification_failure_maintenance_other.go",
+    "internal/host/qualification_failure_maintenance_windows.go",
+    "internal/host/maintenance_startup_gate_windows.go",
+    "internal/domain/qualification_failure_maintenance_windows.go",
+    "internal/store/qualification_maintenance_windows.go",
+    "internal/qualificationmaintenancejournal/contract.go",
+    "internal/qualificationmaintenancejournal/journal_windows.go",
+    "internal/qualificationmaintenancejournal/journal_other.go",
+    "ops/backup/maintenance_gate_windows.go",
+    "ops/backup/maintenance_gate_other.go",
+    "internal/domain/backup_source_lease_windows.go",
+    "internal/domain/backup_source_lease_other.go",
+    "ops/supervisor/release_host/maintenance_gate_windows.go",
+    "ops/supervisor/release_host/maintenance_gate_other.go",
+    "internal/qualificationmaintenancejournal/replacement_windows.go"
+  ],
+  "tests_allowed": [
+    "apps/control/qualification_failure_maintenance_windows_test.go",
+    "apps/control/runtime_verifier_replacement_windows_test.go",
+    "apps/control/replay_command_test.go",
+    "internal/host/qualification_failure_maintenance_windows_test.go",
+    "internal/host/maintenance_startup_gate_windows_test.go",
+    "internal/domain/qualification_failure_maintenance_windows_test.go",
+    "internal/domain/runtime_qualification_failure_windows_test.go",
+    "internal/store/qualification_maintenance_windows_test.go",
+    "internal/qualificationmaintenancejournal/journal_windows_test.go",
+    "adapters/runtime/qualification_maintenance_gate_windows_test.go",
+    "ops/backup/maintenance_gate_windows_test.go",
+    "internal/domain/backup_source_lease_windows_test.go",
+    "internal/domain/backup_prepared_abandonment_handoff_test.go",
+    "internal/domain/backup_prepared_abandonment_upgrade_windows_test.go",
+    "ops/supervisor/release_host/maintenance_gate_windows_test.go",
+    "internal/qualificationmaintenancejournal/replacement_windows_test.go",
+    "internal/domain/backup_configuration_upgrade_test.go",
+    "internal/domain/backup_queue_upgrade_test.go",
+    "internal/domain/backup_upgrade_test.go"
+  ],
+  "reviewer_minimum_additions_adopted": true,
+  "additional_justification": {
+    "shared_replacement_reader_and_test": "Direct domain adapter must check both namespaces without domain-host import cycle or caller callback; strict existing grammar equivalence required",
+    "existing_public_upgrade_tests": "Migrate actual public API positive calls to real guarded native adapters; no always-true fixture seam"
+  },
+  "signatures": "See frozen C-lease-addendum.md",
+  "old_public_APIs": "fail closed UPGRADE_SOURCE_LEASE_REQUIRED",
+  "all_five_upgrade_plans_covered": true,
+  "one_native_handle_owner": "outer CLI or inherited native token; private domain borrower never closes it",
+  "no_other_files": true,
+  "actual_authority": false,
+  "formal_increment": 0
+}
+
+FILE execution\v2.4\receipts\W05\W05-99\qualification_failure_revision03_architecture_codex\20261015-current-chat\F01-claims.json
+{
+  "schema": "researchos.historical-qualification-claim-matrix.v3",
+  "mode": "DESIGN_AND_READONLY_PROOF_ANALYSIS_ONLY",
+  "source_commit": "4f4023c956f84d65743f39ce77d6c8899a21ada1",
+  "subject": {"project":"a7ebcf2a322c6abcf87e043f601ee804","task":"0469d97b91b04fd7fdeed77770ea1bed","run":"f3dcb996b2e43cf52cba874be7abfc70","runtime":"db26746ff0420ca156d315f0de00fb53","epoch":1,"dispatch":"705b11ec99044fef19e85f57e2d2b712"},
+  "claims": [
+    {"id":"HOST_TOOL_EFFECT_NOT_DISPATCHED","status":"SUPPORTED_SOURCE_RECONSTRUCTION","scope":"exact historical TOOL frame3 through Host broker only","proof_kind_proposed":"HISTORICAL_HOST_BROKER_DENIAL_RECONSTRUCTION_V1","sources":["022-exact-compiled-closure-and-contract.stdout.raw","019-historical-response.stdout.raw"],"limits":["not an original online typed denial","not universal OS NO_EFFECT","original denial text absent"]},
+    {"id":"UNIVERSAL_HISTORICAL_OS_NO_EFFECT","status":"NOT_PROVABLE","missing":["historical complete WFP/loopback/shared-object ACL restrictions","LPAC not used","complete SDK/esbuild/node_modules/generated-dist reproducibility closure"],"observed_escape_claim":false},
+    {"id":"MODEL_CONFIRMED_MONEY_UNKNOWN","status":"SUPPORTED_PUBLIC_OBSERVATION","effect_keys":1,"model_outcome":"CONFIRMED","money":"UNKNOWN_NOT_ZERO","keep_all_financial_rows":true},
+    {"id":"RAW_QUEUE_EMPTY","status":"FALSE","frames":3,"acknowledged":2,"queue_required":false,"generic_observation_rule_unchanged":true},
+    {"id":"DERIVED_FAILED_CLOSURE","status":"PROPOSAL_REQUIRES_INDEPENDENT_ACCEPTANCE_AND_ALL_PREMISES","proof_alone_sufficient":false,"requires":["complete exact raw frame census","exact Host first-gate/effect binding","no unresolved extra effect","accepted native worker proof class","accepted current STOP including original verifier prerequisite","current single DataRootLease plus dispatch owner lock","accepted B private proof consumer","current exact C plan and authority"],"cannot_claim_historical_broker_join":true},
+    {"id":"HISTORICAL_WORKER_JOB_CLOSURE","status":"SUPPORTED_SOURCE_DERIVATION_PENDING_INDEPENDENT_CLASS_ACCEPTANCE","proposed_class":"HISTORICAL_NATIVE_JOB_ACCOUNTING_CLOSURE_V1","pid":69860,"creation":"1792057406096619100","job":"Local\\ResearchOS.W10.1792057404322293200","exit_code":124,"stopped":true,"drained":true,"cleanup":true,"raw_wait_result":null,"current_owner_lock_probe":"NOT_PERFORMED","sources":["014-historical-proof-inputs.stdout.raw","022-exact-compiled-closure-and-contract.stdout.raw","024-effect-and-bridge-finalization.stdout.raw"]},
+    {"id":"VERIFIER_HOST_JOB_AND_TOKEN_NOT_TRANSFERRED","status":"SUPPORTED_SOURCE_RECONSTRUCTION","binary_sha256":"f255f4d49c5b217462bb38a8ec2292e9d62889d8506488569ff3638237708a43","historical_branch":"RunAdmitted protocolError -> ExecuteLocalQualification error -> Host line196 before token204/job213","sources":["014-historical-proof-inputs.stdout.raw","017-host-verifier-controlflow.stdout.raw","019-historical-response.stdout.raw","022-exact-compiled-closure-and-contract.stdout.raw"]},
+    {"id":"VERIFIER_RECORDED_NATIVE_HANDLE_WAIT","status":"MISSING","cmd_wait_called_is_not_success_receipt":true,"possibly_alive_not_declared_closed":true},
+    {"id":"VERIFIER_NEVER_JOB_AUTHORIZED_V1_OPERATIONAL_SUBSTITUTE","status":"NOT_PROVABLE_TRANSITIVE_INIT_BACKGROUND_CLOSURE","missing":["complete actual selected-source initializer and background closure across importcfg.link dependencies","proof of no independent DB/network/OS authority if original verifier remains alive"],"sources":["018-spec-discovery.stdout.raw","021-proof-path-search.stdout.raw"],"may_authorize_STOP":false}
+  ],
+  "proposed_consumer": {
+    "proof_kind":"HISTORICAL_HOST_BROKER_DENIAL_RECONSTRUCTION_V1",
+    "claim":"HOST_TOOL_EFFECT_NOT_DISPATCHED",
+    "rule":"EXACT_QUALIFICATION_MODEL_ONLY_FIRST_GATE_V1",
+    "reject_universal_no_effect_consumer":true,
+    "derived_queue_empty_only_after_complete_classification":true,
+    "result":"FAILED_ONLY",
+    "unchanged":["Task","request consumption","raw frames and ACK","native artifacts","effects","budget","NoProgress","lease","qualification","schema"],
+    "actual_enabled":false
+  },
+  "formal_increment":0,
+  "self_acceptance":false
+}
+
+FILE execution\v2.4\receipts\W05\W05-99\qualification_failure_revision03_architecture_codex\20261015-current-chat\F01-proposed-scope-tests.json
+{
+  "schema":"researchos.historical-claims-proposed-cuts.v3",
+  "status":"NO_SOURCE_AUTHORITY_PENDING_INDEPENDENT_REVIEW",
+  "requires_new_Root_scope":true,
+  "candidate_existing_C_paths":["internal/domain/qualification_failure_maintenance_windows.go","internal/domain/runtime_qualification_failure_windows.go","internal/host/qualification_failure_maintenance_windows.go","adapters/runtime/bridge_windows.go"],
+  "candidate_tests":["internal/domain/qualification_failure_maintenance_windows_test.go","internal/domain/runtime_qualification_failure_windows_test.go","internal/host/qualification_failure_maintenance_windows_test.go"],
+  "no_additional_paths_outside_C_revision03":true,
+  "cuts":[
+    "narrow Host claim cannot satisfy a universal OS NO_EFFECT consumer",
+    "exact3 ACK2 TOOLdenied1 accepted only under independently accepted class; raw Observation queue_empty remains false",
+    "extra suffix frame, missing raw bytes, unknown route, existing TOOL stage or ledger, mismatched MODEL receipt each deny",
+    "UNKNOWN effect outcome denies; confirmed MODEL with UNKNOWN money preserves all financial rows",
+    "native Job-accounting proof distinct from raw native wait; missing or changed compiled source/receipt identity denies",
+    "recorded worker closure without currently held root and owner locks denies maintenance",
+    "Host Job-not-transferred with incomplete initializer closure cannot satisfy STOP verifier prerequisite",
+    "missing original verifier native proof plus unsupported substitute remains NOT_PROVABLE",
+    "ordinary AppContainer empty capabilities never becomes LPAC or universal OS containment proof",
+    "historical input reconstruction cannot emit original B denial/ACK/native wait/drain ticket",
+    "exact FAILED transaction preserves Task/counters/consumption/effects/ledger/raw histories and cannot create Acceptance or authority",
+    "B online path still requires actual private drain ticket; historical class has separate constructor and full current quiescence guards"
+  ],
+  "tests_executed":false,
+  "formal_increment":0
+}
+
+FILE execution\v2.4\receipts\W05\W05-99\qualification_failure_revision03_architecture_codex\20261015-current-chat\017-host-verifier-controlflow.invocation.json
+{
+  "schema": "researchos.readonly-command.v1",
+  "at": "2026-10-15T11:13:03.263458+00:00",
+  "args": [
+    "C:\\Users\\yqyyds\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+    "-X",
+    "utf8",
+    "-c",
+    "import pathlib;cuts={'internal/host/runtime_qualification_windows.go':[(120,260)],'internal/host/runtime_verifier_process_windows.go':[(1,250)],'internal/domain/runtime_qualification_execution_windows.go':[(1,190)]};\nfor name,ranges in cuts.items():\n lines=pathlib.Path(name).read_text(encoding='utf-8-sig').splitlines();print('FILE '+name)\n for a,b in ranges:\n  for i in range(a-1,min(b,len(lines))):print(str(i+1)+':'+lines[i])"
+  ],
+  "cwd": "D:\\作品集\\ResearchOS\\research-os",
+  "native_exit": 0,
+  "stdout_sha256": "35c043bf39f9d86c8095b45efb3248f50eaabc9c953cb705123bf886d192c1f5",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+

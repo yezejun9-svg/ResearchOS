@@ -1,0 +1,2861 @@
+diff --git a/internal/host/owned_core_stop_identity_windows.go b/internal/host/owned_core_stop_identity_windows.go
+new file mode 100644
+index 00000000..5be241c6
+--- /dev/null
++++ b/internal/host/owned_core_stop_identity_windows.go
+@@ -0,0 +1,139 @@
++//go:build windows
++
++package host
++
++import (
++	"context"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"net/url"
++	"path/filepath"
++	"strings"
++
++	_ "modernc.org/sqlite"
++	"researchos.local/research-os/internal/auth"
++)
++
++// OwnedCoreStopPublicIdentity contains only public authority metadata. It
++// never reads credentials, keys, vault records or private process memory.
++type OwnedCoreStopPublicIdentity struct {
++	DataRoot        string `json:"data_root"`
++	Database        string `json:"database"`
++	DatabaseVolume  uint32 `json:"database_volume"`
++	DatabaseIndex   uint64 `json:"database_index"`
++	SID             string `json:"sid"`
++	PrincipalRef    string `json:"principal_ref"`
++	HostID          string `json:"host_id"`
++	OwnerID         string `json:"owner_id"`
++	OwnerRoot       string `json:"owner_root"`
++	HostStateSHA256 string `json:"host_state_sha256"`
++	SchemaVersion   int    `json:"schema_version"`
++}
++
++// ReadOwnedCoreStopPublicIdentity opens an existing database read-only and
++// reads the protected host_state.json through the existing same-SID reader.
++// The caller's SQLite barrier, when present, keeps this database view stable.
++func ReadOwnedCoreStopPublicIdentity(ctx context.Context, dataRoot string) (OwnedCoreStopPublicIdentity, error) {
++	var out OwnedCoreStopPublicIdentity
++	if e := replacementPath(dataRoot); e != nil {
++		return out, e
++	}
++	actual, e := filepath.EvalSymlinks(dataRoot)
++	if e != nil || !strings.EqualFold(actual, dataRoot) {
++		return out, errors.New("data-root reparse refused")
++	}
++	hostDir := filepath.Join(dataRoot, "host")
++	dbPath := filepath.Join(dataRoot, "researchos.sqlite")
++	for i, path := range []string{dataRoot, hostDir, dbPath} {
++		if _, e = replacementIdentity(path, i < 2); e != nil {
++			return out, e
++		}
++		if e = replacementACL(path, i < 2, i == 1); e != nil {
++			return out, e
++		}
++	}
++	dbID, e := replacementIdentity(dbPath, false)
++	if e != nil {
++		return out, e
++	}
++	raw, e := replacementRead(filepath.Join(hostDir, stateFile), 64<<10)
++	if e != nil {
++		return out, e
++	}
++	var state hostState
++	if e = decodeRuntimeManaged(raw, &state); e != nil {
++		return out, e
++	}
++	identity, e := auth.Current()
++	if e != nil {
++		return out, e
++	}
++	sid, e := currentSIDString()
++	if e != nil {
++		return out, e
++	}
++	if state.Version != 1 || state.HostInstanceID == "" || state.PrincipalID == "" || state.PrincipalRef != identity.Ref {
++		return out, ErrHostIdentity
++	}
++	stateHash := sha256.Sum256(raw)
++	out = OwnedCoreStopPublicIdentity{DataRoot: dataRoot, Database: dbPath, DatabaseVolume: dbID.Volume, DatabaseIndex: uint64(dbID.IndexHigh)<<32 | uint64(dbID.IndexLow), SID: sid, PrincipalRef: identity.Ref, HostID: state.HostInstanceID, OwnerID: state.PrincipalID, HostStateSHA256: hex.EncodeToString(stateHash[:])}
++	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(dbPath)}
++	q := u.Query()
++	q.Set("mode", "ro")
++	u.RawQuery = q.Encode()
++	db, e := sql.Open("sqlite", u.String())
++	if e != nil {
++		return out, e
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	var versions, minVersion int
++	if e = db.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&out.SchemaVersion, &minVersion, &versions); e != nil || out.SchemaVersion != 24 || minVersion != 1 || versions != 24 {
++		return out, errors.New("schema 24 fingerprint unavailable")
++	}
++	var owners int
++	rows, e := db.QueryContext(ctx, `SELECT id,roles,revoked FROM auth_principals ORDER BY id`)
++	if e != nil {
++		return out, e
++	}
++	for rows.Next() {
++		var id, roles string
++		var revoked int
++		if e = rows.Scan(&id, &roles, &revoked); e != nil {
++			break
++		}
++		var list []string
++		if e = decodeRuntimeManaged([]byte(roles), &list); e != nil {
++			break
++		}
++		for _, role := range list {
++			if role == "OWNER" && revoked == 0 {
++				owners++
++				if id != out.OwnerID {
++					e = ErrHostIdentity
++					break
++				}
++			}
++		}
++		if e != nil {
++			break
++		}
++	}
++	if e == nil {
++		e = rows.Err()
++	}
++	rows.Close()
++	if e != nil {
++		return out, e
++	}
++	if owners != 1 {
++		return out, fmt.Errorf("current unrevoked OWNER count %d", owners)
++	}
++	if e = db.QueryRowContext(ctx, `SELECT root FROM orchestration_identity WHERE principal=?`, out.OwnerID).Scan(&out.OwnerRoot); e != nil || out.OwnerRoot == "" {
++		return out, errors.New("Owner root unavailable")
++	}
++	return out, nil
++}
+diff --git a/internal/host/owned_core_stop_identity_windows_test.go b/internal/host/owned_core_stop_identity_windows_test.go
+new file mode 100644
+index 00000000..225c8157
+--- /dev/null
++++ b/internal/host/owned_core_stop_identity_windows_test.go
+@@ -0,0 +1,71 @@
++//go:build windows
++
++package host
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	_ "modernc.org/sqlite"
++	"researchos.local/research-os/internal/auth"
++)
++
++func TestOwnedCoreStopPublicIdentitySameSIDOwnerAndSchema(t *testing.T) {
++	root := t.TempDir()
++	hostDir := filepath.Join(root, "host")
++	if err := os.Mkdir(hostDir, 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := privateDir(hostDir); err != nil {
++		t.Fatal(err)
++	}
++	identity, err := auth.Current()
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := hostState{Version: 1, PrincipalRef: identity.Ref, PrincipalID: "owner-fixture", HostInstanceID: "host-fixture"}
++	raw, err := json.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	statePath := filepath.Join(hostDir, stateFile)
++	if err = os.WriteFile(statePath, raw, 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err = privateFile(statePath); err != nil {
++		t.Fatal(err)
++	}
++	db, err := sql.Open("sqlite", filepath.Join(root, "researchos.sqlite"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	if _, err = db.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);CREATE TABLE auth_principals(id TEXT PRIMARY KEY,roles TEXT,revoked INTEGER);CREATE TABLE orchestration_identity(principal TEXT PRIMARY KEY,root TEXT)`); err != nil {
++		t.Fatal(err)
++	}
++	for i := 1; i <= 24; i++ {
++		if _, err = db.Exec(`INSERT INTO schema_migrations VALUES(?)`, i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if _, err = db.Exec(`INSERT INTO auth_principals VALUES('owner-fixture','["OWNER"]',0);INSERT INTO orchestration_identity VALUES('owner-fixture','root-fixture')`); err != nil {
++		t.Fatal(err)
++	}
++	public, err := ReadOwnedCoreStopPublicIdentity(context.Background(), root)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if public.OwnerID != "owner-fixture" || public.OwnerRoot != "root-fixture" || public.HostID != "host-fixture" || public.SchemaVersion != 24 || public.DatabaseIndex == 0 || public.SID == "" {
++		t.Fatalf("incomplete public authority: %+v", public)
++	}
++	if _, err = db.Exec(`UPDATE auth_principals SET revoked=1`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = ReadOwnedCoreStopPublicIdentity(context.Background(), root); err == nil {
++		t.Fatal("revoked owner accepted")
++	}
++}
+diff --git a/internal/ownedcorestop/contract.go b/internal/ownedcorestop/contract.go
+new file mode 100644
+index 00000000..d0744173
+--- /dev/null
++++ b/internal/ownedcorestop/contract.go
+@@ -0,0 +1,152 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"researchos.local/research-os/internal/host"
++	"researchos.local/research-os/internal/store"
++	"researchos.local/research-os/ops/supervisor"
++)
++
++const (
++	InputSchema      = "researchos.owned-core-stop-input.v1"
++	PlanSchema       = "researchos.owned-core-stop-plan.v1"
++	ResultSchema     = "researchos.owned-core-stop-result.v1"
++	SourceBaseCommit = "4f4023c956f84d65743f39ce77d6c8899a21ada1"
++	OldRun           = "f3dcb996b2e43cf52cba874be7abfc70"
++	OldDispatch      = "705b11ec99044fef19e85f57e2d2b712"
++	OldRequest       = "bc269e772ada7e1bce54439fd080550c"
++)
++
++type EvidenceRef struct {
++	Kind   string `json:"kind"`
++	Path   string `json:"path"`
++	SHA256 string `json:"sha256"`
++}
++
++// Input names the historical subject and evidence locations, not permission
++// flags. It cannot assert that a proof is accepted or a native child is closed.
++type Input struct {
++	Schema           string                 `json:"schema"`
++	OperationID      string                 `json:"operation_id"`
++	SourceRepository string                 `json:"source_repository"`
++	DataRoot         string                 `json:"data_root"`
++	CorePID          uint32                 `json:"core_pid"`
++	Subject          store.OwnedStopSubject `json:"subject"`
++	Evidence         []EvidenceRef          `json:"evidence"`
++	PlanReviewPath   string                 `json:"plan_review_path"`
++}
++
++type Plan struct {
++	Schema           string                             `json:"schema"`
++	OperationID      string                             `json:"operation_id"`
++	SourceBaseCommit string                             `json:"source_base_commit"`
++	OutputDir        string                             `json:"output_dir"`
++	InputSHA256      string                             `json:"input_sha256"`
++	Input            Input                              `json:"input"`
++	Native           supervisor.OwnedCoreNativeIdentity `json:"native"`
++	Host             host.OwnedCoreStopPublicIdentity   `json:"host"`
++	BackupPath       string                             `json:"backup_path"`
++	BackupSHA256     string                             `json:"backup_sha256"`
++	Baseline         store.OwnedStopCensus              `json:"baseline"`
++	PreflightSafety  store.OwnedStopSafetySnapshot      `json:"preflight_safety"`
++	EvidenceSHA256   string                             `json:"evidence_sha256,omitempty"`
++	Eligibility      string                             `json:"eligibility"`
++	Missing          []string                           `json:"missing,omitempty"`
++}
++
++type Result struct {
++	Schema      string                          `json:"schema"`
++	OperationID string                          `json:"operation_id"`
++	PlanSHA256  string                          `json:"plan_sha256"`
++	State       string                          `json:"state"`
++	Reason      string                          `json:"reason,omitempty"`
++	Native      *supervisor.OwnedCoreNativeExit `json:"native,omitempty"`
++	Postflight  *store.OwnedStopCensus          `json:"postflight,omitempty"`
++}
++
++func digest(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
++func validSHA(s string) bool {
++	b, e := hex.DecodeString(s)
++	return e == nil && len(b) == 32 && strings.ToLower(s) == s
++}
++func validID(s string) bool {
++	b, e := hex.DecodeString(s)
++	return e == nil && len(b) == 16 && strings.ToLower(s) == s
++}
++
++func strictJSON(raw []byte, v any) error {
++	d := json.NewDecoder(bytes.NewReader(raw))
++	d.DisallowUnknownFields()
++	if err := d.Decode(v); err != nil {
++		return err
++	}
++	var rest any
++	if err := d.Decode(&rest); err != io.EOF {
++		return errors.New("trailing JSON data")
++	}
++	return nil
++}
++func canonicalJSON(v any) ([]byte, error) {
++	raw, e := json.MarshalIndent(v, "", "  ")
++	if e != nil {
++		return nil, e
++	}
++	return append(raw, '\n'), nil
++}
++
++func readInput(path string) (Input, string, error) {
++	var in Input
++	raw, e := os.ReadFile(path)
++	if e != nil {
++		return in, "", e
++	}
++	if len(raw) > 64<<10 {
++		return in, "", errors.New("bounded input required")
++	}
++	if e = strictJSON(raw, &in); e != nil {
++		return in, "", e
++	}
++	if e = validateInput(in); e != nil {
++		return in, "", e
++	}
++	return in, digest(raw), nil
++}
++
++func validateInput(in Input) error {
++	if in.Schema != InputSchema || !validID(in.OperationID) || in.CorePID == 0 {
++		return errors.New("invalid input identity")
++	}
++	if in.Subject.Run != OldRun || in.Subject.Epoch != 1 || in.Subject.DispatchKey != OldDispatch || in.Subject.RequestKey != OldRequest || in.Subject.Project == "" {
++		return errors.New("subject differs from frozen historical window")
++	}
++	for _, path := range []string{in.SourceRepository, in.DataRoot} {
++		if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 {
++			return errors.New("canonical absolute local roots required")
++		}
++	}
++	return nil
++}
++
++func validatePlan(p Plan) error {
++	if p.Schema != PlanSchema || p.SourceBaseCommit != SourceBaseCommit || p.OperationID != p.Input.OperationID || p.OutputDir == "" || p.BackupPath != filepath.Join(p.OutputDir, "backup.sqlite") || !validSHA(p.InputSHA256) || !validSHA(p.BackupSHA256) || p.Native.PID != p.Input.CorePID || p.Host.DataRoot != p.Input.DataRoot || p.Host.SID != p.Native.SID || p.Host.SID != p.Native.ParentSID {
++		return errors.New("plan field binding invalid")
++	}
++	if e := validateInput(p.Input); e != nil {
++		return e
++	}
++	if p.Baseline.SHA256 == "" || p.Baseline.QuickCheck != "ok" || p.Host.SchemaVersion != 24 {
++		return errors.New("plan baseline invalid")
++	}
++	return nil
++}
+diff --git a/internal/ownedcorestop/journal_windows.go b/internal/ownedcorestop/journal_windows.go
+new file mode 100644
+index 00000000..25a31dad
+--- /dev/null
++++ b/internal/ownedcorestop/journal_windows.go
+@@ -0,0 +1,278 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++	"researchos.local/research-os/ops/supervisor"
++)
++
++type ownedBeginRecord struct{ Schema, OperationID, PlanSHA256 string }
++type ownedIntentRecord struct {
++	Schema, OperationID, PlanSHA256 string
++	Native                          supervisor.OwnedCoreNativeIdentity `json:"native"`
++}
++type ownedExitRecord struct {
++	Schema, OperationID, PlanSHA256 string
++	Native                          supervisor.OwnedCoreNativeExit `json:"native"`
++}
++
++func readOwnedExit(out, operationID, planSHA string) (supervisor.OwnedCoreNativeExit, error) {
++	raw, err := readOwnedJournal(out, "NATIVE_EXIT.json", 64<<10)
++	if err != nil {
++		return supervisor.OwnedCoreNativeExit{}, err
++	}
++	var record ownedExitRecord
++	if err = strictJSON(raw, &record); err != nil {
++		return supervisor.OwnedCoreNativeExit{}, err
++	}
++	if record.Schema != "researchos.owned-core-stop-native-exit.v1" || record.OperationID != operationID || record.PlanSHA256 != planSHA || !record.Native.ExitObserved || (record.Native.TerminateCalls != 1 && !record.Native.BeforeSignal) {
++		return supervisor.OwnedCoreNativeExit{}, errors.New("native exit journal binding/observation missing")
++	}
++	return record.Native, nil
++}
++
++func currentSID() (*windows.SID, error) {
++	u, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		return nil, err
++	}
++	if u.User.Sid == nil || !u.User.Sid.IsValid() {
++		return nil, errors.New("current SID unavailable")
++	}
++	return u.User.Sid, nil
++}
++
++func privateOwnedPath(path string, dir bool) error {
++	sid, err := currentSID()
++	if err != nil {
++		return err
++	}
++	ace := "(A;;FA;;;" + sid.String() + ")"
++	if dir {
++		ace = "(A;OICI;FA;;;" + sid.String() + ")"
++	}
++	sd, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P" + ace)
++	if err != nil {
++		return err
++	}
++	acl, _, err := sd.DACL()
++	if err != nil {
++		return err
++	}
++	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
++}
++
++func verifyOwnedPrivate(path string, dir bool) error {
++	sid, err := currentSID()
++	if err != nil {
++		return err
++	}
++	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
++	if err != nil {
++		return err
++	}
++	owner, _, err := sd.Owner()
++	if err != nil || owner == nil || owner.String() != sid.String() {
++		return errors.New("private path owner SID differs")
++	}
++	control, _, err := sd.Control()
++	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
++		return errors.New("protected private DACL missing")
++	}
++	acl, _, err := sd.DACL()
++	if err != nil || acl == nil || acl.AceCount != 1 {
++		return errors.New("single private ACE required")
++	}
++	var ace *windows.ACCESS_ALLOWED_ACE
++	if err = windows.GetAce(acl, 0, &ace); err != nil {
++		return err
++	}
++	flags := byte(0)
++	if dir {
++		flags = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
++	}
++	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != flags || ace.Mask != 0x001f01ff || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() != sid.String() {
++		return errors.New("private ACE differs")
++	}
++	return nil
++}
++
++func cleanOwnedLocalPath(path string) error {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") {
++		return errors.New("canonical local path required")
++	}
++	return nil
++}
++
++func outsideDataRoot(out, dataRoot string) error {
++	if err := cleanOwnedLocalPath(out); err != nil {
++		return err
++	}
++	if err := cleanOwnedLocalPath(dataRoot); err != nil {
++		return err
++	}
++	rel, err := filepath.Rel(dataRoot, out)
++	if err != nil || rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
++		return errors.New("output must be outside product data root")
++	}
++	return nil
++}
++
++func createPrivateOutput(out, dataRoot string) error {
++	if err := outsideDataRoot(out, dataRoot); err != nil {
++		return err
++	}
++	parent := filepath.Dir(out)
++	actual, err := filepath.EvalSymlinks(parent)
++	if err != nil || !strings.EqualFold(actual, parent) {
++		return errors.New("output parent reparse or absence")
++	}
++	if err = os.Mkdir(out, 0700); err != nil {
++		return err
++	}
++	if err = privateOwnedPath(out, true); err != nil {
++		return err
++	}
++	return verifyOwnedPrivate(out, true)
++}
++
++func writeOwnedJournal(out, name string, body any) (string, error) {
++	if filepath.Base(name) != name || strings.ContainsAny(name, "/\\:") {
++		return "", errors.New("fixed journal filename required")
++	}
++	if err := verifyOwnedPrivate(out, true); err != nil {
++		return "", err
++	}
++	raw, err := canonicalJSON(body)
++	if err != nil {
++		return "", err
++	}
++	path := filepath.Join(out, name)
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return "", err
++	}
++	defer f.Close()
++	if err = privateOwnedPath(path, false); err != nil {
++		return "", err
++	}
++	if err = verifyOwnedPrivate(path, false); err != nil {
++		return "", err
++	}
++	if _, err = f.Write(raw); err != nil {
++		return "", err
++	}
++	if err = f.Sync(); err != nil {
++		return "", err
++	}
++	return digest(raw), nil
++}
++
++func readOwnedJournal(out, name string, max int) ([]byte, error) {
++	if err := verifyOwnedPrivate(out, true); err != nil {
++		return nil, err
++	}
++	path := filepath.Join(out, name)
++	actual, err := filepath.EvalSymlinks(path)
++	if err != nil || !strings.EqualFold(actual, path) {
++		return nil, errors.New("journal reparse or absence")
++	}
++	if err := verifyOwnedPrivate(path, false); err != nil {
++		return nil, err
++	}
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	if len(raw) == 0 || len(raw) > max {
++		return nil, fmt.Errorf("bounded %s required", name)
++	}
++	return raw, nil
++}
++
++func readPlan(path string) (Plan, string, error) {
++	var plan Plan
++	if filepath.Base(path) != "plan.json" {
++		return plan, "", errors.New("canonical plan.json required")
++	}
++	raw, err := readOwnedJournal(filepath.Dir(path), "plan.json", 256<<10)
++	if err != nil {
++		return plan, "", err
++	}
++	if err = strictJSON(raw, &plan); err != nil {
++		return plan, "", err
++	}
++	if err = validatePlan(plan); err != nil {
++		return plan, "", err
++	}
++	if plan.OutputDir != filepath.Dir(path) {
++		return plan, "", errors.New("plan directory changed")
++	}
++	canonical, err := canonicalJSON(plan)
++	if err != nil || string(canonical) != string(raw) {
++		return plan, "", errors.New("plan serialization differs")
++	}
++	return plan, digest(raw), nil
++}
++
++// Inspect is observation-only. It never opens a termination handle or repairs
++// a missing native wait. Completed POSTFLIGHT is returned unchanged.
++func Inspect(planPath string) (Result, error) {
++	plan, planSHA, err := readPlan(planPath)
++	if err != nil {
++		return Result{}, err
++	}
++	out := Result{Schema: ResultSchema, OperationID: plan.OperationID, PlanSHA256: planSHA, State: "UNKNOWN", Reason: "incomplete journal; no automatic retry"}
++	if _, e := os.Lstat(filepath.Join(plan.OutputDir, "POSTFLIGHT.json")); e == nil {
++		raw, e := readOwnedJournal(plan.OutputDir, "POSTFLIGHT.json", 64<<10)
++		if e != nil {
++			return out, e
++		}
++		var terminal Result
++		if err = strictJSON(raw, &terminal); err != nil {
++			return out, err
++		}
++		if terminal.Schema != ResultSchema || terminal.OperationID != plan.OperationID || terminal.PlanSHA256 != planSHA {
++			return out, errors.New("terminal receipt binding differs")
++		}
++		if terminal.State == "STOPPED_LEASE_VERIFIED" || terminal.State == "STOP_OBSERVED_MAINTENANCE_BLOCKED" || terminal.State == "OBSERVED_BEFORE_SIGNAL" {
++			native, e := readOwnedExit(plan.OutputDir, plan.OperationID, planSHA)
++			if e != nil || terminal.Native == nil || *terminal.Native != native {
++				return out, errors.New("terminal native exit proof absent or differs")
++			}
++		}
++		return terminal, nil
++	}
++	if _, e := os.Lstat(filepath.Join(plan.OutputDir, "NATIVE_EXIT.json")); e == nil {
++		if _, e = readOwnedExit(plan.OutputDir, plan.OperationID, planSHA); e != nil {
++			return out, e
++		}
++		out.State = "STOP_OBSERVED_MAINTENANCE_BLOCKED"
++		out.Reason = "native exit recorded; postflight absent"
++		return out, nil
++	}
++	if _, e := os.Lstat(filepath.Join(plan.OutputDir, "TERMINATE_INTENT.json")); e == nil {
++		raw, e := readOwnedJournal(plan.OutputDir, "TERMINATE_INTENT.json", 64<<10)
++		if e != nil {
++			return out, e
++		}
++		var intent ownedIntentRecord
++		if e = strictJSON(raw, &intent); e != nil {
++			return out, e
++		}
++		if intent.Schema != "researchos.owned-core-stop-terminate-intent.v1" || intent.OperationID != plan.OperationID || intent.PlanSHA256 != planSHA || intent.Native != plan.Native {
++			return out, errors.New("termination intent journal binding differs")
++		}
++		out.Reason = "termination intent exists without retained native wait receipt"
++		return out, nil
++	}
++	return out, nil
++}
+diff --git a/internal/ownedcorestop/journal_windows_test.go b/internal/ownedcorestop/journal_windows_test.go
+new file mode 100644
+index 00000000..508832b4
+--- /dev/null
++++ b/internal/ownedcorestop/journal_windows_test.go
+@@ -0,0 +1,103 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"researchos.local/research-os/internal/host"
++	"researchos.local/research-os/internal/store"
++	"researchos.local/research-os/ops/supervisor"
++)
++
++func TestOwnedCoreStopJournalExclusiveAndPrivate(t *testing.T) {
++	base := t.TempDir()
++	dataRoot := filepath.Join(base, "data")
++	if err := os.Mkdir(dataRoot, 0700); err != nil {
++		t.Fatal(err)
++	}
++	out := filepath.Join(base, "new-output")
++	if err := createPrivateOutput(out, dataRoot); err != nil {
++		t.Fatal(err)
++	}
++	hash, err := writeOwnedJournal(out, "BEGIN.json", struct {
++		Schema string `json:"schema"`
++	}{"test.v1"})
++	if err != nil || !validSHA(hash) {
++		t.Fatalf("private exclusive journal failed: %s %v", hash, err)
++	}
++	if _, err := writeOwnedJournal(out, "BEGIN.json", map[string]string{"schema": "replay"}); err == nil {
++		t.Fatal("immutable journal was overwritten")
++	}
++	raw, err := readOwnedJournal(out, "BEGIN.json", 128)
++	if err != nil || digest(raw) != hash {
++		t.Fatalf("journal read/hash mismatch: %v", err)
++	}
++}
++
++func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
++	base := t.TempDir()
++	dataRoot := filepath.Join(base, "data")
++	if err := os.Mkdir(dataRoot, 0700); err != nil {
++		t.Fatal(err)
++	}
++	out := filepath.Join(base, "new-output")
++	if err := createPrivateOutput(out, dataRoot); err != nil {
++		t.Fatal(err)
++	}
++	subject := store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"}
++	sid := "fixture-sid"
++	op := strings.Repeat("a", 32)
++	plan := Plan{
++		Schema: PlanSchema, OperationID: op, SourceBaseCommit: SourceBaseCommit,
++		OutputDir: out, BackupPath: filepath.Join(out, "backup.sqlite"),
++		InputSHA256: strings.Repeat("b", 64), BackupSHA256: strings.Repeat("c", 64),
++		Input:       Input{Schema: InputSchema, OperationID: op, SourceRepository: base, DataRoot: dataRoot, CorePID: 1, Subject: subject},
++		Native:      supervisor.OwnedCoreNativeIdentity{PID: 1, SID: sid, ParentSID: sid},
++		Host:        host.OwnedCoreStopPublicIdentity{DataRoot: dataRoot, SID: sid, SchemaVersion: 24},
++		Baseline:    store.OwnedStopCensus{SHA256: strings.Repeat("d", 64), QuickCheck: "ok"},
++		Eligibility: "STOP_UNAVAILABLE",
++	}
++	planSHA, err := writeOwnedJournal(out, "plan.json", plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(out, "plan.json")
++	check := func(state string) {
++		t.Helper()
++		got, err := Inspect(path)
++		if err != nil || got.State != state || got.PlanSHA256 != planSHA {
++			t.Fatalf("inspect %s: %+v %v", state, got, err)
++		}
++	}
++	check("UNKNOWN") // before BEGIN
++	if _, err := writeOwnedJournal(out, "BEGIN.json", ownedBeginRecord{"researchos.owned-core-stop-begin.v1", op, planSHA}); err != nil {
++		t.Fatal(err)
++	}
++	check("UNKNOWN") // after BEGIN, before termination intent
++	if _, err := writeOwnedJournal(out, "TERMINATE_INTENT.json", ownedIntentRecord{"researchos.owned-core-stop-terminate-intent.v1", op, planSHA, plan.Native}); err != nil {
++		t.Fatal(err)
++	}
++	check("UNKNOWN") // before/after native call without durable wait proof
++	nativeExit := supervisor.OwnedCoreNativeExit{TerminateCalls: 1, ExitObserved: true, ExitCode: supervisor.OwnedCoreMaintenanceExitCode}
++	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{"researchos.owned-core-stop-native-exit.v1", op, planSHA, nativeExit}); err != nil {
++		t.Fatal(err)
++	}
++	check("STOP_OBSERVED_MAINTENANCE_BLOCKED") // after exit, before lease
++	final := stopResult(plan, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "lease unavailable")
++	final.Native = &nativeExit
++	if _, err := writeOwnedJournal(out, "POSTFLIGHT.json", final); err != nil {
++		t.Fatal(err)
++	}
++	check(final.State)
++	check(final.State) // repeat inspection is identical and observation only
++	if err := os.WriteFile(filepath.Join(out, "POSTFLIGHT.json"), []byte("{\"schema\":\"forged\"}"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := Inspect(path); err == nil {
++		t.Fatal("corrupt terminal receipt silently fell back to earlier journal")
++	}
++}
+diff --git a/internal/ownedcorestop/proof_windows.go b/internal/ownedcorestop/proof_windows.go
+new file mode 100644
+index 00000000..e47978cc
+--- /dev/null
++++ b/internal/ownedcorestop/proof_windows.go
+@@ -0,0 +1,196 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"researchos.local/research-os/internal/store"
++)
++
++const proofSchema = "researchos.owned-core-stop-independent-evidence.v1"
++const planReviewSchema = "researchos.owned-core-stop-independent-plan-review.v1"
++
++var proofKinds = []string{"f01_ready", "retained_window", "native_entry_gates", "worker_native_exit", "verifier_native_exit", "effect_census", "independent_evidence_review"}
++
++// These are observations in independent receipts, not caller-side booleans.
++// Every required digest names a separate raw artifact retained by its reviewer.
++type historicalEvidence struct {
++	Schema                   string                 `json:"schema"`
++	Kind                     string                 `json:"kind"`
++	OperationID              string                 `json:"operation_id"`
++	SourceCommit             string                 `json:"source_commit"`
++	CorePID                  uint32                 `json:"core_pid"`
++	CoreCreatedNS            int64                  `json:"core_created_ns"`
++	CoreImageSHA256          string                 `json:"core_image_sha256"`
++	HostID                   string                 `json:"host_id"`
++	OwnerID                  string                 `json:"owner_id"`
++	OwnerRoot                string                 `json:"owner_root"`
++	Subject                  store.OwnedStopSubject `json:"subject"`
++	Reviewer                 string                 `json:"reviewer"`
++	RawSHA256                map[string]string      `json:"raw_sha256"`
++	NativePID                uint32                 `json:"native_pid,omitempty"`
++	NativeCreatedNS          int64                  `json:"native_created_ns,omitempty"`
++	NativeExitCode           uint32                 `json:"native_exit_code,omitempty"`
++	NativeWaitAPI            string                 `json:"native_wait_api,omitempty"`
++	NativeWaitResult         uint32                 `json:"native_wait_result,omitempty"`
++	NativeExitAPI            string                 `json:"native_exit_api,omitempty"`
++	NativeHandleRecordSHA256 string                 `json:"native_handle_record_sha256,omitempty"`
++	BaselineSHA256           string                 `json:"baseline_sha256,omitempty"`
++}
++
++type operationPlanReview struct {
++	Schema                   string `json:"schema"`
++	OperationID              string `json:"operation_id"`
++	PlanSHA256               string `json:"plan_sha256"`
++	EvidenceSHA256           string `json:"evidence_sha256"`
++	SourceCommit             string `json:"source_commit"`
++	CoreCreatedNS            int64  `json:"core_created_ns"`
++	CoreImageSHA256          string `json:"core_image_sha256"`
++	Reviewer                 string `json:"reviewer"`
++	Verdict                  string `json:"verdict"`
++	RootOperationScopeSHA256 string `json:"root_operation_scope_sha256"`
++}
++
++func verifierPath(repo, path string) error {
++	if !filepath.IsAbs(repo) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return errors.New("canonical independent evidence path required")
++	}
++	root := filepath.Join(repo, "execution", "verifier")
++	rel, err := filepath.Rel(root, path)
++	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
++		return errors.New("evidence outside independent verifier namespace")
++	}
++	actual, err := filepath.EvalSymlinks(path)
++	if err != nil || !strings.EqualFold(actual, path) {
++		return errors.New("evidence reparse or absence")
++	}
++	return nil
++}
++
++func readEvidence(repo string, ref EvidenceRef) (historicalEvidence, error) {
++	var out historicalEvidence
++	if !validSHA(ref.SHA256) {
++		return out, errors.New("evidence hash required")
++	}
++	if err := verifierPath(repo, ref.Path); err != nil {
++		return out, err
++	}
++	raw, err := os.ReadFile(ref.Path)
++	if err != nil {
++		return out, err
++	}
++	if len(raw) == 0 || len(raw) > 128<<10 || digest(raw) != ref.SHA256 {
++		return out, errors.New("evidence content/hash mismatch")
++	}
++	if err = strictJSON(raw, &out); err != nil {
++		return out, err
++	}
++	if out.Schema != proofSchema || out.Kind != ref.Kind || out.Reviewer == "" || strings.Contains(out.Reviewer, "owned_core_stop_builder") {
++		return out, errors.New("independent evidence identity invalid")
++	}
++	return out, nil
++}
++
++func proofNeeds(kind string) []string {
++	switch kind {
++	case "f01_ready":
++		return []string{"main4f_build", "store_open_ready", "wal_full_live_core", "startup_native_identity"}
++	case "retained_window":
++		return []string{"consumed_original_request", "begin_window_marker", "end_unresolved_return", "scan_durable_fence"}
++	case "native_entry_gates":
++		return []string{"all_entry_map", "durable_prepare_before_effect", "dispatch_before_worker", "serial_desktop_serve", "no_alternate_bypass"}
++	case "worker_native_exit":
++		return []string{"original_os_wait_capture", "numeric_exit_capture", "job_drained", "owner_lock_released"}
++	case "verifier_native_exit":
++		return []string{"original_os_wait_capture", "numeric_exit_capture", "original_verifier_registration"}
++	case "effect_census":
++		return []string{"complete_current_census", "original_model_receipt", "original_request_hash", "original_dispatch_hash"}
++	case "independent_evidence_review":
++		return proofKinds[:6]
++	default:
++		return nil
++	}
++}
++
++func validateHistoricalEvidence(plan Plan) (string, []string) {
++	missing := []string{}
++	refs := map[string]EvidenceRef{}
++	for _, r := range plan.Input.Evidence {
++		if _, exists := refs[r.Kind]; exists {
++			missing = append(missing, "duplicate "+r.Kind)
++		}
++		refs[r.Kind] = r
++	}
++	if len(refs) != len(proofKinds) {
++		missing = append(missing, "exact seven independent receipts required")
++	}
++	observed := map[string]string{}
++	for _, kind := range proofKinds {
++		ref, ok := refs[kind]
++		if !ok {
++			missing = append(missing, kind+": missing")
++			continue
++		}
++		receipt, err := readEvidence(plan.Input.SourceRepository, ref)
++		if err != nil {
++			missing = append(missing, kind+": "+err.Error())
++			continue
++		}
++		if receipt.OperationID != plan.OperationID || receipt.SourceCommit != SourceBaseCommit || receipt.CorePID != plan.Native.PID || receipt.CoreCreatedNS != plan.Native.CreatedNS || receipt.CoreImageSHA256 != plan.Native.ImageSHA256 || receipt.HostID != plan.Host.HostID || receipt.OwnerID != plan.Host.OwnerID || receipt.OwnerRoot != plan.Host.OwnerRoot || receipt.Subject != plan.Input.Subject {
++			missing = append(missing, kind+": subject/authority/core binding differs")
++			continue
++		}
++		if kind == "worker_native_exit" || kind == "verifier_native_exit" {
++			// An ignored cmd.Wait error, a PID-list absence, or an assumed exit 0
++			// cannot satisfy this typed original OS wait and numeric-exit receipt.
++			if receipt.NativePID == 0 || receipt.NativePID == plan.Native.PID || receipt.NativeCreatedNS == 0 || receipt.NativeWaitAPI != "WaitForSingleObject" || receipt.NativeWaitResult != 0 || receipt.NativeExitAPI != "GetExitCodeProcess" || !validSHA(receipt.NativeHandleRecordSHA256) {
++				missing = append(missing, kind+": captured exact OS wait/exit/handle identity absent")
++			}
++		}
++		if kind == "effect_census" && receipt.BaselineSHA256 != plan.Baseline.SHA256 {
++			missing = append(missing, kind+": full baseline differs")
++		}
++		for _, name := range proofNeeds(kind) {
++			hash := receipt.RawSHA256[name]
++			if !validSHA(hash) {
++				missing = append(missing, fmt.Sprintf("%s: %s raw receipt missing", kind, name))
++			}
++			if kind == "independent_evidence_review" && hash != observed[name] {
++				missing = append(missing, kind+": evidence hash differs for "+name)
++			}
++		}
++		observed[kind] = ref.SHA256
++	}
++	// Bind the seven references and their order into a single reviewable digest.
++	raw, _ := canonicalJSON(plan.Input.Evidence)
++	return digest(raw), missing
++}
++
++func validatePlanReview(plan Plan, planSHA string) error {
++	if plan.Input.PlanReviewPath == "" {
++		return errors.New("independent operation plan review missing")
++	}
++	if err := verifierPath(plan.Input.SourceRepository, plan.Input.PlanReviewPath); err != nil {
++		return err
++	}
++	raw, err := os.ReadFile(plan.Input.PlanReviewPath)
++	if err != nil {
++		return err
++	}
++	if len(raw) == 0 || len(raw) > 64<<10 {
++		return errors.New("bounded plan review required")
++	}
++	var r operationPlanReview
++	if err = strictJSON(raw, &r); err != nil {
++		return err
++	}
++	if r.Schema != planReviewSchema || r.OperationID != plan.OperationID || r.PlanSHA256 != planSHA || r.EvidenceSHA256 != plan.EvidenceSHA256 || r.SourceCommit != SourceBaseCommit || r.CoreCreatedNS != plan.Native.CreatedNS || r.CoreImageSHA256 != plan.Native.ImageSHA256 || r.Reviewer == "" || strings.Contains(r.Reviewer, "owned_core_stop_builder") || r.Verdict != "ACCEPTED" || !validSHA(r.RootOperationScopeSHA256) {
++		return errors.New("independent exact plan/root-scope review unavailable")
++	}
++	return nil
++}
+diff --git a/internal/ownedcorestop/proof_windows_test.go b/internal/ownedcorestop/proof_windows_test.go
+new file mode 100644
+index 00000000..a976fc82
+--- /dev/null
++++ b/internal/ownedcorestop/proof_windows_test.go
+@@ -0,0 +1,31 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestOwnedCoreStopMissingHistoricalProofNeverEligible(t *testing.T) {
++	plan := Plan{OperationID: strings.Repeat("a", 32), Input: Input{SourceRepository: t.TempDir()}}
++	_, missing := validateHistoricalEvidence(plan)
++	if len(missing) < len(proofKinds) {
++		t.Fatalf("missing F01/native/effect proofs were accepted: %v", missing)
++	}
++	for _, ref := range []EvidenceRef{{Kind: "f01_ready", Path: filepath.Join(t.TempDir(), "forged.json"), SHA256: strings.Repeat("a", 64)}} {
++		plan.Input.Evidence = append(plan.Input.Evidence, ref)
++	}
++	_, missing = validateHistoricalEvidence(plan)
++	if len(missing) == 0 {
++		t.Fatal("caller-selected evidence outside independent namespace accepted")
++	}
++}
++
++func TestOwnedCoreStopCallerReviewCannotOmitExactScope(t *testing.T) {
++	plan := Plan{Input: Input{SourceRepository: t.TempDir(), PlanReviewPath: filepath.Join(t.TempDir(), "review.json")}}
++	if err := validatePlanReview(plan, strings.Repeat("a", 64)); err == nil {
++		t.Fatal("non-independent review path accepted")
++	}
++}
+diff --git a/internal/ownedcorestop/stop_windows.go b/internal/ownedcorestop/stop_windows.go
+new file mode 100644
+index 00000000..2583c954
+--- /dev/null
++++ b/internal/ownedcorestop/stop_windows.go
+@@ -0,0 +1,190 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"time"
++
++	rt "researchos.local/research-os/adapters/runtime"
++	"researchos.local/research-os/internal/host"
++	"researchos.local/research-os/internal/store"
++	"researchos.local/research-os/ops/supervisor"
++)
++
++// Preflight only observes the named existing process and new owned fixture or
++// future reviewed data. This source card does not call it on current product.
++func Preflight(ctx context.Context, inputPath, operationID, outDir string) (Plan, string, error) {
++	var p Plan
++	in, inputSHA, err := readInput(inputPath)
++	if err != nil {
++		return p, "", err
++	}
++	if in.OperationID != operationID {
++		return p, "", errors.New("operation ID differs from strict input")
++	}
++	if err = createPrivateOutput(outDir, in.DataRoot); err != nil {
++		return p, "", err
++	}
++	p = Plan{Schema: PlanSchema, OperationID: in.OperationID, SourceBaseCommit: SourceBaseCommit, OutputDir: outDir, InputSHA256: inputSHA, Input: in, BackupPath: filepath.Join(outDir, "backup.sqlite"), Eligibility: "STOP_UNAVAILABLE"}
++	p.Native, err = supervisor.ObserveOwnedCoreReadOnly(in.CorePID)
++	if err != nil {
++		return p, "", err
++	}
++	p.Host, err = host.ReadOwnedCoreStopPublicIdentity(ctx, in.DataRoot)
++	if err != nil {
++		return p, "", err
++	}
++	if p.Native.SID != p.Host.SID || p.Native.ParentSID != p.Host.SID {
++		return p, "", errors.New("Core/parent/current SID mismatch")
++	}
++	p.Baseline, p.BackupSHA256, err = store.OnlineOwnedStopBackup(ctx, p.Host.Database, p.BackupPath)
++	if err != nil {
++		return p, "", err
++	}
++	p.PreflightSafety, err = store.ReadOwnedStopSafetyPreflight(ctx, p.Host.Database, in.Subject)
++	if err != nil {
++		p.Missing = append(p.Missing, "preflight safety catalog: "+err.Error())
++	} else if !p.PreflightSafety.ExactOldSubjectSafe() {
++		p.Missing = append(p.Missing, "additional unresolved work or exact old subject differs")
++	}
++	proofSHA, missing := validateHistoricalEvidence(p)
++	p.EvidenceSHA256 = proofSHA
++	p.Missing = append(p.Missing, missing...)
++	if len(p.Missing) == 0 {
++		p.Eligibility = "ELIGIBLE_FOR_INDEPENDENT_REVIEW"
++	}
++	if err = validatePlan(p); err != nil {
++		return p, "", err
++	}
++	if _, err = writeOwnedJournal(outDir, "backup-manifest.json", struct {
++		Schema, OperationID, BackupSHA256 string
++		Census                            store.OwnedStopCensus `json:"census"`
++	}{"researchos.owned-core-stop-backup.v1", p.OperationID, p.BackupSHA256, p.Baseline}); err != nil {
++		return p, "", err
++	}
++	planSHA, err := writeOwnedJournal(outDir, "plan.json", p)
++	return p, planSHA, err
++}
++
++func stopResult(plan Plan, sha, state, reason string) Result {
++	return Result{Schema: ResultSchema, OperationID: plan.OperationID, PlanSHA256: sha, State: state, Reason: reason}
++}
++
++func persistStopResult(plan Plan, result Result) (Result, error) {
++	_, err := writeOwnedJournal(plan.OutputDir, "POSTFLIGHT.json", result)
++	return result, err
++}
++
++// Commit has no force flag. An exact independent evidence review and a later
++// exact root operation plan review must already exist in the verifier namespace.
++// This card does not produce either review and grants no current-Core action.
++func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error) {
++	p, planSHA, err := readPlan(planPath)
++	if err != nil {
++		return Result{}, err
++	}
++	if !validSHA(expectPlanSHA) || planSHA != expectPlanSHA {
++		return stopResult(p, planSHA, "STALE_PLAN", "reviewed plan hash differs"), nil
++	}
++	if p.Eligibility != "ELIGIBLE_FOR_INDEPENDENT_REVIEW" || len(p.Missing) != 0 {
++		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "historical proof missing"), nil
++	}
++	if err = validatePlanReview(p, planSHA); err != nil {
++		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
++	}
++	proofSHA, missing := validateHistoricalEvidence(p)
++	if len(missing) != 0 || proofSHA != p.EvidenceSHA256 {
++		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "independent evidence drift"), nil
++	}
++	backup, backupSHA, err := store.ReadOwnedStopBackup(ctx, p.BackupPath)
++	if err != nil || backupSHA != p.BackupSHA256 || backup != p.Baseline {
++		return stopResult(p, planSHA, "STALE_PLAN", "reviewed backup/hash/census differs"), nil
++	}
++	// PROCESS_TERMINATE is requested only after all external evidence and exact
++	// operation-plan review checks have passed. The native handle stays retained.
++	h, err := supervisor.OpenOwnedCoreRetained(p.Native)
++	if err != nil {
++		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
++	}
++	defer h.Close()
++	if _, err = writeOwnedJournal(p.OutputDir, "BEGIN.json", struct{ Schema, OperationID, PlanSHA256 string }{"researchos.owned-core-stop-begin.v1", p.OperationID, planSHA}); err != nil {
++		return Result{}, err
++	}
++	barrier, err := store.AcquireOwnedStopBarrier(ctx, p.Host.Database)
++	if err != nil {
++		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "writer reservation unavailable: "+err.Error()))
++	}
++	defer barrier.Close()
++	current, err := barrier.Census(ctx)
++	if err != nil || current != p.Baseline {
++		return persistStopResult(p, stopResult(p, planSHA, "STALE_PLAN", "full logical baseline changed"))
++	}
++	safety, err := barrier.SafetySnapshot(ctx, p.Input.Subject)
++	if err != nil || !safety.ExactOldSubjectSafe() {
++		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current unresolved subject/effect census differs"))
++	}
++	authority, err := host.ReadOwnedCoreStopPublicIdentity(ctx, p.Input.DataRoot)
++	if err != nil || authority != p.Host {
++		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current Host/Owner/database identity differs"))
++	}
++	if _, err = writeOwnedJournal(p.OutputDir, "TERMINATE_INTENT.json", struct {
++		Schema, OperationID, PlanSHA256 string
++		Native                          supervisor.OwnedCoreNativeIdentity `json:"native"`
++	}{"researchos.owned-core-stop-terminate-intent.v1", p.OperationID, planSHA, p.Native}); err != nil {
++		return Result{}, err
++	}
++	exit, nativeErr := h.TerminateOnceAndWait(15 * time.Second)
++	if nativeErr != nil {
++		result := stopResult(p, planSHA, "UNKNOWN", fmt.Sprintf("single native attempt or wait unknown: %v", nativeErr))
++		result.Native = &exit
++		return persistStopResult(p, result)
++	}
++	if _, err = writeOwnedJournal(p.OutputDir, "NATIVE_EXIT.json", struct {
++		Schema, OperationID, PlanSHA256 string
++		Native                          supervisor.OwnedCoreNativeExit `json:"native"`
++	}{"researchos.owned-core-stop-native-exit.v1", p.OperationID, planSHA, exit}); err != nil {
++		return Result{}, err
++	}
++	if err = barrier.Close(); err != nil {
++		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "writer reservation release failed")
++		result.Native = &exit
++		return persistStopResult(p, result)
++	}
++	lease, err := rt.AcquireDataRootLease(p.Input.DataRoot)
++	if err != nil {
++		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease unavailable")
++		result.Native = &exit
++		return persistStopResult(p, result)
++	}
++	defer lease.Close()
++	if !lease.Held() {
++		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease not held")
++		result.Native = &exit
++		return persistStopResult(p, result)
++	}
++	post, postErr := store.ReadOwnedStopCensus(ctx, p.Host.Database)
++	postAuthority, authorityErr := host.ReadOwnedCoreStopPublicIdentity(ctx, p.Input.DataRoot)
++	result := stopResult(p, planSHA, "STOPPED_LEASE_VERIFIED", "")
++	result.Native = &exit
++	result.Postflight = &post
++	if exit.BeforeSignal {
++		result.State = "OBSERVED_BEFORE_SIGNAL"
++	}
++	if postErr != nil || authorityErr != nil || post != p.Baseline || postAuthority != p.Host {
++		result.State = "STOP_OBSERVED_MAINTENANCE_BLOCKED"
++		result.Reason = "poststop logical/schema/authority/integrity drift"
++	}
++	return persistStopResult(p, result)
++}
++
++func planDirectoryValid(out string) error {
++	if _, err := os.Stat(out); err == nil {
++		return errors.New("new output directory required")
++	}
++	return nil
++}
+diff --git a/internal/ownedcorestop/stop_windows_test.go b/internal/ownedcorestop/stop_windows_test.go
+new file mode 100644
+index 00000000..97545fe3
+--- /dev/null
++++ b/internal/ownedcorestop/stop_windows_test.go
+@@ -0,0 +1,54 @@
++//go:build windows
++
++package ownedcorestop
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"researchos.local/research-os/internal/store"
++)
++
++func TestOwnedCoreStopFrozenSubjectRejectsOtherWork(t *testing.T) {
++	in := Input{Schema: InputSchema, OperationID: strings.Repeat("a", 32), SourceRepository: filepath.Join(t.TempDir(), "source"), DataRoot: filepath.Join(t.TempDir(), "data"), CorePID: 1,
++		Subject: store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"}}
++	if err := validateInput(in); err != nil {
++		t.Fatal(err)
++	}
++	for _, bad := range []store.OwnedStopSubject{
++		{Run: "another", Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"},
++		{Run: OldRun, Epoch: 2, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"},
++		{Run: OldRun, Epoch: 1, DispatchKey: "another", RequestKey: OldRequest, Project: "fixture"},
++		{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: "another", Project: "fixture"},
++	} {
++		in.Subject = bad
++		if err := validateInput(in); err == nil {
++			t.Fatalf("other work accepted: %+v", bad)
++		}
++	}
++}
++
++func TestOwnedCoreStopInvalidPreflightNeverCreatesOutput(t *testing.T) {
++	base := t.TempDir()
++	out := filepath.Join(base, "new-output")
++	in := Input{Schema: InputSchema, OperationID: strings.Repeat("b", 32), SourceRepository: base, DataRoot: filepath.Join(base, "data"), CorePID: 1,
++		Subject: store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: "wrong", Project: "fixture"}}
++	raw, err := json.Marshal(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	inputPath := filepath.Join(base, "input.json")
++	if err := os.WriteFile(inputPath, raw, 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := Preflight(context.Background(), inputPath, in.OperationID, out); err == nil {
++		t.Fatal("wrong historical subject passed preflight")
++	}
++	if _, err := os.Stat(out); !os.IsNotExist(err) {
++		t.Fatalf("invalid preflight created output: %v", err)
++	}
++}
+diff --git a/internal/store/owned_stop_backup.go b/internal/store/owned_stop_backup.go
+new file mode 100644
+index 00000000..be47d275
+--- /dev/null
++++ b/internal/store/owned_stop_backup.go
+@@ -0,0 +1,349 @@
++package store
++
++import (
++	"context"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"hash"
++	"io"
++	"math"
++	"net/url"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"time"
++
++	"modernc.org/sqlite"
++)
++
++// OwnedStopCensus is a hash of the exact sqlite_master rows and every user or
++// SQLite-owned table row. Each cell has a type and length delimiter; BLOBs are
++// hashed as bytes. A row count is included for review, not as a substitute.
++type OwnedStopCensus struct {
++	SHA256       string `json:"sha256"`
++	SchemaSHA256 string `json:"schema_sha256"`
++	Tables       int    `json:"tables"`
++	Rows         int64  `json:"rows"`
++	QuickCheck   string `json:"quick_check"`
++}
++
++type ownedStopQueryer interface {
++	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
++	QueryRowContext(context.Context, string, ...any) *sql.Row
++}
++
++var ownedStopIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
++
++func ownedStopURI(path, mode string) string {
++	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
++	q := u.Query()
++	q.Set("mode", mode)
++	q.Set("_busy_timeout", "1500")
++	u.RawQuery = q.Encode()
++	return u.String()
++}
++
++func ownedStopFrame(h hash.Hash, kind byte, raw []byte) {
++	_, _ = h.Write([]byte{kind})
++	var n [8]byte
++	binary.BigEndian.PutUint64(n[:], uint64(len(raw)))
++	_, _ = h.Write(n[:])
++	_, _ = h.Write(raw)
++}
++func ownedStopCell(h hash.Hash, v any) error {
++	switch x := v.(type) {
++	case nil:
++		ownedStopFrame(h, 'N', nil)
++	case []byte:
++		ownedStopFrame(h, 'B', x)
++	case string:
++		ownedStopFrame(h, 'S', []byte(x))
++	case int64:
++		ownedStopFrame(h, 'I', []byte(fmt.Sprintf("%d", x)))
++	case float64:
++		ownedStopFrame(h, 'F', []byte(fmt.Sprintf("%016x", math.Float64bits(x))))
++	case bool:
++		if x {
++			ownedStopFrame(h, 'T', nil)
++		} else {
++			ownedStopFrame(h, 'f', nil)
++		}
++	case time.Time:
++		ownedStopFrame(h, 'D', []byte(x.UTC().Format(time.RFC3339Nano)))
++	default:
++		return fmt.Errorf("unsupported SQLite cell type %T", v)
++	}
++	return nil
++}
++
++// Fixed statement forms are constructed only from identifiers returned by
++// sqlite_master and PRAGMA table_info. The connection is never returned.
++func ownedStopCensus(ctx context.Context, q ownedStopQueryer) (OwnedStopCensus, error) {
++	var out OwnedStopCensus
++	if err := q.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&out.QuickCheck); err != nil || out.QuickCheck != "ok" {
++		return out, fmt.Errorf("quick_check: %s: %w", out.QuickCheck, err)
++	}
++	schema := sha256.New()
++	all := sha256.New()
++	rows, err := q.QueryContext(ctx, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql")
++	if err != nil {
++		return out, err
++	}
++	tables := []string{}
++	for rows.Next() {
++		var typ, name, tbl string
++		var sqlText sql.NullString
++		if err = rows.Scan(&typ, &name, &tbl, &sqlText); err != nil {
++			break
++		}
++		for _, s := range []string{typ, name, tbl} {
++			ownedStopFrame(schema, 'S', []byte(s))
++		}
++		if sqlText.Valid {
++			ownedStopFrame(schema, 'S', []byte(sqlText.String))
++		} else {
++			ownedStopFrame(schema, 'N', nil)
++		}
++		if typ == "table" {
++			tables = append(tables, name)
++		}
++	}
++	if err == nil {
++		err = rows.Err()
++	}
++	rows.Close()
++	if err != nil {
++		return out, err
++	}
++	out.SchemaSHA256 = hex.EncodeToString(schema.Sum(nil))
++	ownedStopFrame(all, 'H', schema.Sum(nil))
++	for _, table := range tables {
++		if !ownedStopIdentifier.MatchString(table) {
++			return out, errors.New("noncanonical SQLite table identifier")
++		}
++		colRows, e := q.QueryContext(ctx, "PRAGMA table_info(\""+table+"\")")
++		if e != nil {
++			return out, e
++		}
++		type key struct {
++			name  string
++			order int
++		}
++		var keys []key
++		for colRows.Next() {
++			var cid, notnull, pk int
++			var name, typ string
++			var defaultValue sql.NullString
++			if e = colRows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); e != nil {
++				break
++			}
++			if !ownedStopIdentifier.MatchString(name) {
++				e = errors.New("noncanonical SQLite column identifier")
++				break
++			}
++			if pk > 0 {
++				keys = append(keys, key{name, pk})
++			}
++		}
++		if e == nil {
++			e = colRows.Err()
++		}
++		colRows.Close()
++		if e != nil {
++			return out, e
++		}
++		order := "rowid"
++		if len(keys) > 0 {
++			sort.Slice(keys, func(i, j int) bool { return keys[i].order < keys[j].order })
++			parts := make([]string, len(keys))
++			for i, k := range keys {
++				parts[i] = "\"" + k.name + "\""
++			}
++			order = strings.Join(parts, ",")
++		}
++		ownedStopFrame(all, 'T', []byte(table))
++		data, e := q.QueryContext(ctx, "SELECT * FROM \""+table+"\" ORDER BY "+order)
++		if e != nil {
++			return out, e
++		}
++		columns, e := data.Columns()
++		if e != nil {
++			data.Close()
++			return out, e
++		}
++		for data.Next() {
++			values := make([]any, len(columns))
++			ptrs := make([]any, len(columns))
++			for i := range values {
++				ptrs[i] = &values[i]
++			}
++			if e = data.Scan(ptrs...); e != nil {
++				break
++			}
++			ownedStopFrame(all, 'R', nil)
++			for _, v := range values {
++				if e = ownedStopCell(all, v); e != nil {
++					break
++				}
++			}
++			if e != nil {
++				break
++			}
++			out.Rows++
++		}
++		if e == nil {
++			e = data.Err()
++		}
++		data.Close()
++		if e != nil {
++			return out, e
++		}
++		out.Tables++
++	}
++	out.SHA256 = hex.EncodeToString(all.Sum(nil))
++	return out, nil
++}
++
++// OnlineOwnedStopBackup creates a new destination outside the source root and
++// uses the pinned native online-backup API. It returns only hashes and counts.
++func OnlineOwnedStopBackup(ctx context.Context, source, destination string) (OwnedStopCensus, string, error) {
++	if !filepath.IsAbs(source) || !filepath.IsAbs(destination) || filepath.Clean(destination) != destination {
++		return OwnedStopCensus{}, "", errors.New("canonical backup paths required")
++	}
++	rel, e := filepath.Rel(filepath.Dir(source), destination)
++	if e != nil || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
++		return OwnedStopCensus{}, "", errors.New("backup destination must be outside data root")
++	}
++	if _, err := os.Stat(source); err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	if err = f.Close(); err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	src, err := sql.Open("sqlite", ownedStopURI(source, "rw"))
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	defer src.Close()
++	src.SetMaxOpenConns(1)
++	conn, err := src.Conn(ctx)
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	defer conn.Close()
++	destURI := ownedStopURI(destination, "rw")
++	err = conn.Raw(func(driverConn any) error {
++		maker, ok := driverConn.(interface {
++			NewBackup(string) (*sqlite.Backup, error)
++		})
++		if !ok {
++			return errors.New("pinned native backup unavailable")
++		}
++		backup, e := maker.NewBackup(destURI)
++		if e != nil {
++			return e
++		}
++		var stepErr error
++		complete := false
++		for steps := 0; steps < 100000; steps++ {
++			if e = ctx.Err(); e != nil {
++				stepErr = e
++				break
++			}
++			var more bool
++			more, e = backup.Step(128)
++			if e != nil {
++				stepErr = e
++				break
++			}
++			if !more {
++				complete = true
++				break
++			}
++		}
++		if !complete && stepErr == nil {
++			stepErr = errors.New("online backup step limit")
++		}
++		return errors.Join(stepErr, backup.Finish())
++	})
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	closed, err := os.OpenFile(destination, os.O_RDWR, 0)
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	if err = closed.Sync(); err != nil {
++		closed.Close()
++		return OwnedStopCensus{}, "", err
++	}
++	h := sha256.New()
++	_, err = io.Copy(h, closed)
++	closeErr := closed.Close()
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	if closeErr != nil {
++		return OwnedStopCensus{}, "", closeErr
++	}
++	ro, err := sql.Open("sqlite", ownedStopURI(destination, "ro"))
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	defer ro.Close()
++	ro.SetMaxOpenConns(1)
++	census, err := ownedStopCensus(ctx, ro)
++	return census, hex.EncodeToString(h.Sum(nil)), err
++}
++
++// ReadOwnedStopBackup rereads a closed backup as a read-only database. It is
++// used when committing a reviewed plan; it never refreshes the backup.
++func ReadOwnedStopBackup(ctx context.Context, path string) (OwnedStopCensus, string, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return OwnedStopCensus{}, "", errors.New("canonical backup path required")
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	h := sha256.New()
++	_, err = io.Copy(h, f)
++	closeErr := f.Close()
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	if closeErr != nil {
++		return OwnedStopCensus{}, "", closeErr
++	}
++	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
++	if err != nil {
++		return OwnedStopCensus{}, "", err
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	census, err := ownedStopCensus(ctx, db)
++	return census, hex.EncodeToString(h.Sum(nil)), err
++}
++
++func ReadOwnedStopCensus(ctx context.Context, path string) (OwnedStopCensus, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return OwnedStopCensus{}, errors.New("canonical existing SQLite path required")
++	}
++	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
++	if err != nil {
++		return OwnedStopCensus{}, err
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	return ownedStopCensus(ctx, db)
++}
+diff --git a/internal/store/owned_stop_backup_test.go b/internal/store/owned_stop_backup_test.go
+new file mode 100644
+index 00000000..394ef068
+--- /dev/null
++++ b/internal/store/owned_stop_backup_test.go
+@@ -0,0 +1,51 @@
++package store
++
++import (
++	"context"
++	"database/sql"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestOwnedStopOnlineBackupWALAndLogicalCAS(t *testing.T) {
++	root := t.TempDir()
++	source := filepath.Join(root, "source", "owned.sqlite")
++	if err := os.Mkdir(filepath.Dir(source), 0700); err != nil {
++		t.Fatal(err)
++	}
++	db, err := sql.Open("sqlite", ownedStopURI(source, "rwc"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	if _, err = db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE records(k TEXT PRIMARY KEY,b BLOB); INSERT INTO records VALUES('a',x'00ff')`); err != nil {
++		t.Fatal(err)
++	}
++	backup := filepath.Join(root, "private-backup.sqlite")
++	base, digest, err := OnlineOwnedStopBackup(context.Background(), source, backup)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if digest == "" || base.QuickCheck != "ok" || base.Rows != 1 {
++		t.Fatalf("incomplete backup: %+v %q", base, digest)
++	}
++	if _, _, err = OnlineOwnedStopBackup(context.Background(), source, backup); err == nil {
++		t.Fatal("backup overwritten")
++	}
++	if _, err = db.Exec(`INSERT INTO records VALUES('b',x'0100')`); err != nil {
++		t.Fatal(err)
++	}
++	b, err := AcquireOwnedStopBarrier(context.Background(), source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer b.Close()
++	now, err := b.Census(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if now.SHA256 == base.SHA256 || now.Rows != 2 {
++		t.Fatal("committed WAL drift not seen by barrier")
++	}
++}
+diff --git a/internal/store/owned_stop_barrier_windows.go b/internal/store/owned_stop_barrier_windows.go
+new file mode 100644
+index 00000000..fb715ca9
+--- /dev/null
++++ b/internal/store/owned_stop_barrier_windows.go
+@@ -0,0 +1,215 @@
++//go:build windows
++
++package store
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// OwnedStopBarrier owns one SQLite connection and one zero-row writer reservation.
++// It deliberately exposes no SQL executor or connection to its caller.
++type OwnedStopBarrier struct {
++	db       *sql.DB
++	conn     *sql.Conn
++	reserved bool
++}
++
++type OwnedStopSubject struct {
++	Project     string `json:"project"`
++	Run         string `json:"run"`
++	Epoch       int    `json:"epoch"`
++	DispatchKey string `json:"dispatch_key"`
++	RequestKey  string `json:"request_key"`
++}
++
++type OwnedStopSafetySnapshot struct {
++	RunStatus                 string `json:"run_status"`
++	DispatchState             string `json:"dispatch_state"`
++	DispatchKey               string `json:"dispatch_key"`
++	UnresolvedOtherRuns       int    `json:"unresolved_other_runs"`
++	UnresolvedOtherDispatches int    `json:"unresolved_other_dispatches"`
++	UnresolvedExternalEffects int    `json:"unresolved_external_effects"`
++	NonModelEffects           int    `json:"non_model_effects"`
++	ConfirmedModelEffects     int    `json:"confirmed_model_effects"`
++	PendingClientCommands     int    `json:"pending_client_commands"`
++	PendingControlRequests    int    `json:"pending_control_requests"`
++	SchemaVersion             int    `json:"schema_version"`
++}
++
++func (s OwnedStopSafetySnapshot) ExactOldSubjectSafe() bool {
++	return s.SchemaVersion == 24 && s.RunStatus == "RUNNING" && s.DispatchState == "UNKNOWN" &&
++		s.UnresolvedOtherRuns == 0 && s.UnresolvedOtherDispatches == 0 &&
++		s.UnresolvedExternalEffects == 0 && s.NonModelEffects == 0 && s.ConfirmedModelEffects == 1 &&
++		s.PendingClientCommands == 0 && s.PendingControlRequests == 0
++}
++
++func ownedStopExistingDB(path string) (string, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".sqlite") {
++		return "", errors.New("canonical existing SQLite path required")
++	}
++	actual, err := filepath.EvalSymlinks(path)
++	if err != nil || !strings.EqualFold(filepath.Clean(actual), path) {
++		return "", errors.New("SQLite path reparse or absence")
++	}
++	info, err := os.Stat(path)
++	if err != nil || !info.Mode().IsRegular() {
++		return "", errors.New("regular existing SQLite file required")
++	}
++	return path, nil
++}
++
++// AcquireOwnedStopBarrier does not call store.Open, create, bootstrap, migrate,
++// checkpoint or change a persistent PRAGMA. The only SQLite writes it requests
++// are BEGIN IMMEDIATE and ROLLBACK, with no product row write.
++func AcquireOwnedStopBarrier(ctx context.Context, path string) (_ *OwnedStopBarrier, err error) {
++	path, err = ownedStopExistingDB(path)
++	if err != nil {
++		return nil, err
++	}
++	db, err := sql.Open("sqlite", ownedStopURI(path, "rw"))
++	if err != nil {
++		return nil, err
++	}
++	db.SetMaxOpenConns(1)
++	db.SetMaxIdleConns(1)
++	b := &OwnedStopBarrier{db: db}
++	defer func() {
++		if err != nil {
++			_ = b.Close()
++		}
++	}()
++	b.conn, err = db.Conn(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if _, err = b.conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
++		return nil, fmt.Errorf("reserve writer: %w", err)
++	}
++	b.reserved = true
++	if _, err = b.conn.ExecContext(ctx, "PRAGMA query_only=ON"); err != nil {
++		return nil, fmt.Errorf("enable query_only: %w", err)
++	}
++	var readback int
++	if err = b.conn.QueryRowContext(ctx, "PRAGMA query_only").Scan(&readback); err != nil || readback != 1 {
++		return nil, errors.New("query_only readback failed")
++	}
++	return b, nil
++}
++
++// Census reads on the reserved connection, so a Core transaction committed
++// while BEGIN IMMEDIATE waited is included in this exact snapshot.
++func (b *OwnedStopBarrier) Census(ctx context.Context) (OwnedStopCensus, error) {
++	if b == nil || b.conn == nil || !b.reserved {
++		return OwnedStopCensus{}, errors.New("writer reservation unavailable")
++	}
++	return ownedStopCensus(ctx, b.conn)
++}
++
++// SafetySnapshot executes a closed catalog of parameterized SELECTs on the
++// reserved connection. The one historical RUNNING/UNKNOWN subject is allowed;
++// every other unresolved subject or external effect is rejected.
++func (b *OwnedStopBarrier) SafetySnapshot(ctx context.Context, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
++	if b == nil || b.conn == nil || !b.reserved {
++		return OwnedStopSafetySnapshot{}, errors.New("reserved connection required")
++	}
++	return ownedStopSafetySnapshot(ctx, b.conn, subject)
++}
++
++// ReadOwnedStopSafetyPreflight is informational. Commit repeats this exact
++// catalog after acquiring the writer reservation and uses that result.
++func ReadOwnedStopSafetyPreflight(ctx context.Context, path string, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
++	path, err := ownedStopExistingDB(path)
++	if err != nil {
++		return OwnedStopSafetySnapshot{}, err
++	}
++	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
++	if err != nil {
++		return OwnedStopSafetySnapshot{}, err
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	return ownedStopSafetySnapshot(ctx, db, subject)
++}
++
++func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subject OwnedStopSubject) (OwnedStopSafetySnapshot, error) {
++	var s OwnedStopSafetySnapshot
++	if subject.Project == "" || subject.Run == "" || subject.Epoch < 1 || subject.DispatchKey == "" || subject.RequestKey == "" {
++		return s, errors.New("exact subject required")
++	}
++	var n, minVersion int
++	if err := source.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&s.SchemaVersion, &minVersion, &n); err != nil || s.SchemaVersion != 24 || minVersion != 1 || n != 24 {
++		return s, errors.New("schema 24 required")
++	}
++	if err := source.QueryRowContext(ctx, `SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='Run' AND id=?`, subject.Project, subject.Run).Scan(&s.RunStatus); err != nil {
++		return s, err
++	}
++	if err := source.QueryRowContext(ctx, `SELECT state,dispatch_key FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.Project, subject.Run, subject.Epoch).Scan(&s.DispatchState, &s.DispatchKey); err != nil {
++		return s, err
++	}
++	queries := []struct {
++		sql  string
++		args []any
++		dst  *int
++	}{
++		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND NOT(project=? AND id=?) AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, []any{subject.Project, subject.Run}, &s.UnresolvedOtherRuns},
++		{`SELECT count(*) FROM runtime_dispatches WHERE NOT(project=? AND run=? AND epoch=?) AND state IN ('PREPARED','STARTED','UNKNOWN')`, []any{subject.Project, subject.Run, subject.Epoch}, &s.UnresolvedOtherDispatches},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, nil, &s.UnresolvedExternalEffects},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state')!='CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.payload.capability')='MODEL' AND json_extract(body,'$.state')='CONFIRMED' AND x.project=? AND x.run=?`, []any{subject.Project, subject.Run}, &s.ConfirmedModelEffects},
++		{`SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`, nil, &s.PendingClientCommands},
++		{`SELECT count(*) FROM client_control_requests WHERE state!='CONFIRMED'`, nil, &s.PendingControlRequests},
++	}
++	for _, q := range queries {
++		if err := source.QueryRowContext(ctx, q.sql, q.args...).Scan(q.dst); err != nil {
++			return s, err
++		}
++	}
++	if s.DispatchKey != subject.DispatchKey {
++		return s, errors.New("dispatch identity mismatch")
++	}
++	var requestCount int
++	if err := source.QueryRowContext(ctx, `SELECT count(*) FROM idempotency WHERE project=? AND operation='host:managed-runtime-qualification' AND key=?`, subject.Project, subject.RequestKey).Scan(&requestCount); err != nil {
++		return s, err
++	}
++	if requestCount != 1 {
++		return s, errors.New("exact original request not found")
++	}
++	return s, nil
++}
++
++// Close is idempotent and always rolls back; no COMMIT path exists.
++func (b *OwnedStopBarrier) Close() error {
++	if b == nil {
++		return nil
++	}
++	var errs []error
++	if b.conn != nil {
++		if b.reserved {
++			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++			_, err := b.conn.ExecContext(ctx, "ROLLBACK")
++			cancel()
++			if err != nil {
++				errs = append(errs, err)
++			}
++			b.reserved = false
++		}
++		if err := b.conn.Close(); err != nil {
++			errs = append(errs, err)
++		}
++		b.conn = nil
++	}
++	if b.db != nil {
++		if err := b.db.Close(); err != nil {
++			errs = append(errs, err)
++		}
++		b.db = nil
++	}
++	return errors.Join(errs...)
++}
+diff --git a/internal/store/owned_stop_barrier_windows_test.go b/internal/store/owned_stop_barrier_windows_test.go
+new file mode 100644
+index 00000000..74c79bf8
+--- /dev/null
++++ b/internal/store/owned_stop_barrier_windows_test.go
+@@ -0,0 +1,128 @@
++//go:build windows
++
++package store
++
++import (
++	"context"
++	"database/sql"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func ownedStopFixtureDB(t *testing.T) (string, *sql.DB) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "owned.sqlite")
++	db, err := sql.Open("sqlite", ownedStopURI(path, "rwc"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE ledger(id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO ledger VALUES('one',x'0001ff')`); err != nil {
++		t.Fatal(err)
++	}
++	return path, db
++}
++
++func TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter(t *testing.T) {
++	path, db := ownedStopFixtureDB(t)
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	b, err := AcquireOwnedStopBarrier(ctx, path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer b.Close()
++	before, err := b.Census(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, stmt := range []string{
++		`INSERT INTO ledger VALUES('bad',x'ff')`, `UPDATE ledger SET payload=x'11'`,
++		`DELETE FROM ledger`, `CREATE TABLE injection(id INTEGER)`, `DROP TABLE ledger`,
++	} {
++		if _, err = b.conn.ExecContext(ctx, stmt); err == nil {
++			t.Fatalf("SQLite query_only permitted %q", stmt)
++		}
++	}
++	other, err := sql.Open("sqlite", ownedStopURI(path, "rw"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer other.Close()
++	start := time.Now()
++	if _, err = other.ExecContext(ctx, `INSERT INTO ledger VALUES('blocked',x'01')`); err == nil {
++		t.Fatal("writer reservation lost after query_only")
++	}
++	if time.Since(start) < 50*time.Millisecond {
++		t.Log("writer returned busy without waiting, lock still verified")
++	}
++	var count int
++	if err = db.QueryRow(`SELECT count(*) FROM ledger`).Scan(&count); err != nil || count != 1 {
++		t.Fatalf("product rows changed: %d %v", count, err)
++	}
++	after, err := b.Census(ctx)
++	if err != nil || after.SHA256 != before.SHA256 {
++		t.Fatalf("barrier changed rows: %v %v", after, err)
++	}
++	if err = b.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = other.Exec(`INSERT INTO ledger VALUES('after',x'02')`); err != nil {
++		t.Fatalf("ROLLBACK did not release lock: %v", err)
++	}
++}
++
++func TestOwnedStopBarrierIncludesCommitWhileWaiting(t *testing.T) {
++	path, db := ownedStopFixtureDB(t)
++	core, err := db.Conn(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer core.Close()
++	if _, err = core.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = core.ExecContext(context.Background(), `INSERT INTO ledger VALUES('late',x'03')`); err != nil {
++		t.Fatal(err)
++	}
++	got := make(chan *OwnedStopBarrier, 1)
++	errs := make(chan error, 1)
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
++		defer cancel()
++		b, e := AcquireOwnedStopBarrier(ctx, path)
++		if e != nil {
++			errs <- e
++		} else {
++			got <- b
++		}
++	}()
++	time.Sleep(100 * time.Millisecond)
++	if _, err = core.ExecContext(context.Background(), "COMMIT"); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err = <-errs:
++		t.Fatal(err)
++	case b := <-got:
++		defer b.Close()
++		c, e := b.Census(context.Background())
++		if e != nil || c.Rows != 2 {
++			t.Fatalf("late committed row omitted: %+v %v", c, e)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("barrier acquisition timed out")
++	}
++}
++
++func TestOwnedStopBarrierMissingFileNoCreate(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "missing.sqlite")
++	if b, err := AcquireOwnedStopBarrier(context.Background(), path); err == nil || b != nil {
++		t.Fatal("missing source accepted")
++	}
++	if _, err := os.Stat(path); !os.IsNotExist(err) {
++		t.Fatalf("missing file was created: %v", err)
++	}
++}
+diff --git a/ops/owned_core_stop/fixture/main_windows.go b/ops/owned_core_stop/fixture/main_windows.go
+new file mode 100644
+index 00000000..017442a4
+--- /dev/null
++++ b/ops/owned_core_stop/fixture/main_windows.go
+@@ -0,0 +1,72 @@
++//go:build windows
++
++// The fixture is a separate executable and is never linked into the stop CLI.
++package main
++
++import (
++	"context"
++	"database/sql"
++	"flag"
++	"fmt"
++	"os"
++	"path/filepath"
++	"time"
++
++	_ "modernc.org/sqlite"
++	rt "researchos.local/research-os/adapters/runtime"
++)
++
++func main() {
++	root := flag.String("root", "", "new owned fixture data root")
++	ready := flag.String("ready", "", "ready marker outside product")
++	attempt := flag.String("attempt", "", "attempt trigger")
++	attempted := flag.String("attempted", "", "attempted marker")
++	flag.Parse()
++	if *root == "" || *ready == "" || *attempt == "" || *attempted == "" {
++		fmt.Fprintln(os.Stderr, "all fixture paths required")
++		os.Exit(2)
++	}
++	lease, err := rt.AcquireDataRootLease(*root)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
++	defer lease.Close()
++	db, err := sql.Open("sqlite", filepath.Join(*root, "researchos.sqlite"))
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	if _,err=db.Exec(`PRAGMA busy_timeout=10000`);err!=nil{fmt.Fprintln(os.Stderr,err);os.Exit(2)}
++	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; INSERT INTO stop_fixture_rows VALUES('committed',x'0001ff')`); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
++	if err = os.WriteFile(*ready, []byte("READY\n"), 0600); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
++	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
++		if _, err = os.Stat(*attempt); err == nil {
++			break
++		}
++	}
++	if _, err = os.Stat(*attempt); err != nil {
++		return
++	}
++	conn, err := db.Conn(context.Background())
++	if err != nil {
++		return
++	}
++	defer conn.Close()
++	if _, err = conn.ExecContext(context.Background(), "BEGIN DEFERRED"); err != nil {
++		return
++	}
++	if err = os.WriteFile(*attempted, []byte("ATTEMPTED\n"), 0600); err != nil {
++		return
++	}
++	_, _ = conn.ExecContext(context.Background(), `INSERT INTO stop_fixture_rows VALUES('inflight',x'02')`)
++	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
++}
+diff --git a/ops/owned_core_stop/main_nonwindows.go b/ops/owned_core_stop/main_nonwindows.go
+new file mode 100644
+index 00000000..7ae080ce
+--- /dev/null
++++ b/ops/owned_core_stop/main_nonwindows.go
+@@ -0,0 +1,13 @@
++//go:build !windows
++
++package main
++
++import (
++	"fmt"
++	"os"
++)
++
++func main() {
++	fmt.Fprintln(os.Stderr, "STOP_UNAVAILABLE: exact retained Windows handles required")
++	os.Exit(3)
++}
+diff --git a/ops/owned_core_stop/main_windows.go b/ops/owned_core_stop/main_windows.go
+new file mode 100644
+index 00000000..e81e126c
+--- /dev/null
++++ b/ops/owned_core_stop/main_windows.go
+@@ -0,0 +1,76 @@
++//go:build windows
++
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"os"
++	"time"
++
++	"researchos.local/research-os/internal/ownedcorestop"
++)
++
++func main() { os.Exit(run(os.Args[1:])) }
++
++func run(args []string) int {
++	if len(args) == 0 {
++		fmt.Fprintln(os.Stderr, "usage: owned_core_stop preflight|commit|inspect")
++		return 2
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
++	defer cancel()
++	var result any
++	var err error
++	switch args[0] {
++	case "preflight":
++		fs := flag.NewFlagSet("preflight", flag.ContinueOnError)
++		input := fs.String("input", "", "strict subject JSON")
++		operationID := fs.String("operation-id", "", "exact operation ID")
++		out := fs.String("out", "", "new private directory outside data root")
++		if fs.Parse(args[1:]) != nil || fs.NArg() != 0 || *input == "" || *operationID == "" || *out == "" {
++			return 2
++		}
++		var plan ownedcorestop.Plan
++		var sha string
++		plan, sha, err = ownedcorestop.Preflight(ctx, *input, *operationID, *out)
++		if err == nil {
++			result = struct {
++				Plan       ownedcorestop.Plan `json:"plan"`
++				PlanSHA256 string             `json:"plan_sha256"`
++			}{plan, sha}
++		}
++	case "commit":
++		fs := flag.NewFlagSet("commit", flag.ContinueOnError)
++		plan := fs.String("plan", "", "reviewed plan.json")
++		sha := fs.String("expect-plan-sha256", "", "exact reviewed SHA256")
++		if fs.Parse(args[1:]) != nil || fs.NArg() != 0 || *plan == "" || *sha == "" {
++			return 2
++		}
++		result, err = ownedcorestop.Commit(ctx, *plan, *sha)
++	case "inspect":
++		fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
++		plan := fs.String("plan", "", "plan.json")
++		if fs.Parse(args[1:]) != nil || fs.NArg() != 0 || *plan == "" {
++			return 2
++		}
++		result, err = ownedcorestop.Inspect(*plan)
++	default:
++		fmt.Fprintln(os.Stderr, "unknown command")
++		return 2
++	}
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return 1
++	}
++	if err = json.NewEncoder(os.Stdout).Encode(result); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return 1
++	}
++	if r, ok := result.(ownedcorestop.Result); ok && r.State != "STOPPED_LEASE_VERIFIED" {
++		return 3
++	}
++	return 0
++}
+diff --git a/ops/owned_core_stop/main_windows_test.go b/ops/owned_core_stop/main_windows_test.go
+new file mode 100644
+index 00000000..6ff09b6b
+--- /dev/null
++++ b/ops/owned_core_stop/main_windows_test.go
+@@ -0,0 +1,135 @@
++//go:build windows
++
++package main
++
++import (
++	"context"
++	"database/sql"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++
++	_ "modernc.org/sqlite"
++	rt "researchos.local/research-os/adapters/runtime"
++	"researchos.local/research-os/internal/store"
++	"researchos.local/research-os/ops/supervisor"
++)
++
++func waitFixtureFile(t *testing.T, path string) {
++	t.Helper()
++	for deadline := time.Now().Add(6 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
++		if _, e := os.Stat(path); e == nil {
++			return
++		}
++	}
++	t.Fatalf("fixture marker absent: %s", path)
++}
++
++func TestOwnedCoreControlledCrashWALAndLease(t *testing.T) {
++	fixture := os.Getenv("RESEARCHOS_OWNED_STOP_FIXTURE_EXE")
++	if fixture == "" {
++		t.Fatal("built new owned fixture exe required; no skip")
++	}
++	root := filepath.Join(t.TempDir(), "data")
++	if err := os.Mkdir(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	dbPath := filepath.Join(root, "researchos.sqlite")
++	db, err := sql.Open("sqlite", dbPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`); err != nil {
++		db.Close()
++		t.Fatal(err)
++	}
++	if err = db.Close(); err != nil {
++		t.Fatal(err)
++	}
++	out := t.TempDir()
++	ready := filepath.Join(out, "ready")
++	attempt := filepath.Join(out, "attempt")
++	attempted := filepath.Join(out, "attempted")
++	cmd := exec.Command(fixture, "--root", root, "--ready", ready, "--attempt", attempt, "--attempted", attempted)
++	if err = cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer cmd.Wait()
++	waitFixtureFile(t, ready)
++	baseline, backupHash, err := store.OnlineOwnedStopBackup(context.Background(), dbPath, filepath.Join(out, "backup.sqlite"))
++	if err != nil || backupHash == "" || baseline.Rows != 1 {
++		t.Fatalf("WAL online backup failed: %+v %q %v", baseline, backupHash, err)
++	}
++	identity, err := supervisor.ObserveOwnedCoreReadOnly(uint32(cmd.Process.Pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	h, err := supervisor.OpenOwnedCoreRetained(identity)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++	barrier, err := store.AcquireOwnedStopBarrier(context.Background(), dbPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer barrier.Close()
++	current, err := barrier.Census(context.Background())
++	if err != nil || current != baseline {
++		t.Fatalf("baseline differs before signal: %+v %v", current, err)
++	}
++	if err = os.WriteFile(attempt, []byte("go"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	waitFixtureFile(t, attempted)
++	// The fixture has a deferred transaction attempting a write. The reserved
++	// writer lock prevents its durable PREPARED/row commit before the crash.
++	exit, err := h.TerminateOnceAndWait(5 * time.Second)
++	if err != nil || exit.TerminateCalls != 1 || !exit.ExitObserved || exit.ExitCode != supervisor.OwnedCoreMaintenanceExitCode {
++		t.Fatalf("exact controlled crash unavailable: %+v %v", exit, err)
++	}
++	if err = barrier.Close(); err != nil {
++		t.Fatal(err)
++	}
++	lease, err := rt.AcquireDataRootLease(root)
++	if err != nil {
++		t.Fatalf("native exit did not release real root lease: %v", err)
++	}
++	defer lease.Close()
++	if !lease.Held() {
++		t.Fatal("poststop real lease not held")
++	}
++	post, err := store.ReadOwnedStopCensus(context.Background(), dbPath)
++	if err != nil || post != baseline {
++		t.Fatalf("committed WAL lost or in-flight row escaped: %+v %v", post, err)
++	}
++	read, err := sql.Open("sqlite", dbPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer read.Close()
++	var committed, inflight int
++	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='committed'`).Scan(&committed); err != nil {
++		t.Fatal(err)
++	}
++	if err = read.QueryRow(`SELECT count(*) FROM stop_fixture_rows WHERE id='inflight'`).Scan(&inflight); err != nil {
++		t.Fatal(err)
++	}
++	if committed != 1 || inflight != 0 {
++		t.Fatalf("wrong crash durability: committed=%d inflight=%d", committed, inflight)
++	}
++}
++
++func TestOwnedCoreCLIRequiresExactArguments(t *testing.T) {
++	if got := run([]string{"commit", "--plan", "missing"}); got != 2 {
++		t.Fatalf("commit accepted missing reviewed SHA: %d", got)
++	}
++	if got := run([]string{"preflight", "--input", "missing", "--operation-id", "a"}); got != 2 {
++		t.Fatalf("preflight accepted missing new out: %d", got)
++	}
++	if got := run([]string{"inspect"}); got != 2 {
++		t.Fatalf("inspect accepted missing plan: %d", got)
++	}
++}
+diff --git a/ops/supervisor/owned_core_handle_windows.go b/ops/supervisor/owned_core_handle_windows.go
+new file mode 100644
+index 00000000..b5b3cf98
+--- /dev/null
++++ b/ops/supervisor/owned_core_handle_windows.go
+@@ -0,0 +1,360 @@
++//go:build windows
++
++package supervisor
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++// OwnedCoreNativeIdentity is entirely observed from retained native handles.
++// ParentProcessID comes from one Toolhelp snapshot and is then bound to its
++// own retained process handle, creation time, SID and image file identity.
++type OwnedCoreNativeIdentity struct {
++	PID               uint32 `json:"pid"`
++	CreatedNS         int64  `json:"created_ns"`
++	SID               string `json:"sid"`
++	ImagePath         string `json:"image_path"`
++	ImageSHA256       string `json:"image_sha256"`
++	ImageVolume       uint32 `json:"image_volume"`
++	ImageIndex        uint64 `json:"image_index"`
++	ParentPID         uint32 `json:"parent_pid"`
++	ParentCreatedNS   int64  `json:"parent_created_ns"`
++	ParentSID         string `json:"parent_sid"`
++	ParentImagePath   string `json:"parent_image_path"`
++	ParentImageSHA256 string `json:"parent_image_sha256"`
++	ParentImageVolume uint32 `json:"parent_image_volume"`
++	ParentImageIndex  uint64 `json:"parent_image_index"`
++}
++
++type ownedNativeProcess struct {
++	handle  windows.Handle
++	image   *os.File
++	path    string
++	created int64
++	sid     string
++	sha     string
++	volume  uint32
++	index   uint64
++}
++
++func (p *ownedNativeProcess) close() {
++	if p.image != nil {
++		_ = p.image.Close()
++		p.image = nil
++	}
++	if p.handle != 0 {
++		_ = windows.CloseHandle(p.handle)
++		p.handle = 0
++	}
++}
++
++func ownedNativePath(h windows.Handle) (string, error) {
++	buf := make([]uint16, 32768)
++	size := uint32(len(buf))
++	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
++		return "", err
++	}
++	path := windows.UTF16ToString(buf[:size])
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") {
++		return "", errors.New("canonical executable path required")
++	}
++	actual, err := filepath.EvalSymlinks(path)
++	if err != nil || !strings.EqualFold(actual, path) {
++		return "", errors.New("executable path reparse rejected")
++	}
++	return path, nil
++}
++
++func ownedNativeImage(path string) (*os.File, string, uint32, uint64, error) {
++	wide, err := windows.UTF16PtrFromString(path)
++	if err != nil {
++		return nil, "", 0, 0, err
++	}
++	h, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
++	if err != nil {
++		return nil, "", 0, 0, err
++	}
++	f := os.NewFile(uintptr(h), path)
++	var before windows.ByHandleFileInformation
++	if err = windows.GetFileInformationByHandle(h, &before); err != nil {
++		f.Close()
++		return nil, "", 0, 0, err
++	}
++	if before.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || before.NumberOfLinks != 1 || before.FileSizeHigh != 0 || before.FileSizeLow > 256<<20 {
++		f.Close()
++		return nil, "", 0, 0, errors.New("image reparse/alias/size rejected")
++	}
++	hash := sha256.New()
++	n, err := io.Copy(hash, io.LimitReader(f, 256<<20+1))
++	if err != nil {
++		f.Close()
++		return nil, "", 0, 0, err
++	}
++	var after windows.ByHandleFileInformation
++	if err = windows.GetFileInformationByHandle(h, &after); err != nil {
++		f.Close()
++		return nil, "", 0, 0, err
++	}
++	if n != int64(before.FileSizeLow) || before.VolumeSerialNumber != after.VolumeSerialNumber || before.FileIndexHigh != after.FileIndexHigh || before.FileIndexLow != after.FileIndexLow || before.FileSizeLow != after.FileSizeLow || before.LastWriteTime != after.LastWriteTime {
++		f.Close()
++		return nil, "", 0, 0, errors.New("image changed during retained read")
++	}
++	return f, hex.EncodeToString(hash.Sum(nil)), before.VolumeSerialNumber, uint64(before.FileIndexHigh)<<32 | uint64(before.FileIndexLow), nil
++}
++
++func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err error) {
++	p = ownedNativeProcess{handle: h}
++	defer func() {
++		if err != nil {
++			p.close()
++		}
++	}()
++	var created, exited, kernel, user windows.Filetime
++	if err = windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
++		return p, err
++	}
++	p.created = created.Nanoseconds()
++	var token windows.Token
++	if err = windows.OpenProcessToken(h, windows.TOKEN_QUERY, &token); err != nil {
++		return p, err
++	}
++	tu, e := token.GetTokenUser()
++	_ = token.Close()
++	if e != nil || tu.User.Sid == nil || !tu.User.Sid.IsValid() {
++		return p, errors.New("process SID unavailable")
++	}
++	p.sid = tu.User.Sid.String()
++	if p.path, err = ownedNativePath(h); err != nil {
++		return p, err
++	}
++	p.image, p.sha, p.volume, p.index, err = ownedNativeImage(p.path)
++	return p, err
++}
++
++func ownedNativeParentPID(pid uint32) (uint32, error) {
++	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
++	if err != nil {
++		return 0, err
++	}
++	defer windows.CloseHandle(snap)
++	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
++	if err = windows.Process32First(snap, &entry); err != nil {
++		return 0, err
++	}
++	for {
++		if entry.ProcessID == pid {
++			if entry.ParentProcessID == 0 || entry.ParentProcessID == pid {
++				return 0, errors.New("invalid parent identity")
++			}
++			return entry.ParentProcessID, nil
++		}
++		err = windows.Process32Next(snap, &entry)
++		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
++			break
++		}
++		if err != nil {
++			return 0, err
++		}
++	}
++	return 0, errors.New("process absent from snapshot")
++}
++
++// OwnedCoreRetainedHandle is the sole native termination capability. The
++// capability never exports its process handle. The caller must first verify
++// the reviewed plan and all external proofs before opening it.
++type OwnedCoreRetainedHandle struct {
++	core           ownedNativeProcess
++	parent         ownedNativeProcess
++	identity       OwnedCoreNativeIdentity
++	terminateCalls int
++	closed         bool
++	// Per-handle native call seams allow deterministic failure-path fixture cuts.
++	// Nil always uses the Windows APIs; callers outside this package cannot set them.
++	terminate func(windows.Handle, uint32) error
++	wait      func(windows.Handle, uint32) (uint32, error)
++}
++
++func (h *OwnedCoreRetainedHandle) nativeWait(ms uint32) (uint32, error) {
++	if h.wait != nil {
++		return h.wait(h.core.handle, ms)
++	}
++	return windows.WaitForSingleObject(h.core.handle, ms)
++}
++
++func (h *OwnedCoreRetainedHandle) nativeTerminate(code uint32) error {
++	if h.terminate != nil {
++		return h.terminate(h.core.handle, code)
++	}
++	return windows.TerminateProcess(h.core.handle, code)
++}
++
++func ownedCoreOpen(pid uint32, access uint32) (out *OwnedCoreRetainedHandle, err error) {
++	if pid == 0 {
++		return nil, errors.New("zero PID")
++	}
++	h, err := windows.OpenProcess(access|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
++	if err != nil {
++		return nil, err
++	}
++	out = &OwnedCoreRetainedHandle{}
++	defer func() {
++		if err != nil {
++			out.Close()
++			out = nil
++		}
++	}()
++	out.core, err = ownedNativeProcessFromHandle(h)
++	if err != nil {
++		return nil, err
++	}
++	actualPID, e := windows.GetProcessId(out.core.handle)
++	if e != nil || actualPID != pid {
++		return nil, errors.New("process handle PID mismatch")
++	}
++	parentPID, e := ownedNativeParentPID(pid)
++	if e != nil {
++		return nil, e
++	}
++	parentH, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, parentPID)
++	if e != nil {
++		return nil, e
++	}
++	out.parent, err = ownedNativeProcessFromHandle(parentH)
++	if err != nil {
++		return nil, err
++	}
++	actualParent, e := windows.GetProcessId(out.parent.handle)
++	if e != nil || actualParent != parentPID {
++		return nil, errors.New("parent handle PID mismatch")
++	}
++	out.identity = OwnedCoreNativeIdentity{PID: pid, CreatedNS: out.core.created, SID: out.core.sid, ImagePath: out.core.path, ImageSHA256: out.core.sha, ImageVolume: out.core.volume, ImageIndex: out.core.index, ParentPID: parentPID, ParentCreatedNS: out.parent.created, ParentSID: out.parent.sid, ParentImagePath: out.parent.path, ParentImageSHA256: out.parent.sha, ParentImageVolume: out.parent.volume, ParentImageIndex: out.parent.index}
++	return out, nil
++}
++
++// ObserveOwnedCoreReadOnly cannot terminate. It is suitable for preflight.
++func ObserveOwnedCoreReadOnly(pid uint32) (OwnedCoreNativeIdentity, error) {
++	h, err := ownedCoreOpen(pid, 0)
++	if err != nil {
++		return OwnedCoreNativeIdentity{}, err
++	}
++	defer h.Close()
++	return h.identity, nil
++}
++
++// OpenOwnedCoreRetained binds the sole termination handle to a complete exact
++// native identity obtained during reviewed preflight. It cannot accept a
++// partial PID-only expectation.
++func OpenOwnedCoreRetained(expected OwnedCoreNativeIdentity) (*OwnedCoreRetainedHandle, error) {
++	if expected.PID == 0 || expected.CreatedNS == 0 || expected.SID == "" || expected.ImageSHA256 == "" || expected.ImagePath == "" || expected.ImageIndex == 0 || expected.ParentPID == 0 || expected.ParentCreatedNS == 0 || expected.ParentSID == "" || expected.ParentImageSHA256 == "" || expected.ParentImageIndex == 0 {
++		return nil, errors.New("complete reviewed native identity required")
++	}
++	h, err := ownedCoreOpen(expected.PID, windows.PROCESS_TERMINATE)
++	if err != nil {
++		return nil, err
++	}
++	if h.identity != expected {
++		h.Close()
++		return nil, errors.New("retained native identity differs from plan")
++	}
++	return h, nil
++}
++
++func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
++	if h == nil {
++		return OwnedCoreNativeIdentity{}
++	}
++	return h.identity
++}
++
++func (h *OwnedCoreRetainedHandle) verifyRetained() error {
++	if h == nil || h.closed || h.core.handle == 0 {
++		return errors.New("native handle closed")
++	}
++	pid, err := windows.GetProcessId(h.core.handle)
++	if err != nil || pid != h.identity.PID {
++		return errors.New("retained PID changed")
++	}
++	var created, exited, kernel, user windows.Filetime
++	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
++		return errors.New("retained process creation changed")
++	}
++	// File share mode prevents replacement while the retained image is open.
++	var info windows.ByHandleFileInformation
++	if err = windows.GetFileInformationByHandle(windows.Handle(h.core.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ImageIndex {
++		return errors.New("retained image file changed")
++	}
++	return nil
++}
++
++// OwnedCoreNativeExit records whether the one call was made and the numeric
++// exit code from the same retained handle. Unknown wait is never retried.
++type OwnedCoreNativeExit struct {
++	TerminateCalls int    `json:"terminate_calls"`
++	ExitObserved   bool   `json:"exit_observed"`
++	ExitCode       uint32 `json:"exit_code"`
++	BeforeSignal   bool   `json:"before_signal"`
++}
++
++const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
++
++func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
++	var out OwnedCoreNativeExit
++	if timeout <= 0 || timeout > 30*time.Second {
++		return out, errors.New("bounded native wait required")
++	}
++	if err := h.verifyRetained(); err != nil {
++		return out, err
++	}
++	if h.terminateCalls != 0 {
++		return out, errors.New("native termination already attempted")
++	}
++	status, err := h.nativeWait(0)
++	if err != nil {
++		return out, err
++	}
++	if status == windows.WAIT_OBJECT_0 {
++		out.BeforeSignal = true
++		out.ExitObserved = true
++		if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
++			return out, err
++		}
++		return out, nil
++	}
++	if status != uint32(windows.WAIT_TIMEOUT) {
++		return out, fmt.Errorf("unexpected native wait status %d", status)
++	}
++	h.terminateCalls = 1
++	out.TerminateCalls = 1
++	if err = h.nativeTerminate(OwnedCoreMaintenanceExitCode); err != nil {
++		return out, fmt.Errorf("one TerminateProcess failed: %w", err)
++	}
++	status, err = h.nativeWait(uint32(timeout.Milliseconds()))
++	if err != nil || status != windows.WAIT_OBJECT_0 {
++		return out, fmt.Errorf("native wait unknown: status=%d err=%v", status, err)
++	}
++	out.ExitObserved = true
++	if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
++		return out, err
++	}
++	return out, nil
++}
++
++func (h *OwnedCoreRetainedHandle) Close() {
++	if h == nil || h.closed {
++		return
++	}
++	h.closed = true
++	h.core.close()
++	h.parent.close()
++}
+diff --git a/ops/supervisor/owned_core_handle_windows_test.go b/ops/supervisor/owned_core_handle_windows_test.go
+new file mode 100644
+index 00000000..79719346
+--- /dev/null
++++ b/ops/supervisor/owned_core_handle_windows_test.go
+@@ -0,0 +1,134 @@
++//go:build windows
++
++package supervisor
++
++import (
++	"errors"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"golang.org/x/sys/windows"
++)
++
++func TestOwnedCoreFixtureChild(t *testing.T) {
++	if os.Getenv("RESEARCHOS_OWNED_CORE_CHILD") != "yes" {
++		return
++	}
++	time.Sleep(12 * time.Second)
++}
++
++func TestOwnedCoreTerminateFailureIsSingleUnknownAttempt(t *testing.T) {
++	core := ownedCoreChild(t)
++	defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
++	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	h, err := OpenOwnedCoreRetained(id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++	called := 0
++	h.terminate = func(windows.Handle, uint32) error { called++; return errors.New("injected native failure") }
++	exit, err := h.TerminateOnceAndWait(time.Second)
++	if err == nil || exit.TerminateCalls != 1 || exit.ExitObserved || called != 1 {
++		t.Fatalf("one-call failure was not UNKNOWN: %+v calls=%d err=%v", exit, called, err)
++	}
++	if again, err := h.TerminateOnceAndWait(time.Second); err == nil || again.TerminateCalls != 0 || called != 1 {
++		t.Fatalf("native failure retried: %+v calls=%d err=%v", again, called, err)
++	}
++	if _, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
++		t.Fatalf("injected failure affected target before cleanup: %v", err)
++	}
++}
++
++func TestOwnedCoreWaitDeadlineNeverRetriesSignal(t *testing.T) {
++	core := ownedCoreChild(t)
++	defer func() { _ = core.Wait() }()
++	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	h, err := OpenOwnedCoreRetained(id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++	waits := 0
++	h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
++		waits++
++		if waits == 2 {
++			return uint32(windows.WAIT_TIMEOUT), nil
++		}
++		return windows.WaitForSingleObject(handle, ms)
++	}
++	exit, err := h.TerminateOnceAndWait(time.Second)
++	if err == nil || exit.TerminateCalls != 1 || exit.ExitObserved || waits != 2 {
++		t.Fatalf("deadline not reported UNKNOWN: %+v waits=%d err=%v", exit, waits, err)
++	}
++	if again, err := h.TerminateOnceAndWait(time.Second); err == nil || again.TerminateCalls != 0 || waits != 2 {
++		t.Fatalf("deadline retried signal/wait: %+v waits=%d err=%v", again, waits, err)
++	}
++}
++
++func ownedCoreChild(t *testing.T) *exec.Cmd {
++	t.Helper()
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	cmd := exec.Command(exe, "-test.run=^TestOwnedCoreFixtureChild$")
++	cmd.Env = append(os.Environ(), "RESEARCHOS_OWNED_CORE_CHILD=yes")
++	if err = cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	return cmd
++}
++
++func TestOwnedCoreRetainedHandleSingleChildAndUnrelatedSurvives(t *testing.T) {
++	core := ownedCoreChild(t)
++	unrelated := ownedCoreChild(t)
++	defer func() { _ = core.Wait(); _ = unrelated.Wait() }()
++	observed, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if observed.PID != uint32(core.Process.Pid) || observed.CreatedNS == 0 || observed.SID == "" || observed.ParentPID != uint32(os.Getpid()) || observed.ImageIndex == 0 || observed.ParentImageIndex == 0 {
++		t.Fatalf("incomplete retained identity: %+v", observed)
++	}
++	wrong := observed
++	wrong.CreatedNS++
++	if h, e := OpenOwnedCoreRetained(wrong); e == nil {
++		h.Close()
++		t.Fatal("PID reuse identity accepted")
++	}
++	wrong = observed
++	wrong.ImageSHA256 = strings.Repeat("0", 64)
++	if h, e := OpenOwnedCoreRetained(wrong); e == nil {
++		h.Close()
++		t.Fatal("replacement image identity accepted")
++	}
++	h, err := OpenOwnedCoreRetained(observed)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++	if h.Identity() != observed {
++		t.Fatal("retained identity changed")
++	}
++	exit, err := h.TerminateOnceAndWait(5 * time.Second)
++	if err != nil || exit.TerminateCalls != 1 || !exit.ExitObserved || exit.ExitCode != OwnedCoreMaintenanceExitCode || exit.BeforeSignal {
++		t.Fatalf("single exact termination failed: %+v %v", exit, err)
++	}
++	if second, e := h.TerminateOnceAndWait(time.Second); e == nil || second.TerminateCalls != 0 {
++		t.Fatalf("second termination accepted: %+v %v", second, e)
++	}
++	other, e := ObserveOwnedCoreReadOnly(uint32(unrelated.Process.Pid))
++	if e != nil || other.PID != uint32(unrelated.Process.Pid) {
++		t.Fatalf("same-console unrelated child lost: %+v %v", other, e)
++	}
++}

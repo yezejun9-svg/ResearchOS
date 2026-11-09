@@ -1,0 +1,220 @@
+		"forged receipt": func(s Object) {
+			a := Arr(s["mu_turn"].(map[string]any), "effects")
+			a[len(a)-1].(map[string]any)["receipt"].(map[string]any)["receipt_id"] = "sha256:fake"
+		},
+		"reservation missing": func(s Object) { s["mu_turn"].(map[string]any)["ledger"] = Empty() },
+		"unknown money released": func(s Object) {
+			m := s["mu_turn"].(map[string]any)
+			var l Object
+			for _, v := range Arr(m, "ledger") {
+				candidate := v.(map[string]any)
+				if candidate["provider_request_id"] == Arr(m, "effects")[0].(map[string]any)["key"] {
+					l = candidate
+					break
+				}
+			}
+			extra := Merge(l, Object{"id": "fake-release", "operation": "RELEASE"})
+			m["ledger"] = append(Arr(m, "ledger"), extra)
+		},
+		"prompt drift": func(s Object) {
+			s["mu_turn"].(map[string]any)["prompt"].(map[string]any)["task_description"] = "changed intent"
+		},
+		"projection copied from another dispatch": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["model_execution_projection"].(map[string]any)["dispatch_key"] = "foreign-dispatch"
+		},
+		"projection effective hash": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["model_execution_projection"].(map[string]any)["effective_model_config_hash"] = "sha256:forged"
+		},
+		"projection source profile": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model"] = "other"
+		},
+		"projection old tools": func(s Object) {
+			m := s["mu_turn"].(map[string]any)
+			effects := Arr(m, "effects")
+			for _, v := range effects {
+				e := v.(map[string]any)
+				request, _ := e["payload"].(map[string]any)
+				p, _ := request["payload"].(map[string]any)
+				body, _ := p["body"].(map[string]any)
+				if body != nil {
+					body["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+				}
+			}
+		},
+		"projection model excess": func(s Object) {
+			m := s["mu_turn"].(map[string]any)
+			muMutateResult(s, func(o Object) { o["model_calls"] = 2 })
+			m["effects"] = append(Arr(m, "effects"), Object{"key": "forged-second-model"})
+		},
+		"effect order": func(s Object) {
+			a := Arr(s["mu_turn"].(map[string]any), "effects")
+			a[len(a)-1].(map[string]any)["_journal_position"] = 0
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			clone := muCloneSnapshot(t, prepared.snapshot)
+			mutate(clone)
+			status, why := verifyMuTurn(clone)
+			if status != "FAIL" {
+				t.Fatalf("fabrication accepted: %s %s", status, why)
+			}
+		})
+	}
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run("consumer_matrix/"+mutation.name, func(t *testing.T) {
+			clone := muCloneSnapshot(t, prepared.snapshot)
+			if status, reason := verifyMuTurn(clone); status != "PASS" {
+				t.Fatalf("unmodified verifier snapshot invalid: %s %s", status, reason)
+			}
+			mu := clone["mu_turn"].(map[string]any)
+			dispatch := mu["dispatch"].(map[string]any)
+			manifest := dispatch["manifest"].(map[string]any)
+			dispatch["manifest"] = qualificationProjectionMutant(t, manifest, mutation)
+			if status, reason := verifyMuTurn(clone); status != "FAIL" {
+				t.Fatalf("verifier accepted %s: %s %s", mutation.name, status, reason)
+			}
+		})
+	}
+	// Build a bounded legacy/normal verifier snapshot from the valid local
+	// fixture before acceptance. The original profile remains 8/4; only the
+	// in-memory request facts are rebound to that original configuration.
+	for _, mode := range []string{"legacy", "normal"} {
+		t.Run("original_config_snapshot/"+mode, func(t *testing.T) {
+			clone := muCloneSnapshot(t, prepared.snapshot)
+			mu := clone["mu_turn"].(map[string]any)
+			manifest := mu["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			delete(manifest, "model_execution_projection")
+			profile := mu["profile"].(map[string]any)
+			config := profile["model_config"].(map[string]any)
+			if n, _ := Num(config, "max_calls"); n != 8 || len(Arr(config, "tools")) != 4 {
+				t.Fatal("original 8/4 source profile missing")
+			}
+			if mode == "normal" {
+				clone["task"].(map[string]any)["task_type"] = "mu_turn"
+				admission := manifest["admission"].(map[string]any)
+				admission["qualification_bootstrap"] = false
+				admission["permission"].(map[string]any)["purpose"] = "mu_turn"
+			}
+			effects := Arr(mu, "effects")
+			last := effects[len(effects)-1].(map[string]any)
+			request, _ := Decode(Bytes(last["payload"]))
+			body := request["payload"].(map[string]any)["body"].(map[string]any)
+			body["tools"] = config["tools"]
+			var ledger Object
+			for _, value := range Arr(mu, "ledger") {
+				candidate := value.(map[string]any)
+				if candidate["provider_request_id"] == last["key"] {
+					ledger = candidate
+					break
+				}
+			}
+			if ledger == nil {
+				t.Fatal("UNKNOWN original liability missing")
+			}
+			cost := Object{"policy_id": ledger["policy_id"], "run_id": clone["run"].(map[string]any)["id"], "operation": ledger["operation"], "money": ledger["money"], "provider_request_id": last["key"], "provider_event_id": "prepare/" + Str(last, "key"), "reservation_id": nil, "cost_basis": ledger["cost_basis"], "occurred_at": clone["run"].(map[string]any)["created_at"]}
+			requestHash := Hash([]any{request, cost})
+			for _, value := range effects {
+				effect := value.(map[string]any)
+				effect["payload"] = request
+				effect["request_hash"] = requestHash
+			}
+			if stream, ok := mu["model_stream"].(map[string]any); ok {
+				for _, value := range Arr(stream, "bindings") {
+					value.(map[string]any)["request_hash"] = requestHash
+				}
+			}
+			if status, reason := verifyMuTurn(clone); status != "PASS" {
+				t.Fatalf("synthetic %s original-config snapshot invalid: %s %s", mode, status, reason)
+			}
+		})
+	}
+	// An append-only broker fact arriving between prepare/finalize invalidates the
+	// entire computation, even when the already loaded artifact did not change.
+	tx, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := Arr(prepared.snapshot["mu_turn"].(map[string]any), "effects")
+	changed := Merge(facts[len(facts)-1].(map[string]any), Object{"audit_marker": "concurrent trusted evidence"})
+	if err = effectAppend(tx, f.project, Str(r.run, "id"), Str(changed, "key"), changed); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+
+func TestQualificationProjectionFrozenWorkerWire(t *testing.T) {
+	var wire Object
+	tool := func(name string) Object {
+		return Object{"type": "function", "function": Object{"name": name, "description": "fixture", "parameters": Object{"type": "object", "properties": Object{}}}}
+	}
+	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, req *http.Request) {
+		if err := json.NewDecoder(req.Body).Decode(&wire); err != nil {
+			t.Errorf("wire JSON: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"qualified\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}, func(config, profile Object) {
+		config["max_calls"] = 8
+		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
+	})
+	var beforeRaw string
+	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&beforeRaw); err != nil {
+		t.Fatal(err)
+	}
+	beforeManifest, err := Decode([]byte(beforeRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := map[string][]byte{}
+	if err := stageRuntimeProgram(route, Object{"manifest": beforeManifest}, inputs); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := Decode(inputs["worker.json"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := Num(worker, "max_calls"); n != 1 || len(Arr(worker, "tools")) != 0 {
+		t.Fatalf("staged worker wrong bounds: %s", inputs["worker.json"])
+	}
+	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || wire == nil {
+		t.Fatalf("worker issued %d MODEL requests, wire=%v", calls.Load(), wire)
+	}
+	if tools, ok := wire["tools"].([]any); !ok || len(tools) != 0 {
+		t.Fatalf("worker exposed coding tools: %s", Bytes(wire))
+	}
+	var afterRaw string
+	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&afterRaw); err != nil {
+		t.Fatal(err)
+	}
+	if afterRaw != beforeRaw {
+		t.Fatal("immutable dispatch profile changed")
+	}
+	var raw string
+	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Decode([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest["model_execution_projection"] == nil {
+		t.Fatal("new qualification omitted marker")
+	}
+	config := manifest["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
+	if n, _ := Num(config, "max_calls"); n != 8 || len(Arr(config, "tools")) != 4 {
+		t.Fatal("original 8/4 profile changed")
+	}
+	if Hash(c.config.Providers[0].ModelConfig) != Hash(config) {
+		t.Fatal("provider route identity stopped using original model config")
+	}
+	t.Logf("frozen_worker_wire original=8/4 effective=1/0 model_calls=%d provider_tools=%d source_profile_unchanged=true", calls.Load(), len(Arr(wire, "tools")))
+}
+
+func TestQualificationProjectionUnsolicitedProviderToolCalls(t *testing.T) {
+	tool := Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object", "properties": Object{}}}}
+	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, req *http.Request) {

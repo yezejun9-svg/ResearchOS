@@ -1,0 +1,186 @@
+--- 949c/root_native_migration_controller.py
++++ atomic-revision/root_native_migration_controller.py
+@@ -95,12 +95,57 @@
+     return raw
+ 
+ def write_new(path, value):
++    # Windows rename refuses an existing destination. Do not use os.replace,
++    # or run this publisher on a platform whose rename permits replacement.
++    if os.name != "nt":
++        raise OSError("atomic no-clobber publisher requires Windows")
++    path = canonical_path(str(path))
++    parent = canonical_path(str(path.parent))
++    if not parent.is_dir():
++        raise ValueError("existing canonical publication directory required")
++    if os.path.lexists(path):
++        raise FileExistsError("public destination already exists")
+     raw = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+-    with Path(path).open("xb") as stream:
+-        stream.write(raw)
+-        stream.flush()
+-        os.fsync(stream.fileno())
++    temporary = parent/("." + path.name + "." + uuid.uuid4().hex + ".pending")
++    created = False
++    try:
++        with temporary.open("xb") as stream:
++            created = True
++            if stream.write(raw) != len(raw):
++                raise OSError("short public JSON write")
++            stream.flush()
++            os.fsync(stream.fileno())
++        if canonical_path(str(parent)) != parent or not parent.is_dir():
++            raise ValueError("publication directory changed")
++        # Same-directory publication after close; the OS, not the earlier
++        # existence check, enforces no clobber if another writer wins.
++        os.rename(temporary, path)
++    except BaseException as error:
++        if created:
++            try:
++                temporary.unlink(missing_ok=True)
++            except OSError as cleanup_error:
++                # Keep the original failure type and the cleanup failure.
++                # Never remove the destination or another call's temporary.
++                raise error from cleanup_error
++        raise
+     return public_ref(path)
++
++
++class PublicationPending(ValueError):
++    """An unpinned public producer has not yet published complete JSON."""
++
++
++def _complete_public_json(path):
++    path = canonical_path(str(path))
++    try:
++        raw = path.read_bytes()
++        value = decode(raw)
++    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
++        # Go still creates final ready/evidence names before Write/Sync/Close.
++        # Defer only unpinned publication reads; read_ref remains strict.
++        raise PublicationPending("public JSON publication pending") from None
++    return {"path":str(path), "sha256":digest(raw), "bytes":len(raw)}, value
+ 
+ def load_public_module(pin, label):
+     raw = read_ref(pin)
+@@ -210,12 +255,17 @@
+ 
+ def _phase(c):
+     out = c["output"]
+-    if (out/"06-fixture-retained.ready.json").is_file():
+-        return "fixture-retained"
+-    if (out/PHASES["grant"][1]).is_file() and not (out/PHASES["grant"][2]).exists():
+-        return "grant"
+-    if (out/PHASES["release"][1]).is_file() and not (out/PHASES["release"][2]).exists():
+-        return "release"
++    for phase, name, approval in (
++        ("fixture-retained", "06-fixture-retained.ready.json", None),
++        ("grant", PHASES["grant"][1], PHASES["grant"][2]),
++        ("release", PHASES["release"][1], PHASES["release"][2]),
++    ):
++        if (out/name).is_file() and (approval is None or not (out/approval).exists()):
++            try:
++                _complete_public_json(out/name)
++            except PublicationPending:
++                return "running"
++            return phase
+     return "running"
+ 
+ def _closed_native(result):
+@@ -297,14 +347,20 @@
+         while thread.is_alive():
+             stop = c["work"]/"stop.request.json"
+             if stop.is_file():
+-                value = decode(stop.read_bytes())
++                try:
++                    _, value = _complete_public_json(stop)
++                except PublicationPending:
++                    value = None
+                 if value == {"Action":"STOP_OWNED_CASE", "ConfigSHA256":config_ref["sha256"]}:
+                     cancellation.set()
+             for path in c["work"].glob("observe-*.request.json"):
+                 request_id = path.name.removeprefix("observe-").removesuffix(".request.json")
+                 if path.name in seen or len(request_id) != 32 or any(x not in "0123456789abcdef" for x in request_id):
+                     continue
+-                value = decode(path.read_bytes())
++                try:
++                    _, value = _complete_public_json(path)
++                except PublicationPending:
++                    continue
+                 if value != {"Action":"OBSERVE_HELD_JOB", "ConfigSHA256":config_ref["sha256"], "RequestID":request_id}:
+                     raise ValueError("public observation request differs")
+                 seen.add(path.name)
+@@ -354,13 +410,12 @@
+     target = c["work"]/("observe-"+request_id+".response.json")
+     while time.monotonic() < end:
+         if target.is_file():
+-            raw = target.read_bytes()
+             try:
+-                decode(raw)
+-            except (ValueError, UnicodeError):
++                response_ref, _ = _complete_public_json(target)
++            except PublicationPending:
+                 time.sleep(0.05)
+                 continue
+-            return public_ref(target)
++            return response_ref
+         if (c["work"]/"controller.closed.json").is_file():
+             return public_ref(c["work"]/"controller.closed.json")
+         time.sleep(0.05)
+@@ -441,15 +496,16 @@
+                 files.append(optional)
+     else:
+         files += list(PHASES[phase][:2])
+-    refs = [public_ref(c["output"]/name) for name in files if (c["output"]/name).is_file()]
++    refs = [_complete_public_json(c["output"]/name)[0]
++            for name in files if (c["output"]/name).is_file()]
+     fixture_path = c["output"]/"fixture.public.json"
+     if fixture_path.is_file():
+-        fixture = decode(fixture_path.read_bytes())
++        fixture_ref, fixture = _complete_public_json(fixture_path)
+     elif phase == "fixture-retained":
+         # Early fixture assertions may fail before the normal public summary.
+         # The Go cleanup hold still publishes the actual database path.
+         fixture_path = c["output"]/"06-fixture-retained.ready.json"
+-        retained = decode(fixture_path.read_bytes())
++        fixture_ref, retained = _complete_public_json(fixture_path)
+         fixture = {"database":retained["database"],"root":str(Path(retained["database"]).parent)}
+     else:
+         raise ValueError("fixture public identity required")
+@@ -461,10 +517,8 @@
+     sign_kind = None
+     target = None
+     if phase in PHASES:
+-        payload_ref = public_ref(c["output"]/PHASES[phase][0])
+-        ready_ref = public_ref(c["output"]/PHASES[phase][1])
+-        payload = decode(read_ref(payload_ref))
+-        ready = decode(read_ref(ready_ref))
++        payload_ref, payload = _complete_public_json(c["output"]/PHASES[phase][0])
++        ready_ref, ready = _complete_public_json(c["output"]/PHASES[phase][1])
+         sign_kind = "release" if phase == "release" else ("grant" if c["hc"]["Case"] == "wrong-purpose" else "migration-grant")
+         target = str(Path(c["hc"]["RootProgram"]["path"]).parent/PHASES[phase][3])
+         if ready["payload_sha256"] != payload_ref["sha256"] or ready["sign_kind"] != sign_kind or Path(ready["fixed_signed_path"]) != Path(target):
+@@ -487,7 +541,7 @@
+                 "payload_ref":payload_ref, "ready_ref":ready_ref, "sign_kind":sign_kind,
+                 "signed_destination":target, "evidence_refs":evidence,
+                 "declared_pin_observations":declared, "measured_native_ids":measured,
+-                "fixture_public_ref":public_ref(fixture_path),
++                "fixture_public_ref":fixture_ref,
+                 "compiler_inventory_ref":c["cfg"]["CompilerInventory"],
+                 "test_build_invocation_ref":c["cfg"]["BuildInvocation"],
+                 "root_approval":False,"sql_read_performed_by_controller":False,
+@@ -518,13 +572,13 @@
+     if (snap["case"] != c["hc"]["Case"] or snap["case_id"] != c["hc"]["CaseID"] or
+         approval["SignKind"] != expected_kind or Path(approval["SignedDestination"]) != expected_destination or
+         snap["harness_config_ref"] != c["cfg"]["HarnessConfig"] or
+-        snap["ready_ref"] != public_ref(c["output"]/PHASES[phase][1])):
++        snap["ready_ref"] != _complete_public_json(c["output"]/PHASES[phase][1])[0]):
+         raise ValueError("Root approval differs from fixed case contract")
+     if (approval["Payload"] != snap["payload_ref"] or
+         approval["SignedDestination"] != snap["signed_destination"] or
+         approval["SignKind"] != snap["sign_kind"]):
+         raise ValueError("Root approval differs from exact reviewed snapshot")
+-    current_payload = public_ref(c["output"]/PHASES[phase][0])
++    current_payload = _complete_public_json(c["output"]/PHASES[phase][0])[0]
+     if current_payload != approval["Payload"]:
+         raise ValueError("Root approved payload changed")
+     _, observation = _live_observation(config_ref)

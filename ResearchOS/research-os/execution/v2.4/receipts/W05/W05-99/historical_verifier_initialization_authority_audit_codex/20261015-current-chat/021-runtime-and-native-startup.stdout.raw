@@ -1,0 +1,331 @@
+REF {'import_path': 'runtime', 'file': 'D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\src\\runtime\\os_windows.go', 'line': 469, 'end_line': 493, 'name': 'osinit', 'sha256': 'e89fc1c8927f8a8bf0ffd862709a7ced6d751d221792329c0d75bb5616cb009d'}
+469: func osinit() {
+470: 	asmstdcallAddr = unsafe.Pointer(windows.AsmStdCallAddr())
+471: 
+472: 	loadOptionalSyscalls()
+473: 
+474: 	preventErrorDialogs()
+475: 
+476: 	initExceptionHandler()
+477: 
+478: 	initHighResTimer()
+479: 	timeBeginPeriodRetValue = osRelax(false)
+480: 
+481: 	initSysDirectory()
+482: 	initLongPathSupport()
+483: 
+484: 	numCPUStartup = getCPUCount()
+485: 
+486: 	physPageSize = getPageSize()
+487: 
+488: 	// Windows dynamic priority boosting assumes that a process has different types
+489: 	// of dedicated threads -- GUI, IO, computational, etc. Go processes use
+490: 	// equivalent threads that all do a mix of GUI, IO, computations, etc.
+491: 	// In such context dynamic priority boosting does nothing but harm, so we turn it off.
+492: 	stdcall(_SetProcessPriorityBoost, windows.CurrentProcess, 1)
+493: }
+REF {'import_path': 'runtime', 'file': 'D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\src\\runtime\\proc.go', 'line': 153, 'end_line': 346, 'name': 'main', 'sha256': '40d15ce858cf058cff92606001a29ee1689db88c121a2f0c283163a0d64a7375'}
+153: func main() {
+154: 	mp := getg().m
+155: 
+156: 	// Racectx of m0->g0 is used only as the parent of the main goroutine.
+157: 	// It must not be used for anything else.
+158: 	mp.g0.racectx = 0
+159: 
+160: 	// Max stack size is 1 GB on 64-bit, 250 MB on 32-bit.
+161: 	// Using decimal instead of binary GB and MB because
+162: 	// they look nicer in the stack overflow failure message.
+163: 	if goarch.PtrSize == 8 {
+164: 		maxstacksize = 1000000000
+165: 	} else {
+166: 		maxstacksize = 250000000
+167: 	}
+168: 
+169: 	// An upper limit for max stack size. Used to avoid random crashes
+170: 	// after calling SetMaxStack and trying to allocate a stack that is too big,
+171: 	// since stackalloc works with 32-bit sizes.
+172: 	maxstackceiling = 2 * maxstacksize
+173: 
+174: 	// Allow newproc to start new Ms.
+175: 	mainStarted = true
+176: 
+177: 	if haveSysmon {
+178: 		systemstack(func() {
+179: 			newm(sysmon, nil, -1)
+180: 		})
+181: 	}
+182: 
+183: 	// Lock the main goroutine onto this, the main OS thread,
+184: 	// during initialization. Most programs won't care, but a few
+185: 	// do require certain calls to be made by the main thread.
+186: 	// Those can arrange for main.main to run in the main thread
+187: 	// by calling runtime.LockOSThread during initialization
+188: 	// to preserve the lock.
+189: 	lockOSThread()
+190: 
+191: 	if mp != &m0 {
+192: 		throw("runtime.main not on m0")
+193: 	}
+194: 
+195: 	// Record when the world started.
+196: 	// Must be before doInit for tracing init.
+197: 	runtimeInitTime = nanotime()
+198: 	if runtimeInitTime == 0 {
+199: 		throw("nanotime returning zero")
+200: 	}
+201: 
+202: 	if debug.inittrace != 0 {
+203: 		inittrace.id = getg().goid
+204: 		inittrace.active = true
+205: 	}
+206: 
+207: 	doInit(runtime_inittasks) // Must be before defer.
+208: 
+209: 	// Defer unlock so that runtime.Goexit during init does the unlock too.
+210: 	needUnlock := true
+211: 	defer func() {
+212: 		if needUnlock {
+213: 			unlockOSThread()
+214: 		}
+215: 	}()
+216: 
+217: 	gcenable()
+218: 	defaultGOMAXPROCSUpdateEnable() // don't STW before runtime initialized.
+219: 
+220: 	// If we encountered a removed GODEBUG during startup we can panic now.
+221: 	if k := invalidGODEBUG.key; k != "" {
+222: 		v := invalidGODEBUG.value
+223: 		r := strconv.Itoa(invalidGODEBUG.removed)
+224: 		fatal(`removed GODEBUG "` + k + `" set to old value "` + v + `" in environment (https://go.dev/doc/godebug#go-1` + r + `)`)
+225: 	}
+226: 
+227: 	mainInitDoneChan = make(chan bool)
+228: 	if iscgo {
+229: 		if _cgo_pthread_key_created == nil {
+230: 			throw("_cgo_pthread_key_created missing")
+231: 		}
+232: 
+233: 		if GOOS != "windows" {
+234: 			if _cgo_thread_start == nil {
+235: 				throw("_cgo_thread_start missing")
+236: 			}
+237: 			if _cgo_setenv == nil {
+238: 				throw("_cgo_setenv missing")
+239: 			}
+240: 			if _cgo_unsetenv == nil {
+241: 				throw("_cgo_unsetenv missing")
+242: 			}
+243: 		}
+244: 		if _cgo_notify_runtime_init_done == nil {
+245: 			throw("_cgo_notify_runtime_init_done missing")
+246: 		}
+247: 
+248: 		// Set the x_crosscall2_ptr C function pointer variable point to crosscall2.
+249: 		if set_crosscall2 == nil {
+250: 			throw("set_crosscall2 missing")
+251: 		}
+252: 		set_crosscall2()
+253: 
+254: 		// Start the template thread in case we enter Go from
+255: 		// a C-created thread and need to create a new thread.
+256: 		startTemplateThread()
+257: 		cgocall(_cgo_notify_runtime_init_done, nil)
+258: 	}
+259: 
+260: 	// Run the initializing tasks. Depending on build mode this
+261: 	// list can arrive a few different ways, but it will always
+262: 	// contain the init tasks computed by the linker for all the
+263: 	// packages in the program (excluding those added at runtime
+264: 	// by package plugin). Run through the modules in dependency
+265: 	// order (the order they are initialized by the dynamic
+266: 	// loader, i.e. they are added to the moduledata linked list).
+267: 	last := lastmoduledatap // grab before loop starts. Any added modules after this point will do their own doInit calls.
+268: 	for m := &firstmoduledata; true; m = m.next {
+269: 		doInit(m.inittasks)
+270: 		if m == last {
+271: 			break
+272: 		}
+273: 	}
+274: 
+275: 	// Disable init tracing after main init done to avoid overhead
+276: 	// of collecting statistics in malloc and newproc
+277: 	inittrace.active = false
+278: 
+279: 	mainInitDone.Store(true)
+280: 	close(mainInitDoneChan)
+281: 
+282: 	needUnlock = false
+283: 	unlockOSThread()
+284: 
+285: 	if isarchive || islibrary {
+286: 		// A program compiled with -buildmode=c-archive or c-shared
+287: 		// has a main, but it is not executed.
+288: 		if GOARCH == "wasm" {
+289: 			// On Wasm, pause makes it return to the host.
+290: 			// Unlike cgo callbacks where Ms are created on demand,
+291: 			// on Wasm we have only one M. So we keep this M (and this
+292: 			// G) for callbacks.
+293: 			// Using the caller's SP unwinds this frame and backs to
+294: 			// goexit. The -16 is: 8 for goexit's (fake) return PC,
+295: 			// and pause's epilogue pops 8.
+296: 			pause(sys.GetCallerSP() - 16) // should not return
+297: 			panic("unreachable")
+298: 		}
+299: 		return
+300: 	}
+301: 	fn := main_main // make an indirect call, as the linker doesn't know the address of the main package when laying down the runtime
+302: 	fn()
+303: 
+304: 	// Check for C memory leaks if using ASAN and we've made cgo calls,
+305: 	// or if we are running as a library in a C program.
+306: 	// We always make one cgo call, above, to notify_runtime_init_done,
+307: 	// so we ignore that one.
+308: 	// No point in leak checking if no cgo calls, since leak checking
+309: 	// just looks for objects allocated using malloc and friends.
+310: 	// Just checking iscgo doesn't help because asan implies iscgo.
+311: 	exitHooksRun := false
+312: 	if asanenabled && (isarchive || islibrary || NumCgoCall() > 1) {
+313: 		runExitHooks(0) // lsandoleakcheck may not return
+314: 		exitHooksRun = true
+315: 		lsandoleakcheck()
+316: 	}
+317: 
+318: 	// Make racy client program work: if panicking on
+319: 	// another goroutine at the same time as main returns,
+320: 	// let the other goroutine finish printing the panic trace.
+321: 	// Once it does, it will exit. See issues 3934 and 20018.
+322: 	if runningPanicDefers.Load() != 0 {
+323: 		// Running deferred functions should not take long.
+324: 		for c := 0; c < 1000; c++ {
+325: 			if runningPanicDefers.Load() == 0 {
+326: 				break
+327: 			}
+328: 			Gosched()
+329: 		}
+330: 	}
+331: 	if panicking.Load() != 0 {
+332: 		gopark(nil, nil, waitReasonPanicWait, traceBlockForever, 1)
+333: 	}
+334: 	if !exitHooksRun {
+335: 		runExitHooks(0)
+336: 	}
+337: 	if raceenabled {
+338: 		racefini() // does not return
+339: 	}
+340: 
+341: 	exit(0)
+342: 	for {
+343: 		var x *int32
+344: 		*x = 0
+345: 	}
+346: }
+REF {'import_path': 'crypto/internal/fips140', 'file': 'D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\src\\crypto\\internal\\fips140\\cast.go', 'line': 37, 'end_line': 56, 'name': 'CAST', 'sha256': 'ed3b9fddc7581352d4fd67dae28569a33f965778330c9def418df7efc7f11e55'}
+37: func CAST(name string, f func() error) {
+38: 	if strings.ContainsAny(name, ",#=:") {
+39: 		panic("fips: invalid self-test name: " + name)
+40: 	}
+41: 	if !Enabled {
+42: 		return
+43: 	}
+44: 
+45: 	err := f()
+46: 	if name == failfipscast {
+47: 		err = errors.New("simulated CAST failure")
+48: 	}
+49: 	if err != nil {
+50: 		fatal("FIPS 140-3 self-test failed: " + name + ": " + err.Error())
+51: 		panic("unreachable")
+52: 	}
+53: 	if debug {
+54: 		println("FIPS 140-3 self-test passed:", name)
+55: 	}
+56: }
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\arena.go 205 func init() {
+	if userArenaChunkPages*pageSize != userArenaChunkBytes {
+		throw("user arena chunk size is not a multiple of the page size")
+	}
+	if userArenaChunkBytes%physPageSize != 0 {
+		throw("user arena chunk size is not a multiple of the physical page size")
+	}
+	if userArenaChunkBytes < heapArenaBytes {
+		if heapArenaBytes%userArenaChunkBytes != 0 {
+			throw("user arena chunk size is smaller than a heap arena, but doesn't divide it")
+		}
+	} else {
+		if userArenaChunkBytes%heapArenaBytes != 0 {
+			throw("user arena chunks size is larger than a heap arena, but not a multiple")
+		}
+	}
+	lockInit(&userArenaState.lock, lockRankUserArenaState)
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\cpuflags_amd64.go 22 func init() {
+
+	isERMSNiceCPU := isIntel
+	useREPMOV := isERMSNiceCPU && cpu.X86.HasERMS && cpu.X86.HasFSRM
+	if cpu.X86.HasAVX {
+		memmoveBits |= avxSupported
+	}
+	if useREPMOV {
+		memmoveBits |= repmovsPreferred
+	}
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\mgcstack.go 137 func init() {
+	if unsafe.Sizeof(stackWorkBuf{}) > unsafe.Sizeof(workbuf{}) {
+		panic("stackWorkBuf too big")
+	}
+	if unsafe.Sizeof(stackObjectBuf{}) > unsafe.Sizeof(workbuf{}) {
+		panic("stackObjectBuf too big")
+	}
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\mgcwork.go 28 func init() {
+	if workbufAlloc%pageSize != 0 || workbufAlloc%_WorkbufSize != 0 {
+		throw("bad workbufAlloc")
+	}
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\mstats.go 337 func init() {
+	if offset := unsafe.Offsetof(memstats.heapStats); offset%8 != 0 {
+		println(offset)
+		throw("memstats.heapStats not aligned to 8 bytes")
+	}
+
+	if size := unsafe.Sizeof(heapStatsDelta{}); size%8 != 0 {
+		println(size)
+		throw("heapStatsDelta not a multiple of 8 bytes in size")
+	}
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\preempt.go 350 func init() {
+	f := findfunc(abi.FuncPCABI0(asyncPreempt))
+	total := funcMaxSPDelta(f)
+	f = findfunc(abi.FuncPCABIInternal(asyncPreempt2))
+	total += funcMaxSPDelta(f)
+	f = findfunc(abi.FuncPCABIInternal(xRegRestore))
+	total += funcMaxSPDelta(f)
+
+	asyncPreemptStack = uintptr(total) + 8*goarch.PtrSize
+	if asyncPreemptStack > stackNosplit {
+
+		print("runtime: asyncPreemptStack=", asyncPreemptStack, "\n")
+		throw("async stack too large")
+	}
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\proc.go 363 func init() {
+	exithook.Gosched = Gosched
+	exithook.Goid = func() uint64 { return getg().goid }
+	exithook.Throw = throw
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\runtime\proc.go 374 func init() {
+	go forcegchelper()
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\go1.27.1\go\src\net\fd_windows.go 26 func init() {
+	poll.InitWSA()
+}
+INIT D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\mattn\go-isatty@v0.0.24\isatty_windows.go 29 func init() {
+
+	if procGetFileInformationByHandleEx.Find() != nil {
+		procGetFileInformationByHandleEx = nil
+	}
+
+	if procNtQueryObject.Find() != nil {
+		procNtQueryObject = nil
+	}
+}

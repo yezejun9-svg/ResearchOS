@@ -1,0 +1,175 @@
+package domain
+
+// Public-backup handoff is an isolated, same-host rehearsal. The Root-supplied
+// observation pins are provenance inputs, not credentials or execution proof.
+// The old program has already created an ordinary public backup. This program
+// never executes that old binary and must itself equal the distinct target.
+import (
+    "bytes"
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "io"
+    "os"
+    "path/filepath"
+    "strings"
+)
+
+const preparedPublicHandoffSchema = "researchos.public23-to24-backup-handoff.v1"
+const preparedPublicHandoffReceiptName = "prepared-abandonment-public-backup-handoff.json"
+
+type PreparedBackupHandoffOptions struct {
+    Upgrade LocalUpgradeOptions
+    BindingFile string
+    BindingSHA256 string
+}
+
+type preparedHandoffFileRef struct {
+    Path string `json:"path"`
+    SHA256 string `json:"sha256"`
+    Bytes int64 `json:"bytes"`
+}
+
+// All digests in this contract include the "sha256:" prefix. Root must review
+// the original observation independently before constructing and pinning this
+// binding. Reading a JSON declaration does not authenticate its claims.
+type preparedBackupHandoffBinding struct {
+    Schema string `json:"schema"`
+    SourceDatabase string `json:"source_database"`
+    BackupDirectory string `json:"backup_directory"`
+    SourceProgramSHA256 string `json:"source_program_sha256"`
+    TargetProgramSHA256 string `json:"target_program_sha256"`
+    BackupManifestSHA256 string `json:"backup_manifest_sha256"`
+    BackupManifestBytes int64 `json:"backup_manifest_bytes"`
+    BackupID string `json:"backup_id"`
+    SourceBackupOperation string `json:"source_backup_operation"`
+    ObservedBackupExit *int `json:"observed_backup_exit"`
+    ProducerStdout preparedHandoffFileRef `json:"producer_stdout"`
+    ProducerObservation preparedHandoffFileRef `json:"producer_observation"`
+}
+
+func preparedHandoffDigest(value string) bool {
+    if len(value) != 71 || !strings.HasPrefix(value, "sha256:") { return false }
+    for _, c := range value[7:] {
+        if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') { return false }
+    }
+    return true
+}
+
+func preparedHandoffReadRef(ref preparedHandoffFileRef) ([]byte, error) {
+    if !preparedHandoffDigest(ref.SHA256) || ref.Bytes <= 0 || ref.Bytes > 128*1024*1024 {
+        return nil, fmt.Errorf("PREPARED_HANDOFF_EVIDENCE_PIN")
+    }
+    path, err := upgradePath(ref.Path, true)
+    if err != nil { return nil, err }
+    info, err := os.Stat(path)
+    if err != nil || !info.Mode().IsRegular() || info.Size() != ref.Bytes {
+        return nil, fmt.Errorf("PREPARED_HANDOFF_EVIDENCE_FILE")
+    }
+    raw, err := os.ReadFile(path)
+    if err != nil || int64(len(raw)) != ref.Bytes || Digest(raw) != ref.SHA256 {
+        return nil, fmt.Errorf("PREPARED_HANDOFF_EVIDENCE_CHANGED")
+    }
+    return raw, nil
+}
+
+func preparedHandoffMetadata(b preparedBackupHandoffBinding, source, target string, manifest, stdout BackupManifest) error {
+    if b.Schema != preparedPublicHandoffSchema || b.SourceBackupOperation != "create" ||
+       b.ObservedBackupExit == nil || *b.ObservedBackupExit != 0 {
+        return fmt.Errorf("PREPARED_HANDOFF_OBSERVATION_REQUIRED")
+    }
+    if !preparedHandoffDigest(source) || !preparedHandoffDigest(target) ||
+       source == target || source != b.SourceProgramSHA256 || target != b.TargetProgramSHA256 {
+        return fmt.Errorf("PREPARED_HANDOFF_DISTINCT_PROGRAM_PINS")
+    }
+    if b.BackupID == "" || manifest.ID != b.BackupID || manifest.Format != "RESEARCHOS_BACKUP_V1" ||
+       len(manifest.Purpose) != 0 || Hash(manifest.Migrations) != Hash(upgradeVersions(23)) {
+        return fmt.Errorf("PREPARED_HANDOFF_BACKUP_IDENTITY")
+    }
+    if Hash(manifest) != Hash(stdout) {
+        return fmt.Errorf("PREPARED_HANDOFF_PRODUCER_STDOUT_MISMATCH")
+    }
+    return nil
+}
+
+func preparedHandoffCheck(opt LocalUpgradeOptions, handoff PreparedBackupHandoffOptions) (preparedBackupHandoffBinding, error) {
+    var b preparedBackupHandoffBinding
+    if !preparedHandoffDigest(handoff.BindingSHA256) { return b, fmt.Errorf("PREPARED_HANDOFF_BINDING_PIN_REQUIRED") }
+    raw, err := os.ReadFile(handoff.BindingFile)
+    if err != nil || Digest(raw) != handoff.BindingSHA256 { return b, fmt.Errorf("PREPARED_HANDOFF_BINDING_CHANGED") }
+    dec := json.NewDecoder(bytes.NewReader(raw)); dec.DisallowUnknownFields()
+    if err = dec.Decode(&b); err != nil { return b, err }
+    if err = dec.Decode(new(any)); err != io.EOF { return b, fmt.Errorf("PREPARED_HANDOFF_BINDING_TRAILING_DATA") }
+    sourcePath, err := upgradePath(b.SourceDatabase, true)
+    if err != nil || !strings.EqualFold(sourcePath, opt.Source) { return b, fmt.Errorf("PREPARED_HANDOFF_SOURCE_PATH") }
+    backupPath, err := upgradePath(b.BackupDirectory, true)
+    if err != nil || !strings.EqualFold(backupPath, opt.Snapshot) { return b, fmt.Errorf("PREPARED_HANDOFF_BACKUP_PATH") }
+    source, target, err := preparedUpgradeProgramHashes(opt, true)
+    if err != nil { return b, err }
+    rawManifest, err := os.ReadFile(filepath.Join(opt.Snapshot, "manifest.json"))
+    if err != nil || !preparedHandoffDigest(b.BackupManifestSHA256) ||
+       int64(len(rawManifest)) != b.BackupManifestBytes || Digest(rawManifest) != b.BackupManifestSHA256 {
+        return b, fmt.Errorf("PREPARED_HANDOFF_MANIFEST_CHANGED")
+    }
+    var manifest, stdout BackupManifest
+    if err = json.Unmarshal(rawManifest, &manifest); err != nil { return b, err }
+    rawStdout, err := preparedHandoffReadRef(b.ProducerStdout)
+    if err != nil { return b, err }
+    if err = json.Unmarshal(rawStdout, &stdout); err != nil { return b, err }
+    if _, err = preparedHandoffReadRef(b.ProducerObservation); err != nil { return b, err }
+    return b, preparedHandoffMetadata(b, source, target, manifest, stdout)
+}
+
+// Snapshot is existing here; every other path/alias/overlap constraint remains
+// the same as upgradePaths. No dummy nonexistent output is used to bypass it.
+func preparedHandoffPaths(opt *LocalUpgradeOptions, handoff *PreparedBackupHandoffOptions) error {
+    for _, p := range []*string{&opt.Source, &opt.Snapshot, &opt.KeyFile, &opt.SourceRoot, &opt.TargetRoot, &opt.SourceProgram, &opt.TargetProgram, &handoff.BindingFile} {
+        v, err := upgradePath(*p, true)
+        if err != nil { return err }
+        *p = v
+    }
+    destination, err := upgradePath(opt.Destination, false)
+    if err != nil { return err }
+    opt.Destination = destination
+    dirs := []string{filepath.Dir(opt.Source), filepath.Dir(opt.KeyFile), opt.Snapshot, opt.Destination}
+    for i, a := range dirs {
+        for _, b := range dirs[i+1:] {
+            if upgradeInside(a, b) || upgradeInside(b, a) { return fmt.Errorf("UPGRADE_PATH_OVERLAP") }
+        }
+    }
+    var infos []os.FileInfo
+    for _, path := range []string{opt.Source, opt.KeyFile, opt.SourceProgram, opt.TargetProgram, handoff.BindingFile} {
+        info, err := os.Stat(path)
+        if err != nil || !info.Mode().IsRegular() { return fmt.Errorf("UPGRADE_REGULAR_FILE_REQUIRED") }
+        infos = append(infos, info)
+    }
+    for i, a := range infos {
+        for _, b := range infos[i+1:] {
+            if os.SameFile(a, b) { return fmt.Errorf("UPGRADE_FILE_ALIAS") }
+        }
+    }
+    for _, path := range []string{opt.Snapshot, opt.SourceRoot, opt.TargetRoot} {
+        info, err := os.Stat(path)
+        if err != nil || !info.IsDir() { return fmt.Errorf("PREPARED_HANDOFF_DIRECTORY_REQUIRED") }
+    }
+    return nil
+}
+
+func preparedHandoffVerifyBackup(opt LocalUpgradeOptions, key []byte, b preparedBackupHandoffBinding) error {
+    manifest, files, err := readBackup(opt.Snapshot, key)
+    defer func() { for _, raw := range files { clear(raw) } }()
+    if err != nil { return err }
+    if manifest.ID != b.BackupID || Hash(manifest.Migrations) != Hash(upgradeVersions(23)) {
+        return fmt.Errorf("PREPARED_HANDOFF_BACKUP_IDENTITY")
+    }
+    return nil
+}
+
+// Separate public entry point. Its report is not a Native MigrationToken and
+// the receipt filename is intentionally not the original-apply receipt name.
+func UpgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions) (RestoreReport, error) {
+    return upgradePreparedAbandonmentBackup(ctx, handoff, preparedUpgradeConcreteVerifier())
+}
+
+

@@ -1,0 +1,95 @@
+{
+  "schema": "researchos.go-evidence-lossless-recovery-design-review.v1",
+  "actor": "codex:/root/w05_merge_review",
+  "decision": "PARTIAL_DESIGN_REVIEW_NO_EXECUTION_AUTHORITY",
+  "formal": false,
+  "execution_authority": false,
+  "scope": "Read-only source and public trial receipts; no candidate import, Native runtime, database read/write, private admission-state read, provider call, or canonical source edits. Own evidence namespace only.",
+  "go_reader": {
+    "finding": "Raw-pinned host-job evidence contains FILETIME 134359521876434319. execute.go readPinnedObject calls domain.Decode, whose RFC8785 numeric canonical round-trip rejects this exact integer before dispatch.",
+    "source": [
+      "staged-root-69e7c3008fd968419f4d4072c3c8/execute.go:212-258",
+      "internal/domain/contracts.go:35-88",
+      "internal/canonical/jcs.go:8-21"
+    ],
+    "recommendation": "Add a dedicated strict GO-evidence object reader after verifiedBytes. Decode original bytes using encoding/json Decoder.UseNumber, never float64 or canonical JSON conversion. Require exactly one top-level object and EOF; preserve duplicate-key and Unicode rejection with a strict token/validation pass, including nested objects. Preserve raw-byte digest and size pin verification. Use it only for root authority, once evidence, job contract and job probe read by verifyGOEvidence.",
+    "do_not_change": [
+      "domain.Decode, domain.Hash, canonical.JSON or domain object contracts",
+      "sealedProfile canonical decode and profile hashes",
+      "existing integer identity v1 evidence into strings",
+      "old trial receipts, GO once record, whole-trial clocks or failure numbering"
+    ],
+    "required_checks": [
+      "Exact actual FILETIME survives nested decode and identity comparison without rounding",
+      "Reject duplicate keys including escaped-equivalent names and nested duplicates; trailing JSON; non-object top level; malformed Unicode/JSON",
+      "Preserve current schema, actor, deadline, pin, PID and job authority checks",
+      "Where held identity is validated, require positive integral PID and FILETIME in existing integer range, and preserve exact cross-evidence identity binding",
+      "Pure unit checks and raw-pin tamper negative before separately authorized actual Host execution"
+    ],
+    "alternative": "Stringifying FILETIME would require versioned identity and consumers migration: current Python validators demand type int. It is wider than the local GO reader fix."
+  },
+  "recovery": {
+    "status": "PARTIAL_STATIC_REVIEW_EXISTING_INSPECTED_ROUTES_DO_NOT_CLOSE_PREDISPATCH_RUN",
+    "production_state": "Root reports Task RUNNING / Run QUEUED after failed execute GO. This reviewer did not query production SQL or private admission state and does not independently attest those current values.",
+    "verified_routes": [
+      {
+        "source": "internal/domain/runtime.go:212-217",
+        "fact": "cancelRun fences task and enters CANCEL_REQUESTED only; it does not produce terminal cancellation evidence."
+      },
+      {
+        "source": "internal/domain/runtime.go:295-324",
+        "fact": "acknowledgeRunCancellation requires trusted runtimeObservation CANCELLED with children_stopped/queue_empty and immutable runtimeReceipt; reconcileRun also requires observation and receipt and enters RECONCILING."
+      },
+      {
+        "source": "internal/domain/runtime_coordinator_windows.go:935-1021",
+        "fact": "Recover uses durable launch facts, does not StartBridge; absent locator/journal becomes UNKNOWN rather than terminal Run closure."
+      },
+      {
+        "source": "internal/domain/runtime_recovery_windows.go:171-275",
+        "fact": "Terminal recovery consumes trusted durable worker journal and exact current epoch/admission/active-task facts; external Host process cleanup is not worker journal evidence."
+      },
+      {
+        "source": "internal/domain/orchestration_recovery.go:11-55",
+        "fact": "Expired QUEUED/STARTING/RUNNING/CANCEL_REQUESTED runs transition to RECONCILING and retain ownership."
+      },
+      {
+        "source": "internal/domain/durability.go:259-331",
+        "fact": "ResumeCheckpoint requires durable checkpoint and stopped/empty runtime observation, then explicitly rejects qualification_bootstrap."
+      },
+      {
+        "source": "internal/domain/runtime_qualification.go:293-360",
+        "fact": "Qualification admission requires DRAFT task and current immutable plan/profile/root binding; existing RUNNING task cannot be readmitted."
+      },
+      {
+        "source": "migrations/sqlite/0016_runtime_qualification.sql:2-24",
+        "fact": "Runtime binding keyed by project/runtime, plan and qualification run marker keyed by project/task; immutable update triggers and run uniqueness prevent reset/reuse workaround."
+      },
+      {
+        "source": "internal/domain/orchestration.go:390-408",
+        "fact": "Nonterminal Run consumes project concurrency and historical Run count consumes task attempt limit."
+      },
+      {
+        "source": "internal/domain/operations.go:247-259; internal/domain/orchestration.go:181-197; internal/domain/client_protocol_queue_control.go:9-43,169-195,237-254",
+        "fact": "Task/Goal/client cancellation forwards to controlTask; client final cancellation requires already terminal Run and children stopped, queue empty, reconciled effects/queue. This review did not finish tracing controlTask implementation, so conclusion is bounded."
+      }
+    ],
+    "conclusion": "Do not claim current failed trial recovered or create a replacement Run by resetting admission/once/clock/Task state. The inspected APIs provide cancellation intent/reconciliation fencing but no demonstrated terminal pre-dispatch abandonment path without worker journal.",
+    "proposed_followup_not_implemented": [
+      "First consume the independent actual post-failure audit, including exact Run/Task/dispatch tuple, no dispatch start/worker/journal/native identity, ledger/provider/effect counts, and original Root/Host job closure evidence.",
+      "If same project must continue, design and independently review an explicit trusted pre-dispatch abandonment operation. Authenticate owner/root authority; CAS original Run revision, epoch, Task active_run_id and PREPARED dispatch; verify no worker/journal/identity/observation/SDK/provider/effect footprint; atomically retain an immutable abandonment proof and old launch/qualification history while fencing launch against concurrent dispatch.",
+      "Define lawful terminal Run/Task/accounting transitions in contracts and production domain code. Existing dispatch enum allows PREPARED/STARTED/OBSERVED/UNKNOWN only; adding a terminal abandonment state requires an explicit migration/contract decision. Do not fabricate runtimeObservation or cancellation receipt.",
+      "A later explicit Root trial must carry a new immutable lineage and source/binary/input reviews, preserve old failures, once records, and clocks, and pass current admission limits. The existing coordinator's initial Task=1/Run=0 gates do not silently authorize a new trial on this admitted project.",
+      "Fresh project/runtime/task preparation is a separate explicit trial boundary, not recovery of the existing trial, and cannot be used to silently erase or avoid old nonterminal accounting."
+    ]
+  },
+  "limitations": [
+    "Static design review only; production audit not yet consumed",
+    "No implementation or tests executed for the proposed reader or abandonment operation",
+    "No exhaustive proof of absence of all domain recovery routes; controlTask final implementation not inspected in this bounded closeout"
+  ],
+  "failures": [
+    747,
+    748
+  ],
+  "native_provider_sql_execution_count": 0
+}

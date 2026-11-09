@@ -1,0 +1,94 @@
+diff --git a/internal/domain/runtime_model_verification_test.go b/internal/domain/runtime_model_verification_test.go
+index 4f4219ee..e4c6e09d 100644
+--- a/internal/domain/runtime_model_verification_test.go
++++ b/internal/domain/runtime_model_verification_test.go
+@@ -47,7 +47,13 @@ func TestRuntimeMuIndependentQualification(t *testing.T) {
+ }
+ 
+ func TestRuntimeMuVerificationRejectsFabrication(t *testing.T) {
+-	c, route, r, _ := muBrokerFixture(t, nil)
++	tool := func(name string) Object {
++		return Object{"type": "function", "function": Object{"name": name, "parameters": Object{"type": "object"}}}
++	}
++	c, route, r, _ := muBrokerFixtureProgram(t, nil, func(config, _ Object) {
++		config["max_calls"] = 8
++		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
++	})
+ 	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -153,6 +159,74 @@ func TestRuntimeMuVerificationRejectsFabrication(t *testing.T) {
+ 			}
+ 		})
+ 	}
++	for _, mutation := range qualificationProjectionMutations() {
++		t.Run("consumer_matrix/"+mutation.name, func(t *testing.T) {
++			clone := muCloneSnapshot(t, prepared.snapshot)
++			if status, reason := verifyMuTurn(clone); status != "PASS" {
++				t.Fatalf("unmodified verifier snapshot invalid: %s %s", status, reason)
++			}
++			mu := clone["mu_turn"].(map[string]any)
++			dispatch := mu["dispatch"].(map[string]any)
++			manifest := dispatch["manifest"].(map[string]any)
++			dispatch["manifest"] = qualificationProjectionMutant(t, manifest, mutation)
++			if status, reason := verifyMuTurn(clone); status != "FAIL" {
++				t.Fatalf("verifier accepted %s: %s %s", mutation.name, status, reason)
++			}
++		})
++	}
++	// Build a bounded legacy/normal verifier snapshot from the valid local
++	// fixture before acceptance. The original profile remains 8/4; only the
++	// in-memory request facts are rebound to that original configuration.
++	for _, mode := range []string{"legacy", "normal"} {
++		t.Run("original_config_snapshot/"+mode, func(t *testing.T) {
++			clone := muCloneSnapshot(t, prepared.snapshot)
++			mu := clone["mu_turn"].(map[string]any)
++			manifest := mu["dispatch"].(map[string]any)["manifest"].(map[string]any)
++			delete(manifest, "model_execution_projection")
++			profile := mu["profile"].(map[string]any)
++			config := profile["model_config"].(map[string]any)
++			if n, _ := Num(config, "max_calls"); n != 8 || len(Arr(config, "tools")) != 4 {
++				t.Fatal("original 8/4 source profile missing")
++			}
++			if mode == "normal" {
++				clone["task"].(map[string]any)["task_type"] = "mu_turn"
++				admission := manifest["admission"].(map[string]any)
++				admission["qualification_bootstrap"] = false
++				admission["permission"].(map[string]any)["purpose"] = "mu_turn"
++			}
++			effects := Arr(mu, "effects")
++			last := effects[len(effects)-1].(map[string]any)
++			request, _ := Decode(Bytes(last["payload"]))
++			body := request["payload"].(map[string]any)["body"].(map[string]any)
++			body["tools"] = config["tools"]
++			var ledger Object
++			for _, value := range Arr(mu, "ledger") {
++				candidate := value.(map[string]any)
++				if candidate["provider_request_id"] == last["key"] {
++					ledger = candidate
++					break
++				}
++			}
++			if ledger == nil {
++				t.Fatal("UNKNOWN original liability missing")
++			}
++			cost := Object{"policy_id": ledger["policy_id"], "run_id": clone["run"].(map[string]any)["id"], "operation": ledger["operation"], "money": ledger["money"], "provider_request_id": last["key"], "provider_event_id": "prepare/" + Str(last, "key"), "reservation_id": nil, "cost_basis": ledger["cost_basis"], "occurred_at": clone["run"].(map[string]any)["created_at"]}
++			requestHash := Hash([]any{request, cost})
++			for _, value := range effects {
++				effect := value.(map[string]any)
++				effect["payload"] = request
++				effect["request_hash"] = requestHash
++			}
++			if stream, ok := mu["model_stream"].(map[string]any); ok {
++				for _, value := range Arr(stream, "bindings") {
++					value.(map[string]any)["request_hash"] = requestHash
++				}
++			}
++			if status, reason := verifyMuTurn(clone); status != "PASS" {
++				t.Fatalf("synthetic %s original-config snapshot invalid: %s %s", mode, status, reason)
++			}
++		})
++	}
+ 	// An append-only broker fact arriving between prepare/finalize invalidates the
+ 	// entire computation, even when the already loaded artifact did not change.
+ 	tx, err := f.db.Begin()

@@ -1,0 +1,119 @@
+def _public_value(group, name, value):
+    # Closed projection of the three pinned public schemas, not receipt code.
+    _schema_value(PUBLIC_SCHEMAS[group][name], value, group)
+
+
+def _schema_value(schema, value, group, depth=0):
+    if depth > 128:
+        raise ValueError('OPEN_PUBLIC_SCHEMA_DEPTH')
+    if '$ref' in schema:
+        target_group, name = schema['$ref'].split(':', 1)
+        _schema_value(PUBLIC_SCHEMAS[target_group][name], value, target_group, depth+1)
+    if 'type' in schema:
+        expected = {'object': dict, 'array': list, 'string': str, 'integer': int,
+                    'boolean': bool, 'null': type(None)}[schema['type']]
+        if type(value) is not expected:
+            raise ValueError('OPEN_PUBLIC_SCHEMA_TYPE')
+    if 'const' in schema and (type(value) is not type(schema['const']) or value != schema['const']):
+        raise ValueError('OPEN_PUBLIC_SCHEMA_CONST')
+    if 'enum' in schema and not any(type(value) is type(item) and value == item for item in schema['enum']):
+        raise ValueError('OPEN_PUBLIC_SCHEMA_ENUM')
+    if 'anyOf' in schema:
+        matched = False
+        for alternative in schema['anyOf']:
+            try:
+                _schema_value(alternative, value, group, depth+1)
+                matched = True
+                break
+            except ValueError:
+                pass
+        if not matched:
+            raise ValueError('OPEN_PUBLIC_SCHEMA_ANYOF')
+    for child in schema.get('allOf', ()):
+        _schema_value(child, value, group, depth+1)
+    if 'if' in schema:
+        try:
+            _schema_value(schema['if'], value, group, depth+1)
+            applies = True
+        except ValueError:
+            applies = False
+        branch = 'then' if applies else 'else'
+        if branch in schema:
+            _schema_value(schema[branch], value, group, depth+1)
+    if type(value) is dict:
+        props = schema.get('properties', {})
+        if not set(schema.get('required', ())) <= set(value):
+            raise ValueError('OPEN_PUBLIC_SCHEMA_REQUIRED')
+        if schema.get('additionalProperties') is False and not set(value) <= set(props):
+            raise ValueError('OPEN_PUBLIC_SCHEMA_EXTRA')
+        for key in set(value) & set(props):
+            if props[key].get('writeOnly') is True:
+                raise ValueError('OPEN_PUBLIC_WRITE_ONLY')
+            _schema_value(props[key], value[key], group, depth+1)
+    if type(value) is list:
+        if len(value) < schema.get('minItems', 0) or ('maxItems' in schema and len(value) > schema['maxItems']):
+            raise ValueError('OPEN_PUBLIC_SCHEMA_ARRAY_SIZE')
+        for item in value:
+            if 'items' in schema:
+                _schema_value(schema['items'], item, group, depth+1)
+    if type(value) is str:
+        if len(value) < schema.get('minLength', 0) or ('maxLength' in schema and len(value) > schema['maxLength']):
+            raise ValueError('OPEN_PUBLIC_SCHEMA_STRING_SIZE')
+        if 'pattern' in schema and re.search(schema['pattern'], value) is None:
+            raise ValueError('OPEN_PUBLIC_SCHEMA_PATTERN')
+        if schema.get('format') == 'date-time':
+            import datetime
+            if re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})', value) is None:
+                raise ValueError('OPEN_PUBLIC_SCHEMA_DATE_TIME')
+            try:
+                datetime.datetime.fromisoformat(value.upper().replace('Z', '+00:00'))
+            except ValueError:
+                raise ValueError('OPEN_PUBLIC_SCHEMA_DATE_TIME') from None
+    if type(value) is int and 'minimum' in schema and value < schema['minimum']:
+        raise ValueError('OPEN_PUBLIC_SCHEMA_MINIMUM')
+
+
+def _database_row(kind, revision, digest, body, identity, expected_id):
+    _integer(revision, 'database revision')
+    if revision < 1 or revision > 9223372036854775807:
+        raise ValueError('OPEN_DATABASE_REVISION')
+    value = _json_original(body)
+    if type(value) is not dict or kind not in ('Task', 'Run', 'Artifact'):
+        raise ValueError('OPEN_DATABASE_ENTITY')
+    group = 'domain'
+    if kind == 'Task':
+        route = value.get('binding', {}).get('route') if type(value.get('binding')) is dict else None
+        if route in ('MU_FORK', 'PI_COMPOSE', 'GAP_ONLY_COMPOSE'):
+            group = 'persistence'
+        elif route not in ('PAPERCLIP', 'THIN_CORE'):
+            raise ValueError('OPEN_DATABASE_TASK_ROUTE')
+    _public_value(group, kind, value)
+    if value['id'] != expected_id or value['revision'] != revision or value['project_id'] != identity['project_id']:
+        raise ValueError('OPEN_DATABASE_BODY')
+    if kind == 'Artifact':
+        if type(digest) is not str or re.fullmatch(r'sha256:[0-9a-f]{64}', digest) is None or digest != value['content_hash'] or value['run_id'] != identity['run_id']:
+            raise ValueError('OPEN_DATABASE_ARTIFACT_HASH')
+    elif digest is not None:
+        # store.go:221-235 only sets this column for receipt_hash or Artifact.
+        raise ValueError('OPEN_DATABASE_NONHASHED_ENTITY')
+    if kind == 'Task' and value['goal_id'] != identity['goal_id']:
+        raise ValueError('OPEN_DATABASE_TASK_GOAL')
+    if kind == 'Run' and value['task_id'] != identity['task_id']:
+        raise ValueError('OPEN_DATABASE_TASK_RUN')
+    return value
+
+
+def _event_schema(event):
+    _public_value('client', 'SessionEvent', event)
+    sensitive = ('credential_value', 'api_key', 'apikey', 'secret', 'token_value', 'password', 'authorization')
+    pending = [event['payload']]
+    while pending:
+        value = pending.pop()
+        if type(value) is dict:
+            for key, child in value.items():
+                if any(pattern in key.casefold() for pattern in sensitive):
+                    raise ValueError('OPEN_SENSITIVE_EVENT_PAYLOAD')
+                pending.append(child)
+        elif type(value) is list:
+            pending.extend(value)
+

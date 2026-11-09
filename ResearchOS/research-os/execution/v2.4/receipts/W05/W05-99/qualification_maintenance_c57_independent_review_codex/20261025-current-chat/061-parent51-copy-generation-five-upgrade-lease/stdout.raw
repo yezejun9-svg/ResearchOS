@@ -1,0 +1,650 @@
+
+FILE adapters/runtime/data_root_windows.go
+1: //go:build windows
+2: 
+3: package runtime
+4: 
+5: import (
+6: 	"errors"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"strings"
+10: 	"sync"
+11: 	"unsafe"
+12: 
+13: 	"golang.org/x/sys/windows"
+14: 	"researchos.local/research-os/internal/qualificationmaintenancejournal"
+15: )
+16: 
+17: // Copies of DataRootLease share one private owner and OS handle.
+18: type DataRootLease struct{ owner *dataRootLeaseOwner }
+19: 
+20: // DataRootLeaseIdentity is a process-local witness for one live owner
+21: // generation. No caller can construct a matching value from JSON or a path.
+22: type DataRootLeaseIdentity struct {
+23: 	owner      *dataRootLeaseOwner
+24: 	generation uint64
+25: 	root       string
+26: }
+27: 
+28: type dataRootLeaseOwner struct {
+29: 	mu         sync.Mutex
+30: 	root       string
+31: 	file       *os.File
+32: 	closed     bool
+33: 	generation uint64
+34: 	borrowKind dataRootBorrowKind
+35: 	borrow     *dataRootBorrowState
+36: }
+37: 
+38: type dataRootBorrowKind uint8
+39: 
+40: const (
+41: 	noDataRootBorrow dataRootBorrowKind = iota
+42: 	legacyDataRootBorrow
+43: 	maintenanceDataRootBorrow
+44: )
+45: 
+46: type dataRootBorrowState struct {
+47: 	owner      *dataRootLeaseOwner
+48: 	generation uint64
+49: 	kind       dataRootBorrowKind
+50: 	released   bool
+51: 	guards     []dataRootIdentityGuard
+52: }
+53: 
+54: type dataRootFileID struct {
+55: 	volume uint64
+56: 	file   [16]byte
+57: }
+58: type dataRootIdentityGuard struct {
+59: 	path     string
+60: 	handle   windows.Handle
+61: 	identity dataRootFileID
+62: }
+63: 
+64: func dataRootNativeIdentity(h windows.Handle) (dataRootFileID, error) {
+65: 	var raw struct {
+66: 		VolumeSerialNumber uint64
+67: 		FileID             [16]byte
+68: 	}
+69: 	if err := windows.GetFileInformationByHandleEx(h, windows.FileIdInfo, (*byte)(unsafe.Pointer(&raw)), uint32(unsafe.Sizeof(raw))); err != nil {
+70: 		return dataRootFileID{}, err
+71: 	}
+72: 	return dataRootFileID{volume: raw.VolumeSerialNumber, file: raw.FileID}, nil
+73: }
+74: 
+75: func openDataRootGuard(path string, directory bool) (dataRootIdentityGuard, error) {
+76: 	wide, err := windows.UTF16PtrFromString(path)
+77: 	if err != nil {
+78: 		return dataRootIdentityGuard{}, err
+79: 	}
+80: 	h, err := windows.CreateFile(wide, windows.GENERIC_READ,
+81: 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING,
+82: 		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+83: 	if err != nil {
+84: 		return dataRootIdentityGuard{}, err
+85: 	}
+86: 	fail := func(err error) (dataRootIdentityGuard, error) {
+87: 		windows.CloseHandle(h)
+88: 		return dataRootIdentityGuard{}, err
+89: 	}
+90: 	var info windows.ByHandleFileInformation
+91: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+92: 		return fail(err)
+93: 	}
+94: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+95: 		return fail(errors.New("maintenance source reparse or kind mismatch"))
+96: 	}
+97: 	id, err := dataRootNativeIdentity(h)
+98: 	if err != nil {
+99: 		return fail(err)
+100: 	}
+101: 	return dataRootIdentityGuard{path: path, handle: h, identity: id}, nil
+102: }
+103: 
+104: func dataRootGuardPaths(root, database string) []string {
+105: 	var parts []string
+106: 	for p := root; ; p = filepath.Dir(p) {
+107: 		parts = append(parts, p)
+108: 		if filepath.Dir(p) == p {
+109: 			break
+110: 		}
+111: 	}
+112: 	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+113: 		parts[i], parts[j] = parts[j], parts[i]
+114: 	}
+115: 	return append(parts, database)
+116: }
+117: 
+118: func closeDataRootGuards(guards []dataRootIdentityGuard) {
+119: 	for i := len(guards) - 1; i >= 0; i-- {
+120: 		windows.CloseHandle(guards[i].handle)
+121: 	}
+122: }
+123: 
+124: func openDataRootGuards(root, database string) ([]dataRootIdentityGuard, error) {
+125: 	paths := dataRootGuardPaths(root, database)
+126: 	guards := make([]dataRootIdentityGuard, 0, len(paths))
+127: 	for i, path := range paths {
+128: 		g, err := openDataRootGuard(path, i < len(paths)-1)
+129: 		if err != nil {
+130: 			closeDataRootGuards(guards)
+131: 			return nil, err
+132: 		}
+133: 		guards = append(guards, g)
+134: 	}
+135: 	return guards, nil
+136: }
+137: 
+138: func checkDataRootGuards(guards []dataRootIdentityGuard) error {
+139: 	if len(guards) == 0 {
+140: 		return errors.New("maintenance source identity guards missing")
+141: 	}
+142: 	for i, g := range guards {
+143: 		fresh, err := openDataRootGuard(g.path, i < len(guards)-1)
+144: 		if err != nil {
+145: 			return err
+146: 		}
+147: 		id := fresh.identity
+148: 		windows.CloseHandle(fresh.handle)
+149: 		if id != g.identity {
+150: 			return errors.New("maintenance source native identity changed")
+151: 		}
+152: 	}
+153: 	return nil
+154: }
+155: 
+156: // DataRootSourceBorrow is process-local; copies share its consumed state.
+157: type DataRootSourceBorrow struct{ state *dataRootBorrowState }
+158: 
+159: func AcquireDataRootLease(directory string) (*DataRootLease, error) {
+160: 	f, err := LockDataRoot(directory)
+161: 	if err != nil {
+162: 		return nil, err
+163: 	}
+164: 	root, err := filepath.Abs(directory)
+165: 	if err != nil {
+166: 		_ = f.Close()
+167: 		return nil, err
+168: 	}
+169: 	return &DataRootLease{owner: &dataRootLeaseOwner{root: filepath.Clean(root), file: f}}, nil
+170: }
+171: 
+172: func acquireDataRootLeaseForOwnInspection(directory string, permit qualificationmaintenancejournal.InspectionPermit) (*DataRootLease, error) {
+173: 	root, err := filepath.Abs(directory)
+174: 	if err != nil {
+175: 		return nil, err
+176: 	}
+177: 	root = filepath.Clean(root)
+178: 	f, actual, err := lockDataRootRaw(root)
+179: 	if err != nil {
+180: 		return nil, err
+181: 	}
+182: 	if _, err := permit.Check(actual); err != nil {
+183: 		_ = f.Close()
+184: 		return nil, err
+185: 	}
+186: 	return &DataRootLease{owner: &dataRootLeaseOwner{root: actual, file: f}}, nil
+187: }
+188: 
+189: // This lease exposes only a strict read of one existing replacement transition.
+190: // The host recovery path retains all its separate plan and mutation checks.
+191: func AcquireDataRootLeaseForReplacementRecovery(directory, operation, planDigest string, planBytes []byte) (*DataRootLease, error) {
+192: 	root, err := filepath.Abs(directory)
+193: 	if err != nil {
+194: 		return nil, err
+195: 	}
+196: 	permit, _, err := qualificationmaintenancejournal.OpenOwnReplacementInspection(filepath.Clean(root), operation, planDigest, planBytes)
+197: 	if err != nil {
+198: 		return nil, err
+199: 	}
+200: 	return acquireDataRootLeaseForOwnInspection(directory, permit)
+201: }
+202: 
+203: func AcquireDataRootLeaseForQualificationRecovery(directory, operation, planDigest string) (*DataRootLease, error) {
+204: 	root, err := filepath.Abs(directory)
+205: 	if err != nil {
+206: 		return nil, err
+207: 	}
+208: 	permit, _, err := qualificationmaintenancejournal.OpenOwnInspection(filepath.Clean(root), qualificationmaintenancejournal.QualificationNamespace, operation, planDigest)
+209: 	if err != nil {
+210: 		return nil, err
+211: 	}
+212: 	return acquireDataRootLeaseForOwnInspection(directory, permit)
+213: }
+214: 
+215: func (l *DataRootLease) Root() string {
+216: 	if l == nil || l.owner == nil {
+217: 		return ""
+218: 	}
+219: 	o := l.owner
+220: 	o.mu.Lock()
+221: 	defer o.mu.Unlock()
+222: 	if o.closed {
+223: 		return ""
+224: 	}
+225: 	return o.root
+226: }
+227: 
+228: func (o *dataRootLeaseOwner) heldLocked() bool {
+229: 	if o.closed || o.file == nil {
+230: 		return false
+231: 	}
+232: 	_, err := o.file.Stat()
+233: 	return err == nil
+234: }
+235: 
+236: func (l *DataRootLease) Held() bool {
+237: 	if l == nil || l.owner == nil {
+238: 		return false
+239: 	}
+240: 	o := l.owner
+241: 	o.mu.Lock()
+242: 	defer o.mu.Unlock()
+243: 	return o.heldLocked()
+244: }
+245: 
+246: func (l *DataRootLease) MaintenanceIdentity() (DataRootLeaseIdentity, error) {
+247: 	if l == nil || l.owner == nil {
+248: 		return DataRootLeaseIdentity{}, errors.New("control data-root lease required")
+249: 	}
+250: 	o := l.owner
+251: 	o.mu.Lock()
+252: 	defer o.mu.Unlock()
+253: 	if !o.heldLocked() || o.root == "" {
+254: 		return DataRootLeaseIdentity{}, errors.New("control data-root lease unavailable")
+255: 	}
+256: 	return DataRootLeaseIdentity{owner: o, generation: o.generation, root: o.root}, nil
+257: }
+258: 
+259: func (w DataRootLeaseIdentity) Matches(l *DataRootLease) error {
+260: 	if w.owner == nil || l == nil || l.owner == nil || l.owner != w.owner {
+261: 		return errors.New("control data-root lease identity mismatch")
+262: 	}
+263: 	o := l.owner
+264: 	o.mu.Lock()
+265: 	defer o.mu.Unlock()
+266: 	if !o.heldLocked() || o.generation != w.generation || o.root != w.root {
+267: 		return errors.New("control data-root lease generation changed")
+268: 	}
+269: 	return nil
+270: }
+271: 
+272: func (l *DataRootLease) reserve(directory string, kind dataRootBorrowKind) (*dataRootBorrowState, error) {
+273: 	if l == nil || l.owner == nil {
+274: 		return nil, errors.New("control data-root lease required")
+275: 	}
+276: 	root, err := filepath.Abs(directory)
+277: 	if err != nil {
+278: 		return nil, err
+279: 	}
+280: 	o := l.owner
+281: 	o.mu.Lock()
+282: 	defer o.mu.Unlock()
+283: 	if !o.heldLocked() || !strings.EqualFold(filepath.Clean(root), o.root) {
+284: 		return nil, errors.New("control data-root lease unavailable or mismatched")
+285: 	}
+286: 	if o.borrowKind != noDataRootBorrow {
+287: 		return nil, errors.New("control data-root lease already borrowed")
+288: 	}
+289: 	o.generation++
+290: 	b := &dataRootBorrowState{owner: o, generation: o.generation, kind: kind}
+291: 	o.borrow, o.borrowKind = b, kind
+292: 	return b, nil
+293: }
+294: 
+295: // Borrow is reserved for the in-process runtime coordinator.
+296: func (l *DataRootLease) Borrow(directory string) error {
+297: 	_, err := l.reserve(directory, legacyDataRootBorrow)
+298: 	return err
+299: }
+300: 
+301: func (l *DataRootLease) ReturnBorrow() error {
+302: 	if l == nil || l.owner == nil {
+303: 		return errors.New("control data-root lease required")
+304: 	}
+305: 	o := l.owner
+306: 	o.mu.Lock()
+307: 	defer o.mu.Unlock()
+308: 	if o.closed || o.borrowKind != legacyDataRootBorrow || o.borrow == nil || o.borrow.released {
+309: 		return errors.New("control data-root legacy borrow not active")
+310: 	}
+311: 	o.borrow.released = true
+312: 	o.borrow, o.borrowKind = nil, noDataRootBorrow
+313: 	return nil
+314: }
+315: 
+316: func (l *DataRootLease) Close() error {
+317: 	if l == nil || l.owner == nil {
+318: 		return errors.New("control data-root lease required")
+319: 	}
+320: 	o := l.owner
+321: 	o.mu.Lock()
+322: 	defer o.mu.Unlock()
+323: 	if o.closed {
+324: 		return nil
+325: 	}
+326: 	if o.borrowKind != noDataRootBorrow {
+327: 		return errors.New("control data-root lease still borrowed")
+328: 	}
+329: 	o.closed = true
+330: 	if o.file == nil {
+331: 		return errors.New("control data-root lease file missing")
+332: 	}
+333: 	return o.file.Close()
+334: }
+335: 
+336: // CheckMaintenanceReady is read-only and requires the same live OS lock used
+337: // by normal Core. A checked path alone never creates a maintenance borrow.
+338: func (l *DataRootLease) CheckMaintenanceReady(database string) error {
+339: 	if l == nil || l.owner == nil || !l.Held() {
+340: 		return errors.New("maintenance data-root lease required")
+341: 	}
+342: 	root := l.Root()
+343: 	if root == "" || !filepath.IsAbs(database) || filepath.Clean(database) != database ||
+344: 		!strings.EqualFold(database, filepath.Join(root, "researchos.sqlite")) {
+345: 		return errors.New("maintenance database path mismatch")
+346: 	}
+347: 	guards, err := openDataRootGuards(root, database)
+348: 	if err != nil {
+349: 		return err
+350: 	}
+351: 	defer closeDataRootGuards(guards)
+352: 	if err := checkDataRootGuards(guards); err != nil {
+353: 		return err
+354: 	}
+355: 	return qualificationmaintenancejournal.CheckOrdinary(root)
+356: }
+357: 
+358: func (l *DataRootLease) BorrowMaintenanceSource(database string) (*DataRootSourceBorrow, error) {
+359: 	if err := l.CheckMaintenanceReady(database); err != nil {
+360: 		return nil, err
+361: 	}
+362: 	root := l.Root()
+363: 	guards, err := openDataRootGuards(root, database)
+364: 	if err != nil {
+365: 		return nil, err
+366: 	}
+367: 	if err := checkDataRootGuards(guards); err != nil {
+368: 		closeDataRootGuards(guards)
+369: 		return nil, err
+370: 	}
+371: 	if err := qualificationmaintenancejournal.CheckOrdinary(root); err != nil {
+372: 		closeDataRootGuards(guards)
+373: 		return nil, err
+374: 	}
+375: 	state, err := l.reserve(root, maintenanceDataRootBorrow)
+376: 	if err != nil {
+377: 		closeDataRootGuards(guards)
+378: 		return nil, err
+379: 	}
+380: 	state.guards = guards
+381: 	return &DataRootSourceBorrow{state: state}, nil
+382: }
+383: 
+384: func (b *DataRootSourceBorrow) Check(database string) error {
+385: 	if b == nil || b.state == nil {
+386: 		return errors.New("maintenance source borrow required")
+387: 	}
+388: 	s := b.state
+389: 	o := s.owner
+390: 	if o == nil {
+391: 		return errors.New("maintenance source borrow owner missing")
+392: 	}
+393: 	o.mu.Lock()
+394: 	defer o.mu.Unlock()
+395: 	if s.released || s.kind != maintenanceDataRootBorrow || !o.heldLocked() || o.borrow != s || o.generation != s.generation || o.borrowKind != maintenanceDataRootBorrow {
+396: 		return errors.New("maintenance source borrow stale")
+397: 	}
+398: 	if !strings.EqualFold(filepath.Clean(database), filepath.Join(o.root, "researchos.sqlite")) {
+399: 		return errors.New("maintenance database identity mismatch")
+400: 	}
+401: 	return checkDataRootGuards(s.guards)
+402: }
+403: 
+404: func (b *DataRootSourceBorrow) Release() error {
+405: 	if b == nil || b.state == nil {
+406: 		return errors.New("maintenance source borrow required")
+407: 	}
+408: 	s := b.state
+409: 	o := s.owner
+410: 	if o == nil {
+411: 		return errors.New("maintenance source borrow owner missing")
+412: 	}
+413: 	o.mu.Lock()
+414: 	defer o.mu.Unlock()
+415: 	if s.released || s.kind != maintenanceDataRootBorrow || o.borrow != s || o.generation != s.generation || o.borrowKind != maintenanceDataRootBorrow {
+416: 		return errors.New("maintenance source borrow stale")
+417: 	}
+418: 	s.released = true
+419: 	closeDataRootGuards(s.guards)
+420: 	s.guards = nil
+421: 	o.borrow, o.borrowKind = nil, noDataRootBorrow
+422: 	return nil
+423: }
+
+FILE internal/domain/backup_source_lease_windows.go
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"context"
+7: 	"fmt"
+8: 	"path/filepath"
+9: 	"strings"
+10: 
+11: 	"researchos.local/research-os/adapters/protectedstore"
+12: 	runtimeadapter "researchos.local/research-os/adapters/runtime"
+13: )
+14: 
+15: type backupSourceLease struct {
+16: 	borrow       *runtimeadapter.DataRootSourceBorrow
+17: 	root, source string
+18: }
+19: 
+20: func (l *backupSourceLease) Check(root, source string) error {
+21: 	if l == nil || l.borrow == nil || !strings.EqualFold(l.root, root) ||
+22: 		!strings.EqualFold(l.source, source) || !strings.EqualFold(filepath.Dir(source), root) {
+23: 		return fmt.Errorf("UPGRADE_SOURCE_LEASE_IDENTITY")
+24: 	}
+25: 	return l.borrow.Check(source)
+26: }
+27: 
+28: func checkedBackupSource(opt *LocalUpgradeOptions, lease *runtimeadapter.DataRootLease) (*backupSourceLease, error) {
+29: 	if lease == nil {
+30: 		return nil, fmt.Errorf("UPGRADE_SOURCE_LEASE_REQUIRED")
+31: 	}
+32: 	source, err := upgradePath(opt.Source, true)
+33: 	if err != nil {
+34: 		return nil, err
+35: 	}
+36: 	opt.Source = source
+37: 	root := filepath.Dir(source)
+38: 	borrow, err := lease.BorrowMaintenanceSource(source)
+39: 	if err != nil {
+40: 		return nil, err
+41: 	}
+42: 	guard := &backupSourceLease{borrow: borrow, root: root, source: source}
+43: 	if err := guard.Check(root, source); err != nil {
+44: 		_ = borrow.Release()
+45: 		return nil, err
+46: 	}
+47: 	opt.sourceLease = guard
+48: 	return guard, nil
+49: }
+50: 
+51: func concreteUpgradeVerifier() upgradeVerifier {
+52: 	return upgradeVerifier{
+53: 		provider: &protectedstore.FrozenProvider{},
+54: 		summary: func(ctx context.Context) (protectedstore.SafeSummary, error) {
+55: 			if err := ctx.Err(); err != nil {
+56: 				return protectedstore.SafeSummary{}, err
+57: 			}
+58: 			return protectedstore.QueryFrozenService("aggregate")
+59: 		},
+60: 	}
+61: }
+62: 
+63: func UpgradeLocalUnderSourceLease(ctx context.Context, opt LocalUpgradeOptions, lease *runtimeadapter.DataRootLease) (report RestoreReport, err error) {
+64: 	report = RestoreReport{Status: "FAILED"}
+65: 	switch opt.Plan {
+66: 	case LocalUpgradePlan, FinalSchemaUpgradePlan, QueueSchemaUpgradePlan,
+67: 		ConfigurationSchemaUpgradePlan, PreparedAbandonmentSchemaUpgradePlan:
+68: 	default:
+69: 		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+70: 	}
+71: 	guard, err := checkedBackupSource(&opt, lease)
+72: 	if err != nil {
+73: 		return report, err
+74: 	}
+75: 	defer func() {
+76: 		if releaseErr := guard.borrow.Release(); err == nil && releaseErr != nil {
+77: 			err = releaseErr
+78: 		}
+79: 	}()
+80: 	return upgradeLocal(ctx, opt, concreteUpgradeVerifier())
+81: }
+82: 
+83: func UpgradePreparedAbandonmentBackupUnderSourceLease(ctx context.Context, handoff PreparedBackupHandoffOptions, lease *runtimeadapter.DataRootLease) (report RestoreReport, err error) {
+84: 	report = RestoreReport{Status: "FAILED"}
+85: 	if handoff.Upgrade.Plan != PreparedAbandonmentSchemaUpgradePlan {
+86: 		return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED")
+87: 	}
+88: 	guard, err := checkedBackupSource(&handoff.Upgrade, lease)
+89: 	if err != nil {
+90: 		return report, err
+91: 	}
+92: 	defer func() {
+93: 		if releaseErr := guard.borrow.Release(); err == nil && releaseErr != nil {
+94: 			err = releaseErr
+95: 		}
+96: 	}()
+97: 	return upgradePreparedAbandonmentBackup(ctx, handoff, preparedUpgradeConcreteVerifier())
+98: }
+99: 
+100: // Package-private fixture driver. Production callers supply their own held
+101: // outer lease to the typed adapter; this helper is used by historical tests.
+102: func runGuardedUpgradeFixture(ctx context.Context, opt LocalUpgradeOptions) (report RestoreReport, err error) {
+103: 	lease, err := runtimeadapter.AcquireDataRootLease(filepath.Dir(opt.Source))
+104: 	if err != nil {
+105: 		return RestoreReport{Status: "FAILED"}, err
+106: 	}
+107: 	defer func() {
+108: 		if closeErr := lease.Close(); err == nil && closeErr != nil {
+109: 			err = closeErr
+110: 		}
+111: 	}()
+112: 	return UpgradeLocalUnderSourceLease(ctx, opt, lease)
+113: }
+
+FILE internal/domain/backup_source_lease_windows_test.go
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"context"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"testing"
+10: 
+11: 	rt "researchos.local/research-os/adapters/runtime"
+12: )
+13: 
+14: func TestBackupSourceLeaseSurvivesNormalizedAllPlanDispatch(t *testing.T) {
+15: 	base := t.TempDir()
+16: 	root := filepath.Join(base, "data")
+17: 	if err := os.Mkdir(root, 0700); err != nil {
+18: 		t.Fatal(err)
+19: 	}
+20: 	source := filepath.Join(root, "researchos.sqlite")
+21: 	if err := os.WriteFile(source, []byte("disposable source"), 0600); err != nil {
+22: 		t.Fatal(err)
+23: 	}
+24: 	lease, err := rt.AcquireDataRootLease(root)
+25: 	if err != nil {
+26: 		t.Fatal(err)
+27: 	}
+28: 	defer lease.Close()
+29: 	for _, plan := range []string{LocalUpgradePlan, FinalSchemaUpgradePlan, QueueSchemaUpgradePlan,
+30: 		ConfigurationSchemaUpgradePlan, PreparedAbandonmentSchemaUpgradePlan} {
+31: 		t.Run(plan, func(t *testing.T) {
+32: 			// Each typed plan borrows the same exact native source before the
+33: 			// downstream release/key inputs are inspected.
+34: 			opt := LocalUpgradeOptions{Plan: plan, Source: root + `\.\researchos.sqlite`}
+35: 			if _, err := UpgradeLocalUnderSourceLease(context.Background(), opt, lease); err == nil {
+36: 				t.Fatal("incomplete upgrade unexpectedly succeeded")
+37: 			}
+38: 			if !lease.Held() {
+39: 				t.Fatal("inner upgrade released outer data-root owner")
+40: 			}
+41: 			guard, err := checkedBackupSource(&opt, lease)
+42: 			if err != nil {
+43: 				t.Fatal(err)
+44: 			}
+45: 			if err := guard.Check(root, source); err != nil {
+46: 				t.Fatal(err)
+47: 			}
+48: 			if err := os.Rename(source, source+".moved"); err == nil {
+49: 				t.Fatal("borrow allowed source identity replacement")
+50: 			}
+51: 			if err := lease.Close(); err == nil {
+52: 				t.Fatal("outer owner closed during source borrow")
+53: 			}
+54: 			if err := guard.borrow.Release(); err != nil {
+55: 				t.Fatal(err)
+56: 			}
+57: 			if !lease.Held() {
+58: 				t.Fatal("borrow release closed outer owner")
+59: 			}
+60: 		})
+61: 	}
+62: }
+63: 
+64: func TestBackupSourceLeaseNormalizedPathAndRootGuard(t *testing.T) {
+65: 	base := t.TempDir()
+66: 	root := filepath.Join(base, "data")
+67: 	for _, dir := range []string{root, filepath.Join(base, "key"), filepath.Join(base, "source-program"), filepath.Join(base, "target-program"), filepath.Join(base, "source-release"), filepath.Join(base, "target-release")} {
+68: 		if err := os.Mkdir(dir, 0700); err != nil {
+69: 			t.Fatal(err)
+70: 		}
+71: 	}
+72: 	file := func(path string) string {
+73: 		t.Helper()
+74: 		if err := os.WriteFile(path, []byte("disposable"), 0600); err != nil {
+75: 			t.Fatal(err)
+76: 		}
+77: 		return path
+78: 	}
+79: 	source := file(filepath.Join(root, "researchos.sqlite"))
+80: 	opt := LocalUpgradeOptions{Source: root + `\.\researchos.sqlite`,
+81: 		KeyFile:    file(filepath.Join(base, "key", "key.bin")),
+82: 		SourceRoot: filepath.Join(base, "source-release"), TargetRoot: filepath.Join(base, "target-release"),
+83: 		SourceProgram: file(filepath.Join(base, "source-program", "old.exe")),
+84: 		TargetProgram: file(filepath.Join(base, "target-program", "new.exe")),
+85: 		Snapshot:      filepath.Join(base, "snapshot"), Destination: filepath.Join(base, "destination")}
+86: 	lease, err := rt.AcquireDataRootLease(root)
+87: 	if err != nil {
+88: 		t.Fatal(err)
+89: 	}
+90: 	defer lease.Close()
+91: 	guard, err := checkedBackupSource(&opt, lease)
+92: 	if err != nil {
+93: 		t.Fatal(err)
+94: 	}
+95: 	defer guard.borrow.Release()
+96: 	if err := upgradePaths(&opt); err != nil || opt.Source != source {
+97: 		t.Fatalf("normalized guarded source: %q %v", opt.Source, err)
+98: 	}
+99: 	other := filepath.Join(base, "other")
+100: 	if err := os.Mkdir(other, 0700); err != nil {
+101: 		t.Fatal(err)
+102: 	}
+103: 	opt.Source = file(filepath.Join(other, "researchos.sqlite"))
+104: 	if err := upgradePaths(&opt); err == nil {
+105: 		t.Fatal("common normalized upgradePaths admitted a different source")
+106: 	}
+107: }
+108: 

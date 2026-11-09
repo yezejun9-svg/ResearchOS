@@ -1,0 +1,109 @@
+{"source_freeze_sha256": "c6ac8745f27d91a7d74aa804acdc05f3a50932b0d414a91f63daefe75c00c113", "patch_sha256": "7da9b434521f14857766b4d502738fbdff0aadcb1e780228b26d0020c85213d4", "source_digest": "8c32c66c6e5b330ea997d33f7737dbd8028d8c14ba0d12d87fd010d79d546e9c", "changed_since_r2": ["apps/desktop/launch-development.mjs", "tests/ui/desktop/development-launcher.test.mjs"], "seven": {"apps/desktop/build-development.py": {"sha256": "f571ef6b73b8e7e2ce94113c6749b0aac0a5e1851f59dc7fbb2eafd213690032", "bytes": 27035}, "apps/desktop/launch-development.mjs": {"sha256": "88c0e22de2fee6ac4530cf78c4f3c9aff25eacf4801a17fbaec18db4e2f2f7b1", "bytes": 16009}, "apps/desktop/main/main.js": {"sha256": "47427f3077db80432f0fbce3d5e25b354469be427024447101de680eb216b3ac", "bytes": 29349}, "docs/installation/desktop-development.md": {"sha256": "d58c3842e922abe2b480779853119203029b5809816f9fd761044269bd4d6a6b", "bytes": 4174}, "tests/ui/desktop/development-bundle.test.py": {"sha256": "bba9ab6a2433891636aca0e2993f071b9893cb0f965e6ff479165011d2147b86", "bytes": 5902}, "tests/ui/desktop/development-launcher.test.mjs": {"sha256": "29d84df297badce1744049d5a76106c9994fb9854c26c89e484fe2bbbd32f569", "bytes": 11512}, "tests/ui/desktop/development-smoke.test.mjs": {"sha256": "a8c39fd780f29623fda064f941e937681f0263bdadba025e85eaed93308ff068", "bytes": 3733}}, "delta_sha256": "1a7790306d3dc3b42676fe1a2fa1a230496138b21f0310af10d1cfa3d8cff657"}
+--- r2/apps/desktop/launch-development.mjs
++++ r3/apps/desktop/launch-development.mjs
+@@ -5,6 +5,7 @@
+ import path from 'node:path';
+ import crypto from 'node:crypto';
+ import { spawn } from 'node:child_process';
++import { StringDecoder } from 'node:string_decoder';
+ import { fileURLToPath } from 'node:url';
+ 
+ export const MANIFEST_SCHEMA = 'researchos.desktop-development-tree/1';
+@@ -199,7 +200,7 @@
+   const ready = reports.filter(row => row?.event === 'ready_to_show');
+   const shutdown = reports.filter(row => row?.event === 'shutdown_confirmed');
+   if (exitCode !== 0 || ready.length !== 1 || shutdown.length !== 1 ||
+-      reports.some(row => ['boot_failed', 'shutdown_unconfirmed'].includes(row?.event)))
++      reports.some(row => ['boot_failed', 'shutdown_unconfirmed', 'malformed_report'].includes(row?.event)))
+     throw refusal('SMOKE_OUTCOME_UNCONFIRMED');
+   const a = ready[0], b = shutdown[0];
+   if (reports.indexOf(b) <= reports.indexOf(a) || a.management_state !== 'READY' ||
+@@ -209,7 +210,8 @@
+       !validIdentity(a.owned_core_identity) || b.process_exit_confirmed !== true ||
+       JSON.stringify(b.owned_core_identity) !== JSON.stringify(a.owned_core_identity))
+     throw refusal('SMOKE_OUTCOME_UNCONFIRMED');
+-  return { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: a.owned_core_identity };
++  return { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: a.owned_core_identity,
++    renderer_title: a.renderer.mounted_title };
+ }
+ 
+ export function prepareDevelopmentLaunch({ bundle, state, smoke = false, ambient = process.env }) {
+@@ -236,11 +238,12 @@
+     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+   const reports = [];
+   let pending = '', bytes = 0;
++  const decoder = new StringDecoder('utf8');
+   child.stdout.on('data', part => {
+     process.stdout.write(part);
+     bytes += part.length;
+     if (bytes > 1 << 20) return;
+-    pending += part.toString('utf8');
++    pending += decoder.write(part);
+     for (;;) {
+       const end = pending.indexOf('\n');
+       if (end < 0) break;
+@@ -257,6 +260,10 @@
+     child.once('close', (exit, signal) => signal ? reject(refusal('DESKTOP_SIGNALLED')) : resolve(exit));
+   });
+   if (bytes > 1 << 20) throw refusal('SMOKE_REPORT_TOO_LARGE');
++  pending += decoder.end();
++  // console.log always terminates a report line. A truncated UTF-8 sequence
++  // or unterminated final line cannot establish a shutdown confirmation.
++  if (prepared.smoke && pending.length) throw refusal('SMOKE_REPORT_TRAILING_FRAGMENT');
+   if (prepared.smoke) return validateSmokeReports(reports, code);
+   return { status: code === 0 ? 'DEVELOPMENT_EXITED' : 'DEVELOPMENT_FAILED', exit_code: code };
+ }
+--- r2/tests/ui/desktop/development-launcher.test.mjs
++++ r3/tests/ui/desktop/development-launcher.test.mjs
+@@ -143,10 +143,10 @@
+     const { bundle, state } = fixture(root);
+     const owned = { pid: 121, created_ns: '1792057406096619100', image_sha256: 'a'.repeat(64), host_id: 'host-aaaaaaaaaaaa' };
+     const ready = { event: 'ready_to_show', management_state: 'READY', host_health: 'UP',
+-      native_probe: { ok: true }, renderer: { bridge: true, react_root: true, mounted_title: 'ResearchOS', navigation: 3 },
++      native_probe: { ok: true }, renderer: { bridge: true, react_root: true, mounted_title: '研究工作台', navigation: 3 },
+       owned_core_identity: owned };
+     const stopped = { event: 'shutdown_confirmed', process_exit_confirmed: true, owned_core_identity: owned };
+-    assert.deepEqual(validateSmokeReports([ready, stopped], 0), { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: owned });
++    assert.deepEqual(validateSmokeReports([ready, stopped], 0), { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: owned, renderer_title: '研究工作台' });
+     assert.throws(() => validateSmokeReports([ready, { ...stopped, owned_core_identity: { ...owned, created_ns: '1' } }], 0), /SMOKE_OUTCOME_UNCONFIRMED/);
+     assert.throws(() => validateSmokeReports([{ ...ready, native_probe: null }, stopped], 0), /SMOKE_OUTCOME_UNCONFIRMED/);
+     assert.throws(() => validateSmokeReports([ready, stopped], 2), /SMOKE_OUTCOME_UNCONFIRMED/);
+@@ -155,16 +155,35 @@
+       observed = { exe, argv, opts };
+       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+       process.nextTick(() => {
+-        child.stdout.emit('data', Buffer.from('ROS_DESKTOP_REPORT ' + JSON.stringify(ready) + '\n' +
+-          'ROS_DESKTOP_REPORT ' + JSON.stringify(stopped) + '\n'));
++        const transcript = Buffer.from('ROS_DESKTOP_REPORT ' + JSON.stringify(ready) + '\n' +
++          'ROS_DESKTOP_REPORT ' + JSON.stringify(stopped) + '\n');
++        const chinese = transcript.indexOf(Buffer.from('研'));
++        assert.ok(chinese >= 0);
++        child.stdout.emit('data', transcript.subarray(0, chinese + 1));
++        child.stdout.emit('data', transcript.subarray(chinese + 1));
+         child.emit('close', 0, null);
+       });
+       return child;
+     };
+     const result = await executeDevelopmentLaunch({ bundle, state, ambient: { SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, smoke: true }, mockSpawn);
+     assert.equal(result.status, 'NATIVE_SMOKE_CONFIRMED');
++    assert.equal(result.renderer_title, '研究工作台');
+     assert.ok(fs.statSync(path.join(state, 'data')).isDirectory());
+     assert.equal(observed.exe, path.join(bundle, 'runtime/electron/electron.exe'));
+     assert.equal(observed.opts.env.RESEARCHOS_CLI_DISCOVERY, path.join(state, 'discovery.json'));
++    const spawnWith = bytes => () => {
++      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
++      process.nextTick(() => { child.stdout.emit('data', bytes); child.emit('close', 0, null); });
++      return child;
++    };
++    const readyLine = 'ROS_DESKTOP_REPORT ' + JSON.stringify(ready) + '\n';
++    const stoppedLine = 'ROS_DESKTOP_REPORT ' + JSON.stringify(stopped);
++    await assert.rejects(executeDevelopmentLaunch({ bundle, state: path.join(root, 'no-newline-state'),
++      ambient: { SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, smoke: true },
++      spawnWith(Buffer.from(readyLine + stoppedLine))), /SMOKE_REPORT_TRAILING_FRAGMENT/);
++    await assert.rejects(executeDevelopmentLaunch({ bundle, state: path.join(root, 'incomplete-utf8-state'),
++      ambient: { SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, smoke: true },
++      spawnWith(Buffer.concat([Buffer.from(readyLine + stoppedLine + '\n'), Buffer.from([0xe7])]))),
++      /SMOKE_REPORT_TRAILING_FRAGMENT/);
+   } finally { removeFixture(root); }
+ });
+

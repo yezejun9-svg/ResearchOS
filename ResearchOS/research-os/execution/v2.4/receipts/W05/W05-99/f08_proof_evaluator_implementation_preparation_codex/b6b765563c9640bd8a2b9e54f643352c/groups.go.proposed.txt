@@ -1,0 +1,123 @@
+// Same future domain/client_cancel_finalization.go; receipt fragment only.
+const f08Format="researchos.cancel-finalization/1"
+const f08Unwired=f08Error("F08_CALLER_CONTRACT_UNBOUND")
+const f08NativeProofGap=f08Error("F08_NATIVE_PROOF_IMPLEMENTATION_INCOMPLETE")
+
+type f08Group struct {
+	phase string
+	row []any
+	root map[string]any
+	members []any
+	pins []any
+	rootHash,groupHash string
+}
+func f08Hash(value any)(string,error){return f08ValueHash(value)}
+func f08JSONHex(value any)(any,[]byte,error){b,e:=f08Hex(value);if e!=nil{return nil,nil,e};x,_,e:=f08Strict(b);return x,b,e}
+func f08ValidateTuple(category string,row []any)error{
+	_,e:=f08DecodeSources([]any{[]any{category,row}});return e
+}
+func f08RootReference(phase,hash string)map[string]any{return map[string]any{"phase":phase,"task_id":nil,"content_hash":hash}}
+func f08MemberReference(phase,id,hash string)map[string]any{return map[string]any{"phase":phase,"task_id":id,"content_hash":hash}}
+
+// Recompute every group hash and its exact materialization shape. This does
+// not itself authorize the admission or finalization represented by the group.
+func f08ParseGroup(category string,row []any)(*f08Group,error){
+	if category!="admitted" && category!="final"{return nil,f08Mode}
+	if e:=f08ValidateTuple(category,row);e!=nil{return nil,e}
+	docIndex,rootIndex,groupIndex:=8,6,7;phase:="ADMITTED"
+	if category=="final"{docIndex,rootIndex,groupIndex=7,5,6;phase="FINALIZED"}
+	document,_,e:=f08RawObject(row[docIndex]);if e!=nil{return nil,e}
+	if _,e=f08Object(document,"root","members","pins");e!=nil{return nil,e}
+	root,ok:=document["root"].(map[string]any);if !ok{return nil,f08Shape}
+	if category=="admitted" {
+		_,e=f08Object(root,"format","phase","principal","project","command_id","method","operation","key","request_hash","client_id","session_binding","target_binding","private_header_digest","member_task_ids","member_count")
+	} else {
+		_,e=f08Object(root,"format","phase","admitted_root_ref","principal","project","command_id","request_hash","control_request_id","completion_mode","original_response_digest","final_response_digest","final_snapshot_binding","member_count")
+	}
+	if e!=nil{return nil,e}
+	if root["format"]!=f08Format || root["phase"]!=phase{return nil,f08Binding}
+	for i,key:=range []string{"principal","project","command_id","request_hash"}{if root[key]!=row[i]{return nil,f08Binding}}
+	rootHash,e:=f08Hash(root);if e!=nil || rootHash!=row[rootIndex]{return nil,f08Binding}
+	members,e:=f08Array(document["members"]);if e!=nil || len(members)==0{return nil,f08Shape}
+	count,e:=f08Integer(root["member_count"],1);if e!=nil || count!=int64(len(members)){return nil,f08Binding}
+	pins,e:=f08Array(document["pins"]);if e!=nil{return nil,e}
+	var digests []any;last:=""
+	for _,item:=range members{
+		member,ok:=item.(map[string]any);if !ok{return nil,f08Shape}
+		refKey:="task_ref"
+		if phase=="ADMITTED"{
+			_,e=f08Object(member,"format","phase","admitted_root_ref","task_ref","goal_ref","run_ref","runtime_binding","dispatch_stage","dispatch_origin_ref","queue_admission","reference_closure")
+			if !f08Equal(member["admitted_root_ref"],f08RootReference(phase,rootHash)){return nil,f08Binding}
+		} else {
+			refKey="task_admitted_ref"
+			_,e=f08Object(member,"format","phase","admitted_member_ref","proof_kind","task_admitted_ref","run_admitted_ref","run_before_settlement_ref","run_final_ref","task_final_ref","dispatch_origin_ref","dispatch_final_binding","queue_final_binding","effect_closure","observation_ref","native_artifact_refs","sdk_receipt_refs","run_event_ref","task_event_ref","reference_closure","prior_epoch_closure","prelaunch_checkpoint_carry")
+		}
+		if e!=nil || member["format"]!=f08Format || member["phase"]!=phase{return nil,f08Shape}
+		ref,e:=f08Object(member[refKey],"entity_type","id","revision","content_hash");if e!=nil || ref["entity_type"]!="Task"{return nil,f08Shape}
+		id,e:=f08String(ref["id"]);if e!=nil || id<=last{return nil,f08Binding};last=id
+		h,e:=f08Hash(member);if e!=nil{return nil,e};digests=append(digests,map[string]any{"task_id":id,"member_hash":h})
+	}
+	groupHash,e:=f08Hash(digests);if e!=nil || groupHash!=row[groupIndex]{return nil,f08Binding}
+	if phase=="ADMITTED"{
+		ids,e:=f08Array(root["member_task_ids"]);if e!=nil || len(ids)!=len(members){return nil,f08Binding}
+		for i,d:=range digests{if ids[i]!=d.(map[string]any)["task_id"]{return nil,f08Binding}}
+		if root["method"]!="session.control" || root["operation"]!="v2:session.control" || root["key"]!=row[2] || row[4]!=root["operation"]{return nil,f08Binding}
+	} else if !f08Equal(root["admitted_root_ref"],f08RootReference("ADMITTED",row[4].(string))) {return nil,f08Binding}
+	var lastPin []any
+	for _,item:=range pins{
+		pin,e:=f08Object(item,"project","kind","id","revision","content_hash");if e!=nil{return nil,e}
+		p,ok:=pin["project"].(string);if !ok{return nil,f08Shape}
+		kind,e:=f08String(pin["kind"]);if e!=nil{return nil,e};id,e:=f08String(pin["id"]);if e!=nil{return nil,e}
+		if _,e=f08Integer(pin["revision"],1);e!=nil{return nil,e}
+		if pin["content_hash"]!=nil{if _,e=f08HashString(pin["content_hash"]);e!=nil{return nil,e}}
+		key:=[]any{p,kind,id,pin["revision"],pin["content_hash"]}
+		if lastPin!=nil && !f08TupleLess(lastPin,key){return nil,f08Binding};lastPin=key
+	}
+	return &f08Group{phase,row,root,members,pins,rootHash,groupHash},nil
+}
+func f08FindGroup(s *f08Sources,category string,locator []any)(*f08Group,error){
+	r,e:=s.one(category,[]int{0,1,2,3},locator);if e!=nil{return nil,e};return f08ParseGroup(category,r)
+}
+
+func (v *f08ProofValidator) materialization(s *f08Sources,action string,row []any)error{
+	if action=="pin.insert"{
+		if e:=f08ValidateTuple("pins",row);e!=nil{return e};category:="admitted"
+		if row[4]=="FINALIZED"{category="final"}else if row[4]!="ADMITTED"{return f08Shape}
+		parent,e:=f08FindGroup(s,category,row[:4]);if e!=nil{return e}
+		want:=map[string]any{"project":row[5],"kind":row[6],"id":row[7],"revision":row[8],"content_hash":row[9]}
+		matches:=0;for _,pin:=range parent.pins{if f08Equal(pin,want){matches++}}
+		if matches!=1{return f08Binding}
+		_,e=v.version(s,row[5].(string),map[string]any{"entity_type":row[6],"id":row[7],"revision":row[8],"content_hash":row[9]});return e
+	}
+	category,child:="admitted","admitted_members";if action=="final_member.insert"{category,child="final","final_members"}else if action!="admitted_member.insert"{return f08Mode}
+	if e:=f08ValidateTuple(child,row);e!=nil{return e};parent,e:=f08FindGroup(s,category,row[:4]);if e!=nil{return e}
+	index,e:=f08Integer(row[5],0);if e!=nil || index>=int64(len(parent.members)){return f08Binding}
+	want:=parent.members[index].(map[string]any);actual,_,e:=f08RawObject(row[8]);if e!=nil || !f08Equal(actual,want){return f08Binding}
+	h,e:=f08Hash(actual);if e!=nil || h!=row[7]{return f08Binding}
+	key:="task_ref";if category=="final"{key="task_admitted_ref"}
+	if actual[key].(map[string]any)["id"]!=row[4]{return f08Binding}
+	if category=="admitted" {if row[6]!=parent.rootHash{return f08Binding}} else {
+		admitted,e:=f08FindGroup(s,"admitted",row[:4]);if e!=nil || index>=int64(len(admitted.members)){return f08Binding}
+		original:=admitted.members[index].(map[string]any);h,e:=f08Hash(original);if e!=nil || h!=row[6]{return f08Binding}
+		if !f08Equal(actual["admitted_member_ref"],f08MemberReference("ADMITTED",row[4].(string),h)){return f08Binding}
+	}
+	return nil
+}
+func (v *f08ProofValidator) completeMaterializations(s *f08Sources,g *f08Group)error{
+	category,action:="admitted_members","admitted_member.insert";if g.phase=="FINALIZED"{category,action="final_members","final_member.insert"}
+	rows:=s.selectRows(category,[]int{0,1,2,3},g.row[:4]);if len(rows)!=len(g.members){return f08Binding}
+	for _,row:=range rows{if e:=v.materialization(s,action,row);e!=nil{return e}}
+	pins:=s.selectRows("pins",[]int{0,1,2,3,4},append(append([]any(nil),g.row[:4]...),g.phase))
+	if len(pins)!=len(g.pins){return f08Binding};for _,row:=range pins{if e:=v.materialization(s,"pin.insert",row);e!=nil{return e}}
+	return nil
+}
+
+func f08Pins(anchors []any)[]any{
+	result:=make([]any,0,len(anchors));for _,item:=range anchors{
+		a:=item.(map[string]any);r:=a["version_ref"].(map[string]any)
+		result=append(result,map[string]any{"project":a["project"],"kind":r["entity_type"],"id":r["id"],"revision":r["revision"],"content_hash":r["content_hash"]})
+	};return result
+}
+func f08SameVersion(a,b f08Version)bool{return a.project==b.project && f08Equal(a.ref(),b.ref()) && bytes.Equal(a.raw,b.raw)}
+func f08EmptyArray(v any)bool{a,ok:=v.([]any);return ok && len(a)==0}
+func f08NullFields(m map[string]any,keys ...string)bool{for _,key:=range keys{if m[key]!=nil{return false}};return true}

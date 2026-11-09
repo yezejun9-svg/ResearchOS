@@ -1,0 +1,931 @@
+1: //go:build windows
+2: 
+3: package recoveryboundary
+4: 
+5: import (
+6: 	"context"
+7: 	"crypto/sha256"
+8: 	"encoding/hex"
+9: 	"encoding/json"
+10: 	"errors"
+11: 	"fmt"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"sort"
+15: 	"strings"
+16: 	"sync"
+17: 	"time"
+18: 	"unsafe"
+19: 
+20: 	"golang.org/x/sys/windows"
+21: 	"golang.org/x/sys/windows/registry"
+22: 	rt "researchos.local/research-os/adapters/runtime"
+23: 	"researchos.local/research-os/internal/qualificationmaintenancejournal"
+24: )
+25: 
+26: type nativeHold struct {
+27: 	path     string
+28: 	handle   windows.Handle
+29: 	identity FileIdentity
+30: }
+31: type quiescenceOwner struct {
+32: 	mu     sync.Mutex
+33: 	closed bool
+34: 	lease  rt.DataRootLeaseIdentity
+35: 	plan   EntryFencePlan
+36: 	post   BootWitness
+37: 	holds  []nativeHold
+38: }
+39: 
+40: // CurrentQuiescence has no public constructor or serializable authority.
+41: // Value copies share one owner; Close consumes every copy's held native state.
+42: type CurrentQuiescence struct{ owner *quiescenceOwner }
+43: 
+44: type boundaryRecord struct {
+45: 	Plan       EntryFencePlan  `json:"plan"`
+46: 	Pre        BootWitness     `json:"pre"`
+47: 	Post       BootWitness     `json:"post"`
+48: 	Events     []BoundaryEvent `json:"events"`
+49: 	Generation uint64          `json:"generation"`
+50: }
+51: 
+52: func nativeFileID(h windows.Handle) (uint64, string, error) {
+53: 	var x struct {
+54: 		VolumeSerialNumber uint64
+55: 		FileID             [16]byte
+56: 	}
+57: 	if err := windows.GetFileInformationByHandleEx(h, windows.FileIdInfo, (*byte)(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x))); err != nil {
+58: 		return 0, "", err
+59: 	}
+60: 	return x.VolumeSerialNumber, hex.EncodeToString(x.FileID[:]), nil
+61: }
+62: 
+63: func finalPath(h windows.Handle) (string, error) {
+64: 	buf := make([]uint16, 512)
+65: 	for len(buf) <= 32768 {
+66: 		n, e := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+67: 		if e != nil {
+68: 			return "", e
+69: 		}
+70: 		if n == 0 {
+71: 			return "", errors.New("empty final path")
+72: 		}
+73: 		if int(n) < len(buf) {
+74: 			return windows.UTF16ToString(buf[:n]), nil
+75: 		}
+76: 		buf = make([]uint16, int(n)+1)
+77: 	}
+78: 	return "", errors.New("final path exceeds Windows bound")
+79: }
+80: 
+81: func openNative(path string, directory bool, hashFile bool) (nativeHold, error) {
+82: 	return openNativeAccess(path, directory, hashFile, 0)
+83: }
+84: 
+85: func openNativeAccess(path string, directory bool, hashFile bool, extraAccess uint32) (nativeHold, error) {
+86: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+87: 		return nativeHold{}, errors.New("native path is not canonical absolute")
+88: 	}
+89: 	if strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
+90: 		return nativeHold{}, errors.New("alternate data stream forbidden")
+91: 	}
+92: 	w, e := windows.UTF16PtrFromString(path)
+93: 	if e != nil {
+94: 		return nativeHold{}, e
+95: 	}
+96: 	// No FILE_SHARE_DELETE: the live owner pins every opened component against
+97: 	// rename/delete until the caller's actual outer transaction has returned.
+98: 	h, e := windows.CreateFile(w, windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES|windows.FILE_READ_DATA|extraAccess,
+99: 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING,
+100: 		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+101: 	if e != nil {
+102: 		return nativeHold{}, e
+103: 	}
+104: 	fail := func(e error) (nativeHold, error) { windows.CloseHandle(h); return nativeHold{}, e }
+105: 	var info windows.ByHandleFileInformation
+106: 	if e = windows.GetFileInformationByHandle(h, &info); e != nil {
+107: 		return fail(e)
+108: 	}
+109: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+110: 		return fail(errors.New("reparse point or file kind mismatch"))
+111: 	}
+112: 	if !directory && info.NumberOfLinks != 1 {
+113: 		return fail(errors.New("hard-linked boundary file forbidden"))
+114: 	}
+115: 	v, id, e := nativeFileID(h)
+116: 	if e != nil {
+117: 		return fail(e)
+118: 	}
+119: 	final, e := finalPath(h)
+120: 	if e != nil {
+121: 		return fail(e)
+122: 	}
+123: 	sd, e := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+124: 	if e != nil {
+125: 		return fail(e)
+126: 	}
+127: 	x := FileIdentity{Path: path, FinalUTF16: final, Volume: v, FileID: id, SecurityDescriptor: sd.String(), Directory: directory}
+128: 	if hashFile {
+129: 		if directory {
+130: 			return fail(errors.New("cannot hash directory"))
+131: 		}
+132: 		s := sha256.New()
+133: 		var total int64
+134: 		buf := make([]byte, 64<<10)
+135: 		for {
+136: 			var n uint32
+137: 			e = windows.ReadFile(h, buf, &n, nil)
+138: 			if e != nil {
+139: 				return fail(e)
+140: 			}
+141: 			if n == 0 {
+142: 				break
+143: 			}
+144: 			total += int64(n)
+145: 			if total > 128<<20 {
+146: 				return fail(errors.New("hash input exceeds bound"))
+147: 			}
+148: 			_, _ = s.Write(buf[:n])
+149: 		}
+150: 		x.SHA256 = hex.EncodeToString(s.Sum(nil))
+151: 	}
+152: 	return nativeHold{path: path, handle: h, identity: x}, nil
+153: }
+154: 
+155: func closeHolds(holds []nativeHold) error {
+156: 	var out error
+157: 	for i := len(holds) - 1; i >= 0; i-- {
+158: 		out = errors.Join(out, windows.CloseHandle(holds[i].handle))
+159: 	}
+160: 	return out
+161: }
+162: 
+163: func identityEqual(a, b FileIdentity) bool {
+164: 	return strings.EqualFold(a.Path, b.Path) && strings.EqualFold(a.FinalUTF16, b.FinalUTF16) && a.Volume == b.Volume && a.FileID == b.FileID && a.SHA256 == b.SHA256 && a.SecurityDescriptor == b.SecurityDescriptor && a.Directory == b.Directory
+165: }
+166: func identityCoreEqual(a, b FileIdentity) bool {
+167: 	a.SecurityDescriptor = ""
+168: 	b.SecurityDescriptor = ""
+169: 	return identityEqual(a, b)
+170: }
+171: 
+172: func pathAncestors(path string) []string {
+173: 	var xs []string
+174: 	for p := filepath.Dir(path); ; p = filepath.Dir(p) {
+175: 		xs = append(xs, p)
+176: 		if filepath.Dir(p) == p {
+177: 			break
+178: 		}
+179: 	}
+180: 	for i, j := 0, len(xs)-1; i < j; i, j = i+1, j-1 {
+181: 		xs[i], xs[j] = xs[j], xs[i]
+182: 	}
+183: 	return xs
+184: }
+185: 
+186: func openPlanHolds(p EntryFencePlan) ([]nativeHold, error) {
+187: 	all := []FileIdentity{p.DataRoot, p.Database, p.Helper}
+188: 	all = append(all, p.Ancestors...)
+189: 	for _, t := range p.Targets {
+190: 		all = append(all, t.File)
+191: 	}
+192: 	want := map[string]FileIdentity{}
+193: 	for _, x := range all {
+194: 		want[strings.ToLower(x.Path)] = x
+195: 	}
+196: 	for _, x := range all {
+197: 		for _, a := range pathAncestors(x.Path) {
+198: 			if _, ok := want[strings.ToLower(a)]; !ok {
+199: 				return nil, fmt.Errorf("ancestor absent from frozen inventory: %s", a)
+200: 			}
+201: 		}
+202: 	}
+203: 	keys := make([]string, 0, len(want))
+204: 	for k := range want {
+205: 		keys = append(keys, k)
+206: 	}
+207: 	sort.Strings(keys)
+208: 	var holds []nativeHold
+209: 	for _, k := range keys {
+210: 		x := want[k]
+211: 		h, e := openNative(x.Path, x.Directory, !x.Directory)
+212: 		if e != nil {
+213: 			closeHolds(holds)
+214: 			return nil, fmt.Errorf("open boundary identity %s: %w", x.Path, e)
+215: 		}
+216: 		matches := identityEqual(x, h.identity)
+217: 		if !matches {
+218: 			for _, target := range p.Targets {
+219: 				if strings.EqualFold(target.File.Path, x.Path) && identityCoreEqual(x, h.identity) && target.InstalledSD == h.identity.SecurityDescriptor {
+220: 					matches = true
+221: 					break
+222: 				}
+223: 			}
+224: 		}
+225: 		if !matches {
+226: 			windows.CloseHandle(h.handle)
+227: 			closeHolds(holds)
+228: 			return nil, fmt.Errorf("boundary identity drift: %s", x.Path)
+229: 		}
+230: 		holds = append(holds, h)
+231: 	}
+232: 	return holds, nil
+233: }
+234: 
+235: func checkHolds(holds []nativeHold) error {
+236: 	if len(holds) == 0 {
+237: 		return errors.New("native boundary holds missing")
+238: 	}
+239: 	for _, h := range holds {
+240: 		fresh, e := openNative(h.path, h.identity.Directory, !h.identity.Directory)
+241: 		if e != nil {
+242: 			return e
+243: 		}
+244: 		same := identityEqual(h.identity, fresh.identity)
+245: 		if e = windows.CloseHandle(fresh.handle); e != nil {
+246: 			return e
+247: 		}
+248: 		if !same {
+249: 			return fmt.Errorf("native boundary identity changed: %s", h.path)
+250: 		}
+251: 	}
+252: 	return nil
+253: }
+254: 
+255: func registryRestartApps(businessSID string) (uint32, error) {
+256: 	if _, e := windows.StringToSid(businessSID); e != nil {
+257: 		return 0, e
+258: 	}
+259: 	k, e := registry.OpenKey(registry.USERS, businessSID+`\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`, registry.QUERY_VALUE)
+260: 	if e != nil {
+261: 		return 0, e
+262: 	}
+263: 	defer k.Close()
+264: 	v, _, e := k.GetIntegerValue("RestartApps")
+265: 	if e != nil || v > 1 {
+266: 		return 0, errors.New("RestartApps registry state unavailable")
+267: 	}
+268: 	return uint32(v), nil
+269: }
+270: 
+271: var getTick = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetTickCount64")
+272: var ntSystem = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQuerySystemInformation")
+273: var getApplicationRestartSettings = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetApplicationRestartSettings")
+274: 
+275: func restartSettingsForProcess(h windows.Handle) (string, uint32, bool, error) {
+276: 	var size, flags uint32
+277: 	r, _, _ := getApplicationRestartSettings.Call(uintptr(h), 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&flags)))
+278: 	if uint32(r) == 0x80070490 {
+279: 		return "", 0, false, nil
+280: 	} // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+281: 	if uint32(r) != 0 || size == 0 || size > 1025 {
+282: 		return "", 0, false, fmt.Errorf("restart registration size/status invalid: %#x/%d", uint32(r), size)
+283: 	}
+284: 	buf := make([]uint16, size)
+285: 	r, _, _ = getApplicationRestartSettings.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&flags)))
+286: 	if uint32(r) != 0 || size == 0 || size > uint32(len(buf)) || flags&^uint32(0xf) != 0 {
+287: 		return "", 0, false, fmt.Errorf("restart registration read/status invalid: %#x/%d/%#x", uint32(r), size, flags)
+288: 	}
+289: 	return windows.UTF16ToString(buf[:size]), flags, true, nil
+290: }
+291: 
+292: func bootClock() (uint64, time.Time, error) {
+293: 	u, _, e := getTick.Call()
+294: 	if e != windows.ERROR_SUCCESS && e != nil {
+295: 		return 0, time.Time{}, e
+296: 	}
+297: 	var x struct {
+298: 		BootTime          int64
+299: 		CurrentTime       int64
+300: 		TimeZoneBias      int64
+301: 		CurrentTimeZoneID uint32
+302: 		Reserved          uint32
+303: 		BootTimeBias      uint64
+304: 		SleepTimeBias     uint64
+305: 	}
+306: 	r, _, e := ntSystem.Call(3, uintptr(unsafe.Pointer(&x)), unsafe.Sizeof(x), 0)
+307: 	if r != 0 {
+308: 		return 0, time.Time{}, fmt.Errorf("NtQuerySystemInformation status %#x: %v", r, e)
+309: 	}
+310: 	if x.BootTime <= 0 {
+311: 		return 0, time.Time{}, errors.New("native boot time unavailable")
+312: 	}
+313: 	return uint64(u), time.Unix(0, (x.BootTime-116444736000000000)*100).UTC(), nil
+314: }
+315: 
+316: func witness(p EntryFencePlan, fenceHash string) (BootWitness, error) {
+317: 	u, b, e := bootClock()
+318: 	if e != nil {
+319: 		return BootWitness{}, e
+320: 	}
+321: 	r, e := registryRestartApps(p.BusinessSID)
+322: 	if e != nil {
+323: 		return BootWitness{}, e
+324: 	}
+325: 	return BootWitness{Schema: WitnessSchema, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, HelperSHA256: p.Helper.SHA256, UTC: time.Now().UTC(), UptimeMilliseconds: u, LastBootUTC: b, RestartApps: r, FenceSHA256: fenceHash}, nil
+326: }
+327: 
+328: func stateRoot(p EntryFencePlan) (string, error) {
+329: 	base := os.Getenv("ProgramData")
+330: 	if base == "" || !filepath.IsAbs(base) {
+331: 		return "", errors.New("ProgramData unavailable")
+332: 	}
+333: 	if !validOperation(p.OperationID) {
+334: 		return "", errors.New("operation invalid")
+335: 	}
+336: 	h := digest([]byte(strings.ToLower(p.DataRoot.FinalUTF16) + "\x00" + p.DataRoot.FileID))
+337: 	return filepath.Join(base, "ResearchOS", "RecoveryBoundary", h, p.OperationID), nil
+338: }
+339: 
+340: func readRecord(p EntryFencePlan) (boundaryRecord, error) {
+341: 	var r boundaryRecord
+342: 	dir, e := stateRoot(p)
+343: 	if e != nil {
+344: 		return r, e
+345: 	}
+346: 	// The operation directory and every record must be independently protected.
+347: 	if e = checkManagedChain(p); e != nil {
+348: 		return r, e
+349: 	}
+350: 	entries, e := os.ReadDir(dir)
+351: 	if e != nil {
+352: 		return r, e
+353: 	}
+354: 	if len(entries) < 2 || len(entries) > 24 {
+355: 		return r, errors.New("boundary state inventory invalid")
+356: 	}
+357: 	for _, entry := range entries {
+358: 		if entry.IsDir() || (entry.Name() != "plan.json" && entry.Name() != "pre.json" && entry.Name() != "post.json" && entry.Name() != "full-restart-complete.json" && entry.Name() != "source-accepted.json" && entry.Name() != "native-accepted.json" && entry.Name() != "backup-verified.json" && entry.Name() != "recovery-ready.json" && !strings.HasPrefix(entry.Name(), "event-")) {
+359: 			return r, errors.New("unknown boundary state entry")
+360: 		}
+361: 	}
+362: 	raw, e := os.ReadFile(filepath.Join(dir, "plan.json"))
+363: 	if e != nil || len(raw) > 256<<10 {
+364: 		return r, errors.New("boundary plan file unavailable")
+365: 	}
+366: 	if e = json.Unmarshal(raw, &r.Plan); e != nil {
+367: 		return r, e
+368: 	}
+369: 	if r.Plan.OperationID != p.OperationID || r.Plan.PlanSHA256 != p.PlanSHA256 {
+370: 		return r, errors.New("boundary record plan mismatch")
+371: 	}
+372: 	pre, e := os.ReadFile(filepath.Join(dir, "pre.json"))
+373: 	if e != nil || len(pre) > 16<<10 {
+374: 		return r, errors.New("boundary pre witness unavailable")
+375: 	}
+376: 	if e = json.Unmarshal(pre, &r.Pre); e != nil {
+377: 		return r, e
+378: 	}
+379: 	post, e := os.ReadFile(filepath.Join(dir, "post.json"))
+380: 	if e == nil {
+381: 		if len(post) > 16<<10 {
+382: 			return r, errors.New("boundary post witness oversized")
+383: 		}
+384: 		if e = json.Unmarshal(post, &r.Post); e != nil {
+385: 			return r, e
+386: 		}
+387: 	} else if !errors.Is(e, os.ErrNotExist) {
+388: 		return r, e
+389: 	}
+390: 	for i := 1; i <= 16; i++ {
+391: 		name := fmt.Sprintf("event-%02d.json", i)
+392: 		raw, e := os.ReadFile(filepath.Join(dir, name))
+393: 		if errors.Is(e, os.ErrNotExist) {
+394: 			break
+395: 		}
+396: 		if e != nil || len(raw) > 16<<10 {
+397: 			return r, errors.New("boundary event missing or oversized")
+398: 		}
+399: 		var ev BoundaryEvent
+400: 		if e = json.Unmarshal(raw, &ev); e != nil {
+401: 			return r, e
+402: 		}
+403: 		r.Events = append(r.Events, ev)
+404: 	}
+405: 	if e = ValidateEvents(r.Events, p.OperationID, p.PlanSHA256); e != nil {
+406: 		return r, e
+407: 	}
+408: 	fullRestartRaw, fullRestartErr := os.ReadFile(filepath.Join(dir, "full-restart-complete.json"))
+409: 	if fullRestartErr != nil && !errors.Is(fullRestartErr, os.ErrNotExist) {
+410: 		return r, fullRestartErr
+411: 	}
+412: 	if !r.Post.UTC.IsZero() && (fullRestartErr != nil || digest(fullRestartRaw) != r.Post.FullRestartEvidenceSHA256) {
+413: 		return r, errors.New("FullRestart evidence drift")
+414: 	}
+415: 	if len(entries) != 6+len(r.Events)+boolInt(!r.Post.UTC.IsZero())+boolInt(fullRestartErr == nil) {
+416: 		return r, errors.New("boundary event inventory gap")
+417: 	}
+418: 	return r, nil
+419: }
+420: func boolInt(b bool) int {
+421: 	if b {
+422: 		return 1
+423: 	}
+424: 	return 0
+425: }
+426: 
+427: func checkManagedDirectory(path, sid string) error {
+428: 	h, e := openNative(path, true, false)
+429: 	if e != nil {
+430: 		return e
+431: 	}
+432: 	defer windows.CloseHandle(h.handle)
+433: 	sd, e := windows.GetSecurityInfo(h.handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+434: 	if e != nil {
+435: 		return e
+436: 	}
+437: 	return checkManagedDescriptor(sd, sid)
+438: }
+439: 
+440: func checkManagedDescriptor(sd *windows.SECURITY_DESCRIPTOR, sid string) error {
+441: 	if sd == nil {
+442: 		return errors.New("management descriptor missing")
+443: 	}
+444: 	owner, _, e := sd.Owner()
+445: 	if e != nil || owner == nil || owner.String() != sid {
+446: 		return errors.New("boundary management owner mismatch")
+447: 	}
+448: 	control, _, e := sd.Control()
+449: 	if e != nil || control&windows.SE_DACL_PROTECTED == 0 {
+450: 		return errors.New("boundary state DACL not protected")
+451: 	}
+452: 	acl, _, e := sd.DACL()
+453: 	if e != nil || acl == nil || acl.AceCount < 1 || acl.AceCount > 2 {
+454: 		return errors.New("boundary state DACL inventory invalid")
+455: 	}
+456: 	managerFull := false
+457: 	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+458: 		var ace *windows.ACCESS_ALLOWED_ACE
+459: 		if e = windows.GetAce(acl, i, &ace); e != nil {
+460: 			return e
+461: 		}
+462: 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+463: 			return errors.New("boundary state ACE type forbidden")
+464: 		}
+465: 		trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+466: 		if trustee != sid && trustee != "S-1-5-18" {
+467: 			return errors.New("boundary state nonmanagement ACE forbidden")
+468: 		}
+469: 		if trustee == sid && uint32(ace.Mask)&0x001f01ff == 0x001f01ff {
+470: 			managerFull = true
+471: 		} // FILE_ALL_ACCESS
+472: 	}
+473: 	if !managerFull {
+474: 		return errors.New("boundary state manager full access absent")
+475: 	}
+476: 	return nil
+477: }
+478: 
+479: func checkManagedChain(p EntryFencePlan) error {
+480: 	dir, e := stateRoot(p)
+481: 	if e != nil {
+482: 		return e
+483: 	}
+484: 	base := os.Getenv("ProgramData")
+485: 	for _, path := range pathAncestors(dir) {
+486: 		if strings.EqualFold(path, base) {
+487: 			continue
+488: 		}
+489: 		if strings.HasPrefix(strings.ToLower(path), strings.ToLower(base)+string(filepath.Separator)) {
+490: 			if e = checkManagedDirectory(path, p.ManagementSID); e != nil {
+491: 				return e
+492: 			}
+493: 		}
+494: 	}
+495: 	return checkManagedDirectory(dir, p.ManagementSID)
+496: }
+497: 
+498: func checkCurrentBoot(post BootWitness, businessSID string) error {
+499: 	u, b, e := bootClock()
+500: 	if e != nil {
+501: 		return e
+502: 	}
+503: 	if b.Before(post.LastBootUTC.Add(-2*time.Second)) || b.After(post.LastBootUTC.Add(2*time.Second)) || u < post.UptimeMilliseconds {
+504: 		return errors.New("current boot differs from post witness")
+505: 	}
+506: 	if time.Since(post.UTC) < 0 || time.Since(post.UTC) > MaxElapsed {
+507: 		return errors.New("post witness expired")
+508: 	}
+509: 	r, e := registryRestartApps(businessSID)
+510: 	if e != nil {
+511: 		return e
+512: 	}
+513: 	if r != post.RestartApps {
+514: 		return errors.New("RestartApps state changed")
+515: 	}
+516: 	return nil
+517: }
+518: 
+519: func checkPreCurrent(pre BootWitness, businessSID string) error {
+520: 	u, b, e := bootClock()
+521: 	if e != nil {
+522: 		return e
+523: 	}
+524: 	if b.Before(pre.LastBootUTC.Add(-2*time.Second)) || b.After(pre.LastBootUTC.Add(2*time.Second)) || u < pre.UptimeMilliseconds {
+525: 		return errors.New("pre witness boot changed before arm")
+526: 	}
+527: 	if time.Since(pre.UTC) < 0 || time.Since(pre.UTC) > MaxElapsed {
+528: 		return errors.New("pre witness expired before arm")
+529: 	}
+530: 	r, e := registryRestartApps(businessSID)
+531: 	if e != nil {
+532: 		return e
+533: 	}
+534: 	if r != pre.RestartApps {
+535: 		return errors.New("RestartApps changed before arm")
+536: 	}
+537: 	return nil
+538: }
+539: 
+540: func checkFence(p EntryFencePlan, holds []nativeHold) error {
+541: 	byPath := map[string]FileIdentity{}
+542: 	for _, h := range holds {
+543: 		byPath[strings.ToLower(h.path)] = h.identity
+544: 	}
+545: 	for _, t := range p.Targets {
+546: 		x, ok := byPath[strings.ToLower(t.File.Path)]
+547: 		if !ok || !identityCoreEqual(x, t.File) || t.InstalledSD == "" || x.SecurityDescriptor != t.InstalledSD {
+548: 			return errors.New("fence target readback mismatch")
+549: 		}
+550: 		expected, e := denyDescriptor(t.File.SecurityDescriptor, p.BusinessSID, p.ManagementSID, t.Mode)
+551: 		if e != nil || expected != x.SecurityDescriptor {
+552: 			return errors.New("business SID exact deny descriptor absent")
+553: 		}
+554: 	}
+555: 	return nil
+556: }
+557: 
+1014: func preflightManagementRestore(p EntryFencePlan) error {
+1015: 	for _, t := range p.Targets {
+1016: 		h, e := openNativeAccess(t.File.Path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
+1017: 		if e != nil {
+1018: 			return fmt.Errorf("management cannot open target for reversible ACL operation: %w", e)
+1019: 		}
+1020: 		matched := identityEqual(h.identity, t.File)
+1021: 		closeErr := windows.CloseHandle(h.handle)
+1022: 		if closeErr != nil {
+1023: 			return closeErr
+1024: 		}
+1025: 		if !matched {
+1026: 			return errors.New("management ACL preflight target identity drift")
+1027: 		}
+1028: 	}
+1029: 	return nil
+1030: }
+1031: 
+1032: func denyDescriptor(original, sidText, managementSID, mode string) (string, error) {
+1033: 	sid, e := windows.StringToSid(sidText)
+1034: 	if e != nil {
+1035: 		return "", e
+1036: 	}
+1037: 	sd, e := windows.SecurityDescriptorFromString(original)
+1038: 	if e != nil {
+1039: 		return "", e
+1040: 	}
+1041: 	old, _, e := sd.DACL()
+1042: 	if e != nil {
+1043: 		return "", e
+1044: 	}
+1045: 	mask := windows.ACCESS_MASK(windows.FILE_EXECUTE)
+1046: 	if mode == "script" {
+1047: 		mask = windows.ACCESS_MASK(windows.FILE_READ_DATA)
+1048: 	} else if mode != "executable" {
+1049: 		return "", errors.New("unknown target mode")
+1050: 	}
+1051: 	if managementSID != sidText {
+1052: 		mask |= windows.ACCESS_MASK(windows.WRITE_DAC | windows.WRITE_OWNER | windows.DELETE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA)
+1053: 	}
+1054: 	ace := windows.EXPLICIT_ACCESS{AccessPermissions: mask, AccessMode: windows.DENY_ACCESS, Inheritance: windows.NO_INHERITANCE,
+1055: 		Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(sid)}}
+1056: 	entries := []windows.EXPLICIT_ACCESS{ace}
+1057: 	if managementSID != sidText {
+1058: 		manager, e := windows.StringToSid(managementSID)
+1059: 		if e != nil {
+1060: 			return "", e
+1061: 		}
+1062: 		entries = append(entries, windows.EXPLICIT_ACCESS{AccessPermissions: windows.ACCESS_MASK(windows.FILE_READ_DATA | windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL | windows.WRITE_DAC | windows.WRITE_OWNER), AccessMode: windows.GRANT_ACCESS, Inheritance: windows.NO_INHERITANCE,
+1063: 			Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(manager)}})
+1064: 	}
+1065: 	acl, e := windows.ACLFromEntries(entries, old)
+1066: 	if e != nil {
+1067: 		return "", e
+1068: 	}
+1069: 	// Protecting a DACL makes formerly inherited ACEs explicit on the object.
+1070: 	// Normalize the planned descriptor to the native readback representation.
+1071: 	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+1072: 		var item *windows.ACCESS_ALLOWED_ACE
+1073: 		if e = windows.GetAce(acl, i, &item); e != nil {
+1074: 			return "", e
+1075: 		}
+1076: 		item.Header.AceFlags &^= windows.INHERITED_ACE
+1077: 	}
+1078: 	abs, e := sd.ToAbsolute()
+1079: 	if e != nil {
+1080: 		return "", e
+1081: 	}
+1082: 	if managementSID != sidText {
+1083: 		manager, e := windows.StringToSid(managementSID)
+1084: 		if e != nil {
+1085: 			return "", e
+1086: 		}
+1087: 		if e = abs.SetOwner(manager, false); e != nil {
+1088: 			return "", e
+1089: 		}
+1090: 	}
+1091: 	if e = abs.SetDACL(acl, true, false); e != nil {
+1092: 		return "", e
+1093: 	}
+1094: 	if e = abs.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); e != nil {
+1095: 		return "", e
+1096: 	}
+1097: 	installed, e := abs.ToSelfRelative()
+1098: 	if e != nil {
+1099: 		return "", e
+1100: 	}
+1101: 	return installed.String(), nil
+1102: }
+1103: 
+1104: // OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
+1105: // retains native no-delete holds through the caller's actual outer transaction.
+1106: func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+1107: 	if e := ctx.Err(); e != nil {
+1108: 		return nil, e
+1109: 	}
+1110: 	if held == nil || !held.Held() || held.Root() != dataRoot || database != filepath.Join(dataRoot, "researchos.sqlite") || !validOperation(operationID) || !validDigest(planSHA256) {
+1111: 		return nil, errors.New("current quiescence held lease or binding invalid")
+1112: 	}
+1113: 	lease, e := held.MaintenanceIdentity()
+1114: 	if e != nil {
+1115: 		return nil, e
+1116: 	}
+1117: 	// Discovery is by fixed ProgramData inventory. We never accept a path from
+1118: 	// a caller or a JSON supplied capability.
+1119: 	p, e := discoverPlan(dataRoot, operationID, planSHA256)
+1120: 	if e != nil {
+1121: 		return nil, e
+1122: 	}
+1123: 	if e = ValidatePlan(p); e != nil {
+1124: 		return nil, e
+1125: 	}
+1126: 	if e = managedToken(p); e != nil {
+1127: 		return nil, e
+1128: 	}
+1129: 	if p.DataRoot.Path != dataRoot || p.Database.Path != database {
+1130: 		return nil, errors.New("current quiescence source mismatch")
+1131: 	}
+1132: 	holds, e := openPlanHolds(p)
+1133: 	if e != nil {
+1134: 		return nil, e
+1135: 	}
+1136: 	fail := func(e error) (*CurrentQuiescence, error) { return nil, errors.Join(e, closeHolds(holds)) }
+1137: 	r, e := readRecord(p)
+1138: 	if e != nil {
+1139: 		return fail(e)
+1140: 	}
+1141: 	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
+1142: 		return fail(errors.New("boundary not boot observed"))
+1143: 	}
+1144: 	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1145: 		return fail(e)
+1146: 	}
+1147: 	if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
+1148: 		return fail(e)
+1149: 	}
+1150: 	if e = checkNoOfficialProcess(p); e != nil {
+1151: 		return fail(e)
+1152: 	}
+1153: 	if e = checkFence(p, holds); e != nil {
+1154: 		return fail(e)
+1155: 	}
+1156: 	if e = checkAncestorControl(p, holds); e != nil {
+1157: 		return fail(e)
+1158: 	}
+1159: 	if e = checkHolds(holds); e != nil {
+1160: 		return fail(e)
+1161: 	}
+1162: 	if e = lease.Matches(held); e != nil {
+1163: 		return fail(e)
+1164: 	}
+1165: 	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
+1166: 	return q, nil
+1167: }
+1168: 
+1169: func discoverPlan(root, operation, sha string) (EntryFencePlan, error) {
+1170: 	var p EntryFencePlan
+1171: 	base := os.Getenv("ProgramData")
+1172: 	if base == "" {
+1173: 		return p, errors.New("ProgramData unavailable")
+1174: 	}
+1175: 	parent := filepath.Join(base, "ResearchOS", "RecoveryBoundary")
+1176: 	entries, e := os.ReadDir(parent)
+1177: 	if e != nil {
+1178: 		return p, e
+1179: 	}
+1180: 	if len(entries) > 128 {
+1181: 		return p, errors.New("boundary root inventory too large")
+1182: 	}
+1183: 	var found int
+1184: 	for _, entry := range entries {
+1185: 		if !entry.IsDir() || !validDigest(entry.Name()) {
+1186: 			return p, errors.New("unknown boundary root inventory")
+1187: 		}
+1188: 		path := filepath.Join(parent, entry.Name(), operation, "plan.json")
+1189: 		raw, e := os.ReadFile(path)
+1190: 		if errors.Is(e, os.ErrNotExist) {
+1191: 			continue
+1192: 		}
+1193: 		if e != nil || len(raw) > 256<<10 {
+1194: 			return p, errors.New("boundary plan unavailable")
+1195: 		}
+1196: 		var candidate EntryFencePlan
+1197: 		if e = json.Unmarshal(raw, &candidate); e != nil {
+1198: 			return p, e
+1199: 		}
+1200: 		if candidate.OperationID == operation && candidate.PlanSHA256 == sha && candidate.DataRoot.Path == root {
+1201: 			p = candidate
+1202: 			found++
+1203: 		}
+1204: 	}
+1205: 	if found != 1 {
+1206: 		return p, errors.New("exact boundary operation not found")
+1207: 	}
+1208: 	return p, nil
+1209: }
+1210: 
+1211: // ReadBoundaryPlan returns evidence for a C preflight. Its return value is
+1212: // serializable data, never authority to enter a transaction.
+1213: func ReadBoundaryPlan(dataRoot, operationID, boundaryPlanSHA256 string) (EntryFencePlan, string, error) {
+1214: 	var zero EntryFencePlan
+1215: 	if !filepath.IsAbs(dataRoot) || !validOperation(operationID) || !validDigest(boundaryPlanSHA256) {
+1216: 		return zero, "", errors.New("boundary selector invalid")
+1217: 	}
+1218: 	p, e := discoverPlan(dataRoot, operationID, boundaryPlanSHA256)
+1219: 	if e != nil {
+1220: 		return zero, "", e
+1221: 	}
+1222: 	if e = ValidatePlan(p); e != nil {
+1223: 		return zero, "", e
+1224: 	}
+1225: 	if e = checkManagedChain(p); e != nil {
+1226: 		return zero, "", e
+1227: 	}
+1228: 	if e = checkAcceptanceFiles(p); e != nil {
+1229: 		return zero, "", e
+1230: 	}
+1231: 	r, e := readRecord(p)
+1232: 	if e != nil {
+1233: 		return zero, "", e
+1234: 	}
+1235: 	state := r.Events[len(r.Events)-1].State
+1236: 	if state == "BOOT_OBSERVED" {
+1237: 		if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1238: 			return zero, "", e
+1239: 		}
+1240: 		if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
+1241: 			return zero, "", e
+1242: 		}
+1243: 	}
+1244: 	return p, state, nil
+1245: }
+1246: 
+1247: func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
+1248: 	if e := ctx.Err(); e != nil {
+1249: 		return e
+1250: 	}
+1251: 	if q == nil || q.owner == nil {
+1252: 		return errors.New("current quiescence absent")
+1253: 	}
+1254: 	o := q.owner
+1255: 	o.mu.Lock()
+1256: 	defer o.mu.Unlock()
+1257: 	if o.closed || o.plan.DataRoot.Path != dataRoot || o.plan.Database.Path != database || o.plan.OperationID != operationID || o.plan.PlanSHA256 != planSHA256 {
+1258: 		return errors.New("current quiescence binding stale")
+1259: 	}
+1260: 	if e := managedToken(o.plan); e != nil {
+1261: 		return e
+1262: 	}
+1263: 	if e := o.lease.Matches(held); e != nil {
+1264: 		return e
+1265: 	}
+1266: 	if e := checkHolds(o.holds); e != nil {
+1267: 		return e
+1268: 	}
+1269: 	r, e := readRecord(o.plan)
+1270: 	if e != nil {
+1271: 		return e
+1272: 	}
+1273: 	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" || r.Post != o.post {
+1274: 		return errors.New("current quiescence state changed")
+1275: 	}
+1276: 	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1277: 		return e
+1278: 	}
+1279: 	if e = checkCurrentBoot(r.Post, o.plan.BusinessSID); e != nil {
+1280: 		return e
+1281: 	}
+1282: 	if e = checkNoOfficialProcess(o.plan); e != nil {
+1283: 		return e
+1284: 	}
+1285: 	if e = checkFence(o.plan, o.holds); e != nil {
+1286: 		return e
+1287: 	}
+1288: 	return checkAncestorControl(o.plan, o.holds)
+1289: }
+1290: 
+1291: func (q *CurrentQuiescence) Close() error {
+1292: 	if q == nil || q.owner == nil {
+1293: 		return errors.New("current quiescence absent")
+1294: 	}
+1295: 	o := q.owner
+1296: 	o.mu.Lock()
+1297: 	defer o.mu.Unlock()
+1298: 	if o.closed {
+1299: 		return errors.New("current quiescence already closed")
+1300: 	}
+1301: 	o.closed = true
+1302: 	err := closeHolds(o.holds)
+1303: 	o.holds = nil
+1304: 	return err
+1305: }
+1306: 
+1307: // MarkCDurable is called only after the outer SQL transaction has actually
+1308: // returned. It reads the independently durable C journal; a caller bool or
+1309: // returned SQL result is insufficient to advance the external fence record.
+1310: func MarkCDurable(ctx context.Context, q *CurrentQuiescence, held *rt.DataRootLease, dataRoot, database, operationID, boundaryPlanSHA256, cPlanDigest string) error {
+1311: 	if q == nil || q.owner == nil {
+1312: 		return errors.New("current quiescence absent")
+1313: 	}
+1314: 	r, err := readRecord(q.owner.plan)
+1315: 	if err != nil {
+1316: 		return err
+1317: 	}
+1318: 	state := r.Events[len(r.Events)-1].State
+1319: 	if state == "BOOT_OBSERVED" {
+1320: 		if err = q.Check(ctx, held, dataRoot, database, operationID, boundaryPlanSHA256); err != nil {
+1321: 			return err
+1322: 		}
+1323: 	} else if state == "C_HELD" {
+1324: 		if err = ctx.Err(); err != nil {
+1325: 			return err
+1326: 		}
+1327: 		if err = managedToken(q.owner.plan); err != nil {
+1328: 			return err
+1329: 		}
+1330: 		q.owner.mu.Lock()
+1331: 		defer q.owner.mu.Unlock()
+1332: 		if q.owner.closed || q.owner.plan.DataRoot.Path != dataRoot || q.owner.plan.Database.Path != database || q.owner.plan.OperationID != operationID || q.owner.plan.PlanSHA256 != boundaryPlanSHA256 {
+1333: 			return errors.New("current quiescence binding stale")
+1334: 		}
+1335: 		if err = q.owner.lease.Matches(held); err != nil {
+1336: 			return err
+1337: 		}
+1338: 		if err = checkHolds(q.owner.holds); err != nil {
+1339: 			return err
+1340: 		}
+1341: 		if err = checkCurrentBoot(q.owner.post, q.owner.plan.BusinessSID); err != nil {
+1342: 			return err
+1343: 		}
+1344: 		if err = checkFence(q.owner.plan, q.owner.holds); err != nil {
+1345: 			return err
+1346: 		}
+1347: 		if err = checkAncestorControl(q.owner.plan, q.owner.holds); err != nil {
+1348: 			return err
+1349: 		}
+1350: 	} else {
+1351: 		return errors.New("boundary not awaiting C durable")
+1352: 	}
+1353: 	if !strings.HasPrefix(cPlanDigest, "sha256:") || !validDigest(strings.TrimPrefix(cPlanDigest, "sha256:")) {
+1354: 		return errors.New("C plan digest invalid")
+1355: 	}
+1356: 	_, status, err := qualificationmaintenancejournal.OpenOwnInspection(dataRoot, qualificationmaintenancejournal.QualificationNamespace, operationID, cPlanDigest)
+1357: 	if err != nil {
+1358: 		return err
+1359: 	}
+1360: 	if !status.Terminal || !status.Applied || status.State != "DURABLE" {
+1361: 		return errors.New("C journal is not durable")
+1362: 	}
+1363: 	if err = qualificationmaintenancejournal.CheckOrdinary(dataRoot); err != nil {
+1364: 		return err
+1365: 	}
+1366: 	r, err = readRecord(q.owner.plan)
+1367: 	if err != nil {
+1368: 		return err
+1369: 	}
+1370: 	if state == "BOOT_OBSERVED" {
+1371: 		if r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
+1372: 			return errors.New("boundary state changed before C durable")
+1373: 		}
+1374: 		if err = appendEvent(q.owner.plan, r.Events, "C_HELD"); err != nil {
+1375: 			return err
+1376: 		}
+1377: 		r, err = readRecord(q.owner.plan)
+1378: 		if err != nil {
+1379: 			return err
+1380: 		}
+1381: 	}
+1382: 	if r.Events[len(r.Events)-1].State != "C_HELD" {
+1383: 		return errors.New("boundary C held state changed")
+1384: 	}
+1385: 	return appendEvent(q.owner.plan, r.Events, "C_DURABLE")
+1386: }
+1387: 

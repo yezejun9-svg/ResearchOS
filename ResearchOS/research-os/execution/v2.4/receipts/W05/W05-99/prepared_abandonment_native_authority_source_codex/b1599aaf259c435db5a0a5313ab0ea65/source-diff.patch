@@ -1,0 +1,137 @@
+--- a/internal/recoveryauthority/native_windows.go
++++ b/internal/recoveryauthority/native_windows.go
+@@ -145,17 +145,31 @@
+         key:=strings.ToLower(filepath.ToSlash(rel)); if _,ok:=expected[key]; ok { return fail(errors.New("AUTHORITY_SOURCE_DUPLICATE")) }; expected[key]=p
+         f,_,e:=pinHeld(p); if e!=nil { return fail(e) }; guards=append(guards,f)
+     }
+-    // Independently enumerate compile inputs and frozen contracts; omission is
+-    // rejected even if a request supplies a shorter signed inventory.
+-    for _,dir:=range []string{"apps/control","internal","adapters","evaluation","ops","migrations/sqlite","spec/v2.0/contracts"} {
++    // Conservative repository-local coverage: every regular file under these
++    // fixed product trees is required, regardless of suffix, dot/underscore
++    // name, test status or go:embed directory/glob selection. Go embeds cannot
++    // escape their package tree. Do not confuse this with a compiler-derived
++    // closure of external modules: Root must separately verify go list -deps
++    // EmbedFiles/compiled inputs against its accepted, pinned build inventory.
++    dirs:=[]string{"apps/control","internal","adapters","evaluation","ops","migrations/sqlite","spec/v2.0/contracts"}
++    if _,e:=os.Lstat(filepath.Join(r.SourceRoot,"vendor")); e==nil {
++        dirs=append(dirs,"vendor")
++    } else if !errors.Is(e,os.ErrNotExist) { return fail(e) }
++    for _,dir:=range dirs {
+         e:=filepath.WalkDir(filepath.Join(r.SourceRoot,filepath.FromSlash(dir)),func(path string,d os.DirEntry,e error) error {
+-            if e!=nil { return e }; if d.Type()&os.ModeSymlink!=0 { return errors.New("AUTHORITY_SOURCE_LINK") }; if d.IsDir() { return nil }
+-            ext:=strings.ToLower(filepath.Ext(path)); needed:=ext==".go" || ext==".s" || ext==".h" || ext==".c" || ext==".syso" || ext==".json" || ext==".sql" || ext==".mjs"
+-            if !needed || strings.HasSuffix(path,"_test.go") { return nil }
+-            rel,e:=filepath.Rel(r.SourceRoot,path); if e!=nil { return e }; if _,ok:=expected[strings.ToLower(filepath.ToSlash(rel))]; !ok { return errors.New("AUTHORITY_SOURCE_OMITTED") }; return nil
++            if e!=nil { return e }; if d.Type()&os.ModeSymlink!=0 { return errors.New("AUTHORITY_SOURCE_LINK") }; if d.IsDir() { return plainPath(path) }
++            if !d.Type().IsRegular() { return errors.New("AUTHORITY_SOURCE_NONREGULAR") }
++            rel,e:=filepath.Rel(r.SourceRoot,path); if e!=nil { return e }; if _,ok:=expected[strings.ToLower(filepath.ToSlash(rel))]; !ok { return fmt.Errorf("AUTHORITY_SOURCE_OMITTED:%s",filepath.ToSlash(rel)) }; return nil
+         }); if e!=nil { return fail(e) }
+     }
+     for _,rel:=range []string{"go.mod","go.sum","execution/toolchains/locked.json"} { if _,ok:=expected[rel]; !ok { return fail(errors.New("AUTHORITY_REQUIRED_BUILD_PIN")) } }
++    // The accepted build still uses GOWORK=off; pin any present workspace files
++    // conservatively so an unexpected local build selector cannot be omitted.
++    for _,rel:=range []string{"go.work","go.work.sum"} {
++        if _,e:=os.Lstat(filepath.Join(r.SourceRoot,rel)); e==nil {
++            if _,ok:=expected[rel]; !ok { return fail(fmt.Errorf("AUTHORITY_REQUIRED_BUILD_PIN:%s",rel)) }
++        } else if !errors.Is(e,os.ErrNotExist) { return fail(e) }
++    }
+     return guards,nil
+ }
+ 
+--- a/internal/recoveryauthority/native_windows_test.go
++++ b/internal/recoveryauthority/native_windows_test.go
+@@ -9,6 +9,7 @@
+     "encoding/json"
+     "os"
+     "path/filepath"
++    "strings"
+     "testing"
+ 
+     "golang.org/x/sys/windows"
+@@ -54,3 +55,69 @@
+     raw,err:=os.ReadFile(path); if err!=nil { t.Fatal(err) }; if bytes.Contains(raw,key) || json.Valid(raw) { t.Fatal("private key stored as plaintext") }
+     if _,err=ProvisionEnrollmentKey(path,"root-adoption"); err==nil { t.Fatal("existing private resource overwritten") }
+ }
++
++// This fixture includes the actual project_rules_v24.go and both of its actual
++// embedded files from the integration source tree. The fixture is only for the
++// source guard, not an accepted build or a production authority constructor.
++func sourceInventoryFixture(t *testing.T,extra map[string][]byte) Release {
++    t.Helper()
++    root:=t.TempDir()
++    for _,dir:=range []string{"apps/control","internal/domain/contracts","adapters","evaluation","ops","migrations/sqlite","spec/v2.0/contracts","execution/toolchains"} {
++        if err:=os.MkdirAll(filepath.Join(root,filepath.FromSlash(dir)),0700); err!=nil { t.Fatal(err) }
++    }
++    cwd,err:=os.Getwd(); if err!=nil { t.Fatal(err) }
++    sourceRoot:=filepath.Clean(filepath.Join(cwd,"..",".."))
++    files:=map[string][]byte{"go.mod":[]byte("module fixture\n"),"go.sum":nil,"execution/toolchains/locked.json":[]byte("{}")}
++    for _,rel:=range []string{"internal/domain/project_rules_v24.go","internal/domain/contracts/new-project-rules-v24.md","internal/domain/contracts/new-project-rules-v24.json"} {
++        raw,e:=os.ReadFile(filepath.Join(sourceRoot,filepath.FromSlash(rel))); if e!=nil { t.Fatal("actual embed input unavailable",rel,e) }; files[rel]=raw
++    }
++    if !bytes.Contains(files["internal/domain/project_rules_v24.go"],[]byte("//go:embed contracts/new-project-rules-v24.md")) { t.Fatal("actual markdown is no longer the tested go:embed input") }
++    for rel,raw:=range extra { files[rel]=raw }
++    release:=Release{SourceRoot:root}
++    for rel,raw:=range files {
++        path:=filepath.Join(root,filepath.FromSlash(rel))
++        if err=os.MkdirAll(filepath.Dir(path),0700); err!=nil { t.Fatal(err) }
++        if err=os.WriteFile(path,raw,0600); err!=nil { t.Fatal(err) }
++        release.SourceFiles=append(release.SourceFiles,RawPin{Role:"source:"+rel,Path:path,SHA256:digest(raw),Bytes:int64(len(raw))})
++    }
++    return release
++}
++func requireSourceInventoryOmission(t *testing.T,release Release,rel string) {
++    t.Helper()
++    expectedPath:=filepath.Join(release.SourceRoot,filepath.FromSlash(rel))
++    filtered:=[]RawPin{}; found:=false
++    for _,p:=range release.SourceFiles { if p.Path==expectedPath { found=true } else { filtered=append(filtered,p) } }
++    if !found { t.Fatal("test did not remove a real declared member") }
++    release.SourceFiles=filtered
++    guards,err:=sourceGuards(release)
++    for _,g:=range guards { _=g.file.Close() }
++    if err==nil || err.Error()!="AUTHORITY_SOURCE_OMITTED:"+rel { t.Fatalf("omitting %s: got %v",rel,err) }
++    // A failed inventory must release earlier handles, including the remaining
++    // actual embedded JSON file, so rejection cannot leak a permanent read lock.
++    for _,p:=range release.SourceFiles { if strings.HasSuffix(p.Path,"new-project-rules-v24.json") { if err=os.WriteFile(p.Path,[]byte("released after reject"),0600); err!=nil { t.Fatal(err) }; break } }
++}
++func TestAuthoritySourceInventoryRequiresActualEmbeddedMarkdown(t *testing.T) {
++    release:=sourceInventoryFixture(t,nil)
++    guards,err:=sourceGuards(release); if err!=nil { t.Fatal("complete actual embed fixture rejected",err) }
++    markdown:=filepath.Join(release.SourceRoot,"internal","domain","contracts","new-project-rules-v24.md")
++    if err=os.WriteFile(markdown,[]byte("tampered"),0600); err==nil { t.Fatal("complete inventory failed to retain markdown read guard") }
++    for _,g:=range guards { if err=g.file.Close(); err!=nil { t.Fatal(err) } }
++    requireSourceInventoryOmission(t,release,"internal/domain/contracts/new-project-rules-v24.md")
++}
++func TestAuthoritySourceInventoryConservativelyRequiresAllEmbedCandidates(t *testing.T) {
++    // Go permits directory/glob and all: patterns. Full-tree enumeration does
++    // not interpret their syntax and therefore cannot omit a future suffix or
++    // an all:-eligible dot/underscore member by filtering extensions.
++    extra:=map[string][]byte{
++        "internal/example/embed.go":[]byte("package example\nimport \"embed\"\n//go:embed all:assets\nvar data embed.FS\n"),
++        "internal/example/assets/extensionless":[]byte("asset"),
++        "internal/example/assets/future.custom":[]byte("custom"),
++        "internal/example/assets/.hidden":[]byte("hidden"),
++        "internal/example/assets/_hidden":[]byte("underscore"),
++        "internal/example/assets/matches_test.go":[]byte("package assets\n"),
++        "vendor/example.test/mod/assets/embedded.payload":[]byte("vendored embed"),
++    }
++    for _,rel:=range []string{"internal/example/assets/extensionless","internal/example/assets/future.custom","internal/example/assets/.hidden","internal/example/assets/_hidden","internal/example/assets/matches_test.go","vendor/example.test/mod/assets/embedded.payload"} {
++        t.Run(rel,func(t *testing.T){ requireSourceInventoryOmission(t,sourceInventoryFixture(t,extra),rel) })
++    }
++}
+--- a/internal/recoveryauthority/types.go
++++ b/internal/recoveryauthority/types.go
+@@ -18,9 +18,10 @@
+ 
+ const Purpose = "RESEARCHOS_PREPARED_HISTORICAL_ADOPTION_V1"
+ const Schema = "researchos.historical-evidence-adoption.v1"
+-// Empty until a NEW independently accepted Source revision pins a freshly
+-// provisioned purpose-specific issuer. No command, environment or JSON setter.
+-const enrolledIssuerPublicKeyHex = ""
++// Public-only anchor from Root's independently provisioned, purpose-specific
++// issuer. This Source revision still requires fresh build/native review before
++// acceptance. No command, environment or JSON setter can replace the anchor.
++const enrolledIssuerPublicKeyHex = "936929c4ad26612ee75cc4ad5a6dc2d8c0f898bf974bb9c01e8e5140ee207bdf"
+ 
+ type RawPin struct {
+     Role string `json:"role"`

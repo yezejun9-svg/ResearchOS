@@ -1,0 +1,137 @@
+--- a/internal/qualificationmaintenancejournal/journal_windows.go
++++ b/internal/qualificationmaintenancejournal/journal_windows.go
+@@ -78,7 +78,7 @@
+ 	}
+ 	before := map[string]any{
+ 		"census": get("before_census"), "run": get("before_run"), "state": get("before_state"),
+-		"dispatch": get("before_dispatch"), "protected": get("before_protected_sha256"),
++		"dispatch": get("before_dispatch"), "dispatch_row": get("before_dispatch_row"), "protected": get("before_protected_sha256"),
+ 		"residual": get("before_residual_sha256"),
+ 	}
+ 	if value, err := hash(before); err != nil || value != plan.BeforeHash {
+--- a/internal/qualificationmaintenancejournal/journal_windows_test.go
++++ b/internal/qualificationmaintenancejournal/journal_windows_test.go
+@@ -26,7 +26,7 @@
+ 		"operation_id": plan.OperationID, "data_root": plan.DataRoot, "database": plan.Database,
+ 		"core": core, "subject": subject, "source": source, "proof": proof,
+ 		"before_census": map[string]any{"rows": 0}, "before_run": map[string]any{}, "before_state": map[string]any{},
+-		"before_dispatch": map[string]any{}, "before_protected_sha256": "p", "before_residual_sha256": "r",
++		"before_dispatch": map[string]any{}, "before_dispatch_row": map[string]any{}, "before_protected_sha256": "p", "before_residual_sha256": "r",
+ 		"artifact": map[string]any{}, "impact_link": map[string]any{}, "run": map[string]any{},
+ 		"project_state": map[string]any{}, "event": map[string]any{}, "observation": map[string]any{},
+ 		"dispatch_sequence": int64(1), "proof_bytes": []byte("fixture"), "outcome_hash": digest([]byte("outcome")),
+@@ -42,7 +42,7 @@
+ 	plan.SubjectHash = mustHash(subject)
+ 	plan.EvidenceHash = mustHash(map[string]any{"source": source, "native": proof["native"], "model": proof["model_binding"]})
+ 	plan.BeforeHash = mustHash(map[string]any{"census": full["before_census"], "run": full["before_run"], "state": full["before_state"],
+-		"dispatch": full["before_dispatch"], "protected": full["before_protected_sha256"], "residual": full["before_residual_sha256"]})
++		"dispatch": full["before_dispatch"], "dispatch_row": full["before_dispatch_row"], "protected": full["before_protected_sha256"], "residual": full["before_residual_sha256"]})
+ 	plan.AfterHash = mustHash(map[string]any{"artifact": full["artifact"], "impact_link": full["impact_link"], "run": full["run"],
+ 		"state": full["project_state"], "event": full["event"], "observation": full["observation"],
+ 		"dispatch_sequence": full["dispatch_sequence"], "upload_hash": digest([]byte("fixture")), "outcome_hash": full["outcome_hash"]})
+@@ -114,6 +114,7 @@
+ 		func(full map[string]any) { full["operation_id"] = "ffeeddccbbaa99887766554433221100" },
+ 		func(full map[string]any) { full["core"] = map[string]any{"schema": "changed"} },
+ 		func(full map[string]any) { full["before_protected_sha256"] = "changed" },
++		func(full map[string]any) { full["before_dispatch_row"] = map[string]any{"changed": true} },
+ 		func(full map[string]any) { full["proof_bytes"] = []byte("different") },
+ 		func(full map[string]any) { full["source"] = map[string]any{"source": "changed"} },
+ 	} {
+--- a/internal/host/qualification_failure_maintenance_windows_test.go
++++ b/internal/host/qualification_failure_maintenance_windows_test.go
+@@ -6,15 +6,95 @@
+ 	"context"
+ 	"crypto/sha256"
+ 	"database/sql"
++	"encoding/base64"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"unsafe"
+ 
+ 	"golang.org/x/sys/windows"
+ 	"researchos.local/research-os/internal/domain"
++	"researchos.local/research-os/internal/qualificationmaintenancejournal"
+ )
++
++func TestQualificationJournalFullPlanDispatchRowRoundTrip(t *testing.T) {
++	root := t.TempDir()
++	user, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	sid := user.User.Sid.String()
++	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")")
++	if err != nil {
++		t.Fatal(err)
++	}
++	hostPath, err := windows.UTF16PtrFromString(filepath.Join(root, "host"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
++	if err = windows.CreateDirectory(hostPath, &sa); err != nil {
++		t.Fatal(err)
++	}
++	plan := domain.HistoricalQualificationPlan{
++		Schema:      "researchos.qualification-failure-maintenance-full-plan.v1",
++		OperationID: "00112233445566778899aabbccddeeff", DataRoot: root,
++		Database: filepath.Join(root, "researchos.sqlite"),
++		Core:     domain.Object{"schema": "fixture"}, Proof: domain.Object{
++			"native": domain.Object{"kind": "fixture"}, "model_binding": domain.Object{"kind": "fixture"}},
++		ProofBytes: []byte("fixture"), OutcomeHash: domain.Digest([]byte("outcome")),
++		Subject:   domain.HistoricalQualificationSubject{ProjectID: "project", RunID: "run", Epoch: 1, DispatchKey: "dispatch"},
++		BeforeRun: domain.Object{}, BeforeState: domain.Object{}, BeforeDispatch: domain.Object{"state": "STARTED"},
++		BeforeProtectedSHA256: domain.Digest([]byte("protected")), BeforeResidualSHA256: domain.Digest([]byte("residual")),
++		Artifact: domain.Object{}, ImpactLink: domain.Object{}, Run: domain.Object{}, ProjectState: domain.Object{},
++		Event: domain.Object{}, Observation: domain.Object{}, DispatchSequence: 1,
++	}
++	// Populate the private typed dispatch row through its public JSON contract,
++	// as the Host does when reading a reviewed plan from disk.
++	initial, err := json.Marshal(plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var tree map[string]any
++	if err = json.Unmarshal(initial, &tree); err != nil {
++		t.Fatal(err)
++	}
++	row := tree["before_dispatch_row"].(map[string]any)
++	row["project"], row["run"], row["epoch"], row["dispatch_key"] = "project", "run", float64(1), "dispatch"
++	row["worker"] = "fixture-worker"
++	cells := row["cells"].([]any)
++	cells[7] = map[string]any{"type": "text", "data": base64.StdEncoding.EncodeToString([]byte("fixture-worker"))}
++	serialized, err := json.Marshal(tree)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = json.Unmarshal(serialized, &plan); err != nil {
++		t.Fatal(err)
++	}
++	fullPlanRaw, err := json.Marshal(plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var reviewed domain.HistoricalQualificationPlan
++	if err = json.Unmarshal(fullPlanRaw, &reviewed); err != nil {
++		t.Fatal(err)
++	}
++	journalRaw, err := qualificationJournalRaw(reviewed, fullPlanRaw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	digest, err := qualificationmaintenancejournal.StartQualification(root, journalRaw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, status, err := qualificationmaintenancejournal.OpenOwnInspection(root,
++		qualificationmaintenancejournal.QualificationNamespace, plan.OperationID, digest)
++	if err != nil || status.State != "BEGIN" {
++		t.Fatalf("typed full plan journal readback: %#v %v", status, err)
++	}
++}
+ 
+ func TestQualificationMaintenanceFrozenSubjectAndExternalPlan(t *testing.T) {
+ 	s := domain.HistoricalQualificationSubject{

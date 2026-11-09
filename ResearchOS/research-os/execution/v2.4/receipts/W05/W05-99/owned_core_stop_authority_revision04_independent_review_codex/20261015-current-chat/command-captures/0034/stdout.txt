@@ -1,0 +1,716 @@
+FILE internal/ownedcorestop/journal_windows.go SHA256 f04ad0ffcb60e8a794fac6ff948a3e72e0ed9b11245d88c078079b53bfdd4afd
+1: //go:build windows
+2: 
+3: package ownedcorestop
+4: 
+5: import (
+6: 	"crypto/sha256"
+7: 	"encoding/hex"
+8: 	"errors"
+9: 	"fmt"
+10: 	"io"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"strings"
+14: 	"unsafe"
+15: 
+16: 	"golang.org/x/sys/windows"
+17: 	"researchos.local/research-os/internal/store"
+18: 	"researchos.local/research-os/ops/supervisor"
+19: )
+20: 
+21: type heldFile struct {
+22: 	file      *os.File
+23: 	ancestors []windows.Handle
+24: 	info      windows.ByHandleFileInformation
+25: }
+26: 
+27: func (h *heldFile) Close() {
+28: 	if h == nil {
+29: 		return
+30: 	}
+31: 	if h.file != nil {
+32: 		_ = h.file.Close()
+33: 		h.file = nil
+34: 	}
+35: 	for i := len(h.ancestors) - 1; i >= 0; i-- {
+36: 		_ = windows.CloseHandle(h.ancestors[i])
+37: 	}
+38: 	h.ancestors = nil
+39: }
+40: 
+41: func nativeFileIdentity(info windows.ByHandleFileInformation, path string) grantFileIdentity {
+42: 	return grantFileIdentity{Path: path, Volume: info.VolumeSerialNumber, Index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}
+43: }
+44: 
+45: // Every component is opened without FILE_SHARE_DELETE and retained. The final
+46: // file additionally denies write sharing; its bytes are read and decoded from
+47: // this one handle while the handles remain live through the operation.
+48: func openHeldFile(path string, directory bool) (out *heldFile, err error) {
+49: 	if err = cleanOwnedLocalPath(path); err != nil {
+50: 		return nil, err
+51: 	}
+52: 	out = &heldFile{}
+53: 	defer func() {
+54: 		if err != nil {
+55: 			out.Close()
+56: 			out = nil
+57: 		}
+58: 	}()
+59: 	volume := filepath.VolumeName(path)
+60: 	parts := strings.Split(strings.TrimPrefix(path[len(volume):], string(filepath.Separator)), string(filepath.Separator))
+61: 	current := volume + string(filepath.Separator)
+62: 	paths := []string{current}
+63: 	if path != current {
+64: 		for _, part := range parts {
+65: 			if part == "" || part == "." || part == ".." {
+66: 				return nil, errors.New("noncanonical path component")
+67: 			}
+68: 			current = filepath.Join(current, part)
+69: 			paths = append(paths, current)
+70: 		}
+71: 	}
+72: 	for i, p := range paths {
+73: 		last := i == len(paths)-1
+74: 		wide, e := windows.UTF16PtrFromString(p)
+75: 		if e != nil {
+76: 			err = e
+77: 			return
+78: 		}
+79: 		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
+80: 		share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+81: 		flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT | windows.FILE_FLAG_BACKUP_SEMANTICS)
+82: 		if last && !directory {
+83: 			access = windows.GENERIC_READ | windows.READ_CONTROL
+84: 			share = windows.FILE_SHARE_READ
+85: 		}
+86: 		if last && directory {
+87: 			share = windows.FILE_SHARE_READ
+88: 		}
+89: 		h, e := windows.CreateFile(wide, access, share, nil, windows.OPEN_EXISTING, flags, 0)
+90: 		if e != nil {
+91: 			err = e
+92: 			return
+93: 		}
+94: 		var info windows.ByHandleFileInformation
+95: 		if e = windows.GetFileInformationByHandle(h, &info); e != nil {
+96: 			_ = windows.CloseHandle(h)
+97: 			err = e
+98: 			return
+99: 		}
+100: 		expectDir := !last || directory
+101: 		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != expectDir || info.VolumeSerialNumber == 0 || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) == 0 || (!expectDir && info.NumberOfLinks != 1) {
+102: 			_ = windows.CloseHandle(h)
+103: 			err = errors.New("reparse, alias, or native identity invalid")
+104: 			return
+105: 		}
+106: 		if last {
+107: 			sd, e := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+108: 			if e != nil {
+109: 				_ = windows.CloseHandle(h)
+110: 				err = e
+111: 				return
+112: 			}
+113: 			owner, _, e := sd.Owner()
+114: 			sid, se := currentSID()
+115: 			if e != nil || se != nil || owner == nil || owner.String() != sid.String() {
+116: 				_ = windows.CloseHandle(h)
+117: 				err = errors.New("file owner SID differs")
+118: 				return
+119: 			}
+120: 			out.file = os.NewFile(uintptr(h), p)
+121: 			out.info = info
+122: 		} else {
+123: 			out.ancestors = append(out.ancestors, h)
+124: 		}
+125: 	}
+126: 	return out, nil
+127: }
+128: 
+129: func readHeldBytes(h *heldFile, max int) ([]byte, error) {
+130: 	if h == nil || h.file == nil || h.info.FileSizeHigh != 0 || h.info.FileSizeLow == 0 || h.info.FileSizeLow > uint32(max) {
+131: 		return nil, errors.New("bounded held file required")
+132: 	}
+133: 	raw, err := io.ReadAll(io.LimitReader(h.file, int64(max)+1))
+134: 	if err != nil || len(raw) != int(h.info.FileSizeLow) {
+135: 		return nil, errors.New("held file read changed")
+136: 	}
+137: 	var after windows.ByHandleFileInformation
+138: 	if err = windows.GetFileInformationByHandle(windows.Handle(h.file.Fd()), &after); err != nil || nativeFileIdentity(after, h.file.Name()) != nativeFileIdentity(h.info, h.file.Name()) || after.FileSizeHigh != h.info.FileSizeHigh || after.FileSizeLow != h.info.FileSizeLow || after.LastWriteTime != h.info.LastWriteTime {
+139: 		return nil, errors.New("held file identity/content changed")
+140: 	}
+141: 	return raw, nil
+142: }
+143: 
+144: type heldDocuments struct{ files []*heldFile }
+145: 
+146: func (d *heldDocuments) Close() {
+147: 	for i := len(d.files) - 1; i >= 0; i-- {
+148: 		d.files[i].Close()
+149: 	}
+150: 	d.files = nil
+151: }
+152: func (d *heldDocuments) read(ref grantDocument, max int) ([]byte, error) {
+153: 	if !validGrantDocument(ref) {
+154: 		return nil, errors.New("invalid pinned document")
+155: 	}
+156: 	raw, err := d.readUnpinned(ref.Path, max)
+157: 	if err != nil {
+158: 		return nil, err
+159: 	}
+160: 	if digest(raw) != ref.SHA256 {
+161: 		return nil, errors.New("pinned document digest differs")
+162: 	}
+163: 	return raw, nil
+164: }
+165: func (d *heldDocuments) readUnpinned(path string, max int) ([]byte, error) {
+166: 	h, err := openHeldFile(path, false)
+167: 	if err != nil {
+168: 		return nil, err
+169: 	}
+170: 	d.files = append(d.files, h)
+171: 	raw, err := readHeldBytes(h, max)
+172: 	if err != nil {
+173: 		return nil, err
+174: 	}
+175: 	return raw, nil
+176: }
+177: 
+178: type operationLock struct {
+179: 	dir  *heldFile
+180: 	file *os.File
+181: }
+182: 
+183: func (l *operationLock) Close() {
+184: 	if l == nil {
+185: 		return
+186: 	}
+187: 	if l.file != nil {
+188: 		_ = l.file.Close()
+189: 	}
+190: 	if l.dir != nil {
+191: 		l.dir.Close()
+192: 	}
+193: }
+194: 
+195: func acquireOperationLock(g operationGrant, create bool) (*operationLock, error) {
+196: 	if err := outsideDataRoot(g.OperationDir.Path, g.DataRoot.Path); err != nil {
+197: 		return nil, err
+198: 	}
+199: 	dir, err := openHeldFile(g.OperationDir.Path, true)
+200: 	if err != nil {
+201: 		return nil, err
+202: 	}
+203: 	if nativeFileIdentity(dir.info, g.OperationDir.Path) != g.OperationDir {
+204: 		dir.Close()
+205: 		return nil, errors.New("pinned operation directory identity differs")
+206: 	}
+207: 	if err = verifyOwnedPrivate(g.OperationDir.Path, true); err != nil {
+208: 		dir.Close()
+209: 		return nil, err
+210: 	}
+211: 	lockPath := filepath.Join(g.OperationDir.Path, ".operation.lock")
+212: 	wide, err := windows.UTF16PtrFromString(lockPath)
+213: 	if err != nil {
+214: 		dir.Close()
+215: 		return nil, err
+216: 	}
+217: 	mode := uint32(windows.OPEN_EXISTING)
+218: 	newLock := false
+219: 	if create {
+220: 		mode = windows.CREATE_NEW
+221: 	}
+222: 	h, err := windows.CreateFile(wide, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, mode, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+223: 	if create && (errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS)) {
+224: 		h, err = windows.CreateFile(wide, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+225: 	} else if create && err == nil {
+226: 		newLock = true
+227: 	}
+228: 	if err != nil {
+229: 		dir.Close()
+230: 		return nil, fmt.Errorf("operation already locked or lock absent: %w", err)
+231: 	}
+232: 	l := &operationLock{dir: dir, file: os.NewFile(uintptr(h), lockPath)}
+233: 	var info windows.ByHandleFileInformation
+234: 	if err = windows.GetFileInformationByHandle(h, &info); err != nil || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || info.NumberOfLinks != 1 {
+235: 		l.Close()
+236: 		return nil, errors.New("operation lock reparse/alias rejected")
+237: 	}
+238: 	if newLock {
+239: 		err = privateOwnedPath(lockPath, false)
+240: 	}
+241: 	if err != nil {
+242: 		l.Close()
+243: 		return nil, err
+244: 	}
+245: 	if err = verifyOwnedPrivate(lockPath, false); err != nil {
+246: 		l.Close()
+247: 		return nil, err
+248: 	}
+249: 	return l, nil
+250: }
+251: 
+252: type ownedBeginRecord struct{ Schema, OperationID, PlanSHA256, GrantSHA256 string }
+253: type preflightManifest struct {
+254: 	Schema               string            `json:"schema"`
+255: 	OperationID          string            `json:"operation_id"`
+256: 	GrantSHA256          string            `json:"grant_sha256"`
+257: 	ExecutableSHA256     string            `json:"executable_sha256"`
+258: 	InputSHA256          string            `json:"input_sha256"`
+259: 	PlanSHA256           string            `json:"plan_sha256"`
+260: 	BackupSHA256         string            `json:"backup_sha256"`
+261: 	BackupManifestSHA256 string            `json:"backup_manifest_sha256"`
+262: 	PlanFile             grantFileIdentity `json:"plan_file"`
+263: 	BackupFile           grantFileIdentity `json:"backup_file"`
+264: }
+265: type preflightComplete struct {
+266: 	Schema           string `json:"schema"`
+267: 	OperationID      string `json:"operation_id"`
+268: 	GrantSHA256      string `json:"grant_sha256"`
+269: 	ExecutableSHA256 string `json:"executable_sha256"`
+270: 	PlanSHA256       string `json:"plan_sha256"`
+271: 	ManifestSHA256   string `json:"manifest_sha256"`
+272: }
+273: type stopAttemptRecord struct {
+274: 	Schema      string `json:"schema"`
+275: 	OperationID string `json:"operation_id"`
+276: 	GrantSHA256 string `json:"grant_sha256"`
+277: 	PlanSHA256  string `json:"plan_sha256"`
+278: }
+279: type ownedIntentRecord struct {
+280: 	Schema, OperationID, PlanSHA256, GrantSHA256 string
+281: 	Native                                       supervisor.OwnedCoreNativeIdentity `json:"native"`
+282: }
+283: type ownedExitRecord struct {
+284: 	Schema, OperationID, PlanSHA256, GrantSHA256 string
+285: 	Native                                       supervisor.OwnedCoreNativeExit `json:"native"`
+286: }
+287: 
+288: func readOwnedExit(out, operationID, planSHA string, grantSHA ...string) (supervisor.OwnedCoreNativeExit, error) {
+289: 	raw, err := readOwnedJournal(out, "NATIVE_EXIT.json", 64<<10)
+290: 	if err != nil {
+291: 		return supervisor.OwnedCoreNativeExit{}, err
+292: 	}
+293: 	var record ownedExitRecord
+294: 	if err = strictJSON(raw, &record); err != nil {
+295: 		return supervisor.OwnedCoreNativeExit{}, err
+296: 	}
+297: 	if record.Schema != "researchos.owned-core-stop-native-exit.v1" || record.OperationID != operationID || record.PlanSHA256 != planSHA || !record.Native.ExitObserved || (record.Native.TerminateCalls != 1 && !record.Native.BeforeSignal) {
+298: 		return supervisor.OwnedCoreNativeExit{}, errors.New("native exit journal binding/observation missing")
+299: 	}
+300: 	if len(grantSHA) > 0 && record.GrantSHA256 != grantSHA[0] {
+301: 		return supervisor.OwnedCoreNativeExit{}, errors.New("native exit grant differs")
+302: 	}
+303: 	return record.Native, nil
+304: }
+305: 
+306: func currentExecutableSHA256() (string, error) {
+307: 	path, err := os.Executable()
+308: 	if err != nil {
+309: 		return "", err
+310: 	}
+311: 	h, err := openHeldFile(path, false)
+312: 	if err != nil {
+313: 		return "", err
+314: 	}
+315: 	defer h.Close()
+316: 	if h.info.FileSizeHigh != 0 || h.info.FileSizeLow == 0 || h.info.FileSizeLow > 256<<20 {
+317: 		return "", errors.New("bounded executable required")
+318: 	}
+319: 	stream := sha256.New()
+320: 	n, err := io.Copy(stream, io.LimitReader(h.file, 256<<20+1))
+321: 	if err != nil || n != int64(h.info.FileSizeLow) {
+322: 		return "", errors.New("executable read differs")
+323: 	}
+324: 	return hex.EncodeToString(stream.Sum(nil)), nil
+325: }
+326: 
+327: func readPinnedPlan(d *heldDocuments, g operationGrant) (Plan, string, error) {
+328: 	var p Plan
+329: 	path := filepath.Join(g.OperationDir.Path, "plan.json")
+330: 	raw, err := d.read(grantDocument{Path: path, SHA256: g.PlanSHA256}, 256<<10)
+331: 	if err != nil {
+332: 		return p, "", err
+333: 	}
+334: 	if err = decodeCanonicalAuthority(raw, &p); err != nil {
+335: 		return p, "", err
+336: 	}
+337: 	canonical, err := canonicalJSON(p)
+338: 	if err != nil || string(canonical) != string(raw) {
+339: 		return p, "", errors.New("plan serialization differs")
+340: 	}
+341: 	if err = validatePlan(p); err != nil {
+342: 		return p, "", err
+343: 	}
+344: 	if p.OutputDir != g.OperationDir.Path || p.OperationID != g.OperationID || p.Native != mustObservedNative(g) || p.Host != g.Host || p.Input.Subject != g.Subject || p.Input.DataRoot != g.DataRoot.Path {
+345: 		return p, "", errors.New("pinned plan subject/authority differs")
+346: 	}
+347: 	return p, digest(raw), nil
+348: }
+349: 
+350: func mustObservedNative(g operationGrant) supervisor.OwnedCoreNativeIdentity {
+351: 	n, _ := g.Native.observed()
+352: 	return n
+353: }
+354: 
+355: func readPreflightComplete(d *heldDocuments, g operationGrant) (preflightComplete, preflightManifest, error) {
+356: 	var c preflightComplete
+357: 	var m preflightManifest
+358: 	raw, err := d.readUnpinned(filepath.Join(g.OperationDir.Path, "PREFLIGHT_COMPLETE.json"), 64<<10)
+359: 	if err != nil {
+360: 		return c, m, err
+361: 	}
+362: 	if err = decodeCanonicalAuthority(raw, &c); err != nil {
+363: 		return c, m, err
+364: 	}
+365: 	if c.Schema != "researchos.owned-core-stop-preflight-complete.v1" || c.OperationID != g.OperationID || !validSHA(c.GrantSHA256) || !validSHA(c.ExecutableSHA256) || !validSHA(c.PlanSHA256) || !validSHA(c.ManifestSHA256) {
+366: 		return c, m, errors.New("preflight complete binding")
+367: 	}
+368: 	if g.GrantKind == "STOP_ONCE" && (c.GrantSHA256 != g.PreflightGrantSHA256 || c.ExecutableSHA256 != g.PreflightExecutableSHA256 || c.PlanSHA256 != g.PlanSHA256 || c.ManifestSHA256 != g.PreflightManifestSHA256) {
+369: 		return c, m, errors.New("predecessor grant/manifest differs")
+370: 	}
+371: 	if g.GrantKind == "PREFLIGHT_ONLY" && c.GrantSHA256 != g.digest {
+372: 		return c, m, errors.New("preflight grant digest differs")
+373: 	}
+374: 	manifestRaw, err := d.read(grantDocument{Path: filepath.Join(g.OperationDir.Path, "preflight-manifest.json"), SHA256: c.ManifestSHA256}, 128<<10)
+375: 	if err != nil {
+376: 		return c, m, err
+377: 	}
+378: 	if err = decodeCanonicalAuthority(manifestRaw, &m); err != nil {
+379: 		return c, m, err
+380: 	}
+381: 	if m.Schema != "researchos.owned-core-stop-preflight-manifest.v1" || m.OperationID != g.OperationID || m.GrantSHA256 != c.GrantSHA256 || m.ExecutableSHA256 != c.ExecutableSHA256 || m.PlanSHA256 != c.PlanSHA256 || !validSHA(m.BackupSHA256) || !validSHA(m.BackupManifestSHA256) {
+382: 		return c, m, errors.New("preflight manifest binding")
+383: 	}
+384: 	return c, m, nil
+385: }
+386: 
+387: func validatePreflightOutputs(d *heldDocuments, g operationGrant, c preflightComplete, m preflightManifest, p Plan) error {
+388: 	if p.GrantSHA256 != c.GrantSHA256 || p.PreflightExecutableSHA256 != c.ExecutableSHA256 || p.InputSHA256 != m.InputSHA256 || p.BackupSHA256 != m.BackupSHA256 || p.BackupPath != m.BackupFile.Path || filepath.Join(g.OperationDir.Path, "plan.json") != m.PlanFile.Path {
+389: 		return errors.New("preflight plan/manifest links differ")
+390: 	}
+391: 	for _, item := range []grantFileIdentity{m.PlanFile, m.BackupFile} {
+392: 		h, err := openHeldFile(item.Path, false)
+393: 		if err != nil {
+394: 			return err
+395: 		}
+396: 		d.files = append(d.files, h)
+397: 		if nativeFileIdentity(h.info, item.Path) != item {
+398: 			return errors.New("preflight output native identity differs")
+399: 		}
+400: 	}
+401: 	raw, err := d.read(grantDocument{Path: filepath.Join(g.OperationDir.Path, "backup-manifest.json"), SHA256: m.BackupManifestSHA256}, 128<<10)
+402: 	if err != nil {
+403: 		return err
+404: 	}
+405: 	var backup struct {
+406: 		Schema, OperationID, BackupSHA256 string
+407: 		Census                            store.OwnedStopCensus `json:"census"`
+408: 	}
+409: 	if err = decodeCanonicalAuthority(raw, &backup); err != nil {
+410: 		return err
+411: 	}
+412: 	if backup.Schema != "researchos.owned-core-stop-backup.v1" || backup.OperationID != g.OperationID || backup.BackupSHA256 != p.BackupSHA256 || backup.Census != p.Baseline {
+413: 		return errors.New("backup manifest differs")
+414: 	}
+415: 	return nil
+416: }
+417: 
+418: func readExistingStopOutcome(d *heldDocuments, g operationGrant, p Plan, planSHA string) (Result, error) {
+419: 	unknown := Result{Schema: ResultSchema, OperationID: g.OperationID, PlanSHA256: planSHA, StopGrantSHA256: g.digest, State: "UNKNOWN", Reason: "consumed attempt without immutable outcome; no retry"}
+420: 	raw, err := d.readUnpinned(filepath.Join(g.OperationDir.Path, "STOP_ATTEMPT.json"), 64<<10)
+421: 	if err != nil {
+422: 		return unknown, err
+423: 	}
+424: 	var attempt stopAttemptRecord
+425: 	if err = decodeCanonicalAuthority(raw, &attempt); err != nil {
+426: 		return unknown, err
+427: 	}
+428: 	if attempt.Schema != "researchos.owned-core-stop-attempt.v1" || attempt.OperationID != g.OperationID || attempt.GrantSHA256 != g.digest || attempt.PlanSHA256 != planSHA {
+429: 		return unknown, errors.New("STOP attempt grant conflict")
+430: 	}
+431: 	terminalPath := filepath.Join(g.OperationDir.Path, "POSTFLIGHT.json")
+432: 	if _, err = os.Stat(terminalPath); errors.Is(err, os.ErrNotExist) {
+433: 		return unknown, nil
+434: 	} else if err != nil {
+435: 		return unknown, err
+436: 	}
+437: 	raw, err = d.readUnpinned(terminalPath, 64<<10)
+438: 	if err != nil {
+439: 		return unknown, err
+440: 	}
+441: 	var terminal Result
+442: 	if err = decodeCanonicalAuthority(raw, &terminal); err != nil {
+443: 		return unknown, err
+444: 	}
+445: 	if terminal.Schema != ResultSchema || terminal.OperationID != g.OperationID || terminal.PlanSHA256 != planSHA || terminal.StopGrantSHA256 != g.digest {
+446: 		return unknown, errors.New("terminal outcome grant binding differs")
+447: 	}
+448: 	if terminal.State == "STOPPED_LEASE_VERIFIED" || terminal.State == "STOP_OBSERVED_MAINTENANCE_BLOCKED" || terminal.State == "OBSERVED_BEFORE_SIGNAL" {
+449: 		beginRaw, e := d.readUnpinned(filepath.Join(g.OperationDir.Path, "BEGIN.json"), 64<<10)
+450: 		if e != nil {
+451: 			return unknown, e
+452: 		}
+453: 		var begin ownedBeginRecord
+454: 		if e = strictJSON(beginRaw, &begin); e != nil {
+455: 			return unknown, e
+456: 		}
+457: 		if begin.Schema != "researchos.owned-core-stop-begin.v1" || begin.OperationID != g.OperationID || begin.PlanSHA256 != planSHA || begin.GrantSHA256 != g.digest {
+458: 			return unknown, errors.New("BEGIN journal binding differs")
+459: 		}
+460: 		intentRaw, e := d.readUnpinned(filepath.Join(g.OperationDir.Path, "TERMINATE_INTENT.json"), 64<<10)
+461: 		if e != nil {
+462: 			return unknown, e
+463: 		}
+464: 		var intent ownedIntentRecord
+465: 		if e = strictJSON(intentRaw, &intent); e != nil {
+466: 			return unknown, e
+467: 		}
+468: 		if intent.Schema != "researchos.owned-core-stop-terminate-intent.v1" || intent.OperationID != g.OperationID || intent.PlanSHA256 != planSHA || intent.GrantSHA256 != g.digest || intent.Native != p.Native {
+469: 			return unknown, errors.New("intent journal binding differs")
+470: 		}
+471: 		exitRaw, e := d.readUnpinned(filepath.Join(g.OperationDir.Path, "NATIVE_EXIT.json"), 64<<10)
+472: 		if e != nil {
+473: 			return unknown, e
+474: 		}
+475: 		var native ownedExitRecord
+476: 		if e = decodeCanonicalAuthority(exitRaw, &native); e != nil {
+477: 			return unknown, e
+478: 		}
+479: 		if native.Schema != "researchos.owned-core-stop-native-exit.v1" || native.OperationID != g.OperationID || native.PlanSHA256 != planSHA || native.GrantSHA256 != g.digest || !native.Native.ExitObserved || terminal.Native == nil || *terminal.Native != native.Native {
+480: 			return unknown, errors.New("native closure outcome differs")
+481: 		}
+482: 		if terminal.State == "STOPPED_LEASE_VERIFIED" && (terminal.Postflight == nil || *terminal.Postflight != p.Baseline || native.Native.TerminateCalls != 1 || native.Native.BeforeSignal) {
+483: 			return unknown, errors.New("verified terminal lacks exact postflight/one call")
+484: 		}
+485: 	}
+486: 	return terminal, nil
+487: }
+488: 
+489: func currentSID() (*windows.SID, error) {
+490: 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+491: 	if err != nil {
+492: 		return nil, err
+493: 	}
+494: 	if u.User.Sid == nil || !u.User.Sid.IsValid() {
+495: 		return nil, errors.New("current SID unavailable")
+496: 	}
+497: 	return u.User.Sid, nil
+498: }
+499: 
+500: func privateOwnedPath(path string, dir bool) error {
+501: 	sid, err := currentSID()
+502: 	if err != nil {
+503: 		return err
+504: 	}
+505: 	ace := "(A;;FA;;;" + sid.String() + ")"
+506: 	if dir {
+507: 		ace = "(A;OICI;FA;;;" + sid.String() + ")"
+508: 	}
+509: 	sd, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P" + ace)
+510: 	if err != nil {
+511: 		return err
+512: 	}
+513: 	acl, _, err := sd.DACL()
+514: 	if err != nil {
+515: 		return err
+516: 	}
+517: 	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+518: }
+519: 
+520: func verifyOwnedPrivate(path string, dir bool) error {
+521: 	sid, err := currentSID()
+522: 	if err != nil {
+523: 		return err
+524: 	}
+525: 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+526: 	if err != nil {
+527: 		return err
+528: 	}
+529: 	owner, _, err := sd.Owner()
+530: 	if err != nil || owner == nil || owner.String() != sid.String() {
+531: 		return errors.New("private path owner SID differs")
+532: 	}
+533: 	control, _, err := sd.Control()
+534: 	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+535: 		return errors.New("protected private DACL missing")
+536: 	}
+537: 	acl, _, err := sd.DACL()
+538: 	if err != nil || acl == nil || acl.AceCount != 1 {
+539: 		return errors.New("single private ACE required")
+540: 	}
+541: 	var ace *windows.ACCESS_ALLOWED_ACE
+542: 	if err = windows.GetAce(acl, 0, &ace); err != nil {
+543: 		return err
+544: 	}
+545: 	flags := byte(0)
+546: 	if dir {
+547: 		flags = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
+548: 	}
+549: 	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != flags || ace.Mask != 0x001f01ff || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() != sid.String() {
+550: 		return errors.New("private ACE differs")
+551: 	}
+552: 	return nil
+553: }
+554: 
+555: func cleanOwnedLocalPath(path string) error {
+556: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") {
+557: 		return errors.New("canonical local path required")
+558: 	}
+559: 	return nil
+560: }
+561: 
+562: func outsideDataRoot(out, dataRoot string) error {
+563: 	if err := cleanOwnedLocalPath(out); err != nil {
+564: 		return err
+565: 	}
+566: 	if err := cleanOwnedLocalPath(dataRoot); err != nil {
+567: 		return err
+568: 	}
+569: 	rel, err := filepath.Rel(dataRoot, out)
+570: 	if err != nil || rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
+571: 		return errors.New("output must be outside product data root")
+572: 	}
+573: 	return nil
+574: }
+575: 
+576: func createPrivateOutput(out, dataRoot string) error {
+577: 	if err := outsideDataRoot(out, dataRoot); err != nil {
+578: 		return err
+579: 	}
+580: 	parent := filepath.Dir(out)
+581: 	actual, err := filepath.EvalSymlinks(parent)
+582: 	if err != nil || !strings.EqualFold(actual, parent) {
+583: 		return errors.New("output parent reparse or absence")
+584: 	}
+585: 	if err = os.Mkdir(out, 0700); err != nil {
+586: 		return err
+587: 	}
+588: 	if err = privateOwnedPath(out, true); err != nil {
+589: 		return err
+590: 	}
+591: 	return verifyOwnedPrivate(out, true)
+592: }
+593: 
+594: func writeOwnedJournal(out, name string, body any) (string, error) {
+595: 	if filepath.Base(name) != name || strings.ContainsAny(name, "/\\:") {
+596: 		return "", errors.New("fixed journal filename required")
+597: 	}
+598: 	if err := verifyOwnedPrivate(out, true); err != nil {
+599: 		return "", err
+600: 	}
+601: 	raw, err := canonicalJSON(body)
+602: 	if err != nil {
+603: 		return "", err
+604: 	}
+605: 	path := filepath.Join(out, name)
+606: 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+607: 	if err != nil {
+608: 		return "", err
+609: 	}
+610: 	defer f.Close()
+611: 	if err = privateOwnedPath(path, false); err != nil {
+612: 		return "", err
+613: 	}
+614: 	if err = verifyOwnedPrivate(path, false); err != nil {
+615: 		return "", err
+616: 	}
+617: 	if _, err = f.Write(raw); err != nil {
+618: 		return "", err
+619: 	}
+620: 	if err = f.Sync(); err != nil {
+621: 		return "", err
+622: 	}
+623: 	return digest(raw), nil
+624: }
+625: 
+626: func readOwnedJournal(out, name string, max int) ([]byte, error) {
+627: 	if err := verifyOwnedPrivate(out, true); err != nil {
+628: 		return nil, err
+629: 	}
+630: 	path := filepath.Join(out, name)
+631: 	actual, err := filepath.EvalSymlinks(path)
+632: 	if err != nil || !strings.EqualFold(actual, path) {
+633: 		return nil, errors.New("journal reparse or absence")
+634: 	}
+635: 	if err := verifyOwnedPrivate(path, false); err != nil {
+636: 		return nil, err
+637: 	}
+638: 	raw, err := os.ReadFile(path)
+639: 	if err != nil {
+640: 		return nil, err
+641: 	}
+642: 	if len(raw) == 0 || len(raw) > max {
+643: 		return nil, fmt.Errorf("bounded %s required", name)
+644: 	}
+645: 	return raw, nil
+646: }
+647: 
+648: func readPlan(path string) (Plan, string, error) {
+649: 	var plan Plan
+650: 	if filepath.Base(path) != "plan.json" {
+651: 		return plan, "", errors.New("canonical plan.json required")
+652: 	}
+653: 	raw, err := readOwnedJournal(filepath.Dir(path), "plan.json", 256<<10)
+654: 	if err != nil {
+655: 		return plan, "", err
+656: 	}
+657: 	if err = strictJSON(raw, &plan); err != nil {
+658: 		return plan, "", err
+659: 	}
+660: 	if err = validatePlan(plan); err != nil {
+661: 		return plan, "", err
+662: 	}
+663: 	if plan.OutputDir != filepath.Dir(path) {
+664: 		return plan, "", errors.New("plan directory changed")
+665: 	}
+666: 	canonical, err := canonicalJSON(plan)
+667: 	if err != nil || string(canonical) != string(raw) {
+668: 		return plan, "", errors.New("plan serialization differs")
+669: 	}
+670: 	return plan, digest(raw), nil
+671: }
+672: 
+673: // Inspect is observation-only. It never opens a termination handle or repairs
+674: // a missing native wait. Completed POSTFLIGHT is returned unchanged.
+675: func Inspect(planPath string) (Result, error) {
+676: 	g, err := loadCompiledOperationGrant()
+677: 	if err != nil {
+678: 		return Result{}, err
+679: 	}
+680: 	if _, err = g.checkAction("inspect", false); err != nil {
+681: 		return Result{}, err
+682: 	}
+683: 	if planPath != filepath.Join(g.OperationDir.Path, "plan.json") {
+684: 		return Result{}, errors.New("inspect plan differs from compiled grant")
+685: 	}
+686: 	lock, err := acquireOperationLock(g, false)
+687: 	if err != nil {
+688: 		return Result{Schema: ResultSchema, OperationID: g.OperationID, State: "IN_PROGRESS", Reason: "operation writer active or immutable lock absent"}, nil
+689: 	}
+690: 	defer lock.Close()
+691: 	docs := &heldDocuments{}
+692: 	defer docs.Close()
+693: 	c, m, err := readPreflightComplete(docs, g)
+694: 	if err != nil {
+695: 		return Result{Schema: ResultSchema, OperationID: g.OperationID, State: "STOP_UNAVAILABLE", Reason: "immutable preflight completion absent"}, nil
+696: 	}
+697: 	planGrant := g
+698: 	planGrant.PlanSHA256 = c.PlanSHA256
+699: 	p, sha, err := readPinnedPlan(docs, planGrant)
+700: 	if err != nil {
+701: 		return Result{}, err
+702: 	}
+703: 	if err = validatePreflightOutputs(docs, g, c, m, p); err != nil {
+704: 		return Result{}, err
+705: 	}
+706: 	if g.GrantKind == "PREFLIGHT_ONLY" {
+707: 		return Result{Schema: ResultSchema, OperationID: g.OperationID, PlanSHA256: sha, State: "PREFLIGHT_COMPLETE"}, nil
+708: 	}
+709: 	if _, err = os.Stat(filepath.Join(g.OperationDir.Path, "STOP_ATTEMPT.json")); errors.Is(err, os.ErrNotExist) {
+710: 		return Result{Schema: ResultSchema, OperationID: g.OperationID, PlanSHA256: sha, State: "STOP_UNAVAILABLE", Reason: "no STOP attempt"}, nil
+711: 	} else if err != nil {
+712: 		return Result{}, err
+713: 	}
+714: 	return readExistingStopOutcome(docs, g, p, sha)
+715: }

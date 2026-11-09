@@ -1,0 +1,542 @@
+FILE ops/experiment_sandbox/sandbox_windows.go
+137: 	var sid *windows.SID
+138: 	hr, _, _ := userenv.NewProc("CreateAppContainerProfile").Call(uintptr(unsafe.Pointer(utf(name))), uintptr(unsafe.Pointer(utf(name))), uintptr(unsafe.Pointer(utf("bounded development evaluation"))), 0, 0, uintptr(unsafe.Pointer(&sid)))
+139: 	if int32(hr) < 0 {
+140: 		return r, fmt.Errorf("CreateAppContainerProfile HRESULT 0x%x", hr)
+141: 	}
+142: 	defer userenv.NewProc("DeleteAppContainerProfile").Call(uintptr(unsafe.Pointer(utf(name))))
+143: 	defer windows.FreeSid(sid)
+144: 	r.SID = sid.String()
+145: 	r.Profile = name
+146: 	r.Capabilities = []string{}
+147: 
+148: 	// A fresh copied tree inherits one known DACL; source ACLs and reparse points
+149: 	// never cross the boundary. AppContainer, not the copy, enforces isolation.
+150: 	staging, e := os.MkdirTemp("", "researchos-w10-staging-")
+197: 	r.Executable, r.Args, r.Directory = c.Executable, c.Args, c.OutputDirectory
+198: 	defer func() {
+199: 		if r.Stopped {
+200: 			copyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+201: 			defer cancel()
+202: 			x := copyTree(copyCtx, c.OutputDirectory, originalOutput)
+203: 			r.OutputCopied = x == nil
+204: 			err = errors.Join(err, x)
+205: 		}
+206: 	}()
+207: 	r.Job = "Local\\" + name
+208: 	job, e := windows.CreateJobObject(nil, utf(r.Job))
+209: 	if e != nil {
+210: 		return r, e
+211: 	}
+212: 	defer windows.CloseHandle(job)
+213: 	limit := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+214: 	limit.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY
+215: 	limit.BasicLimitInformation.ActiveProcessLimit = processLimit
+216: 	limit.ProcessMemoryLimit = uintptr(memoryMiB) * 1024 * 1024
+217: 	if _, e = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limit)), uint32(unsafe.Sizeof(limit))); e != nil {
+218: 		return r, e
+219: 	}
+220: 	stdin, input, e := os.Pipe()
+221: 	if e != nil {
+222: 		return r, e
+223: 	}
+224: 	defer stdin.Close()
+225: 	process.mu.Lock()
+226: 	process.stdin = input
+227: 	process.mu.Unlock()
+228: 	defer process.CloseInput()
+229: 	if !options.Interactive {
+230: 		process.CloseInput()
+237: 	defer stdoutReader.Close()
+238: 	stderrReader, stderr, e := os.Pipe()
+239: 	if e != nil {
+240: 		return r, e
+241: 	}
+242: 	defer stderr.Close()
+243: 	defer stderrReader.Close()
+244: 	outDone, errDone := make(chan streamResult, 1), make(chan streamResult, 1)
+245: 	go collectStream(stdoutReader, "stdout", options.OnStream, process.cancel, outDone)
+246: 	go collectStream(stderrReader, "stderr", options.OnStream, process.cancel, errDone)
+247: 	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(stdout.Fd()), windows.Handle(stderr.Fd())}
+248: 	for _, h := range handles {
+249: 		if e = windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
+250: 			return r, e
+251: 		}
+252: 		defer windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, 0)
+253: 	}
+254: 	attrs, e := windows.NewProcThreadAttributeList(3)
+255: 	if e != nil {
+256: 		return r, e
+257: 	}
+258: 	defer attrs.Delete()
+259: 	type caps struct {
+260: 		SID             *windows.SID
+261: 		Capabilities    uintptr
+262: 		Count, Reserved uint32
+263: 	}
+264: 	capability := caps{SID: sid}
+265: 	if e = attrs.Update(0x00020009, unsafe.Pointer(&capability), unsafe.Sizeof(capability)); e != nil {
+266: 		return r, e
+267: 	}
+268: 	if e = attrs.Update(0x0002000d, unsafe.Pointer(&job), unsafe.Sizeof(job)); e != nil {
+269: 		return r, e
+270: 	}
+271: 	if e = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); e != nil {
+272: 		return r, e
+273: 	}
+274: 	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
+275: 	si.Cb = uint32(unsafe.Sizeof(si))
+276: 	si.Flags = windows.STARTF_USESTDHANDLES
+277: 	si.StdInput = handles[0]
+278: 	si.StdOutput = handles[1]
+279: 	si.StdErr = handles[2]
+295: 	for _, k := range keys {
+296: 		envValues = append(envValues, k+"="+goEnv[k])
+297: 	}
+298: 	env := utf16.Encode([]rune(strings.Join(envValues, "\x00") + "\x00\x00"))
+299: 	var pi windows.ProcessInformation
+300: 	r.Started = time.Now().UTC().Format(time.RFC3339Nano)
+301: 	if e = windows.CreateProcess(utf(c.Executable), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED, &env[0], utf(c.OutputDirectory), &si.StartupInfo, &pi); e != nil {
+302: 		return r, fmt.Errorf("CreateProcess: %w", e)
+303: 	}
+304: 	defer windows.CloseHandle(pi.Process)
+305: 	defer windows.CloseHandle(pi.Thread)
+306: 	// The parent must release its copies of the child write ends for true EOF.
+307: 	stdout.Close()
+308: 	stderr.Close()
+309: 	stdin.Close()
+310: 	r.PID = pi.ProcessId
+311: 	var created, exited, kernel, user windows.Filetime
+312: 	if e = windows.GetProcessTimes(pi.Process, &created, &exited, &kernel, &user); e != nil {
+313: 		windows.TerminateJobObject(job, 125)
+314: 		windows.WaitForSingleObject(pi.Process, 5000)
+315: 		return r, e
+316: 	}
+317: 	r.Created = created.Nanoseconds()
+318: 	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile, StagingDirectory: staging}
+319: 	if options.BeforeResume != nil {
+320: 		if e = options.BeforeResume(identity); e != nil {
+321: 			windows.TerminateJobObject(job, 125)
+322: 			windows.WaitForSingleObject(pi.Process, 5000)
+323: 			return r, fmt.Errorf("beforeResume: %w", e)
+324: 		}
+325: 	}
+326: 	if ctx.Err() != nil {
+327: 		windows.TerminateJobObject(job, 125)
+328: 		windows.WaitForSingleObject(pi.Process, 5000)
+329: 		return r, ctx.Err()
+330: 	}
+331: 	if _, e = windows.ResumeThread(pi.Thread); e != nil {
+332: 		windows.TerminateJobObject(job, 125)
+333: 		windows.WaitForSingleObject(pi.Process, 5000)
+334: 		return r, e
+335: 	}
+336: 	process.ready <- nil
+337: 	deadline := time.Now().Add(c.Timeout)
+338: 	for {
+339: 		state, x := windows.WaitForSingleObject(pi.Process, 20)
+340: 		if x != nil {
+341: 			return r, x
+342: 		}
+343: 		if state == windows.WAIT_OBJECT_0 {
+344: 			break
+345: 		}
+346: 		if ctx.Err() != nil || time.Now().After(deadline) {
+347: 			r.TimedOut = true
+348: 			if e = windows.TerminateJobObject(job, 124); e != nil {
+349: 				return r, e
+350: 			}
+351: 			windows.WaitForSingleObject(pi.Process, 5000)
+352: 			break
+353: 		}
+354: 	}
+355: 	var code uint32
+356: 	if e = windows.GetExitCodeProcess(pi.Process, &code); e != nil {
+357: 		return r, e
+358: 	}
+359: 	r.ExitCode = int(code)
+360: 	r.Finished = time.Now().UTC().Format(time.RFC3339Nano)
+361: 	var accounting struct {
+362: 		User, Kernel, PeriodUser, PeriodKernel              int64
+363: 		Faults, TotalProcesses, ActiveProcesses, Terminated uint32
+364: 	}
+365: 	if e = windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); e != nil {
+366: 		return r, e
+367: 	}
+368: 	for n := 0; n < 50 && accounting.ActiveProcesses != 0; n++ {
+369: 		time.Sleep(10 * time.Millisecond)
+370: 		if e = windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); e != nil {
+371: 			return r, e
+372: 		}
+373: 	}
+374: 	r.Stopped = accounting.ActiveProcesses == 0
+375: 	r.JobProcesses = accounting.TotalProcesses
+376: 	outResult, errResult := <-outDone, <-errDone
+377: 	r.Stdout, r.Stderr = outResult.bytes, errResult.bytes
+378: 	r.StreamsDrained = outResult.err == nil && errResult.err == nil
+379: 	return r, errors.Join(outResult.err, errResult.err)
+380: }
+FILE ops/experiment_sandbox/async_windows.go
+45: 
+46: type Process struct {
+47: 	mu        sync.Mutex
+48: 	writeGate chan struct{}
+49: 	stopped   <-chan struct{}
+50: 	stdin     *os.File
+51: 	cancel    context.CancelFunc
+52: 	done      chan struct{}
+53: 	ready     chan error
+54: 	receipt   Receipt
+55: 	err       error
+56: }
+57: 
+58: // Start returns after suspended identity persistence and ResumeThread succeed.
+59: // It owns process termination, stream draining and staging cleanup until Wait.
+60: func Start(ctx context.Context, c Command, options StartOptions) (*Process, error) {
+61: 	child, cancel := context.WithCancel(ctx)
+62: 	p := &Process{cancel: cancel, done: make(chan struct{}), ready: make(chan error, 1), writeGate: make(chan struct{}, 1), stopped: child.Done()}
+63: 	go func() {
+64: 		r, err := runSandbox(child, c, options, p)
+65: 		p.mu.Lock()
+66: 		p.receipt, p.err = r, err
+67: 		if p.stdin != nil {
+68: 			p.stdin.Close()
+69: 			p.stdin = nil
+70: 		}
+71: 		p.mu.Unlock()
+72: 		select {
+73: 		case p.ready <- err:
+74: 		default:
+75: 		}
+76: 		cancel()
+77: 		close(p.done)
+78: 	}()
+79: 	select {
+80: 	case err := <-p.ready:
+81: 		if err != nil {
+82: 			<-p.done
+83: 			return nil, err
+84: 		}
+85: 		return p, nil
+86: 	case <-ctx.Done():
+87: 		cancel()
+145: 		return bounded.Err()
+146: 	case <-p.stopped:
+147: 		return errors.New("process input closed")
+148: 	}
+149: }
+150: 
+151: func (p *Process) CloseInput() error {
+152: 	p.mu.Lock()
+153: 	defer p.mu.Unlock()
+154: 	if p.stdin == nil {
+155: 		return nil
+156: 	}
+157: 	err := p.stdin.Close()
+158: 	p.stdin = nil
+159: 	return err
+160: }
+161: 
+162: func (p *Process) Cancel() { p.cancel(); p.CloseInput() }
+163: 
+164: func (p *Process) Wait(ctx context.Context) (Receipt, error) {
+165: 	select {
+166: 	case <-p.done:
+167: 		p.mu.Lock()
+168: 		defer p.mu.Unlock()
+169: 		return p.receipt, p.err
+170: 	case <-ctx.Done():
+171: 		return Receipt{}, ctx.Err()
+172: 	}
+173: }
+174: 
+175: type streamResult struct {
+FILE adapters/runtime/bridge_windows.go
+160: 	return Hash(b), nil
+161: }
+162: 
+163: // LockDataRoot is held for the complete control coordinator lifetime. It uses
+164: // an OS-exclusive non-inherited handle, not the SQLite connection count.
+165: func LockDataRoot(directory string) (*os.File, error) {
+166: 	abs, e := filepath.Abs(directory)
+167: 	if e != nil {
+168: 		return nil, e
+169: 	}
+170: 	if e = os.MkdirAll(abs, 0700); e != nil {
+171: 		return nil, e
+172: 	}
+173: 	actual, e := filepath.EvalSymlinks(abs)
+174: 	if e != nil || !strings.EqualFold(filepath.Clean(abs), filepath.Clean(actual)) {
+175: 		return nil, errors.New("canonical non-reparse data root required")
+176: 	}
+177: 	return lockFile(filepath.Join(actual, "coordinator.lock"))
+178: }
+179: 
+180: func (w *Bridge) persist() error {
+181: 	w.journal.Sequence++
+490: 	return nil
+491: }
+492: 
+493: func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+494: 	defer close(w.done)
+495: 	defer close(w.frames)
+496: 	defer w.lock.Close()
+497: 	finished := make(chan struct{})
+498: 	go func() {
+499: 		ticker := time.NewTicker(50 * time.Millisecond)
+500: 		defer ticker.Stop()
+501: 		for {
+502: 			select {
+503: 			case <-finished:
+504: 				return
+505: 			case <-ticker.C:
+506: 				w.mu.Lock()
+507: 				expired := time.Now().After(w.deadline) || time.Now().UTC().After(w.wallDeadline)
+508: 				w.mu.Unlock()
+509: 				if expired {
+510: 					w.Cancel("lease expired")
+511: 					return
+512: 				}
+513: 			case <-ctx.Done():
+514: 				w.Cancel("coordinator control channel closed")
+515: 				return
+516: 			}
+517: 		}
+518: 	}()
+519: 	receipt, err := w.process.Wait(context.Background())
+520: 	close(finished)
+521: 	w.mu.Lock()
+522: 	defer w.mu.Unlock()
+523: 	w.journal.Receipt = receipt
+524: 	w.journal.Ended = now()
+525: 	err = errors.Join(err, w.stdout.Close(), w.stderr.Close())
+526: 	w.journal.StdoutHash = Hash(receipt.Stdout)
+527: 	w.journal.StderrHash = Hash(receipt.Stderr)
+528: 	if len(w.pending) != 0 {
+529: 		err = errors.Join(err, errors.New("unterminated protocol frame"))
+530: 	}
+531: 	if err != nil || !receipt.Stopped || !receipt.StreamsDrained || !receipt.OutputCopied || !receipt.CleanupComplete {
+532: 		w.journal.State = "UNKNOWN"
+533: 	} else if receipt.ExitCode != 0 || receipt.TimedOut || w.journal.Cancelled || !w.journal.ProtocolComplete || !w.journal.ContextReady {
+534: 		w.journal.State = "FAILED"
+535: 	} else if w.journal.Paused {
+536: 		w.journal.State = "PAUSED"
+537: 	} else {
+538: 		w.journal.State = "EXITED"
+539: 	}
+540: 	if !w.journal.Cancelled {
+541: 		for _, stream := range w.modelStreams {
+542: 			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+759: 	}
+760: 	if !w.journal.Cancelled {
+761: 		for _, stream := range w.modelStreams {
+762: 			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+763: 				return w.journal, errors.New("MODEL stream closure not reconciled")
+764: 			}
+765: 		}
+766: 	}
+767: 	if w.journal.State == "EXITED" {
+768: 		w.journal.State = "SETTLED"
+769: 	}
+770: 	if e := w.persist(); e != nil {
+771: 		return w.journal, e
+772: 	}
+773: 	return w.journal, nil
+774: }
+775: 
+776: // Observation is host-created. PID creation time is represented as decimal
+777: // text to retain all 64 bits through canonical JSON, unlike a float64 number.
+778: func (j BridgeJournal) Observation() (map[string]any, error) {
+779: 	manifest, e := bridgeMap(j.Manifest)
+780: 	if e != nil {
+781: 		return nil, e
+782: 	}
+783: 	admission, _ := manifest["admission"].(map[string]any)
+784: 	profile, _ := admission["profile"].(map[string]any)
+785: 	spec := map[string]any{"run_id": manifest["run_id"], "task_id": manifest["task_id"], "epoch": manifest["epoch"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "capabilities": []any{"start"}}
+786: 	if j.ContextReady {
+787: 		spec["capabilities"] = []any{"start", "context_rebuild"}
+788: 	}
+789: 	for _, key := range []string{"build_hash", "backend", "model", "sandbox", "platform", "adapter", "adapter_revision", "credential_revision"} {
+790: 		spec[key] = profile[key]
+791: 	}
+792: 	state := j.State
+793: 	if state == "EXITED" {
+794: 		state = "UNKNOWN"
+795: 	}
+796: 	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
+797: 		state = "CANCELLED"
+798: 	}
+799: 	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+800: }
+801: 
+802: // ReadBridgeTerminal checks the trusted directory and raw hashes. It never
+803: // creates a process, renews a lease or turns missing PID into success.
+804: func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+805: 	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+806: 	if e != nil {
+807: 		return BridgeJournal{}, errors.New("worker still owns dispatch")
+808: 	}
+809: 	defer lock.Close()
+810: 	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+811: 	if e != nil {
+812: 		return BridgeJournal{}, e
+813: 	}
+814: 	var j BridgeJournal
+815: 	if e = json.Unmarshal(raw, &j); e != nil {
+816: 		return j, e
+817: 	}
+818: 	digest, e := canonicalHash(j.Manifest)
+819: 	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+820: 		return j, errors.New("recovery manifest mismatch")
+821: 	}
+822: 	if j.Identity.PID != 0 {
+823: 		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+824: 		if e != nil || alive {
+825: 			return j, errors.New("old process identity not confirmed stopped")
+826: 		}
+827: 	}
+828: 	if j.Ended == "" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete {
+829: 		return j, errors.New("dispatch outcome UNKNOWN")
+830: 	}
+831: 	if j.State == "SETTLED" && (!j.ProtocolComplete || j.Acknowledged != j.Frames || j.Receipt.ExitCode != 0 || !j.Receipt.OutputCopied || j.Cancelled) {
+832: 		return j, errors.New("terminal protocol is not settled")
+833: 	}
+834: 	for file, digest := range map[string]string{"stdout.raw": j.StdoutHash, "stderr.raw": j.StderrHash} {
+835: 		f, e := os.Open(filepath.Join(directory, file))
+836: 		if e != nil {
+837: 			return j, e
+FILE internal/domain/runtime_command_queue_windows.go
+426: func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) error {
+427: 	type completion struct {
+428: 		seq      int64
+429: 		response any
+430: 		err      error
+431: 	}
+432: 	results := make(chan completion, 32)
+433: 	ready := map[int64]completion{}
+434: 	inflight := 0
+435: 	next := int64(1)
+436: 	frames := bridge.Frames()
+437: 	tick := time.NewTicker(40 * time.Millisecond)
+438: 	defer tick.Stop()
+439: 	var initialized time.Time
+440: 	var cancelSent time.Time
+441: 	var deferredError error
+442: 	for frames != nil || inflight > 0 {
+443: 		select {
+444: 		case observation := <-bridge.ModelObservations():
+445: 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+446: 			if err != nil {
+447: 				return err
+448: 			}
+449: 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+450: 				return err
+451: 			}
+452: 		case frame, ok := <-frames:
+453: 			if !ok {
+454: 				frames = nil
+455: 				continue
+456: 			}
+457: 			if frame.Type == "effect.request" {
+458: 				if inflight >= 16 {
+459: 					return Fail(409, "GATE_FAILED", "effect concurrency exceeds bound")
+460: 				}
+461: 				inflight++
+462: 				go func(f rt.BridgeFrame) {
+463: 					r, e := c.brokerEffect(brokerCtx, route, run, lease, epoch, bridge, f)
+464: 					results <- completion{f.Sequence, r, e}
+465: 				}(frame)
+466: 			} else {
+467: 				var response any
+468: 				var err error
+469: 				if strings.HasPrefix(frame.Type, "command.") {
+470: 					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+471: 					if err == nil && frame.Type == "command.accepted" {
+472: 						payload, e := Decode(frame.Payload)
+473: 						if e != nil {
+474: 							return e
+475: 						}
+476: 						if payload["initialized"] == true {
+477: 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+478: 						}
+479: 					}
+480: 				}
+481: 				if frame.Type == "checkpoint" {
+482: 					mutation.Lock()
+483: 					response, err = c.checkpoint(ctx, route, run, lease, epoch, locator, bridge, frame)
+484: 					mutation.Unlock()
+485: 				}
+486: 				if err != nil {
+487: 					return err
+488: 				}
+489: 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+490: 			}
+491: 		case done := <-results:
+492: 			inflight--
+493: 			if done.err != nil {
+494: 				var fenced int
+495: 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+496: 					return done.err
+497: 				}
+498: 				deferredError = done.err
+499: 			}
+500: 			ready[done.seq] = done
+501: 		case <-tick.C:
+502: 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+503: 				return err
+504: 			}
+505: 		case <-ctx.Done():
+506: 			return ctx.Err()
+507: 		}
+508: 		for {
+509: 			done, ok := ready[next]
+510: 			if !ok {
+511: 				break
+512: 			}
+513: 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+514: 				return err
+515: 			}
+516: 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+517: 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+518: 					return err
+519: 				}
+520: 			}
+521: 			delete(ready, next)
+522: 			next++
+523: 		}
+524: 	}
+525: 	if len(ready) != 0 {
+526: 		return Fail(409, "GATE_FAILED", "protocol receipt gap")
+527: 	}
+528: 	return deferredError
+FILE internal/domain/durability.go
+15: 	return Decode([]byte(raw))
+16: }
+17: func effectAppend(tx *sql.Tx, project, run, key string, o Object) error {
+18: 	var seq int64
+19: 	if e := tx.QueryRow("SELECT coalesce(max(sequence),0)+1 FROM resource_effects WHERE project=? AND run=? AND effect_key=?", project, run, key).Scan(&seq); e != nil {
+20: 		return e
+21: 	}
+22: 	o["sequence"] = seq
+23: 	o["observed_at"] = Now()
+24: 	_, e := tx.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)", project, run, key, seq, string(Bytes(o)))
+25: 	return e
+26: }
+27: func effectsReconciled(tx *sql.Tx, project, run string) error {
+28: 	var unresolved int
+29: 	e := tx.QueryRow(`SELECT count(*) FROM resource_effects x WHERE project=? AND run=? AND sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('STARTED','UNKNOWN')`, project, run).Scan(&unresolved)
+30: 	if e != nil {
+31: 		return e
+32: 	}
+33: 	if unresolved != 0 {
+34: 		return Fail(409, "STATE_CONFLICT", "unknown effects require reconciliation; blind retry prohibited")
+35: 	}
+36: 	return nil
+37: }
+38: 
+39: // PrepareEffect persists intent and cost admission in one transaction before
+40: // any provider request. The sole scheduler owns this; a worker cannot enqueue.
+41: func (s *Service) PrepareEffect(ctx context.Context, token, project, runID, key string, payload, cost Object) (Object, error) {
+42: 	tx, e := s.DB.BeginTx(ctx, nil)
+43: 	if e != nil {

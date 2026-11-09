@@ -1,0 +1,165 @@
+	return result, tx.Commit()
+}
+func (s *Service) prepareEffectTx(tx *sql.Tx, token, project, runID, key string, payload, cost Object) (Object, error) {
+	if e := resourceWriteLock(tx); e != nil {
+		return nil, e
+	}
+	p, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+	if e != nil {
+		return nil, e
+	}
+	if s.Contracts.Validate("Idempotency-Key", key) != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "stable effect key required")
+	}
+	digest := Hash([]any{payload, cost})
+	prior, e := latestEffect(tx, project, runID, key)
+	if e == nil {
+		if prior["request_hash"] != digest {
+			return nil, Fail(409, "IDEMPOTENCY_CONFLICT", "effect key payload changed")
+		}
+		return prior, nil
+	}
+	if e != sql.ErrNoRows {
+		return nil, e
+	}
+	run, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return nil, e
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return nil, e
+	}
+	if e = qualificationEffectBlocked(tx, project, task); e != nil {
+		if e = qualificationModelEffectAllowed(tx, project, task, payload); e != nil {
+			return nil, e
+		}
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	if task["active_run_id"] != runID || goal["status"] != "ACTIVE" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
+		return nil, Fail(409, "STATE_CONFLICT", "run is not permitted new effects")
+	}
+	if e = s.taskContextForRun(tx, project, run); e != nil {
+		return nil, e
+	}
+	if e = effectsReconciled(tx, project, runID); e != nil {
+		return nil, e
+	}
+	if cost["run_id"] != runID || cost["provider_request_id"] != key || cost["reservation_id"] != nil || (cost["operation"] != "RESERVE" && cost["operation"] != "UNKNOWN") {
+		return nil, Fail(422, "GATE_FAILED", "effect must bind a new reservation")
+	}
+	if e = s.Contracts.Validate("CostEntryRequest", cost); e != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "invalid cost request")
+	}
+	ledger, e := s.appendBudget(tx, project, cost)
+	if e != nil {
+		return nil, e
+	}
+	o := Object{"project_id": project, "goal_id": goal["id"], "task_id": task["id"], "run_id": runID, "key": key, "request_hash": digest, "payload": payload, "reservation_id": ledger["id"], "state": "PREPARED", "epoch": run["lease_epoch"], "context_bundle_id": task["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "receipt": nil}
+	if e = effectAppend(tx, project, runID, key, o); e != nil {
+		return nil, e
+	}
+	if e = s.event(tx, project, "Run", run, p.ID, ID(), "RUN_CHANGED"); e != nil {
+		return nil, e
+	}
+	return o, nil
+}
+
+// BeginEffect is an atomic one-time dispatch fence. A lost acknowledgement is
+// STARTED/UNKNOWN until trusted reconciliation, even when retries remain.
+func (s *Service) BeginEffect(ctx context.Context, token, project, runID, key string) (Object, error) {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	result, e := s.beginEffectTx(tx, token, project, runID, key)
+	if e != nil {
+		return nil, e
+	}
+	return result, tx.Commit()
+}
+func (s *Service) beginEffectTx(tx *sql.Tx, token, project, runID, key string) (Object, error) {
+	if e := resourceWriteLock(tx); e != nil {
+		return nil, e
+	}
+	_, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+	if e != nil {
+		return nil, e
+	}
+	o, e := latestEffect(tx, project, runID, key)
+	if e != nil {
+		return nil, e
+	}
+	if o["state"] != "PREPARED" {
+		return nil, Fail(409, "STATE_CONFLICT", "already dispatched; query provider before recovery")
+	}
+	run, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return nil, e
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return nil, e
+	}
+	if e = qualificationEffectBlocked(tx, project, task); e != nil {
+		payload, _ := o["payload"].(map[string]any)
+		if e = qualificationModelEffectAllowed(tx, project, task, payload); e != nil {
+			return nil, e
+		}
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	if goal["status"] != "ACTIVE" || task["status"] != "RUNNING" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" || task["active_run_id"] != runID {
+		return nil, Fail(409, "STATE_CONFLICT", "run stopped or superseded")
+	}
+	expiry, e := time.Parse(time.RFC3339Nano, Str(run, "lease_expires_at"))
+	if e != nil || !expiry.After(time.Now()) {
+		return nil, Fail(409, "LEASE_EXPIRED", "expired lease cannot start effect")
+	}
+	if e = s.taskContextForRun(tx, project, run); e != nil {
+		return nil, e
+	}
+	ledger, e := load(tx, project, "BudgetLedgerEntry", Str(o, "reservation_id"))
+	if e != nil {
+		return nil, e
+	}
+	var lastCost string
+	if e = tx.QueryRow("SELECT json_extract(body,'$.operation') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? ORDER BY rowid DESC LIMIT 1", project, runID, key).Scan(&lastCost); e != nil {
+		return nil, e
+	}
+	if lastCost != "RESERVE" && lastCost != "UNKNOWN" {
+		return nil, Fail(409, "STATE_CONFLICT", "settled or released cost cannot authorize a new effect")
+	}
+	chain, _, e := runBudgetScopes(tx, project, runID)
+	if e != nil {
+		return nil, e
+	}
+	for _, policy := range chain {
+		if policy["mode"] != "CAPPED" {
+			continue
+
+func sourceTx(t *testing.T, db *sql.DB, fn func(*sql.Tx) error) {
+	t.Helper()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestW07EvidenceNeedsSealedLiveSnapshotAndAllowedOrigin(t *testing.T) {
+	f, _, cursor := sourceProject(t)
+	actor := Principal{ID: "fixture-source"}
+	actor.Roles = []string{"SOURCE_ADAPTER"}

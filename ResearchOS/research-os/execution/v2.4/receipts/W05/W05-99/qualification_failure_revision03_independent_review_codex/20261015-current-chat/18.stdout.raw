@@ -1,0 +1,717 @@
+FILE adapters/runtime/data_root_windows.go
+1: //go:build windows
+2: 
+3: package runtime
+4: 
+5: import (
+6: 	"errors"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"strings"
+10: 	"sync"
+11: )
+12: 
+13: // DataRootLease is an opaque, process-local owner of the existing exclusive
+14: // coordinator.lock. The control process acquires it before opening SQLite and
+15: // the in-process coordinator may borrow it without opening a second writer.
+16: type DataRootLease struct {
+17: 	mu       sync.Mutex
+18: 	root     string
+19: 	file     *os.File
+20: 	closed   bool
+21: 	borrowed bool
+22: }
+23: 
+24: func AcquireDataRootLease(directory string) (*DataRootLease, error) {
+25: 	f, e := LockDataRoot(directory)
+26: 	if e != nil {
+27: 		return nil, e
+28: 	}
+29: 	root, e := filepath.Abs(directory)
+30: 	if e != nil {
+31: 		_ = f.Close()
+32: 		return nil, e
+33: 	}
+34: 	return &DataRootLease{root: filepath.Clean(root), file: f}, nil
+35: }
+36: 
+37: func (l *DataRootLease) Root() string {
+38: 	if l == nil {
+39: 		return ""
+40: 	}
+41: 	return l.root
+42: }
+43: 
+44: // Held observes the owner's live handle; it neither borrows nor acquires a lease.
+45: func (l *DataRootLease) Held() bool {
+46: 	if l == nil {
+47: 		return false
+48: 	}
+49: 	l.mu.Lock()
+50: 	defer l.mu.Unlock()
+51: 	if l.closed || l.file == nil {
+52: 		return false
+53: 	}
+54: 	_, err := l.file.Stat()
+55: 	return err == nil
+56: }
+57: 
+58: func (l *DataRootLease) Borrow(directory string) error {
+59: 	if l == nil {
+60: 		return errors.New("control data-root lease required")
+61: 	}
+62: 	root, e := filepath.Abs(directory)
+63: 	if e != nil {
+64: 		return e
+65: 	}
+66: 	l.mu.Lock()
+67: 	defer l.mu.Unlock()
+68: 	if l.closed || l.file == nil || !strings.EqualFold(filepath.Clean(root), l.root) {
+69: 		return errors.New("control data-root lease unavailable or mismatched")
+70: 	}
+71: 	if l.borrowed {
+72: 		return errors.New("control data-root lease already borrowed")
+73: 	}
+74: 	if _, e = l.file.Stat(); e != nil {
+75: 		return e
+76: 	}
+77: 	l.borrowed = true
+78: 	return nil
+79: }
+80: 
+81: func (l *DataRootLease) ReturnBorrow() error {
+82: 	if l == nil {
+83: 		return errors.New("control data-root lease required")
+84: 	}
+85: 	l.mu.Lock()
+86: 	defer l.mu.Unlock()
+87: 	if !l.borrowed {
+88: 		return errors.New("control data-root lease not borrowed")
+89: 	}
+90: 	l.borrowed = false
+91: 	return nil
+92: }
+93: 
+94: func (l *DataRootLease) Close() error {
+95: 	if l == nil {
+96: 		return nil
+97: 	}
+98: 	l.mu.Lock()
+99: 	defer l.mu.Unlock()
+100: 	if l.closed {
+101: 		return nil
+102: 	}
+103: 	if l.borrowed {
+104: 		return errors.New("control data-root lease still borrowed")
+105: 	}
+106: 	l.closed = true
+107: 	return l.file.Close()
+108: }
+FILE internal/domain/backup_configuration_upgrade.go
+1: package domain
+2: 
+3: // Exact schema22 ->23 coordinator. Historical upgrade plans remain separate.
+4: import (
+5: 	"context"
+6: 	"database/sql"
+7: 	"fmt"
+8: 	"os"
+9: 	"path/filepath"
+10: 	"reflect"
+11: 	"researchos.local/research-os/internal/store"
+12: 	"strings"
+13: )
+14: 
+15: const ConfigurationSchemaUpgradePlan = "schema22-to23-host-model-configuration-v1"
+16: const upgradeConfigurationSQLHash = "sha256:07feef35d8d114f3d31aa99684ce85be9d2fafd2d5090a2c8548789b636cf794"
+17: 
+18: var upgradeConfigurationTables = map[string]bool{"client_command_identities": true, "host_model_configurations": true, "host_model_config_heads": true}
+19: 
+20: func upgradeConfigurationRelease(root string, count int) (Object, [][]byte, error) {
+21: 	if count != 22 && count != 23 {
+22: 		return nil, nil, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+23: 	}
+24: 	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/0*.sql"))
+25: 	if e != nil || len(files) != count {
+26: 		return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS: require exact 1..%d", count)
+27: 	}
+28: 	manifest := Object{}
+29: 	sqls := make([][]byte, count+1)
+30: 	for i, file := range files {
+31: 		name := filepath.Base(file)
+32: 		if len(name) < 5 || name[:4] != fmt.Sprintf("%04d", i+1) {
+33: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS")
+34: 		}
+35: 		expected := upgradeMigrationHashes[name]
+36: 		switch name {
+37: 		case "0021_research_pending_windows.sql":
+38: 			expected = "sha256:36d4e5c93aa1edcd7ca5aca922b3bea11d5739f307bd11c6834936adf5552f32"
+39: 		case "0022_client_command_queue.sql":
+40: 			expected = upgradeQueueSQLHash
+41: 		case "0023_host_model_configuration.sql":
+42: 			expected = upgradeConfigurationSQLHash
+43: 		}
+44: 		raw, e := os.ReadFile(file)
+45: 		if e != nil || expected == "" || Digest(raw) != expected {
+46: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_HASH: %s", name)
+47: 		}
+48: 		manifest["migrations/sqlite/"+name] = expected
+49: 		sqls[i] = raw
+50: 	}
+51: 	for path, expected := range map[string]string{
+52: 		"spec/v2.0/contracts/domain.schema.json":             "sha256:b11439c80d15c9481d7940c98eb6517b5156470f871c839e505a8dce40e0b847",
+53: 		"spec/v2.0/contracts/openapi.json":                   "sha256:f1edd7955a1d134a675c5558618756db809d82729f8eebe622a9bc2605a58920",
+54: 		"internal/api/contracts/client.protocol.schema.json": "sha256:8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+55: 		"internal/api/contracts/domain.schema.json":          "sha256:b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54",
+56: 	} {
+57: 		raw, e := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+58: 		if e != nil || Digest(raw) != expected {
+59: 			return nil, nil, fmt.Errorf("UPGRADE_CONTRACT_HASH: %s", path)
+60: 		}
+61: 		manifest[path] = expected
+62: 	}
+63: 	raw, e := os.ReadFile(filepath.Join(root, "migrations/sqlite/next_v24_sessions.sql"))
+64: 	if e != nil || Digest(raw) != upgradeQueueSessionHash {
+65: 		return nil, nil, fmt.Errorf("UPGRADE_SESSION_SCHEMA_HASH")
+66: 	}
+67: 	manifest["migrations/sqlite/next_v24_sessions.sql"] = Digest(raw)
+68: 	sqls[count] = raw
+69: 	return manifest, sqls, nil
+70: }
+71: 
+72: func upgradeConfigurationTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+73: 	if len(sqls) != 24 {
+74: 		return "", "", fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+75: 	}
+76: 	stage, e := os.MkdirTemp("", ".researchos-configuration-template-")
+77: 	if e != nil {
+78: 		return "", "", e
+79: 	}
+80: 	defer backupDiscard(stage)
+81: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+82: 	if e != nil {
+83: 		return "", "", e
+84: 	}
+85: 	defer db.Close()
+86: 	for i, raw := range sqls[:22] {
+87: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+88: 			return "", "", e
+89: 		}
+90: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+91: 			return "", "", e
+92: 		}
+93: 	}
+94: 	if _, e = db.ExecContext(ctx, string(sqls[23])); e != nil {
+95: 		return "", "", e
+96: 	}
+97: 	if e = installClientSessionFence(ctx, db, false); e != nil {
+98: 		return "", "", e
+99: 	}
+100: 	before, e := backupSchema(db)
+101: 	if e != nil {
+102: 		return "", "", e
+103: 	}
+104: 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
+105: 		return "", "", e
+106: 	}
+107: 	if e = upgradeConfigurationMigration(ctx, db, sqls[22]); e != nil {
+108: 		return "", "", e
+109: 	}
+110: 	after, e := backupSchema(db)
+111: 	return before, after, e
+112: }
+113: 
+114: func upgradeConfigurationMigration(ctx context.Context, db *sql.DB, raw []byte) error {
+115: 	if Digest(raw) != upgradeConfigurationSQLHash {
+116: 		return fmt.Errorf("UPGRADE_MIGRATION_HASH")
+117: 	}
+118: 	versions, e := backupMigrations(db)
+119: 	if e != nil || !reflect.DeepEqual(versions, upgradeVersions(22)) {
+120: 		return fmt.Errorf("UPGRADE_SOURCE_VERSION")
+121: 	}
+122: 	before, e := upgradeRows(db)
+123: 	if e != nil {
+124: 		return e
+125: 	}
+126: 	tx, e := db.BeginTx(ctx, nil)
+127: 	if e != nil {
+128: 		return e
+129: 	}
+130: 	defer tx.Rollback()
+131: 	if _, e = tx.ExecContext(ctx, string(raw)); e != nil {
+132: 		return e
+133: 	}
+134: 	if _, e = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(23)"); e != nil {
+135: 		return e
+136: 	}
+137: 	after, e := upgradeQueueRows(tx)
+138: 	if e != nil {
+139: 		return e
+140: 	}
+141: 	for table, rows := range before {
+142: 		if table != "schema_migrations" && Hash(rows) != Hash(after[table]) {
+143: 			return fmt.Errorf("UPGRADE_MIGRATION_MUTATED_HISTORY: %s", table)
+144: 		}
+145: 	}
+146: 	for table := range upgradeConfigurationTables {
+147: 		rows, ok := after[table]
+148: 		if !ok || len(rows) != 0 {
+149: 			return fmt.Errorf("UPGRADE_CONFIGURATION_NOT_EMPTY")
+150: 		}
+151: 	}
+152: 	for table := range after {
+153: 		if _, ok := before[table]; !ok && !upgradeConfigurationTables[table] {
+154: 			return fmt.Errorf("UPGRADE_UNEXPECTED_TABLE")
+155: 		}
+FILE internal/domain/backup_queue_upgrade.go
+1: package domain
+2: 
+3: // Fixed source21 to target22 plan. Historical 13/14/20 guards are intentionally
+4: // separate: only the four source-defined operational kinds are unversioned.
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"fmt"
+9: 	"os"
+10: 	"path/filepath"
+11: 	"reflect"
+12: 	"researchos.local/research-os/adapters/protectedstore"
+13: 	"researchos.local/research-os/adapters/retrieval"
+14: 	"researchos.local/research-os/internal/store"
+15: 	"sort"
+16: 	"strings"
+17: 	"time"
+18: )
+19: 
+20: const QueueSchemaUpgradePlan = "schema21-to22-client-command-queue-v1"
+21: const upgradeQueueSQLHash = "sha256:e2abcc078bbac1c076736a40249d50c85e25b4c8fd93e975f8528f8f8277abcd"
+22: const upgradeQueueSessionHash = "sha256:1ca3930f96f7c2c99e7bc6e668dd5658393264cf1e6bf6352b47fb3de8c7dfe3"
+23: 
+24: var upgradeQueueTables = map[string]bool{"client_queue_fences": true, "client_command_queue": true, "client_control_requests": true, "client_control_receipts": true}
+25: 
+26: type upgradeQueueProtection struct {
+27: 	upgradeProtection
+28: 	contracts       *Contracts
+29: 	operationalHash string
+30: }
+31: 
+32: // Same-host continuity reads only directory metadata. It does not copy a
+33: // workspace, grant access, or replace the existing host authority/pin store.
+34: func upgradeQueueWorkspaceIdentity(db *sql.DB, opt LocalUpgradeOptions) (Object, error) {
+35: 	bindings, e := workspaceBackupBindings(db)
+36: 	if e != nil {
+37: 		return nil, e
+38: 	}
+39: 	manifest := Object{}
+40: 	for _, b := range bindings {
+41: 		path, e := upgradeExistingPath(b.RealPath)
+42: 		if e != nil {
+43: 			return nil, e
+44: 		}
+45: 		if !strings.EqualFold(filepath.Clean(path), filepath.Clean(b.RealPath)) {
+46: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_ALIAS")
+47: 		}
+48: 		info, e := os.Stat(path)
+49: 		if e != nil || !info.IsDir() {
+50: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_DIRECTORY")
+51: 		}
+52: 		if backupWorkspaceOverlaps(path, opt.Destination) || backupWorkspaceOverlaps(path, opt.Snapshot) {
+53: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_OUTPUT_OVERLAP")
+54: 		}
+55: 		identity, e := retrieval.Identity(path)
+56: 		if e != nil {
+57: 			return nil, e
+58: 		}
+59: 		manifest[b.AuthorizedRef] = Object{"path": path, "identity": identity, "principal": b.PrincipalID, "host_principal": b.HostPrincipalRef, "access": b.Access, "project": b.ProjectID}
+60: 	}
+61: 	return manifest, nil
+62: }
+63: 
+64: func upgradeQueueTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+65: 	if len(sqls) != 23 {
+66: 		return "", "", fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+67: 	}
+68: 	stage, e := os.MkdirTemp("", ".researchos-backup-stage-")
+69: 	if e != nil {
+70: 		return "", "", e
+71: 	}
+72: 	defer backupDiscard(stage)
+73: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+74: 	if e != nil {
+75: 		return "", "", e
+76: 	}
+77: 	defer db.Close()
+78: 	for i, raw := range sqls[:21] {
+79: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+80: 			return "", "", e
+81: 		}
+82: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+83: 			return "", "", e
+84: 		}
+85: 	}
+86: 	if _, e = db.ExecContext(ctx, string(sqls[22])); e != nil {
+87: 		return "", "", e
+88: 	}
+89: 	if e = installClientSessionFence(ctx, db, false); e != nil {
+90: 		return "", "", e
+91: 	}
+92: 	before, e := backupSchema(db)
+93: 	if e != nil {
+94: 		return "", "", e
+95: 	}
+96: 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
+97: 		return "", "", e
+98: 	}
+99: 	if e = upgradeQueueMigration(ctx, db, sqls[21], sqls[22]); e != nil {
+100: 		return "", "", e
+101: 	}
+102: 	after, e := backupSchema(db)
+103: 	return before, after, e
+104: }
+105: 
+106: func upgradeQueueMigration(ctx context.Context, db *sql.DB, raw, additive []byte) error {
+107: 	if Digest(raw) != upgradeQueueSQLHash || Digest(additive) != upgradeQueueSessionHash {
+108: 		return fmt.Errorf("UPGRADE_MIGRATION_HASH")
+109: 	}
+110: 	versions, e := backupMigrations(db)
+111: 	if e != nil || !reflect.DeepEqual(versions, upgradeVersions(21)) {
+112: 		return fmt.Errorf("UPGRADE_SOURCE_VERSION")
+113: 	}
+114: 	before, e := upgradeRows(db)
+115: 	if e != nil {
+116: 		return e
+117: 	}
+118: 	tx, e := db.BeginTx(ctx, nil)
+119: 	if e != nil {
+120: 		return e
+121: 	}
+122: 	defer tx.Rollback()
+123: 	// The exact additive schema must already exist. Reinstalling it must be a
+124: 	// no-op, not a repair of corrupt source state or a reconstruction of sessions.
+125: 	if _, e = tx.ExecContext(ctx, string(additive)); e != nil {
+126: 		return e
+127: 	}
+128: 	if e = installClientSessionFence(ctx, tx, false); e != nil {
+129: 		return e
+130: 	}
+131: 	if _, e = tx.ExecContext(ctx, string(raw)); e != nil {
+132: 		return e
+133: 	}
+134: 	if _, e = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(22)"); e != nil {
+135: 		return e
+136: 	}
+137: 	after, e := upgradeQueueRows(tx)
+138: 	if e != nil {
+139: 		return e
+140: 	}
+141: 	for table, rows := range before {
+142: 		if table == "schema_migrations" {
+143: 			continue
+144: 		}
+145: 		if Hash(rows) != Hash(after[table]) {
+146: 			return fmt.Errorf("UPGRADE_MIGRATION_MUTATED_HISTORY: %s", table)
+147: 		}
+148: 	}
+149: 	for table := range upgradeQueueTables {
+150: 		if rows, ok := after[table]; !ok || len(rows) != 0 {
+151: 			return fmt.Errorf("UPGRADE_QUEUE_NOT_EMPTY: %s", table)
+152: 		}
+153: 	}
+154: 	for table := range after {
+155: 		if _, ok := before[table]; !ok && !upgradeQueueTables[table] {
+156: 			return fmt.Errorf("UPGRADE_UNEXPECTED_TABLE: %s", table)
+157: 		}
+158: 	}
+159: 	var integrity string
+160: 	if e = tx.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); e != nil || integrity != "ok" {
+FILE internal/host/runtime_qualification_windows.go
+145: 	if e = h.db.QueryRowContext(ctx, `SELECT root FROM orchestration_identity WHERE principal=?`, owner).Scan(&ownerRoot); e != nil || ownerRoot == root {
+146: 		return "", "", errors.New("service authority must differ from registered Owner lineage")
+147: 	}
+148: 	if e = writePrivate(h.dir, "runtime-verifier-installation.json", record); e != nil {
+149: 		return "", "", e
+150: 	}
+151: 	return root, child, nil
+152: }
+153: 
+154: // QualifyLocalRuntime performs an explicitly requested managed operation. The
+155: // coordinator remains the sole launcher; this administrative host has no model
+156: // client. Separate verifier credentials never enter the coordinator or worker.
+157: func (h *Host) QualifyLocalRuntime(ctx context.Context, service *domain.Service, coordinator *domain.RuntimeCoordinator, apiURL string, request domain.LocalRuntimeQualificationRequest, install RuntimeVerifierInstallation) (domain.Object, error) {
+158: 	if e := coordinator.BeginLocalQualificationWindow(ctx, request.RequestID); e != nil {
+159: 		return nil, e
+160: 	}
+161: 	defer coordinator.EndLocalQualificationWindow(context.Background())
+162: 	if _, e := h.reverify(); e != nil {
+163: 		return nil, e
+164: 	}
+165: 	owner := h.boundPrincipal()
+166: 	if owner == "" {
+167: 		return nil, errors.New("managed qualification requires existing OS-bound Owner")
+168: 	}
+169: 	if _, e := h.ConfigurationMetadata(ctx, owner, "", nil); e != nil {
+170: 		return nil, e
+171: 	}
+172: 	ownerToken, e := service.IssueCredential(ctx, owner, 5*time.Minute)
+173: 	if e != nil {
+174: 		return nil, e
+175: 	}
+176: 	defer h.revokeCredentialByHash(context.Background(), owner, domain.Digest([]byte(ownerToken)))
+177: 	if e = coordinator.ValidateLocalQualification(ctx, ownerToken, request); e != nil {
+178: 		return nil, e
+179: 	}
+180: 	process, e := startRuntimeVerifier(ctx, install)
+181: 	if e != nil {
+182: 		return nil, e
+183: 	}
+184: 	defer process.close()
+185: 	root, principal, e := h.ensureRuntimeVerifier(ctx, owner, request.ProjectID, install)
+186: 	if e != nil {
+187: 		return nil, e
+188: 	}
+189: 	provenance := domain.Object{"schema": "researchos.local-runtime-administration.v1", "action": "EXPLICIT_QUALIFICATION_REQUEST", "request": request, "request_hash": domain.Hash(request), "installation": install, "installation_hash": domain.Hash(install), "service_root": root, "verifier_principal": principal, "process_identity": process.identity, "handshake_nonce": process.nonce, "owner": owner, "owner_host": h.InstanceID(), "os_principal_ref": h.identity.Ref, "application_separation": true, "protected_holdout": false}
+190: 	proof, e := service.RecordLocalRuntimeAdministration(ctx, ownerToken, request.ProjectID, provenance)
+191: 	if e != nil {
+192: 		return nil, e
+193: 	}
+194: 	run, e := coordinator.ExecuteLocalQualification(ctx, ownerToken, request)
+195: 	if e != nil {
+196: 		return domain.Object{"administration_ref": domain.Ref(proof, "Artifact"), "run": run, "state": "QUALIFICATION_NOT_ACCEPTED"}, e
+197: 	}
+198: 	review, e := service.LocalQualificationReview(ctx, ownerToken, request, domain.Str(run, "id"))
+199: 	if e != nil {
+200: 		return nil, e
+201: 	}
+202: 	// Issue only after execution is settled. The child process is still the same
+203: 	// verified PID/image/creation identity; it alone receives the short token.
+204: 	token, e := service.IssueCredential(ctx, principal, 2*time.Minute)
+205: 	if e != nil {
+206: 		return nil, e
+207: 	}
+208: 	defer h.revokeCredentialByHash(context.Background(), principal, domain.Digest([]byte(token)))
+209: 	epoch, _ := domain.Num(review, "epoch")
+210: 	job := verifier.Job{APIURL: apiURL, Token: token, PrincipalID: principal, ServiceRoot: root, ProjectID: request.ProjectID, RuntimeID: request.RuntimeID, TaskRef: review["task_ref"].(map[string]any), RunRef: review["run_ref"].(map[string]any), ProfileRef: review["profile_ref"].(map[string]any), ObservationRef: review["observation_ref"].(map[string]any), PlanHash: domain.Str(review, "plan_hash"), ExecutorID: domain.Str(review, "executor_id"), Epoch: epoch}
+211: 	job.VerificationSnapshot = review["verification_snapshot"].(map[string]any)
+212: 	job.VerificationSnapshotHash = domain.Str(review, "verification_snapshot_hash")
+213: 	result, e := process.verify(ctx, job)
+214: 	job.Token = ""
+215: 	if e != nil {
+216: 		return domain.Object{"state": "QUALIFICATION_NOT_ACCEPTED", "check_status": review["diagnostic_status"], "check_reason": review["diagnostic_reason"], "administration_ref": domain.Ref(proof, "Artifact")}, e
+217: 	}
+218: 	if domain.Str(result.RuntimeRef, "id") != request.RuntimeID {
+219: 		return nil, errors.New("verified runtime differs from Owner request")
+220: 	}
+221: 	// This re-enters the unchanged admission checks, including actual accepted
+222: 	// receipt/root/profile evidence. A child stdout claim cannot authorize use.
+223: 	expires := time.Now().UTC().Add(time.Duration(request.PurposeSeconds) * time.Second)
+224: 	if e = service.AuthorizeRuntimePurpose(ctx, ownerToken, request.ProjectID, request.RuntimeID, "mu_turn", expires); e != nil {
+225: 		return nil, e
+FILE internal/host/runtime_verifier_process_windows.go
+90: 		return errors.New("managed runtime JSON must have unique keys and valid encoding")
+91: 	}
+92: 	d := json.NewDecoder(strings.NewReader(string(strict)))
+93: 	d.DisallowUnknownFields()
+94: 	if d.Decode(target) != nil {
+95: 		return errors.New("managed runtime request invalid")
+96: 	}
+97: 	var extra any
+98: 	if d.Decode(&extra) != io.EOF {
+99: 		return errors.New("managed runtime request has trailing data")
+100: 	}
+101: 	return nil
+102: }
+103: 
+104: type runtimeVerifierProcess struct {
+105: 	cmd      *exec.Cmd
+106: 	in       io.WriteCloser
+107: 	out      io.ReadCloser
+108: 	cancel   context.CancelFunc
+109: 	identity supervisor.ProcessIdentity
+110: 	nonce    string
+111: 	waited   bool
+112: }
+113: 
+114: func startRuntimeVerifier(ctx context.Context, install RuntimeVerifierInstallation) (*runtimeVerifierProcess, error) {
+115: 	if e := verifyRuntimeVerifierImage(install); e != nil {
+116: 		return nil, e
+117: 	}
+118: 	deadline, cancel := context.WithTimeout(ctx, 3*time.Minute)
+119: 	p := &runtimeVerifierProcess{cancel: cancel}
+120: 	p.cmd = exec.CommandContext(deadline, install.Executable)
+121: 	p.cmd.Dir = filepath.Dir(install.Executable)
+122: 	p.cmd.Env = []string{}
+123: 	for _, name := range []string{"SystemRoot", "WINDIR", "TEMP", "TMP"} {
+124: 		if value := os.Getenv(name); value != "" {
+125: 			p.cmd.Env = append(p.cmd.Env, name+"="+value)
+126: 		}
+127: 	}
+128: 	p.cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+129: 	// These are dedicated inherited anonymous pipes. No token is placed in argv,
+130: 	// environment, a file, logs, worker configuration or the scheduler object.
+131: 	var e error
+132: 	if p.in, e = p.cmd.StdinPipe(); e != nil {
+133: 		cancel()
+134: 		return nil, e
+135: 	}
+136: 	if p.out, e = p.cmd.StdoutPipe(); e != nil {
+137: 		p.in.Close()
+138: 		cancel()
+139: 		return nil, e
+140: 	}
+141: 	p.cmd.Stderr = io.Discard
+142: 	if e = p.cmd.Start(); e != nil {
+143: 		p.in.Close()
+144: 		p.out.Close()
+145: 		cancel()
+146: 		return nil, errors.New("installed verifier process could not start")
+147: 	}
+148: 	ok := false
+149: 	defer func() {
+150: 		if !ok {
+151: 			p.close()
+152: 		}
+153: 	}()
+154: 	p.identity, e = supervisor.ObserveProcess(uint32(p.cmd.Process.Pid))
+155: 	if e != nil || "sha256:"+p.identity.ImageSHA256 != install.ExecutableHash {
+156: 		return nil, errors.New("verifier process does not match installed image")
+157: 	}
+158: 	var nonce [32]byte
+159: 	if _, e = rand.Read(nonce[:]); e != nil {
+160: 		return nil, e
+161: 	}
+162: 	p.nonce = hex.EncodeToString(nonce[:])
+163: 	if e = verifier.WriteFrame(p.in, verifier.Challenge{Protocol: verifier.Protocol, Nonce: p.nonce}); e != nil {
+164: 		return nil, errors.New("verifier handshake write failed")
+165: 	}
+166: 	var hello verifier.Hello
+167: 	if e = p.read(deadline, &hello); e != nil {
+168: 		return nil, e
+169: 	}
+170: 	if hello.Protocol != verifier.Protocol || hello.ServiceID != verifier.ServiceID || hello.Nonce != p.nonce || hello.PID != p.cmd.Process.Pid {
+171: 		return nil, errors.New("verifier process handshake identity differs")
+172: 	}
+173: 	ok = true
+174: 	return p, nil
+175: }
+176: func (p *runtimeVerifierProcess) read(ctx context.Context, target any) error {
+177: 	done := make(chan error, 1)
+178: 	go func() { done <- verifier.ReadFrame(p.out, target) }()
+179: 	timer := time.NewTimer(20 * time.Second)
+180: 	defer timer.Stop()
+181: 	select {
+182: 	case e := <-done:
+183: 		return e
+184: 	case <-ctx.Done():
+185: 		p.cancel()
+186: 		return errors.New("verifier process cancelled")
+187: 	case <-timer.C:
+188: 		p.cancel()
+189: 		return errors.New("verifier reply deadline exceeded")
+190: 	}
+191: }
+192: func (p *runtimeVerifierProcess) verify(ctx context.Context, job verifier.Job) (verifier.Result, error) {
+193: 	var result verifier.Result
+194: 	observed, e := supervisor.ObserveProcess(uint32(p.cmd.Process.Pid))
+195: 	if e != nil || observed != p.identity {
+196: 		return result, errors.New("verifier process identity changed before credential transfer")
+197: 	}
+198: 	job.Protocol, job.Nonce = verifier.Protocol, p.nonce
+199: 	if e = verifier.WriteFrame(p.in, job); e != nil {
+200: 		return result, errors.New("private verifier job transfer failed")
+201: 	}
+202: 	job.Token = ""
+203: 	_ = p.in.Close()
+204: 	if e = p.read(ctx, &result); e != nil {
+205: 		return result, e
+206: 	}
+207: 	e = p.cmd.Wait()
+208: 	p.waited = true
+209: 	if e != nil || result.Protocol != verifier.Protocol || result.Nonce != p.nonce || result.Status != "QUALIFIED" || result.ErrorCode != "" {
+210: 		for _, code := range []string{"TASK_RUN_BINDING", "PROFILE_EVIDENCE", "NATIVE_OBSERVATION", "OUTPUT_EVIDENCE", "FROZEN_CHECKS", "DETERMINISTIC_CHECK", "SERVER_ACCEPTANCE", "SERVER_QUALIFICATION"} {
+211: 			if result.ErrorCode == code {
+212: 				return result, errors.New("independent verifier rejected stage " + code)
+213: 			}
+214: 		}
+215: 		return result, errors.New("independent verifier did not qualify the runtime")
+FILE internal/domain/runtime_qualification_execution_windows.go
+70: 		return nil, nil, Fail(412, "STALE_INPUT", "qualification task inputs changed")
+71: 	}
+72: 	return runtime, task, nil
+73: }
+74: 
+75: // ValidateLocalQualification is read-only and exposes no token or execution
+76: // capability. The same checks run again under the sole scan lock before Begin.
+77: func (c *RuntimeCoordinator) ValidateLocalQualification(ctx context.Context, ownerToken string, request LocalRuntimeQualificationRequest) error {
+78: 	tx, e := c.service.DB.BeginTx(ctx, nil)
+79: 	if e != nil {
+80: 		return e
+81: 	}
+82: 	defer tx.Rollback()
+83: 	p, e := authenticate(tx, ownerToken)
+84: 	if e != nil {
+85: 		return e
+86: 	}
+87: 	_, task, e := c.localQualification(tx, p, request)
+88: 	if e == nil {
+89: 		e = c.validateLocalConfirmation(ctx, tx, p, request)
+90: 	}
+91: 	if e == nil && task["status"] != "DRAFT" {
+92: 		return Fail(409, "STATE_CONFLICT", "qualification request was already consumed; no automatic retry")
+93: 	}
+94: 	return e
+95: }
+96: 
+97: // ExecuteLocalQualification joins the single coordinator lifecycle. Scan does
+98: // not claim qualification tasks, so a trusted explicit request must bridge
+99: // Begin to RunAdmitted exactly once. Cancellation/recovery never relaunches it.
+100: func (c *RuntimeCoordinator) ExecuteLocalQualification(ctx context.Context, ownerToken string, request LocalRuntimeQualificationRequest) (Object, error) {
+101: 	c.scanMu.Lock()
+102: 	unlock := true
+103: 	defer func() {
+104: 		if unlock {
+105: 			c.scanMu.Unlock()
+106: 		}
+107: 	}()
+108: 	if c.quiesced || !c.qualificationActive || c.qualificationRequest != request.RequestID {
+109: 		return nil, Fail(409, "RESOURCE_BLOCKED", "runtime intake is fenced")
+110: 	}
+111: 	if !c.startupComplete {
+112: 		if e := c.Recover(ctx); e != nil {
+113: 			return nil, e
+114: 		}
+115: 		c.startupComplete = true
+116: 	}
+117: 	tx, e := c.service.DB.BeginTx(ctx, nil)
+118: 	if e != nil {
+119: 		return nil, e
+120: 	}
+121: 	p, e := authenticate(tx, ownerToken)
+122: 	if e != nil {
+123: 		tx.Rollback()
+124: 		return nil, e
+125: 	}
+126: 	_, task, e := c.localQualification(tx, p, request)
+127: 	if e != nil {
+128: 		tx.Rollback()
+129: 		return nil, e
+130: 	}
+131: 	if task["status"] != "DRAFT" {
+132: 		tx.Rollback()
+133: 		return nil, Fail(409, "STATE_CONFLICT", "qualification already consumed; no automatic retry")
+134: 	}
+135: 	var route RuntimeCoordinatorRoute
+136: 	for _, current := range c.runtimeRoutes() {
+137: 		if current.ProjectID == request.ProjectID && current.RuntimeID == request.RuntimeID {
+138: 			if route.RuntimeID != "" {
+139: 				tx.Rollback()
+140: 				return nil, errors.New("ambiguous qualification route")
+141: 			}
+142: 			route = current
+143: 		}
+144: 	}
+145: 	if route.RuntimeID == "" {
+146: 		tx.Rollback()
+147: 		return nil, Fail(503, "MODEL_UNAVAILABLE", "prepared route unavailable")
+148: 	}
+149: 	var active int
+150: 	e = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.executor_principal_id')=? AND json_extract(body,'$.status') NOT IN ('SETTLED','FAILED','CANCELLED')`, route.ProjectID, route.ExecutorID).Scan(&active)

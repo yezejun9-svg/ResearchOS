@@ -1,0 +1,108 @@
+--- a/internal/domain/backup.go
++++ b/internal/domain/backup.go
+@@ -58,6 +58,12 @@
+ 	preserveQueueUpgradeWorkspaces         func(*sql.DB) error
+ 	preserveConfigurationUpgradeWorkspaces func(*sql.DB) error
+ 	preservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error
++	publicPreparedAbandonmentHandoff bool
++}
++
++// Ordinary public validation remains mandatory for the fixed handoff policy.
++func backupOrdinaryPublicPolicy(policy *backupPolicy) bool {
++    return policy == nil || policy.publicPreparedAbandonmentHandoff
+ }
+ 
+ func backupFormat(policy *backupPolicy) string {
+@@ -525,10 +531,10 @@
+ 		}
+ 		files[f.Name] = raw
+ 	}
+-	if files["state.sqlite"] == nil || (policy == nil && files["portable.json"] == nil) {
++	if files["state.sqlite"] == nil || (backupOrdinaryPublicPolicy(policy) && files["portable.json"] == nil) {
+ 		return m, nil, fmt.Errorf("BACKUP_REQUIRED_FILE_MISSING")
+ 	}
+-	if policy != nil && files["portable.json"] != nil {
++	if !backupOrdinaryPublicPolicy(policy) && files["portable.json"] != nil {
+ 		return m, nil, fmt.Errorf("UPGRADE_PORTABLE_EXPORT_PROHIBITED")
+ 	}
+ 	return m, files, nil
+@@ -579,7 +585,7 @@
+ 	if e != nil {
+ 		return r, e
+ 	}
+-	if policy == nil {
++	if backupOrdinaryPublicPolicy(policy) {
+ 		if e = backupWorkspaceRestorePaths(files, directory, destination); e != nil {
+ 			return r, e
+ 		}
+@@ -631,7 +637,7 @@
+ 	if schema != m.SchemaHash {
+ 		return r, fmt.Errorf("BACKUP_SCHEMA_HASH_MISMATCH")
+ 	}
+-	if policy == nil {
++	if backupOrdinaryPublicPolicy(policy) {
+ 		queue, err := backupQueueState(db)
+ 		if err != nil {
+ 			return r, err
+@@ -694,9 +700,12 @@
+ 		e = policy.preserveConfigurationUpgradeWorkspaces(db)
+ 	} else if policy != nil && policy.preservePreparedAbandonmentUpgradeWorkspaces != nil {
+ 		plan, ok := policy.purpose["plan"].(Object)
+-		if !ok || policy.format != localUpgradeFormat || plan["id"] != PreparedAbandonmentSchemaUpgradePlan {
+-			return r, fmt.Errorf("RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH")
+-		}
++        fixedLocal := ok && policy.format == localUpgradeFormat && plan["id"] == PreparedAbandonmentSchemaUpgradePlan
++        fixedPublic := policy.publicPreparedAbandonmentHandoff && policy.format == "RESEARCHOS_BACKUP_V1" &&
++            len(policy.purpose) == 0 && policy.allowProtected == nil
++        if !fixedLocal && !fixedPublic {
++            return r, fmt.Errorf("RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH")
++        }
+ 		e = policy.preservePreparedAbandonmentUpgradeWorkspaces(db)
+ 	} else {
+ 		workspaceRequests, e = backupPrepareWorkspaces(ctx, db, files, stage, destination)
+--- a/ops/backup/main.go
++++ b/ops/backup/main.go
+@@ -25,7 +25,7 @@
+ }
+ func run() error {
+ 	if len(os.Args) < 2 {
+-		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local [flags]")
++		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+ 	}
+ 	command := os.Args[1]
+ 	f := flag.NewFlagSet(command, flag.ContinueOnError)
+@@ -39,6 +39,8 @@
+ 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+ 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+ 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
++    handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
++    handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+ 	if e := f.Parse(os.Args[2:]); e != nil {
+ 		return e
+ 	}
+@@ -67,12 +69,24 @@
+ 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
+ 		return nil
+ 	}
+-	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" {
++	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+ 		return fmt.Errorf("unknown command")
+ 	}
+ 	if *out == "" {
+ 		return fmt.Errorf("--out required")
+ 	}
++    if command == "upgrade-prepared-backup" {
++        r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
++            Upgrade: domain.LocalUpgradeOptions{
++                Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
++                SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
++                TargetProgram: *targetProgram, Plan: *plan,
++            },
++            BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
++        })
++        if e != nil { return e }
++        return json.NewEncoder(os.Stdout).Encode(r)
++    }
+ 	if command == "upgrade-local" {
+ 		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+ 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,

@@ -1,0 +1,156 @@
+335: 	failed = false
+336: 	go w.wait(child, profile)
+337: 	return w, nil
+338: }
+339: 
+340: func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+341: 	w.mu.Lock()
+342: 	defer w.mu.Unlock()
+343: 	if chunk.Offset != w.streamOffsets[chunk.Stream] {
+344: 		return errors.New("stream sequence gap")
+345: 	}
+346: 	f := w.stdout
+347: 	if chunk.Stream == "stderr" {
+348: 		f = w.stderr
+349: 	}
+350: 	if _, e := f.Write(chunk.Data); e != nil {
+351: 		return e
+352: 	}
+353: 	if e := f.Sync(); e != nil {
+354: 		return e
+355: 	}
+356: 	w.streamOffsets[chunk.Stream] += int64(len(chunk.Data))
+357: 	if chunk.Stream != "stdout" {
+358: 		return nil
+359: 	}
+360: 	w.pending = append(w.pending, chunk.Data...)
+361: 	for {
+362: 		end := bytes.IndexByte(w.pending, '\n')
+363: 		if end < 0 {
+364: 			break
+365: 		}
+366: 		line := w.pending[:end]
+367: 		w.pending = w.pending[end+1:]
+368: 		if len(line) == 0 || len(line) > 64*1024 {
+369: 			return errors.New("protocol frame size invalid")
+370: 		}
+371: 		var frame BridgeFrame
+372: 		if _, e := canonical.JSON(line); e != nil {
+373: 			return errors.New("invalid canonical JSON protocol line")
+374: 		}
+375: 		shape, shapeErr := bridgeMap(line)
+376: 		if shapeErr != nil {
+377: 			return shapeErr
+378: 		}
+379: 		if _, auxiliary := shape["version"]; auxiliary {
+380: 			if err := w.consumeModelFrame(line); err != nil {
+381: 				return err
+382: 			}
+383: 			continue
+384: 		}
+385: 		decoder := json.NewDecoder(bytes.NewReader(line))
+386: 		decoder.DisallowUnknownFields()
+387: 		if e := decoder.Decode(&frame); e != nil {
+388: 			return errors.New("invalid typed protocol")
+389: 		}
+390: 		if e := decoder.Decode(new(any)); e != io.EOF {
+391: 			return errors.New("one complete JSON object per protocol line required")
+392: 		}
+393: 		if frame.Sequence != w.journal.Frames+1 || w.journal.ProtocolComplete {
+394: 			return errors.New("protocol sequence or terminal ordering invalid")
+395: 		}
+396: 		switch frame.Type {
+397: 		case "context.ready":
+398: 			payload, err := bridgeMap(frame.Payload)
+399: 			if err != nil || w.journal.ContextReady || payload["input_hash"] != w.journal.InputHash {
+400: 				return errors.New("context acknowledgement mismatch")
+401: 			}
+402: 			if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
+403: 				return errors.New("pause capability unsupported")
+404: 			}
+405: 			w.journal.ContextReady = true
+406: 		case "effect.request", "checkpoint":
+407: 			if !w.journal.ContextReady || w.journal.QueueRequired && (w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence) {
+408: 				return errors.New("context and queue initialization acknowledgement required before work")
+409: 			}
+410: 			if frame.Type == "checkpoint" {
+411: 				if err := w.capturePauseCheckpoint(frame); err != nil {
+412: 					return err
+413: 				}
+414: 				w.journal.CheckpointSequence = frame.Sequence
+415: 			}
+416: 		case "turn.paused":
+417: 			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence || w.journal.CheckpointSeal == nil {
+418: 				return errors.New("durably acknowledged checkpoint required before pause")
+419: 			}
+420: 			var paused CheckpointSeal
+421: 			if json.Unmarshal(frame.Payload, &paused) != nil || paused.Version != PauseProtocol || !samePauseBinding(paused.Binding, w.journal.Checkpoint.Binding) || paused.Sequence != w.journal.CheckpointSequence || paused.ContentHash != w.journal.Checkpoint.ContentHash || paused.PauseID != w.journal.PauseID || paused.CheckpointUsePrincipal != w.journal.CheckpointSeal.CheckpointUsePrincipal || paused.CheckpointArtifactID != w.journal.CheckpointSeal.CheckpointArtifactID || paused.CheckpointUseReceiptHash != w.journal.CheckpointSeal.CheckpointUseReceiptHash || paused.JournalCheckpointHash != w.journal.CheckpointSeal.JournalCheckpointHash {
+422: 				return errors.New("paused seal correlation mismatch")
+423: 			}
+424: 			w.journal.Paused, w.journal.ProtocolComplete = true, true
+425: 		case "turn.completed":
+426: 			if !w.journal.ContextReady || w.journal.QueueRequired && !w.journal.QueueSealed {
+427: 				return errors.New("context acknowledgement required before completion")
+428: 			}
+429: 			w.journal.ProtocolComplete = true
+430: 		case "command.accepted", "command.consumed", "command.cleared", "command.abort_observed", "command.idle", "command.sealed":
+431: 			if !w.journal.ContextReady || !w.journal.QueueRequired || len(w.journal.CommandReceipts) >= 256 {
+432: 				return errors.New("unexpected or excessive command receipt")
+433: 			}
+434: 			payload, err := bridgeMap(frame.Payload)
+435: 			if err != nil || w.validateControlBinding(payload) != nil {
+436: 				return errors.New("unbound command receipt")
+437: 			}
+438: 			if frame.Type == "command.accepted" && payload["initialized"] == true {
+439: 				if w.journal.QueueInitSequence != 0 {
+440: 					return errors.New("duplicate initialization receipt")
+441: 				}
+442: 				if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
+443: 					return errors.New("pause initialization negotiation failed")
+444: 				}
+445: 				w.journal.QueueInitSequence = frame.Sequence
+446: 			} else if w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence {
+447: 				return errors.New("command receipt before initialization")
+448: 			}
+449: 			if frame.Type == "command.abort_observed" {
+450: 				w.journal.QueueAbortObserved = payload["sdk_idle"] == true && payload["sdk_queue_empty"] == true
+451: 			}
+452: 			if frame.Type == "command.idle" || frame.Type == "command.sealed" {
+453: 				if !w.journal.Cancelled && payload["cancelled"] != true {
+454: 					for _, stream := range w.modelStreams {
+455: 						if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+456: 							return errors.New("SDK idle before MODEL stream observations reconciled")
+457: 						}
+458: 					}
+459: 				}
+460: 				if payload["sdk_idle"] != true || payload["sdk_queue_empty"] != true {
+461: 					return errors.New("false SDK settlement witness")
+462: 				}
+463: 				w.journal.QueueIdle = true
+464: 				if payload["cancelled"] == true && w.journal.QueueAbortObserved {
+465: 					w.journal.QueueCancelIdle = true
+466: 				}
+467: 			}
+468: 			if frame.Type == "command.sealed" {
+469: 				w.journal.QueueSealed = true
+470: 			}
+471: 			w.journal.CommandReceipts = append(w.journal.CommandReceipts, frame)
+472: 		default:
+473: 			return errors.New("unknown protocol frame")
+474: 		}
+475: 		w.journal.Frames = frame.Sequence
+476: 		if strings.HasPrefix(frame.Type, "command.") || frame.Type == "checkpoint" || frame.Type == "turn.paused" {
+477: 			if err := w.persist(); err != nil {
+478: 				return err
+479: 			}
+480: 		}
+481: 		select {
+482: 		case w.frames <- frame:
+483: 		default:
+484: 			return errors.New("protocol queue overflow")
+485: 		}
+486: 	}
+487: 	if len(w.pending) > 64*1024 {
+488: 		return errors.New("protocol frame overflow")
+489: 	}
+490: 	return nil

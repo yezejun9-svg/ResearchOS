@@ -1,0 +1,90 @@
+--- v2
++++ v3
+@@ -2,10 +2,11 @@
+ import hashlib
+ import json
+ import os
++import sys
+ from pathlib import Path
+ 
+ ROOT = Path(r'D:/作品集/ResearchOS/research-os')
+-REGISTRATION = 'execution/v2.4/receipts/W05/W05-99/integration_codex/session-list-closedcopy-root-r318'
++REGISTRATION = 'execution/v2.4/receipts/W05/W05-99/integration_codex/session-list-closedcopy-root-r319'
+ CANONICAL = ['execution/v2.4/' + n + '.json' for n in
+              ['checkpoint', 'path_ownership', 'step_state', 'commands']]
+ CASES = ['NullContext', 'OwnedContext', 'ContextNotResultFilter', 'ExactReplayAfterCommit',
+@@ -94,11 +95,12 @@
+             'ordered_cases', 'limits', 'registration_namespace', 'expected_registration',
+             'runner_ref', 'launcher_ref', 'authorization_gate_ref', 'owned_process_helper_ref',
+             'author14_review_ref', 'author14_handoff_ref', 'author14_manifest_ref',
+-            'runtime_resources_ref', 'main_git', 'launch_limits']
++            'runtime_resources_ref', 'main_git', 'launch_limits', 'python_flags']
+     return {key: scope[key] for key in keys}
+ 
+ 
+ def load_scope(reader, scope_path, scope_sha256):
++    require(sys.flags.no_site, 'Python site startup must be disabled')
+     sr = reader.ref(scope_path)
+     require(sr['sha256'] == scope_sha256, 'Scope SHA')
+     scope = reader.doc(sr)
+@@ -107,7 +109,8 @@
+             scope['source_paths_sha256'] == SOURCE_HASHES, 'Candidate/owner mismatch')
+     require(scope['ordered_cases'] == CASES and scope['limits'] == CAPS, 'Roster/caps mismatch')
+     require(scope['registration_namespace'] == REGISTRATION and
+-            scope['expected_registration'] == [318, 146, 410], 'Registration identity')
++            scope['expected_registration'] == [319, 147, 413], 'Registration identity')
++    require(scope['python_flags'] == ['-I', '-S', '-X', 'utf8'], 'Python isolation flags')
+     require(scope['first_unexpected_stop'] is True and scope['same_input_automatic_retry'] is False
+             and scope['counter_reset'] is False, 'Stop/retry policy')
+     require(scope['source_acceptance'] is False and scope['Main_integration_authorized'] is False
+@@ -150,7 +153,7 @@
+     require([x['canonical_path'] for x in canonical_copies] == CANONICAL, 'Canonical order')
+     docs = [reader.doc(x['ref']) for x in canonical_copies]
+     cp, ow = docs[:2]
+-    require([cp['revision'], ow['revision'], len(cp['failure_counters'])] == [318, 146, 410], 'Canonical revision')
++    require([cp['revision'], ow['revision'], len(cp['failure_counters'])] == [319, 147, 413], 'Canonical revision')
+     require(cp['project_id'] == 'aede0678-7308-43dc-b9f2-cfe3d90cfdfb', 'Project identity')
+     wip = cp['work_in_progress']
+     require(wip['session_list_closedcopy_root_finite14_scope_ref'] == scope_ref, 'Scope not registered')
+@@ -192,7 +195,7 @@
+     verified = sealed(registration['verified'])
+     require(audit['actor'] == 'codex:/root' and
+             audit['status'] == 'ACTUAL_CANONICAL_REGISTRATION_CLOSED_NO_CASE_ACCEPTANCE' and
+-            audit['before'] == [317, 145, 410] and audit['after'] == [318, 146, 410] and
++            audit['before'] == [318, 146, 410] and audit['after'] == [319, 147, 413] and
+             audit['actual_registration_exit'] == 0, 'Registration audit not completed')
+     require(inv['actor'] == 'codex:/root' and inv['actual_exit'] == 0 and
+             inv['automatic_retry'] is False and inv['counter_reset'] is False, 'Registration invocation')
+@@ -203,7 +206,7 @@
+             reg_review['reviewer'] != 'codex:/root' and
+             reg_review['decision'] == 'REGISTRATION_DRAFT_REVIEWED_FOR_ROOT_EXECUTION' and
+             reg_review['requested_changes'] == [] and reg_review['actual_registration_executed'] is False and
+-            reg_review['expected_before'] == [317,145,410] and reg_review['expected_after'] == [318,146,410], 'Registration independent review')
++            reg_review['expected_before'] == [318,146,410] and reg_review['expected_after'] == [319,147,413], 'Registration independent review')
+     for key, name in [('register_sha256','register.py'), ('wrapper_sha256','run.py'),
+                       ('prepared_refs_sha256','prepared_refs.json'), ('audit_sha256','audit.json')]:
+         rr = reader.ref(ROOT/REGISTRATION/name)
+@@ -213,10 +216,10 @@
+     for name in ['stdout', 'stderr']:
+         rr = reader.ref(ROOT/REGISTRATION/(name+'.raw'))
+         require(listed.get(str(bounded_path(rr['path']))) == rr and inv[name+'_sha256'] == rr['sha256'], 'Registration raw')
+-    require([verified['checkpoint'],verified['ownership'],verified['failure_origins']] == [318,146,410]
++    require([verified['checkpoint'],verified['ownership'],verified['failure_origins']] == [319,147,413]
+             and verified['intent_ref'] == registration['intent'], 'Registration postverify')
+     require(intent['actor'] == 'codex:/root' and intent['Main_head'] == scope['main_git']['head'] and
+-            intent['transition'] == {'checkpoint':[317,318], 'ownership':[145,146], 'failures':[410,410]}, 'Intent transition')
++            intent['transition'] == {'checkpoint':[318,319], 'ownership':[146,147], 'failures':[410,413]}, 'Intent transition')
+     require([x['path'] for x in intent['metadata']] == CANONICAL[:2], 'Intent metadata shape')
+     for idx, entry in enumerate(intent['metadata']):
+         reader.verify(entry['original_ref'])
+@@ -229,7 +232,9 @@
+     require([x['path'] for x in intent['unchanged']] == CANONICAL[2:], 'Intent unchanged order')
+     for idx, item in enumerate(intent['unchanged'],2):
+         require(canonical_copies[idx]['ref']['sha256'] == item['sha256'], 'Unchanged canonical mismatch')
+-    require(docs[0]['failure_counters'] == strict_json(reader.verify(intent['metadata'][0]['original_ref']))['failure_counters'], 'Failure history changed')
++    original_failures = strict_json(reader.verify(intent['metadata'][0]['original_ref']))['failure_counters']
++    require(len(original_failures) == 410 and len(docs[0]['failure_counters']) == 413 and
++            docs[0]['failure_counters'][:410] == original_failures, 'Failure history prefix changed')
+     return {'runner_review_ref':runner_ref, 'author14_review_ref':author_ref, 'registration_review_ref':inv['review_ref']}
+ 
+ 

@@ -1,0 +1,258 @@
+internal/domain\runtime_model_windows.go:53:func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+internal/domain\runtime_qualification_confirmation_windows_test.go:13:func confirmationFixture(t *testing.T) (*fixture, *RuntimeCoordinator, LocalRuntimeQualificationRequest, string) {
+internal/domain\runtime_qualification_execution_windows.go:180:func (c *RuntimeCoordinator) beginManagedLocalQualification(ctx context.Context, token string, request LocalRuntimeQualificationRequest, executor string) (Object, string, error) {
+	if e = c.projectSessionEffects(tx, route.ProjectID, run, nil); e != nil {
+		tx.Rollback()
+		return nil, e
+	}
+	if e = tx.Commit(); e != nil {
+		return nil, e
+	}
+	c.boundary("effect_started", intent)
+	if provider.Capability == "TOOL" {
+		return c.brokerTool(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
+	if provider.Capability == "MODEL" {
+		return c.brokerModel(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
+	if provider.Capability == "SOURCE" {
+		return c.brokerResearchSource(ctx, route, provider, runID, lease, epoch, frame, payload, intent)
+	}
+	if provider.Capability == "EXPERIMENT" {
+		return c.brokerResearchExperiment(ctx, route, runID, lease, epoch, frame, payload, intent)
+	}
+	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
+	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", frame.Key)
+	if provider.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+	}
+	// No shared proxy credentials, redirects or automatic semantic retry.
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("provider redirect denied") }}
+	defer client.CloseIdleConnections()
+	response, e := client.Do(req)
+	if e == nil {
+		c.boundary("provider_responded", intent)
+	}
+	unknown := func(reason string) (Object, error) {
+		c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason})
+		return nil, Fail(409, "STATE_CONFLICT", "provider outcome UNKNOWN; query provider before recovery")
+	}
+	if e != nil {
+		return unknown("provider transport ended without receipt")
+	}
+	raw, e := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
+	response.Body.Close()
+	if e != nil || len(raw) > 64*1024 || response.StatusCode < 200 || response.StatusCode >= 300 {
+		return unknown("provider returned no bounded successful receipt")
+	}
+	for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+		if secret != "" && bytes.Contains(raw, []byte(secret)) {
+			return unknown("provider response contained a host credential")
+		}
+	}
+	receipt, e := Decode(raw)
+	if e != nil || receipt["key"] != frame.Key || Hash(receipt["epoch"]) != Hash(epoch) || receipt["run_id"] != runID || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+		return unknown("provider receipt binding invalid")
+	}
+	actual, ok := receipt["actual_cost"].(map[string]any)
+	if !ok || c.service.Contracts.Validate("Money", actual) != nil {
+		return unknown("provider actual cost missing")
+	}
+	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+		return unknown("provider receipt persistence failed")
+	}
+	c.boundary("effect_receipt_durable", intent)
+	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+		return nil, e
+	}
+	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
+}
+
+// This is the last MODEL authority gate before prepareEffectTx writes the
+// first durable effect. Keeping all three checks together lets a fixture prove
+// that a rejected projection cannot create a reservation or provider request.
+func validateModelEffectBeforePrepare(tx *sql.Tx, project, runID string, task Object, manifest map[string]any, effectKey string, payload Object) error {
+	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if err != nil {
+		return err
+	}
+	if _, err = validateRuntimeModelRequest(effective, payload); err != nil {
+		return err
+	}
+	return runtimeModelCallGate(tx, project, runID, effectKey, effective)
+}
+
+const runtimeFactMaxBytes = 4*1024*1024 + 128*1024
+
+func writeRuntimeFact(path string, raw []byte) error {
+	if len(raw) == 0 || len(raw) > runtimeFactMaxBytes {
+		return errors.New("encoded host fact exceeds persistence bound")
+	}
+	temp := path + ".pending"
+	f, e := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return e
+	}
+	_, e = f.Write(raw)
+	e = errors.Join(e, f.Sync(), f.Close())
+	if e != nil {
+		return e
+	}
+	if _, e = os.Stat(path); e == nil {
+		old, e := os.ReadFile(path)
+		if e == nil && bytes.Equal(old, raw) {
+			os.Remove(temp)
+			return nil
+		}
+		return errors.New("immutable host fact already exists")
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"testing"
+	"time"
+)
+
+func confirmationFixture(t *testing.T) (*fixture, *RuntimeCoordinator, LocalRuntimeQualificationRequest, string) {
+	t.Helper()
+	f, client, candidate, assets := localSetupFixture(t)
+	ctx := context.Background()
+	prepared, e := f.s.PrepareClientRuntime(ctx, f.token, candidate, assets, client.Doc, client.ConfigurationAuthority)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ids, tokens := map[string]string{}, map[string]string{}
+	for _, role := range []string{"EXECUTOR", "SCHEDULER"} {
+		ids[role], e = f.s.EnsureRuntimeSetupPrincipal(ctx, f.token, f.project, role)
+		if e != nil {
+			t.Fatal(e)
+		}
+		tokens[role], e = f.s.IssueCredential(ctx, ids[role], time.Minute)
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	c := &RuntimeCoordinator{service: f.s, config: RuntimeCoordinatorConfig{ClientSchema: client.Doc, ConfigurationAuthority: client.ConfigurationAuthority}, active: map[string]bool{}, startupComplete: true}
+	if e = c.InstallPreparedRuntime(ctx, prepared, ids["EXECUTOR"], tokens["EXECUTOR"], tokens["SCHEDULER"], assets); e != nil {
+		t.Fatal(e)
+	}
+	r, e := c.PreparedLocalQualification(ctx, f.token, candidate, 600)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return f, c, r, ids["EXECUTOR"]
+}
+
+// A fresh, isolated confirmation row allows each invalid timestamp/binding to
+// reach the transaction check without modifying any previously recorded row.
+func isolatedConfirmation(t *testing.T, f *fixture, r LocalRuntimeQualificationRequest) LocalRuntimeQualificationRequest {
+	t.Helper()
+	r.RequestID = ID()
+	_, e := f.db.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-confirmation',?,?,200,?,'{}',?)`, f.owner, f.project, r.RequestID, Hash(r), Bytes(r), Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	return r
+}
+
+func TestManagedConfirmationBeginTransactionGates(t *testing.T) {
+	for _, name := range []string{"expired", "future_issue", "long_ttl", "wrong_owner", "wrong_root", "wrong_host", "wrong_session_hash", "wrong_config_hash", "changed_session_revision", "changed_model", "changed_plan", "unregistered", "owner_revoked"} {
+		t.Run(name, func(t *testing.T) {
+			f, c, r, executor := confirmationFixture(t)
+			ctx := context.Background()
+			before := localSetupCensus(t, f)
+			switch name {
+			case "expired":
+				r.IssuedAt = time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+				r.ExpiresAt = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+			case "future_issue":
+				r.IssuedAt = time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+				r.ExpiresAt = time.Now().Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
+			case "long_ttl":
+				r.ExpiresAt = time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+			case "wrong_owner":
+				r.OwnerPrincipal = "foreign-owner"
+			case "wrong_root":
+				r.OwnerRoot = "foreign-root"
+			case "wrong_host":
+				r.OwnerHost = "host-111111111111"
+			case "wrong_session_hash":
+				r.SessionHash = Digest([]byte("changed"))
+			case "wrong_config_hash":
+				r.ConfigurationHash = Digest([]byte("changed"))
+			case "changed_session_revision":
+				if _, e := f.db.Exec(`UPDATE client_sessions SET revision=revision+1 WHERE id=?`, r.SessionID); e != nil {
+					t.Fatal(e)
+				}
+			case "changed_model":
+				if _, e := f.db.Exec(`UPDATE client_sessions SET model_config_ref=NULL WHERE id=?`, r.SessionID); e != nil {
+					t.Fatal(e)
+				}
+			case "changed_plan":
+				r.PlanHash = Digest([]byte("changed"))
+			case "unregistered":
+				r.RequestID = ID()
+			case "owner_revoked":
+				if e := f.s.RevokePrincipal(ctx, f.owner); e != nil {
+					t.Fatal(e)
+				}
+			}
+			if name != "unregistered" {
+				r = isolatedConfirmation(t, f, r)
+			}
+			// Bypass wrapper/preflight deliberately. Begin itself must reject atomically.
+			if _, _, e := c.beginManagedLocalQualification(ctx, f.token, r, executor); e == nil {
+				t.Fatal("invalid confirmation reached atomic Begin")
+			}
+			var consumed int
+			if e := f.db.QueryRow(`SELECT count(*) FROM idempotency WHERE operation='host:managed-runtime-qualification'`).Scan(&consumed); e != nil || consumed != 0 {
+				t.Fatalf("rejected request consumed: %d %v", consumed, e)
+			}
+			if localSetupCensus(t, f) != before {
+				t.Fatal("rejected confirmation changed Run/effect/ledger activity")
+			}
+		})
+	}
+}
+
+func TestManagedConfirmationClaimCrashAndStatus(t *testing.T) {
+	f, c, r, executor := confirmationFixture(t)
+	ctx := context.Background()
+	run, lease, e := c.beginManagedLocalQualification(ctx, f.token, r, executor)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = c.beginManagedLocalQualification(ctx, f.token, r, executor); e == nil {
+		t.Fatal("claimed request replayed")
+	}
+	var body string
+	f.db.QueryRow(`SELECT body FROM idempotency WHERE operation='host:managed-runtime-qualification' AND key=?`, r.RequestID).Scan(&body)
+	if strings.Contains(body, lease) {
+		t.Fatal("Run lease escaped into durable confirmation")
+	}
+	// Fresh coordinator instance simulates loss of all in-memory management state.
+	restarted := &RuntimeCoordinator{service: f.s, config: c.config, active: map[string]bool{}, startupComplete: true}
+	if fenced, e := restarted.managedQualificationUnsettled(ctx); e != nil || !fenced {
+		t.Fatalf("claimed Run did not restore fence: %v", e)
+	}
+	if e = restarted.Scan(ctx); e != nil || restarted.ClientIntakeOpen() {
+		t.Fatalf("restart escaped outstanding claim fence: %v", e)
+	}
+	status, e := restarted.LocalQualificationStatus(ctx, f.token, r.ProjectID, r.RequestID, Hash(r))
+	if e != nil || status["state"] != "UNRESOLVED" || status["consumed"] != true {
+		t.Fatalf("original claim status lost: %s %v", Bytes(status), e)
+	}
+	if e = c.BeginLocalQualificationWindow(ctx, ID()); e == nil {
+		t.Fatal("outstanding Run admitted another qualification")
+	}
+	if e = c.EndLocalQualificationWindow(ctx); e == nil {

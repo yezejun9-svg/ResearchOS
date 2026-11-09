@@ -1,0 +1,609 @@
+package domain
+
+// PROPOSED PURE COMPONENT TESTS ONLY. Not run/compiled; no database/SQL tests
+// are hidden here. Passing these would NOT qualify proof modes 0..8 or SQL24.
+import (
+	"bytes"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+)
+
+type f08TestFixture struct {
+	functions [3]f08Scalar
+	header []byte
+	identity []byte
+	identityObject map[string]any
+}
+
+func f08TestJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil { t.Fatal(err) }
+	return b
+}
+
+func f08TestHeader(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	return f08TestJSON(t, struct {
+		Schema string `json:"schema"`
+		Encoding string `json:"encoding"`
+		Raw string `json:"raw_envelope_base64"`
+	}{f08HeaderSchema, "base64", base64.StdEncoding.EncodeToString(raw)})
+}
+
+func f08TestSetup(t *testing.T) f08TestFixture {
+	t.Helper()
+ f := f08TestDataSetup(t)
+ functions, err := f08BuildCallbacks(backupConfigurationProtocol, backupConfigurationDomain)
+ if err != nil { t.Fatal(err) }; f.functions=functions; return f
+}
+func f08TestDataSetup(t *testing.T) f08TestFixture {
+ t.Helper()
+ raw := []byte(`{"protocol_version":"researchos-client/2","command_id":"cancel-one","client_id":"client-one","project_id":"project-one","session_id":"session-one","expected_revision":7,"writer_epoch":3,"method":"session.control","payload":{"action":"CANCEL","target_id":"goal-one","reason":"fixture"}}`)
+	envelope, err := DecodeEnvelope(raw)
+	if err != nil { t.Fatal(err) }
+	hash, err := envelope.ContentHash()
+	if err != nil { t.Fatal(err) }
+	identity := map[string]any{"format":f08IdentityFormat, "principal":"owner-one", "project":"project-one", "operation":"v2:session.control", "key":"cancel-one", "request_hash":hash, "command_id":"cancel-one", "method":"session.control", "client_id":"client-one", "session_id":"session-one", "writer_epoch":3, "expected_revision":7, "target_id":"goal-one"}
+	return f08TestFixture{[3]f08Scalar{}, f08TestHeader(t, raw), f08TestJSON(t, identity), identity}
+}
+
+func f08TestRequireOne(t *testing.T, fn f08Scalar, args ...driver.Value) {
+	t.Helper()
+	v, err := fn(nil, args)
+	if err != nil || v != int64(1) { t.Fatalf("expected int64(1), value type=%T error=%v", v, err) }
+}
+
+func f08TestRequireError(t *testing.T, fn f08Scalar, expected f08Error, args ...driver.Value) {
+	t.Helper()
+	v, err := fn(nil, args)
+	if err == nil || v != nil { t.Fatalf("expected fail-closed nil/error, type=%T err=%v", v, err) }
+	if expected != "" && err != expected { t.Fatalf("wrong fixed error: %v", err) }
+}
+
+func f08TestResponse(t *testing.T, status string, revision int, result any) []byte {
+	t.Helper()
+	return f08TestJSON(t, map[string]any{"protocol_version":ProtocolV2, "command_id":"cancel-one", "method":"session.control", "status":status, "session_id":"session-one", "revision":revision, "error_code":nil, "error":nil, "result":result})
+}
+
+func f08TestACK(t *testing.T) []byte {
+	t.Helper()
+	return f08TestResponse(t, "ACKNOWLEDGED", 7, map[string]any{"accepted_at":"2026-01-01T00:00:00Z", "operation_id":"op-cancel-one", "after_sequence":12, "related_resource_ref":nil})
+}
+
+func f08TestCompleted(t *testing.T) ([]byte, map[string]any) {
+	t.Helper()
+	snapshot := map[string]any{
+		"session_id":"session-one", "project_id":"project-one", "workspace_ref":"workspace-one",
+		"native_session_ref":"native-one", "core_build_id":"build-one", "protocol_version":ProtocolV2,
+		"revision":8, "title":"fixture", "archived_at":nil, "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:01Z", "model_config_ref":"configuration-one",
+		"goal_id":"goal-one", "active_run_id":nil, "run_status":nil, "goal_status":"CANCELLED", "writer":nil,
+		"event_sequence":13, "earliest_event_sequence":0, "checkpoint_artifact_ref":nil,
+		"pending_command_ids":[]any{"other-command"}, "pending_permissions":[]any{}, "resume_requires_explicit_user":false,
+		"messages":[]any{}, "transcript_artifact_ref":nil, "has_earlier_messages":false,
+	}
+	return f08TestResponse(t, "COMPLETED", 8, map[string]any{"action":"CANCEL", "target_id":"goal-one", "control_request_id":"ctrl-cancel-one", "settled":true, "children_stopped":true, "queue_empty":true, "snapshot":snapshot}), snapshot
+}
+
+func f08TestBinding(t *testing.T, f f08TestFixture, old, current []byte, snapshot map[string]any) []byte {
+	t.Helper()
+	p := map[string]any{"admitted_root_hash":"sha256:"+strings.Repeat("a",64), "original_response_digest":f08RawHash(current), "final_root_hash":nil, "final_response_digest":nil, "final_snapshot_binding":nil}
+	if snapshot != nil {
+		pendingHash, err := f08ValueHash(snapshot["pending_command_ids"])
+		if err != nil { t.Fatal(err) }
+		p["final_root_hash"] = "sha256:"+strings.Repeat("b",64)
+		p["final_response_digest"] = f08RawHash(current)
+		p["final_snapshot_binding"] = map[string]any{"session_id":"session-one", "project_id":"project-one", "revision":snapshot["revision"], "event_sequence":snapshot["event_sequence"], "pending_command_ids_digest":pendingHash}
+	}
+	if old != nil { p["original_response_digest"] = f08RawHash(old) }
+	return f08TestJSON(t, map[string]any{"identity":f.identityObject, "response_proof":p})
+}
+
+func TestF08ProposedRequestOriginalTuple(t *testing.T) {
+	f := f08TestSetup(t)
+	f08TestRequireOne(t, f.functions[0], f.header, f.identity)
+	for _, key := range []string{"principal", "project", "key", "request_hash", "command_id", "method", "client_id", "session_id", "target_id"} {
+		t.Run(key, func(t *testing.T) {
+			m := map[string]any{}
+			for k,v := range f.identityObject { m[k]=v }
+			m[key] = "changed"
+			if key == "principal" {
+				// Principal is SQL producer authority, not present in Envelope.
+				// Local callback must not invent authentication from this field.
+				f08TestRequireOne(t, f.functions[0], f.header, f08TestJSON(t,m))
+				return
+			}
+			f08TestRequireError(t, f.functions[0], "", f.header, f08TestJSON(t,m))
+		})
+	}
+}
+
+func TestF08ProposedStrictHeader(t *testing.T) {
+	f:=f08TestSetup(t)
+	for name, raw := range map[string][]byte{
+		"legacy-empty":{}, "legacy-object":[]byte(`{}`), "null":[]byte(`null`),
+		"case-key":bytes.Replace(f.header,[]byte(`"schema"`),[]byte(`"Schema"`),1),
+		"duplicate-escaped":bytes.Replace(f.header,[]byte(`{`),[]byte(`{"\u0073chema":"x",`),1),
+		"trailing-value":append(bytes.Clone(f.header),[]byte(` {}`)...),
+		"leading-space":append([]byte(" "),f.header...),
+		"header-over-bound":bytes.Repeat([]byte("x"),f08HeaderMaximum+1),
+	} {
+		t.Run(name,func(t *testing.T){f08TestRequireError(t,f.functions[0],"",raw,f.identity)})
+	}
+}
+
+func TestF08ProposedDriverTypes(t *testing.T) {
+	f:=f08TestSetup(t)
+	for name,value := range map[string]driver.Value{"null":nil,"text":string(f.header),"integer":int64(1),"real":float64(1),"boolean":true} {
+		t.Run(name,func(t *testing.T){f08TestRequireError(t,f.functions[0],f08Arguments,value,f.identity)})
+	}
+	f08TestRequireError(t,f.functions[0],f08Arguments,f.header)
+	f08TestRequireError(t,f.functions[2],f08Arguments,float64(-2),[]byte("x"))
+}
+
+func TestF08ProposedStrictNumbers(t *testing.T) {
+	f:=f08TestSetup(t)
+	for _, lexeme := range []string{"7.0000000000000001","9223372036854775808","true","null","\"7\"","0","-1"} {
+		t.Run(lexeme,func(t *testing.T){
+			identity:=bytes.Replace(f.identity,[]byte(`"expected_revision":7`),[]byte(`"expected_revision":`+lexeme),1)
+			f08TestRequireError(t,f.functions[0],"",f.header,identity)
+		})
+	}
+}
+
+func TestF08ProposedResponseModes(t *testing.T) {
+	f:=f08TestSetup(t)
+	ack:=f08TestACK(t)
+	complete,snapshot:=f08TestCompleted(t)
+	t.Run("initial-ack",func(t *testing.T){f08TestRequireOne(t,f.functions[1],f.header,f08TestBinding(t,f,nil,ack,nil),nil,ack,int64(0))})
+	t.Run("original-completed",func(t *testing.T){f08TestRequireOne(t,f.functions[1],f.header,f08TestBinding(t,f,nil,complete,snapshot),nil,complete,int64(1))})
+	t.Run("ack-completed-local-wire",func(t *testing.T){f08TestRequireOne(t,f.functions[1],f.header,f08TestBinding(t,f,ack,complete,snapshot),ack,complete,int64(2))})
+	t.Run("old-null-mode2",func(t *testing.T){f08TestRequireError(t,f.functions[1],f08Arguments,f.header,f08TestBinding(t,f,ack,complete,snapshot),nil,complete,int64(2))})
+	t.Run("old-present-mode1",func(t *testing.T){f08TestRequireError(t,f.functions[1],f08Arguments,f.header,f08TestBinding(t,f,nil,complete,snapshot),ack,complete,int64(1))})
+	t.Run("reverse",func(t *testing.T){f08TestRequireError(t,f.functions[1],"",f.header,f08TestBinding(t,f,complete,ack,snapshot),complete,ack,int64(2))})
+}
+
+func TestF08ProposedResponseFullSchemaAndRawDigest(t *testing.T) {
+	f:=f08TestSetup(t)
+	ack:=f08TestACK(t)
+	complete,snapshot:=f08TestCompleted(t)
+	binding:=f08TestBinding(t,f,ack,complete,snapshot)
+	for name,raw:=range map[string][]byte{
+		"wrong-session":bytes.Replace(complete,[]byte(`"session-one"`),[]byte(`"session-two"`),1),
+		"unsettled":bytes.Replace(complete,[]byte(`"settled":true`),[]byte(`"settled":false`),1),
+		"null-revision":bytes.Replace(complete,[]byte(`"revision":8`),[]byte(`"revision":null`),1),
+		"duplicate-escaped":bytes.Replace(complete,[]byte(`{`),[]byte(`{"\u0073tatus":"COMPLETED",`),1),
+		"raw-whitespace-changed":append([]byte(" "),complete...),
+	} {
+		t.Run(name,func(t *testing.T){
+			candidateBinding:=binding
+			if name!="raw-whitespace-changed" {
+				// Recompute transport digest so these controls reach full raw
+				// schema/identity checking rather than failing only a digest.
+				candidateBinding=f08TestBinding(t,f,ack,raw,snapshot)
+			}
+			f08TestRequireError(t,f.functions[1],"",f.header,candidateBinding,ack,raw,int64(2))
+		})
+	}
+	t.Run("invalid-ack-operation",func(t *testing.T){
+		bad:=bytes.Replace(ack,[]byte(`"op-cancel-one"`),[]byte(`"op-other"`),1)
+		f08TestRequireError(t,f.functions[1],f08Binding,f.header,f08TestBinding(t,f,nil,bad,nil),nil,bad,int64(0))
+	})
+}
+
+func TestF08ProposedLargeLegalResponseNotCapped(t *testing.T) {
+	f:=f08TestSetup(t)
+	_,snapshot:=f08TestCompleted(t)
+	snapshot["title"]=strings.Repeat("界",400000)
+	complete:=f08TestResponse(t,"COMPLETED",8,map[string]any{"action":"CANCEL","target_id":"goal-one","control_request_id":"ctrl-cancel-one","settled":true,"children_stopped":true,"queue_empty":true,"snapshot":snapshot})
+	if len(complete)<=1<<20 { t.Fatal("fixture did not exceed old rejected response cap") }
+	f08TestRequireOne(t,f.functions[1],f.header,f08TestBinding(t,f,nil,complete,snapshot),nil,complete,int64(1))
+}
+
+func TestF08ProposedDigestAndTypeViolationModes(t *testing.T) {
+	f:=f08TestSetup(t)
+	raw:=[]byte{0,0xff,0x61}
+	v,err:=f.functions[2](nil,[]driver.Value{int64(-2),raw})
+	if err!=nil || v!=f08RawHash(raw) { t.Fatal("raw digest altered bytes") }
+	a,err:=f.functions[2](nil,[]driver.Value{int64(-1),[]byte(`{"b":2,"a":1}`)})
+	if err!=nil {t.Fatal(err)}
+	b,err:=f.functions[2](nil,[]driver.Value{int64(-1),[]byte(` { "a":1,"b":2 } `)})
+	if err!=nil || a!=b {t.Fatal("canonical digest mismatch")}
+	f08TestRequireError(t,f.functions[2],f08StorageClass,int64(9),[]byte("F08_STORAGE_CLASS"))
+	f08TestRequireError(t,f.functions[2],f08Mode,int64(10),[]byte(`{}`))
+}
+
+func TestF08ProposedIncompleteProofNeverAuthorizes(t *testing.T) {
+	f:=f08TestSetup(t)
+	for mode, action:=range map[int64]string{0:"admitted.insert",1:"final.insert",2:"origin.insert",4:"dispatch.update",5:"journal.insert",6:"control.insert",7:"pin.insert",8:"origin.derive"} {
+		t.Run(fmt.Sprint(mode),func(t *testing.T){
+			var old any
+			if mode==4 {old=[]any{"old"}}
+			input:=f08TestJSON(t,map[string]any{"action":action,"row":[]any{"not-proof"},"old":old,"sources":[]any{}})
+			f08TestRequireError(t,f.functions[2],"",mode,input) // malformed one-column tuple must still refuse; no all-error stub expectation
+		})
+	}
+	// Mode3 has no concrete action literal in the current SQL; no guessed alias.
+	f08TestRequireError(t,f.functions[2],f08Unwired,int64(3),[]byte(`{"action":"legacy.insert","row":[1],"old":null,"sources":[]}`))
+}
+
+func TestF08ProposedBoundaryContainsPanic(t *testing.T) {
+	fn:=f08Boundary(func([]driver.Value)(driver.Value,error){panic("SYNTHETIC_SECRET_DO_NOT_ECHO")})
+	f08TestRequireError(t,fn,f08Panic)
+	fn=f08Boundary(func([]driver.Value)(driver.Value,error){return nil,nil})
+	f08TestRequireError(t,fn,f08Panic)
+}
+
+func TestF08ProposedSchemaHashBeforeInitialization(t *testing.T) {
+	b:=bytes.Clone(backupConfigurationProtocol)
+	b[0]^=1
+	if _,err:=f08BuildCallbacks(b,backupConfigurationDomain);err!=f08Schema {t.Fatal("changed protocol accepted")}
+	b=bytes.Clone(backupConfigurationDomain)
+	b[0]^=1
+	if _,err:=f08BuildCallbacks(backupConfigurationProtocol,b);err!=f08Schema {t.Fatal("changed external accepted")}
+}
+
+func TestF08ProposedRepeatedInputHasNoRetainedArguments(t *testing.T) {
+	f:=f08TestSetup(t)
+	h:=bytes.Clone(f.header)
+	f08TestRequireOne(t,f.functions[0],h,f.identity)
+	for i:=range h {h[i]=0}
+	f08TestRequireError(t,f.functions[0],f08JSON,h,f.identity)
+	f08TestRequireOne(t,f.functions[0],f.header,f.identity)
+	// This narrow lifetime control is not a proof of all concurrency/IO freedom.
+}
+
+
+func f08ProofTestHex(t *testing.T,v any)string{t.Helper();b,e:=f08Encode(v);if e!=nil{t.Fatal(e)};return strings.ToUpper(hex.EncodeToString(b))}
+func f08ProofTestDispatch()[]any{return []any{"p","run",f08Number(7),"dispatch","7B7D","manifest","STARTED","worker","dispatch","7B7D",f08Number(0),"","prepared","updated","reason"}}
+func f08ProofTestSource(category string,row []any)*f08Sources{return &f08Sources{rows:map[string][][]any{category:{row}}}}
+func f08ProofTestCall(t *testing.T,v *f08ProofValidator,mode int64,action string,row,old []any,sources []any)(driver.Value,error){t.Helper();var oldValue any;if old!=nil{oldValue=old};b,e:=f08Encode(map[string]any{"action":action,"row":row,"old":oldValue,"sources":sources});if e!=nil{t.Fatal(e)};return v.evaluate(mode,b)}
+
+func TestF08ProofSourceMultisetAndKeyTypes(t *testing.T){
+	relation:=[]any{"p","Task","task",f08Number(1),"/dependency_task_ids","p","Task","prior",f08Number(2)}
+	t.Run("duplicate_relation_retained",func(t *testing.T){s,e:=f08DecodeSources([]any{[]any{"domain_refs",relation},[]any{"domain_refs",relation}});if e!=nil || len(s.rows["domain_refs"])!=2{t.Fatalf("actual duplicate multiset lost: %v",e)}})
+	t.Run("duplicate_real_key_refused",func(t *testing.T){r:=[]any{"p","Task","t",f08Number(1),"7B7D",nil};if _,e:=f08DecodeSources([]any{[]any{"domain_versions",r},[]any{"domain_versions",r}});e==nil{t.Fatal("duplicate PK accepted")}})
+	t.Run("integer_text_refused",func(t *testing.T){r:=append([]any(nil),relation...);r[3]="1";if _,e:=f08DecodeSources([]any{[]any{"domain_refs",r}});e==nil{t.Fatal("TEXT supplied as INTEGER")}})
+	t.Run("nullable_sql_key_kept",func(t *testing.T){r:=[]any{nil,"p","run","7B7D"};s,e:=f08DecodeSources([]any{[]any{"routes",r},[]any{"routes",r}});if e!=nil || len(s.rows["routes"])!=2{t.Fatal("SQLite nullable key semantics lost",e)}})
+	t.Run("unknown_category_refused",func(t *testing.T){if _,e:=f08DecodeSources([]any{[]any{"invented",relation}});e==nil{t.Fatal("unknown category")}})
+}
+func TestF08ProofDispatchUnknownMonotone(t *testing.T){
+	v:=&f08ProofValidator{}
+	for _,state:=range []string{"PREPARED","STARTED","UNKNOWN"}{t.Run(state+"_to_UNKNOWN",func(t *testing.T){old:=f08ProofTestDispatch();old[6]=state;row:=append([]any(nil),old...);row[6]="UNKNOWN";row[13]="later";row[14]="cleanup unavailable";if e:=v.dispatchUpdate(f08ProofTestSource("dispatches",old),old,row);e!=nil{t.Fatal(e)}})}
+	t.Run("identity_erasure_refused",func(t *testing.T){old:=f08ProofTestDispatch();old[9]=f08ProofTestHex(t,map[string]any{"pid":f08Number(2)});row:=append([]any(nil),old...);row[6]="UNKNOWN";row[9]="7B7D";if e:=v.dispatchUpdate(f08ProofTestSource("dispatches",old),old,row);e==nil{t.Fatal("erased identity")}})
+	t.Run("observed_to_unknown_refused",func(t *testing.T){old:=f08ProofTestDispatch();old[6]="OBSERVED";row:=append([]any(nil),old...);row[6]="UNKNOWN";if e:=v.dispatchUpdate(f08ProofTestSource("dispatches",old),old,row);e==nil{t.Fatal("OBSERVED rewind")}})
+	t.Run("source_old_mismatch_refused",func(t *testing.T){old:=f08ProofTestDispatch();row:=append([]any(nil),old...);row[6]="UNKNOWN";actual:=append([]any(nil),old...);actual[3]="other";if e:=v.dispatchUpdate(f08ProofTestSource("dispatches",actual),old,row);e==nil{t.Fatal("caller OLD substituted")}})
+}
+func TestF08ProofControlRecoveryDoesNotFinalize(t *testing.T){
+	v:=&f08ProofValidator{};old:=[]any{"principal","p","c","session","ctrl-c","hash","goal","5B5D","REQUESTED",nil,nil,"created"}
+	t.Run("legacy_reconciling_preserves_bytes",func(t *testing.T){row:=append([]any(nil),old...);row[8]="RECONCILING";if e:=v.control(f08ProofTestSource("controls",old),"control.update",old,row);e!=nil{t.Fatal(e)}})
+	t.Run("missing_original_final_refused",func(t *testing.T){row:=append([]any(nil),old...);row[8]="CONFIRMED";if e:=v.control(f08ProofTestSource("controls",old),"control.update",old,row);e==nil{t.Fatal("legacy became final")}})
+	t.Run("recovery_header_backfill_refused",func(t *testing.T){row:=append([]any(nil),old...);row[8]="RECONCILING";row[9]="7B7D";if e:=v.control(f08ProofTestSource("controls",old),"control.update",old,row);e==nil{t.Fatal("recovery backfill")}})
+	t.Run("recovery_membership_change_refused",func(t *testing.T){row:=append([]any(nil),old...);row[8]="RECONCILING";row[7]="5B2278225D";if e:=v.control(f08ProofTestSource("controls",old),"control.update",old,row);e==nil{t.Fatal("membership changed")}})
+}
+func TestF08ProofPendingExactOriginalCommand(t *testing.T){
+	q:=make([]any,18);q[1],q[2],q[3],q[14]="p","other-queue","s","SENDING"
+	c1:=make([]any,12);c1[1],c1[2],c1[3],c1[8]="p","this","s","REQUESTED"
+	c2:=append([]any(nil),c1...);c2[2]="other-control"
+	s:=&f08Sources{rows:map[string][][]any{"queue":{q},"controls":{c1,c2}}}
+	t.Run("other_pending_kept_sorted",func(t *testing.T){if !f08Equal(f08Pending(s,"p","s","this"),[]any{"other-control","other-queue"}){t.Fatal("other pending removed")}})
+	t.Run("queue_same_command_not_hidden",func(t *testing.T){q[2]="this";if !f08Equal(f08Pending(s,"p","s","this"),[]any{"other-control","this"}){t.Fatal("pending queue hidden by control removal")}})
+}
+func TestF08ProofBoundNativeIdentity(t *testing.T){
+	good:=map[string]any{"pid":f08Number(42),"process_created_ns":"123","job":"owned","appcontainer_sid":"sid","profile":"sandbox","staging_directory":"stage"}
+	t.Run("actual_shape",func(t *testing.T){if e:=f08BoundIdentity(good);e!=nil{t.Fatal(e)}})
+	t.Run("empty_or_partial",func(t *testing.T){if e:=f08BoundIdentity(map[string]any{"pid":f08Number(42)});e==nil{t.Fatal("partial identity")}})
+	t.Run("numeric_text_alias",func(t *testing.T){b:=map[string]any{};for k,v:=range good{b[k]=v};b["process_created_ns"]="0123";if e:=f08BoundIdentity(b);e==nil{t.Fatal("timestamp alias")}})
+	t.Run("pid_overflow",func(t *testing.T){b:=map[string]any{};for k,v:=range good{b[k]=v};b["pid"]=f08Number(4294967296);if e:=f08BoundIdentity(b);e==nil{t.Fatal("pid overflow")}})
+}
+func TestF08ProofHistoricalEffectPrefix(t *testing.T){
+	one:=map[string]any{"effect_key":"key","sequence":f08Number(1),"epoch":f08Number(7),"body_digest":"sha256:"+strings.Repeat("a",64)}
+	two:=map[string]any{"effect_key":"key","sequence":f08Number(2),"epoch":f08Number(8),"body_digest":"sha256:"+strings.Repeat("b",64)}
+	t.Run("legal_append_not_replacement",func(t *testing.T){if e:=f08EffectPrefix([]any{one},[]any{one,two});e!=nil{t.Fatal(e)}})
+	t.Run("original_deleted",func(t *testing.T){if e:=f08EffectPrefix([]any{one},[]any{two});e==nil{t.Fatal("lost original")}})
+	t.Run("epoch_relabelled",func(t *testing.T){changed:=map[string]any{};for k,v:=range one{changed[k]=v};changed["epoch"]=f08Number(8);if e:=f08EffectPrefix([]any{one},[]any{changed,two});e==nil{t.Fatal("old epoch reassigned")}})
+	t.Run("duplicate_key_sequence",func(t *testing.T){if e:=f08EffectPrefix([]any{one},[]any{one,one});e==nil{t.Fatal("duplicate sequence")}})
+}
+func TestF08ProofModeDispatchPositiveAndClosedFailures(t *testing.T){
+	v:=&f08ProofValidator{};old:=f08ProofTestDispatch();row:=append([]any(nil),old...);row[6]="UNKNOWN"
+	t.Run("mode4_real_old_tuple",func(t *testing.T){x,e:=f08ProofTestCall(t,v,4,"dispatch.update",row,old,[]any{[]any{"dispatches",old}});if e!=nil || x!=int64(1){t.Fatalf("mode4 %v %v",x,e)}})
+	t.Run("mode3_unwired_never_true",func(t *testing.T){x,e:=v.evaluate(3,[]byte(`{}`));if e!=f08Unwired || x!=nil{t.Fatal("invented mode3 alias")}})
+	t.Run("action_alias_refused",func(t *testing.T){if _,e:=f08ProofTestCall(t,v,4,"journal.update",row,old,[]any{});e==nil{t.Fatal("mode action alias")}})
+	t.Run("missing_actual_old_refused",func(t *testing.T){if _,e:=f08ProofTestCall(t,v,4,"dispatch.update",row,old,[]any{});e==nil{t.Fatal("fabricated source")}})
+}
+
+// Append to the same proposed test file. These are deliberately structural
+// parent/child controls, not an admitted-source authority qualification.
+func TestF08ProofMaterializationExactParent(t *testing.T){
+	root:=map[string]any{"format":f08Format,"phase":"ADMITTED","principal":"principal","project":"p","command_id":"c","method":"session.control","operation":"v2:session.control","key":"c","request_hash":"request","client_id":"client","session_binding":nil,"target_binding":nil,"private_header_digest":"header","member_task_ids":[]any{"task"},"member_count":f08Number(1)}
+	rh,e:=f08Hash(root);if e!=nil{t.Fatal(e)}
+	task:=map[string]any{"entity_type":"Task","id":"task","revision":f08Number(1),"content_hash":nil}
+	member:=map[string]any{"format":f08Format,"phase":"ADMITTED","admitted_root_ref":f08RootReference("ADMITTED",rh),"task_ref":task,"goal_ref":nil,"run_ref":nil,"runtime_binding":nil,"dispatch_stage":"NO_RUN","dispatch_origin_ref":nil,"queue_admission":nil,"reference_closure":[]any{}}
+	mh,e:=f08Hash(member);if e!=nil{t.Fatal(e)};gh,e:=f08Hash([]any{map[string]any{"task_id":"task","member_hash":mh}});if e!=nil{t.Fatal(e)}
+	parent:=[]any{"principal","p","c","request","v2:session.control","7B7D",rh,gh,f08ProofTestHex(t,map[string]any{"root":root,"members":[]any{member},"pins":[]any{}})}
+	child:=[]any{"principal","p","c","request","task",f08Number(0),rh,mh,f08ProofTestHex(t,member)}
+	v:=&f08ProofValidator{};s:=f08ProofTestSource("admitted",parent)
+	t.Run("exact_parent_member",func(t *testing.T){if e:=v.materialization(s,"admitted_member.insert",child);e!=nil{t.Fatal(e)}})
+	t.Run("wrong_index",func(t *testing.T){r:=append([]any(nil),child...);r[5]=f08Number(1);if e:=v.materialization(s,"admitted_member.insert",r);e==nil{t.Fatal("index alias")}})
+	t.Run("wrong_original_task",func(t *testing.T){r:=append([]any(nil),child...);r[4]="other";if e:=v.materialization(s,"admitted_member.insert",r);e==nil{t.Fatal("task alias")}})
+	t.Run("missing_parent",func(t *testing.T){if e:=v.materialization(&f08Sources{rows:map[string][][]any{}},"admitted_member.insert",child);e==nil{t.Fatal("orphan child")}})
+}
+
+// These tests consume complete typed queue/fence/receipt/Session tuples and
+// full frozen-schema Task/Goal bodies, not hand-waved empty bindings. They test
+// the two shared absence callsites. They do not replace the still-open complete
+// modes 0 -> 7 -> 1 -> 5 journal/response fixtures or SQL24 integration controls.
+func f08AbsenceValidator(t *testing.T) *f08ProofValidator {
+	t.Helper()
+	d, e := LoadSchemaWithExternals(backupConfigurationProtocol, map[string][]byte{"domain.schema.json":backupConfigurationDomain}); if e != nil { t.Fatal(e) }
+	v, e := f08NewProofValidator(d, backupConfigurationDomain); if e != nil { t.Fatal(e) }; return v
+}
+func f08AbsenceFixture(t *testing.T, other bool) []any {
+	t.Helper()
+	when := "2026-01-01T00:00:00Z"
+	binding := map[string]any{"route":"MU_FORK","upstream_project_id":nil,"upstream_goal_id":nil,"upstream_task_id":nil}
+	contract := map[string]any{"contract_hash":"sha256:"+strings.Repeat("a",64),"contract_revision":f08Number(1),"checks":[]any{map[string]any{"check_id":"check","kind":"DETERMINISTIC","required":true,"expected":"finite fixture","command_key":"fixture","rubric_ref":nil,"qualification_id":nil,"not_applicable_reason":nil}},"require_independent_verifier":true,"version_policy":"EXACT","frozen_at":when}
+	rows := []any{}
+	addVersion := func(kind string, body map[string]any) {
+		rows = append(rows, []any{"domain_versions",[]any{"p",kind,body["id"],f08Number(1),f08ProofTestHex(t,body),nil}}, []any{"domain_objects",[]any{"p",kind,body["id"],f08Number(1),f08ProofTestHex(t,body),nil,f08Number(0)}})
+	}
+	for _, id := range []string{"A","B"} {
+		task := map[string]any{"id":id,"project_id":"p","revision":f08Number(1),"created_at":when,"updated_at":when,"goal_id":"goal-"+id,"title":"fixture","task_type":"fixture","stage":"review","status":"DRAFT","dependency_task_ids":[]any{},"requirement_refs":[]any{},"input_refs":[]any{},"context_bundle_id":nil,"acceptance_contract":contract,"assigned_principal_id":nil,"active_run_id":nil,"output_artifact_ids":[]any{},"acceptance_id":nil,"blocking_conflict_ids":[]any{},"no_progress_record_id":"progress-"+id,"stop_policy":map[string]any{"wall_time_seconds":f08Number(1),"max_attempts":f08Number(1),"max_parallel_runs":f08Number(1),"stop_conditions":[]any{"fixture"}},"binding":binding}
+		goal := map[string]any{"id":"goal-"+id,"project_id":"p","revision":f08Number(1),"created_at":when,"updated_at":when,"title":"fixture","original_intent":"fixture","scope":"PROJECT","status":"ACTIVE","requirement_refs":[]any{map[string]any{"entity_type":"Requirement","id":"requirement-"+id,"revision":f08Number(1),"content_hash":nil}},"problem_ids":[]any{"problem-"+id},"task_ids":[]any{id},"deliverables":[]any{"fixture"},"acceptance_contract":contract,"budget_policy_id":"budget-"+id,"outcome":nil,"acceptance_id":nil,"binding":binding}
+		addVersion("Task",task); addVersion("Goal",goal)
+	}
+	if other {
+		content := map[string]any{"text":"unrelated B","attachments":[]any{}}; contentRaw:=f08TestJSON(t,content)
+		body := map[string]any{"task_id":"B","from":"ENQUEUED","to":"DROPPED"}; raw:=f08TestJSON(t,body)
+		rows=append(rows,
+			[]any{"sessions",[]any{"session-B","p",f08Number(1),when,when,"goal-B","B",nil,f08Number(1),"client-B",when,f08Number(0),"native-B",nil,nil,nil,nil,nil,nil,nil,f08Number(0),nil,nil,ProtocolV2}},
+			[]any{"fences",[]any{"p","B","session-B","generation-B","CANCEL_FENCED",f08Number(1),f08Number(1),nil,nil,nil,nil,nil,f08Number(0),f08Number(3)}},
+			[]any{"queue",[]any{"principal-B","p","command-B","session-B","B","goal-B","generation-B",f08Number(1),"sha256:"+strings.Repeat("b",64),"message-B",f08Number(1),"STEER",strings.ToUpper(hex.EncodeToString(contentRaw)),f08RawHash(contentRaw),"DROPPED",f08Number(2),"receipt-B",when}},
+			[]any{"receipts",[]any{"receipt-B","p","generation-B","command-B","CANCEL_FENCE",strings.ToUpper(hex.EncodeToString(raw)),f08RawHash(raw),nil,when}})
+	}
+	return rows
+}
+func f08AbsenceDecode(t *testing.T, rows []any) *f08Sources {
+	t.Helper(); s,e:=f08DecodeSources(rows); if e!=nil { t.Fatal(e) }
+	v:=f08AbsenceValidator(t)
+	for _,r:=range s.rows["domain_versions"] { b,_,e:=f08RawObject(r[4]);if e!=nil{t.Fatal(e)}; if e=v.entities.ValidateDefInput(r[1].(string),b);e!=nil{t.Fatal("fixture schema",e)} }
+	return s
+}
+func f08AbsenceRow(rows []any, category string) []any {
+	for _, pair:=range rows { p:=pair.([]any);if p[0]==category{return p[1].([]any)} };panic("missing fixture category")
+}
+func f08AbsenceReceiptBody(t *testing.T, rows []any, body map[string]any) {
+	t.Helper(); r:=f08AbsenceRow(rows,"receipts");raw:=f08TestJSON(t,body);r[5]=strings.ToUpper(hex.EncodeToString(raw));r[6]=f08RawHash(raw)
+}
+func TestF08NoSessionAbsenceFullTypedSources(t *testing.T) {
+	v:=f08AbsenceValidator(t)
+	for _, other:=range []bool{false,true} {
+		t.Run(fmt.Sprintf("positive_unrelated_history_%v",other),func(t *testing.T){s:=f08AbsenceDecode(t,f08AbsenceFixture(t,other));q,e:=v.queueAdmission(s,"p","A");if e!=nil||q["variant"]!="NO_SESSION"{t.Fatal(q,e)};final,e:=v.emptyQueueFinal(s,"p","A",q);if e!=nil||!f08EmptyArray(final["entry_refs"])||!f08EmptyArray(final["receipt_refs"]){t.Fatal(final,e)}})
+	}
+	t.Run("negative_unrelated_receipt_missing_current_pointer",func(t *testing.T){rows:=f08AbsenceFixture(t,true);f08AbsenceRow(rows,"queue")[16]=nil;s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("known producer current pointer omitted")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("final accepted missing producer pointer")}})
+	for _,state:=range []string{"ENQUEUED","SENDING","SDK_ACCEPTED","UNKNOWN","CONSUMED","DROP_REQUESTED","DROPPED"} {
+		t.Run("cross_task_generation_"+state,func(t *testing.T){rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[4]="A";q[14]=state;s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("generation FK hid Task A queue")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("final omitted Task A history")}})
+	}
+	cases:=[]struct{name string; mutate func([]any)}{
+		{"receipt_task_changed_rehash",func(rows []any){f08AbsenceReceiptBody(t,rows,map[string]any{"task_id":"A","from":"ENQUEUED","to":"DROPPED"})}},
+		{"orphan_generation_rehash",func(rows []any){f08AbsenceRow(rows,"receipts")[2]="missing-generation"}},
+		{"orphan_command",func(rows []any){f08AbsenceRow(rows,"receipts")[3]="missing-command"}},
+		{"null_command",func(rows []any){f08AbsenceRow(rows,"receipts")[3]=nil}},
+		{"cross_project_receipt",func(rows []any){f08AbsenceRow(rows,"receipts")[1]="other-project"}},
+		{"cross_session_queue",func(rows []any){f08AbsenceRow(rows,"queue")[3]="other-session"}},
+		{"cross_goal_queue",func(rows []any){f08AbsenceRow(rows,"queue")[5]="goal-A"}},
+		{"receipt_cycle",func(rows []any){f08AbsenceRow(rows,"receipts")[7]="receipt-B"}},
+		{"missing_predecessor",func(rows []any){f08AbsenceRow(rows,"receipts")[7]="missing-receipt"}},
+		{"receipt_content_hash",func(rows []any){f08AbsenceRow(rows,"receipts")[6]="sha256:"+strings.Repeat("0",64)}},
+		{"queue_content_hash",func(rows []any){f08AbsenceRow(rows,"queue")[13]="sha256:"+strings.Repeat("0",64)}},
+		{"invalid_transition_rehash",func(rows []any){f08AbsenceReceiptBody(t,rows,map[string]any{"task_id":"B","from":"SENDING","to":"DROPPED"})}},
+		{"unknown_kind_not_absence",func(rows []any){f08AbsenceRow(rows,"receipts")[4]="UNCLASSIFIED"}},
+	}
+	for _,tc:=range cases {t.Run(tc.name,func(t *testing.T){rows:=f08AbsenceFixture(t,true);tc.mutate(rows);s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("admission accepted corrupt association")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("final accepted corrupt association")}})}
+	t.Run("receipt_only_task_A_correct_raw_hash",func(t *testing.T){rows:=f08AbsenceFixture(t,true);filtered:=[]any{};for _,x:=range rows{if x.([]any)[0]!="queue"{filtered=append(filtered,x)}};f08AbsenceReceiptBody(t,filtered,map[string]any{"task_id":"A","from":"SENDING","to":"DROP_REQUESTED"});s:=f08AbsenceDecode(t,filtered);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("receipt-only Task A hidden")};before,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e==nil{t.Fatal("receipt-only final")}})
+}
+
+func TestF08ReceiptLocatorAndProducerGraph(t *testing.T){
+	v:=f08AbsenceValidator(t)
+	cases:=[]struct{name string;change func([]any)[]any}{
+		{"null_id",func(rows []any)[]any{f08AbsenceRow(rows,"receipts")[0]=nil;f08AbsenceRow(rows,"queue")[16]=nil;return rows}},
+		{"empty_id",func(rows []any)[]any{f08AbsenceRow(rows,"receipts")[0]="";f08AbsenceRow(rows,"queue")[16]=nil;return rows}},
+		{"duplicate_null_ids",func(rows []any)[]any{r:=f08AbsenceRow(rows,"receipts");r[0]=nil;f08AbsenceRow(rows,"queue")[16]=nil;return append(rows,[]any{"receipts",append([]any{},r...)})}},
+		{"missing_current_pointer",func(rows []any)[]any{f08AbsenceRow(rows,"queue")[16]=nil;return rows}},
+		{"wrong_current_pointer",func(rows []any)[]any{f08AbsenceRow(rows,"queue")[16]="other-receipt";return rows}},
+		{"wrong_current_state",func(rows []any)[]any{f08AbsenceRow(rows,"queue")[14]="ENQUEUED";return rows}},
+		{"wrong_current_revision",func(rows []any)[]any{f08AbsenceRow(rows,"queue")[15]=f08Number(1);return rows}},
+		{"wrong_fence_state",func(rows []any)[]any{f08AbsenceRow(rows,"fences")[4]="OPEN";return rows}},
+		{"unsealed_sequence",func(rows []any)[]any{f08AbsenceRow(rows,"fences")[6]=f08Number(0);return rows}},
+		{"unknown_sdk_successor",func(rows []any)[]any{f08AbsenceRow(rows,"queue")[14]="CONSUMED";f08AbsenceRow(rows,"queue")[15]=f08Number(4);return rows}},
+	}
+	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){rows:=tc.change(f08AbsenceFixture(t,true));s:=f08AbsenceDecode(t,rows);if _,e:=v.queueAdmission(s,"p","A");e==nil{t.Fatal("admission accepted bad locator/current producer graph")};original,e:=v.queueAdmission(f08AbsenceDecode(t,f08AbsenceFixture(t,false)),"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",original);e==nil{t.Fatal("final accepted bad locator/current producer graph")}})}
+	t.Run("known_dropped_producer_graph",func(t *testing.T){s:=f08AbsenceDecode(t,f08AbsenceFixture(t,true));q,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",q);e!=nil{t.Fatal(e)}})
+	t.Run("known_enqueued_without_receipt",func(t *testing.T){rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[14]="ENQUEUED";q[15]=f08Number(1);q[16]=nil;fence:=f08AbsenceRow(rows,"fences");fence[4]="OPEN";fence[6]=f08Number(0);fence[13]=f08Number(2);kept:=[]any{};for _,x:=range rows{if x.([]any)[0]!="receipts"{kept=append(kept,x)}};s:=f08AbsenceDecode(t,kept);before,e:=v.queueAdmission(s,"p","A");if e!=nil{t.Fatal(e)};if _,e=v.emptyQueueFinal(s,"p","A",before);e!=nil{t.Fatal(e)}})
+}
+func f08PureProfileFixture()map[string]any{
+	c:=map[string]any{"api":"openai-completions","model":"fixture-model","provider":"fixture-provider","ref":"fixture-config","route":"fixture-route","endpoint":"https://fixture.invalid/v1/chat/completions","max_output_tokens":f08Number(8192),"max_calls":f08Number(4),"tools":[]any{}}
+	return map[string]any{"backend":"mu-sdk-broker-v1","model":"fixture-model","model_config":c,"bundle_hash":"sha256:"+strings.Repeat("a",64),"model_qualification":map[string]any{"route":"fixture-route","model_config_hash":Hash(c),"max_calls":f08Number(2)},"sandbox":"appcontainer-zero-capabilities-v1","adapter_revision":"windows-appcontainer-v1","platform":"windows-amd64","command_id":"fixture-command","build_hash":"fixture-build","credential_revision":"fixture-revision","permissions":map[string]any{"capabilities":[]any{},"network":"none","environment":"staging-only","process_limit":f08Number(1),"memory_mib":f08Number(256)},"timeout_seconds":f08Number(900),"outputs":[]any{"result.json"},"argv":[]any{"fixture"},"max_cost":map[string]any{"amount":"0.50","currency":"USD"}}
+}
+func TestF08FrozenProfilePurePredicates(t *testing.T){
+	for _,name:=range []string{"bounded_positive","output_escape","reserved_output_os_gap","permission_network","timeout_over","model_calls_over","model_config_hash","qualification_calls_over","fractional_memory","duplicate_output","missing_tools","negative_live_cost","runtime_ref_in_inputs","missing_profile_input","unknown_capability"}{t.Run(name,func(t *testing.T){p:=f08PureProfileFixture();ref:=map[string]any{"entity_type":"Artifact","id":"profile","revision":f08Number(1),"content_hash":"sha256:"+strings.Repeat("b",64)};runtime:=map[string]any{"measurement_mode":"LIVE","capabilities":[]any{"MODEL"}};task:=map[string]any{"input_refs":[]any{ref},"requirement_refs":[]any{}};plan:=map[string]any{"required_capabilities":[]any{"MODEL"},"model_qualification":p["model_qualification"]};artifact:=map[string]any{"validity":"CURRENT","sealed_at":"2026-01-01T00:00:00Z","access_class":"PUBLIC","content_hash":ref["content_hash"]}
+		switch name{case "output_escape":p["outputs"]=[]any{"../outside"};case "reserved_output_os_gap":p["outputs"]=[]any{"CON.txt"};case "permission_network":p["permissions"].(map[string]any)["network"]="unrestricted";case "timeout_over":p["timeout_seconds"]=f08Number(901);case "model_calls_over":p["model_config"].(map[string]any)["max_calls"]=f08Number(33);case "model_config_hash":p["model_qualification"].(map[string]any)["model_config_hash"]="sha256:"+strings.Repeat("0",64);case "qualification_calls_over":p["model_qualification"].(map[string]any)["max_calls"]=f08Number(3);case "fractional_memory":p["permissions"].(map[string]any)["memory_mib"]=json.Number("256.1");case "duplicate_output":p["outputs"]=[]any{"result.json","result.json"};case "missing_tools":delete(p["model_config"].(map[string]any),"tools");case "negative_live_cost":p["max_cost"].(map[string]any)["amount"]="-1";case "runtime_ref_in_inputs":task["input_refs"]=[]any{ref,map[string]any{"entity_type":"RuntimeRegistration","id":"runtime","revision":f08Number(1),"content_hash":nil}};case "missing_profile_input":task["input_refs"]=[]any{};case "unknown_capability":plan["required_capabilities"]=[]any{"UNDECLARED"}}
+		e:=f08FrozenQualificationProfile(p,runtime,task,plan,ref,artifact);if name=="bounded_positive"{if e!=nil{t.Fatal(e)}}else if e==nil{t.Fatal("invalid profile allowed")};if name=="reserved_output_os_gap"&&e!=f08ProfilePathOSGap{t.Fatal("OS-dependent predicate was guessed",e)}
+	})}
+}
+func TestF08GlobalPolicyStorageMapping(t *testing.T){
+	for _,name:=range []string{"actual_global_budget","same_project_global_ref","foreign_project_global_ref","empty_source_non_global","wrong_scope_id","null_other_entity","actual_global_runpolicy"}{t.Run(name,func(t *testing.T){v:=f08AbsenceValidator(t);when:="2026-01-01T00:00:00Z";kind:="BudgetPolicy";body:=map[string]any{"id":"global","project_id":nil,"revision":f08Number(1),"created_at":when,"updated_at":when,"scope_type":"GLOBAL","scope_id":"global","parent_policy_id":nil,"mode":"UNLIMITED_AMOUNT","cap":nil,"enforcement":"ACCOUNTING_ONLY","period":"LIFETIME","timezone":"Asia/Shanghai","effective_from":when,"unknown_cost_action":"ALLOW_AND_RECORD"};project:=""
+		switch name{case "same_project_global_ref":project="p";case "foreign_project_global_ref":project="foreign";case "empty_source_non_global":body["project_id"]="p";body["scope_type"]="PROJECT";body["scope_id"]="p";body["parent_policy_id"]="parent";case "wrong_scope_id":body["scope_id"]="not-global";case "null_other_entity":kind="Requirement";case "actual_global_runpolicy":kind="RunPolicy";body=map[string]any{"id":"global","project_id":nil,"revision":f08Number(1),"created_at":when,"updated_at":when,"scope_type":"GLOBAL","scope_id":"global","parent_policy_id":nil,"max_concurrency":f08Number(2),"max_queue":f08Number(100),"monitor_period_seconds":f08Number(60),"first_lookback_seconds":f08Number(1),"max_active_cycles_per_project":f08Number(1),"coalesce_missed_triggers":true,"same_failure_retry_limit":f08Number(2),"no_progress_iteration_limit":f08Number(3),"heartbeat_seconds":f08Number(15),"lease_seconds":f08Number(90),"log_retention_days":f08Number(30),"timezone":"Asia/Shanghai"}}
+		r:=[]any{project,kind,"global",f08Number(1),f08ProofTestHex(t,body),nil};s,e:=f08DecodeSources([]any{[]any{"domain_versions",r}});if e!=nil{t.Fatal(e)};_,e=v.version(s,project,map[string]any{"entity_type":kind,"id":"global","revision":f08Number(1),"content_hash":nil});positive:=name=="actual_global_budget"||name=="actual_global_runpolicy";if positive&&e!=nil{t.Fatal(e)};if !positive&&e==nil{t.Fatal("global policy exemption escaped exact schema/storage mapping")}
+	})}
+}
+
+// Pure evaluator fixture proposal, NOT_RUN. Source rows below are explicit
+// synthetic frozen tuples. No SQL, API, runtime or real cancellation occurs.
+// Expected R1 graphs are assembled from the explicit fixture edges, never by
+// calling the predicate under test to generate its expected proof.
+type f08JournalFixture struct {
+	t *testing.T
+	v *f08ProofValidator
+ entities *SchemaDoc
+ frames []f08I17CapturedFrame
+	f f08TestFixture
+	rows []any
+	versions map[string]f08Version
+	edges map[string][]any
+	admitted,final,control,journal []any
+	member,finalMember map[string]any
+	ack,completed []byte
+	trace []string
+}
+func f08FixtureKey(project,kind,id string,revision any) string { return project+"|"+kind+"|"+id+"|"+fmt.Sprint(revision) }
+func f08FixtureClone(t *testing.T,m map[string]any) map[string]any {t.Helper();d:=json.NewDecoder(bytes.NewReader(f08TestJSON(t,m)));d.UseNumber();var x map[string]any;if e:=d.Decode(&x);e!=nil{t.Fatal(e)};return x}
+func(f *f08JournalFixture) add(category string,row []any){f.rows=append(f.rows,[]any{category,row})}
+func(f *f08JournalFixture) replace(category string,old,row []any){for i,x:=range f.rows{p:=x.([]any);if p[0]==category&&f08Equal(p[1],old){f.rows[i]=[]any{category,row};return}};f.t.Fatal("fixture missing actual OLD",category)}
+func(f *f08JournalFixture) put(project,kind string,body map[string]any,head bool) f08Version {
+	f.t.Helper();if e:=f.entities.ValidateDefInput(kind,body);e!=nil{f.t.Fatal("complete fixture schema",kind,e)}
+	raw:=f08TestJSON(f.t,body);revision,e:=f08Integer(body["revision"],1);if e!=nil{f.t.Fatal(e)}
+	var hash any;if kind=="EventEnvelope"{hash=body["receipt_hash"]}
+	x:=f08Version{project,kind,body["id"].(string),revision,hash,raw,body};key:=f08FixtureKey(project,kind,x.id,body["revision"]);f.versions[key]=x
+	r:=[]any{project,kind,x.id,f08Number(revision),strings.ToUpper(hex.EncodeToString(raw)),hash};f.add("domain_versions",r)
+	if head {for i,pair:=range f.rows{p:=pair.([]any);row:=p[1].([]any);if p[0]=="domain_objects"&&row[0]==project&&row[1]==kind&&row[2]==x.id{f.rows=append(f.rows[:i],f.rows[i+1:]...);break}};f.add("domain_objects",append(append([]any{},r...),f08Number(0)))}
+	return x
+}
+func(f *f08JournalFixture) edge(owner f08Version,field string,target f08Version){r:=[]any{owner.project,owner.kind,owner.id,f08Number(owner.revision),field,target.project,target.kind,target.id,f08Number(target.revision)};f.add("domain_refs",r);key:=f08FixtureKey(owner.project,owner.kind,owner.id,f08Number(owner.revision));f.edges[key]=append(f.edges[key],r)}
+func(f *f08JournalFixture) graph(roots ...f08Version)([]any,[]any){
+	pending:=append([]f08Version{},roots...);seen:=map[string]bool{};anchors:=map[string]any{};closures:=[]any{}
+	for len(pending)>0{o:=pending[0];pending=pending[1:];k:=f08FixtureKey(o.project,o.kind,o.id,f08Number(o.revision));if seen[k]{continue};seen[k]=true;ak,_:=f08Key([]any{o.project,o.ref()});anchors[ak]=o.anchor();targets:=map[string]any{};rows:=append([]any{},f.edges[k]...)
+		for _,r:=range rows{e:=r.([]any);target,ok:=f.versions[f08FixtureKey(e[5].(string),e[6].(string),e[7].(string),e[8])];if !ok{f.t.Fatal("explicit fixture edge missing target")};tk,_:=f08Key([]any{target.project,target.ref()});targets[tk]=target.anchor();pending=append(pending,target)}
+		f08SortTuples(rows);closures=append(closures,map[string]any{"owner_project":o.project,"owner_ref":o.ref(),"owner_body_digest":f08RawHash(o.raw),"rows":rows,"targets":f08SortedAnchors(targets)})
+	}
+	sort.Slice(closures,func(i,j int)bool{x:=closures[i].(map[string]any);y:=closures[j].(map[string]any);xr:=x["owner_ref"].(map[string]any);yr:=y["owner_ref"].(map[string]any);return f08TupleLess([]any{x["owner_project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["owner_project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})})
+	return closures,f08Pins(f08SortedAnchors(anchors))
+}
+func(f *f08JournalFixture) step(mode int64,action string,old,row []any,category string){
+	f.t.Helper();var oldValue any;if old!=nil{oldValue=old};raw:=f08TestJSON(f.t,map[string]any{"action":action,"row":row,"old":oldValue,"sources":f.rows})
+	f.frames=append(f.frames,f08I17CapturedFrame{Mode:mode,Action:action,Raw:bytes.Clone(raw)}) // freeze BEFORE any SUT or transition
+	f.trace=append(f.trace,action);if old==nil{f.add(category,row)}else{f.replace(category,old,row)}
+}
+func(f *f08JournalFixture) materialize(row []any,member map[string]any,pins []any,phase string){
+	h,_:=f08Hash(member);child:=append(append([]any{},row[:4]...),"task-one",f08Number(0),row[6],h,f08ProofTestHex(f.t,member));action,category:="admitted_member.insert","admitted_members"
+	if phase=="FINALIZED"{prior,_:=f08Hash(f.member);child[6]=prior;action,category="final_member.insert","final_members"};f.step(7,action,nil,child,category)
+	for _,value:=range pins{p:=value.(map[string]any);pin:=append(append([]any{},row[:4]...),phase,p["project"],p["kind"],p["id"],p["revision"],p["content_hash"]);f.step(7,"pin.insert",nil,pin,"pins")}
+}
+type f08I17CapturedFrame struct {Mode int64;Action string;Raw []byte}
+func f08FullJournalFixture(t *testing.T,withACK bool,bodyType string)*f08JournalFixture {
+ t.Helper();f:=f08FullJournalDataFixture(t,withACK,bodyType);f.v=f08AbsenceValidator(t)
+ for _,frame:=range f.frames{result,e:=f.v.evaluate(frame.Mode,frame.Raw);if e!=nil||result!=int64(1){t.Fatalf("actual pure step %s mode%d: value=%v err=%v",frame.Action,frame.Mode,result,e)}}
+ return f
+}
+func f08FullJournalDataFixture(t *testing.T,withACK bool,bodyType string)*f08JournalFixture {
+ t.Helper();entities,e:=LoadSchema(backupConfigurationDomain);if e!=nil{t.Fatal(e)}
+ f:=&f08JournalFixture{t:t,entities:entities,f:f08TestDataSetup(t),rows:[]any{},versions:map[string]f08Version{},edges:map[string][]any{}}
+	when:="2026-01-01T00:00:00Z";q:=f.f.identityObject["request_hash"]
+	// Copy only the full entity shapes; overwrite their IDs and every actual
+	// relation explicitly. No unrelated B objects enter this source bundle.
+	shapes:=f08AbsenceFixture(t,false);var taskBody,goalBody map[string]any
+	for _,value:=range shapes{p:=value.([]any);r:=p[1].([]any);if p[0]!="domain_versions"||r[2]!="A"&&r[2]!="goal-A"{continue};b,_,e:=f08RawObject(r[4]);if e!=nil{t.Fatal(e)};if r[1]=="Task"{taskBody=b}else{goalBody=b}}
+	taskBody["id"]="task-one";taskBody["project_id"]="project-one";taskBody["goal_id"]="goal-one";taskBody["no_progress_record_id"]="progress-one"
+	goalBody["id"]="goal-one";goalBody["project_id"]="project-one";goalBody["task_ids"]=[]any{"task-one"};goalBody["problem_ids"]=[]any{"problem-one"};goalBody["budget_policy_id"]="budget-one"
+	reqBody:=map[string]any{"id":"requirement-one","project_id":"project-one","revision":f08Number(1),"created_at":when,"updated_at":when,"requirement_key":"fixture","text":"cancel finite task","basis":"USER_STATED","status":"ACCEPTED","source_refs":[]any{},"rationale":"fixture","supersedes_id":nil,"acceptance_check_ids":[]any{}}
+	req:=f.put("project-one","Requirement",reqBody,true);goalBody["requirement_refs"]=[]any{req.ref()}
+	np:=f.put("project-one","NoProgressRecord",map[string]any{"id":"progress-one","project_id":"project-one","revision":f08Number(1),"created_at":when,"updated_at":when,"origin_problem_id":"problem-one","candidate_id":"candidate-one","input_hash":"sha256:"+strings.Repeat("1",64),"key_hash":"sha256:"+strings.Repeat("2",64),"same_failure_count":f08Number(0),"no_progress_iterations":f08Number(0),"best_accepted_artifact_ref":nil,"last_effective_progress_at":nil,"resume_conditions":[]any{"fixture"},"status":"ACTIVE"},true)
+	policyBody:=map[string]any{"id":"budget-global","project_id":nil,"revision":f08Number(1),"created_at":when,"updated_at":when,"scope_type":"GLOBAL","scope_id":"global","parent_policy_id":nil,"mode":"UNLIMITED_AMOUNT","cap":nil,"enforcement":"ACCOUNTING_ONLY","period":"LIFETIME","timezone":"Asia/Shanghai","effective_from":when,"unknown_cost_action":"ALLOW_AND_RECORD"}
+	global:=f.put("","BudgetPolicy",policyBody,true);projectPolicy:=f08FixtureClone(t,policyBody);projectPolicy["id"]="budget-one";projectPolicy["project_id"]="project-one";projectPolicy["scope_type"]="PROJECT";projectPolicy["scope_id"]="project-one";projectPolicy["parent_policy_id"]="budget-global";budget:=f.put("project-one","BudgetPolicy",projectPolicy,true);f.edge(budget,"/parent_policy_id",global)
+	task:=f.put("project-one","Task",taskBody,true);goal:=f.put("project-one","Goal",goalBody,true)
+	f.edge(task,"/goal_id",goal);f.edge(task,"/no_progress_record_id",np);f.edge(goal,"/task_ids",task);f.edge(goal,"/requirement_refs/0",req);f.edge(goal,"/budget_policy_id",budget)
+	f.add("identities",[]any{"owner-one","cancel-one",ProtocolV2,"project-one","session.control","v2:session.control",q,when})
+	session:=[]any{"session-one","project-one",f08Number(7),when,when,"goal-one",nil,nil,f08Number(3),"client-one","2026-01-01T01:00:00Z",f08Number(12),"native-one",nil,nil,"workspace-one","fixture","configuration-one","build-one",nil,f08Number(0),nil,nil,ProtocolV2};f.add("sessions",session)
+	queue:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+	root:=map[string]any{"format":f08Format,"phase":"ADMITTED","principal":"owner-one","project":"project-one","command_id":"cancel-one","method":"session.control","operation":"v2:session.control","key":"cancel-one","request_hash":q,"client_id":"client-one","session_binding":map[string]any{"session_id":"session-one","accepted_revision":f08Number(7),"writer_client_id":"client-one","writer_epoch":f08Number(3),"lease_expires_at":session[10],"event_watermark":f08Number(12)},"target_binding":map[string]any{"kind":"Goal","id":"goal-one","version_ref":goal.ref()},"private_header_digest":f08RawHash(f.f.header),"member_task_ids":[]any{"task-one"},"member_count":f08Number(1)}
+	rh,_:=f08Hash(root);closure,pins:=f.graph(task,goal);f.member=map[string]any{"format":f08Format,"phase":"ADMITTED","admitted_root_ref":f08RootReference("ADMITTED",rh),"task_ref":task.ref(),"goal_ref":goal.ref(),"run_ref":nil,"runtime_binding":nil,"dispatch_stage":"NO_RUN","dispatch_origin_ref":nil,"queue_admission":queue,"reference_closure":closure}
+	mh,_:=f08Hash(f.member);gh,_:=f08Hash([]any{map[string]any{"task_id":"task-one","member_hash":mh}});doc:=map[string]any{"root":root,"members":[]any{f.member},"pins":pins}
+	f.admitted=[]any{"owner-one","project-one","cancel-one",q,"v2:session.control",strings.ToUpper(hex.EncodeToString(f.f.header)),rh,gh,f08ProofTestHex(t,doc)}
+	f.step(0,"admitted.insert",nil,f.admitted,"admitted");f.materialize(f.admitted,f.member,pins,"ADMITTED")
+	f.control=[]any{"owner-one","project-one","cancel-one","session-one","ctrl-cancel-one",q,"goal-one",f08ProofTestHex(t,[]any{"task-one"}),"REQUESTED",nil,nil,when};f.step(6,"control.insert",nil,f.control,"controls")
+	f.ack=f08TestACK(t)
+	if withACK {next:=append([]any{},f.control...);next[9]=strings.ToUpper(hex.EncodeToString(f.ack));f.step(6,"control.update",f.control,next,"controls");f.control=next
+		f.journal=[]any{"owner-one","project-one","v2:session.control","cancel-one",q,f08Number(200),next[9],f.admitted[5],when,bodyType,"text"};f.step(5,"journal.insert",nil,f.journal,"idempotency")}
+	finalTaskBody:=f08FixtureClone(t,taskBody);finalTaskBody["revision"]=f08Number(2);finalTaskBody["status"]="CANCELLED";finalTaskBody["updated_at"]="2026-01-01T00:00:01Z";finalTask:=f.put("project-one","Task",finalTaskBody,true)
+	finalGoalBody:=f08FixtureClone(t,goalBody);finalGoalBody["revision"]=f08Number(2);finalGoalBody["status"]="CANCELLED";finalGoalBody["updated_at"]="2026-01-01T00:00:01Z";finalGoal:=f.put("project-one","Goal",finalGoalBody,true)
+	f.edge(finalTask,"/goal_id",finalGoal);f.edge(finalTask,"/no_progress_record_id",np);f.edge(finalGoal,"/task_ids",finalTask);f.edge(finalGoal,"/requirement_refs/0",req);f.edge(finalGoal,"/budget_policy_id",budget)
+	eb:=map[string]any{"id":"event-one","project_id":"project-one","revision":f08Number(1),"created_at":"2026-01-01T00:00:01Z","receipt_hash":"sha256:"+strings.Repeat("0",64),"sequence":f08Number(13),"event_type":"TASK_CHANGED","aggregate_ref":finalTask.ref(),"actor_id":"owner-one","correlation_id":"cancel-one","causation_id":nil,"event_data_artifact_ref":nil};eb["receipt_hash"]=Receipt(Object(eb));event:=f.put("project-one","EventEnvelope",eb,false);f.edge(event,"/aggregate_ref",finalTask);f.add("outbox",[]any{"project-one",f08Number(13),"event-one",strings.ToUpper(hex.EncodeToString(event.raw)),f08Number(0)})
+	_,snapshot:=f08TestCompleted(t);snapshot["pending_command_ids"]=[]any{};f.completed=f08TestResponse(t,"COMPLETED",8,map[string]any{"action":"CANCEL","target_id":"goal-one","control_request_id":"ctrl-cancel-one","settled":true,"children_stopped":true,"queue_empty":true,"snapshot":snapshot})
+	newSession:=append([]any{},session...);newSession[2]=f08Number(8);newSession[4]="2026-01-01T00:00:01Z";newSession[9]="";newSession[10]=nil;newSession[11]=f08Number(13);f.replace("sessions",session,newSession)
+	mode:="ORIGINAL_COMPLETED";original:=f08RawHash(f.completed);if withACK{mode="ACK_TO_COMPLETED";original=f08RawHash(f.ack)};pendingHash,_:=f08Hash([]any{})
+	fr:=map[string]any{"format":f08Format,"phase":"FINALIZED","admitted_root_ref":f08RootReference("ADMITTED",rh),"principal":"owner-one","project":"project-one","command_id":"cancel-one","request_hash":q,"control_request_id":"ctrl-cancel-one","completion_mode":mode,"original_response_digest":original,"final_response_digest":f08RawHash(f.completed),"final_snapshot_binding":map[string]any{"session_id":"session-one","project_id":"project-one","revision":f08Number(8),"event_sequence":f08Number(13),"pending_command_ids_digest":pendingHash},"member_count":f08Number(1)}
+	fq:=f08FixtureClone(t,queue);fq["entry_refs"]=[]any{};fq["receipt_refs"]=[]any{};closure,pins=f.graph(task,goal,finalTask,event)
+	f.finalMember=map[string]any{"format":f08Format,"phase":"FINALIZED","admitted_member_ref":f08MemberReference("ADMITTED","task-one",mh),"proof_kind":"NO_EXECUTION","task_admitted_ref":task.ref(),"run_admitted_ref":nil,"run_before_settlement_ref":nil,"run_final_ref":nil,"task_final_ref":finalTask.ref(),"dispatch_origin_ref":nil,"dispatch_final_binding":nil,"queue_final_binding":fq,"effect_closure":map[string]any{"run_id":nil,"epoch":nil,"histories":[]any{},"non_effect_reservations":[]any{}},"observation_ref":nil,"native_artifact_refs":[]any{},"sdk_receipt_refs":[]any{},"run_event_ref":nil,"task_event_ref":map[string]any{"version_ref":event.ref(),"outbox_id":"event-one","sequence":f08Number(13),"body_digest":f08RawHash(event.raw)},"reference_closure":closure,"prior_epoch_closure":[]any{},"prelaunch_checkpoint_carry":nil}
+	frh,_:=f08Hash(fr);fmh,_:=f08Hash(f.finalMember);fgh,_:=f08Hash([]any{map[string]any{"task_id":"task-one","member_hash":fmh}});f.final=[]any{"owner-one","project-one","cancel-one",q,rh,frh,fgh,f08ProofTestHex(t,map[string]any{"root":fr,"members":[]any{f.finalMember},"pins":pins})}
+	f.step(1,"final.insert",nil,f.final,"final");f.materialize(f.final,f.finalMember,pins,"FINALIZED")
+	next:=append([]any{},f.control...);next[10]=strings.ToUpper(hex.EncodeToString(f.completed));if !withACK{next[9]=next[10]};f.step(6,"control.update",f.control,next,"controls");f.control=next
+	next=append([]any{},f.control...);next[8]="CONFIRMED";f.step(6,"control.update",f.control,next,"controls");f.control=next
+	completedJournal:=[]any{"owner-one","project-one","v2:session.control","cancel-one",q,f08Number(200),next[10],f.admitted[5],when,bodyType,"text"}
+	if withACK{f.step(5,"journal.update",f.journal,completedJournal,"idempotency")}else{f.step(5,"journal.insert",nil,completedJournal,"idempotency")};f.journal=completedJournal
+	f.step(5,"commit.insert",nil,[]any{"owner-one","project-one","cancel-one",q,frh,original,f08RawHash(f.completed)},"commits")
+	return f
+}
+func TestF08FullNoRunJournalSequence(t *testing.T){
+	for _,ack:=range []bool{false,true}{for _,bodyType:=range []string{"text","blob"}{t.Run(fmt.Sprintf("ack_%v_%s",ack,bodyType),func(t *testing.T){f:=f08FullJournalFixture(t,ack,bodyType);if len(f.trace)<20||f.trace[0]!="admitted.insert"||f.trace[len(f.trace)-1]!="commit.insert"{t.Fatal("incomplete actual evaluator call sequence",f.trace)};s,e:=f08DecodeSources(f.rows);if e!=nil{t.Fatal(e)};if len(s.rows["commits"])!=1||len(s.rows["idempotency"])!=1||len(s.rows["admitted_members"])!=1||len(s.rows["final_members"])!=1{t.Fatal("materialization/journal count")};t.Log("PURE_PROPOSED_SEQUENCE",f.trace)})}}
+}
+func TestF08FullJournalSingleFactMutations(t *testing.T){
+	cases:=[]struct{name string;change func(*f08JournalFixture)}{
+		{"missing_admitted_pin",func(f *f08JournalFixture){for i,x:=range f.rows{p:=x.([]any);if p[0]=="pins"&&p[1].([]any)[4]=="ADMITTED"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"missing_final_member",func(f *f08JournalFixture){for i,x:=range f.rows{if x.([]any)[0]=="final_members"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"missing_outbox",func(f *f08JournalFixture){for i,x:=range f.rows{if x.([]any)[0]=="outbox"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"original_header_removed",func(f *f08JournalFixture){f.journal[7]=f08ProofTestHex(f.t,map[string]any{})}},
+		{"original_timestamp_changed",func(f *f08JournalFixture){f.journal[8]="2026-01-02T00:00:00Z"}},
+		{"control_not_confirmed",func(f *f08JournalFixture){f.control[8]="RECONCILING"}},
+		{"source_global_relocated",func(f *f08JournalFixture){for _,x:=range f.rows{p:=x.([]any);r:=p[1].([]any);if p[0]=="domain_versions"&&r[0]==""{r[0]="project-one";return}}}},
+	}
+	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){f:=f08FullJournalFixture(t,true,"text");tc.change(f);s,e:=f08DecodeSources(f.rows);if e!=nil{t.Fatal("mutation must retain typed source shape",e)}
+		if tc.name=="original_timestamp_changed"{old:=append([]any{},f.journal...);old[6]=strings.ToUpper(hex.EncodeToString(f.ack));old[8]="2026-01-01T00:00:00Z";for i,x:=range f.rows{if x.([]any)[0]=="idempotency"{f.rows[i]=[]any{"idempotency",old}}};s,e=f08DecodeSources(f.rows);if e!=nil{t.Fatal(e)};if e=f.v.journal(s,"journal.update",old,f.journal);e==nil{t.Fatal("changed original timestamp authorized")};return}
+		final,e:=f08ParseGroup("final",f.final);if e!=nil{t.Fatal(e)};if e=f.v.completedJournal(s,f.journal,final);e==nil{t.Fatal("full source mutation authorized")}
+	})}
+}
+
+func TestF08EndpointEnvironmentBranchesRemainOpen(t *testing.T){
+ for _,endpoint:=range []string{"https://fixture.invalid/v1/chat/completions","https://fixture.invalid:443/v1/chat/completions","https://a:80,b:81/path","https://[::1]/path"}{t.Run(endpoint,func(t *testing.T){
+  p:=f08PureProfileFixture();c:=p["model_config"].(map[string]any);c["endpoint"]=endpoint;p["model_qualification"].(map[string]any)["model_config_hash"]=Hash(c)
+  e:=f08FrozenModelProfile(p);open:=strings.Contains(endpoint,"a:80")||strings.Contains(endpoint,"[::1]");if open&&e!=f08ProfileEndpointGlobalGap{t.Fatal("environment-dependent URL branch not refused",e)};if !open&&e!=nil{t.Fatal("ordinary pure host rejected",e)}
+ })}
+}
+
+// C01-R2 pure producer-graph fixture proposal. All cases remain NOT_RUN.
+// Only unrelated Task B contributes retained history; Task A has NO_SESSION.
+func f08AbsenceEnqueuedFixture(t *testing.T) []any {
+	t.Helper();rows:=f08AbsenceFixture(t,true);q:=f08AbsenceRow(rows,"queue");q[14]="ENQUEUED";q[15]=f08Number(1);q[16]=nil
+	f:=f08AbsenceRow(rows,"fences");f[4]="OPEN";f[6]=f08Number(0);f[13]=f08Number(2)
+	kept:=[]any{};for _,x:=range rows{if x.([]any)[0]!="receipts"{kept=append(kept,x)}};return kept
+}
+func TestF08NoSessionFenceProducerBounds(t *testing.T) {
+	v:=f08AbsenceValidator(t)
+	for _,enqueued:=range []bool{true,false}{t.Run(fmt.Sprintf("known_producer_enqueued_%v",enqueued),func(t *testing.T){
+		rows:=f08AbsenceFixture(t,true);if enqueued{rows=f08AbsenceEnqueuedFixture(t)};f:=f08AbsenceRow(rows,"fences")
+		wantRevision:=f08Number(3);if enqueued{wantRevision=f08Number(2)};if !f08Equal(f[13],wantRevision){t.Fatal("fixture does not include actual producer increments")}
+		s:=f08AbsenceDecode(t,rows);q,e:=v.queueAdmission(s,"p","A");if e!=nil||q["variant"]!="NO_SESSION"{t.Fatal(q,e)}
+		final,e:=v.emptyQueueFinal(s,"p","A",q);if e!=nil||!f08EmptyArray(final["entry_refs"])||!f08EmptyArray(final["receipt_refs"]){t.Fatal(final,e)}
+	})}
+	cases:=[]struct{name string;enqueued bool;index int;value any;want error}{
+		{"ENQUEUED_CLOSED_CANCEL_FENCE",true,4,"CANCEL_FENCED",f08Binding},
+		{"ENQUEUED_SEALED_FENCE",true,4,"SEALED",f08NativeProofGap},
+		{"ENQUEUED_SEALED_SEQUENCE",true,6,f08Number(1),f08Binding},
+		{"ENQUEUED_RESTORE_OPEN",true,12,f08Number(1),f08NativeProofGap},
+		{"ENQUEUED_FENCE_REVISION_BEFORE_ACCEPTANCE",true,13,f08Number(1),f08Binding},
+		{"DROPPED_FENCE_REVISION_BEFORE_CANCEL",false,13,f08Number(2),f08Binding},
+	}
+	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){
+		rows:=f08AbsenceFixture(t,true);if tc.enqueued{rows=f08AbsenceEnqueuedFixture(t)}
+		// Establish a valid baseline for both entrypoints before one fact changes.
+		valid:=f08AbsenceDecode(t,rows);original,e:=v.queueAdmission(valid,"p","A");if e!=nil{t.Fatal("invalid baseline",e)};if _,e=v.emptyQueueFinal(valid,"p","A",original);e!=nil{t.Fatal("invalid final baseline",e)}
+		q:=f08AbsenceRow(rows,"queue");queueBefore:=append([]any{},q...);f:=f08AbsenceRow(rows,"fences");fenceBefore:=append([]any{},f...);f[tc.index]=tc.value
+		if !f08Equal(queueBefore,q){t.Fatal("queue/content/hash/locator changed")};changed:=0;for i:=range f{if !f08Equal(fenceBefore[i],f[i]){changed++;if i!=tc.index{t.Fatal("unexpected fence mutation")}}};if changed!=1{t.Fatal("control must change exactly one fence fact")}
+		s:=f08AbsenceDecode(t,rows);if _,e=v.queueAdmission(s,"p","A");e!=tc.want{t.Fatal("admission did not refuse with expected typed reason",e)};if _,e=v.emptyQueueFinal(s,"p","A",original);e!=tc.want{t.Fatal("final did not refuse with expected typed reason",e)}
+	})}
+}

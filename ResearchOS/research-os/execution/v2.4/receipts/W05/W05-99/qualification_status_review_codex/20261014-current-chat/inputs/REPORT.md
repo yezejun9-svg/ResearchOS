@@ -1,0 +1,16 @@
+# Original qualification STATUS repair — source candidate
+
+Candidate: `5ddc0abb8c6d95e9ca071a4eb41a7e12b8559456`. Tree: `bfade6fd49897f53e2ec629c71691405be2f2fbe`. Base: `c465d1356480d6e6a90da84656724f9fc02b31c7`.
+Scope SHA256: `d9a3ea6c447905ab75c0505af3eb3a89b9116ca4f2b8481a29d123bec8fb5ae3`. Only the four scope paths changed.
+
+Original-request read-only STATUS now tolerates writer epoch, lease expiry/renewal and revision changes only inside the original project/session/selection generation. The original native host ID, data root, control process identity and desktop identity are frozen at PREPARE and checked before and after STATUS. Exact full context still gates CONFIRM; consumed remains monotonic and request ID/hash/context/modelRef are retained.
+
+History is explicitly exposed as ORIGINAL_REQUEST_HISTORY and cannot assert current authorized=true. A historical check cannot become current authorization just because the original context reappears. Failed/replayed/malformed/timeout rechecks leave needsRecheck=true. The existing coding gate still needs a consumed terminal original STATUS younger than ten seconds, and now also rechecks original selection and origin. Current coding context/resource validation and privileged confirmation checks remain in place.
+
+Model/config changes: STATUS always queries the original request and original model evidence; it never rewrites the old modelRef, request hash or original context. A newer model/config can be used by a separately prepared coding request only through its current scope/resource/authority path. The bound-handler regression changes modelRef, session revision, writer epoch and config revision together and verifies the new coding dispatch uses those current values while old qualification remains historical and unauthorized. No claim is made that old qualification authorizes the new model. Native prepareCodingScope/main.js and all core authority contracts are unchanged.
+
+Verification: 41 tests, 41 pass, zero fail/cancel/skip/todo; numeric exit 0. These tests import the current changed production module and register the actual qualification/coding IPC handlers. Existing 45-second PREPARE timeout test ran unchanged. Frontend Vite build exit 0, 30 transformed modules. No real model calls. Output, command arguments, numeric exits, input hashes, dependency census and binary source patch are frozen here.
+
+Known verification detail: default git diff --check exits 2 because tracked workbench.jsx already uses CRLF; its added CRLF lines are flagged. Explicit core.whitespace=cr-at-eol check exits 0 without normalizing the file or changing repository settings. Initial 40-test evidence is retained; final 41-test evidence is authoritative for this source candidate.
+
+This is source/fixture/build evidence only. It does not prove the currently running installed Desktop is repaired or the original live request has been revalidated. Root PID 65164/Core PID 66364, Main, Canon, contracts, installedMu/pins, databases and ownCLI target were not modified. No GUI/process interaction was performed. Independent review and source-bound packaging plus normal original-session live revalidation remain Root-owned. Formal increment 0/42; all 22 parents remain open. No self-acceptance.

@@ -1,0 +1,733 @@
+diff --git a/apps/web/AGENTS.md b/apps/web/AGENTS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..900eb29b3bb97497fcfe3a681da52a506f5f9a93
+--- /dev/null
++++ b/apps/web/AGENTS.md
+@@ -0,0 +1,7 @@
++# Web app structure
++
++`src/main.jsx` owns bootstrap, shared queries, and top level routing state. `src/navigation.jsx` owns route parsing, history navigation, route labels, and links; screens import these from navigation rather than the entry module. `src/screens.jsx`, `src/workbench.jsx`, and `src/continuity.jsx` own their existing product workflows and protocol-facing state. `src/components/` contains production-only presentational React components: `ui.jsx` for small accessible primitives, `app-shell.jsx` for global navigation and status, and `workbench-layout.jsx` for the three-region research workspace. These components receive data and actions through props and do not call transport, native bridges, or storage.
++
++`src/style.css` owns application layout and visual rules, layered over unchanged design token values. Add class names for roles or states, not individual screens. Keep keyboard focus and reduced-motion behavior visible. All routes, native/browser separation, explicit confirmation, writer lease, and error states remain reachable.
++
++Browser/native-shaped fixtures live under `tests/ui/` and must intercept their network/bridge boundary. Task-generated artifacts and temporary data live in the owned `.local/react-workbench-redesign-20261025-tmp/` directory; command recipes and retained verification evidence live in the owned execution receipt directory. Do not import fixture data or bridge stubs into production modules. Remove disposable task files after retained evidence is complete.
+diff --git a/apps/web/src/components/app-shell.jsx b/apps/web/src/components/app-shell.jsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd4852dab0c2c12cfae670a7e8c0dd5b180185e1
+--- /dev/null
++++ b/apps/web/src/components/app-shell.jsx
+@@ -0,0 +1,62 @@
++import React, { useState } from 'react'
++import { etagOf, itemsOf } from '../api'
++import { Link, navigation, stages } from '../navigation'
++
++function Icon({ name }) {
++  const paths = {
++    home: <><path d="M3 10 12 3l9 7v10H3z"/><path d="M9 20v-6h6v6"/></>,
++    cycle: <><path d="M20 7a8 8 0 0 0-14-2L4 7M4 3v4h4M4 17a8 8 0 0 0 14 2l2-2M16 17h4v4"/></>,
++    release: <path d="M5 3h11l3 3v15H5zM8 10h8M8 14h8M8 18h5"/>,
++    evidence: <path d="M4 4h16v16H4zM8 8h8M8 12h6M8 16h8"/>,
++    experiment: <path d="M8 3h8M10 3v7l-5 9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2l-5-9V3M8 16h8"/>,
++    knowledge: <path d="M3 5c3-2 6-2 9 0 3-2 6-2 9 0v15c-3-2-6-2-9 0-3-2-6-2-9 0zM12 5v15"/>,
++    team: <><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M2 20c0-4 3-6 6-6s6 2 6 6M14 15c4-1 8 1 8 5"/></>,
++    resources: <><circle cx="12" cy="12" r="9"/><path d="M15 8H10a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H9M12 5v3m0 8v3"/></>,
++    settings: <><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
++    chat: <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12h5"/>,
++    menu: <path d="M3 6h18M3 12h18M3 18h18"/>, close: <path d="M5 5l14 14M19 5 5 19"/>,
++  }
++  return <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name] || paths.home}</svg>
++}
++
++function StageRail({ projection, state, releases, navigate, projectId, onClose }) {
++  return <div className="rail-inner"><div className="rail-heading"><h2>阶段进度</h2><button className="icon-button drawer-close" aria-label="关闭进度" onClick={onClose}><Icon name="close"/></button></div>
++    {projection ? <><p className="small-muted">计划版本 {projection.plan_revision} · 事件水位 {projection.as_of_event_sequence}</p>{projection.plan_change_note && <p className="small-muted">{projection.plan_change_note}</p>}<ol className="stage-list">{stages.map(([stage, label], index) => {
++      const value = projection.stages?.find(row => row.stage === stage)
++      return <li key={stage}><span className="stage-number">{index + 1}</span><span className="stage-title">{label}</span><span className="stage-count">{value ? `${value.accepted} / ${value.planned} 已验收` : '尚无计划'}</span>{value?.active > 0 && <span className="stage-extra">{value.active} 进行中</span>}{value?.pending_review > 0 && <span className="stage-extra">{value.pending_review} 待评审</span>}{value?.blocked > 0 && <span className="stage-extra warning">{value.blocked} 受阻</span>}</li>
++    })}</ol></> : <p className="empty-inline">进度投影尚不可用，暂不显示百分比。</p>}
++    <div className="rail-section"><h3>当前阻塞</h3><p>{state?.blocking_conflict_ids?.length ? `${state.blocking_conflict_ids.length} 项冲突待处理` : '无已记录的阻塞冲突'}</p></div>
++    <div className="rail-section"><h3>最近已验收成果</h3>{itemsOf(releases).length ? itemsOf(releases).slice(-3).reverse().map(item => <Link className="rail-release" key={item.id} navigate={navigate} to={`/p/${projectId}/releases/${item.id}`}>{item.summary}<small>里程碑 {item.sequence}</small></Link>) : <p>尚无已验收成果</p>}</div>
++  </div>
++}
++
++function NotificationDrawer({ notifications, projectId, navigate, mutate, onClose }) {
++  const [busy, setBusy] = useState(null)
++  async function read(notification) {
++    if (notification.status === 'READ') return
++    setBusy(notification.id)
++    try { await mutate('markNotificationRead', { params: { projectId, id: notification.id }, etag: etagOf(notification), body: { reason: '用户在工作台已读通知' } }, '通知已标记为已读') }
++    catch { /* App feedback shows the service error */ }
++    finally { setBusy(null) }
++  }
++  return <div className="notice-inner"><div className="rail-heading"><h2>通知</h2><button className="icon-button drawer-close" aria-label="关闭通知" onClick={onClose}><Icon name="close"/></button></div>
++    {notifications.length ? notifications.map(item => <div className="notice-row" key={item.id}><span className={`tag ${item.status === 'UNREAD' ? 'good' : ''}`}>{item.status === 'UNREAD' ? '未读' : '已读'}</span><p>{item.summary}</p><small>{new Date(item.created_at).toLocaleString()}</small><div className="button-row">{item.release_id && <Link to={`/p/${projectId}/releases/${item.release_id}`} navigate={navigate} onClick={onClose}>查看成果</Link>}{item.resource_request_id && <Link to={`/p/${projectId}/resources`} navigate={navigate} onClick={onClose}>查看资源</Link>}{item.status === 'UNREAD' && <button disabled={busy === item.id} onClick={() => read(item)}>标记已读</button>}</div></div>) : <p className="empty-state">没有项目通知。</p>}
++  </div>
++}
++
++export function AppShell({ route, navigate, drawer, setDrawer, compact, openDrawer, events, projectId, profile,
++  unread, theme, setTheme, notifications, shared, state, feedback, setFeedback, deviceSession, api, mutate,
++  navUrl, children }) {
++  return <>
++    <header className={`topbar ${route.kind === 'workbench' ? 'workbench-topbar' : ''}`} inert={!!drawer}><button className="icon-button menu-button" aria-label="打开导航" onClick={e => openDrawer('nav', e)}><Icon name="menu"/></button><Link to="/" navigate={navigate} className="brand"><span className="brandmark">R</span><span>ResearchOS</span></Link><span className="top-context">研究工作台</span><span className="top-spacer"/><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/><span className="connection-text">{events.online ? '已连接' : '连接中断'}</span>{projectId && <button className="theme-button" aria-label={`打开通知，${unread} 条未读`} onClick={e => openDrawer('notice', e)}>通知{unread ? ` ${unread}` : ''}</button>}<button className="theme-button" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} aria-label={`切换为${theme === 'light' ? '深色' : '浅色'}主题`}>{theme === 'light' ? '深色' : '浅色'}</button><button className="icon-button progress-button" aria-label="打开阶段进度" onClick={e => openDrawer('rail', e)}><Icon name="cycle"/></button></header>
++    {projectId && !events.online && <div className="connection-banner" role="status">连接已断开，状态可能过期。{events.lastSync ? `最后同步 ${events.lastSync.toLocaleString()}` : '尚未同步'}。</div>}
++    {deviceSession.device && <div className="connection-banner" role="status">{(api?.deviceRole() || deviceSession.device.role) === 'READER' ? '此设备为只读监督；控制操作需要电脑显式授权。' : '此设备可控制已授权项目；设备和全局设置仍由电脑管理。'}</div>}
++    {feedback && <div className={`feedback ${feedback.kind}`} role="status"><span>{feedback.text}</span><button aria-label="关闭提示" onClick={() => setFeedback(null)}><Icon name="close"/></button></div>}
++    <div className={`drawer-overlay ${drawer ? 'visible' : ''}`} onClick={() => setDrawer(null)}/>
++    <div className={`app-grid ${route.kind === 'workbench' ? 'workbench-route' : ''}`}><nav className={`sidebar ${drawer === 'nav' ? 'drawer-open' : ''}`} aria-label="主导航" inert={(compact || !!drawer) && drawer !== 'nav'}><div className="sidebar-inner"><div className="sidebar-head"><span>项目空间</span><button className="icon-button drawer-close" aria-label="关闭导航" onClick={() => setDrawer(null)}><Icon name="close"/></button></div><Link to="/" navigate={navigate} className="project-switch">{profile?.name || '选择项目'}<small>{projectId ? '切换项目' : '项目入口'}</small></Link><div className="nav-group">{navigation.map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} aria-label={label} className={`nav-link ${route.kind === kind ? 'active' : ''}`}><Icon name={icon}/><span>{label}</span></Link>)}</div><div className="sidebar-bottom"><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/> {events.online ? '已连接' : events.message || '连接中断'}<small>开发阶段 · 以服务回执为准</small></div></div></nav>
++      <main id="main" className="main-area" tabIndex="-1" inert={!!drawer}>{children}</main>
++      <aside className={`progress-rail ${drawer === 'rail' ? 'drawer-open' : ''}`} aria-label="阶段进度" inert={(compact || !!drawer) && drawer !== 'rail'}><StageRail projection={shared.data.getProgressProjection} state={state} releases={shared.data.listMilestoneRelease} navigate={navigate} projectId={projectId} onClose={() => setDrawer(null)}/></aside></div>
++    {drawer === 'notice' && <aside className="notice-drawer" aria-label="通知列表"><NotificationDrawer notifications={notifications} projectId={projectId} navigate={navigate} mutate={mutate} onClose={() => setDrawer(null)}/></aside>}
++    {projectId && <nav className="bottom-nav" aria-label="手机主要导航" inert={!!drawer}>{[['home', '工作台', 'workbench'], ['cycle', '周期', 'cycle'], ['release', '成果', 'release'], ['resources', '资源', 'resources']].map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} className={route.kind === kind ? 'active' : ''}><Icon name={icon}/><span>{label}</span></Link>)}</nav>}
++  </>
++}
+diff --git a/apps/web/src/components/ui.jsx b/apps/web/src/components/ui.jsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..58e290e5f1fdc7e9d51ae55ec541968d0a7716a7
+--- /dev/null
++++ b/apps/web/src/components/ui.jsx
+@@ -0,0 +1,20 @@
++import React from 'react'
++
++export function Header({ title, description, action }) {
++  return <header className="page-heading"><div><h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</header>
++}
++
++export function Section({ title, aside, children, className = '' }) {
++  return <section className={`panel ${className}`}><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section>
++}
++
++export function Empty({ children }) { return <p className="empty-state">{children || '当前没有记录。'}</p> }
++
++export function Tag({ value, type }) {
++  const tone = type || (/失败|受阻|拒绝|限流|过期|PARTIAL|RATE_LIMITED/.test(String(value)) ? 'warning' : /验收|COMPLETE|CURRENT|IMPROVED/.test(String(value)) ? 'good' : '')
++  return <span className={`tag ${tone}`}>{value ?? '未知'}</span>
++}
++
++export function JsonDetails({ value, label = '查看原始字段' }) {
++  return <details className="raw-details"><summary>{label}</summary><pre>{JSON.stringify(value, null, 2)}</pre></details>
++}
+diff --git a/apps/web/src/components/workbench-layout.jsx b/apps/web/src/components/workbench-layout.jsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..70b58ab4fccef5ad56474ee4c1716f0fcf3990b8
+--- /dev/null
++++ b/apps/web/src/components/workbench-layout.jsx
+@@ -0,0 +1,9 @@
++import React from 'react'
++
++export function WorkbenchLayout({ sessions, conversation, context }) {
++  return <div className="workbench-layout">
++    <aside className="workbench-session-pane" aria-label="项目会话">{sessions}</aside>
++    <section className="workbench-conversation-pane" aria-label="当前研究会话">{conversation}</section>
++    <aside className="workbench-context-pane" aria-label="工作区、配置与资格">{context}</aside>
++  </div>
++}
+diff --git a/apps/web/src/main.jsx b/apps/web/src/main.jsx
+index c5bef8f2a903485bb9d4b4a096c376e9bf67be95..f1257e540b81ecbcf199f17fdd5e565b35bcfa12 100644
+--- a/apps/web/src/main.jsx
++++ b/apps/web/src/main.jsx
+@@ -1,86 +1,16 @@
+ import React, { useEffect, useMemo, useRef, useState } from 'react'
+ import { createRoot } from 'react-dom/client'
+ import tokens from '../../../spec/v2.0/ui/design-tokens.json'
+-import { createApi, classify, etagOf, itemsOf } from './api'
++import { createApi, classify, itemsOf } from './api'
+ import { useQueries, useProjectEvents } from './hooks'
+ import { Screen } from './screens'
++import { useRoute } from './navigation'
++import { AppShell } from './components/app-shell'
+ import { PairingGate, useDeviceSession } from './Pairing'
+ import './style.css'
+ 
+ const nativeDesktop = !!window.researchos?.desktop?.context
+ 
+-export const stages = [['discovery', '发现'], ['verification', '核验'], ['experiment', '实验'], ['review', '评审'], ['delivery', '交付'], ['follow_up', '跟踪']]
+-export const taskLabels = { DRAFT: '草稿', READY: '待执行', RUNNING: '执行中', EXECUTION_REPORTED: '结果已提交', VERIFYING: '验收中', ACCEPTED: '已验收', FAILED: '失败', BLOCKED: '受阻', CANCELLED: '已取消', NEEDS_REVALIDATION: '需重验', DEFERRED_NO_PROGRESS: '无进展延期' }
+-export const runLabels = { QUEUED: '排队', STARTING: '启动中', RUNNING: '运行中', CANCEL_REQUESTED: '取消请求中', SETTLED: '执行已结束', FAILED: '执行失败', CANCELLED: '已取消', LOST: '连接丢失', RECONCILING: '恢复对账中' }
+-
+-const navigation = [['home', '工作台', 'workbench'], ...(!nativeDesktop ? [['chat', '对话接续', 'continuity']] : []), ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
+-
+-function routeOf(path) {
+-  const p = path.split('/').filter(Boolean).map(decodeURIComponent)
+-  if (!p.length) return { kind: 'projects', key: path }
+-  if (p[0] !== 'p' || !p[1]) return { kind: 'not-found', key: path }
+-  const projectId = p[1]
+-  if (p.length === 2) return { kind: 'workbench', projectId, key: path }
+-  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings', continuity: nativeDesktop ? 'workbench' : 'continuity' }[p[2]]
+-  if (!kind || (['evidence', 'knowledge', 'team', 'resources', 'settings'].includes(kind) && p.length > 3)) return { kind: 'not-found', projectId, key: path }
+-  if (['cycle', 'task', 'release', 'experiment'].includes(kind) && !p[3]) return { kind: 'selection', section: kind, projectId, key: path }
+-  return { kind, projectId, id: p[3], key: path }
+-}
+-
+-function useRoute() {
+-  const currentRoute = () => ({ ...routeOf(location.pathname), search: location.search })
+-  const [route, setRoute] = useState(currentRoute)
+-  useEffect(() => { const pop = () => setRoute(currentRoute()); addEventListener('popstate', pop); return () => removeEventListener('popstate', pop) }, [])
+-  const navigate = path => { const target = new URL(path, location.origin); if (target.pathname + target.search !== location.pathname + location.search) history.pushState(null, '', target); setRoute({ ...routeOf(target.pathname), search: target.search }); scrollTo(0, 0) }
+-  return [route, navigate]
+-}
+-
+-export function Link({ to, navigate, children, ...props }) {
+-  return <a {...props} href={to} onClick={event => { props.onClick?.(event); if (!event.defaultPrevented && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); navigate(to) } }}>{children}</a>
+-}
+-
+-function Icon({ name }) {
+-  const paths = {
+-    home: <><path d="M3 10 12 3l9 7v10H3z"/><path d="M9 20v-6h6v6"/></>,
+-    cycle: <><path d="M20 7a8 8 0 0 0-14-2L4 7M4 3v4h4M4 17a8 8 0 0 0 14 2l2-2M16 17h4v4"/></>,
+-    release: <path d="M5 3h11l3 3v15H5zM8 10h8M8 14h8M8 18h5"/>,
+-    evidence: <path d="M4 4h16v16H4zM8 8h8M8 12h6M8 16h8"/>,
+-    experiment: <path d="M8 3h8M10 3v7l-5 9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2l-5-9V3M8 16h8"/>,
+-    knowledge: <path d="M3 5c3-2 6-2 9 0 3-2 6-2 9 0v15c-3-2-6-2-9 0-3-2-6-2-9 0zM12 5v15"/>,
+-    team: <><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M2 20c0-4 3-6 6-6s6 2 6 6M14 15c4-1 8 1 8 5"/></>,
+-    resources: <><circle cx="12" cy="12" r="9"/><path d="M15 8H10a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H9M12 5v3m0 8v3"/></>,
+-    settings: <><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
+-    chat: <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12h5"/>,
+-    menu: <path d="M3 6h18M3 12h18M3 18h18"/>, close: <path d="M5 5l14 14M19 5 5 19"/>,
+-  }
+-  return <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name] || paths.home}</svg>
+-}
+-
+-function StageRail({ projection, state, releases, navigate, projectId, onClose }) {
+-  return <div className="rail-inner"><div className="rail-heading"><h2>阶段进度</h2><button className="icon-button drawer-close" aria-label="关闭进度" onClick={onClose}><Icon name="close"/></button></div>
+-    {projection ? <><p className="small-muted">计划版本 {projection.plan_revision} · 事件水位 {projection.as_of_event_sequence}</p>{projection.plan_change_note && <p className="small-muted">{projection.plan_change_note}</p>}<ol className="stage-list">{stages.map(([stage, label], index) => {
+-      const value = projection.stages?.find(row => row.stage === stage)
+-      return <li key={stage}><span className="stage-number">{index + 1}</span><span className="stage-title">{label}</span><span className="stage-count">{value ? `${value.accepted} / ${value.planned} 已验收` : '尚无计划'}</span>{value?.active > 0 && <span className="stage-extra">{value.active} 进行中</span>}{value?.pending_review > 0 && <span className="stage-extra">{value.pending_review} 待评审</span>}{value?.blocked > 0 && <span className="stage-extra warning">{value.blocked} 受阻</span>}</li>
+-    })}</ol></> : <p className="empty-inline">进度投影尚不可用，暂不显示百分比。</p>}
+-    <div className="rail-section"><h3>当前阻塞</h3><p>{state?.blocking_conflict_ids?.length ? `${state.blocking_conflict_ids.length} 项冲突待处理` : '无已记录的阻塞冲突'}</p></div>
+-    <div className="rail-section"><h3>最近已验收成果</h3>{itemsOf(releases).length ? itemsOf(releases).slice(-3).reverse().map(item => <Link className="rail-release" key={item.id} navigate={navigate} to={`/p/${projectId}/releases/${item.id}`}>{item.summary}<small>里程碑 {item.sequence}</small></Link>) : <p>尚无已验收成果</p>}</div>
+-  </div>
+-}
+-
+-function NotificationDrawer({ notifications, projectId, navigate, mutate, onClose }) {
+-  const [busy, setBusy] = useState(null)
+-  async function read(notification) {
+-    if (notification.status === 'READ') return
+-    setBusy(notification.id)
+-    try { await mutate('markNotificationRead', { params: { projectId, id: notification.id }, etag: etagOf(notification), body: { reason: '用户在工作台已读通知' } }, '通知已标记为已读') }
+-    catch { /* App feedback shows the service error */ }
+-    finally { setBusy(null) }
+-  }
+-  return <div className="notice-inner"><div className="rail-heading"><h2>通知</h2><button className="icon-button drawer-close" aria-label="关闭通知" onClick={onClose}><Icon name="close"/></button></div>
+-    {notifications.length ? notifications.map(item => <div className="notice-row" key={item.id}><span className={`tag ${item.status === 'UNREAD' ? 'good' : ''}`}>{item.status === 'UNREAD' ? '未读' : '已读'}</span><p>{item.summary}</p><small>{new Date(item.created_at).toLocaleString()}</small><div className="button-row">{item.release_id && <Link to={`/p/${projectId}/releases/${item.release_id}`} navigate={navigate} onClick={onClose}>查看成果</Link>}{item.resource_request_id && <Link to={`/p/${projectId}/resources`} navigate={navigate} onClick={onClose}>查看资源</Link>}{item.status === 'UNREAD' && <button disabled={busy === item.id} onClick={() => read(item)}>标记已读</button>}</div></div>) : <p className="empty-state">没有项目通知。</p>}
+-  </div>
+-}
+-
+ function AuthGate({ onToken }) {
+   const [value, setValue] = useState('')
+   return <div className="auth-wrap"><div className="auth-card"><span className="brandmark">R</span><h1>ResearchOS</h1><p>输入本机已配置的访问令牌，打开研究工作台。令牌只保存在当前页面内存中，关闭页面即清除。</p><form onSubmit={event => { event.preventDefault(); if (value.trim()) onToken(value.trim()) }}><label htmlFor="access-token">访问令牌</label><input id="access-token" type="password" autoComplete="off" value={value} onChange={event => setValue(event.target.value)} required/><button className="primary" type="submit">打开工作台</button></form><small>令牌由本机受保护的凭据管理流程提供。</small></div></div>
+@@ -152,18 +82,13 @@ function App() {
+   }
+   if (!nativeDesktop && !token && (location.pathname === '/pair' || deviceSession.error || location.hostname.endsWith('.trycloudflare.com'))) return <PairingGate sessionError={deviceSession.error} onSession={session => { deviceSession.accept(session); navigate(`/p/${session.device.project_ids[0]}`) }}/>
+   if (!nativeDesktop && !token) return <AuthGate onToken={setToken}/>
+-  return <>
+-    <header className="topbar" inert={!!drawer}><button className="icon-button menu-button" aria-label="打开导航" onClick={e => openDrawer('nav', e)}><Icon name="menu"/></button><Link to="/" navigate={navigate} className="brand"><span className="brandmark">R</span><span>ResearchOS</span></Link><span className="top-context">研究工作台</span><span className="top-spacer"/><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/><span className="connection-text">{events.online ? '已连接' : '连接中断'}</span>{projectId && <button className="theme-button" aria-label={`打开通知，${unread} 条未读`} onClick={e => openDrawer('notice', e)}>通知{unread ? ` ${unread}` : ''}</button>}<button className="theme-button" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} aria-label={`切换为${theme === 'light' ? '深色' : '浅色'}主题`}>{theme === 'light' ? '深色' : '浅色'}</button><button className="icon-button progress-button" aria-label="打开阶段进度" onClick={e => openDrawer('rail', e)}><Icon name="cycle"/></button></header>
+-    {projectId && !events.online && <div className="connection-banner" role="status">连接已断开，状态可能过期。{events.lastSync ? `最后同步 ${events.lastSync.toLocaleString()}` : '尚未同步'}。</div>}
+-    {deviceSession.device && <div className="connection-banner" role="status">{(api?.deviceRole() || deviceSession.device.role) === 'READER' ? '此设备为只读监督；控制操作需要电脑显式授权。' : '此设备可控制已授权项目；设备和全局设置仍由电脑管理。'}</div>}
+-    {feedback && <div className={`feedback ${feedback.kind}`} role="status"><span>{feedback.text}</span><button aria-label="关闭提示" onClick={() => setFeedback(null)}><Icon name="close"/></button></div>}
+-    <div className={`drawer-overlay ${drawer ? 'visible' : ''}`} onClick={() => setDrawer(null)}/>
+-    <div className="app-grid"><nav className={`sidebar ${drawer === 'nav' ? 'drawer-open' : ''}`} aria-label="主导航" inert={(compact || !!drawer) && drawer !== 'nav'}><div className="sidebar-inner"><div className="sidebar-head"><span>项目空间</span><button className="icon-button drawer-close" aria-label="关闭导航" onClick={() => setDrawer(null)}><Icon name="close"/></button></div><Link to="/" navigate={navigate} className="project-switch">{profile?.name || '选择项目'}<small>{projectId ? '切换项目' : '项目入口'}</small></Link><div className="nav-group">{navigation.map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} aria-label={label} className={`nav-link ${route.kind === kind ? 'active' : ''}`}><Icon name={icon}/><span>{label}</span></Link>)}</div><div className="sidebar-bottom"><span className="connection-dot"/> {events.online ? '已连接' : '等待连接'}<small>开发阶段 · 以服务回执为准</small></div></div></nav>
+-      <main id="main" className="main-area" tabIndex="-1" inert={!!drawer}><Screen key={route.key} route={route} api={api} token={token} navigate={navigate} shared={shared} events={events} refresh={refresh + events.refresh} mutate={mutate} onRefresh={() => setRefresh(n => n + 1)}/></main>
+-      <aside className={`progress-rail ${drawer === 'rail' ? 'drawer-open' : ''}`} aria-label="阶段进度" inert={(compact || !!drawer) && drawer !== 'rail'}><StageRail projection={shared.data.getProgressProjection} state={state} releases={shared.data.listMilestoneRelease} navigate={navigate} projectId={projectId} onClose={() => setDrawer(null)}/></aside></div>
+-    {drawer === 'notice' && <aside className="notice-drawer" aria-label="通知列表"><NotificationDrawer notifications={notifications} projectId={projectId} navigate={navigate} mutate={mutate} onClose={() => setDrawer(null)}/></aside>}
+-    {projectId && <nav className="bottom-nav" aria-label="手机主要导航" inert={!!drawer}>{[['home', '工作台', 'workbench'], ['cycle', '周期', 'cycle'], ['release', '成果', 'release'], ['resources', '资源', 'resources']].map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} className={route.kind === kind ? 'active' : ''}><Icon name={icon}/><span>{label}</span></Link>)}</nav>}
+-  </>
++  return <AppShell route={route} navigate={navigate} drawer={drawer} setDrawer={setDrawer} compact={compact}
++    openDrawer={openDrawer} events={events} projectId={projectId} profile={profile} unread={unread}
++    theme={theme} setTheme={setTheme} notifications={notifications} shared={shared} state={state}
++    feedback={feedback} setFeedback={setFeedback} deviceSession={deviceSession} api={api}
++    mutate={mutate} navUrl={navUrl}>
++    <Screen key={route.key} route={route} api={api} token={token} navigate={navigate} shared={shared} events={events} refresh={refresh + events.refresh} mutate={mutate} onRefresh={() => setRefresh(n => n + 1)}/>
++  </AppShell>
+ }
+ 
+ createRoot(document.getElementById('root')).render(<App />)
+diff --git a/apps/web/src/navigation.jsx b/apps/web/src/navigation.jsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c17354f6f58e215078ecc2753bd5456ab970b0b3
+--- /dev/null
++++ b/apps/web/src/navigation.jsx
+@@ -0,0 +1,33 @@
++import React, { useEffect, useState } from 'react'
++
++const nativeDesktop = !!window.researchos?.desktop?.context
++
++export const stages = [['discovery', '发现'], ['verification', '核验'], ['experiment', '实验'], ['review', '评审'], ['delivery', '交付'], ['follow_up', '跟踪']]
++export const taskLabels = { DRAFT: '草稿', READY: '待执行', RUNNING: '执行中', EXECUTION_REPORTED: '结果已提交', VERIFYING: '验收中', ACCEPTED: '已验收', FAILED: '失败', BLOCKED: '受阻', CANCELLED: '已取消', NEEDS_REVALIDATION: '需重验', DEFERRED_NO_PROGRESS: '无进展延期' }
++export const runLabels = { QUEUED: '排队', STARTING: '启动中', RUNNING: '运行中', CANCEL_REQUESTED: '取消请求中', SETTLED: '执行已结束', FAILED: '执行失败', CANCELLED: '已取消', LOST: '连接丢失', RECONCILING: '恢复对账中' }
++
++export const navigation = [['home', '工作台', 'workbench'], ...(!nativeDesktop ? [['chat', '对话接续', 'continuity']] : []), ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
++
++export function routeOf(path) {
++  const p = path.split('/').filter(Boolean).map(decodeURIComponent)
++  if (!p.length) return { kind: 'projects', key: path }
++  if (p[0] !== 'p' || !p[1]) return { kind: 'not-found', key: path }
++  const projectId = p[1]
++  if (p.length === 2) return { kind: 'workbench', projectId, key: path }
++  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings', continuity: nativeDesktop ? 'workbench' : 'continuity' }[p[2]]
++  if (!kind || (['evidence', 'knowledge', 'team', 'resources', 'settings'].includes(kind) && p.length > 3)) return { kind: 'not-found', projectId, key: path }
++  if (['cycle', 'task', 'release', 'experiment'].includes(kind) && !p[3]) return { kind: 'selection', section: kind, projectId, key: path }
++  return { kind, projectId, id: p[3], key: path }
++}
++
++export function useRoute() {
++  const currentRoute = () => ({ ...routeOf(location.pathname), search: location.search })
++  const [route, setRoute] = useState(currentRoute)
++  useEffect(() => { const pop = () => setRoute(currentRoute()); addEventListener('popstate', pop); return () => removeEventListener('popstate', pop) }, [])
++  const navigate = path => { const target = new URL(path, location.origin); if (target.pathname + target.search !== location.pathname + location.search) history.pushState(null, '', target); setRoute({ ...routeOf(target.pathname), search: target.search }); scrollTo(0, 0) }
++  return [route, navigate]
++}
++
++export function Link({ to, navigate, children, ...props }) {
++  return <a {...props} href={to} onClick={event => { props.onClick?.(event); if (!event.defaultPrevented && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); navigate(to) } }}>{children}</a>
++}
+diff --git a/apps/web/src/screens.jsx b/apps/web/src/screens.jsx
+index ba3beee94e1d9140c821f8eaa1c8c777ce91ceb6..921e58306065b2999900aa44ab3bca0f703713cd 100644
+--- a/apps/web/src/screens.jsx
++++ b/apps/web/src/screens.jsx
+@@ -1,20 +1,17 @@
+ import React, { useEffect, useMemo, useRef, useState } from 'react'
+ import { ApiError, classify, etagOf, itemsOf } from './api'
+ import { useQueries } from './hooks'
+-import { Link, taskLabels, runLabels } from './main'
++import { Link, taskLabels, runLabels } from './navigation'
+ import { ArtifactPreview } from './preview'
+ import { ProfileDraft } from './profile-draft'
+ import { DevicePanel } from './Pairing'
+ import { Continuity } from './continuity'
+ import { ResourceRecovery } from './resource-recovery.jsx'
+ import { NativeModelConfiguration, NativeProjectEntry, NativeWorkbench } from './workbench.jsx'
++import { Header, Section, Tag, Empty, JsonDetails } from './components/ui'
+ 
+ const briefDate = raw => raw ? new Date(raw).toLocaleString() : '未记录'
+ const short = raw => raw ? String(raw).slice(0, 12) : '—'
+-function Header({ title, description, action }) { return <header className="page-heading"><div><h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</header> }
+-function Section({ title, aside, children, className = '' }) { return <section className={`panel ${className}`}><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
+-function Tag({ value, type }) { return <span className={`tag ${type || (/失败|受阻|拒绝|限流|过期|PARTIAL|RATE_LIMITED/.test(String(value)) ? 'warning' : /验收|COMPLETE|CURRENT|IMPROVED/.test(String(value)) ? 'good' : '')}`}>{value ?? '未知'}</span> }
+-function Empty({ children }) { return <p className="empty-state">{children || '当前没有记录。'}</p> }
+ function StateNotice({ state, empty, onRetry }) {
+   if (state.loading) return <div className="loading-state" role="status"><span className="loading-line"/><span className="loading-line short"/>正在读取已保存状态…</div>
+   const entries = Object.entries(state.errors)
+@@ -22,7 +19,6 @@ function StateNotice({ state, empty, onRetry }) {
+   if (empty) return <Empty/>
+   return null
+ }
+-function JsonDetails({ value, label = '查看原始字段' }) { return <details className="raw-details"><summary>{label}</summary><pre>{JSON.stringify(value, null, 2)}</pre></details> }
+ function Table({ headers, rows }) { return <div className="table-wrap"><table><thead><tr>{headers.map(x => <th key={x}>{x}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>)}</tbody></table></div> }
+ function refFor(value, kind) { return { entity_type: kind, id: value.id, revision: value.revision, content_hash: value.content_hash ?? null } }
+ 
+@@ -70,11 +66,49 @@ function Workbench({ api, projectId, navigate, shared, refresh, onRefresh }) {
+   const more = useQueries(api, projectId, [{ op: 'listGoal' }, { op: 'listTask' }, { op: 'listResearchCycle' }, { op: 'listResourceRequest' }], refresh)
+   const state = shared.data.getProjectState, profile = shared.data.getProjectProfile
+   const tasks = itemsOf(more.data.listTask), goals = itemsOf(more.data.listGoal), cycles = itemsOf(more.data.listResearchCycle)
+-  const planningTasks = tasks.filter(t => t.task_type === 'intent_planning')
+-  const businessTasks = tasks.filter(t => !['intent_planning', 'runtime_qualification'].includes(t.task_type))
+-  const active = cycles.find(c => c.id === state?.active_cycle_id) || cycles.at(-1)
++  const planningTasks = tasks.filter(task => task.task_type === 'intent_planning')
++  const businessTasks = tasks.filter(task => !['intent_planning', 'runtime_qualification'].includes(task.task_type))
++  const active = cycles.find(cycle => cycle.id === state?.active_cycle_id) || cycles.at(-1)
+   const release = itemsOf(shared.data.listMilestoneRelease).at(-1)
+-  return <><Header title={profile?.name || '研究工作台'} description="先看有效进展，再查看执行细节。" action={<IdeaForm key={projectId} api={api} projectId={projectId} onCreated={onRefresh}/>}/><StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/><Section title="持续目标" className="goal-section">{goals.length ? goals.filter(g => g.status === 'ACTIVE' || g.status === 'DRAFT').slice(-2).map(goal => <div key={goal.id}><h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div></div>) : <Empty>尚无目标。用右上角“提出新想法”开始规划。</Empty>}</Section><div className="summary-strip"><div><span>业务已验收</span><strong>{businessTasks.filter(t => t.status === 'ACCEPTED').length}</strong><small>业务任务 {businessTasks.length}</small><small>待执行 {businessTasks.filter(task => task.status === 'READY').length}</small></div><div><span>待评审</span><strong>{businessTasks.filter(t => ['EXECUTION_REPORTED', 'VERIFYING'].includes(t.status)).length}</strong><small>执行结果不算已验收</small></div><div><span>{state?.active_cycle_id ? '当前周期' : '最近周期'}</span><strong>{active ? active.status : '—'}</strong><small>{active ? briefDate(active.started_at) : '尚未开始'}</small></div></div><Section title="意图规划"><p className="small-muted">规划检查通过只表示提案可追溯、结构可检验，业务成果另行验收。</p>{planningTasks.length ? planningTasks.map(task => <Link key={task.id} className="record-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><strong>{goals.find(g => g.id === task.goal_id)?.original_intent || task.title}</strong><span>{task.status === 'ACCEPTED' ? '规划提案检查通过' : taskLabels[task.status] || task.status}</span><small>查看提案、执行与独立检查 →</small></Link>) : <Empty>提交一句想法即可开始。</Empty>}</Section><Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>{tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/></Link>)}</div> : <Empty>尚无任务。</Empty>}</Section><div className="two-column"><Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(c => <div className="coverage-row" key={c.source_id}><span>{short(c.source_id)}</span><Tag value={c.status}/><small>{c.gap_reason || `${c.record_count} 条记录`}</small></div>) : <Empty>尚无活动研究周期。</Empty>}</Section><Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link"><strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span></Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section></div><Section title="下一步">{itemsOf(more.data.listResourceRequest).filter(r => r.status !== 'RESOLVED').length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看待处理的资源请求 →</Link> : <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section></>
++  const pendingResources = itemsOf(more.data.listResourceRequest).filter(request => request.status !== 'RESOLVED')
++  const currentGoals = goals.filter(goal => goal.status === 'ACTIVE' || goal.status === 'DRAFT').slice(-2)
++  return <>
++    <Header title={profile?.name || '研究工作台'} description="查看当前目标、任务和下一步。" action={<IdeaForm key={projectId} api={api} projectId={projectId} onCreated={onRefresh}/>}/>
++    <StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/>
++    <div className="browser-workbench">
++      <div className="browser-primary">
++        <Section title="当前目标" className="goal-section">{currentGoals.length ? currentGoals.map(goal => <div key={goal.id}>
++          <h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div>
++        </div>) : <Empty>尚无目标。用右上角“提出新想法”开始规划。</Empty>}</Section>
++        <Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>
++          {tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}>
++            <span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/>
++          </Link>)}</div> : <Empty>尚无任务。提交想法后，可在这里查看真实规划与执行状态。</Empty>}
++        </Section>
++        <Section title="意图规划"><p className="small-muted">规划检查通过只表示提案可追溯、结构可检验；业务成果另行验收。</p>
++          {planningTasks.length ? planningTasks.map(task => <Link key={task.id} className="record-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}>
++            <strong>{goals.find(goal => goal.id === task.goal_id)?.original_intent || task.title}</strong>
++            <span>{task.status === 'ACCEPTED' ? '规划提案检查通过' : taskLabels[task.status] || task.status}</span><small>查看提案、执行与独立检查 →</small>
++          </Link>) : <Empty>提交一句想法即可开始。</Empty>}
++        </Section>
++      </div>
++      <aside className="browser-inspector" aria-label="项目上下文与结果">
++        <Section title="下一步">{pendingResources.length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看 {pendingResources.length} 项待处理资源请求 →</Link> :
++          <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section>
++        <Section title="项目状态"><dl className="workbench-facts">
++          <div><dt>业务已验收</dt><dd>{businessTasks.filter(task => task.status === 'ACCEPTED').length} / {businessTasks.length}</dd></div>
++          <div><dt>待评审</dt><dd>{businessTasks.filter(task => ['EXECUTION_REPORTED', 'VERIFYING'].includes(task.status)).length}</dd></div>
++          <div><dt>{state?.active_cycle_id ? '当前周期' : '最近周期'}</dt><dd>{active ? `${active.status} · ${briefDate(active.started_at)}` : '尚未开始'}</dd></div>
++        </dl><p className="small-muted">执行结果不等于业务验收。</p></Section>
++        <Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(coverage => <div className="coverage-row" key={coverage.source_id}>
++          <span>{short(coverage.source_id)}</span><Tag value={coverage.status}/><small>{coverage.gap_reason || `${coverage.record_count} 条记录`}</small>
++        </div>) : <Empty>尚无活动研究周期。</Empty>}</Section>
++        <Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link">
++          <strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span>
++        </Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section>
++      </aside>
++    </div>
++  </>
+ }
+ 
+ function Cycle({ route, api, navigate, refresh, onRefresh }) {
+diff --git a/apps/web/src/style.css b/apps/web/src/style.css
+index f9496dfc9eed013ba32ef0fed247fcb2b5cdf17a..8ce1403b0b49a6837d56e6f74586e9b69eef6a51 100644
+--- a/apps/web/src/style.css
++++ b/apps/web/src/style.css
+@@ -19,3 +19,51 @@
+ @media(max-width:1023px){.session-layout,.workspace-layout{grid-template-columns:minmax(0,1fr)}.session-picker{display:flex;flex-wrap:wrap;gap:8px}.session-picker li{flex:1 1 140px}.conversation-transcript{max-height:none}}
+ @media(max-width:390px){.composer-controls{align-items:stretch;flex-direction:column}.session-layout .panel{padding:12px}.session-layout .button-row button{flex:1 1 auto}}
+ .session-picker{max-height:45vh;overflow:auto;overscroll-behavior:contain;padding-right:4px}
++
++/* The research route gives the conversation the primary canvas. The project
++   navigation and contextual workspace remain directly reachable. */
++.app-grid.workbench-route{grid-template-columns:var(--nav-width,216px) minmax(0,1fr)}
++.workbench-route .main-area{max-width:none;padding:24px clamp(16px,2vw,32px) 72px}
++.workbench-route .progress-rail{display:none}
++.workbench-topbar .progress-button{display:inline-grid}
++.workbench-layout{display:grid;grid-template-columns:minmax(168px,0.21fr) minmax(0,1fr) minmax(260px,0.32fr);gap:12px;align-items:start}
++.workbench-layout>*{min-width:0}
++.workbench-layout .panel{margin-bottom:12px}
++.workbench-session-pane,.workbench-context-pane{min-width:0}
++.workbench-session-pane .panel,.workbench-context-pane .panel{padding:16px}
++.workbench-session-pane .section-heading,.workbench-context-pane .section-heading{margin-bottom:12px}
++.workbench-context-pane .section-heading{align-items:flex-start;flex-direction:column;gap:8px}
++.workbench-context-pane .section-heading button{white-space:nowrap}
++.workbench-session-pane .session-picker{max-height:calc(100vh - 310px)}
++.workbench-conversation-pane>.session-center>.panel:first-child{min-height:calc(100vh - 176px);display:flex;flex-direction:column}
++.workbench-conversation-pane .conversation-transcript{flex:1;min-height:180px;max-height:55vh}
++.workbench-conversation-pane .session-composer{margin-top:auto}
++.workbench-context-pane .workspace-layout{grid-template-columns:minmax(0,1fr)}
++.workbench-context-pane .workspace-layout>*{min-width:0}
++.workbench-context-pane .workspace-layout label{margin:8px 0}
++.workbench-context-pane .file-editor{min-height:180px}
++.workbench-context-pane .file-list{max-height:180px;overflow:auto}
++.workbench-layout .session-picker button[aria-current=page]{background:var(--accent-soft);color:var(--text);font-weight:650}
++.workbench-layout .conversation-message{padding:12px 0}
++.workbench-layout .section-heading h2{overflow-wrap:anywhere}
++.workbench-layout pre,.workbench-layout .break-all{overflow-wrap:anywhere}
++.browser-workbench{display:grid;grid-template-columns:minmax(0,1fr) minmax(250px,290px);gap:16px;align-items:start}
++.browser-workbench>*{min-width:0}
++.browser-inspector .panel{padding:16px;margin-bottom:12px}
++.browser-inspector .section-heading{margin-bottom:10px}
++.browser-inspector .empty-state{padding:0}
++.workbench-facts{margin:0 0 10px}
++.workbench-facts>div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)}
++.workbench-facts dt{color:var(--muted)}
++.workbench-facts dd{margin:0;text-align:right;font-weight:650;overflow-wrap:anywhere}
++.setup-disclosure{margin:12px 0;padding:8px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
++.setup-disclosure>summary{color:var(--accent);font-weight:650;cursor:pointer;min-height:36px;display:list-item;list-style-position:inside}
++.setup-disclosure[open]>summary{margin-bottom:12px}
++.drawer-overlay.visible{display:block;position:fixed;inset:var(--header-height,56px) 0 0;background:#0008;z-index:30}
++.workbench-route .progress-rail.drawer-open{display:block;position:fixed;right:0;top:var(--header-height,56px);bottom:0;width:min(320px,90vw);z-index:32;overflow:auto}
++.workbench-route .progress-rail.drawer-open .drawer-close{display:inline-grid}
++@media(max-width:1279px){.app-grid.workbench-route{grid-template-columns:64px minmax(0,1fr)}}
++@media(max-width:1000px){.workbench-layout{grid-template-columns:minmax(160px,0.26fr) minmax(0,1fr)}.workbench-context-pane{grid-column:1/-1}.workbench-context-pane .workspace-layout{grid-template-columns:minmax(160px,0.28fr) minmax(0,1fr)}}
++@media(max-width:850px){.browser-workbench{grid-template-columns:minmax(0,1fr)}}
++@media(max-width:767px){.app-grid.workbench-route{display:block}.workbench-route .main-area{padding:20px 12px 92px}.workbench-layout{grid-template-columns:minmax(0,1fr)}.workbench-context-pane{grid-column:auto}.workbench-context-pane .workspace-layout{grid-template-columns:minmax(0,1fr)}.workbench-session-pane .session-picker{max-height:none;display:flex;flex-wrap:wrap;gap:6px}.workbench-session-pane .session-picker li{flex:1 1 140px}.workbench-conversation-pane>.session-center>.panel:first-child{min-height:0}.workbench-conversation-pane .conversation-transcript{max-height:none}.workbench-route .page-heading{margin-bottom:18px}}
++:root{font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei','PingFang SC',system-ui,sans-serif}
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index cb9fe41dc778a288b9c176c93fad0632a16d63f1..69c365b2a05dc0d9b1c59a9b1ec21b09016b70a2 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -2,9 +2,13 @@ import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+ import { integer, previous, display } from '../../desktop/main/lib/wire-values.mjs'
+ import { ArtifactPreview } from './preview.jsx'
+ import { SessionContinuation } from './session-continuation.jsx'
++import { WorkbenchLayout } from './components/workbench-layout.jsx'
+ 
+ const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
+ const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
++const sessionStates = { WAITING: '等待消息', QUEUED: '排队中', STARTING: '启动中', RUNNING: '执行中', PAUSED: '已暂停', SETTLED: '执行已结束', COMPLETED: '已结束', FAILED: '执行失败', CANCELLED: '已取消', RECONCILING: '恢复核对中' }
++const configurationStates = { NOT_REQUESTED: '尚未发起请求', AWAITING_CONFIRMATION: '等待明确确认', AWAITING_CODING_CONFIRMATION: '等待明确确认', QUALIFIED_PURPOSE_AUTHORIZED: '用途授权已核对', CODING_CONFIGURED: '编码配置已保存，运行资格待核对', HOST_UNAVAILABLE: '本机主机不可核对', CONTEXT_CHANGED_PENDING: '会话已变化，需复核原请求', EXPIRED: '原请求已过期', CURRENT_RECHECK_REQUIRED: '当前状态待复核', FAILED: '未通过', REGISTERED: '已登记，资格待核对' }
++const statusLabel = (value, dictionary, fallback) => value ? dictionary[value] || '状态待核对' : fallback
+ const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
+ const sameConfiguration = (value, request) => !!value?.model_config_ref &&
+   ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
+@@ -230,8 +234,9 @@ export function DesktopQualification({ projectId, sessionId }) {
+   const pending = state?.state === 'AWAITING_CONFIRMATION' && !state?.consumed &&
+     Date.parse(state?.expires_at) > Date.now()
+   return <Panel title="本地模型运行资格">
+-    <p>先打开会话并取得写入权，再准备当前会话的模型资格确认。准备阶段不会调用模型。</p>
+-    <p className="small-muted">确认后最多调用模型 1 次，工具 0 个，用途仅为 mu_turn（600 秒）；费用依据 UNKNOWN，金额无法预估。确认可能消耗一次性请求，失败或超时后请用“复核原请求”查询，不要重复确认。</p>
++    <p>{!sessionId ? '尚未打开会话，请先选择或创建会话。' : state && !state.available ? '当前资格请求不可操作，请查看状态并复核原请求。' : '当前会话可准备模型资格请求；准备阶段不会调用模型。'}</p>
++    <p className="small-muted">明确确认后最多调用本地模型 1 次；费用未知。</p>
++    <details className="raw-details"><summary>查看用途、限制与失败后的处理</summary><p>工具调用 0 次，用途仅为 mu_turn（600 秒）。金额无法预估。确认可能消耗一次性请求；失败或超时后请复核原请求，不要重复确认。</p></details>
+     {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
+     {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
+     {state?.previous_request_id && <p className="break-all small-muted">已退役的过期原请求：{state.previous_request_id}；过期于 {state.previous_expires_at || '未知'}。该记录仅供审计，不代表当前资格。</p>}
+@@ -242,7 +247,8 @@ export function DesktopQualification({ projectId, sessionId }) {
+       state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ? '保留上次用途授权结果；当前授权尚未确认，请复核原请求。' :
+       state?.state === 'HOST_UNAVAILABLE' ? '本机主机身份已变化或无法确认；旧请求仅作历史记录，当前不可用。' :
+       state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
+-      state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
++      statusLabel(state?.state, configurationStates, '正在读取资格状态')}{state?.reason ? ` · ${state.reason}` : ''}</p>
++    {state?.state && <details className="raw-details"><summary>原始状态</summary><code>{state.state}</code></details>}
+     <div className="button-row">
+       <button disabled={!!busy || !state?.available || !sessionId ||
+         (!!state?.request_id && !(state?.state === 'EXPIRED' && !state?.consumed))}
+@@ -345,6 +351,7 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+     Date.parse(state.expires_at) > Date.now()
+   return <Panel title="显式工作区编码授权">
+     <p>选择当前会话的可读、可写相对文件和离线 Go 检查。准备只冻结文件与检查计划；明确确认才写入新的模型配置，期间模型调用为 0。</p>
++    <details className="setup-disclosure"><summary>编辑授权范围与离线检查</summary>
+     <div className="button-row"><button disabled={!!busy || !sessionId} onClick={() => pick('toolchain')}>选择 Go 工具链目录</button>
+       <span>{toolchain || '尚未选择'}</span><button disabled={!!busy || !sessionId} onClick={() => pick('vendor')}>选择离线 vendor（可选）</button><span>{vendor || '未选择'}</span></div>
+     <label>可读相对路径（每行一个）<textarea value={readPaths} onChange={event => setReadPaths(event.target.value)}/></label>
+@@ -362,6 +369,7 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+       <label>进程上限<input type="number" value={limits.process_limit} onChange={setLimit('process_limit')}/></label>
+       <label>内存上限（MiB）<input type="number" value={limits.memory_mib} onChange={setLimit('memory_mib')}/></label>
+       <label>输出上限（字节）<input type="number" value={limits.max_text_bytes} onChange={setLimit('max_text_bytes')}/></label></div>
++    </details>
+     {state?.scope && <div><h3>本次冻结摘要</h3><p>可读：{state.scope.read_paths.join('、')}；可写：{state.scope.write_paths.join('、')}</p>
+       <p>检查：{state.scope.checks.map(check => `${check.id} ${check.package} ${check.test_pattern}（${check.source_paths.join('、')}）`).join('；')}</p>
+       <p>限制：读取 {state.scope.max_read_bytes} 字节/文件，写入 {state.scope.max_write_bytes} 字节/文件，
+@@ -371,7 +379,8 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured
+         Go 工具链{check.toolchain_selected ? '已选' : '未选'}，离线 vendor {check.vendor_selected ? '已选' : '未选'}。</p>)}
+       <p>最多 8 次普通模型调用；资格验证最多 1 次模型调用、0 次工具调用。当前模型调用：{state.model_calls}。</p>
+       <p>截止：{state.expires_at || '未知'}；冻结检查摘要：{state.frozen_checks?.map(check => check.id).join('、') || '无'}。</p></div>}
+-    <p role="status">{state?.state || '正在读取编码授权状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
++    <p role="status">{statusLabel(state?.state, configurationStates, '正在读取编码授权状态')}{state?.reason ? ` · ${state.reason}` : ''}</p>
++    {state?.state && <details className="raw-details"><summary>原始状态</summary><code>{state.state}</code></details>}
+     <div className="button-row"><button disabled={!!busy || !state?.available || !sessionId || !toolchain ||
+       (!!state?.scope && !(state?.state === 'EXPIRED' && !state?.consumed))}
+       onClick={() => action('准备', 'codingPrepare', intent())}>准备并冻结</button>
+@@ -528,11 +537,8 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
+     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
+     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
+     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
+-    <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
+-    <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
+-      sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
+-    <div className="session-layout">
+-      <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
++    <WorkbenchLayout sessions={<>
++      <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small title={item.run_status ? `原始状态：${item.run_status}` : undefined}>{item.archived_at ? '已归档' : statusLabel(item.run_status, sessionStates, '等待消息')}</small></button></li>)}</ul>
+         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
+         {!state.sessions.length && !state.loading && <p className="empty-state">{state.error ? '会话列表尚未读取，请恢复连接或权限后重试。' : '还没有会话，选择已配置模型后开始。'}</p>}
+         <details><summary>新建会话</summary><label>名称<input value={title} onChange={event => setTitle(event.target.value)}/></label>
+@@ -540,8 +546,8 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
+           <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择配置记录（资格未确认）</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
+           {!state.host?.model_configurations?.length ? <p>还没有模型配置，请先使用上方表单或项目设置保存。</p> : <p className="small-muted">配置记录不代表运行时已具备资格；创建会话时由服务端检查。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>
+       </Panel>
+-      <div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag">{snapshot.run_status || '等待消息'}</span>}>
+-        {snapshot ? <><div className="button-row"><button disabled={disabled || writer} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>{writer ? '当前可写' : '在此继续'}</button>
++    </>} conversation={<div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag" title={snapshot.run_status ? `原始状态：${snapshot.run_status}` : undefined}>{statusLabel(snapshot.run_status, sessionStates, '等待消息')}</span>}>
++        {snapshot ? <><div className="button-row">{writer ? <span className="tag good" role="status">当前可写</span> : <button disabled={disabled} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>在此继续</button>}
+           {['PAUSE', 'RESUME', 'CANCEL'].map((action, index) => <button key={action} disabled={disabled || !writer || (action !== 'RESUME' && !snapshot.active_run_id)} onClick={() => command(action, async () => { unwrap(await window.researchos.v2['session.control']({ action, target_id: action === 'RESUME' ? snapshot.session_id : snapshot.active_run_id, reason: '用户从桌面会话操作' })); await readSnapshot() })}>{['暂停', '恢复', '取消'][index]}</button>)}</div>
+           {snapshot.resume_requires_explicit_user && <p className="callout">会话等待明确恢复。查看上次结果后再继续。</p>}
+           <div className="conversation-transcript" aria-label="会话记录">{(snapshot.messages || []).map(message => <article className={`conversation-message role-${message.role.toLowerCase()}`} key={message.message_id}><h3>{labels[message.role] || message.role}</h3><div className="message-text">{(message.parts || []).map(part => part.text).join('')}</div>{!message.complete && <small>正在接收…</small>}</article>)}{!snapshot.messages?.length && <p className="empty-state">发送第一条消息，说明希望完成的事。</p>}</div>
+@@ -559,9 +565,12 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
+       {snapshot?.project_id === projectId && <SessionContinuation key={`${projectId}:${snapshot.session_id}:${snapshot.goal_id || ''}:${snapshot.revision}`} api={api} projectId={projectId} snapshot={snapshot} navigate={navigate}/>}
+       {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{display(event.payload)}</pre></details></li>)}</ol></Panel>}
+       {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
+-      </div>
+-    </div>
+-    {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
++      </div>} context={<>
++      {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
++      <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
++      <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
++        sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
++    </>}/>
+   </>
+ }
+ 
+diff --git a/tests/ui/frontend-redesign-fixture.cjs b/tests/ui/frontend-redesign-fixture.cjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f01dc404543a2ea0e86f52dd0d27ca2869f90066
+--- /dev/null
++++ b/tests/ui/frontend-redesign-fixture.cjs
+@@ -0,0 +1,81 @@
++'use strict';
++
++// Disposable, browser-only product fixture. Every business request is handled
++// here; no request may reach a real Core or remote provider.
++const projectId = 'fixture-project';
++
++async function installFixture(page, { native = false, profileError = false, qualificationState = 'NOT_REQUESTED' } = {}) {
++  const unexpected = [];
++  const requests = [];
++  const data = {
++    '/v1/projects': { items: [{ project_id: projectId, name: '城市河流研究', intent: '整理水质与治理证据' }] },
++    [`/v1/projects/${projectId}/profile`]: { project_id: projectId, name: '城市河流研究', revision: 3 },
++    [`/v1/projects/${projectId}/state`]: { project_id: projectId, revision: 3, active_cycle_id: null, blocking_conflict_ids: [] },
++    [`/v1/projects/${projectId}/progress`]: { project_id: projectId, plan_revision: 3, as_of_event_sequence: 0, stages: [] },
++    [`/v1/projects/${projectId}/releases`]: { items: [] },
++    [`/v1/projects/${projectId}/notifications`]: { items: [] },
++    [`/v1/projects/${projectId}/goals`]: { items: [] },
++    [`/v1/projects/${projectId}/tasks`]: { items: [] },
++    [`/v1/projects/${projectId}/research-cycles`]: { items: [] },
++    [`/v1/projects/${projectId}/resource-requests`]: { items: [] },
++  };
++  await page.route('**/*', async route => {
++    const url = new URL(route.request().url());
++    const path = url.pathname;
++    if (path.startsWith('/v1/') || path.startsWith('/v2/')) {
++      requests.push({ method: route.request().method(), path });
++      if (path.endsWith('/events/stream')) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture heartbeat\n\n' });
++      if (profileError && path === `/v1/projects/${projectId}/profile`)
++        return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ code: 'FIXTURE_PROFILE_UNAVAILABLE', message: '项目资料暂不可用' }) });
++      if (route.request().method() === 'GET' && Object.hasOwn(data, path))
++        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(data[path]) });
++      unexpected.push(`${route.request().method()} ${path}`);
++      return route.fulfill({ status: 599, contentType: 'application/json', body: JSON.stringify({ code: 'FIXTURE_UNEXPECTED_REQUEST' }) });
++    }
++    if (path === '/remote-info') return route.fulfill({ status: 404, body: '{}' });
++    if (url.hostname === '127.0.0.1' && (path === '/' || path.startsWith('/p/') || path.startsWith('/assets/')))
++      return route.continue();
++    unexpected.push(`EXTERNAL ${url.href}`);
++    return route.abort();
++  });
++  if (native) await page.addInitScript(({ projectId, qualificationState }) => {
++    const initial = {
++      project_id: projectId, session_id: 'session-one', title: '河流污染证据核对', revision: 7,
++      event_sequence: 0, earliest_event_sequence: 0, run_status: 'WAITING', active_run_id: null,
++      workspace_ref: 'workspace-one', goal_id: null, pending_command_ids: [], pending_permissions: [],
++      writer: { client_id: 'fixture-client', expires_at: '2099-01-01T00:00:00Z' },
++      messages: [
++        { message_id: 'm1', role: 'USER', complete: true, parts: [{ text: '请核对上游与下游水质记录，标出来源不一致的结论。' }] },
++        { message_id: 'm2', role: 'ASSISTANT', complete: true, parts: [{ text: '已收到研究问题。下一步先整理来源，再逐条核对采样时间和测点。' }] },
++      ],
++    };
++    const state = { snapshot: initial, sessions: [{ session_id: initial.session_id, title: initial.title, run_status: 'WAITING' }] };
++    const completed = result => ({ ok: true, completed: true, protocol_status: 'COMPLETED', result });
++    window.__frontendFixtureCalls = [];
++    const actions = {
++      'host.status': () => ({ client_id: 'fixture-client', model_configurations: [{ model_config_ref: 'model-one', provider_id: 'local', model_id: 'research-model', config_revision: 1 }], workspaces: [{ project_id: projectId, status: 'ACTIVE', authorized_workspace_ref: 'workspace-one', display_name: '研究资料' }] }),
++      'session.list': () => ({ items: state.sessions, next_cursor: null }),
++      'session.get': () => state.snapshot,
++      'session.events': () => ({ events: [], next_sequence: state.snapshot.event_sequence }),
++      'session.attach': () => state.snapshot,
++      'session.create': body => { const next = { ...initial, session_id: 'session-two', title: body.title, messages: [], revision: 1 }; state.sessions.unshift({ session_id: next.session_id, title: next.title, run_status: 'WAITING' }); state.snapshot = next; return next },
++      'session.send': body => { state.snapshot.messages.push({ message_id: `m${state.snapshot.messages.length + 1}`, role: 'USER', complete: true, parts: [{ text: body.text }] }); state.snapshot.pending_command_ids.push('pending-fixture'); return { command_id: 'pending-fixture' } },
++      'session.control': () => state.snapshot,
++      'workspace.tree': () => ({ entries: [], next_cursor: null }),
++      'workspace.diff': () => ({ base: 'HEAD', files: [], total_files: 0, truncated: false }),
++    };
++    const v2 = Object.fromEntries(Object.entries(actions).map(([name, action]) => [name, async body => { window.__frontendFixtureCalls.push({ name, body }); return completed(action(body || {})) }]));
++    window.researchos = { desktop: {
++      context: async () => ({ project_id: projectId, session_id: state.snapshot.session_id }),
++      selectProject: async () => ({ ok: true }),
++      openSession: async sessionId => { const session = state.sessions.find(item => item.session_id === sessionId); if (session) state.snapshot = { ...state.snapshot, session_id: session.session_id, title: session.title }; return completed(state.snapshot) },
++      qualificationCurrent: async () => qualificationState === 'AWAITING_CONFIRMATION'
++        ? { ok: true, available: true, state: qualificationState, consumed: false, request_id: 'fixture-request', expires_at: '2099-01-01T00:00:00Z', model: { provider_id: 'local', model_id: 'research-model' } }
++        : { ok: true, available: false, state: qualificationState },
++      codingCurrent: async () => ({ ok: true, available: false, state: 'NOT_REQUESTED' }),
++    }, v2 };
++  }, { projectId, qualificationState });
++  return { unexpected, requests, projectId };
++}
++
++module.exports = { installFixture, projectId };
+diff --git a/tests/ui/frontend-redesign.cjs b/tests/ui/frontend-redesign.cjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff1dde10ac873da7386db0ecff98ee6da3fc27b3
+--- /dev/null
++++ b/tests/ui/frontend-redesign.cjs
+@@ -0,0 +1,107 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const { createHash } = require('node:crypto');
++let playwright;
++try { playwright = require(process.env.RESEARCHOS_PLAYWRIGHT_MODULE || 'playwright'); }
++catch (error) { throw new Error('Playwright is unavailable; set RESEARCHOS_PLAYWRIGHT_MODULE to the installed driver package path', { cause: error }); }
++const { installFixture, projectId } = require('./frontend-redesign-fixture.cjs');
++
++const url = process.argv[2];
++const out = path.resolve(process.argv[3]);
++if (!url || !out || new URL(url).hostname !== '127.0.0.1') throw new Error('A task-owned loopback preview URL and output directory are required');
++fs.mkdirSync(out, { recursive: true });
++const report = { schema: 'researchos.frontend-redesign-fixture.v1', evidence_kind: 'VISUAL_INTERACTION_FIXTURE_ONLY', checks: [], screenshots: [], limitations: ['Browser and native-shaped bridges are disposable fixtures. No Core, owner, provider, or formal acceptance is asserted.'] };
++function check(name, value, detail) { report.checks.push({ name, status: value ? 'PASS' : 'FAIL', detail }); assert.ok(value, `${name}: ${JSON.stringify(detail)}`); }
++function shot(page, name) { const target = path.join(out, `${name}.png`); return page.screenshot({ path: target, fullPage: true }).then(() => report.screenshots.push({ name, path: target, sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') })); }
++
++async function main() {
++  const browser = await playwright.chromium.launch({ headless: true });
++  try {
++    for (const width of [320, 768, 1024, 1440]) {
++      for (const theme of ['light', 'dark']) {
++        const context = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: 1 });
++        const page = await context.newPage();
++        const errors = [];
++        page.on('pageerror', error => errors.push(error.message));
++        const fixture = await installFixture(page, { native: true });
++        await page.addInitScript(theme => localStorage.setItem('researchos.theme', theme), theme);
++        await page.goto(`${url}/p/${projectId}`, { waitUntil: 'domcontentloaded' });
++        await page.getByRole('heading', { name: '河流污染证据核对' }).waitFor({ timeout: 12000 });
++        await page.getByText('请核对上游与下游水质记录').waitFor({ timeout: 12000 });
++        const metrics = await page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth,
++          regions: [...document.querySelectorAll('.workbench-layout > *')].map(el => ({ label: el.getAttribute('aria-label'), width: Math.round(el.getBoundingClientRect().width) })),
++          theme: document.documentElement.dataset.theme, font: getComputedStyle(document.body).fontFamily }));
++        check(`${width}-${theme}-no-overflow`, metrics.document <= metrics.viewport, metrics);
++        check(`${width}-${theme}-regions`, metrics.regions.length === 3 && metrics.regions.every(x => x.width > 0), metrics);
++        check(`${width}-${theme}-theme`, metrics.theme === theme, metrics);
++        check(`${width}-${theme}-font-stack`, metrics.font.includes('Microsoft YaHei UI') && metrics.font.includes('Microsoft YaHei'), metrics);
++        check(`${width}-${theme}-console`, errors.length === 0, errors);
++        check(`${width}-${theme}-interception`, fixture.unexpected.length === 0, fixture.unexpected);
++        await shot(page, `native-${width}-${theme}`);
++        if (width === 1440 && theme === 'light') {
++          const input = page.getByRole('textbox', { name: '会话消息' });
++          await input.fill('核对采样点 A 与 B 的时间差异。');
++          await page.getByRole('button', { name: '发送', exact: true }).click();
++          await page.getByText('核对采样点 A 与 B 的时间差异。').waitFor();
++          const calls = await page.evaluate(() => window.__frontendFixtureCalls);
++          check('native-send-callback', calls.some(x => x.name === 'session.send' && x.body.text.includes('采样点 A')), calls);
++          check('native-pending-visible', await page.getByText('1 条命令等待处理。').count() === 1);
++          await page.getByRole('button', { name: '打开阶段进度' }).click();
++          check('drawer-focus', await page.evaluate(() => document.activeElement?.getAttribute('aria-label') === '关闭进度'));
++          await page.keyboard.press('Escape');
++          check('drawer-close-escape', await page.locator('.progress-rail.drawer-open').count() === 0);
++          await shot(page, 'native-1440-pending');
++        }
++        await context.close();
++      }
++    }
++    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
++    const page = await context.newPage();
++    const errors = [];
++    page.on('pageerror', error => errors.push(error.message));
++    const fixture = await installFixture(page);
++    await page.goto(`${url}/p/${projectId}`, { waitUntil: 'domcontentloaded' });
++    await page.getByLabel('访问令牌').fill('disposable-fixture-token');
++    await page.getByRole('button', { name: '打开工作台' }).click();
++    await page.getByRole('heading', { name: '城市河流研究' }).waitFor();
++    check('browser-workbench-route', new URL(page.url()).pathname === `/p/${projectId}`);
++    check('browser-fixture-no-fallthrough', fixture.unexpected.length === 0, fixture.unexpected);
++    check('browser-console', errors.length === 0, errors);
++    await shot(page, 'browser-1440-light');
++    await context.close();
++
++    const pendingContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
++    const pendingPage = await pendingContext.newPage();
++    const pendingFixture = await installFixture(pendingPage, { native: true, qualificationState: 'AWAITING_CONFIRMATION' });
++    await pendingPage.goto(`${url}/p/${projectId}`, { waitUntil: 'domcontentloaded' });
++    const confirm = pendingPage.getByRole('button', { name: '明确确认一次调用' });
++    await confirm.waitFor();
++    check('qualification-pending-visible', await pendingPage.getByText('等待明确确认', { exact: true }).count() > 0 && await confirm.isEnabled());
++    await shot(pendingPage, 'native-1440-confirmation-pending');
++    pendingPage.once('dialog', dialog => dialog.dismiss());
++    await confirm.click();
++    const callsAfterDismiss = await pendingPage.evaluate(() => window.__frontendFixtureCalls);
++    check('qualification-dismiss-does-not-confirm', !callsAfterDismiss.some(call => call.name === 'qualificationConfirm'), callsAfterDismiss);
++    check('qualification-pending-no-fallthrough', pendingFixture.unexpected.length === 0, pendingFixture.unexpected);
++    await pendingContext.close();
++
++    const errorContext = await browser.newContext({ viewport: { width: 1024, height: 900 } });
++    const errorPage = await errorContext.newPage();
++    const errorFixture = await installFixture(errorPage, { native: true, profileError: true });
++    await errorPage.goto(`${url}/p/${projectId}`, { waitUntil: 'domcontentloaded' });
++    await errorPage.getByText('部分项目资料尚未读取').waitFor();
++    check('partial-project-error-visible', await errorPage.getByRole('button', { name: '重新读取' }).count() > 0);
++    check('partial-project-no-fallthrough', errorFixture.unexpected.length === 0, errorFixture.unexpected);
++    await shot(errorPage, 'native-1024-partial-error');
++    await errorContext.close();
++  } finally { await browser.close(); }
++}
++
++main().then(() => { report.status = 'PASS'; }).catch(error => { report.status = 'FAIL'; report.error = error.stack || String(error); }).finally(() => {
++  fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2));
++  console.log(JSON.stringify({ status: report.status, checks: report.checks.length, screenshots: report.screenshots.length, error: report.error || null }));
++  if (report.status !== 'PASS') process.exitCode = 1;
++});

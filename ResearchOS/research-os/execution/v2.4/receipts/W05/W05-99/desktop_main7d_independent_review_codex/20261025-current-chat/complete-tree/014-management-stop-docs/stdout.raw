@@ -1,0 +1,190 @@
+apps/desktop/main/lib/desktop-management.js
+735:         value.qualification_model_calls !== 1 || value.qualification_tool_calls !== 0 ||
+736:         !object(value.scope) || !sameValue(value.scope, intent.scope) ||
+737:         !Array.isArray(value.frozen_checks) || !sameValue(value.frozen_checks, intent.frozenChecks) ||
+738:         !Number.isSafeInteger(value.revision) || !Number.isSafeInteger(value.config_revision))
+739:       throw failure('CODING_RESULT_INVALID');
+740:     intent.state = value.state; intent.newModelRef = value.model_config_ref;
+741:     intent.runtimeStatus = value.runtime_status; intent.profileRef = frozenCopy(value.profile_ref);
+742:     intent.configRevision = value.config_revision;
+743:     intent.commitKey = digest(Buffer.from(JSON.stringify([intent.hostId, intent.projectId,
+744:       intent.sessionId, intent.requestId, value.model_config_ref, value.revision, value.config_revision])));
+745:   }
+746:   retireQualificationAfterCodingCommit() {
+747:     if (this.intent?.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state)) {
+748:       this.currentHost();
+749:       this.retiredIntents.push(Object.freeze({ ...this.intent, retiredAt: new Date().toISOString(),
+750:         retireReason: 'CODING_COMMITTED' })); this.intent = null;
+751:     }
+752:   }
+753:   async statusCoding() {
+754:     this.commandIdle();
+755:     const intent = this.codingIntent;
+756:     if (!intent) throw failure('CODING_ORIGINAL_REQUEST_REQUIRED');
+757:     if (!intent.requestId) throw failure('CODING_PREPARE_ORIGINAL_UNRESOLVED');
+758:     if (!this.sameSelection(intent.projectId, intent.sessionId)) throw failure('CONTEXT_CHANGED');
+759:     const reply = await this.exchange('STATUS_CODING', { project_id: intent.projectId,
+760:       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
+761:     if (reply.kind !== 'RESULT') throw failure('CODING_STATUS_REJECTED');
+762:     const value = reply.result;
+763:     if (value?.state === 'CODING_CONFIGURED') {
+764:       this.acceptCodingResult(intent, value); this.retireQualificationAfterCodingCommit();
+765:     }
+766:     else if (!object(value) || !['AWAITING_CODING_CONFIRMATION', 'EXPIRED'].includes(value.state) ||
+767:         value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
+768:         value.project_id !== intent.projectId || value.session_id !== intent.sessionId)
+769:       throw failure('CODING_STATUS_RESULT_INVALID');
+770:     else { intent.state = value.state; intent.statusCheckedAt = Date.now(); }
+771:     return this.codingSummary();
+772:   }
+773:   async shutdown() {
+774:     if (this.state === 'STOPPED') return { state: 'STOPPED', process_exit_confirmed: true };
+775:     if (this.state !== 'READY') throw failure('SAFE_SHUTDOWN_UNAVAILABLE');
+776:     const reply = await this.exchange('SHUTDOWN', {}, 30000);
+777:     if (reply.kind !== 'RESULT' || reply.result?.state !== 'SHUTDOWN_ACCEPTED')
+778:       throw failure('SHUTDOWN_REFUSED');
+779:     this.shutdownAccepted = true;
+780:     let timer;
+781:     let outcome;
+782:     try {
+783:       outcome = await Promise.race([
+784:         this.exitPromise,
+785:         new Promise((_, reject) => { timer = setTimeout(() => reject(failure('SHUTDOWN_EXIT_UNCONFIRMED')), 15000); }),
+786:       ]);
+787:     } finally { clearTimeout(timer); }
+788:     if (outcome.code !== 0 || outcome.signal || this.state !== 'STOPPED')
+789:       throw failure('SHUTDOWN_EXIT_UNCONFIRMED');
+790:     return { state: 'STOPPED', process_exit_confirmed: true };
+791:   }
+792: }
+793: 
+794: function createDesktopManagement(options) { return new DesktopManagement(options); }
+795: module.exports = { PROTOCOL, FRAME_LIMIT, strictJSON, installedResources, observeWindowsProcess,
+796:   createDesktopManagement, DesktopManagement };
+apps/desktop/main/main.js
+400:   const started = await host.ensureCore(deps);
+401:   const win = new BrowserWindow({
+402:     width: 1180, height: 760, title: 'ResearchOS', show: !SMOKE || !!process.env.ROS_DESKTOP_CAPTURE_PATH,
+403:     webPreferences: { preload: path.join(ROOT, 'preload', 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+404:   });
+405:   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+406:   win.webContents.on('will-navigate', (event, target) => {
+407:     const destination = new URL(target);
+408:     if (destination.protocol !== 'ros-app:' || destination.hostname !== 'desktop') event.preventDefault();
+409:   });
+410:   let closing = false;
+411:   win.on('close', event => {
+412:     if (closing || !desktopManagement.hasUnconfirmedChild()) return;
+413:     event.preventDefault();
+414:     if (desktopManagement.state !== 'READY') {
+415:       dialog.showMessageBox(win, { type: 'warning', message: '当前主机无法安全退出',
+416:         detail: desktopManagement.failure || '管理连接中断，主机进程退出尚未确认' });
+417:       return;
+418:     }
+419:     desktopManagement.shutdown().then(() => {
+420:       closing = true; win.close();
+421:     }).catch(error => dialog.showMessageBox(win, { type: 'warning',
+422:       message: '当前主机无法安全退出', detail: String(error.code || error.message || error) }));
+423:   });
+424:   await win.loadURL(process.env.ROS_DESKTOP_LEGACY_WORKBENCH === '1'
+425:     ? 'file://' + path.join(__dirname, 'workbench.html').replaceAll('\\', '/') : APP_ORIGIN + '/');
+426:   const renderer = await win.webContents.executeJavaScript(`({
+427:     bridge: !!window.researchos?.desktop && !!window.researchos?.v2,
+428:     review: !!document.getElementById('root') || (!!document.getElementById('review') && !!document.getElementById('review-open')),
+429:     react_root: !!document.getElementById('root'),
+430:     mounted_title: document.querySelector('#root h1')?.textContent || null,
+431:     navigation: document.querySelectorAll('[aria-label="主导航"] a').length,
+432:     status: document.getElementById('review-report')?.textContent || '',
+433:     health: document.getElementById('host-health')?.textContent || ''
+434:   })`);
+435:   const nativeProbe = SMOKE
+436:     ? await win.webContents.executeJavaScript(`window.researchos.v2['host.status']({}).then(r => ({
+437:         ok: r.ok === true, protocol_status: r.protocol_status || null, reason: r.reason || null
+438:       }))`)
+439:     : null;
+440:   const owned = ownedCoreIdentity(desktopManagement);
+441:   const report = {
+442:     event: 'ready_to_show', host_health: started.health, host_launched_by_shell: started.launched,
+443:     spawns: started.spawns, host_url: started.discovery ? started.discovery.url : null,
+444:     channels: ipc.BRIDGE.length, electron: process.versions.electron, protocol: 'researchos-client/2',
+445:     renderer, native_probe: nativeProbe, pid: process.pid,
+446:     owned_core_identity: owned,
+447:     management_state: management.state, management_reason: management.reason || null,
+448:     management_diagnostic_bytes: managementDiagnostic.bytes,
+449:     management_diagnostic_sha256: managementDiagnostic.bytes ? crypto.createHash('sha256').update(Buffer.concat(managementDiagnostic.chunks)).digest('hex') : null,
+450:     management_diagnostic_truncated: managementDiagnostic.truncated,
+451:   };
+452:   if (SMOKE && process.env.ROS_DESKTOP_CAPTURE_PATH) {
+453:     const capturePath = path.resolve(process.env.ROS_DESKTOP_CAPTURE_PATH);
+454:     await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+455:     await new Promise(resolve => setTimeout(resolve, 400));
+456:     await fs.promises.writeFile(capturePath, (await win.webContents.capturePage()).toPNG());
+457:     report.capture_path = capturePath;
+458:   }
+459:   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify(report));
+460:   if (SMOKE) {
+461:     let code = smokeReadyEvidence(renderer, nativeProbe, management, started, owned) ? 0 : 2;
+462:     if (desktopManagement.state === 'READY') {
+463:       try {
+464:         const stopped = await desktopManagement.shutdown();
+465:         const confirmed = smokeShutdownConfirmation(stopped, desktopManagement, owned);
+466:         if (confirmed) console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_confirmed', ...confirmed }));
+467:         else {
+468:           code = 2;
+469:           console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: 'OWNED_EXIT_IDENTITY_UNCONFIRMED' }));
+470:         }
+471:       }
+472:       catch (error) {
+473:         code = 2;
+474:         console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: error.code || error.message }));
+475:       }
+476:     }
+477:     if (desktopManagement.hasUnconfirmedChild()) {
+478:       console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: desktopManagement.failure || 'CONTROL_EXIT_UNCONFIRMED' }));
+479:       return;
+480:     }
+481:     app.exit(code);
+482:   }
+483: }
+484: 
+485: app.whenReady().then(boot).catch(async (e) => {
+docs/installation/desktop-development.md
+1: # Windows Desktop development tree
+2: 
+3: This workflow builds an isolated, repository-shaped development tree. It is not an installer, an upgrade path, or evidence of a native run. Keep the source worktree, build output, and runtime state separate. Never point the launcher at an existing ResearchOS data directory.
+4: 
+5: ## Build
+6: 
+7: Use a clean, isolated source worktree and pinned tools. Create a unique output path under that worktree's ignored `.local` directory and a unique receipt path. The example uses existing local public caches and does not download packages:
+8: 
+9: ```powershell
+10: & 'C:/Users/yqyyds/AppData/Local/Python/pythoncore-3.14-64/python.exe' -B -X utf8 apps/desktop/build-development.py `
+11:   --go 'D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe' `
+12:   --node 'C:/nvm4w/nodejs/node.exe' `
+13:   --electron-dist 'D:/作品集/ResearchOS/research-os/apps/desktop/node_modules/electron/dist' `
+14:   --module-cache 'D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod' `
+15:   --web-modules 'D:/作品集/ResearchOS/research-os/apps/web/node_modules' `
+16:   --mu-common 'D:/作品集/ResearchOS/research-os' `
+17:   --output '<isolated-worktree>/.local/desktop-complete-unique' `
+18:   --receipts '<approved-canonical-receipts>/build-unique'
+19: ```
+20: 
+21: The builder first snapshots tracked files and the seven scoped source files. It runs the existing client-wire builder and the current `adapters/runtime/mu/build.mjs` producer; the latter rechecks all 5083 public vendored Mu files from the common Main repository and pinned esbuild. It then compiles Core and the real verifier with the locked Go compiler, copies the complete pinned Electron runtime, the current Mu output, all numbered SQLite migrations and session migration, four Core cwd contracts, and the compiled React assets. It verifies source and public Mu input hashes again and writes `development-manifest.json` with every output file's SHA-256 and size. A failed subcommand leaves raw stdout, stderr, exit and first failure in the new receipt directory; do not overwrite or retry with the same inputs.
+22: 
+23: The verifier registration contains the absolute path in this output tree, and the manifest records the output root. Moving or copying the tree invalidates the bound paths. A fresh build is required for a new location. The Mu vendor and package cache are external public build inputs; the resulting bundle and metadata are copied into the output tree.
+24: 
+25: ## Validate without starting processes
+26: 
+27: Run the launcher in dry-run mode with a **nonexistent** state path outside the bundle. It verifies every inventory file, the verifier and Mu bindings, the Electron files, the React assets and migrations, then reports the exact spawn arguments and environment variable names. It does not create the state path or start Electron or Core.
+28: 
+29: ```powershell
+30: & 'C:/nvm4w/nodejs/node.exe' '<isolated-worktree>/.local/desktop-complete-unique/launch-development.mjs' `
+31:   --bundle '<isolated-worktree>/.local/desktop-complete-unique' `
+32:   --state '<isolated-worktree>/.local/new-state-unique' --dry-run
+33: ```
+34: 
+35: The launcher refuses missing or modified files, symlinks and junctions, existing state directories, case-insensitive environment-key collisions, and stale manifest bindings. Its child environment is constructed from essential Windows paths plus new state-specific data, discovery, Electron user data, profile and temporary paths. It does not pass ambient `RESEARCHOS_*`, `ROS_DESKTOP_*`, `NODE_OPTIONS`, `NODE_PATH` or `ELECTRON_*` values to the child.
+36: 
+37: ## Later native observation
+38: 
+39: Only under a separate approved native-run scope, use `--launch --smoke` with a new state path. The launcher then creates that state and runs the pinned Electron executable from the bundle. A smoke result is accepted only when the real Desktop reports a React renderer, management `READY`, a successful native `host.status` probe for the owned Core, and a `shutdown_confirmed` event with the same PID, creation time, image hash and Host ID after `process_exit_confirmed`. A failed or uncertain shutdown is a failure and leaves its state for diagnosis. The code and mock tests in this branch do not provide that native observation.

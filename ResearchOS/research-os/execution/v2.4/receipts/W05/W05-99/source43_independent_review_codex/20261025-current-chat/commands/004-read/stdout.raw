@@ -1,0 +1,312 @@
+
+FILE AGENTS.md
+1: # ResearchOS
+2: 
+3: 本仓库是独立 ResearchOS 产品，中文沟通。用户授权实现 `spec/v2.0/08_AGENT_EXECUTION_GOAL.md`，按难度选择子 Agent 模型。不得读取或继承其他业务项目的私有配置、身份、代码或部署。
+4: 
+5: ## 唯一执行基线
+6: 
+7: - `spec/v2.0/`：原实施包逐字节只读快照；不得修改初始状态或验收阈值。
+8: - `execution/project_identity.json`：永久项目身份。`execution/bootstrap_ledger.json`：施工状态，独立于产品业务状态。
+9: - `execution/receipts/`：实际命令与产物回执；`execution/verifier/`：仅独立 Verifier 写入的施工审查。
+10: - `execution/checkpoint.json`：续跑入口。按 `spec/v2.0/contracts/tasks.json` DAG，先核对 Git、身份、输入版本及有效回执。
+11: - `bootstrap/`：开工导入与验证工具。W02 再由平台 owner 登记实际产品目录和命令。
+12: - `.local/`：本仓库生成的工具、进程数据与可重建缓存，不入 Git；不得放正式唯一证据。
+13: 
+14: ## 执行约束
+15: 
+16: 默认最多 2 个活跃施工任务；使用独立 worktree 和唯一 owner/lease。共享合同、锁文件、路由和命令登记串行整合。主 Agent 负责整合与真实验证；执行者不签发自身接受回执。只读审查可使用当前仓库，不能把同用户的不同 Agent 当作受保护留出隔离。
+17: 
+18: 模型策略：架构、安全、独立验收优先 `gpt-6-astra` 高推理；边界清晰的非平凡实现和施工复核用 `gpt-6-sol` 高推理；简单、低风险、可机械核验的独立工作用 `gpt-6-luna`。记录实际选择与理由，不创建用户侧新聊天，除非用户明确要求。
+19: 
+20: 保留既有修改；不用 reset/clean 或 git add .。允许本地原子提交，不自动 push、部署、购买、充值或对外发消息。规格校验、开发夹具、真实服务和产品正式验收分开记录；未实现和零断言不得 PASS。只对新变化和未解决疑点补验。临时文件完成后删除，证据/检查点保留。
+
+FILE execution/v2.4/receipts/W05/W05-99/source43_b_stop_finalpath_codex/20261025-current-chat/fix2-from-baseB.patch
+1: diff --git a/internal/host/roots_windows.go b/internal/host/roots_windows.go
+2: index 9057ffb9..ff6bc671 100644
+3: --- a/internal/host/roots_windows.go
+4: +++ b/internal/host/roots_windows.go
+5: @@ -33,17 +33,29 @@ func fileIdentity(path string) (volume string, fileID uint64, final string, err
+6:  	id := uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+7:  	buf := make([]uint16, 4096)
+8:  	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+9: -	if err != nil || n == 0 {
+10: -		return vol, id, "", fmt.Errorf("final path unavailable for %s: %v", path, err)
+11: +	if err != nil {
+12: +		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
+13:  	}
+14: -	final = windows.UTF16PtrToString(&buf[0])
+15: -	if l := int(n); len(final) > l {
+16: -		final = final[:l]
+17: +	final, err = boundedFinalPathUTF16(buf, n)
+18: +	if err != nil {
+19: +		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
+20:  	}
+21:  	final = strings.TrimPrefix(final, `\\?\`)
+22:  	return vol, id, final, nil
+23:  }
+24:  
+25: +// GetFinalPathNameByHandleW reports UTF-16 code units, not UTF-8 bytes. On
+26: +// insufficient capacity its return is the required capacity, including NUL.
+27: +func boundedFinalPathUTF16(buf []uint16, n uint32) (string, error) {
+28: +	if n == 0 {
+29: +		return "", fmt.Errorf("empty final path")
+30: +	}
+31: +	if n >= uint32(len(buf)) {
+32: +		return "", fmt.Errorf("final path needs %d UTF-16 units; capacity is %d", n, len(buf))
+33: +	}
+34: +	return windows.UTF16ToString(buf[:n]), nil
+35: +}
+36: +
+37:  // chainHasReparsePoint walks every prefix of the path, so a junction anywhere above the target
+38:  // is caught even when the final component is an ordinary file.
+39:  func chainHasReparsePoint(path string) (bool, error) {
+40: diff --git a/internal/host/roots_windows_test.go b/internal/host/roots_windows_test.go
+41: new file mode 100644
+42: index 00000000..9b6cd089
+43: --- /dev/null
+44: +++ b/internal/host/roots_windows_test.go
+45: @@ -0,0 +1,140 @@
+46: +//go:build windows
+47: +
+48: +package host
+49: +
+50: +import (
+51: +	"os"
+52: +	"path/filepath"
+53: +	"strings"
+54: +	"testing"
+55: +	"time"
+56: +	"unicode/utf16"
+57: +	"unicode/utf8"
+58: +)
+59: +
+60: +func source43FixtureRoot(t *testing.T) string {
+61: +	t.Helper()
+62: +	base := os.Getenv("RESEARCHOS_SOURCE43_ASCII_FIXTURE_ROOT")
+63: +	if base == "" {
+64: +		base = os.TempDir()
+65: +	}
+66: +	base, err := filepath.Abs(base)
+67: +	if err != nil {
+68: +		t.Fatal(err)
+69: +	}
+70: +	if err := os.MkdirAll(base, 0o700); err != nil {
+71: +		t.Fatal(err)
+72: +	}
+73: +	root, err := os.MkdirTemp(base, "roots-windows-")
+74: +	if err != nil {
+75: +		t.Fatal(err)
+76: +	}
+77: +	t.Cleanup(func() {
+78: +		resolvedBase, baseErr := filepath.EvalSymlinks(base)
+79: +		resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+80: +		if baseErr != nil || rootErr != nil {
+81: +			t.Errorf("resolve fixture cleanup path: base=%v root=%v", baseErr, rootErr)
+82: +			return
+83: +		}
+84: +		rel, relErr := filepath.Rel(resolvedBase, resolvedRoot)
+85: +		if relErr != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+86: +			t.Errorf("fixture cleanup escaped explicit root: %q, %v", rel, relErr)
+87: +			return
+88: +		}
+89: +		if err := os.RemoveAll(root); err != nil {
+90: +			t.Errorf("remove fixture: %v", err)
+91: +		}
+92: +	})
+93: +	return root
+94: +}
+95: +
+96: +func TestBoundedFinalPathUTF16(t *testing.T) {
+97: +	want := `\\?\C:\作品集\工作区😀`
+98: +	units := utf16.Encode([]rune(want))
+99: +	buf := make([]uint16, len(units)+2)
+100: +	copy(buf, units)
+101: +	buf[len(units)] = 'X'
+102: +	got, err := boundedFinalPathUTF16(buf, uint32(len(units)))
+103: +	if err != nil || got != want {
+104: +		t.Fatalf("bounded conversion = %q, %v; want %q", got, err, want)
+105: +	}
+106: +	for _, n := range []uint32{0, uint32(len(buf)), uint32(len(buf) + 1)} {
+107: +		if got, err := boundedFinalPathUTF16(buf, n); err == nil || got != "" {
+108: +			t.Fatalf("invalid length %d accepted: %q, %v", n, got, err)
+109: +		}
+110: +	}
+111: +}
+112: +
+113: +func TestFileIdentityUnicodeFinalPath(t *testing.T) {
+114: +	root := source43FixtureRoot(t)
+115: +	if os.Getenv("RESEARCHOS_SOURCE43_ASCII_FIXTURE_ROOT") != "" {
+116: +		for _, r := range root {
+117: +			if r > 127 {
+118: +				t.Fatalf("ASCII control fixture root is not ASCII: %q", root)
+119: +			}
+120: +		}
+121: +	}
+122: +	paths := map[string]string{
+123: +		"ascii-control":             filepath.Join(root, "ascii-control"),
+124: +		"CJK-ancestor-and-basename": filepath.Join(root, "父目录", "工作区"),
+125: +		"non-BMP":                   filepath.Join(root, "emoji-😀"),
+126: +		"common-prefix-one":         filepath.Join(root, "共同前缀", "collision-000001"),
+127: +		"common-prefix-two":         filepath.Join(root, "共同前缀", "collision-000002"),
+128: +	}
+129: +	type identity struct {
+130: +		volume string
+131: +		id     uint64
+132: +		final  string
+133: +	}
+134: +	seen := map[string]identity{}
+135: +	for label, path := range paths {
+136: +		if err := os.MkdirAll(path, 0o700); err != nil {
+137: +			t.Fatal(err)
+138: +		}
+139: +		volume, id, final, err := fileIdentity(path)
+140: +		if err != nil {
+141: +			t.Fatalf("%s: %v", label, err)
+142: +		}
+143: +		if !utf8.ValidString(final) || final != filepath.Clean(path) || volume == "" || id == 0 {
+144: +			t.Fatalf("%s: final=%q want=%q utf8=%v volume=%q id=%d", label, final, filepath.Clean(path), utf8.ValidString(final), volume, id)
+145: +		}
+146: +		seen[label] = identity{volume, id, final}
+147: +	}
+148: +	one, two := seen["common-prefix-one"], seen["common-prefix-two"]
+149: +	if one.final == two.final || (one.volume == two.volume && one.id == two.id) {
+150: +		t.Fatalf("distinct suffixes collapsed: one=%+v two=%+v", one, two)
+151: +	}
+152: +}
+153: +
+154: +func TestRootRegistryUnicodeFinalPathRoundTrip(t *testing.T) {
+155: +	root := source43FixtureRoot(t)
+156: +	path := filepath.Join(root, "父目录", "工作区😀")
+157: +	if err := os.MkdirAll(path, 0o700); err != nil {
+158: +		t.Fatal(err)
+159: +	}
+160: +	_, _, expectedFinal, err := fileIdentity(path)
+161: +	if err != nil {
+162: +		t.Fatal(err)
+163: +	}
+164: +	registryDir := filepath.Join(root, "registry")
+165: +	registry, err := openRootRegistry(registryDir)
+166: +	if err != nil {
+167: +		t.Fatal(err)
+168: +	}
+169: +	const ref = "source43-unicode-root"
+170: +	binding, err := registry.Register(ref, path, AccessReadOnly, time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC))
+171: +	if err != nil {
+172: +		t.Fatal(err)
+173: +	}
+174: +	if binding.FinalPath != expectedFinal || binding.RealPath != filepath.Clean(path) || binding.VolumeID == "" || binding.FileID == 0 {
+175: +		t.Fatalf("registered root lost native path or identity: %+v", binding)
+176: +	}
+177: +	reopened, err := openRootRegistry(registryDir)
+178: +	if err != nil {
+179: +		t.Fatal(err)
+180: +	}
+181: +	got := reopened.roots[ref]
+182: +	if got == nil || got.FinalPath != expectedFinal || got.RealPath != filepath.Clean(path) || got.VolumeID != binding.VolumeID || got.FileID != binding.FileID || !utf8.ValidString(got.FinalPath) {
+183: +		t.Fatalf("reopened root lost full Unicode paths or identity: %+v", got)
+184: +	}
+185: +}
+
+FILE execution/v2.4/receipts/W05/W05-99/source43_b_stop_finalpath_codex/20261025-current-chat/diagnostic-ledger.json
+1: {
+2:   "old_command_count": 24,
+3:   "old_failures_or_missing_exit": [
+4:     {
+5:       "id": "009-precompose-pin",
+6:       "exit_present": true,
+7:       "native_exit": 1,
+8:       "invocation.json": {
+9:         "sha256": "4c57ab68fb9b9996f1f8a7d7bbf532c90d154a9dbe7f4c122ef15fb72d2c0d01",
+10:         "bytes": 899
+11:       },
+12:       "stdout.raw": {
+13:         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+14:         "bytes": 0
+15:       },
+16:       "stderr.raw": {
+17:         "sha256": "1df7e7084cfc31d76a963a258603d689cbf4fd59ba6b5d52bd3863443bc45339",
+18:         "bytes": 904
+19:       }
+20:     },
+21:     {
+22:       "id": "019-read-diagnosis-roots",
+23:       "exit_present": true,
+24:       "native_exit": 1,
+25:       "invocation.json": {
+26:         "sha256": "1c9d272591e9eb1047570284c9c5bed0085170df6dba379d0240b24af48be8a2",
+27:         "bytes": 902
+28:       },
+29:       "stdout.raw": {
+30:         "sha256": "939f25943e44527e6acff0e5393ba24084c2adbc1bc5a3ea716eed00dc1d4b84",
+31:         "bytes": 4332
+32:       },
+33:       "stderr.raw": {
+34:         "sha256": "015e31023b4a9b06895e8bd25433fed0e7c364f886efcabd65373806a9deb0ab",
+35:         "bytes": 416
+36:       }
+37:     }
+38:   ],
+39:   "new_recorded_failures": [
+40:     {
+41:       "id": "010-stop-store-ops",
+42:       "exit": 1,
+43:       "invocation": "010-stop-store-ops\\invocation.json",
+44:       "stdout": {
+45:         "path": "010-stop-store-ops\\stdout.raw",
+46:         "sha256": "7612a6069690c04dec7ee2aa5610e7092697b8e32a6f887dfe3474086c042fa8",
+47:         "bytes": 80047
+48:       },
+49:       "stderr": {
+50:         "path": "010-stop-store-ops\\stderr.raw",
+51:         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+52:         "bytes": 0
+53:       }
+54:     },
+55:     {
+56:       "id": "016-rerun-fixture-tests",
+57:       "exit": 1,
+58:       "invocation": "016-rerun-fixture-tests\\invocation.json",
+59:       "stdout": {
+60:         "path": "016-rerun-fixture-tests\\stdout.raw",
+61:         "sha256": "2d2456f90ef99166b50198849fa2d1bab1dd4c4c09646d33792df124a0a37d67",
+62:         "bytes": 3825
+63:       },
+64:       "stderr": {
+65:         "path": "016-rerun-fixture-tests\\stderr.raw",
+66:         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+67:         "bytes": 0
+68:       }
+69:     },
+70:     {
+71:       "id": "018-rerun-fixture-tests-c",
+72:       "exit": 1,
+73:       "invocation": "018-rerun-fixture-tests-c\\invocation.json",
+74:       "stdout": {
+75:         "path": "018-rerun-fixture-tests-c\\stdout.raw",
+76:         "sha256": "b29d988cf648eb25acfb839b6ff25fe5a882fbdba0d257d8c85c63a198e1ee68",
+77:         "bytes": 3822
+78:       },
+79:       "stderr": {
+80:         "path": "018-rerun-fixture-tests-c\\stderr.raw",
+81:         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+82:         "bytes": 0
+83:       }
+84:     }
+85:   ],
+86:   "launcher_binding_failures_without_subprocess_receipt": [
+87:     {
+88:       "id": "005-check-test-invocation",
+89:       "cause": "PowerShell parameter binder rejected python -c argument"
+90:     },
+91:     {
+92:       "id": "012-fixture-requirements",
+93:       "cause": "PowerShell parameter binder rejected rg -C"
+94:     },
+95:     {
+96:       "id": "014-build-owned-fixture",
+97:       "cause": "PowerShell parameter binder treated -o as common parameter"
+98:     }
+99:   ],
+100:   "historical_boundary": "20261015 receipts are read only; ordinal 011 absent in old sequence and not rewritten."
+101: }

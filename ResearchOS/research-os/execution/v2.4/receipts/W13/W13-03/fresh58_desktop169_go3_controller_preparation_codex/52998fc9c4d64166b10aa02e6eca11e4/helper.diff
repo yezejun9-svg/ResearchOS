@@ -1,0 +1,160 @@
+--- 9c77
++++ future-images-proposal
+@@ -61,7 +61,7 @@
+     raise RuntimeError('Windows module inventory changed repeatedly; no stable bounded inventory')
+ 
+ 
+-def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, allowed_images, allowed_module_files, process_cap, stdin=None, creation_flags=0):
++def run_owned(argv, cwd, env, stdout, stderr, timeout, expected_image, allowed_images, allowed_module_files, process_cap, stdin=None, creation_flags=0, future_images=None, future_context=None):
+     """Return JSON-safe observations, including on preparation/launch failure.
+ 
+     timeout covers preparation through the primary process AND Job becoming idle.
+@@ -98,6 +98,9 @@
+                  exit_event_code=None, total_processes_last_observed=None,
+                  debugger_thread_process_handles='OS debug-engine lifetime until matching exit continuation; not explicitly owned duplicates')
+     loaded_files = []
++    future_pins = {}
++    debug['future_image_admissions'] = []
++    debug['future_images_declared'] = []
+     def image_key(value):
+         value = str(value)
+         if value.startswith("\\\\?\\UNC\\"):
+@@ -177,6 +180,44 @@
+             raise ValueError('Explicit module/runtime file universe required')
+         module_pins = {image_key(r['path']): {'sha256':r['sha256'],'bytes':r['bytes']} for r in allowed_module_files}
+         module_pins.update(image_pins)
++        if future_images is not None:
++            if not isinstance(future_images,list) or len(future_images)>20 or len(future_images)+len(image_pins)>64:
++                raise ValueError('Finite future image list bound')
++            if not isinstance(future_context,dict) or set(future_context)!={'root','run_uuid','case_name','scope_sha256'}:
++                raise ValueError('Exact future image context required')
++            future_root=Path(future_context['root'])
++            if not future_root.is_absolute() or str(future_root.absolute())!=str(future_root) or str(future_root.resolve(strict=False))!=str(future_root):
++                raise ValueError('Future root canonical spelling')
++            if len(future_context['run_uuid'])!=32 or any(c not in '0123456789abcdef' for c in future_context['run_uuid']):
++                raise ValueError('Future run UUID')
++            if len(future_context['scope_sha256'])!=64 or any(c not in '0123456789abcdef' for c in future_context['scope_sha256']):
++                raise ValueError('Future scope hash')
++            for row in future_images:
++                if set(row)!={'path','sha256','bytes','origin_ref','case_name','scope_sha256','run_uuid','allocation_ordinal','max_creates'}:
++                    raise ValueError('Exact future row fields')
++                p=Path(row['path'])
++                if not p.is_absolute() or str(p)!=str(p.absolute()) or str(p.resolve(strict=False))!=str(p) or not p.is_relative_to(future_root):
++                    raise ValueError('Future image outside exact root or alias')
++                if os.path.lexists(p):raise ValueError('Future image must initially be absent')
++                if any(row[k]!=future_context[k] for k in ['case_name','scope_sha256','run_uuid']):raise ValueError('Future case/scope mismatch')
++                if type(row['allocation_ordinal']) is not int or not 0<=row['allocation_ordinal']<20 or row['max_creates'] not in [1,2]:raise ValueError('Future finite ordinal/create bound')
++                expected=future_root/(row['run_uuid']+'-'+str(row['allocation_ordinal']).zfill(2))/'resources/client-wire/researchos-client-wire-validator.exe'
++                if str(p)!=str(expected):raise ValueError('Future exact alias not frozen ordinal')
++                cur=p
++                while cur!=cur.parent:
++                    if os.path.lexists(cur):
++                        st=os.lstat(cur)
++                        if cur.is_symlink() or getattr(st,'st_file_attributes',0)&0x400:raise ValueError('Future path reparse')
++                    cur=cur.parent
++                origin=row['origin_ref']
++                if set(origin)!={'path','sha256','bytes'} or image_pins.get(image_key(origin['path']))!={'sha256':row['sha256'],'bytes':row['bytes']} or origin['sha256']!=row['sha256'] or origin['bytes']!=row['bytes']:
++                    raise ValueError('Future origin must be an actual pinned fresh negative child')
++                raw=Path(origin['path']).read_bytes()
++                if len(raw)!=origin['bytes'] or hashlib.sha256(raw).hexdigest()!=origin['sha256']:raise ValueError('Future origin changed')
++                key=image_key(p)
++                if key in image_pins or key in future_pins:raise ValueError('Duplicate future image')
++                future_pins[key]={'row':row,'used':0}
++                debug['future_images_declared'].append({'path':str(p),'case_name':row['case_name'],'allocation_ordinal':row['allocation_ordinal'],'uses':0})
+         capture_deadline = started + timeout
+         import msvcrt
+ 
+@@ -296,6 +337,48 @@
+                 deadline_check(deadline, 'module hash')
+             return {'sha256': digest.hexdigest(), 'bytes': total}
+ 
++        class FILE_INFORMATION(ctypes.Structure):
++            _fields_=[('attributes',DWORD),('creation',wintypes.FILETIME),('access',wintypes.FILETIME),('write',wintypes.FILETIME),
++                      ('volume',DWORD),('sizeHigh',DWORD),('sizeLow',DWORD),('links',DWORD),('indexHigh',DWORD),('indexLow',DWORD)]
++        file_info=bind('GetFileInformationByHandle',[HANDLE,ctypes.POINTER(FILE_INFORMATION)],wintypes.BOOL)
++        open_exact=bind('CreateFileW',[wintypes.LPCWSTR,DWORD,DWORD,ctypes.c_void_p,DWORD,DWORD,HANDLE],HANDLE)
++        def info(handle):
++            value=FILE_INFORMATION();require(file_info(handle,ctypes.byref(value)))
++            if value.attributes & (0x400|0x10):raise RuntimeError('Future executable reparse/directory')
++            return {'volume':int(value.volume),'index':(int(value.indexHigh)<<32)|int(value.indexLow),
++                    'bytes':(int(value.sizeHigh)<<32)|int(value.sizeLow)}
++        def admit_future(fact, retained, key):
++            declaration=future_pins[key];row=declaration['row'];p=Path(row['path'])
++            if declaration['used']>=row['max_creates']:raise RuntimeError('Future executable generation cap')
++            # The debug event still suspends this child. Read the same current path by a held handle;
++            # no write/delete sharing, no directory or reparse resolution is accepted.
++            cur=p
++            while cur!=cur.parent:
++                if os.path.lexists(cur):
++                    st=os.lstat(cur)
++                    if cur.is_symlink() or getattr(st,'st_file_attributes',0)&0x400:raise RuntimeError('Future executable ancestor replaced')
++                cur=cur.parent
++            held=open_exact(str(p),0x80000000,1,None,3,0x00200000,None)
++            if not held or held==ctypes.c_void_p(-1).value:raise ctypes.WinError(ctypes.get_last_error())
++            handles.append(held)
++            buffer=ctypes.create_unicode_buffer(32768);length=file_name(held,buffer,len(buffer),0)
++            if not length or length>=len(buffer):raise ctypes.WinError(ctypes.get_last_error())
++            actual=buffer.value[4:] if buffer.value.startswith('\\\\?\\') else buffer.value
++            event_path=fact['path_from_actual_file_handle'];event_path=event_path[4:] if event_path.startswith('\\\\?\\') else event_path
++            expected={'sha256':row['sha256'],'bytes':row['bytes']}
++            if str(Path(actual).resolve())!=str(p) or str(Path(event_path).resolve())!=str(p):raise RuntimeError('Future final path mismatch')
++            event_identity,current_identity=info(retained),info(held)
++            if event_identity!=current_identity or event_identity['bytes']!=row['bytes'] or fact['before']!=expected or hash_loaded_file(held,capture_deadline)!=expected:
++                raise RuntimeError('Future path and event file identity/digest mismatch')
++            declaration['used']+=1
++            item={'path':str(p),'scope_sha256':row['scope_sha256'],'case_name':row['case_name'],'allocation_ordinal':row['allocation_ordinal'],
++                  'pid':fact['pid'],'creation_time_100ns':fact['creation_time_100ns'],'event_file_identity':event_identity,
++                  'current_path_file_identity':current_identity,'pin':expected,'checked_before_debug_continue':True}
++            debug['future_image_admissions'].append(item)
++            for declared in debug['future_images_declared']:
++                if declared['path']==str(p):declared['uses']=declaration['used']
++            image_pins[key]=expected;module_pins[key]=expected
++
+         def reject_load(fact, expected_pin, reason):
+             # Preserve only facts already read from this event's actual hFile.
+             # This never authorizes the load, performs extra IO, or appends a qualified module.
+@@ -325,6 +408,10 @@
+                         'creation_time_100ns':processes[process_id]['creation_time_100ns'],
+                         'path_from_actual_file_handle':path_buffer.value,
+                         'before':hash_loaded_file(retained, capture_deadline)}
++                future_key=image_key(path_buffer.value)
++                if event_code==3 and future_key in future_pins:
++                    try:admit_future(fact,retained,future_key)
++                    except BaseException as exc:reject_load(fact,{'sha256':future_pins[future_key]['row']['sha256'],'bytes':future_pins[future_key]['row']['bytes']},'Future image admission failed: '+error_text(exc))
+                 if module_pins.get(image_key(path_buffer.value)) != fact['before']:
+                     reject_load(fact,module_pins.get(image_key(path_buffer.value)),
+                                 'Actual loaded module outside frozen runtime universe')
+@@ -352,6 +439,7 @@
+                 raise ctypes.WinError(error)
+             status = 0x00010002
+             event_fact = {'code':int(event.code), 'pid':int(event.pid), 'tid':int(event.tid)}
++            may_continue = True
+             raw = bytes(event.u)
+             event_file = struct.unpack_from('<Q', raw, 0)[0] if event.code in (3, 6) else 0
+             try:
+@@ -422,13 +510,24 @@
+                         debug['exit_event_code'] = proc['exit_event_code']
+             except BaseException as exc:
+                 record_error(exc)
++                if future_images is not None and not cleanup_mode:
++                    # In this new opt-in mode a failed event is never released to execute.
++                    may_continue=False
++                    cleanup['termination_requested']=True
++                    cleanup['termination_code_requested']=0xE0000008
++                    stopped=bool(terminate_job(job,0xE0000008))
++                    cleanup['termination_succeeded']=stopped
++                    event_fact['termination_before_continue']=stopped
++                    if stopped:may_continue=True
++                    else:record_error(ctypes.WinError(ctypes.get_last_error()))
+             finally:
+                 try:
+                     if event_file and event_file != 0xFFFFFFFFFFFFFFFF:
+                         require(close(HANDLE(event_file)))
+                 finally:
+                     # Always release the received notification, even after capture failure.
+-                    require(continue_debug(event.pid, event.tid, status))
++                    if may_continue:require(continue_debug(event.pid, event.tid, status))
++                    event_fact['debug_event_continued']=may_continue
+                     if event.code == 5 and event.pid in processes:
+                         processes[event.pid]['exit_continued'] = True
+                     if len(debug['events']) < 131072:

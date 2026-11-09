@@ -1,0 +1,155 @@
+//go:build windows
+
+package runtime
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"strings"
+	"syscall"
+	"unicode/utf16"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// PrivateDirectory applies an inheritable, protected DACL, and reads the actual descriptor back.
+// os.Chmod alone does not restrict Windows access.
+func PrivateDirectory(path string) (string, error) {
+	u, e := user.Current()
+	if e != nil {
+		return "", e
+	}
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + u.Uid + ")")
+	if e != nil {
+		return "", e
+	}
+	acl, _, e := sd.DACL()
+	if e != nil {
+		return "", e
+	}
+	if e = windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); e != nil {
+		return "", e
+	}
+	actual, e := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if e != nil {
+		return "", e
+	}
+	text := actual.String()
+	if !strings.Contains(text, u.Uid) || !strings.Contains(text, "D:P") {
+		return "", errors.New("private DACL verification failed")
+	}
+	return text, nil
+}
+
+type process struct {
+	job, handle windows.Handle
+	pid         uint32
+	created     int64
+}
+
+func newJob(name string) (windows.Handle, error) {
+	n, e := windows.UTF16PtrFromString(name)
+	if e != nil {
+		return 0, e
+	}
+	h, e := windows.CreateJobObject(nil, n)
+	if e != nil {
+		return 0, e
+	}
+	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, e = windows.SetInformationJobObject(h, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); e != nil {
+		windows.CloseHandle(h)
+		return 0, e
+	}
+	return h, nil
+}
+
+// Job membership is assigned atomically at creation, before a suspended process can run.
+// This also closes the worker-crash gap between CreateProcess and AssignProcessToJobObject.
+func launch(job windows.Handle, c Command, env []string, stdin, stdout, stderr *os.File) (*process, error) {
+	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(stdout.Fd()), windows.Handle(stderr.Fd())}
+	for _, h := range handles {
+		if e := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
+			return nil, e
+		}
+		defer windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, 0)
+	}
+	attrs, e := windows.NewProcThreadAttributeList(2)
+	if e != nil {
+		return nil, e
+	}
+	defer attrs.Delete()
+	if e != nil {
+		return BridgeJournal{}, errors.New("worker still owns dispatch")
+	}
+	defer lock.Close()
+	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+	if e != nil {
+		return BridgeJournal{}, e
+	}
+	var j BridgeJournal
+	if e = json.Unmarshal(raw, &j); e != nil {
+		return j, e
+	}
+	digest, e := canonicalHash(j.Manifest)
+	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+		return j, errors.New("recovery manifest mismatch")
+	}
+	if j.Identity.PID != 0 {
+		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+		if e != nil || alive {
+			return j, errors.New("old process identity not confirmed stopped")
+		}
+	}
+	if j.Ended == "" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete {
+		return j, errors.New("dispatch outcome UNKNOWN")
+	}
+	if j.State == "SETTLED" && (!j.ProtocolComplete || j.Acknowledged != j.Frames || j.Receipt.ExitCode != 0 || !j.Receipt.OutputCopied || j.Cancelled) {
+		return j, errors.New("terminal protocol is not settled")
+	}
+	for file, digest := range map[string]string{"stdout.raw": j.StdoutHash, "stderr.raw": j.StderrHash} {
+		f, e := os.Open(filepath.Join(directory, file))
+		if e != nil {
+			return j, e
+		}
+		raw, e := io.ReadAll(io.LimitReader(f, sandbox.MaxStreamBytes+1))
+		f.Close()
+		if e != nil || len(raw) > sandbox.MaxStreamBytes || Hash(raw) != digest {
+			return j, errors.New("recovery stream mismatch")
+		}
+	}
+	if j.Checkpoint != nil {
+		checkpoint, e := readPauseFile(filepath.Join(directory, "checkpoint.sealed.json"))
+		if e != nil || int64(len(checkpoint)) != j.Checkpoint.Bytes || Hash(checkpoint) != j.Checkpoint.ContentHash {
+			return j, errors.New("recovery checkpoint bytes changed")
+		}
+	}
+	if j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
+		return j, errors.New("recovery checkpoint seal missing")
+	}
+	manifest, e := bridgeMap(j.Manifest)
+	if e != nil {
+		return j, e
+	}
+	admission, _ := manifest["admission"].(map[string]any)
+	profile, _ := admission["profile"].(map[string]any)
+	expected, _ := profile["outputs"].([]any)
+	if j.State == "SETTLED" && len(expected) != len(j.Artifacts) {
+		return j, errors.New("recovery output manifest incomplete")
+	}
+	var total int64
+	for i, a := range j.Artifacts {
+		if i >= len(expected) || expected[i] != a.Path || !filepath.IsLocal(a.Path) {
+			return j, errors.New("recovery output manifest changed")
+		}
+		path := filepath.Join(directory, "output", a.Path)
+		actual, e := filepath.EvalSymlinks(path)
+		if e != nil || !strings.EqualFold(path, actual) {
+			return j, errors.New("recovery output reparse rejected")
+		}
+		info, e := os.Stat(path)
+		if e != nil || !info.Mode().IsRegular() || info.Size() != a.Size || a.Size < 0 || a.Size > 64*1024*1024 {

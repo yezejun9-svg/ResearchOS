@@ -1,0 +1,14 @@
+"""Source-only future prepare entrypoint; exact Root request required."""
+import hashlib
+from pathlib import Path
+import sys
+import types
+sys.dont_write_bytecode=True
+N=Path(__file__).resolve().parent
+def main():
+    p=N/'full_w09_runtime.source.py';raw=p.read_bytes()
+    if hashlib.sha256(raw).hexdigest()!='d04691e351d9bd810dbd19555c352d393bd7649ffcc85c7385df68e964174630':raise ValueError('PINNED_RUNTIME_DRIFT')
+    m=types.ModuleType('full_w09_prepare_runtime');m.__file__=str(p)
+    exec(compile(raw,str(p),'exec'),m.__dict__)
+    m.stage('prepare',sys.argv[1:])
+if __name__=='__main__':main()

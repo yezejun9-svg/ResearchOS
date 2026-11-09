@@ -1,0 +1,71 @@
+--- seal_readonly.v2.py
++++ seal_readonly.v2.final.py
+@@ -3,9 +3,9 @@
+ import argparse, contextlib, hashlib, io, json, os, re, stat, time, types
+ from pathlib import Path
+ # Hash actual source bytes BEFORE compile; no importlib loader and no pyc read for controller modules.
+-_common_path=Path(__file__).resolve().parent/'controller_common.v2.py'
++_common_path=Path(__file__).resolve().parent/'controller_common.v2.final.py'
+ _common_raw=_common_path.read_bytes()
+-if hashlib.sha256(_common_raw).hexdigest()!='d7c12331d66be452a807b172a1d7510ee307326b42c869d32edb9a5199889eb9':raise RuntimeError('Pinned common source mismatch before import')
++if hashlib.sha256(_common_raw).hexdigest()!='f9b673e52caf9ad3a781171e3681fee1cc1ef523e64d7dd979bbb28bbf41cc3d':raise RuntimeError('Pinned common source mismatch before import')
+ if not sys.flags.isolated or not sys.flags.no_site or sys._xoptions.get('utf8') is not True:raise RuntimeError('Pinned -I -S -X utf8 required')
+ _common=types.ModuleType('w09_common_v2');_common.__file__=str(_common_path);sys.modules[_common.__name__]=_common
+ exec(compile(_common_raw,str(_common_path),'exec'),_common.__dict__)
+@@ -71,6 +71,22 @@
+  if len(rows)!=49 or [x['id'] for x in rows]!=[x['id'] for x in roster] or [x['selector'] for x in rows]!=[x['selector'] for x in roster]:raise Stop('Fixed roster order/identity')
+  eligible=[x for x in roster if all(g['resources'][k] for k in x['requires_resource'])]
+  labels=['git-parent','git-four-diff','git-export','go-version','go-env','list-domain','compile-domain','buildinfo-domain','list-adapter','compile-adapter','buildinfo-adapter']+(['junction-resource'] if g['resources']['junction'] else [])+['case-'+x['id'] for x in eligible]
++ git=g['tools']['git']['path'];go=g['tools']['go']['path'];tree=root/'source'
++ expected_argv={
++  'git-parent':[git,'rev-parse',CANDIDATE+'^'],
++  'git-four-diff':[git,'diff-tree','--no-commit-id','--name-only','-r',CANDIDATE],
++  'git-export':[git,'cat-file','--batch'],
++  'go-version':[go,'version'],
++  'go-env':[go,'env','-json','GOROOT','GOVERSION','GOENV','GOTOOLCHAIN','GOMOD','GOMODCACHE','GOCACHE','GOTMPDIR','CGO_ENABLED','GOWORK','GOOS','GOARCH','GOAMD64','GOEXPERIMENT','GODEBUG']}
++ for label,pkg in [('domain','./internal/domain'),('adapter','./adapters/retrieval')]:
++  expected_argv['list-'+label]=[go,'list','-deps','-test','-compiled','-json','-mod=readonly','-work','-x',pkg]
++  expected_argv['compile-'+label]=[go,'test','-c','-p=1','-mod=readonly','-work','-x','-o',str(root/(label+'.test.exe')),pkg]
++  expected_argv['buildinfo-'+label]=[go,'version','-m',str(root/(label+'.test.exe'))]
++ if g['resources']['junction']:
++  resource=root/'junction-resource';expected_argv['junction-resource']=[g['tools']['cmd']['path'],'/D','/V:OFF','/S','/C','mklink /J "'+str(resource/'A/outside')+'" "'+str(resource/'B')+'"']
++ for row in eligible:
++  package='adapter' if row['file'].startswith('adapters/') else 'domain'
++  expected_argv['case-'+row['id']]=[str(root/(package+'.test.exe')),'-test.run',row['test_run'],'-test.v','-test.count=1','-test.failfast','-test.timeout=120s']
+  attempts=result['attempts']
+  if [x['label'] for x in attempts]!=labels or len(attempts)>128 or result['actual_test_invocations']!=len(eligible):raise Stop('Exact complete native stage inventory')
+  actualdirs=sorted(x.name for x in (root/'native').iterdir())
+@@ -78,6 +94,7 @@
+  for i,(item,label) in enumerate(zip(attempts,labels),1):
+   d=root/'native'/('%03d-%s'%(i,label));inv=raw_json((d/'invocation.json').read_bytes());start=raw_json((d/'invocation.started.json').read_bytes())
+   if inv!=item or inv['serial']!=i or inv.get('first_error') or inv.get('secondary_errors') or inv['actual_native_exit']!=0 or start['actualargv']!=inv['actualargv']:raise Stop('Incomplete actual native invocation')
++  if inv['actualargv']!=expected_argv[label]:raise Stop('Actual native argv differs from fixed stage plan')
+   require_job(inv['owned_result'],True)
+   for key in ['stdout_ref','stderr_ref']:verify(inv[key])
+   check_vector(root/'vectors'/('%03d-%s-before.json'%(i,label)));check_vector(root/'vectors'/('%03d-%s-after.json'%(i,label)))
+@@ -133,9 +150,25 @@
+  for pin in derived['generated_testmain_refs']+derived['archive_refs']+derived['importcfg_refs']+list(derived['testexe_refs'].values()):
+   verify(pin)
+   if pin['path'] not in frozenpaths:raise Stop('Derived compiler input not frozen')
++ for ownedroot in [root/'source',root/'gotmpdir',root/'gocache',Path(g['goroot']),Path(g['module_cache'])]:
++  if {str(p) for p in walk_files(ownedroot)}!={p for p in frozenpaths if Path(p).is_relative_to(ownedroot)}:raise Stop('Complete actual compiled/input directory membership differs')
++ work=walk_files(root/'gotmpdir');actual_mains=[file_ref(p) for p in work if p.name=='_testmain.go'];actual_cfgs=[file_ref(p) for p in work if p.name.startswith('importcfg')];actual_archives={}
++ for pin in actual_cfgs:
++  for line in Path(pin['path']).read_text(encoding='utf-8',errors='strict').splitlines():
++   if line.startswith('packagefile '):
++    p=no_alias(line.split('=',1)[1]);actual_archives[str(p)]=file_ref(p)
++ if actual_mains!=derived['generated_testmain_refs'] or actual_cfgs!=derived['importcfg_refs'] or list(actual_archives.values())!=derived['archive_refs']:raise Stop('Actual generated/importcfg/archive multiset differs')
+  for label in ['domain','adapter']:
+   graph=raw_json((root/('graph-'+label+'.json')).read_bytes())
+   if not graph or len(graph)>4096 or any(x.get('Error') or x.get('DepsErrors') or x.get('Incomplete') for x in graph):raise Stop('Actual full Go graph failed')
++  for package in graph:
++   if not package.get('Dir'):continue
++   directory=no_alias(package['Dir'])
++   for key in ['GoFiles','CgoFiles','CompiledGoFiles','TestGoFiles','XTestGoFiles','EmbedFiles','TestEmbedFiles','XTestEmbedFiles','CFiles','CXXFiles','MFiles','HFiles','FFiles','SFiles','SwigFiles','SwigCXXFiles','SysoFiles']:
++    for name in package.get(key,[]):
++     p=Path(name);p=p if p.is_absolute() else directory/p
++     if str(no_alias(p)) not in frozenpaths:raise Stop('Actual Go package input omitted from complete closure')
++   if package.get('Module',{}).get('GoMod') and str(no_alias(package['Module']['GoMod'])) not in frozenpaths:raise Stop('Actual module metadata omitted')
+  # All evidence is preserved. The new summary is included; only this manifest excludes itself.
+  seal=root/'sealed-readonly-v2';seal.mkdir(exist_ok=False)
+  write_json(seal/'summary.json',{'schema':'researchos.w09.finite-evidence-seal.v2','result_ref':resultref,'grant_ref':g['_grant_ref'],'spec_ref':g['spec_ref'],'scenario_rows':49,'actual_pass_rows':passed,'actual_leaf_records':leafs,'holds':holds,'source_acceptance':False,'formal_increment':0,'status':'EVIDENCE_ASSEMBLED_PENDING_NONAUTHOR_REVIEW','SQL_reads':0,'processes_started':0,'python_inventory':'ACTUAL_POINT_IN_TIME_ONLY','closed_DB_limitation':'29 new domain VACUUM copies; 21 selected four-table driver-value JSON and 8 business JSON; not fullDB/typeof/rowid equivalence; old six domain no export'})

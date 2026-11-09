@@ -1,0 +1,158 @@
+FILE internal/ownedcorestop/proof_windows_test.go SHA256 f83d894dbd2760094594761b06a5141daeb3e4c1a18c6ca11cdda32675b0ce63
+1: //go:build windows
+2: 
+3: package ownedcorestop
+4: 
+5: import (
+6: 	"encoding/base64"
+7: 	"encoding/json"
+8: 	"path/filepath"
+9: 	"strings"
+10: 	"testing"
+11: 	"time"
+12: 
+13: 	"researchos.local/research-os/internal/host"
+14: 	"researchos.local/research-os/internal/store"
+15: )
+16: 
+17: func TestCompiledGrantStrictCanonicalAndActionBoundary(t *testing.T) {
+18: 	sha := strings.Repeat("a", 64)
+19: 	sid := "S-1-5-21-fixture"
+20: 	data := `C:\fixture\data`
+21: 	db := filepath.Join(data, "researchos.sqlite")
+22: 	out := `C:\fixture\operation`
+23: 	now := time.Now().UTC().Truncate(time.Second)
+24: 	g := operationGrant{Schema: grantSchema, GrantKind: "PREFLIGHT_ONLY", OperationID: strings.Repeat("b", 32), IssuedAt: now.Format(time.RFC3339Nano), NotBefore: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(20 * time.Minute).Format(time.RFC3339Nano), Purpose: "EXACT_RETAINED_CORE_CRASH_STOP", TrustedOperatorSID: sid, DataRoot: grantFileIdentity{data, 1, 2}, Database: grantFileIdentity{db, 1, 3}, OperationDir: grantFileIdentity{out, 1, 4}, Native: grantNativeIdentity{PID: 10, Created100NS: "123", SID: sid, ImagePath: `C:\fixture\core.exe`, ImageSHA256: sha, ImageVolume: 1, ImageIndex: 5, ParentPID: 9, ParentCreated100NS: "100", ParentSID: sid, ParentImagePath: `C:\fixture\desktop.exe`, ParentImageSHA256: sha, ParentImageVolume: 1, ParentImageIndex: 6}, Host: host.OwnedCoreStopPublicIdentity{DataRoot: data, Database: db, DatabaseVolume: 1, DatabaseIndex: 3, SID: sid, PrincipalRef: "fixture", HostID: "fixture", OwnerID: "fixture", OwnerRoot: "fixture", HostStateSHA256: sha, SchemaVersion: 24}, Subject: store.OwnedStopSubject{Project: "fixture", Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest}, RequiredProofKinds: append([]string{}, proofKinds...), RulesetVersion: "strict-closure-v1", SchemaSHA256: sha, AllowedActions: []string{"preflight", "inspect"}, TerminateCount: 0, Proposal: grantDocument{`C:\fixture\proposal.json`, sha}, PreflightScope: grantDocument{`C:\fixture\scope.json`, sha}, PreflightReview: grantDocument{`C:\fixture\review.json`, sha}, HistoricalManifest: grantDocument{`C:\fixture\historical.json`, sha}}
+25: 	raw, err := json.Marshal(g)
+26: 	if err != nil {
+27: 		t.Fatal(err)
+28: 	}
+29: 	raw, err = canonicalMapJSON(raw)
+30: 	if err != nil {
+31: 		t.Fatal(err)
+32: 	}
+33: 	parsed, err := parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(raw))
+34: 	if err != nil {
+35: 		t.Fatal(err)
+36: 	}
+37: 	if parsed.digest != digest(raw) {
+38: 		t.Fatal("compiled grant digest differs")
+39: 	}
+40: 	if _, err = parsed.checkAction("commit", true); err == nil {
+41: 		t.Fatal("preflight grant allowed commit")
+42: 	}
+43: 	parsed.expires = time.Now().Add(-time.Second)
+44: 	if _, err = parsed.checkAction("preflight", true); err == nil {
+45: 		t.Fatal("expired preflight allowed action")
+46: 	}
+47: 	if _, err = parsed.checkAction("inspect", false); err != nil {
+48: 		t.Fatalf("expired read-only inspect denied: %v", err)
+49: 	}
+50: 	for _, bad := range []string{"", base64.StdEncoding.EncodeToString([]byte(`{"schema":"a","schema":"b"}`)), base64.StdEncoding.EncodeToString(raw) + "\n"} {
+51: 		if _, err = parseCompiledOperationGrant(bad); err == nil {
+52: 			t.Fatalf("malformed grant accepted: %q", bad)
+53: 		}
+54: 	}
+55: 	var unknown map[string]any
+56: 	if err = json.Unmarshal(raw, &unknown); err != nil {
+57: 		t.Fatal(err)
+58: 	}
+59: 	unknown["wildcard"] = true
+60: 	unknownRaw, err := json.Marshal(unknown)
+61: 	if err != nil {
+62: 		t.Fatal(err)
+63: 	}
+64: 	unknownRaw, err = canonicalMapJSON(unknownRaw)
+65: 	if err != nil {
+66: 		t.Fatal(err)
+67: 	}
+68: 	if _, err = parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(unknownRaw)); err == nil {
+69: 		t.Fatal("unknown grant field accepted")
+70: 	}
+71: 	g.Proposal.SHA256 = strings.Repeat("0", 64)
+72: 	zeroRaw, err := json.Marshal(g)
+73: 	if err != nil {
+74: 		t.Fatal(err)
+75: 	}
+76: 	zeroRaw, err = canonicalMapJSON(zeroRaw)
+77: 	if err != nil {
+78: 		t.Fatal(err)
+79: 	}
+80: 	if _, err = parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(zeroRaw)); err == nil {
+81: 		t.Fatal("zero digest accepted")
+82: 	}
+83: }
+84: 
+85: func TestOwnedCoreStopMissingHistoricalProofNeverEligible(t *testing.T) {
+86: 	plan := Plan{OperationID: strings.Repeat("a", 32), Input: Input{SourceRepository: t.TempDir()}}
+87: 	_, missing := validateHistoricalEvidence(plan)
+88: 	if len(missing) < len(proofKinds) {
+89: 		t.Fatalf("missing F01/native/effect proofs were accepted: %v", missing)
+90: 	}
+91: 	for _, ref := range []EvidenceRef{{Kind: "f01_ready", Path: filepath.Join(t.TempDir(), "forged.json"), SHA256: strings.Repeat("a", 64)}} {
+92: 		plan.Input.Evidence = append(plan.Input.Evidence, ref)
+93: 	}
+94: 	_, missing = validateHistoricalEvidence(plan)
+95: 	if len(missing) == 0 {
+96: 		t.Fatal("caller-selected evidence outside independent namespace accepted")
+97: 	}
+98: }
+99: 
+100: func TestOwnedCoreStopCallerReviewCannotOmitExactScope(t *testing.T) {
+101: 	plan := Plan{Input: Input{SourceRepository: t.TempDir(), PlanReviewPath: filepath.Join(t.TempDir(), "review.json")}}
+102: 	if err := validatePlanReview(plan, strings.Repeat("a", 64)); err == nil {
+103: 		t.Fatal("non-independent review path accepted")
+104: 	}
+105: }
+106: 
+107: func TestNativeExitProofRequiresExplicitNumericCapturePerClass(t *testing.T) {
+108: 	sha := strings.Repeat("a", 64)
+109: 	for _, kind := range []string{"worker_native_exit", "verifier_native_exit"} {
+110: 		for _, tc := range []struct {
+111: 			name  string
+112: 			field string
+113: 			value any
+114: 			omit  bool
+115: 			want  bool
+116: 		}{
+117: 			{"explicit exit zero", "native_exit_code", 0, false, true},
+118: 			{"explicit exit nonzero", "native_exit_code", 137, false, true},
+119: 			{"missing exit", "native_exit_code", nil, true, false},
+120: 			{"null exit", "native_exit_code", nil, false, false},
+121: 			{"negative exit", "native_exit_code", -1, false, false},
+122: 			{"overflow exit", "native_exit_code", int64(1) << 32, false, false},
+123: 			{"fractional exit", "native_exit_code", 0.5, false, false},
+124: 			{"explicit wait zero", "native_wait_result", 0, false, true},
+125: 			{"missing wait", "native_wait_result", nil, true, false},
+126: 			{"null wait", "native_wait_result", nil, false, false},
+127: 			{"nonzero wait", "native_wait_result", 258, false, false},
+128: 			{"negative wait", "native_wait_result", -1, false, false},
+129: 			{"overflow wait", "native_wait_result", int64(1) << 32, false, false},
+130: 			{"fractional wait", "native_wait_result", 0.5, false, false},
+131: 		} {
+132: 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+133: 				fields := map[string]any{
+134: 					"kind": kind, "native_pid": 8, "native_created_ns": 123,
+135: 					"native_wait_api": "WaitForSingleObject", "native_wait_result": 0,
+136: 					"native_exit_api": "GetExitCodeProcess", "native_exit_code": 0,
+137: 					"native_handle_record_sha256": sha,
+138: 				}
+139: 				if tc.omit {
+140: 					delete(fields, tc.field)
+141: 				} else {
+142: 					fields[tc.field] = tc.value
+143: 				}
+144: 				raw, err := json.Marshal(fields)
+145: 				if err != nil {
+146: 					t.Fatal(err)
+147: 				}
+148: 				var proof historicalEvidence
+149: 				err = decodeCanonicalAuthority(raw, &proof)
+150: 				got := err == nil && nativeExitEvidenceComplete(proof, 9)
+151: 				if got != tc.want {
+152: 					t.Fatalf("native proof %s accepted=%v want=%v decode=%v: %s", tc.name, got, tc.want, err, raw)
+153: 				}
+154: 			})
+155: 		}
+156: 	}
+157: }

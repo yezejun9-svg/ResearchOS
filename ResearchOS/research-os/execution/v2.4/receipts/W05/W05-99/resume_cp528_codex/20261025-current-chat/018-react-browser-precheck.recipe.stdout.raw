@@ -1,0 +1,141 @@
+FILE tests/ui/frontend-redesign-fixture.cjs lines=77
+1: 'use strict';
+2: 
+3: // Disposable, browser-only product fixture. Every business request is handled
+4: // here; no request may reach a real Core or remote provider.
+5: const projectId = 'fixture-project';
+6: 
+7: async function installFixture(page, { native = false } = {}) {
+8:   const unexpected = [];
+9:   const requests = [];
+10:   const data = {
+11:     '/v1/projects': { items: [{ project_id: projectId, name: '城市河流研究', intent: '整理水质与治理证据' }] },
+12:     [`/v1/projects/${projectId}/profile`]: { project_id: projectId, name: '城市河流研究', revision: 3 },
+13:     [`/v1/projects/${projectId}/state`]: { project_id: projectId, revision: 3, active_cycle_id: null, blocking_conflict_ids: [] },
+14:     [`/v1/projects/${projectId}/progress`]: { project_id: projectId, plan_revision: 3, as_of_event_sequence: 0, stages: [] },
+15:     [`/v1/projects/${projectId}/releases`]: { items: [] },
+16:     [`/v1/projects/${projectId}/notifications`]: { items: [] },
+17:     [`/v1/projects/${projectId}/goals`]: { items: [] },
+18:     [`/v1/projects/${projectId}/tasks`]: { items: [] },
+19:     [`/v1/projects/${projectId}/research-cycles`]: { items: [] },
+20:     [`/v1/projects/${projectId}/resource-requests`]: { items: [] },
+21:   };
+22:   await page.route('**/*', async route => {
+23:     const url = new URL(route.request().url());
+24:     const path = url.pathname;
+25:     if (path.startsWith('/v1/') || path.startsWith('/v2/')) {
+26:       requests.push({ method: route.request().method(), path });
+27:       if (path.endsWith('/events/stream')) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture heartbeat\n\n' });
+28:       if (route.request().method() === 'GET' && Object.hasOwn(data, path))
+29:         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(data[path]) });
+30:       unexpected.push(`${route.request().method()} ${path}`);
+31:       return route.fulfill({ status: 599, contentType: 'application/json', body: JSON.stringify({ code: 'FIXTURE_UNEXPECTED_REQUEST' }) });
+32:     }
+33:     if (path === '/remote-info') return route.fulfill({ status: 404, body: '{}' });
+34:     if (url.hostname === '127.0.0.1' && (path === '/' || path.startsWith('/p/') || path.startsWith('/assets/')))
+35:       return route.continue();
+36:     unexpected.push(`EXTERNAL ${url.href}`);
+37:     return route.abort();
+38:   });
+39:   if (native) await page.addInitScript(({ projectId }) => {
+40:     const initial = {
+41:       project_id: projectId, session_id: 'session-one', title: '河流污染证据核对', revision: 7,
+42:       event_sequence: 0, earliest_event_sequence: 0, run_status: 'WAITING', active_run_id: null,
+43:       workspace_ref: 'workspace-one', goal_id: null, pending_command_ids: [], pending_permissions: [],
+44:       writer: { client_id: 'fixture-client', expires_at: '2099-01-01T00:00:00Z' },
+45:       messages: [
+46:         { message_id: 'm1', role: 'USER', complete: true, parts: [{ text: '请核对上游与下游水质记录，标出来源不一致的结论。' }] },
+47:         { message_id: 'm2', role: 'ASSISTANT', complete: true, parts: [{ text: '已收到研究问题。下一步先整理来源，再逐条核对采样时间和测点。' }] },
+48:       ],
+49:     };
+50:     const state = { snapshot: initial, sessions: [{ session_id: initial.session_id, title: initial.title, run_status: 'WAITING' }] };
+51:     const completed = result => ({ ok: true, completed: true, protocol_status: 'COMPLETED', result });
+52:     window.__frontendFixtureCalls = [];
+53:     const actions = {
+54:       'host.status': () => ({ client_id: 'fixture-client', model_configurations: [{ model_config_ref: 'model-one', provider_id: 'local', model_id: 'research-model', config_revision: 1 }], workspaces: [{ project_id: projectId, status: 'ACTIVE', authorized_workspace_ref: 'workspace-one', display_name: '研究资料' }] }),
+55:       'session.list': () => ({ items: state.sessions, next_cursor: null }),
+56:       'session.get': () => state.snapshot,
+57:       'session.events': () => ({ events: [], next_sequence: state.snapshot.event_sequence }),
+58:       'session.attach': () => state.snapshot,
+59:       'session.create': body => { const next = { ...initial, session_id: 'session-two', title: body.title, messages: [], revision: 1 }; state.sessions.unshift({ session_id: next.session_id, title: next.title, run_status: 'WAITING' }); state.snapshot = next; return next },
+60:       'session.send': body => { state.snapshot.messages.push({ message_id: `m${state.snapshot.messages.length + 1}`, role: 'USER', complete: true, parts: [{ text: body.text }] }); state.snapshot.pending_command_ids.push('pending-fixture'); return { command_id: 'pending-fixture' } },
+61:       'session.control': () => state.snapshot,
+62:       'workspace.tree': () => ({ entries: [], next_cursor: null }),
+63:       'workspace.diff': () => ({ base: 'HEAD', files: [], total_files: 0, truncated: false }),
+64:     };
+65:     const v2 = Object.fromEntries(Object.entries(actions).map(([name, action]) => [name, async body => { window.__frontendFixtureCalls.push({ name, body }); return completed(action(body || {})) }]));
+66:     window.researchos = { desktop: {
+67:       context: async () => ({ project_id: projectId, session_id: state.snapshot.session_id }),
+68:       selectProject: async () => ({ ok: true }),
+69:       openSession: async sessionId => { const session = state.sessions.find(item => item.session_id === sessionId); if (session) state.snapshot = { ...state.snapshot, session_id: session.session_id, title: session.title }; return completed(state.snapshot) },
+70:       qualificationCurrent: async () => ({ ok: true, available: false, state: 'NOT_REQUESTED' }),
+71:       codingCurrent: async () => ({ ok: true, available: false, state: 'NOT_REQUESTED' }),
+72:     }, v2 };
+73:   }, { projectId });
+74:   return { unexpected, requests, projectId };
+75: }
+76: 
+77: module.exports = { installFixture, projectId };
+FILE apps/web/src/components/app-shell.jsx lines=62
+1: import React, { useState } from 'react'
+2: import { etagOf, itemsOf } from '../api'
+3: import { Link, navigation, stages } from '../navigation'
+4: 
+5: function Icon({ name }) {
+6:   const paths = {
+7:     home: <><path d="M3 10 12 3l9 7v10H3z"/><path d="M9 20v-6h6v6"/></>,
+8:     cycle: <><path d="M20 7a8 8 0 0 0-14-2L4 7M4 3v4h4M4 17a8 8 0 0 0 14 2l2-2M16 17h4v4"/></>,
+9:     release: <path d="M5 3h11l3 3v15H5zM8 10h8M8 14h8M8 18h5"/>,
+10:     evidence: <path d="M4 4h16v16H4zM8 8h8M8 12h6M8 16h8"/>,
+11:     experiment: <path d="M8 3h8M10 3v7l-5 9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2l-5-9V3M8 16h8"/>,
+12:     knowledge: <path d="M3 5c3-2 6-2 9 0 3-2 6-2 9 0v15c-3-2-6-2-9 0-3-2-6-2-9 0zM12 5v15"/>,
+13:     team: <><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M2 20c0-4 3-6 6-6s6 2 6 6M14 15c4-1 8 1 8 5"/></>,
+14:     resources: <><circle cx="12" cy="12" r="9"/><path d="M15 8H10a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H9M12 5v3m0 8v3"/></>,
+15:     settings: <><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
+16:     chat: <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12h5"/>,
+17:     menu: <path d="M3 6h18M3 12h18M3 18h18"/>, close: <path d="M5 5l14 14M19 5 5 19"/>,
+18:   }
+19:   return <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name] || paths.home}</svg>
+20: }
+21: 
+22: function StageRail({ projection, state, releases, navigate, projectId, onClose }) {
+23:   return <div className="rail-inner"><div className="rail-heading"><h2>阶段进度</h2><button className="icon-button drawer-close" aria-label="关闭进度" onClick={onClose}><Icon name="close"/></button></div>
+24:     {projection ? <><p className="small-muted">计划版本 {projection.plan_revision} · 事件水位 {projection.as_of_event_sequence}</p>{projection.plan_change_note && <p className="small-muted">{projection.plan_change_note}</p>}<ol className="stage-list">{stages.map(([stage, label], index) => {
+25:       const value = projection.stages?.find(row => row.stage === stage)
+26:       return <li key={stage}><span className="stage-number">{index + 1}</span><span className="stage-title">{label}</span><span className="stage-count">{value ? `${value.accepted} / ${value.planned} 已验收` : '尚无计划'}</span>{value?.active > 0 && <span className="stage-extra">{value.active} 进行中</span>}{value?.pending_review > 0 && <span className="stage-extra">{value.pending_review} 待评审</span>}{value?.blocked > 0 && <span className="stage-extra warning">{value.blocked} 受阻</span>}</li>
+27:     })}</ol></> : <p className="empty-inline">进度投影尚不可用，暂不显示百分比。</p>}
+28:     <div className="rail-section"><h3>当前阻塞</h3><p>{state?.blocking_conflict_ids?.length ? `${state.blocking_conflict_ids.length} 项冲突待处理` : '无已记录的阻塞冲突'}</p></div>
+29:     <div className="rail-section"><h3>最近已验收成果</h3>{itemsOf(releases).length ? itemsOf(releases).slice(-3).reverse().map(item => <Link className="rail-release" key={item.id} navigate={navigate} to={`/p/${projectId}/releases/${item.id}`}>{item.summary}<small>里程碑 {item.sequence}</small></Link>) : <p>尚无已验收成果</p>}</div>
+30:   </div>
+31: }
+32: 
+33: function NotificationDrawer({ notifications, projectId, navigate, mutate, onClose }) {
+34:   const [busy, setBusy] = useState(null)
+35:   async function read(notification) {
+36:     if (notification.status === 'READ') return
+37:     setBusy(notification.id)
+38:     try { await mutate('markNotificationRead', { params: { projectId, id: notification.id }, etag: etagOf(notification), body: { reason: '用户在工作台已读通知' } }, '通知已标记为已读') }
+39:     catch { /* App feedback shows the service error */ }
+40:     finally { setBusy(null) }
+41:   }
+42:   return <div className="notice-inner"><div className="rail-heading"><h2>通知</h2><button className="icon-button drawer-close" aria-label="关闭通知" onClick={onClose}><Icon name="close"/></button></div>
+43:     {notifications.length ? notifications.map(item => <div className="notice-row" key={item.id}><span className={`tag ${item.status === 'UNREAD' ? 'good' : ''}`}>{item.status === 'UNREAD' ? '未读' : '已读'}</span><p>{item.summary}</p><small>{new Date(item.created_at).toLocaleString()}</small><div className="button-row">{item.release_id && <Link to={`/p/${projectId}/releases/${item.release_id}`} navigate={navigate} onClick={onClose}>查看成果</Link>}{item.resource_request_id && <Link to={`/p/${projectId}/resources`} navigate={navigate} onClick={onClose}>查看资源</Link>}{item.status === 'UNREAD' && <button disabled={busy === item.id} onClick={() => read(item)}>标记已读</button>}</div></div>) : <p className="empty-state">没有项目通知。</p>}
+44:   </div>
+45: }
+46: 
+47: export function AppShell({ route, navigate, drawer, setDrawer, compact, openDrawer, events, projectId, profile,
+48:   unread, theme, setTheme, notifications, shared, state, feedback, setFeedback, deviceSession, api, mutate,
+49:   navUrl, children }) {
+50:   return <>
+51:     <header className={`topbar ${route.kind === 'workbench' ? 'workbench-topbar' : ''}`} inert={!!drawer}><button className="icon-button menu-button" aria-label="打开导航" onClick={e => openDrawer('nav', e)}><Icon name="menu"/></button><Link to="/" navigate={navigate} className="brand"><span className="brandmark">R</span><span>ResearchOS</span></Link><span className="top-context">研究工作台</span><span className="top-spacer"/><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/><span className="connection-text">{events.online ? '已连接' : '连接中断'}</span>{projectId && <button className="theme-button" aria-label={`打开通知，${unread} 条未读`} onClick={e => openDrawer('notice', e)}>通知{unread ? ` ${unread}` : ''}</button>}<button className="theme-button" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} aria-label={`切换为${theme === 'light' ? '深色' : '浅色'}主题`}>{theme === 'light' ? '深色' : '浅色'}</button><button className="icon-button progress-button" aria-label="打开阶段进度" onClick={e => openDrawer('rail', e)}><Icon name="cycle"/></button></header>
+52:     {projectId && !events.online && <div className="connection-banner" role="status">连接已断开，状态可能过期。{events.lastSync ? `最后同步 ${events.lastSync.toLocaleString()}` : '尚未同步'}。</div>}
+53:     {deviceSession.device && <div className="connection-banner" role="status">{(api?.deviceRole() || deviceSession.device.role) === 'READER' ? '此设备为只读监督；控制操作需要电脑显式授权。' : '此设备可控制已授权项目；设备和全局设置仍由电脑管理。'}</div>}
+54:     {feedback && <div className={`feedback ${feedback.kind}`} role="status"><span>{feedback.text}</span><button aria-label="关闭提示" onClick={() => setFeedback(null)}><Icon name="close"/></button></div>}
+55:     <div className={`drawer-overlay ${drawer ? 'visible' : ''}`} onClick={() => setDrawer(null)}/>
+56:     <div className={`app-grid ${route.kind === 'workbench' ? 'workbench-route' : ''}`}><nav className={`sidebar ${drawer === 'nav' ? 'drawer-open' : ''}`} aria-label="主导航" inert={(compact || !!drawer) && drawer !== 'nav'}><div className="sidebar-inner"><div className="sidebar-head"><span>项目空间</span><button className="icon-button drawer-close" aria-label="关闭导航" onClick={() => setDrawer(null)}><Icon name="close"/></button></div><Link to="/" navigate={navigate} className="project-switch">{profile?.name || '选择项目'}<small>{projectId ? '切换项目' : '项目入口'}</small></Link><div className="nav-group">{navigation.map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} aria-label={label} className={`nav-link ${route.kind === kind ? 'active' : ''}`}><Icon name={icon}/><span>{label}</span></Link>)}</div><div className="sidebar-bottom"><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/> {events.online ? '已连接' : events.message || '连接中断'}<small>开发阶段 · 以服务回执为准</small></div></div></nav>
+57:       <main id="main" className="main-area" tabIndex="-1" inert={!!drawer}>{children}</main>
+58:       <aside className={`progress-rail ${drawer === 'rail' ? 'drawer-open' : ''}`} aria-label="阶段进度" inert={(compact || !!drawer) && drawer !== 'rail'}><StageRail projection={shared.data.getProgressProjection} state={state} releases={shared.data.listMilestoneRelease} navigate={navigate} projectId={projectId} onClose={() => setDrawer(null)}/></aside></div>
+59:     {drawer === 'notice' && <aside className="notice-drawer" aria-label="通知列表"><NotificationDrawer notifications={notifications} projectId={projectId} navigate={navigate} mutate={mutate} onClose={() => setDrawer(null)}/></aside>}
+60:     {projectId && <nav className="bottom-nav" aria-label="手机主要导航" inert={!!drawer}>{[['home', '工作台', 'workbench'], ['cycle', '周期', 'cycle'], ['release', '成果', 'release'], ['resources', '资源', 'resources']].map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} className={route.kind === kind ? 'active' : ''}><Icon name={icon}/><span>{label}</span></Link>)}</nav>}
+61:   </>
+62: }

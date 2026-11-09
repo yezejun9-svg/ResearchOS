@@ -1,0 +1,64 @@
+# Windows-only nonce profile barrier: bounded source design
+
+Disposition: CONDITIONAL_SOURCE_FEASIBLE, not implemented or qualified. This narrows the previous ID-only blocker without changing Slice A's production UNVERIFIED gate. No Native, CLI, App, echo, model, local probe, setup or execution scope was run or created. Product files and old evidence are unchanged. Investigation used public OpenAI source tagged rust-v0.166.0; this is not a runtime attestation of the installed executable. One direct PowerShell HTTPS source fetch was blocked by the environment socket restriction and abandoned; successful reads used the web tool. No private config/authentication files were read.
+
+## Fresh identity removes the ordinary pre-existing-name collision
+
+For every new Native process, Host can draw 16 bytes from the OS cryptographic RNG and form `researchos-readonly-<32 lowercase hex>`. RNG failure must stop admission. Never accept the name from renderer/task JSON, reuse a past nonce, or fall back to the fixed name. Inference: with m pre-existing names independent of this draw, collision probability is at most m/2^128 per draw. This is not protection against a malicious same-OS-user process observing argv and changing configuration concurrently; that attacker is outside the stated boundary.
+
+The profile catalog is a BTreeMap indexed by the exact string. Resolution uses exact get(), no wildcard matching; inheritance occurs only through an explicit extends string. Missing extends is None. This nonce grammar is compatible with dotted CLI config keys and avoids the reserved ':' prefix. A normal configuration default profile does not become a parent. The explicit selection wins over configured defaults unless requirements force fallback; Host must reject a different/missing effective ID, never accept that fallback.
+
+Sources: [permissions_toml.rs, PermissionsToml::resolve_profile and PermissionProfileToml](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/permissions_toml.rs), [config/permissions.rs, validate_user_permission_profile_names](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/permissions.rs).
+
+## Windows memory condition
+
+The correct public feature override is `features.memories=false`, not `features.memory_tool=false`. Also set `memories.use_memories=false`. Managed feature pins can normalize the feature back to true, so the first flag alone is not an invariant. The second scalar independently makes the memory-root augmentation condition false; the inspected requirement application does not rewrite it. This proves only that augmentation condition is disabled, not that every Native memory/background/context feature is inactive.
+
+Sources: [features/src/lib.rs, MemoryTool key](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/features/src/lib.rs), [config/types.rs, MemoriesToml and conversion](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/types.rs), [managed_features.rs, normalize_candidate](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/managed_features.rs), [config/requirements.rs, apply_to_config](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/requirements.rs).
+
+The preliminary concern about legacy managed layers overriding this scalar is excluded for the normal Windows CLI loader: with no injected managed_config_path, Windows checks the deprecated path only for a warning and returns no legacy file config; MDM loading is macOS-only. System/cloud/user/project config precede SessionFlags. The typed external thread config carries model/provider/features, not permissions or memories.use_memories; the standard app-server initially supplies NoopThreadConfigLoader. This Windows-only inference requires the installed normal CLI route, not arbitrary embedding with LoaderOverrides. Do not generalize it to Unix or custom library hosts.
+
+Sources: [loader/layer_io.rs, load_config_layers_internal](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/loader/layer_io.rs), [config_layer_source.rs, precedence](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/config_layer_source.rs), [thread_config.rs, SessionThreadConfig](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/thread_config.rs), [app-server/lib.rs, ConfigManager construction](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/lib.rs).
+
+## Effective identity and response limits
+
+Named-selection fallback changes the selected ID; constrained-profile fallback clears it. Same-name managed profile definitions conflict rather than overwrite. A managed allowlist is exact-name based; if it disallows the nonce, fail Unavailable. Explicit mxc, root Deny, minimal Read, source Read, workload network=false and approval=never remain required. Full profile construction must omit extends, supply the complete filesystem/network/workspace-roots template, and prohibit renderer config overrides.
+
+Native appends readable helper roots after profile compilation, retaining the ID. Its memory-root addition requires both MemoryTool and use_memories. Therefore the scalar suppression above matters even when exact ID matches. Source: [core/config/mod.rs, resolve_default_permissions, merge_managed_permission_profiles, helper_readable_roots](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/mod.rs).
+
+`thread/start` returns actual thread.config_snapshot() fields. Host can compare active ID/extends, approval policy, cwd, runtime roots and the coarse sandbox/network fields before sending a prompt. At this version, public SandboxPolicy ReadOnly contains only networkAccess; restricted readOnly.access input is explicitly rejected. Core's legacy SandboxPolicy also lacks readableRoots. Thus this response is not an enumeration of the complete read graph; do not invent such a field.
+
+Sources: [thread_processor.rs, thread/start response](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/request_processors/thread_processor.rs), [v2/permissions.rs, SandboxPolicy serialization/deserialization](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server-protocol/src/protocol/v2/permissions.rs), [protocol.rs, SandboxPolicy](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/protocol.rs).
+
+## Narrow Native helper exception
+
+On successful normal Windows arg0 setup, Native creates a fresh child under its own tmp/arg0-windows directory, named with the codex-arg0 prefix. The code creates a lock and apply_patch.bat/applypatch.bat pointing back to the same executable; it prepends that directory and keeps its guard alive. Configuration selects the first exact-parent/prefix matching PATH entry and adds Read to that single directory. This is a Native-generated runtime-helper read exception. It is not a grant for all CODEX_HOME, auth/config files, arbitrary caches, sibling sessions or arbitrary directories sharing the prefix. Nor does the source say the literal ':minimal' token itself expands to that helper: the helper is a separate implementation addition that the bounded platform-minimum contract must explicitly name.
+
+There is a concrete exceptional path: alias creation failure emits a warning and continues; then a matching inherited PATH entry could be selected instead. A path-prefix check alone does not establish current-process helper ownership. The proposed Host driver must reject the exact alias-setup failure diagnostic and any lost/truncated/undecodable startup capture before prompt admission. It must not claim helper provenance if that gate is unknown. No private helper directory inspection is proposed here.
+
+Sources: [arg0/src/lib.rs, prepare_path_env_var_with_aliases/prepare_aliases_in_home](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/arg0/src/lib.rs), [config/permissions.rs, active_arg0_helper_dir](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/permissions.rs).
+
+Implementation option for a reviewable ordering guarantee: attach Native stdout and stderr to the same bounded OS capture pipe, with stdin separate. Preserve every raw byte and parse JSON-RPC plus Native diagnostics from that one stream. The arg0 failure write precedes app-server startup in the source, so a single pipe avoids relying on relative scheduling of two independent readers. This is a proposed Host transport design requiring fake-process ordering/partial-write tests; it has not been implemented or run. Do not modify the original outer Job controller. Unknown protocol messages, capture failure or overflow stop before turn/start.
+
+## Minimal next source contract (proposal, not execution authorization)
+
+- Version a new Windows app-server policy template, retaining the previous sealed profiles as historical records. Template identity contains the literal nonce placeholder; actual launch identity contains real profile name, rendered config SHA256, binary SHA256, source/workspace binding, Native process identity and thread ID. Store in existing run/runtime-binding evidence; no new database or scheduler.
+- Host alone produces the CSPRNG name and immutable complete argv/config. Fixed mxc, exact filesystem/network policy and memory scalars are included in both template and rendered hashes. No caller-supplied permission/config maps and no arbitrary RPC forwarding.
+- Start one bounded Native process via the existing trusted lifecycle/Job boundary. Initialize the experimental API capability needed for activePermissionProfile; absence or schema mismatch fails closed. Start one fresh thread with no user prompt. Reject response mismatch, initialization failure, captured constructor error or missing evidence.
+- Permit exactly one Host-authored turn/start after the barrier. The simplest retention variant supplies no cwd, roots, model, sandbox or permissions reconfiguration. The alternative explicit permissions=the same nonce reloads config and rejects a disallowed-profile fallback warning before accepting input; it is a fresh resolution, not an unchanged snapshot. Select and freeze one variant before coding. Do not combine an old response with arbitrary new settings.
+- Production readiness still requires Host-owned local qualification for the stated filesystem/network properties and this per-start barrier; fixture metadata or nonce equality alone cannot mint READY. Independent review and Root's distinct execution authorization remain separate. No consumed Task or echo scope is reused.
+
+The explicit-permissions rejection precedes start_or_steer_turn in [turn_processor.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/request_processors/turn_processor.rs); session flags are retained on that reload in [config_manager.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/config_manager.rs). No-override turn retention was traced in the prior B report. No simpler public whole-profile-replacement CLI mechanism was established in this focused investigation.
+
+## Meaningful fake/static checks for the next lease
+
+1. CSPRNG failure, malformed/reused nonce, caller-injected name/config: no Native prompt or READY.
+2. Fixed-name lower-layer extra grant fixture survives merge; fresh independent nonce fixture cannot inherit it or a wildcard/implicit parent.
+3. Generated argv/template covers mxc, exact fs/network, correct memory keys; actual hash changes with source binding and nonce while normalized template hash stays stable.
+4. Missing/different active ID, non-null extends, wrong thread/cwd/roots, write-capable coarse sandbox, network true or approval mismatch each leave prompt bytes unsent.
+5. Alias-setup warning split across capture chunks before a valid thread response still blocks; limit, decode and capture errors block; no stderr/stdout reader-order assumption.
+6. Managed allowlist fallback and constrained-profile fallback are rejected; no fixed-name/builtin retry occurs.
+7. Exact fake response permits only the one frozen turn variant; later settings mutation, mismatched Native process or reconnect invalidates the barrier.
+8. Fake success remains test composition metadata; HTTP/renderer receipts cannot qualify production, old failures/history remain intact, and outer Job cleanup accounting is preserved.
+
+Remaining work is concrete implementation/review and bounded qualification of the selected variant and helper gate, not a demand for universal context isolation. Native account/config/cloud/MCP/hooks remain D03 PLATFORM_POLICY; workload network denial is not a claim that the outer Native process never communicates. This document supplies no new executable helper, probe or scope.

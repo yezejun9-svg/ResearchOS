@@ -1,0 +1,57 @@
+--- a/adapters/runtime/codex_driver_windows_test.go
++++ b/adapters/runtime/codex_driver_windows_test.go
+@@ -77,6 +77,43 @@
+ 		}
+ 	}
+ }
++func TestCodexReadinessMutationBeforeResume(t *testing.T) {
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	raw, err := os.ReadFile(exe)
++	if err != nil {
++		t.Fatal(err)
++	}
++	hash := Hash(raw)
++	checks := 0
++	provider := CodexReadinessFunc(func() CodexReadiness {
++		checks++
++		identity := CodexRequestedPolicyIdentity(hash)
++		if checks > 1 {
++			identity.WindowsSandbox = "none"
++		}
++		return CodexReadiness{State: "READY", PolicyIdentity: identity}
++	})
++	driver, err := NewCodexCLIForTrustedGoTest(CodexCLIOptions{Executable: exe, Descriptor: CodexDescriptor{
++		Present: true, ExecutableHash: hash, AuthState: "LOGGED_IN", ConfigurationControlled: true,
++	}}, provider)
++	if err != nil {
++		t.Fatal(err)
++	}
++	d := driver.(*codexCLI)
++	d.fixtureArgs = []string{"-test.run=^TestCodexHarnessOwnedChild$"}
++	d.fixtureEnv = []string{"RESEARCHOS_CODEX_FAKE_CHILD=1"}
++	callback := false
++	_, err = d.Start(context.Background(), CodexLaunch{TaskID: "t", RunID: "r-mutate", Epoch: "1",
++		Workspace: t.TempDir(), Prompt: "COMPLETE", Directory: filepath.Join(t.TempDir(), "dispatch"), Timeout: 5 * time.Second},
++		CodexCallbacks{BeforeResume: func(CodexIdentity) error { callback = true; return nil }, Event: func(CodexEvent) error { callback = true; return nil }})
++	if err == nil || !strings.Contains(err.Error(), "CODEX_POLICY_IDENTITY_MISMATCH") || callback || checks < 2 {
++		t.Fatalf("mutated provider passed suspended-child fence: err=%v callback=%v checks=%d", err, callback, checks)
++	}
++}
++
+ func TestCodexHarnessExecutionSourceContext(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name, workspace, cwd, prompt string
+@@ -175,7 +212,9 @@
+ 	}
+ 	for _, mode := range []string{"COMPLETE", "WAIT", "FENCE", "NO_THREAD", "EMPTY_THREAD", "WHITESPACE_THREAD", "CONTROL_THREAD", "WRONGTYPE_THREAD", "CONFLICTING_THREADS", "DUPLICATE_THREAD", "THREAD_AFTER_MESSAGE"} {
+ 		t.Run(mode, func(t *testing.T) {
+-			driver, err := NewCodexCLI(CodexCLIOptions{Executable: exe, Descriptor: CodexDescriptor{Present: true, ExecutableHash: Hash(raw), AuthState: "LOGGED_IN", ConfigurationControlled: true}})
++			driver, err := NewCodexCLIForTrustedGoTest(CodexCLIOptions{Executable: exe, Descriptor: CodexDescriptor{Present: true, ExecutableHash: Hash(raw), AuthState: "LOGGED_IN", ConfigurationControlled: true}}, CodexReadinessFunc(func() CodexReadiness {
++				return CodexReadiness{State: "READY", PolicyIdentity: CodexRequestedPolicyIdentity(Hash(raw))}
++			}))
+ 			if err != nil {
+ 				t.Fatal(err)
+ 			}

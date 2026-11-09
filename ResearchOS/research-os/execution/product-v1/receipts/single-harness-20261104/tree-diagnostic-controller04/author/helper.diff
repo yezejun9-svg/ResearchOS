@@ -1,0 +1,51 @@
+--- blocked-direct03/helper
++++ owner-fixed04/helper
+@@ -60,13 +60,18 @@
+   if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $number.ToString([Globalization.CultureInfo]::InvariantCulture) }
+   return $number
+ }
+-function Project-TreeDiagnostic($Element,[int]$Index) {
++function Project-TreeDiagnostic($Element,[int]$Index,[int]$OwnerPid) {
++  if ($OwnerPid -le 0) { throw 'EXPECTED_METADATA_OWNER_REQUIRED' }
+   try {
+     $info=$Element.Current
+     if ($null -eq $info) { throw 'ELEMENT_CURRENT_UNAVAILABLE' }
++    $observedPid=$info.ProcessId
++    if ($null -eq $observedPid) { throw 'ELEMENT_OWNER_UNAVAILABLE' }
+   } catch {
+-    return @{ index=$Index; status='ELEMENT_UNAVAILABLE'; reason=(Limit-DiagnosticText $_.Exception.Message) }
+-  }
++    return @{ status='PROVIDER_IDENTITY_UNAVAILABLE'; process_id=$null }
++  }
++  # No other Current getter may run before this same-snapshot owner check.
++  if ($observedPid -ne $OwnerPid) { return @{ status='FOREIGN_PROVIDER_OWNER'; process_id=$observedPid } }
+   $failures=[Collections.Generic.List[object]]::new()
+   $control=Read-DiagnosticField $info 'ControlType' $failures
+   $rectangle=Read-DiagnosticField $info 'BoundingRectangle' $failures
+@@ -84,7 +89,7 @@
+   return @{
+     index=$Index; status='METADATA_ONLY'
+     control_type=(Limit-DiagnosticText $control.ProgrammaticName)
+-    process_id=(Read-DiagnosticField $info 'ProcessId' $failures)
++    process_id=$observedPid
+     native_window_handle=$(if ($null -eq $handle) { $null } else { [string]$handle })
+     class_name=(Limit-DiagnosticText (Read-DiagnosticField $info 'ClassName' $failures))
+     automation_id=(Limit-DiagnosticText (Read-DiagnosticField $info 'AutomationId' $failures))
+@@ -408,7 +413,7 @@
+     }
+     try {
+       $element=[Windows.Automation.AutomationElement]::FromHandle($nativeHwnd)
+-      $current=Project-TreeDiagnostic $element 0
++      $current=Project-TreeDiagnostic $element 0 $coreId
+       $direct.provider_status='FROM_HANDLE_RETURNED'
+       $read=Read-PublicPatterns $element
+       $direct.patterns=$read.support;$direct.public_values=$read.values
+@@ -424,7 +429,7 @@
+           Assert-DirectNativeTree
+           try {
+             $read=Read-PublicPatterns $selected[$i]
+-            $rows.Add(@{index=$i;current=(Project-TreeDiagnostic $selected[$i] $i);patterns=$read.support
++            $rows.Add(@{index=$i;current=(Project-TreeDiagnostic $selected[$i] $i $coreId);patterns=$read.support
+               public_values=$read.values;absolute_candidates=@($read.values|Where-Object {$_.absolute_candidate});can_authorize_selection=$false})
+           } catch { $rows.Add(@{index=$i;status='SELECTED_ELEMENT_UNAVAILABLE';error=(Limit-DiagnosticText $_.Exception.Message)}) }
+         }

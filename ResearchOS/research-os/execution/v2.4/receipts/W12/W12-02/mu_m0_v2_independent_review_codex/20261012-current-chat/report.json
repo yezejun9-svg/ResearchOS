@@ -1,0 +1,163 @@
+{
+  "schema": "researchos.mu-m0-v2-independent-review/1",
+  "at": "2026-10-12T14:42:03.829Z",
+  "verdict": "REQUEST_CHANGES",
+  "scope": "SOURCE_BOUND_UNCOMMITTED_NONINSTALLED_CANDIDATE_ONLY",
+  "reviewer": "/root/mu_m0_v2_independent_review",
+  "requested_model": "gpt-6-astra",
+  "requested_reasoning": "high",
+  "base": "7ec619a16a932ae02daa7c2e6132d266528a1da8",
+  "installed_pin_unchanged": "8dfebe36508ac0c2508735bb866756dab9283e74",
+  "candidate_source": "C:/Users/yqyyds/.codex/researchos-build-worktrees/mu-pause-checkpoint-m0-v2-20261012",
+  "patch_sha256": "71cfeda5c1e6c9f5217e32cf2d7cc1f25bcce9a8d2a6d7b6a75e1dda77883347",
+  "candidate9_unchanged": true,
+  "modified_paths": 4,
+  "source_scope_paths": 9,
+  "compiled_inputs": 2125,
+  "all_compile_inputs_unchanged": true,
+  "actual_candidate_agent_binding": true,
+  "findings": [
+    {
+      "id": "M0-V2-R1",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Already-paused custom message corrupts unfinished tool batch",
+      "path": "packages/coding-agent/src/core/agent-session.ts",
+      "line": 2043,
+      "related_lines": [
+        2049,
+        2054
+      ],
+      "case": "N5",
+      "actual": "After pause: pendingCustom=0; transcript system/custom/assistant/toolResult/custom. Resume: Resumable tool batch has unexpected trailing message; effects=[one], provider fixture calls=1.",
+      "expected": "Keep the new custom message deferred until the entire batch is complete; remaining effect two must execute exactly once.",
+      "why": "isStreaming is false after cooperative pause, so triggerTurn:false falls through to _appendCustomMessage even though the assistant tool batch is incomplete.",
+      "suggestion": "Treat paused unfinished turns as deferred message ingestion boundaries. Snapshot raw new messages and flush only after full batch settlement. Add both same-instance and checkpoint-restored arrival coverage.",
+      "original_finding": "M0-R2 remains open beyond its original reproducer"
+    },
+    {
+      "id": "M0-V2-R2",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Pause during prepareNextTurn repeats preparation on restore",
+      "path": "packages/agent/src/agent-loop.ts",
+      "line": 313,
+      "related_paths": [
+        "packages/agent/src/agent-loop.ts:332",
+        "packages/agent/src/agent.ts:781",
+        "packages/agent/src/agent.ts:406"
+      ],
+      "case": "N1",
+      "actual": "Pause requested while awaited prepareNextTurn is gated. It finishes once; next steering poll throws pause. Snapshot retains afterTurn. Restore/resume invokes preparation again: prepares=2, model fixture calls=2.",
+      "expected": "The successfully completed next-turn preparation must commit once; restore resumes the prepared request.",
+      "why": "Continuation only distinguishes tools and afterTurn. The returned preparation state is local and no prepared-next-request phase is committed before the later pause fence.",
+      "suggestion": "Persist a completed preparation phase and its context/model/thinking/message outputs, with queue consumption position. Resume it without reexecuting compaction or extension preparation.",
+      "original_finding": "M0-R4 original skip fixed, exactly-once boundary remains open"
+    },
+    {
+      "id": "M0-V2-R3",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Pause during ordinary assistant response loses finishTurn and continuation decision",
+      "path": "packages/agent/src/agent-loop.ts",
+      "line": 415,
+      "related_paths": [
+        "packages/agent/src/agent.ts:879",
+        "packages/agent/src/agent.ts:452"
+      ],
+      "case": "N2",
+      "actual": "Pause while first fixture response is in flight, then settle ordinary assistant with no tools. Resume finishes immediately: finishTurn=0, model fixture calls=1. Default control requires finishTurn=2 and calls=2.",
+      "expected": "Run the pending finishTurn once and honor its continue/end decision before declaring the resumed run settled.",
+      "why": "The new pre-finish fence interrupts after message_end; a non-tool assistant clears continuation, and resumePaused returns for trailing assistant without queued messages.",
+      "suggestion": "Record a pending-finish phase for every assistant response, including no-tool responses, before honoring pause. Persist and resume its finish decision exactly once.",
+      "original_finding": "New V2 regression caused by the pre-finish pause fence"
+    }
+  ],
+  "original_closures": [
+    {
+      "id": "M0-R1",
+      "status": "ORIGINAL_REPRO_CLOSED",
+      "evidence": "baseline-21: async transform pauses before provider dispatch"
+    },
+    {
+      "id": "M0-R2",
+      "status": "PARTIAL_STILL_OPEN",
+      "evidence": "original finally-flush repro passes; already-paused ingestion N5 fails"
+    },
+    {
+      "id": "M0-R3",
+      "status": "ORIGINAL_REPRO_CLOSED",
+      "evidence": "whole-batch mixed termination and all-terminate controls pass; new pending-finish regression separately tracked"
+    },
+    {
+      "id": "M0-R4",
+      "status": "PARTIAL_STILL_OPEN",
+      "evidence": "restored tool batch preparation runs once in original scenario; pause inside preparation N1 repeats it"
+    },
+    {
+      "id": "M0-R5",
+      "status": "CLOSED_IN_SCOPE",
+      "evidence": "both empty queue watermark boundaries and atomic failed restore N3 pass"
+    }
+  ],
+  "verification": {
+    "author_and_prior_independent": {
+      "total": 21,
+      "pass": 21,
+      "fail": 0,
+      "exit": 0,
+      "evidence": "baseline-21.stdout.txt"
+    },
+    "new_independent_negative_and_controls": {
+      "total": 5,
+      "pass": 2,
+      "fail": 3,
+      "exit": 1,
+      "evidence": "negative-extra.stdout.txt"
+    },
+    "default_agent": {
+      "total": 40,
+      "pass": 40,
+      "exit": 0,
+      "evidence": "original-agent-40.stdout.txt"
+    },
+    "worker_protocol": {
+      "total": 2,
+      "pass": 2,
+      "exit": 0,
+      "evidence": "worker-2.stdout.txt"
+    },
+    "targeted_types": {
+      "exit": 0,
+      "evidence": "targeted-tsgo.command.json"
+    },
+    "biome": "Author-only, not rerun"
+  },
+  "boundaries": {
+    "actual_model_calls": 0,
+    "actual_provider_calls": 0,
+    "external_tool_calls": 0,
+    "network_calls": 0,
+    "product_data_writes": 0,
+    "source_writes": 0,
+    "root_writes": 0,
+    "installed_sdk_writes": 0,
+    "formal_increment": 0,
+    "formal_accepted": "0/42",
+    "parent_acceptance": false,
+    "all_22_current_obligations": "OPEN",
+    "candidate_committed": false,
+    "candidate_installed": false,
+    "windows_desktop_or_phone_acceptance": false,
+    "D_writes": 0
+  },
+  "evidence_notes": [
+    "All execution test commands capture argv/cwd/exit/stdout/stderr in C only; failures preserved without changed assertions.",
+    "Fresh six esbuild bundles with explicit pi-agent-core alias to C Source and every compilation input hash/realpath; no old installed agent core substitution.",
+    "Source source hash and every compiled input rechecked after tests.",
+    "Initial read-only discovery used missing D:/作品集/ResearchOS/AGENTS.md; actual research-os/AGENTS.md read successfully. Shell error retained in session tool output; no mutation.",
+    "Baseline fixture bodies compared against original independent review after allowing import path and ts-expect-error changes.",
+    "General read-only inspection tool outputs remain in session transcript; durable command receipts cover compilation and qualification runs.",
+    "No C evidence mirrored to D due resource constraint."
+  ]
+}

@@ -1,0 +1,19 @@
+# Cleanup context independent Source review
+Verdict: SOURCE_ACCEPTED_PENDING_RESOURCE_PREREQUISITE_AND_ROOT_ACTUAL.
+Scope: the single candidate native_migration_authority_harness_windows_test.go, bbccac67b4143632160defb5ecf2c1697a062e448e793d8fbfed8070d3b68f73 / 38972 bytes. Reviewer codex:/root/attach_fixture_source_review is not author. No source change was made.
+
+The candidate fixes the specific reused-expired-context defect: its cleanup callback creates the review context only when cleanup starts, derives it from context.Background(), explicitly ignores the main context parameter, and defers its cancellation. Main expiry/cancel does not propagate into that context; cleanup cancellation does not cancel main. WithTimeout bounds this local context to four minutes. The helper creates no new native/SQL activity and does not extend main or grant lifetimes.
+
+The existing fixture is prepared before cleanup registration. The cleanup still writes the same retained-ready evidence then calls the unchanged nativeHarnessWait with the same 06-release-fixture.approval.json path and release-fixture action. nativeHarnessWait continues to reject malformed/wrong-action approval and to call t.Fatal when its context expires. No approval is invented and timeout is not accepted as independent inspection or successful release. Existing TempDir cleanup behavior is unchanged.
+
+Independent preservation evidence: all 13 manifest members match the supplied HDF/MF. The candidate inverse reconstructs the whole original 35845-byte Source exactly. All 18 original named functions retain their original text, except the one explicitly reviewed cleanup block inside the main harness. All 90 original assertion calls remain byte-exact and in order; the full nine-case map, original imports, main20-minute context, grant4-minute TTL and all unrelated bytes are unchanged. Two named declarations are appended: the context helper and one Test with four children.
+
+The added children cover an already expired main deadline, main cancel independence, cleanup cancel/Done behavior, and a freshly bounded deadline between before+4min and after+4min. They cancel all allocated contexts, have no long sleep, no native child, SQL or filesystem fixture calls, and do not fabricate integration success. Source semantics and imports were reviewed manually; the supplemental lexical scanner is explicitly not a Go AST parser/compiler. No Go test or build has run in this review.
+
+## Mandatory runtime prerequisite
+The existing inner native controller e6a4d23ff0a84a6d9c2905181d97c2e4/root_native_migration_controller.py, a1f53e223f47c5d8ecdb7edc5f94fec0bcc36beae9774d16ad9d0002b6ef638a, still passes 1260 seconds to run_owned_observed (line 372) and has a 1270-second serve loop deadline (line 388); Go test timeout is 25 minutes. Root confirmed that the outer S10 wrapper's 1800 seconds does not change these inner limits.
+
+Therefore this candidate provides an independent four-minute context upper bound, but the current integrated controller can terminate it around one minute after main20 expires. Full four-minute retained inspection time is NOT currently qualified. Before relying on that interval, Root requires a separate immutable controller Source revision and non-author review with the selected 1560/1570-second inner owned/loop limits, below outer30, while retaining main20/grant4/Go25. This review does not change or approve that future revision. T11 currently being run is attach actual (CP363), not a native controller case using this cleanup change.
+
+82 Source/pin checks passed; 17 source inputs are unchanged after review. No review mechanical errors. Author failure899 remains original evidence and is not recounted; next900 was the received counter. No Git/Go/native/SQL/model execution, Main/canonical edits, private-resource reads or formal acceptance.
+

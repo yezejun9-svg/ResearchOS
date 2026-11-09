@@ -1,0 +1,96 @@
+adapters/runtime\bridge_windows.go:808:func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+adapters/runtime\bridge_windows.go-809-	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\bridge_windows.go-810-	if e != nil {
+adapters/runtime\bridge_windows.go-811-		return BridgeJournal{}, errors.New("worker still owns dispatch")
+adapters/runtime\bridge_windows.go-812-	}
+adapters/runtime\bridge_windows.go-813-	defer lock.Close()
+adapters/runtime\bridge_windows.go-814-	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+adapters/runtime\bridge_windows.go-815-	if e != nil {
+adapters/runtime\bridge_windows.go-816-		return BridgeJournal{}, e
+adapters/runtime\bridge_windows.go-817-	}
+adapters/runtime\bridge_windows.go-818-	var j BridgeJournal
+adapters/runtime\bridge_windows.go-819-	if e = json.Unmarshal(raw, &j); e != nil {
+adapters/runtime\bridge_windows.go-820-		return j, e
+adapters/runtime\bridge_windows.go-821-	}
+adapters/runtime\bridge_windows.go-822-	digest, e := canonicalHash(j.Manifest)
+adapters/runtime\bridge_windows.go-823-	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+adapters/runtime\bridge_windows.go-824-		return j, errors.New("recovery manifest mismatch")
+adapters/runtime\bridge_windows.go-825-	}
+adapters/runtime\bridge_windows.go-826-	if j.Identity.PID != 0 {
+adapters/runtime\bridge_windows.go-827-		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+adapters/runtime\bridge_windows.go-828-		if e != nil || alive {
+adapters/runtime\bridge_windows.go-829-			return j, errors.New("old process identity not confirmed stopped")
+adapters/runtime\bridge_windows.go-830-		}
+adapters/runtime\bridge_windows.go-831-	}
+adapters/runtime\bridge_windows.go-832-	if j.Ended == "" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete {
+adapters/runtime\bridge_windows.go-833-		return j, errors.New("dispatch outcome UNKNOWN")
+adapters/runtime\bridge_windows.go-834-	}
+adapters/runtime\bridge_windows.go-835-	if j.State == "SETTLED" && (!j.ProtocolComplete || j.Acknowledged != j.Frames || j.Receipt.ExitCode != 0 || !j.Receipt.OutputCopied || j.Cancelled) {
+adapters/runtime\bridge_windows.go-836-		return j, errors.New("terminal protocol is not settled")
+adapters/runtime\bridge_windows.go-837-	}
+adapters/runtime\bridge_windows.go-838-	for file, digest := range map[string]string{"stdout.raw": j.StdoutHash, "stderr.raw": j.StderrHash} {
+adapters/runtime\bridge_windows.go-839-		f, e := os.Open(filepath.Join(directory, file))
+adapters/runtime\bridge_windows.go-840-		if e != nil {
+adapters/runtime\bridge_windows.go-841-			return j, e
+adapters/runtime\bridge_windows.go-842-		}
+adapters/runtime\bridge_windows.go-843-		raw, e := io.ReadAll(io.LimitReader(f, sandbox.MaxStreamBytes+1))
+adapters/runtime\bridge_windows.go-844-		f.Close()
+adapters/runtime\bridge_windows.go-845-		if e != nil || len(raw) > sandbox.MaxStreamBytes || Hash(raw) != digest {
+adapters/runtime\bridge_windows.go-846-			return j, errors.New("recovery stream mismatch")
+adapters/runtime\bridge_windows.go-847-		}
+adapters/runtime\bridge_windows.go-848-	}
+adapters/runtime\bridge_windows.go-849-	if j.Checkpoint != nil {
+adapters/runtime\bridge_windows.go-850-		checkpoint, e := readPauseFile(filepath.Join(directory, "checkpoint.sealed.json"))
+adapters/runtime\bridge_windows.go-851-		if e != nil || int64(len(checkpoint)) != j.Checkpoint.Bytes || Hash(checkpoint) != j.Checkpoint.ContentHash {
+adapters/runtime\bridge_windows.go-852-			return j, errors.New("recovery checkpoint bytes changed")
+adapters/runtime\bridge_windows.go-853-		}
+adapters/runtime\bridge_windows.go-854-	}
+adapters/runtime\bridge_windows.go-855-	if j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
+adapters/runtime\bridge_windows.go-856-		return j, errors.New("recovery checkpoint seal missing")
+adapters/runtime\bridge_windows.go-857-	}
+adapters/runtime\bridge_windows.go-858-	manifest, e := bridgeMap(j.Manifest)
+adapters/runtime\bridge_windows.go-859-	if e != nil {
+adapters/runtime\bridge_windows.go-860-		return j, e
+adapters/runtime\bridge_windows.go-861-	}
+adapters/runtime\bridge_windows.go-862-	admission, _ := manifest["admission"].(map[string]any)
+adapters/runtime\bridge_windows.go-863-	profile, _ := admission["profile"].(map[string]any)
+adapters/runtime\bridge_windows.go-864-	expected, _ := profile["outputs"].([]any)
+adapters/runtime\bridge_windows.go-865-	if j.State == "SETTLED" && len(expected) != len(j.Artifacts) {
+adapters/runtime\bridge_windows.go-866-		return j, errors.New("recovery output manifest incomplete")
+adapters/runtime\bridge_windows.go-867-	}
+adapters/runtime\bridge_windows.go-868-	var total int64
+adapters/runtime\bridge_windows.go-869-	for i, a := range j.Artifacts {
+adapters/runtime\bridge_windows.go-870-		if i >= len(expected) || expected[i] != a.Path || !filepath.IsLocal(a.Path) {
+adapters/runtime\bridge_windows.go-871-			return j, errors.New("recovery output manifest changed")
+adapters/runtime\bridge_windows.go-872-		}
+adapters/runtime\bridge_windows.go-873-		path := filepath.Join(directory, "output", a.Path)
+adapters/runtime\bridge_windows.go-874-		actual, e := filepath.EvalSymlinks(path)
+adapters/runtime\bridge_windows.go-875-		if e != nil || !strings.EqualFold(path, actual) {
+adapters/runtime\bridge_windows.go-876-			return j, errors.New("recovery output reparse rejected")
+adapters/runtime\bridge_windows.go-877-		}
+adapters/runtime\bridge_windows.go-878-		info, e := os.Stat(path)
+adapters/runtime\bridge_windows.go-879-		if e != nil || !info.Mode().IsRegular() || info.Size() != a.Size || a.Size < 0 || a.Size > 64*1024*1024 {
+adapters/runtime\bridge_windows.go-880-			return j, errors.New("recovery output size changed")
+adapters/runtime\bridge_windows.go-881-		}
+adapters/runtime\bridge_windows.go-882-		total += a.Size
+adapters/runtime\bridge_windows.go-883-		if total > 64*1024*1024 {
+adapters/runtime\bridge_windows.go-884-			return j, errors.New("recovery outputs exceed total bound")
+adapters/runtime\bridge_windows.go-885-		}
+adapters/runtime\bridge_windows.go-886-		raw, e := os.ReadFile(path)
+adapters/runtime\bridge_windows.go-887-		if e != nil || Hash(raw) != a.Hash {
+adapters/runtime\bridge_windows.go-888-			return j, errors.New("recovery output bytes changed")
+adapters/runtime\bridge_windows.go-889-		}
+adapters/runtime\bridge_windows.go-890-	}
+adapters/runtime\bridge_windows.go-891-	return j, nil
+adapters/runtime\bridge_windows.go-892-}
+adapters/runtime\bridge_windows.go-893-
+adapters/runtime\bridge_windows.go-894-// ReconcileBridge stops only the exact recorded process after the worker lock
+adapters/runtime\bridge_windows.go-895-// is released. Missing end/drain records remain UNKNOWN even after termination.
+adapters/runtime\bridge_windows.go-896-func ReconcileBridge(directory, manifestHash string) (BridgeJournal, error) {
+adapters/runtime\bridge_windows.go-897-	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+adapters/runtime\bridge_windows.go-898-	if e != nil {
+adapters/runtime\bridge_windows.go-899-		return BridgeJournal{}, errors.New("worker still owns dispatch")
+adapters/runtime\bridge_windows.go-900-	}
+adapters/runtime\bridge_windows.go-901-	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+adapters/runtime\bridge_windows.go-902-	if e != nil {
+adapters/runtime\bridge_windows.go-903-		lock.Close()

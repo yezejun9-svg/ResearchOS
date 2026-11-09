@@ -1,0 +1,45 @@
+//go:build windows
+
+package runtime
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"golang.org/x/sys/windows"
+)
+
+func TestQualificationRejectionReceiptPrivateCreateNew(t *testing.T) {
+	private := t.TempDir()
+	if _, err := PrivateDirectory(private); err != nil {
+		t.Fatal(err)
+	}
+	first := []byte(`{"schema":"first-gate","outcome":"NO_EFFECT"}`)
+	if err := PersistQualificationRejection(private, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistQualificationRejection(private, []byte(`{"replaced":true}`)); err == nil {
+		t.Fatal("immutable receipt overwritten")
+	}
+	got, err := os.ReadFile(filepath.Join(private, qualificationRejectionFile))
+	if err != nil || string(got) != string(first) {
+		t.Fatalf("create-new receipt changed: %v", err)
+	}
+	permissive := t.TempDir()
+	if err := PersistQualificationRejection(permissive, first); err == nil {
+		t.Fatal("permissive DACL accepted")
+	}
+	if _, err := os.Stat(filepath.Join(permissive, qualificationRejectionFile)); !os.IsNotExist(err) {
+		t.Fatal("rejected DACL wrote receipt")
+	}
+	if err := PersistQualificationRejection(private, nil); err == nil {
+		t.Fatal("empty receipt accepted")
+	}
+	if err := PersistQualificationRejection(private, make([]byte, 64*1024+1)); err == nil {
+		t.Fatal("oversized receipt accepted")
+	}

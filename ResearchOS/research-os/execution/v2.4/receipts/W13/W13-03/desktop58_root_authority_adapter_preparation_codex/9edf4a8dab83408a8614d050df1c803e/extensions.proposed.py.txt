@@ -1,0 +1,212 @@
+def exact_tuple(value, name):
+    require(type(value) is list and len(value) == 3 and
+            all(type(x) is int and x >= 0 for x in value), name)
+    return value
+
+
+def absolute_ref(reader, item):
+    reader.verify(item, external=Path(item['path']).is_absolute() and not Path(item['path']).is_relative_to(ROOT))
+    p = Path(item['path'])
+    if not p.is_absolute():
+        p = ROOT / p
+    return {'path': str(p), 'sha256': item['sha256'], 'bytes': item['bytes']}
+
+
+def same_ref(reader, a, b):
+    require(absolute_ref(reader, a) == absolute_ref(reader, b), 'Exact ref identity differs')
+
+
+def sealed_manifest(reader, item, field, excluded_key=None):
+    doc = reader.doc(item)
+    rows = doc[field]
+    require(type(rows) is list and rows, 'Empty evidence manifest')
+    if excluded_key:
+        require(doc[excluded_key] is True and type(doc['count']) is int and doc['count'] == len(rows), 'Manifest count/self exclusion')
+    base = bounded_path(item['path']).parent
+    members = {}
+    for row in rows:
+        p = bounded_path(row['path'])
+        require(p.is_relative_to(base) and p != bounded_path(item['path']) and str(p) not in members, 'Foreign/duplicate/self manifest member')
+        reader.verify(row)
+        members[str(p)] = row
+    return members
+
+
+def member(reader, members, item):
+    key = str(bounded_path(item['path']))
+    require(key in members, 'Required fact is not sealed')
+    same_ref(reader, members[key], item)
+    return reader.doc(item)
+
+
+def binding(scope):
+    # Full scope binding; the independent review path is predetermined, not its future digest.
+    return scope
+
+
+def validate_cli2(reader, scope):
+    qref = scope['current58_CLI2_qualification_ref']
+    rref = scope['current58_CLI2_review_ref']
+    proof = sealed_manifest(reader, scope['current58_CLI2_manifest_ref'], 'entries', 'self_excluded')
+    q = member(reader, proof, qref)
+    review = member(reader, proof, rref)
+    # These are the actual r331 wire schemas; their names do not grant old43 compatibility.
+    require(q['schema'] == 'researchos.cli43-bounded-execution-qualification.v1' and
+            review['schema'] == 'researchos.cli43-bounded-execution-independent-review.v1', 'Unknown CLI qualification wire schema: explicit adaptation required')
+    require(q['source_commit'] == review['source_commit'] == SOURCE and
+            q['reviewer'] == review['reviewer'] == 'codex:/root/w05_merge_review' and
+            review['decision'] == 'CURRENT43_FRESH_HELD2_BOUNDED_QUALIFICATION_EVIDENCE_CLOSED' and
+            review['requested_changes'] == [] and review['non_author'] is True and
+            review['actual_readonly_evidence_audit'] is True, 'Same-head nonauthor CLI2 closure required')
+    same_ref(reader, review['qualification_ref'], qref)
+    require(q['current43_fresh_held2_qualified'] is True and review['current43_fresh_held2_qualified'] is True and
+            q['qualified_case_count'] == 2 and q['qualified_case_ids'] == review['case_ids'] == CASES and
+            q['native_calls'] == q['native_calls_exit0'] == 14 and q['test_leaf_PASS'] == 2 and
+            q['test_leaf_FAIL'] == q['test_leaf_SKIP'] == 0 and q['CLI_exit_codes'] == [0, 3] and
+            q['cases_NOT_RUN'] == [] and q['SDK_MODEL_Node_external_paid_private_calls'] == 0 and
+            q['underlying_product_failure_count_this_cohort'] == 0, 'Incomplete fresh CLI2 result')
+    for d in [q, review]:
+        require(d['source_acceptance'] is False and d['formal_increment'] == 0 and
+                d['desktop15_execution_authorized'] is False, 'CLI result cannot grant Desktop execution')
+    require(q['whole43_test_suite_qualified'] is False and q['Main_integration_authorized'] is False, 'No whole-suite/integration inheritance')
+    evidence = q['evidence_refs']
+    for key in ['scope_ref', 'grant_ref', 'result_ref', 'executor_manifest_ref', 'launcher_completed_ref',
+                'launcher_manifest_ref', 'root_completion_ref', 'root_closed_manifest_ref', 'audit_ref', 'supplement_ref', 'final_corrections_ref']:
+        same_ref(reader, evidence[key], review[key])
+    cli_scope = reader.doc(evidence['scope_ref'])
+    require(cli_scope['source_commit'] == SOURCE and cli_scope['ordered_cases'] == CASES and
+            cli_scope['run_uuid'] == q['run_uuid'], 'CLI result belongs to another source/scope/run')
+    same_ref(reader, cli_scope['catalog_ref'], scope['source_catalog_ref'])
+    cli_grant = reader.doc(evidence['grant_ref'])
+    same_ref(reader, cli_grant['scope_ref'], evidence['scope_ref'])
+    require(cli_grant['actual_registration_completed'] is True and cli_grant['binding']['source_commit'] == SOURCE and
+            cli_grant['binding']['run_uuid'] == q['run_uuid'] and
+            cli_grant['status'] == 'ROOT_REGISTERED_EXECUTION_AUTHORIZED', 'CLI original grant mismatch')
+    qualified_at = exact_tuple(q['current_canonical_tuple'], 'CLI qualifier tuple')
+    require(all(qualified_at[i] <= scope['expected_registration'][i] for i in range(3)), 'CLI qualification is from a future tuple')
+    ex = sealed_manifest(reader, evidence['executor_manifest_ref'], 'files', 'excluded_only_self')
+    la = sealed_manifest(reader, evidence['launcher_manifest_ref'], 'files', 'excluded_only_self')
+    rt = sealed_manifest(reader, evidence['root_closed_manifest_ref'], 'members')
+    member(reader, rt, evidence['root_completion_ref'])
+    result = member(reader, ex, evidence['result_ref'])
+    completed = member(reader, la, evidence['launcher_completed_ref'])
+    require(completed['program_reported_exit'] == completed['actual_inner_native_exit'] == 0 and
+            completed['first_cause'] is None and completed['secondary'] == [], 'CLI launcher not closed')
+    require(result['status'] == 'BOUNDED_DEVELOPMENT_EVIDENCE_REPORTED' and result['first_cause'] is None and
+            result['secondary'] == [] and result['NOT_RUN'] == [] and result['native_calls'] == 14 and
+            len(result['stages']) == 14 and len(result['case_roster']) == len(result['cases']) == 2,
+            'CLI actual result incomplete')
+    for stage in result['stages']:
+        member(reader, ex, stage['result_ref'])
+    require([x['case_id'] for x in q['case_facts']] == CASES, 'CLI fact order')
+    for i, case in enumerate(CASES):
+        fact, state, case_result = q['case_facts'][i], result['case_roster'][i], result['cases'][i]
+        require(fact['state'] == state['state'] == 'QUALIFIED' and fact['native_test_exit'] == 0 and
+                fact['CLI_exit'] == [0,3][i] and state['leaf'] == case_result['leaf'] == case and
+                state['launch_attempted'] is True and state['resumed'] is True and state['actual_native_exit'] == 0 and
+                state['test_leaf_started'] is True and state['fixture_observation'] == 'OBSERVED' and
+                state['qualified'] is True and state['failure'] is None and case_result['status'] == 'PASS', 'CLI leaf not truly qualified')
+        for key in ['invocation_ref','verified_ref','stdout_ref','stderr_ref']:
+            require(str(bounded_path(fact[key]['path'])) in ex, 'CLI leaf unsealed raw fact')
+            same_ref(reader, ex[str(bounded_path(fact[key]['path']))], fact[key])
+        reader.verify(case_result['proof_ref'])
+    return {'qualification_ref':qref, 'review_ref':rref, 'manifest_ref':scope['current58_CLI2_manifest_ref']}
+
+
+def validate_resources(reader, scope):
+    catalog = reader.doc(scope['source_catalog_ref'])
+    require(catalog['commit'] == SOURCE and catalog['file_count'] == 639 and
+            len(catalog['files']) == 639 and catalog['all_platform_Go_count'] == 559, 'Actual current639 catalogue absent')
+    names = set()
+    for row in catalog['files']:
+        require(row['path'] not in names and row['kind'] == 'blob' and row['mode'] in ['100644','100755'], 'Catalogue member shape')
+        names.add(row['path'])
+        reader.verify({k:row[k] for k in ['path','sha256','bytes']})
+    resource = reader.doc(scope['resource_catalog_ref'])
+    require(resource['complete_public_roots_frozen'] is True, 'Public compiler/runtime closure is not frozen')
+    # New resource producer contract: explicit provenance refs, never cardinality-only acceptance.
+    same_ref(reader, resource['runtime_resources_ref'], scope['runtime_resources_ref'])
+    same_ref(reader, resource['compiler_resources_ref'], scope['compiler_resources_ref'])
+    files = resource['files']
+    require(type(files) is list and files, 'Missing resource members')
+    seen = {}
+    for row in files:
+        p = Path(row['path'])
+        require(p.is_absolute() and str(p.resolve()) == str(p) and str(p) not in seen, 'Resource alias/duplicate')
+        reader.verify(row, external=True)
+        seen[str(p)] = row
+    for refkey in ['runtime_resources_ref','compiler_resources_ref']:
+        source = reader.doc(scope[refkey])
+        require(type(source['files']) is list and source['files'], 'Missing explicit compiler/runtime input list')
+        for row in source['files']:
+            require(row['path'] in seen and row == seen[row['path']], 'Resource union omits pinned input')
+    require(type(resource['images']) is list and 0 < len(resource['images']) <= 60, 'Static executable image allocation')
+    for image in resource['images']:
+        require(image['path'] in seen and image == seen[image['path']], 'Executable outside frozen public files')
+    for key in ['python','go','node','electron','git']:
+        tool = resource['tools'][key]
+        require(tool['path'] in seen and tool == seen[tool['path']] and tool in resource['images'], 'Tool outside fixed compiler/image closure')
+    require(str(Path(sys.executable).resolve()) == resource['tools']['python']['path'], 'Actual Python differs')
+    for key in ['GOMODCACHE','web_modules']:
+        p = Path(resource[key])
+        require(p.is_absolute() and str(p.resolve()) == str(p) and p.is_dir(), 'Missing physical public resource root')
+    return resource
+
+
+def load_scope(reader, scope_path, scope_sha256):
+    require(sys.flags.isolated and sys.flags.no_site, 'Python must use -I -S')
+    sr = reader.ref(scope_path)
+    require(sr['sha256'] == scope_sha256, 'Scope SHA')
+    scope = reader.doc(sr)
+    require(scope['schema'] == 'researchos.desktop58-169-go3-preparation-scope.v1' and scope['owner'] == 'codex:/root' and
+            scope['source_commit'] == SOURCE and scope['source_parent'] == PARENT and
+            scope['preparation_only'] is False and scope['execution_authorized'] is True, 'Unbound/preparation scope cannot execute')
+    expected = exact_tuple(scope['expected_registration'], 'Root actual registration tuple')
+    before = exact_tuple(scope['expected_before_registration'], 'Root original registration tuple')
+    require(expected[0] == before[0]+1 and expected[1] == before[1]+1 and expected[2] >= before[2], 'Actual registration transition')
+    require(type(scope['registration_namespace']) is str and scope['registration_namespace'].startswith(
+        'execution/v2.4/receipts/W05/W05-99/integration_codex/'), 'Actual Root registration namespace')
+    require(scope['registration_metadata_paths'] in [CANONICAL[:2], CANONICAL], 'Unknown actual intent layout')
+    require(scope['python_flags'] == ['-I','-S','-X','utf8'] and scope['first_unexpected_stop'] is True and
+            scope['automatic_retry'] is False and scope['counter_reset'] is False and
+            scope['source_acceptance'] is False and scope['formal_increment'] == 0, 'Policy escalation')
+    for key, value in [('node_cases',169),('Go_top_cases',3),('native_top_command_cap',176),('loopback_HTTP_max',390),
+                       ('offscreen_Electron_controls',2),('installed_visible_GUI_calls',0),('SDK_model_external_paid_calls',0),
+                       ('process_cap',2048),('active_job_processes',16),('image_cap',64),('cleanup_seconds',5)]:
+        require(type(scope[key]) is int and scope[key] == value, 'Finite original limit changed: '+key)
+    for key in ['inner_seconds','outer_seconds','builder_seconds','controller_evidence_reserve_seconds','launcher_evidence_reserve_seconds']:
+        require(type(scope[key]) is int and scope[key] > 0, 'Root allocation not supplied: '+key)
+    require(scope['inner_seconds'] > 30+scope['controller_evidence_reserve_seconds'] and
+            scope['builder_seconds'] <= scope['inner_seconds']-30-scope['controller_evidence_reserve_seconds'] and
+            scope['outer_seconds'] > scope['inner_seconds']+30+scope['launcher_evidence_reserve_seconds'], 'IO/finalization reserve missing')
+    uid = scope['run_uuid']
+    require(type(uid) is str and len(uid) == 32 and all(c in '0123456789abcdef' for c in uid), 'Root run UUID required')
+    roots = [bounded_path(scope[k],False) for k in ['output_root','outer_output_root','export_root','new_authorization_root']]
+    require(len(set(roots)) == 4 and all(uid in p.name for p in roots) and
+            all(not a.is_relative_to(b) for a in roots for b in roots if a != b), 'Fresh disjoint exact roots')
+    require(roots[2].is_relative_to(ROOT/'.local') and all(roots[i].is_relative_to(ROOT/'execution/v2.4/receipts/W13/W13-03') for i in [0,1,3]), 'Wrong output root class')
+    # Launcher creates outer root before the inner validates the SAME grant. This gate is pure/read-only.
+    require(not roots[0].exists() and not roots[2].exists(), 'Inner output/export must be new')
+    require(scope['main_git']['head'] == SOURCE, 'Current58 Main HEAD required')
+    bounded_path(scope['controller_review_path'], False)
+    for key in CODE_KEYS:
+        r = scope[key]
+        require(Path(r['path']).is_absolute() and str(Path(r['path']).resolve()) == r['path'], 'Controller consumes absolute canonical refs')
+        reader.verify(r)
+    require(bounded_path(scope['authorization_verifier_ref']['path']) == Path(__file__).resolve(), 'Actual gate path')
+    for key, original in FIXED_CODE.items():
+        same_ref(reader, scope[key], original)
+    roster = reader.doc(scope['roster_ref'])
+    require(len(roster['leaves']) == 162 and len(roster['regressions']) == 7 and len(roster['go_units']) == 3, 'Exact original lanes')
+    alias = reader.doc(scope['alias_roster_ref'])
+    require(len(alias['rows']) == 20 and alias['executable_aliases'] == 15 and alias['prebuild_clones'] is False, 'Finite future aliases')
+    declaration = scope['negative_alias_declarations']
+    require(type(declaration) is list and len(declaration) == 20, 'Root must predeclare all exact alias paths')
+    for row, actual in zip(alias['rows'],declaration):
+        root = roots[2]/'.local/desktop-wire-negative'/(uid+'-'+str(row['allocation_ordinal']).zfill(2))
+        want = {'case_name':row['name'],'allocation_ordinal':row['allocation_ordinal'],'path':str(root/'resources/client-wire/researchos-client-wire-validator.exe'),
+                'max_creates':row['expected_image_creates'],'mode':row['mode']}
+        require(actual == want and not root.exists(), 'Alias path/case/allocation changed or preexisting')
+    require(type(scope['public_environment']) is dict and set(scope['public_environment']) <= {'SystemRoot','WINDIR','ComSpec','PATH','PATHEXT'}, 'Public environment only')
+    validate_resources(reader, scope)
+    return scope, sr

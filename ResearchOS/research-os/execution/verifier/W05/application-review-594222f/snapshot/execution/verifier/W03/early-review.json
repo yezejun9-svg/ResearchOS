@@ -1,0 +1,83 @@
+{
+  "task_id": "W03",
+  "verifier_identity": "codex:/root/route_verifier",
+  "status": "EARLY_REVIEW_FINDINGS_NOT_ACCEPTANCE",
+  "scope": "READ_ONLY_W03_DEVELOPMENT_SNAPSHOT_SYNTHETIC_HTTP_AND_DATABASE_CHECKS",
+  "reviewed_workspace": "D:/作品集/ResearchOS/research-os/.local/worktrees/domain-foundation",
+  "snapshot": {
+    "git_revision": "NOT_CAPTURED_FOR_IN_PROGRESS_FILES",
+    "source_hashes_observed_immediately_before_overlay_probe": {
+      "internal/domain/contracts.go": "b5812874f818a436f71b5a94db33ea8091e403c5bbddec7c55ba4bda09a176a9",
+      "internal/domain/http.go": "c9bff69f0a998f159a667bac47f6431b0caeb20f9bf235eb5fc2dc02a523d512",
+      "internal/domain/operations.go": "474f18c07b14d74f791f6f9970b28c207efb295074c2131f86261059882a65ef"
+    },
+    "concurrency_caveat": "Executor was editing this worktree. Hashes were read immediately before the probe, not atomically captured with compilation. Findings describe the executed early snapshot; they do not assert later commits remain defective."
+  },
+  "actual_execution": {
+    "command": [
+      "D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe",
+      "test",
+      "-overlay",
+      "<temporary overlay.json>",
+      "-run",
+      "TestVerifierReview",
+      "-count=1",
+      "-v",
+      "./internal/domain"
+    ],
+    "environment_overrides": {
+      "GOTOOLCHAIN": "local",
+      "GOENV": "off"
+    },
+    "overlay_target": "internal/domain/verifier_review_test.go",
+    "execution_time_evidence": "Synthetic event output created_at=2026-09-29T18:56:13.7331173Z",
+    "go_test_exit_code": 1,
+    "go_test_summary": "FAIL researchos.local/research-os/internal/domain 0.588s",
+    "fixture": "Existing setup() creates isolated temporary SQLite, migrates schema, provisions fixture Owner and issues synthetic credential; no live provider or stored secrets.",
+    "temporary_files": "Overlay backing test file and overlay.json created with Python TemporaryDirectory and removed when invocation returned; source files untouched."
+  },
+  "findings": [
+    {
+      "id": "W03-EARLY-01",
+      "title": "Integer overflow accepted as zero during artifact sealing",
+      "test": "TestVerifierReviewIntegerOverflow",
+      "result": "REPRODUCED",
+      "input": "Provision fixture EXECUTOR with project grant; upload empty bytes; POST /artifacts with matching empty content hash/storage_key, byte_size=json.Number(\"1e21\"), run_id=null, kind=REPORT, evidence_kind=GENERATED, measurement_mode=FIXTURE, access_class=PROJECT, current If-Match and fresh idempotency key.",
+      "observed": "HTTP 201; returned Artifact.byte_size=1e21 despite content length zero.",
+      "raw_test_output": "accepted empty bytes with byte_size=1e21: status=201 byte_size=1e+21",
+      "cause": "Num discards json.Number.Int64 conversion error and returns zero; seal compares that zero to len(empty content). Schema permits integer byte_size without an upper bound.",
+      "expected": "Reject invalid/out-of-range integer conversion or compare requested byte size exactly with actual length; do not persist incorrect metadata.",
+      "follow_up": "Owner reported repair underway; not independently retested in this record."
+    },
+    {
+      "id": "W03-EARLY-02",
+      "title": "Cursor reused with different event query",
+      "test": "TestVerifierReviewCursorQuery",
+      "result": "REPRODUCED_BEFORE_REPORTED_CURSOR_REVISION",
+      "input": "Create project and accepted requirement; GET /events?limit=1&after_sequence=0, then reuse next_cursor with /events?after_sequence=100&limit=1&cursor=<cursor>.",
+      "observed": "HTTP 200 returned an EventEnvelope with sequence=2 and snapshot_event_sequence=3.",
+      "raw_test_output": "changed query accepted: status=200; items[0].sequence=2; snapshot_event_sequence=3",
+      "cause": "Reviewed cursor branch bound principal/project/operation/grant_hash but ignored changed after_sequence.",
+      "expected": "Reject cursor whose bound query differs from the request.",
+      "follow_up": "Parent reports later integrated commit 6b9e6dc has operationKey including limit/after_sequence. This record does not invalidate that revision; compare its source/hash and rerun changed-query counterexample during final review."
+    },
+    {
+      "id": "W03-EARLY-03",
+      "title": "Slow request body holds the sole database connection",
+      "test": "TestVerifierReviewBodyHoldsDatabase",
+      "result": "REPRODUCED",
+      "input": "Authenticated GET /state uses synthetic ReadCloser that signals Read entry then blocks until released. While its body read is blocked, run another authenticated GET /state with a 150ms context deadline; release first body after second returns.",
+      "observed": "Second request returned HTTP 500 INTERNAL_ERROR while waiting for the sole SQLite connection.",
+      "raw_test_output": "request body blocked unrelated database read: status=500 body.code=INTERNAL_ERROR; body.retryable=false",
+      "cause": "handle begins transaction before reading request body; store permits one open connection. Runtime server had ReadHeaderTimeout but no body deadline in the reviewed snapshot.",
+      "expected": "Perform bounded body reading outside the database transaction and use finite request body read limits/deadlines.",
+      "follow_up": "Owner reported repair underway; not independently retested in this record."
+    }
+  ],
+  "product_acceptance": "NOT_RUN",
+  "acceptance_decision": "NONE",
+  "next_action": "Review final submitted W03 snapshot and independently verify fixes before any construction acceptance.",
+  "side_effects": [
+    "Temporary synthetic SQLite databases and overlay files only; automatically cleaned. No source edits, live provider calls, private secret reads, or UI dialogs."
+  ]
+}

@@ -1,0 +1,39 @@
+--- original/seal_readonly.py
++++ candidate/seal_readonly.py
+@@ -6,7 +6,7 @@
+ import argparse, json, re
+ from pathlib import Path
+ sys.path.insert(0,str(Path(__file__).resolve().parent))
+-from controller_common import file_ref,verify,raw_json,no_alias,write_json,Stop,require_job,CANDIDATE,BASE,check_closed_evidence
++from controller_common import file_ref,verify,raw_json,no_alias,write_json,Stop,require_job,CANDIDATE,BASE,check_closed_evidence,validate_grant
+ from controller import test_facts
+ 
+ def main():
+@@ -20,9 +20,15 @@
+  if result['source']!=CANDIDATE or result['base']!=BASE or result.get('first_error') or result.get('finalization_error'):raise Stop('Incomplete/faulted controller result')
+  rows=result['results']
+  if len(rows)!=49 or [x['id'] for x in rows]!=[x['id'] for x in spec['roster']]:raise Stop('Roster omissions/order mismatch')
++ started=raw_json((root/'started.json').read_bytes())
++ grant,signed_spec,expected_root=validate_grant(started['grant_ref']['path'],started['grant_ref']['sha256'])
++ if expected_root!=root or grant['spec_ref']!=spec_ref or signed_spec!=spec:raise Stop('Seal authority/spec/run substitution')
+  holds=[];scenario_pass=0;actual_leaf=0
+  for row,planned in zip(rows,spec['roster']):
+-  if row['state']=='NOT_RUN_RESOURCE_HOLD':holds.append(row);continue
++  if row['state']=='NOT_RUN_RESOURCE_HOLD':
++   required=planned['requires_resource']
++   if not required or not any(grant['resources'][k] is False for k in required) or row['requirements']!=required or row['actual_native_exit'] is not None:raise Stop('Unjustified resource HOLD')
++   holds.append(row);continue
+   if row['state']!='PASS_OBSERVED_PENDING_REVIEW' or row['actual_native_exit']!=0:raise Stop('Unqualified result row')
+   verify(row['invocation_ref']);verify(row['stdout_ref']);verify(row['stderr_ref'])
+   facts=test_facts(Path(row['stdout_ref']['path']).read_bytes(),row['selector'],planned['expected_records'])
+@@ -35,8 +41,8 @@
+  for p in sorted((root/'native').glob('*/invocation.json')):
+   entry=raw_json(p.read_bytes());verify(entry['stdout_ref']);verify(entry['stderr_ref'])
+   native=entry['actual_native_exit']
+-  if native==0:require_job(entry['owned_result'],True)
+-  elif 'junction-resource' not in p.parent.name:raise Stop('Unexpected failed native invocation')
++  require_job(entry['owned_result'],True)
++  if type(native) is not int or native!=0 or native!=entry['owned_result']['actual_exit']:raise Stop('Native exit fact mismatch')
+  for row in raw_json((root/'inputs.final.json').read_bytes()):verify(row['ref'])
+  # A new direct child only; never mutate raw inputs or old seal.
+  seal=root/'sealed-readonly';seal.mkdir(exist_ok=False)

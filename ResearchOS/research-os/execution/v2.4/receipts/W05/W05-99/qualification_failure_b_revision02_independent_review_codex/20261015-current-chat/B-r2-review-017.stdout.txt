@@ -1,0 +1,1069 @@
+FILE D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_broker_windows.go
+105: 		}
+106: 		if provider.Capability == "MODEL" {
+107: 			if profile["backend"] != runtimeMuBackend || Hash(provider.ModelConfig) != Hash(profile["model_config"]) || provider.Endpoint != Str(provider.ModelConfig, "endpoint") || provider.ID != Str(provider.ModelConfig, "route") {
+108: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "model route differs from frozen profile")
+109: 			}
+110: 			if !c.liveModelCredentialBound(provider, profile) {
+111: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model credential differs from bound endpoint")
+112: 			}
+113: 		}
+114: 		if provider.Capability == "TOOL" {
+115: 			if profile["backend"] != runtimeMuBackend || provider.ID != Str(profile["model_config"].(map[string]any), "route") || c.config.RunTool == nil || provider.Endpoint != "" || provider.BearerToken != "" || provider.CredentialRef != "" {
+116: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool requires the frozen host-only route")
+117: 			}
+118: 			amount, err := moneyAmount(provider.UpperBound)
+119: 			if err != nil || amount.Sign() != 0 {
+120: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool route requires an explicit zero monetary bound")
+121: 			}
+122: 			return provider, nil
+123: 		}
+124: 		if provider.Capability == "SOURCE" {
+125: 			if provider.SourceID == "" || provider.SourceToken == "" {
+126: 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "host source identity required")
+127: 			}
+128: 			return provider, nil
+129: 		}
+130: 		if provider.Capability == "EXPERIMENT" {
+131: 			return provider, nil
+132: 		}
+133: 		if !providerEndpointAllowed(provider) {
+134: 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider endpoint requires bound TLS or permitted local loopback")
+135: 		}
+136: 		return provider, nil
+137: 	}
+138: 	return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "effect route not permitted for this purpose")
+139: }
+140: 
+141: func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoordinatorRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame) (Object, error) {
+142: 	payload, e := Decode(frame.Payload)
+143: 	if e != nil {
+144: 		return nil, Fail(400, "INVALID_REQUEST", "effect JSON object required")
+145: 	}
+146: 	tx, run, dispatch, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+147: 	if e != nil {
+148: 		return nil, e
+149: 	}
+150: 	rejection, e := c.qualificationFirstGateRejectionTx(tx, route, run, dispatch, bridge, frame, payload)
+151: 	if e != nil {
+152: 		tx.Rollback()
+153: 		return nil, e
+154: 	}
+155: 	if rejection != nil {
+156: 		tx.Rollback()
+157: 		return nil, rejection
+158: 	}
+159: 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
+160: 	if e != nil {
+161: 		tx.Rollback()
+162: 		return nil, e
+163: 	}
+164: 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+165: 	if e != nil {
+166: 		tx.Rollback()
+167: 		return nil, e
+168: 	}
+169: 	goal, e := load(tx, route.ProjectID, "Goal", Str(task, "goal_id"))
+170: 	if e != nil {
+171: 		tx.Rollback()
+172: 		return nil, e
+173: 	}
+174: 	if provider.Capability == "SOURCE" {
+175: 		var work *researchWork
+176: 		if work, _, _, e = c.researchSourceGate(tx, route.ProjectID, task, provider, payload); e != nil {
+177: 			tx.Rollback()
+178: 			return nil, e
+179: 		}
+180: 		if work.SourceReceipt != nil && (work.SourceReceipt["effect_key"] != frame.Key || work.SourceReceipt["run_id"] != runID || Hash(work.SourceReceipt["epoch"]) != Hash(epoch)) {
+181: 			tx.Rollback()
+182: 			return nil, Fail(409, "STATE_CONFLICT", "one source page permits only its original effect replay")
+183: 		}
+184: 	}
+185: 	request := Object{"route": provider.ID, "capability": provider.Capability, "credential_revision": provider.CredentialRevision, "payload": payload}
+186: 	if provider.Capability == "TOOL" {
+187: 		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {
+188: 			tx.Rollback()
+189: 			return nil, e
+190: 		}
+191: 	}
+192: 	if provider.Capability == "MODEL" {
+193: 		e = validateModelEffectBeforePrepare(tx, route.ProjectID, runID, task, dispatch["manifest"].(map[string]any), frame.Key, payload)
+194: 		if e != nil {
+195: 			tx.Rollback()
+196: 			return nil, e
+197: 		}
+198: 	}
+FILE D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_broker_windows.go
+275: 	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
+276: 	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))
+277: 	if e != nil {
+278: 		return nil, e
+279: 	}
+280: 	req.Header.Set("Content-Type", "application/json")
+281: 	req.Header.Set("Idempotency-Key", frame.Key)
+282: 	if provider.BearerToken != "" {
+283: 		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+284: 	}
+285: 	// No shared proxy credentials, redirects or automatic semantic retry.
+286: 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("provider redirect denied") }}
+287: 	defer client.CloseIdleConnections()
+288: 	response, e := client.Do(req)
+289: 	if e == nil {
+290: 		c.boundary("provider_responded", intent)
+291: 	}
+292: 	unknown := func(reason string) (Object, error) {
+293: 		c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason})
+294: 		return nil, Fail(409, "STATE_CONFLICT", "provider outcome UNKNOWN; query provider before recovery")
+295: 	}
+296: 	if e != nil {
+297: 		return unknown("provider transport ended without receipt")
+298: 	}
+299: 	raw, e := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
+300: 	response.Body.Close()
+301: 	if e != nil || len(raw) > 64*1024 || response.StatusCode < 200 || response.StatusCode >= 300 {
+302: 		return unknown("provider returned no bounded successful receipt")
+303: 	}
+304: 	for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+305: 		if secret != "" && bytes.Contains(raw, []byte(secret)) {
+306: 			return unknown("provider response contained a host credential")
+307: 		}
+308: 	}
+309: 	receipt, e := Decode(raw)
+310: 	if e != nil || receipt["key"] != frame.Key || Hash(receipt["epoch"]) != Hash(epoch) || receipt["run_id"] != runID || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+311: 		return unknown("provider receipt binding invalid")
+312: 	}
+313: 	actual, ok := receipt["actual_cost"].(map[string]any)
+314: 	if !ok || c.service.Contracts.Validate("Money", actual) != nil {
+315: 		return unknown("provider actual cost missing")
+316: 	}
+317: 	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+318: 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+319: 		return unknown("provider receipt persistence failed")
+320: 	}
+321: 	c.boundary("effect_receipt_durable", intent)
+322: 	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+323: 		return nil, e
+324: 	}
+325: 	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
+326: }
+327: 
+328: // This is the last MODEL authority gate before prepareEffectTx writes the
+329: // first durable effect. Keeping all three checks together lets a fixture prove
+330: // that a rejected projection cannot create a reservation or provider request.
+331: func validateModelEffectBeforePrepare(tx *sql.Tx, project, runID string, task Object, manifest map[string]any, effectKey string, payload Object) error {
+332: 	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+333: 	if err != nil {
+334: 		return err
+335: 	}
+336: 	if _, err = validateRuntimeModelRequest(effective, payload); err != nil {
+337: 		return err
+338: 	}
+339: 	return runtimeModelCallGate(tx, project, runID, effectKey, effective)
+340: }
+341: 
+342: const runtimeFactMaxBytes = 4*1024*1024 + 128*1024
+343: 
+344: func writeRuntimeFact(path string, raw []byte) error {
+345: 	if len(raw) == 0 || len(raw) > runtimeFactMaxBytes {
+346: 		return errors.New("encoded host fact exceeds persistence bound")
+347: 	}
+348: 	temp := path + ".pending"
+349: 	f, e := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+350: 	if e != nil {
+351: 		return e
+352: 	}
+353: 	_, e = f.Write(raw)
+354: 	e = errors.Join(e, f.Sync(), f.Close())
+355: 	if e != nil {
+356: 		return e
+357: 	}
+358: 	if _, e = os.Stat(path); e == nil {
+359: 		old, e := os.ReadFile(path)
+360: 		if e == nil && bytes.Equal(old, raw) {
+361: 			os.Remove(temp)
+362: 			return nil
+363: 		}
+364: 		return errors.New("immutable host fact already exists")
+365: 	}
+366: 	return os.Rename(temp, path)
+367: }
+368: 
+369: // A late receipt settles the original reservation and recorded epoch, without
+370: // acquiring execution authority or extending any lease.
+FILE D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_coordinator_windows.go
+600: 	defer cancel()
+601: 	brokerContext, cancelBroker := context.WithCancel(child)
+602: 	defer cancelBroker()
+603: 	go func() {
+604: 		select {
+605: 		case <-bridge.Done():
+606: 			cancelBroker()
+607: 		case <-child.Done():
+608: 		}
+609: 	}()
+610: 	heartbeatDone := make(chan struct{})
+611: 	heartbeatError := make(chan error, 1)
+612: 	// A committed Owner cancel must stop transport and tools promptly; waiting
+613: 	// for the 15-second heartbeat would allow an already cancelled check to run.
+614: 	go func() {
+615: 		tick := time.NewTicker(200 * time.Millisecond)
+616: 		defer tick.Stop()
+617: 		for {
+618: 			select {
+619: 			case <-child.Done():
+620: 				return
+621: 			case <-bridge.Done():
+622: 				return
+623: 			case <-tick.C:
+624: 				var status string
+625: 				var currentEpoch int64
+626: 				err := c.service.DB.QueryRowContext(child, "SELECT json_extract(body,'$.status'),json_extract(body,'$.lease_epoch') FROM domain_objects WHERE project=? AND kind='Run' AND id=?", route.ProjectID, runID).Scan(&status, &currentEpoch)
+627: 				if err != nil || status == "CANCEL_REQUESTED" || currentEpoch != epoch {
+628: 					cancelBroker()
+629: 					if !bridge.Read().QueueRequired || err != nil || currentEpoch != epoch {
+630: 						bridge.Cancel("canonical run cancellation or epoch ended")
+631: 					}
+632: 					return
+633: 				}
+634: 			}
+635: 		}
+636: 	}()
+637: 	var mutation sync.Mutex
+638: 	go func() {
+639: 		defer close(heartbeatDone)
+640: 		tick := time.NewTicker(15 * time.Second)
+641: 		defer tick.Stop()
+642: 		for {
+643: 			mutation.Lock()
+644: 			e := c.heartbeat(child, route, runID, lease, epoch, locator, "")
+645: 			mutation.Unlock()
+646: 			if e != nil {
+647: 				heartbeatError <- e
+648: 				cancel()
+649: 				bridge.Cancel("control lease or authority unavailable")
+650: 				return
+651: 			}
+652: 			if e := bridge.Renew(epoch, 90*time.Second); e != nil {
+653: 				heartbeatError <- e
+654: 				cancel()
+655: 				bridge.Cancel("worker lease expired")
+656: 				return
+657: 			}
+658: 			select {
+659: 			case <-child.Done():
+660: 				return
+661: 			case <-tick.C:
+662: 			}
+663: 		}
+664: 	}()
+665: 	drain, protocolError := c.runCommandBridge(child, brokerContext, cancelBroker, route, runID, lease, epoch, locator, bridge, &mutation)
+666: 	if protocolError != nil {
+667: 		bridge.Cancel("protocol reconciliation failed")
+668: 	}
+669: 	<-bridge.Done()
+670: 	var qualificationRejection *qualificationPreEffectRejection
+671: 	if errors.As(protocolError, &qualificationRejection) {
+672: 		cancelBroker()
+673: 		cancel()
+674: 		<-heartbeatDone
+675: 		select {
+676: 		case heartbeatFailure := <-heartbeatError:
+677: 			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "heartbeat changed before qualification closure")
+678: 			return errors.Join(protocolError, heartbeatFailure)
+679: 		default:
+680: 		}
+681: 		if e := c.closeOnlineQualificationFailure(context.Background(), route, runID, epoch, locator, bridge, qualificationRejection, drain); e != nil {
+682: 			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "qualification failure proof incomplete")
+683: 			return errors.Join(protocolError, e)
+684: 		}
+685: 		return protocolError
+686: 	}
+687: 	if protocolError != nil {
+688: 		cancel()
+689: 		<-heartbeatDone
+690: 		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "protocol not reconciled")
+691: 		return protocolError
+692: 	}
+693: 	tx, e = c.service.DB.BeginTx(ctx, nil)
+694: 	if e == nil {
+695: 		e = effectsReconciled(tx, route.ProjectID, runID)
+696: 		tx.Rollback()
+697: 	}
+698: 	if e != nil {
+699: 		cancel()
+700: 		<-heartbeatDone
+701: 		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "effect reconciliation incomplete")
+702: 		return e
+703: 	}
+704: 	j, e := bridge.Finalize(true)
+705: 	if e != nil {
+706: 		cancel()
+707: 		<-heartbeatDone
+708: 		return e
+709: 	}
+710: 	c.boundary("terminal_durable", run)
+711: 	if e = c.ingestObservation(ctx, route.ProjectID, runID, epoch, j); e != nil {
+712: 		cancel()
+713: 		<-heartbeatDone
+714: 		return e
+715: 	}
+716: 	if j.State == "CANCELLED" {
+717: 		cancel()
+718: 		<-heartbeatDone
+719: 		return c.recoverTerminal(ctx, route.ProjectID, runID, epoch, directory, j)
+FILE D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_command_queue_windows.go
+424: 
+425: // Effects may block on a model/tool. Only this flow owns ACK order; a bounded
+426: // result pump lets the same coordinator receive SDK receipts and send controls.
+427: func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, cancelBroker context.CancelFunc, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) (qualificationBrokerDrain, error) {
+428: 	type completion struct {
+429: 		seq      int64
+430: 		response any
+431: 		err      error
+432: 	}
+433: 	results := make(chan completion, 32)
+434: 	ready := map[int64]completion{}
+435: 	registry := newQualificationBrokerRegistry()
+436: 	inflight := 0
+437: 	next := int64(1)
+438: 	frames := bridge.Frames()
+439: 	tick := time.NewTicker(40 * time.Millisecond)
+440: 	defer tick.Stop()
+441: 	var initialized time.Time
+442: 	var cancelSent time.Time
+443: 	var deferredError error
+444: 	var firstError error
+445: 	var closing bool
+446: 	ctxDone := ctx.Done()
+447: 	var fence *time.Timer
+448: 	var fenceExpired <-chan time.Time
+449: 	defer func() {
+450: 		if fence != nil {
+451: 			fence.Stop()
+452: 		}
+453: 	}()
+454: 	closeAdmission := func(cause error, rejectedSeq int64) {
+455: 		if firstError == nil {
+456: 			firstError = cause
+457: 		}
+458: 		if closing {
+459: 			if rejectedSeq > 0 {
+460: 				registry.disqualify()
+461: 			}
+462: 			return
+463: 		}
+464: 		closing = true
+465: 		registry.close(rejectedSeq)
+466: 		cancelBroker()
+467: 		if rejectedSeq > 0 {
+468: 			bridge.Cancel("qualification first dispatch gate denied TOOL")
+469: 		} else {
+470: 			bridge.Cancel("protocol reconciliation failed")
+471: 		}
+472: 		fence = time.NewTimer(15 * time.Second)
+473: 		fenceExpired = fence.C
+474: 	}
+475: 	for frames != nil || inflight > 0 {
+476: 		select {
+477: 		case observation := <-bridge.ModelObservations():
+478: 			if closing {
+479: 				registry.disqualify()
+480: 				continue
+481: 			}
+482: 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+483: 			if err != nil {
+484: 				closeAdmission(err, 0)
+485: 				continue
+486: 			}
+487: 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+488: 				closeAdmission(err, 0)
+489: 				continue
+490: 			}
+491: 		case frame, ok := <-frames:
+492: 			if !ok {
+493: 				frames = nil
+494: 				continue
+495: 			}
+496: 			if closing {
+497: 				registry.disqualify()
+498: 				continue
+499: 			}
+500: 			if frame.Type == "effect.request" {
+501: 				if inflight >= 16 {
+502: 					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
+503: 					continue
+504: 				}
+505: 				if !registry.admit(frame) {
+506: 					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
+507: 					continue
+508: 				}
+509: 				inflight++
+510: 				go func(f rt.BridgeFrame) {
+511: 					r, e := c.brokerEffect(brokerCtx, route, run, lease, epoch, bridge, f)
+512: 					results <- completion{f.Sequence, r, e}
+513: 				}(frame)
+514: 			} else {
+515: 				var response any
+516: 				var err error
+517: 				if strings.HasPrefix(frame.Type, "command.") {
+518: 					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+519: 					if err == nil && frame.Type == "command.accepted" {
+520: 						payload, e := Decode(frame.Payload)
+521: 						if e != nil {
+522: 							closeAdmission(e, 0)
+523: 							continue
+524: 						}
+525: 						if payload["initialized"] == true {
+526: 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+527: 						}
+528: 					}
+529: 				}
+530: 				if frame.Type == "checkpoint" {
+531: 					mutation.Lock()
+532: 					response, err = c.checkpoint(ctx, route, run, lease, epoch, locator, bridge, frame)
+533: 					mutation.Unlock()
+534: 				}
+535: 				if err != nil {
+536: 					closeAdmission(err, 0)
+537: 					continue
+538: 				}
+539: 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+540: 			}
+541: 		case done := <-results:
+542: 			if closing {
+543: 				registry.disqualify()
+544: 			}
+545: 			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
+546: 				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
+547: 				continue
+548: 			}
+549: 			inflight--
+550: 			if done.err != nil {
+551: 				var rejection *qualificationPreEffectRejection
+552: 				if errors.As(done.err, &rejection) {
+553: 					closeAdmission(done.err, done.seq)
+554: 					continue
+555: 				}
+556: 				if closing {
+557: 					registry.disqualify()
+558: 					continue
+559: 				}
+560: 				var fenced int
+561: 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
+562: 					closeAdmission(done.err, 0)
+563: 					continue
+564: 				}
+565: 				deferredError = done.err
+566: 			}
+567: 			if !closing {
+568: 				ready[done.seq] = done
+569: 			}
+570: 		case <-tick.C:
+571: 			if closing {
+572: 				continue
+573: 			}
+574: 			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+575: 				closeAdmission(err, 0)
+576: 				continue
+577: 			}
+578: 		case <-ctxDone:
+579: 			closeAdmission(ctx.Err(), 0)
+580: 			ctxDone = nil
+581: 		case <-fenceExpired:
+582: 			registry.disqualify()
+583: 			return registry.snapshot(), errors.Join(firstError, Fail(409, "GATE_FAILED", "broker drain timed out"))
+584: 		}
+585: 		if closing {
+586: 			continue
+587: 		}
+588: 		for {
+589: 			done, ok := ready[next]
+590: 			if !ok {
+591: 				break
+592: 			}
+593: 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
+594: 				closeAdmission(err, 0)
+595: 				break
+596: 			}
+597: 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
+598: 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
+599: 					closeAdmission(err, 0)
+600: 					break
+601: 				}
+602: 			}
+603: 			delete(ready, next)
+604: 			next++
+605: 		}
+606: 	}
+607: 	if closing {
+608: 		return registry.snapshot(), firstError
+609: 	}
+610: 	if len(ready) != 0 {
+611: 		return registry.snapshot(), Fail(409, "GATE_FAILED", "protocol receipt gap")
+612: 	}
+613: 	return registry.snapshot(), deferredError
+614: }
+FILE D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/adapters/runtime/bridge_windows.go
+520: 	close(finished)
+521: 	w.mu.Lock()
+522: 	defer w.mu.Unlock()
+523: 	w.journal.Receipt = receipt
+524: 	w.journal.Ended = now()
+525: 	err = errors.Join(err, w.stdout.Close(), w.stderr.Close())
+526: 	w.journal.StdoutHash = Hash(receipt.Stdout)
+527: 	w.journal.StderrHash = Hash(receipt.Stderr)
+528: 	if len(w.pending) != 0 {
+529: 		err = errors.Join(err, errors.New("unterminated protocol frame"))
+530: 	}
+531: 	if err != nil || !receipt.Stopped || !receipt.StreamsDrained || !receipt.OutputCopied || !receipt.CleanupComplete {
+532: 		w.journal.State = "UNKNOWN"
+533: 	} else if receipt.ExitCode != 0 || receipt.TimedOut || w.journal.Cancelled || !w.journal.ProtocolComplete || !w.journal.ContextReady {
+534: 		w.journal.State = "FAILED"
+535: 	} else if w.journal.Paused {
+536: 		w.journal.State = "PAUSED"
+537: 	} else {
+538: 		w.journal.State = "EXITED"
+539: 	}
+540: 	if !w.journal.Cancelled {
+541: 		for _, stream := range w.modelStreams {
+542: 			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+543: 				err = errors.Join(err, errors.New("MODEL stream closure not reconciled"))
+544: 				w.journal.State = "UNKNOWN"
+545: 			}
+546: 		}
+547: 	}
+548: 	if w.journal.State == "EXITED" {
+549: 		outputs, _ := profile["outputs"].([]any)
+550: 		var total int64
+551: 		for _, v := range outputs {
+552: 			relative, ok := v.(string)
+553: 			if !ok || !filepath.IsLocal(relative) {
+554: 				err = errors.New("invalid output path")
+555: 				break
+556: 			}
+557: 			path := filepath.Join(w.directory, "output", relative)
+558: 			actual, e := filepath.EvalSymlinks(path)
+559: 			if e != nil || !strings.EqualFold(actual, path) {
+560: 				err = errors.New("output reparse rejected")
+561: 				break
+562: 			}
+563: 			info, e := os.Stat(path)
+564: 			if e != nil || !info.Mode().IsRegular() || info.Size() > 64*1024*1024 {
+565: 				err = errors.New("output missing or exceeds bound")
+566: 				break
+567: 			}
+568: 			total += info.Size()
+569: 			if total > 64*1024*1024 {
+570: 				err = errors.New("output total exceeds bound")
+571: 				break
+572: 			}
+573: 			raw, e := os.ReadFile(path)
+574: 			if e != nil {
+575: 				err = e
+576: 				break
+577: 			}
+578: 			w.journal.Artifacts = append(w.journal.Artifacts, Artifact{Path: relative, Hash: Hash(raw), Size: int64(len(raw))})
+579: 		}
+580: 		if err != nil {
+581: 			w.journal.State = "FAILED"
+582: 		}
+583: 	}
+584: 	if err != nil {
+585: 		if w.journal.Reason == "" {
+586: 			w.journal.Reason = err.Error()
+587: 		}
+588: 	}
+589: 	w.err = errors.Join(err, w.persist())
+590: }
+591: 
+592: func (w *Bridge) Frames() <-chan BridgeFrame { return w.frames }
+593: func (w *Bridge) Done() <-chan struct{}      { return w.done }
+594: func (w *Bridge) Directory() string          { return w.directory }
+595: func (w *Bridge) Read() BridgeJournal {
+596: 	w.mu.Lock()
+597: 	defer w.mu.Unlock()
+598: 	b, _ := json.Marshal(w.journal)
+599: 	var journal BridgeJournal
+600: 	json.Unmarshal(b, &journal)
+601: 	return journal
+602: }
+603: func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
+604: 	w.mu.Lock()
+605: 	defer w.mu.Unlock()
+606: 	manifest, e := bridgeMap(w.journal.Manifest)
+607: 	if e != nil || epoch != bridgeNumber(manifest, "epoch") || lease <= 0 || lease > LeaseDuration || w.journal.Cancelled || time.Now().After(w.deadline) || time.Now().UTC().After(w.wallDeadline) {
+608: 		return errors.New("expired, cancelled or stale worker lease")
+609: 	}
+610: 	w.deadline = time.Now().Add(lease)
+611: 	w.wallDeadline = time.Now().UTC().Add(lease)
+612: 	return nil
+613: }
+614: func (w *Bridge) Cancel(reason string) {
+615: 	w.mu.Lock()
+616: 	if !w.journal.Cancelled {
+617: 		w.journal.Reason = reason
+618: 	}
+619: 	w.journal.Cancelled = true
+620: 	w.persist()
+621: 	w.mu.Unlock()
+622: 	w.mu.Lock()
+623: 	w.modelNotifyLocked()
+624: 	w.mu.Unlock()
+625: 	w.cancel()
+626: 	if w.process != nil {
+627: 		w.process.Cancel()
+628: 	}
+629: }
+630: func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any) error {
+631: 	w.mu.Lock()
+632: 	if sequence != w.journal.Acknowledged+1 || sequence > w.journal.Frames {
+633: 		w.mu.Unlock()
+634: 		return errors.New("protocol acknowledgement out of order")
+635: 	}
+636: 	if sequence == w.journal.CheckpointSequence {
+637: 		raw, e := json.Marshal(response)
+638: 		if e != nil {
+639: 			w.mu.Unlock()
+640: 			return e
+AUTHOR diagnostic-ledger.json
+{
+  "schema": "researchos.qualification-failure-B-r2-diagnostic-ledger.v1",
+  "meaning": "Append-only captured attempts; nonzero exits are retained and not reset by later passes.",
+  "native_nonzero_count": 16,
+  "native_nonzero": [
+    {
+      "tag": "r2-009-windows-api-read",
+      "argv": [
+        "pwsh",
+        "-NoProfile",
+        "-Command",
+        "$r='D:/作品集/ResearchOS/research-os'; rg -n 'golang.org/x/sys' (Join-Path $r 'go.mod'); rg -n 'func GetSecurityInfo|func GetAce|type ACCESS_ALLOWED_ACE|type ACL struct|func.*AceCount|func.*Owner|func.*DACL|FILE_FLAG_OPEN_REPARSE_POINT|FILE_SHARE_DELETE|FILE_ID_INFO|GetFileInformationByHandle' (Join-Path $r '.local/tools/gopath/pkg/mod/golang.org/x/sys@v*/windows') | Select-Object -First 120"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 1,
+      "stdout_sha256": "bfeb568987e86142b9a33dff7878379579019e92b583d35a6a0b5dd5204a374f",
+      "stderr_sha256": "08ec99c1f595c650b2363ee74949e4340dd5f02dfed86bf1922c13cb1ade3e12",
+      "stdout_raw": "r2-009-windows-api-read.stdout.raw",
+      "stderr_raw": "r2-009-windows-api-read.stderr.raw",
+      "result": "r2-009-windows-api-read.result.json"
+    },
+    {
+      "tag": "r2-023-service-config",
+      "argv": [
+        "rg",
+        "-n",
+        "type Service struct|type RuntimeCoordinatorConfig struct|DataRoot|validatedQualificationFailureTx\\(",
+        "internal/domain/service.go",
+        "internal/domain/runtime_coordinator_windows.go",
+        "internal/domain/runtime_qualification_failure_windows.go",
+        "internal/domain"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 2,
+      "stdout_sha256": "02f966b680253b1eaec6f5faa25f3b3b77a981a3a556850a3999707ee3a2fd72",
+      "stderr_sha256": "de64f92bdb6c5b511f8c652cc071a834ed1a53d47143ba65e4d9a377b9e10ea3",
+      "stdout_raw": "r2-023-service-config.stdout.raw",
+      "stderr_raw": "r2-023-service-config.stderr.raw",
+      "result": "r2-023-service-config.result.json"
+    },
+    {
+      "tag": "r2-032-limits2",
+      "argv": [
+        "rg",
+        "-n",
+        "runtimeFactMaxBytes|runtimeModelMaxSSEBytes|MaxStreamBytes",
+        "internal/domain/runtime_model.go",
+        "internal/domain/runtime_broker_windows.go",
+        "internal/domain/runtime_model_windows.go",
+        "internal/domain/runtime_*",
+        "ops/experiment_sandbox"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 2,
+      "stdout_sha256": "4be57d79dc4be31dd9a68af4740008c54a549bc8efbdbb5a249682376af29d72",
+      "stderr_sha256": "e1362485e52b070ccb53876eb17a9febeca63d478d700cd258790c2fe554014f",
+      "stdout_raw": "r2-032-limits2.stdout.raw",
+      "stderr_raw": "r2-032-limits2.stderr.raw",
+      "result": "r2-032-limits2.result.json"
+    },
+    {
+      "tag": "r2-038-gofmt",
+      "argv": [
+        "gofmt",
+        "-w",
+        "adapters/runtime/qualification_failure_proof_windows.go"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": null,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "bf7ff3600d8f6e6241c56acfb2e54e99642214efda797aa25d6207bc45e1b504",
+      "stdout_raw": "r2-038-gofmt.stdout.raw",
+      "stderr_raw": "r2-038-gofmt.stderr.raw",
+      "result": "r2-038-gofmt.result.json"
+    },
+    {
+      "tag": "r2-040-go-path",
+      "argv": [
+        "rg",
+        "--files",
+        "--hidden",
+        "-g",
+        "go.exe",
+        "-g",
+        "gofmt.exe",
+        "-g",
+        "!**/.git/**",
+        "D:/作品集/ResearchOS",
+        "C:/Users/yqyyds",
+        "C:/tools",
+        "D:/tools"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 2,
+      "stdout_sha256": "8272a65fe5cdb30c9e248b4d4c1225744b554ba5a081e57d9d315cf3f135cef4",
+      "stderr_sha256": "fba59a1ec4538f54399d7d996f3b9310cde6ed4cf0148b56e5d443e5121604be",
+      "stdout_raw": "r2-040-go-path.stdout.raw",
+      "stderr_raw": "r2-040-go-path.stderr.raw",
+      "result": "r2-040-go-path.result.json"
+    },
+    {
+      "tag": "r2-041-go-command",
+      "argv": [
+        "rg",
+        "-n",
+        "go.exe|gofmt.exe|GOROOT|GO_EXE",
+        "execution/v2.4/receipts/W05/W05-99/qualification_failure_b_revision01_source_codex",
+        "execution/v2.4/receipts/W05/W05-99/qualification_projection_a_revision02_source_codex"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os",
+      "native_exit": 2,
+      "stdout_sha256": "69c64b21bc995ee6c14df026a3fdd481573e25e99db4edc7cf6ea35c42a57a85",
+      "stderr_sha256": "019995177a5ea8e217e63034ef2178aaa60803f07c9403c9b076a8c2f7219c4e",
+      "stdout_raw": "r2-041-go-command.stdout.raw",
+      "stderr_raw": "r2-041-go-command.stderr.raw",
+      "result": "r2-041-go-command.result.json"
+    },
+    {
+      "tag": "r2-047-effect-refs",
+      "argv": [
+        "rg",
+        "-n",
+        "-A",
+        "55",
+        "ingestEffectFact|func latestEffect|request_hash",
+        "internal/domain/runtime_model_windows.go",
+        "internal/domain/durability.go",
+        "internal/domain/runtime_effect_windows.go"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 2,
+      "stdout_sha256": "c0a94a7f2abb1613544decf47bdf99a63023de00da0a90c6fc883fe929b4cb46",
+      "stderr_sha256": "233ae877828e4e0ad7e67f4588a666bb50da64c67362ec5d5680e59b2e077748",
+      "stdout_raw": "r2-047-effect-refs.stdout.raw",
+      "stderr_raw": "r2-047-effect-refs.stderr.raw",
+      "result": "r2-047-effect-refs.result.json"
+    },
+    {
+      "tag": "r2-059-card-read",
+      "argv": [
+        "python",
+        "-c",
+        "from pathlib import Path; p=Path('execution/v2.4/cards/CP518_qualification_failure_b_revision02_source.md'); print(p.read_text(encoding='utf-8'))"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os",
+      "native_exit": 1,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "4131e8bc2deed26c74e9f2710a47e8009ff620513730782fce27059f9e919cc5",
+      "stdout_raw": "r2-059-card-read.stdout.raw",
+      "stderr_raw": "r2-059-card-read.stderr.raw",
+      "result": "r2-059-card-read.result.json"
+    },
+    {
+      "tag": "r2-060-card-path",
+      "argv": [
+        "rg",
+        "--files",
+        "execution/v2.4",
+        "-g",
+        "*CP518*",
+        "-g",
+        "*qualification_failure_b*"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os",
+      "native_exit": 1,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_raw": "r2-060-card-path.stdout.raw",
+      "stderr_raw": "r2-060-card-path.stderr.raw",
+      "result": "r2-060-card-path.result.json"
+    },
+    {
+      "tag": "r2-066-firstgate",
+      "argv": [
+        "D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe",
+        "test",
+        "./internal/domain",
+        "-run",
+        "^TestQualificationFailureFirstGateRefusalMatrix$",
+        "-count=1",
+        "-v"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 1,
+      "stdout_sha256": "dbc7b1673b553044d0087f8eebaadf3d92b5f7f940c8e3e8beb4b229b439b192",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_raw": "r2-066-firstgate.stdout.raw",
+      "stderr_raw": "r2-066-firstgate.stderr.raw",
+      "result": "r2-066-firstgate.result.json"
+    },
+    {
+      "tag": "r2-068-firstgate",
+      "argv": [
+        "D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe",
+        "test",
+        "./internal/domain",
+        "-run",
+        "^TestQualificationFailureFirstGateRefusalMatrix$",
+        "-count=1",
+        "-v"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 1,
+      "stdout_sha256": "1e768d718cc5758da685988ef6be9be170495725e5302b21d1aa67364dc4e1cc",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_raw": "r2-068-firstgate.stdout.raw",
+      "stderr_raw": "r2-068-firstgate.stderr.raw",
+      "result": "r2-068-firstgate.result.json"
+    },
+    {
+      "tag": "r2-104-source-tx",
+      "argv": [
+        "rg",
+        "-n",
+        "func sourceTx",
+        "internal/domain/runtime_qualification_failure_windows_test.go"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 1,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_raw": "r2-104-source-tx.stdout.raw",
+      "stderr_raw": "r2-104-source-tx.stderr.raw",
+      "result": "r2-104-source-tx.result.json"
+    },
+    {
+      "tag": "r2-113-card-tail",
+      "argv": [
+        "python",
+        "-c",
+        "from pathlib import Path; p=Path('execution/v2.4/receipts/W05/W05-99/qualification_failure_b_revision02_source_codex/20261015-current-chat/r2-061-card.stdout.raw'); print(p.read_text(encoding='utf-8',errors='replace')[-18000:])"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os",
+      "native_exit": 1,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "42f657d5ecb53611551f1fd6c82300bd0c016b718abe103c2d4205527d02c695",
+      "stdout_raw": "r2-113-card-tail.stdout.raw",
+      "stderr_raw": "r2-113-card-tail.stderr.raw",
+      "result": "r2-113-card-tail.result.json"
+    },
+    {
+      "tag": "r2-115-card-tail",
+      "argv": [
+        "python",
+        "-c",
+        "from pathlib import Path; p=Path('execution/v2.4/receipts/W05/W05-99/qualification_failure_b_revision02_source_codex/20261015-current-chat/r2-061-card-read.stdout.raw'); print(p.read_text(encoding='utf-8',errors='replace')[-18000:])"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os",
+      "native_exit": 1,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "bbb18f6367e16bf0e4f223209aac89c757e779a166440869546b2d87f94f60e8",
+      "stdout_raw": "r2-115-card-tail.stdout.raw",
+      "stderr_raw": "r2-115-card-tail.stderr.raw",
+      "result": "r2-115-card-tail.result.json"
+    },
+    {
+      "tag": "r2-118-drain-code",
+      "argv": [
+        "rg",
+        "-n",
+        "15 \\* time.Second|drain|brokerDone|resultPending|workerDone",
+        "internal/domain/runtime_command_windows.go",
+        "internal/domain/runtime_qualification_failure_windows.go"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 2,
+      "stdout_sha256": "d9c7c4ba5e8269d10c2cacf9b1ca9d72a0e9224015475a678a5898052341ceab",
+      "stderr_sha256": "3ebfec289ddb257f6c35be9cc7e646e421c045aa833ba893a84d8ad0c2f0f4aa",
+      "stdout_raw": "r2-118-drain-code.stdout.raw",
+      "stderr_raw": "r2-118-drain-code.stderr.raw",
+      "result": "r2-118-drain-code.result.json"
+    },
+    {
+      "tag": "r2-124-f48",
+      "argv": [
+        "git",
+        "rev-parse",
+        "f48"
+      ],
+      "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-r2-20261015",
+      "native_exit": 128,
+      "stdout_sha256": "f1385493957c415e3c3b0a06b36604eb6cfe6e820993d510aeab52f599fcf8ba",
+      "stderr_sha256": "993532d069eb030dd1157b795cf3ae99254103bc5338806de23835b66ad22720",
+      "stdout_raw": "r2-124-f48.stdout.raw",
+      "stderr_raw": "r2-124-f48.stderr.raw",
+      "result": "r2-124-f48.result.json"
+    }
+  ],
+  "known_initial_failures": {
+    "r2-038": "gofmt was not on PATH; corrected to pinned Go tool",
+    "r2-041": "exploratory search path did not exist",
+    "r2-047": "first recipe JSON was malformed; corrected and rerun",
+    "r2-059": "first card lookup used wrong path",
+    "r2-060": "card lookup did not find file",
+    "r2-063": "first recipe JSON was malformed; corrected and rerun",
+    "r2-066": "initial refusal matrix exposed invalid TOOL seed; corrected",
+    "r2-068": "initial marker mutant exposed missing guard; corrected",
+    "r2-077": "first recipe JSON was malformed; corrected and rerun",
+    "r2-088": "first recipe JSON was malformed; corrected and rerun",
+    "r2-104": "exploratory exact helper name search returned no match",
+    "r2-107": "wrong test filter exited 0 with no tests to run; r2-109 ran the actual test",
+    "r2-113": "receipt lookup used wrong filename",
+    "r2-115": "Windows GBK console could not encode replacement character; raw-byte read r2-116 succeeded",
+    "r2-118": "exploratory multi-path search included absent path; valid path search r2-120 succeeded",
+    "r2-124": "short f48 token was ambiguous; log identified f48fca0e"
+  }
+}
+
+AUTHOR capture-gap-and-skip-supplement.json
+{
+  "schema": "researchos.qualification-failure-B-r2-capture-gap-and-skip-supplement.v1",
+  "scope": "Supplement only; frozen Source commit and earlier raw captures/results/diagnostic ledger are unchanged.",
+  "manifest": {
+    "path": "FINAL-manifest.json",
+    "sha256": "1aca112dd1d8c963da7ea1cd7a9db6b012048426515aff439ccb420aca689bda",
+    "bytes": 5037,
+    "verified_by": "r2-139-capture-gap-audit"
+  },
+  "native_nonzero_ledger": {
+    "path": "diagnostic-ledger.json",
+    "count": 16,
+    "unchanged": true,
+    "dedup_rule": "The four pre-execution recipe parse attempts below are separate attempted runner invocations, not additional native exits. Corrected same-tag captures remain counted by their actual native exit."
+  },
+  "pre_execution_malformed_recipe_attempts": [
+    {
+      "tag": "r2-047-effect-refs",
+      "original_tool_call_utc": "2026-10-15T13:12:56.173094Z",
+      "original_tool": "functions.exec -> exec_command -> run_logged.py",
+      "failure": "Malformed recipe JSON while loading the argv regex; target rg command was not dispatched.",
+      "original_raw_artifact": null,
+      "raw_location": "No ownE command/result/stdout.raw/stderr.raw for this first attempt; the pre-execution tool response was shown in the chat. The same-tag files now present are from the corrected retry.",
+      "corrected_retry": {
+        "result": "r2-047-effect-refs.result.json",
+        "stdout": "r2-047-effect-refs.stdout.raw",
+        "stderr": "r2-047-effect-refs.stderr.raw",
+        "native_exit": 2
+      },
+      "distinct_attempt_from_corrected_retry": true
+    },
+    {
+      "tag": "r2-063-bridge-ctor",
+      "original_tool_call_utc": "2026-10-15T13:18:43.053389Z",
+      "original_tool": "functions.exec -> exec_command -> run_logged.py",
+      "failure": "Malformed recipe JSON while loading the argv regex; target rg command was not dispatched.",
+      "original_raw_artifact": null,
+      "raw_location": "No ownE command/result/stdout.raw/stderr.raw for this first attempt; the pre-execution tool response was shown in the chat. The same-tag files now present are from the corrected retry.",
+      "corrected_retry": {
+        "result": "r2-063-bridge-ctor.result.json",
+        "stdout": "r2-063-bridge-ctor.stdout.raw",
+        "stderr": "r2-063-bridge-ctor.stderr.raw",
+        "native_exit": 0
+      },
+      "distinct_attempt_from_corrected_retry": true
+    },
+    {
+      "tag": "r2-077-domain-refs",
+      "original_tool_call_utc": "2026-10-15T13:23:08.664925Z",
+      "original_tool": "functions.exec -> exec_command -> run_logged.py",
+      "failure": "Malformed recipe JSON while loading the argv regex; target rg command was not dispatched.",
+      "original_raw_artifact": null,
+      "raw_location": "No ownE command/result/stdout.raw/stderr.raw for this first attempt; the pre-execution tool response was shown in the chat. The same-tag files now present are from the corrected retry.",
+      "corrected_retry": {
+        "result": "r2-077-domain-refs.result.json",
+        "stdout": "r2-077-domain-refs.stdout.raw",
+        "stderr": "r2-077-domain-refs.stderr.raw",
+        "native_exit": 0
+      },
+      "distinct_attempt_from_corrected_retry": true
+    },
+    {
+      "tag": "r2-088-model-frame",
+      "original_tool_call_utc": "2026-10-15T13:26:45.690804Z",
+      "original_tool": "functions.exec -> exec_command -> run_logged.py",
+      "failure": "Malformed recipe JSON while loading the argv regex; target rg command was not dispatched.",
+      "original_raw_artifact": null,
+      "raw_location": "No ownE command/result/stdout.raw/stderr.raw for this first attempt; the pre-execution tool response was shown in the chat. The same-tag files now present are from the corrected retry.",
+      "corrected_retry": {
+        "result": "r2-088-model-frame.result.json",
+        "stdout": "r2-088-model-frame.stdout.raw",
+        "stderr": "r2-088-model-frame.stderr.raw",
+        "native_exit": 0
+      },
+      "distinct_attempt_from_corrected_retry": true
+    }
+  ],
+  "skips_and_empty_success": [
+    {
+      "tag": "r2-027-original-queue-tests",
+      "result": "r2-027-original-queue-tests.result.json",
+      "stdout": "r2-027-original-queue-tests.stdout.raw",
+      "native_exit": 0,
+      "classification": "SKIP, not a passing original-Mu regression",
+      "detail": "The immutable Mu bundle was absent: two top-level tests and both claim-ordering subtests have four explicit SKIP lines; the parent claim-ordering test prints PASS only because both subtests skipped.",
+      "subsequent_evidence": "r2-030-original-queue-with-mu.result.json and .stdout.raw run the original three suites and two claim-ordering subtests with the frozen local bundle, zero SKIP."
+    },
+    {
+      "tag": "r2-107-consumer-grant",
+      "result": "r2-107-consumer-grant.result.json",
+      "stdout": "r2-107-consumer-grant.stdout.raw",
+      "native_exit": 0,
+      "classification": "EMPTY TEST SELECTION, not a passing consumer test",
+      "detail": "The wrong -run filter emitted 'testing: warning: no tests to run' and '[no tests to run]'.",
+      "subsequent_evidence": "r2-109-final-domain.result.json and .stdout.raw run TestQualificationFailurePrivateConsumerRejectsTampering including Owner-grant deletion."
+    }
+  ],
+  "shell_logging_audit": {
+    "first_scope_and_agents_read": {
+      "logged": true,
+      "tag": "r2-001-bootstrap-read",
+      "result": "r2-001-bootstrap-read.result.json",
+      "stdout": "r2-001-bootstrap-read.stdout.raw",
+      "native_exit": 0,
+      "scope_sha256": "b43f950f884540f2daad10abc3872612bd15ccb40134de42a94ff1e415de1842",
+      "encoding_note": "The captured PowerShell UTF-8 output shows replacement characters for Chinese text when decoded by the capture path; scope hash and ASCII structural fields are present."
+    },
+    "unlogged_shell_gap_count": 1,
+    "unlogged_shell_gap": {
+      "at_utc": "2026-10-15T13:10:02.119535Z",
+      "command": "Get-Content -LiteralPath 'execution/v2.4/receipts/W05/W05-99/qualification_failure_b_revision02_source_codex/20261015-current-chat/r2-034-runtime-hash.recipe.json' -Raw",
+      "cwd": "D:/作品集/ResearchOS",
+      "classification": "Read-only wrong-working-directory lookup immediately after context switch; invoked outside run_logged and has no ownE command/raw/native-exit capture. It did not change Source or replace r2-001 scope/AGENT read.",
+      "raw_artifact": null
+    },
+    "other_unlogged_shell_gap": "No additional r2 shell command outside run_logged was identified in the available r2 call transcript; this is a bounded audit statement, not proof of every external process."
+  },
+  "native_zero_nonterminating_audit": {
+    "audit_tags": [
+      "r2-139-capture-gap-audit",
+      "r2-140-preexec-current-results",
+      "r2-141-native0-audit",
+      "r2-142-worktree-stderr"
+    ],
+    "finding": "r2-027 SKIP and r2-107 empty selection are the native-0 evidence exceptions above. r2-002-worktree-add wrote normal checkout progress to stderr and exited 0. No other nonterminating command error was identified in native-0 ownE raw captures by the focused warning/error scan; the scan is not a semantic proof over arbitrary source-text output.",
+    "r2_002_stderr": "r2-002-worktree-add.stderr.raw"
+  },
+  "formal_increment": 0,
+  "actual_authority": false,
+  "self_acceptance": false
+}
+

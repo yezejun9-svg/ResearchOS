@@ -1,0 +1,1899 @@
+diff --git a/adapters/runtime/bridge_control_windows_test.go b/adapters/runtime/bridge_control_windows_test.go
+index cd127823..cc85b49d 100644
+--- a/adapters/runtime/bridge_control_windows_test.go
++++ b/adapters/runtime/bridge_control_windows_test.go
+@@ -3,9 +3,21 @@
+ package runtime
+ 
+ import (
++	"bytes"
++	"compress/gzip"
++	"context"
++	"encoding/base64"
+ 	"encoding/json"
++	"errors"
++	"flag"
++	"fmt"
++	"os"
++	"path/filepath"
+ 	sandbox "researchos.local/research-os/ops/experiment_sandbox"
++	"strconv"
++	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func TestBridgeQueueEmptyNeedsSDKProof(t *testing.T) {
+@@ -54,3 +66,266 @@ func TestBridgeControlIdentityRejectsForeignProcessAndEpoch(t *testing.T) {
+ 		})
+ 	}
+ }
++
++var pauseWorkerBundle = flag.String("pause-worker-bundle", "", "explicit current candidate production bundle for native isolated pause test")
++var pauseWorkerNode = flag.String("pause-worker-node", "", "explicit Node executable for native isolated pause test")
++
++func TestBridgeProductionPauseCheckpointNative(t *testing.T) {
++	if *pauseWorkerBundle == "" || *pauseWorkerNode == "" {
++		t.Skip("explicit candidate assets required; no native proof claimed")
++	}
++	bundle, err := os.ReadFile(*pauseWorkerBundle)
++	if err != nil {
++		t.Fatal(err)
++	}
++	node, err := os.ReadFile(*pauseWorkerNode)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config := map[string]any{"ref": "fixture", "api": "openai-completions", "provider": "openai", "model": "fixture", "endpoint": "https://fixture.invalid", "route": "broker", "max_output_tokens": 128, "max_calls": 8, "tools": []any{}}
++	workerConfig, _ := json.Marshal(config)
++	profile := map[string]any{"backend": "mu-sdk-broker-v1", "model": "fixture", "sandbox": "appcontainer-zero-capabilities-v1", "adapter_revision": BridgeRevision, "build_hash": Hash(node), "bundle_hash": Hash(bundle), "model_config": config, "argv": []string{"--preserve-symlinks-main", "--preserve-symlinks", "{bundle}", "{manifest}"}, "timeout_seconds": 60, "outputs": []string{"result.json"}}
++	manifest, _ := json.Marshal(map[string]any{"task_id": "task", "run_id": "run", "epoch": 1, "dispatch_key": "dispatch-pause", "admission": map[string]any{"profile": profile}})
++	manifestHash, _ := canonicalHash(manifest)
++	binding := map[string]any{"project_id": "project", "session_id": "session", "task_id": "task", "run_id": "run", "runtime_epoch": 1, "queue_generation": "generation", "dispatch_key": "dispatch-pause", "manifest_hash": manifestHash}
++	request, _ := json.Marshal(map[string]any{"task_id": "task", "run_id": "run", "epoch": 1, "input_refs": []any{}, "context": map[string]any{}, "task_title": "native synthetic pause", "task_description": "one original prompt", "queue_control": true, "queue_binding": binding, "pause_protocol": PauseProtocol})
++	directory := filepath.Join(t.TempDir(), "dispatch")
++	ctx, cancel := context.WithTimeout(context.Background(), 65*time.Second)
++	defer cancel()
++	w, err := StartBridge(ctx, directory, BridgeRequest{WorkerID: "native-pause", Manifest: manifest, ManifestHash: manifestHash, Executable: *pauseWorkerNode, Inputs: map[string][]byte{"request.json": request, "worker.json": workerConfig, "mu-worker.mjs": bundle}, BeforeResume: func(i sandbox.Identity) error {
++		binding["process_identity"] = map[string]any{"pid": i.PID, "process_created_ns": strconv.FormatInt(i.Created, 10), "job": i.Job, "appcontainer_sid": i.SID, "profile": i.Profile, "staging_directory": i.StagingDirectory}
++		return nil
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { w.Cancel("test cleanup"); <-w.Done() })
++	send := func(value map[string]any) {
++		t.Helper()
++		value["binding"] = binding
++		if e := w.Control(ctx, value); e != nil {
++			t.Fatal(e)
++		}
++	}
++	var sequences []int64
++	var checkpointSequence int64
++	var checkpointRaw []byte
++	for {
++		select {
++		case frame, ok := <-w.Frames():
++			if !ok {
++				goto done
++			}
++			sequences = append(sequences, frame.Sequence)
++			switch frame.Type {
++			case "context.ready":
++				if err = w.Acknowledge(ctx, frame.Sequence, nil); err != nil {
++					t.Fatal(err)
++				}
++				send(map[string]any{"type": "command.deliver", "initialize": true, "command": nil, "pause_protocol": PauseProtocol})
++			case "command.accepted":
++				payload, _ := bridgeMap(frame.Payload)
++				var reply any
++				if payload["initialized"] == true {
++					reply = map[string]any{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": map[string]any{}}
++				}
++				if err = w.Acknowledge(ctx, frame.Sequence, reply); err != nil {
++					t.Fatal(err)
++				}
++			case "effect.request":
++				if frame.Sequence != 3 {
++					t.Fatal("unexpected extra model call")
++				}
++				for i, delivery := range []string{"STEER", "FOLLOW_UP"} {
++					content, _ := json.Marshal(map[string]any{"text": strings.Repeat("x", 20000), "attachments": []any{}})
++					send(map[string]any{"type": "command.deliver", "command": map[string]any{"command_id": fmt.Sprint("c", i), "message_id": fmt.Sprint("m", i), "queue_sequence": i + 1, "content": string(content), "content_hash": Hash(content), "delivery": delivery}})
++				}
++				send(map[string]any{"type": "command.pause", "version": PauseProtocol, "pause_id": "native-pause"})
++				sse := []byte("data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"reply\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
++				var packed bytes.Buffer
++				gzipWriter := gzip.NewWriter(&packed)
++				_, _ = gzipWriter.Write(sse)
++				_ = gzipWriter.Close()
++				reply := map[string]any{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": map[string]any{"status": 200, "content_type": "text/event-stream", "body_encoding": "gzip+base64", "body_gzip_base64": base64.StdEncoding.EncodeToString(packed.Bytes()), "body_sha256": Hash(sse)}}
++				if err = w.Acknowledge(ctx, frame.Sequence, reply); err != nil {
++					t.Fatal(err)
++				}
++			case "checkpoint":
++				checkpointSequence = frame.Sequence
++				raw, e := w.CheckpointBytes()
++				checkpointRaw = raw
++				if e != nil {
++					t.Fatal(e)
++				}
++				if len(raw) <= 64*1024 {
++					t.Fatal("checkpoint file must prove transport beyond line bound")
++				}
++				var snap map[string]any
++				if json.Unmarshal(raw, &snap) != nil {
++					t.Fatal("invalid checkpoint")
++				}
++				j := w.Read()
++				if Hash(raw) != j.Checkpoint.ContentHash {
++					t.Fatal("trusted byte mismatch")
++				}
++				// The Core-shaped durable journal fact is a test stand-in for the later
++				// canonical coordinator card. No DB Artifact acceptance is claimed here.
++				fact := map[string]any{"project_id": "project", "run_id": "run", "epoch": 1, "manifest_hash": manifestHash, "dispatch_key": "dispatch-pause", "sequence": frame.Sequence, "content_hash": Hash(raw), "payload": json.RawMessage(frame.Payload)}
++				factRaw, _ := json.Marshal(fact)
++				f, e := os.OpenFile(filepath.Join(directory, "checkpoint-"+strconv.FormatInt(frame.Sequence, 10)+".json"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++				if e != nil {
++					t.Fatal(e)
++				}
++				_, e = f.Write(factRaw)
++				if e == nil {
++					e = f.Sync()
++				}
++				e = errors.Join(e, f.Close())
++				if e != nil {
++					t.Fatal(e)
++				}
++				b, _ := json.Marshal(binding)
++				seal := CheckpointSeal{Type: "checkpoint.sealed", Version: PauseProtocol, PauseID: "native-pause", Binding: b, Sequence: frame.Sequence, ContentHash: Hash(raw), CheckpointArtifactID: "fixture-artifact", CheckpointUseReceiptHash: Hash([]byte("fixture-use")), CheckpointUsePrincipal: "fixture-executor", JournalCheckpointHash: Hash(factRaw)}
++				if err = w.SealCheckpoint(ctx, seal); err != nil {
++					t.Fatal(err)
++				}
++			case "turn.paused":
++				if frame.Sequence <= checkpointSequence {
++					t.Fatal("non-advancing paused sequence")
++				}
++				if err = w.Acknowledge(ctx, frame.Sequence, nil); err != nil {
++					t.Fatal(err)
++				}
++			default:
++				t.Fatalf("unexpected frame %s", frame.Type)
++			}
++		case <-ctx.Done():
++			t.Fatal(ctx.Err())
++		}
++	}
++done:
++	<-w.Done()
++	j := w.Read()
++	if j.State != "PAUSED" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Frames != j.Acknowledged {
++		t.Fatalf("native pause not settled: state=%s frames=%d ack=%d stderr=%s", j.State, j.Frames, j.Acknowledged, string(j.Receipt.Stderr))
++	}
++	if j.QueueSealed {
++		t.Fatal("paused queue incorrectly reported empty/sealed")
++	}
++	recovered, e := ReadBridgeTerminal(directory, manifestHash)
++	if e != nil || !recovered.Paused {
++		t.Fatalf("durable recovery: %v", e)
++	}
++	t.Logf("NATIVE_SYNTHETIC production worker+bridge, frames=%v bytes=%d checkpoint=%d model_calls=%d stopped=%v drained=%v; Core canonical integration OPEN", sequences, j.Checkpoint.Bytes, j.CheckpointSequence, j.Checkpoint.ModelCalls, j.Receipt.Stopped, j.Receipt.StreamsDrained)
++	// A new physical AppContainer resumes the original SDK header/tree under
++	// a same-Run successor activation. The old checkpoint bytes remain exact.
++	manifest2, _ := json.Marshal(map[string]any{"task_id": "task", "run_id": "run", "epoch": 2, "dispatch_key": "dispatch-resume", "admission": map[string]any{"profile": profile}})
++	hash2, _ := canonicalHash(manifest2)
++	binding2 := map[string]any{"project_id": "project", "session_id": "session", "task_id": "task", "run_id": "run", "runtime_epoch": 2, "queue_generation": "generation", "dispatch_key": "dispatch-resume", "manifest_hash": hash2}
++	request2, _ := json.Marshal(map[string]any{"task_id": "task", "run_id": "run", "epoch": 2, "input_refs": []any{}, "context": map[string]any{}, "task_title": "native synthetic pause", "task_description": "one original prompt", "queue_control": true, "queue_binding": binding2, "pause_protocol": PauseProtocol, "pause_activation": map[string]any{"version": PauseProtocol, "previous_epoch": 1, "new_epoch": 2, "checkpoint_hash": j.Checkpoint.ContentHash, "checkpoint_artifact_id": j.CheckpointSeal.CheckpointArtifactID, "checkpoint_use_receipt_hash": j.CheckpointSeal.CheckpointUseReceiptHash, "checkpoint_use_principal": j.CheckpointSeal.CheckpointUsePrincipal, "carry_use_receipt_hash": Hash([]byte("fixture-carry")), "original_input_hash": j.Checkpoint.InputHash}})
++	w2, e := StartBridge(ctx, filepath.Join(t.TempDir(), "resume"), BridgeRequest{WorkerID: "native-resume", Manifest: manifest2, ManifestHash: hash2, Executable: *pauseWorkerNode, Inputs: map[string][]byte{"request.json": request2, "worker.json": workerConfig, "mu-worker.mjs": bundle, PauseCheckpointFilename: checkpointRaw}, BeforeResume: func(i sandbox.Identity) error {
++		binding2["process_identity"] = map[string]any{"pid": i.PID, "process_created_ns": strconv.FormatInt(i.Created, 10), "job": i.Job, "appcontainer_sid": i.SID, "profile": i.Profile, "staging_directory": i.StagingDirectory}
++		return nil
++	}})
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(func() { w2.Cancel("test cleanup"); <-w2.Done() })
++	send2 := func(v map[string]any) {
++		t.Helper()
++		v["binding"] = binding2
++		if e := w2.Control(ctx, v); e != nil {
++			t.Fatal(e)
++		}
++	}
++	prepared, committed := false, false
++	consumed, models := 0, 0
++	for frame := range w2.Frames() {
++		var reply any
++		switch frame.Type {
++		case "context.ready":
++		case "command.accepted":
++			p, _ := bridgeMap(frame.Payload)
++			if p["initialized"] != true {
++				t.Fatal("restored command redelivered")
++			}
++			reply = map[string]any{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": map[string]any{}}
++		case "command.consumed":
++			consumed++
++		case "effect.request":
++			models++
++			if frame.Key != fmt.Sprintf("task:run:2:model:%d", models+1) {
++				t.Fatal("effect count reset", frame.Key)
++			}
++			sse := []byte("data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"resumed\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
++			var buf bytes.Buffer
++			z := gzip.NewWriter(&buf)
++			_, _ = z.Write(sse)
++			_ = z.Close()
++			reply = map[string]any{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": map[string]any{"status": 200, "content_type": "text/event-stream", "body_encoding": "gzip+base64", "body_gzip_base64": base64.StdEncoding.EncodeToString(buf.Bytes()), "body_sha256": Hash(sse)}}
++		case "command.idle", "command.sealed", "turn.completed":
++		default:
++			t.Fatal("unexpected restored frame", frame.Type)
++		}
++		if e = w2.Acknowledge(ctx, frame.Sequence, reply); e != nil {
++			t.Fatal(e)
++		}
++		if frame.Type == "context.ready" {
++			send2(map[string]any{"type": "command.deliver", "initialize": true, "command": nil, "pause_protocol": PauseProtocol})
++		}
++		if frame.Type == "command.idle" {
++			if !prepared {
++				prepared = true
++				send2(map[string]any{"type": "command.prepare_seal", "through": 2})
++			} else if !committed {
++				committed = true
++				send2(map[string]any{"type": "command.commit_seal", "through": 2})
++			}
++		}
++	}
++	<-w2.Done()
++	j2 := w2.Read()
++	if j2.State != "EXITED" || !j2.Receipt.Stopped || !j2.Receipt.StreamsDrained || consumed != 2 || models != 2 {
++		t.Fatalf("native resume state=%s consumed=%d models=%d stderr=%s", j2.State, consumed, models, string(j2.Receipt.Stderr))
++	}
++	resultRaw, e := os.ReadFile(filepath.Join(w2.Directory(), "output", "result.json"))
++	if e != nil {
++		t.Fatal(e)
++	}
++	result, e := bridgeMap(resultRaw)
++	if e != nil || bridgeNumber(result, "model_calls") != 3 || strings.Count(string(resultRaw), "one original prompt") != 1 {
++		t.Fatal("restored counts/prompt replay", e)
++	}
++	if Hash(checkpointRaw) != j.Checkpoint.ContentHash {
++		t.Fatal("original checkpoint relabelled")
++	}
++	t.Logf("NATIVE_SYNTHETIC same Run epoch 1 -> 2, consumed=%d model_calls=3 no prompt replay, new process=%d old process=%d", consumed, j2.Identity.PID, j.Identity.PID)
++
++}
++
++func TestPauseCheckpointFileBoundsAndSealRejection(t *testing.T) {
++	root := t.TempDir()
++	path := filepath.Join(root, "checkpoint.json")
++	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), MaxPauseCheckpointBytes+1), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := readPauseFile(path); err == nil {
++		t.Fatal("oversized checkpoint accepted")
++	}
++	if err := os.WriteFile(path, []byte("exact"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	raw, err := readPauseFile(path)
++	if err != nil || string(raw) != "exact" {
++		t.Fatal(err)
++	}
++	w := &Bridge{directory: root, journal: BridgeJournal{Frames: 4, Acknowledged: 3, CheckpointSequence: 4, Checkpoint: &PauseCheckpoint{Version: PauseProtocol, PauseID: "p", ContentHash: Hash(raw), Binding: json.RawMessage(`{}`)}}}
++	for _, reply := range []any{nil, map[string]any{"sequence": 4, "key": "checkpoint.sealed", "state": "CONFIRMED", "payload": map[string]any{"persisted": true}}} {
++		if err = w.Acknowledge(context.Background(), 4, reply); err == nil {
++			t.Fatal("unsealed checkpoint ACK accepted")
++		}
++		if w.Read().Acknowledged != 3 {
++			t.Fatal("rejected seal advanced ACK")
++		}
++	}
++}
+diff --git a/adapters/runtime/bridge_windows.go b/adapters/runtime/bridge_windows.go
+index d0e4acae..5b2661a7 100644
+--- a/adapters/runtime/bridge_windows.go
++++ b/adapters/runtime/bridge_windows.go
+@@ -21,6 +21,36 @@ import (
+ )
+ 
+ const BridgeRevision = "windows-appcontainer-v1"
++const PauseProtocol = "RESEARCHOS_PAUSE_V1"
++const PauseCheckpointFilename = "pause-checkpoint.json"
++const MaxPauseCheckpointBytes = 12 * 1024 * 1024
++
++type PauseCheckpoint struct {
++	QueueCut          int64           `json:"queue_cut"`
++	CommandLedgerHash string          `json:"command_ledger_hash"`
++	SDKWatermarks     json.RawMessage `json:"sdk_watermarks"`
++	SDKSessionID      string          `json:"sdk_session_id"`
++	Version           string          `json:"version"`
++	PauseID           string          `json:"pause_id"`
++	Binding           json.RawMessage `json:"binding"`
++	ContentHash       string          `json:"content_hash"`
++	Bytes             int64           `json:"bytes"`
++	InputHash         string          `json:"input_hash"`
++	ModelCalls        int64           `json:"model_calls"`
++	ToolCalls         int64           `json:"tool_calls"`
++}
++type CheckpointSeal struct {
++	CheckpointUsePrincipal   string          `json:"checkpoint_use_principal"`
++	Type                     string          `json:"type"`
++	Version                  string          `json:"version"`
++	PauseID                  string          `json:"pause_id"`
++	Binding                  json.RawMessage `json:"binding"`
++	Sequence                 int64           `json:"checkpoint_sequence"`
++	ContentHash              string          `json:"content_hash"`
++	CheckpointArtifactID     string          `json:"checkpoint_artifact_id"`
++	CheckpointUseReceiptHash string          `json:"checkpoint_use_receipt_hash"`
++	JournalCheckpointHash    string          `json:"journal_checkpoint_hash"`
++}
+ 
+ type BridgeFrame struct {
+ 	Sequence   int64           `json:"sequence"`
+@@ -44,6 +74,12 @@ type BridgeRequest struct {
+ }
+ 
+ type BridgeJournal struct {
++	PauseProtocol      string           `json:"pause_protocol,omitempty"`
++	PauseRequested     bool             `json:"pause_requested,omitempty"`
++	PauseID            string           `json:"pause_id,omitempty"`
++	QueueBinding       json.RawMessage  `json:"queue_binding,omitempty"`
++	Checkpoint         *PauseCheckpoint `json:"checkpoint,omitempty"`
++	CheckpointSeal     *CheckpointSeal  `json:"checkpoint_seal,omitempty"`
+ 	Version            int              `json:"version"`
+ 	Manifest           json.RawMessage  `json:"manifest"`
+ 	ManifestHash       string           `json:"manifest_hash"`
+@@ -196,6 +232,10 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
+ 	w.journal = BridgeJournal{Version: 1, Manifest: append(json.RawMessage(nil), request.Manifest...), ManifestHash: digest, DispatchKey: bridgeString(manifest, "dispatch_key"), Worker: request.WorkerID, Revision: BridgeRevision, State: "PREPARED", Started: now(), Artifacts: []Artifact{}, InputHash: Hash(request.Inputs["request.json"])}
+ 	inputRequest, _ := bridgeMap(request.Inputs["request.json"])
+ 	w.journal.QueueRequired = inputRequest["queue_control"] == true
++	w.journal.QueueBinding, _ = json.Marshal(inputRequest["queue_binding"])
++	if inputRequest["pause_protocol"] == PauseProtocol {
++		w.journal.PauseProtocol = PauseProtocol
++	}
+ 	failed := true
+ 	defer func() {
+ 		if failed {
+@@ -359,18 +399,28 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+ 			if err != nil || w.journal.ContextReady || payload["input_hash"] != w.journal.InputHash {
+ 				return errors.New("context acknowledgement mismatch")
+ 			}
++			if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
++				return errors.New("pause capability unsupported")
++			}
+ 			w.journal.ContextReady = true
+ 		case "effect.request", "checkpoint":
+ 			if !w.journal.ContextReady || w.journal.QueueRequired && (w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence) {
+ 				return errors.New("context and queue initialization acknowledgement required before work")
+ 			}
+ 			if frame.Type == "checkpoint" {
++				if err := w.capturePauseCheckpoint(frame); err != nil {
++					return err
++				}
+ 				w.journal.CheckpointSequence = frame.Sequence
+ 			}
+ 		case "turn.paused":
+-			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence {
++			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence || w.journal.CheckpointSeal == nil {
+ 				return errors.New("durably acknowledged checkpoint required before pause")
+ 			}
++			var paused CheckpointSeal
++			if json.Unmarshal(frame.Payload, &paused) != nil || paused.Version != PauseProtocol || !samePauseBinding(paused.Binding, w.journal.Checkpoint.Binding) || paused.Sequence != w.journal.CheckpointSequence || paused.ContentHash != w.journal.Checkpoint.ContentHash || paused.PauseID != w.journal.PauseID || paused.CheckpointUsePrincipal != w.journal.CheckpointSeal.CheckpointUsePrincipal || paused.CheckpointArtifactID != w.journal.CheckpointSeal.CheckpointArtifactID || paused.CheckpointUseReceiptHash != w.journal.CheckpointSeal.CheckpointUseReceiptHash || paused.JournalCheckpointHash != w.journal.CheckpointSeal.JournalCheckpointHash {
++				return errors.New("paused seal correlation mismatch")
++			}
+ 			w.journal.Paused, w.journal.ProtocolComplete = true, true
+ 		case "turn.completed":
+ 			if !w.journal.ContextReady || w.journal.QueueRequired && !w.journal.QueueSealed {
+@@ -389,6 +439,9 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+ 				if w.journal.QueueInitSequence != 0 {
+ 					return errors.New("duplicate initialization receipt")
+ 				}
++				if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
++					return errors.New("pause initialization negotiation failed")
++				}
+ 				w.journal.QueueInitSequence = frame.Sequence
+ 			} else if w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence {
+ 				return errors.New("command receipt before initialization")
+@@ -420,7 +473,7 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+ 			return errors.New("unknown protocol frame")
+ 		}
+ 		w.journal.Frames = frame.Sequence
+-		if strings.HasPrefix(frame.Type, "command.") {
++		if strings.HasPrefix(frame.Type, "command.") || frame.Type == "checkpoint" || frame.Type == "turn.paused" {
+ 			if err := w.persist(); err != nil {
+ 				return err
+ 			}
+@@ -576,6 +629,25 @@ func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any)
+ 		w.mu.Unlock()
+ 		return errors.New("protocol acknowledgement out of order")
+ 	}
++	if sequence == w.journal.CheckpointSequence {
++		raw, e := json.Marshal(response)
++		if e != nil {
++			w.mu.Unlock()
++			return e
++		}
++		var reply struct {
++			Sequence int64          `json:"sequence"`
++			Key      string         `json:"key"`
++			State    string         `json:"state"`
++			Payload  CheckpointSeal `json:"payload"`
++		}
++		if json.Unmarshal(raw, &reply) != nil || reply.Sequence != sequence || reply.Key != "checkpoint.sealed" || reply.State != "CONFIRMED" || w.validateCheckpointSeal(reply.Payload) != nil {
++			w.mu.Unlock()
++			return errors.New("checkpoint requires durable artifact/use/journal seal")
++		}
++		seal := reply.Payload
++		w.journal.CheckpointSeal = &seal
++	}
+ 	w.journal.Acknowledged = sequence
+ 	err := w.persist()
+ 	w.mu.Unlock()
+@@ -616,6 +688,17 @@ func (w *Bridge) validateControlBinding(binding map[string]any) error {
+ 	if err != nil || binding["task_id"] != manifest["task_id"] || binding["run_id"] != manifest["run_id"] || bridgeNumber(binding, "runtime_epoch") != bridgeNumber(manifest, "epoch") || binding["dispatch_key"] != w.journal.DispatchKey || binding["manifest_hash"] != w.journal.ManifestHash || actual != expected || bridgeString(binding, "queue_generation") == "" {
+ 		return errors.New("control identity mismatch")
+ 	}
++	if len(w.journal.QueueBinding) > 0 && string(w.journal.QueueBinding) != "null" {
++		expected, e := bridgeMap(w.journal.QueueBinding)
++		if e != nil {
++			return e
++		}
++		for _, key := range []string{"project_id", "session_id", "queue_generation"} {
++			if expected[key] != binding[key] {
++				return errors.New("frozen queue binding mismatch")
++			}
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -638,6 +721,17 @@ func (w *Bridge) Control(ctx context.Context, frame any) error {
+ 	if err == nil && (!w.journal.QueueRequired || w.journal.ProtocolComplete) {
+ 		err = errors.New("control on closed worker")
+ 	}
++	if err == nil && value["type"] == "command.pause" {
++		if w.journal.PauseProtocol != PauseProtocol || value["version"] != PauseProtocol || w.journal.PauseRequested || w.journal.QueueSealed || w.journal.Cancelled || w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence || bridgeString(value, "pause_id") == "" {
++			err = errors.New("pause unsupported or fenced")
++		} else {
++			w.journal.PauseRequested = true
++			w.journal.PauseID = bridgeString(value, "pause_id")
++			err = w.persist()
++		}
++	} else if err == nil && w.journal.PauseRequested {
++		err = errors.New("control blocked during pause")
++	}
+ 	if err == nil && value["type"] == "command.deliver" && value["initialize"] != true {
+ 		w.journal.QueueIdle = false
+ 	}
+@@ -748,6 +842,15 @@ func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+ 			return j, errors.New("recovery stream mismatch")
+ 		}
+ 	}
++	if j.Checkpoint != nil {
++		checkpoint, e := readPauseFile(filepath.Join(directory, "checkpoint.sealed.json"))
++		if e != nil || int64(len(checkpoint)) != j.Checkpoint.Bytes || Hash(checkpoint) != j.Checkpoint.ContentHash {
++			return j, errors.New("recovery checkpoint bytes changed")
++		}
++	}
++	if j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
++		return j, errors.New("recovery checkpoint seal missing")
++	}
+ 	manifest, e := bridgeMap(j.Manifest)
+ 	if e != nil {
+ 		return j, e
+@@ -865,3 +968,141 @@ func ReconcileBridge(directory, manifestHash string) (BridgeJournal, error) {
+ 	lock.Close()
+ 	return ReadBridgeTerminal(directory, manifestHash)
+ }
++
++// readPauseFile opens the final path without following a reparse point and
++// denies concurrent writes/deletion while reading at most 12 MiB + 1 byte.
++func readPauseFile(path string) ([]byte, error) {
++	actual, err := filepath.EvalSymlinks(path)
++	if err != nil || !strings.EqualFold(filepath.Clean(actual), filepath.Clean(path)) {
++		return nil, errors.New("checkpoint reparse rejected")
++	}
++	p, err := windows.UTF16PtrFromString(path)
++	if err != nil {
++		return nil, err
++	}
++	handle, err := windows.CreateFile(p, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(handle), path)
++	defer file.Close()
++	finalPath := make([]uint16, 32768)
++	count, e := windows.GetFinalPathNameByHandle(handle, &finalPath[0], uint32(len(finalPath)), 0)
++	expectedPath := strings.TrimPrefix(filepath.Clean(path), `\\?\`)
++	if e != nil || count >= uint32(len(finalPath)) || !strings.EqualFold(strings.TrimPrefix(windows.UTF16ToString(finalPath[:count]), `\\?\`), expectedPath) {
++		return nil, errors.New("checkpoint opened path differs")
++	}
++	var info windows.ByHandleFileInformation
++	if err = windows.GetFileInformationByHandle(handle, &info); err != nil || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
++		return nil, errors.New("regular non-reparse checkpoint required")
++	}
++	stat, err := file.Stat()
++	if err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > MaxPauseCheckpointBytes {
++		return nil, errors.New("checkpoint size invalid")
++	}
++	raw, err := io.ReadAll(io.LimitReader(file, MaxPauseCheckpointBytes+1))
++	if err != nil || len(raw) > MaxPauseCheckpointBytes || int64(len(raw)) != stat.Size() {
++		return nil, errors.New("checkpoint read bound violated")
++	}
++	return raw, nil
++}
++func (w *Bridge) capturePauseCheckpoint(frame BridgeFrame) error {
++	var checkpoint PauseCheckpoint
++	if !w.journal.PauseRequested || w.journal.Checkpoint != nil || frame.Path != PauseCheckpointFilename || frame.Key != "checkpoint.sealed" || json.Unmarshal(frame.Payload, &checkpoint) != nil || checkpoint.Version != PauseProtocol || checkpoint.PauseID != w.journal.PauseID || checkpoint.Bytes <= 0 || checkpoint.Bytes > MaxPauseCheckpointBytes || "sha256:"+checkpoint.InputHash != w.journal.InputHash || checkpoint.ModelCalls < 0 || checkpoint.ToolCalls < 0 || checkpoint.QueueCut < 0 || !validPauseHash(checkpoint.CommandLedgerHash) || checkpoint.SDKSessionID == "" {
++		return errors.New("invalid bound pause checkpoint")
++	}
++	binding, err := bridgeMap(checkpoint.Binding)
++	if err != nil || w.validateControlBinding(binding) != nil {
++		return errors.New("checkpoint binding mismatch")
++	}
++	for _, stream := range w.modelStreams {
++		if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
++			return errors.New("checkpoint before stream drain")
++		}
++	}
++	raw, err := readPauseFile(filepath.Join(w.journal.Identity.StagingDirectory, "output", PauseCheckpointFilename))
++	if err != nil {
++		return err
++	}
++	if int64(len(raw)) != checkpoint.Bytes || Hash(raw) != checkpoint.ContentHash {
++		return errors.New("checkpoint content mismatch")
++	}
++	dest := filepath.Join(w.directory, "checkpoint.sealed.json")
++	file, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return err
++	}
++	_, err = file.Write(raw)
++	if err == nil {
++		err = file.Sync()
++	}
++	err = errors.Join(err, file.Close())
++	if err != nil {
++		return err
++	}
++	w.journal.Checkpoint = &checkpoint
++	return nil
++}
++func (w *Bridge) validateCheckpointSeal(seal CheckpointSeal) error {
++	c := w.journal.Checkpoint
++	if c == nil || seal.Type != "checkpoint.sealed" || seal.Version != PauseProtocol || seal.Sequence != w.journal.CheckpointSequence || seal.PauseID != c.PauseID || seal.ContentHash != c.ContentHash || seal.CheckpointUsePrincipal == "" || seal.CheckpointArtifactID == "" || !validPauseHash(seal.CheckpointUseReceiptHash) || !validPauseHash(seal.JournalCheckpointHash) {
++		return errors.New("incomplete checkpoint seal")
++	}
++	a, e := canonicalHash(seal.Binding)
++	b, f := canonicalHash(c.Binding)
++	if e != nil || f != nil || a != b {
++		return errors.New("checkpoint seal binding changed")
++	}
++	fact, err := readPauseFile(filepath.Join(w.directory, "checkpoint-"+strconv.FormatInt(seal.Sequence, 10)+".json"))
++	if err != nil || len(fact) > 64*1024 || Hash(fact) != seal.JournalCheckpointHash {
++		return errors.New("durable checkpoint journal fact missing or changed")
++	}
++	value, err := bridgeMap(fact)
++	binding, _ := bridgeMap(c.Binding)
++	if err != nil || value["project_id"] != binding["project_id"] || value["run_id"] != binding["run_id"] || bridgeNumber(value, "epoch") != bridgeNumber(binding, "runtime_epoch") || value["manifest_hash"] != w.journal.ManifestHash || value["dispatch_key"] != w.journal.DispatchKey || bridgeNumber(value, "sequence") != seal.Sequence || value["content_hash"] != c.ContentHash {
++		return errors.New("checkpoint journal identity mismatch")
++	}
++	return nil
++}
++func validPauseHash(v string) bool {
++	if len(v) != 71 || !strings.HasPrefix(v, "sha256:") {
++		return false
++	}
++	for _, c := range v[7:] {
++		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
++			return false
++		}
++	}
++	return true
++}
++
++// SealCheckpoint must be called only after Core has durably recorded the exact
++// bytes as a CHECKPOINT Artifact and its authorized use. It persists the receipt
++// before the worker can observe the acknowledgement.
++func (w *Bridge) SealCheckpoint(ctx context.Context, seal CheckpointSeal) error {
++	return w.Acknowledge(ctx, seal.Sequence, map[string]any{"sequence": seal.Sequence, "key": "checkpoint.sealed", "state": "CONFIRMED", "payload": seal})
++}
++
++// CheckpointBytes returns the already captured trusted bytes, never a second
++// read of the sandbox file. Core hashes and stores these exact bytes.
++func (w *Bridge) CheckpointBytes() ([]byte, error) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if w.journal.Checkpoint == nil {
++		return nil, errors.New("checkpoint not captured")
++	}
++	raw, err := readPauseFile(filepath.Join(w.directory, "checkpoint.sealed.json"))
++	if err != nil {
++		return nil, err
++	}
++	if Hash(raw) != w.journal.Checkpoint.ContentHash {
++		return nil, errors.New("trusted checkpoint changed")
++	}
++	return raw, nil
++}
++
++func samePauseBinding(a, b json.RawMessage) bool {
++	x, e := canonicalHash(a)
++	y, f := canonicalHash(b)
++	return e == nil && f == nil && x == y
++}
+diff --git a/adapters/runtime/mu/build-candidate.mjs b/adapters/runtime/mu/build-candidate.mjs
+new file mode 100644
+index 00000000..46a0f3fb
+--- /dev/null
++++ b/adapters/runtime/mu/build-candidate.mjs
+@@ -0,0 +1,280 @@
++import { createHash } from "node:crypto";
++import { createRequire } from "node:module";
++import { execFileSync } from "node:child_process";
++import { readFile, writeFile, mkdir, realpath, lstat } from "node:fs/promises";
++import { dirname, resolve, join, isAbsolute, relative } from "node:path";
++import { fileURLToPath } from "node:url";
++export const CANDIDATE = Object.freeze({
++  base: "7ec619a16a932ae02daa7c2e6132d266528a1da8",
++  manifest: "9e5dd1e5d93f19c6a4aa5eb5c0e2ebd7f0d1e05a987f6ec03963b4b560139da9",
++  patch: "f82f8b8f866ae920bb769b657faf0a1a8709844979422fa409cb5bbc5194ad67",
++  review: "13c6ce9fbad76c6e6f2b2c8537bbaa2e662dc5539709c0161fa5219d06dd7489",
++  protocol: "RESEARCHOS_PAUSE_V1",
++});
++const sha = (b) => createHash("sha256").update(b).digest("hex");
++const here = dirname(fileURLToPath(import.meta.url)),
++  worktree = resolve(here, "../../..");
++const git = (cwd, args) =>
++  execFileSync("git", args, {
++    cwd,
++    encoding: "utf8",
++    maxBuffer: 32 << 20,
++  }).trim();
++export async function buildCandidate({ source, output }) {
++  source = resolve(source);
++  output = resolve(output);
++  const local = join(worktree, ".local");
++  if (
++    relative(local, output).startsWith("..") ||
++    isAbsolute(relative(local, output))
++  )
++    throw Error("candidate output must be under worktree .local");
++  // Refuse symlink/junction ancestors before creating or overwriting assets.
++  for (let parent = dirname(output); ; parent = dirname(parent)) {
++    try {
++      const info = await lstat(parent);
++      if (
++        info.isSymbolicLink() ||
++        resolve(await realpath(parent)).toLowerCase() !== parent.toLowerCase()
++      )
++        throw Error("candidate output reparse rejected");
++    } catch (error) {
++      if (error.code !== "ENOENT") throw error;
++    }
++    if (parent === dirname(parent)) break;
++  }
++  for (const suffix of [
++    "",
++    ".build.json",
++    ".inputs.json",
++    ".metafile.json",
++    ".audit.json",
++  ]) {
++    try {
++      if (
++        !(await lstat(output + suffix)).isFile() ||
++        resolve(await realpath(output + suffix)).toLowerCase() !==
++          (output + suffix).toLowerCase()
++      )
++        throw Error("candidate output file reparse rejected");
++    } catch (error) {
++      if (error.code !== "ENOENT") throw error;
++    }
++  }
++  const common = git(worktree, ["rev-parse", "--git-common-dir"]),
++    root = dirname(isAbsolute(common) ? common : resolve(worktree, common));
++  const deps = join(root, "qualification/v2.4/mu/node_modules"),
++    ai = join(root, "qualification/v2.4/mu/packages/ai/dist");
++  const freeze = join(source, ".local/v6-final-20261014-r3");
++  async function verified(path, hash) {
++    const b = await readFile(path);
++    if (sha(b) !== hash) throw Error("candidate provenance drift: " + path);
++    return b;
++  }
++  const manifest = JSON.parse(
++    await verified(join(freeze, "v6-final-manifest.json"), CANDIDATE.manifest),
++  );
++  await verified(join(freeze, "v6-source.patch"), CANDIDATE.patch);
++  await verified(
++    join(
++      root,
++      "execution/v2.4/receipts/W12/W12-02/mu_m0_v6_independent_review_codex/20261014-current-chat/report.json",
++    ),
++    CANDIDATE.review,
++  );
++  const census = JSON.parse(
++    await verified(
++      join(freeze, "compiled-inputs-census.json"),
++      manifest.compiled_inputs_census_sha256,
++    ),
++  );
++  const expected = new Map(
++    census.map((x) => [resolve(x.realpath).toLowerCase(), x]),
++  );
++  async function audit() {
++    if (git(source, ["rev-parse", "HEAD"]) !== CANDIDATE.base)
++      throw Error("wrong complete candidate base");
++    const allowed = new Set(manifest.source9.map((x) => x.path));
++    const changed = git(source, ["diff", "--name-only", "HEAD"])
++      .split(/\r?\n/)
++      .filter(Boolean);
++    if (changed.some((p) => !allowed.has(p)))
++      throw Error("candidate delta outside exact9");
++    for (const f of manifest.source9)
++      await verified(join(source, f.path), f.sha256);
++    const untracked = git(source, [
++      "ls-files",
++      "--others",
++      "--exclude-standard",
++    ])
++      .split(/\r?\n/)
++      .filter((p) => p && !p.startsWith(".local/"));
++    if (untracked.some((p) => !allowed.has(p)))
++      throw Error("untracked candidate source outside exact9");
++    const patch = execFileSync(
++      "git",
++      [
++        "diff",
++        "--binary",
++        "HEAD",
++        "--",
++        ...manifest.source9.map((x) => x.path),
++      ],
++      { cwd: source, maxBuffer: 32 << 20 },
++    );
++    if (sha(patch) !== CANDIDATE.patch)
++      throw Error("actual candidate exact9 patch drift");
++    return {
++      head: CANDIDATE.base,
++      patch_sha256: sha(patch),
++      changed,
++      source9: manifest.source9,
++    };
++  }
++  const before = await audit();
++  await mkdir(dirname(output), { recursive: true });
++  const require = createRequire(import.meta.url),
++    esbuild = require(join(deps, "esbuild"));
++  if (esbuild.version !== "0.28.2") throw Error("esbuild version drift");
++  const result = await esbuild.build({
++    absWorkingDir: worktree,
++    entryPoints: [join(here, "worker.mjs")],
++    outfile: output,
++    bundle: true,
++    platform: "node",
++    format: "esm",
++    target: "node24",
++    nodePaths: [deps],
++    metafile: true,
++    logLevel: "warning",
++    banner: {
++      js: "import {createRequire as workerRequire} from 'node:module';const require=workerRequire(import.meta.url);",
++    },
++    plugins: [
++      {
++        name: "accepted-source-only",
++        setup(b) {
++          b.onResolve(
++            {
++              filter:
++                /^@earendil-works\/(pi-agent-core|pi-coding-agent|pi-ai)(?:\/.*)?$/,
++            },
++            async (args) => {
++              const [, pkg, ...suffix] = args.path.split("/");
++              const base =
++                pkg === "pi-ai"
++                  ? ai
++                  : join(
++                      source,
++                      "packages",
++                      pkg === "pi-agent-core" ? "agent" : "coding-agent",
++                      "src",
++                    );
++              const path = join(
++                base,
++                (suffix.join("/") || "index") +
++                  (pkg === "pi-ai" ? ".js" : ".ts"),
++              );
++              if (pkg === "pi-ai") {
++                const exp = expected.get(
++                  resolve(await realpath(path)).toLowerCase(),
++                );
++                if (!exp) throw Error("AI input absent from accepted census");
++                await verified(path, exp.sha256);
++              }
++              return { path };
++            },
++          );
++        },
++      },
++    ],
++  });
++  const inputs = [];
++  for (const name of Object.keys(result.metafile.inputs)) {
++    if (name.startsWith("<")) throw Error("unrecorded virtual input");
++    const path = resolve(worktree, name),
++      real = await realpath(path),
++      bytes = await readFile(real),
++      hash = sha(bytes),
++      norm = real.replaceAll("\\", "/");
++    if (
++      /\/packages\/(agent|coding-agent)\/dist\//.test(norm) ||
++      /node_modules\/@earendil-works\/pi-(agent-core|coding-agent)\//.test(norm)
++    )
++      throw Error("installed agent/session fallback");
++    if (norm.includes("/packages/ai/dist/")) {
++      const exp = expected.get(resolve(real).toLowerCase());
++      if (!exp || exp.sha256 !== hash)
++        throw Error("unverified AI distribution input");
++    }
++    const prior = expected.get(resolve(real).toLowerCase());
++    if (prior && prior.sha256 !== hash)
++      throw Error("accepted dependency changed");
++    inputs.push({ path, realpath: real, sha256: hash, bytes: bytes.length });
++  }
++  for (const p of [
++    "packages/agent/src/agent.ts",
++    "packages/coding-agent/src/core/agent-session.ts",
++  ])
++    if (
++      !inputs.some(
++        (i) =>
++          resolve(i.realpath).toLowerCase() ===
++          resolve(source, p).toLowerCase(),
++      )
++    )
++      throw Error("candidate production source missing");
++  const after = await audit(),
++    bundle = await readFile(output),
++    worker = await readFile(join(here, "worker.mjs"));
++  const metadata = {
++    source_mode: "ACCEPTED_M0_CANDIDATE",
++    candidate_manifest_sha256: CANDIDATE.manifest,
++    candidate_base: CANDIDATE.base,
++    candidate_patch_sha256: CANDIDATE.patch,
++    independent_review_sha256: CANDIDATE.review,
++    protocol_capability: CANDIDATE.protocol,
++    source_sha256: sha(worker),
++    bundle_sha256: sha(bundle),
++    bundle_bytes: bundle.length,
++    esbuild_version: esbuild.version,
++    node_version: process.version,
++    sdk_version: JSON.parse(
++      await readFile(join(source, "packages/coding-agent/package.json")),
++    ).version,
++    ai_version: JSON.parse(
++      await readFile(
++        join(root, "qualification/v2.4/mu/packages/ai/package.json"),
++      ),
++    ).version,
++    compiled_inputs: inputs.length,
++    compiled_inputs_sha256: sha(JSON.stringify(inputs)),
++    metafile_sha256: sha(JSON.stringify(result.metafile)),
++  };
++  await writeFile(output + ".inputs.json", JSON.stringify(inputs, null, 2));
++  await writeFile(
++    output + ".metafile.json",
++    JSON.stringify(result.metafile, null, 2),
++  );
++  await writeFile(
++    output + ".audit.json",
++    JSON.stringify({ before, after }, null, 2),
++  );
++  await writeFile(output + ".build.json", JSON.stringify(metadata, null, 2));
++  return metadata;
++}
++if (
++  process.argv[1] &&
++  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
++) {
++  if (process.argv.length !== 4)
++    throw Error("usage: build-candidate.mjs accepted-source output");
++  console.log(
++    JSON.stringify(
++      await buildCandidate({
++        source: process.argv[2],
++        output: process.argv[3],
++      }),
++    ),
++  );
++}
+diff --git a/adapters/runtime/mu/build-candidate.test.mjs b/adapters/runtime/mu/build-candidate.test.mjs
+new file mode 100644
+index 00000000..1fe89332
+--- /dev/null
++++ b/adapters/runtime/mu/build-candidate.test.mjs
+@@ -0,0 +1,66 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readFile, mkdir } from "node:fs/promises";
++import { resolve, join } from "node:path";
++import { createHash } from "node:crypto";
++import { buildCandidate, CANDIDATE } from "./build-candidate.mjs";
++const source = process.env.RESEARCHOS_ACCEPTED_MU_SOURCE;
++assert.ok(source, "explicit accepted candidate source required");
++const sha = (b) => createHash("sha256").update(b).digest("hex");
++test(
++  "candidate builder compiles real agent and session source with accepted full base and records every input",
++  { timeout: 60000 },
++  async () => {
++    const output = resolve(".local/m1-01/build-test/mu-worker.mjs"),
++      meta = await buildCandidate({ source, output });
++    assert.equal(meta.source_mode, "ACCEPTED_M0_CANDIDATE");
++    assert.equal(meta.candidate_base, CANDIDATE.base);
++    assert.equal(meta.candidate_manifest_sha256, CANDIDATE.manifest);
++    assert.ok(!("mu_commit" in meta));
++    const inputs = JSON.parse(await readFile(output + ".inputs.json")),
++      audit = JSON.parse(await readFile(output + ".audit.json"));
++    assert.equal(inputs.length, meta.compiled_inputs);
++    assert.equal(sha(JSON.stringify(inputs)), meta.compiled_inputs_sha256);
++    assert.deepEqual(audit.before, audit.after);
++    for (const name of [
++      "packages/agent/src/agent.ts",
++      "packages/coding-agent/src/core/agent-session.ts",
++    ])
++      assert.ok(
++        inputs.some((x) => resolve(x.realpath) === resolve(source, name)),
++      );
++    assert.ok(
++      inputs.every(
++        (x) =>
++          !/[\\/]packages[\\/](agent|coding-agent)[\\/]dist[\\/]/.test(
++            x.realpath,
++          ),
++      ),
++    );
++    for (const input of inputs)
++      assert.equal(
++        sha(await readFile(input.realpath)),
++        input.sha256,
++        "actual input remains exact: " + input.path,
++      );
++    assert.equal(sha(await readFile(output)), meta.bundle_sha256);
++  },
++);
++test("candidate builder rejects output outside separate local assets root", async () => {
++  await assert.rejects(
++    buildCandidate({
++      source,
++      output: resolve("adapters/runtime/mu/forbidden.mjs"),
++    }),
++    /worktree .local/,
++  );
++});
++test("installed legacy source cannot masquerade as accepted candidate", async () => {
++  await assert.rejects(
++    buildCandidate({
++      source: resolve("third_party/mu"),
++      output: resolve(".local/m1-01/rejected/mu-worker.mjs"),
++    }),
++    /ENOENT|provenance|candidate/,
++  );
++});
+diff --git a/adapters/runtime/mu/worker-pause.test.mjs b/adapters/runtime/mu/worker-pause.test.mjs
+new file mode 100644
+index 00000000..cf19e83e
+--- /dev/null
++++ b/adapters/runtime/mu/worker-pause.test.mjs
+@@ -0,0 +1,452 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { createInterface } from "node:readline";
++import { createHash } from "node:crypto";
++import { gzipSync } from "node:zlib";
++const bundle = process.env.RESEARCHOS_PAUSE_WORKER_BUNDLE;
++assert.ok(bundle, "actual rebuilt candidate worker required");
++const sha = (b) => createHash("sha256").update(b).digest("hex"),
++  digest = (b) => "sha256:" + sha(b),
++  version = "RESEARCHOS_PAUSE_V1";
++const config = {
++  ref: "fixture",
++  api: "openai-completions",
++  provider: "openai",
++  model: "fixture",
++  endpoint: "https://fixture.invalid",
++  route: "broker",
++  max_output_tokens: 128,
++  max_calls: 8,
++  tools: [],
++};
++const sse =
++  "data: " +
++  JSON.stringify({
++    id: "fixture",
++    object: "chat.completion.chunk",
++    choices: [
++      {
++        index: 0,
++        delta: { role: "assistant", content: "reply" },
++        finish_reason: null,
++      },
++    ],
++  }) +
++  "\n\ndata: " +
++  JSON.stringify({
++    id: "fixture",
++    object: "chat.completion.chunk",
++    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
++  }) +
++  "\n\ndata: [DONE]\n\n";
++async function run(
++  t,
++  {
++    snapshot,
++    ack = "valid",
++    epoch = 1,
++    mutateActivation,
++    withTool = false,
++  } = {},
++) {
++  const root = await mkdtemp(join(tmpdir(), "researchos-production-pause-"));
++  await mkdir(join(root, "input"));
++  await mkdir(join(root, "output"));
++  const binding = {
++    project_id: "p",
++    session_id: "s",
++    task_id: "t",
++    run_id: "r",
++    runtime_epoch: epoch,
++    queue_generation: "g",
++    dispatch_key: "d" + epoch,
++    manifest_hash: digest("manifest" + epoch),
++  };
++  const request = {
++    task_id: "t",
++    run_id: "r",
++    epoch,
++    input_refs: [],
++    context: {},
++    task_title: "pause evidence",
++    task_description: "original prompt once",
++    queue_control: true,
++    queue_binding: { ...binding },
++    pause_protocol: version,
++  };
++  if (snapshot) {
++    request.pause_activation = {
++      version,
++      previous_epoch: 1,
++      new_epoch: epoch,
++      checkpoint_hash: digest(snapshot),
++      checkpoint_artifact_id: "a",
++      checkpoint_use_receipt_hash: digest("u"),
++      checkpoint_use_principal: "executor",
++      carry_use_receipt_hash: digest("carry"),
++      original_input_hash: JSON.parse(snapshot).input_hash,
++    };
++    mutateActivation?.(request.pause_activation);
++    await writeFile(join(root, "input", "pause-checkpoint.json"), snapshot);
++  }
++  await writeFile(join(root, "input", "request.json"), JSON.stringify(request));
++  await writeFile(
++    join(root, "input", "worker.json"),
++    JSON.stringify({
++      ...config,
++      tools: withTool
++        ? [
++            {
++              type: "function",
++              function: {
++                name: "read",
++                description: "Read a declared file",
++                parameters: {
++                  type: "object",
++                  properties: { path: { type: "string" } },
++                  required: ["path"],
++                },
++              },
++            },
++          ]
++        : [],
++    }),
++  );
++  const child = spawn(
++    process.execPath,
++    [bundle, join(root, "input", "request.json")],
++    { cwd: root, stdio: ["pipe", "pipe", "pipe"] },
++  );
++  const exited = new Promise((resolve) => child.once("exit", resolve));
++  let stderr = "";
++  child.stderr.on("data", (x) => (stderr += x));
++  t.after(async () => {
++    if (child.exitCode === null) child.kill();
++    await exited;
++    await rm(root, {
++      recursive: true,
++      force: true,
++      maxRetries: 5,
++      retryDelay: 50,
++    });
++  });
++  binding.process_identity = {
++    pid: child.pid,
++    process_created_ns: "1",
++    job: "j" + epoch,
++    appcontainer_sid: "sid",
++    profile: "profile",
++    staging_directory: root,
++  };
++  const send = (x) => child.stdin.write(JSON.stringify(x) + "\n"),
++    control = (x) => send({ ...x, binding });
++  const frames = [],
++    effects = [];
++  let checkpoint,
++    prepared = false,
++    committed = false;
++  const finished = new Promise((resolve, reject) => {
++    const reader = createInterface({ input: child.stdout });
++    reader.on("line", (line) => {
++      try {
++        const f = JSON.parse(line);
++        frames.push(f);
++        assert.equal(f.sequence, frames.length);
++        if (f.type === "context.ready")
++          control({
++            type: "command.deliver",
++            initialize: true,
++            command: null,
++            pause_protocol: version,
++          });
++        if (f.type === "command.accepted" && f.payload.initialized)
++          send({
++            sequence: f.sequence,
++            key: "command.initialize",
++            state: "CONFIRMED",
++            payload: {},
++          });
++        if (f.type === "effect.request") {
++          effects.push(f);
++          if (
++            !snapshot &&
++            (withTool ? f.capability === "TOOL" : effects.length === 1)
++          ) {
++            for (const [i, delivery] of ["STEER", "FOLLOW_UP"].entries()) {
++              const content = JSON.stringify({
++                text: "queued-" + i,
++                attachments: [],
++              });
++              control({
++                type: "command.deliver",
++                command: {
++                  command_id: "c" + i,
++                  message_id: "m" + i,
++                  queue_sequence: i + 1,
++                  content,
++                  content_hash: digest(content),
++                  delivery,
++                },
++              });
++            }
++            control({ type: "command.pause", version, pause_id: "pause-1" });
++          }
++          const toolSSE =
++            "data: " +
++            JSON.stringify({
++              id: "fixture",
++              object: "chat.completion.chunk",
++              choices: [
++                {
++                  index: 0,
++                  delta: {
++                    role: "assistant",
++                    tool_calls: [
++                      {
++                        index: 0,
++                        id: "call-1",
++                        type: "function",
++                        function: {
++                          name: "read",
++                          arguments: JSON.stringify({ path: "file.txt" }),
++                        },
++                      },
++                    ],
++                  },
++                  finish_reason: null,
++                },
++              ],
++            }) +
++            "\n\ndata: " +
++            JSON.stringify({
++              id: "fixture",
++              object: "chat.completion.chunk",
++              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
++            }) +
++            "\n\ndata: [DONE]\n\n";
++          const body =
++            withTool && !snapshot && f.capability === "MODEL" ? toolSSE : sse;
++          if (f.capability === "TOOL") {
++            setTimeout(
++              () =>
++                send({
++                  sequence: f.sequence,
++                  key: f.key,
++                  state: "CONFIRMED",
++                  payload: {
++                    content: [{ type: "text", text: "tool-result-preserved" }],
++                    details: {
++                      path: "file.txt",
++                      content_hash: digest("tool-result-preserved"),
++                      next_offset: 21,
++                      truncated: false,
++                      size_bytes: 21,
++                    },
++                  },
++                }),
++              50,
++            );
++            return;
++          }
++          setTimeout(
++            () =>
++              send({
++                sequence: f.sequence,
++                key: f.key,
++                state: "CONFIRMED",
++                payload: {
++                  status: 200,
++                  content_type: "text/event-stream",
++                  body_encoding: "gzip+base64",
++                  body_gzip_base64: gzipSync(body).toString("base64"),
++                  body_sha256: digest(body),
++                },
++              }),
++            50,
++          );
++        }
++        if (f.type === "checkpoint") {
++          checkpoint = f;
++          const payload = {
++            type: "checkpoint.sealed",
++            version,
++            pause_id: f.payload.pause_id,
++            binding,
++            checkpoint_sequence: f.sequence,
++            content_hash: f.payload.content_hash,
++            checkpoint_artifact_id: "a",
++            checkpoint_use_receipt_hash: digest("u"),
++            checkpoint_use_principal: "executor",
++            journal_checkpoint_hash: digest("journal"),
++          };
++          if (ack === "boolean") {
++            delete payload.type;
++            payload.persisted = true;
++          }
++          if (ack === "wrong-hash") payload.content_hash = digest("wrong");
++          if (ack === "old-epoch")
++            payload.binding = { ...binding, runtime_epoch: 0 };
++          send({
++            sequence: f.sequence,
++            key: "checkpoint.sealed",
++            state: "CONFIRMED",
++            payload,
++          });
++        }
++        if (snapshot && f.type === "command.idle") {
++          if (!prepared) {
++            prepared = true;
++            control({ type: "command.prepare_seal", through: 2 });
++          } else if (!committed) {
++            committed = true;
++            control({ type: "command.commit_seal", through: 2 });
++          }
++        }
++      } catch (e) {
++        reject(e);
++        child.kill();
++      }
++    });
++    child.once("error", reject);
++    child.once("exit", (code) => resolve({ code, stderr }));
++  });
++  const terminal = await finished;
++  let raw;
++  if (checkpoint)
++    raw = await readFile(join(root, "output", "pause-checkpoint.json"));
++  let result;
++  if (terminal.code === 0 && snapshot)
++    result = JSON.parse(await readFile(join(root, "output", "result.json")));
++  return { ...terminal, frames, effects, checkpoint, raw, result };
++}
++test(
++  "actual production worker pauses both SDK queues and restores same Run with cumulative effects and no prompt replay",
++  { timeout: 30000 },
++  async (t) => {
++    const first = await run(t);
++    assert.equal(first.code, 0, first.stderr);
++    assert.equal(first.frames.at(-1).type, "turn.paused");
++    assert.ok(first.frames.at(-1).sequence > first.checkpoint.sequence);
++    const snapshot = JSON.parse(first.raw);
++    assert.equal(snapshot.counts.model_calls, 1);
++    assert.equal(snapshot.commands.length, 2);
++    assert.equal(snapshot.queue_state.queue_cut, 2);
++    assert.equal(snapshot.queue_state.sdk_pending_mapping.length, 2);
++    assert.equal(
++      snapshot.queue_state.command_ledger_hash,
++      digest(
++        JSON.stringify(snapshot.commands, (_key, value) =>
++          value !== null && typeof value === "object" && !Array.isArray(value)
++            ? Object.fromEntries(
++                Object.keys(value)
++                  .sort()
++                  .map((k) => [k, value[k]]),
++              )
++            : value,
++        ),
++      ),
++    );
++    assert.equal(snapshot.sdk.payload.agent.steering.pending.length, 1);
++    assert.equal(snapshot.sdk.payload.agent.followUp.pending.length, 1);
++    const oldEpoch = snapshot.sdk.payload.binding.leaseEpoch,
++      oldId = snapshot.sdk.payload.binding.sessionId;
++    const resumed = await run(t, { snapshot: first.raw, epoch: 2 });
++    assert.equal(resumed.code, 0, resumed.stderr);
++    assert.equal(resumed.frames.at(-1).type, "turn.completed");
++    assert.equal(resumed.result.model_calls, resumed.effects.length + 1);
++    assert.deepEqual(
++      resumed.frames
++        .filter((f) => f.type === "command.consumed")
++        .map((f) => f.payload.command_id),
++      ["c0", "c1"],
++    );
++    assert.equal(
++      resumed.frames.filter(
++        (f) => f.type === "command.accepted" && f.payload.command_id,
++      ).length,
++      0,
++    );
++    assert.ok(resumed.effects.every((f) => f.key.startsWith("t:r:2:model:")));
++    assert.equal(resumed.effects[0].key, "t:r:2:model:2");
++    assert.equal(
++      resumed.result.messages.filter(
++        (m) =>
++          m.role === "user" &&
++          JSON.stringify(m.content).includes("original prompt once"),
++      ).length,
++      1,
++    );
++    assert.equal(
++      JSON.parse(first.raw).sdk.payload.binding.leaseEpoch,
++      oldEpoch,
++    );
++    assert.equal(JSON.parse(first.raw).sdk.payload.binding.sessionId, oldId);
++    t.diagnostic(
++      JSON.stringify({
++        evidence: "PRODUCTION_WORKER_PROCESS_SYNTHETIC_BROKER_NO_MODEL",
++        first_frames: first.frames.map((f) => [f.sequence, f.type]),
++        resume_frames: resumed.frames.map((f) => [f.sequence, f.type]),
++        counts: resumed.result.model_calls,
++      }),
++    );
++  },
++);
++for (const ack of ["boolean", "wrong-hash", "old-epoch"])
++  test(
++    "production worker rejects " + ack + " checkpoint ACK",
++    { timeout: 15000 },
++    async (t) => {
++      const r = await run(t, { ack });
++      assert.notEqual(r.code, 0);
++      assert.ok(!r.frames.some((f) => f.type === "turn.paused"));
++      assert.match(r.stderr, /seal ACK mismatch/);
++    },
++  );
++test(
++  "restore rejects epoch relabel and changed checkpoint hash before model",
++  { timeout: 30000 },
++  async (t) => {
++    const first = await run(t);
++    assert.equal(first.code, 0, first.stderr);
++    const r = await run(t, {
++      snapshot: first.raw,
++      epoch: 2,
++      mutateActivation: (a) => (a.original_input_hash = "0".repeat(64)),
++    });
++    assert.notEqual(r.code, 0);
++    assert.equal(r.effects.length, 0);
++    assert.match(r.stderr, /original identity mismatch/);
++  },
++);
++
++test(
++  "completed production TOOL result and cumulative tool count survive restore without effect replay",
++  { timeout: 30000 },
++  async (t) => {
++    const first = await run(t, { withTool: true });
++    assert.equal(first.code, 0, first.stderr);
++    const checkpoint = JSON.parse(first.raw);
++    assert.equal(checkpoint.counts.tool_calls, 1);
++    assert.equal(
++      checkpoint.sdk.payload.agent.messages.filter(
++        (m) => m.role === "toolResult",
++      ).length,
++      1,
++    );
++    const resumed = await run(t, {
++      withTool: true,
++      snapshot: first.raw,
++      epoch: 2,
++    });
++    assert.equal(resumed.code, 0, resumed.stderr);
++    assert.equal(resumed.result.tool_calls, 1);
++    assert.ok(resumed.effects.every((f) => f.capability === "MODEL"));
++    const result = resumed.result.messages.find((m) => m.role === "toolResult");
++    assert.equal(result.content[0].text, "tool-result-preserved");
++    assert.equal(result.details.path, "file.txt");
++  },
++);
+diff --git a/adapters/runtime/mu/worker.mjs b/adapters/runtime/mu/worker.mjs
+index c713f660..53242430 100644
+--- a/adapters/runtime/mu/worker.mjs
++++ b/adapters/runtime/mu/worker.mjs
+@@ -1,5 +1,5 @@
+ import { createHash } from "node:crypto";
+-import { readFile, writeFile } from "node:fs/promises";
++import { readFile, writeFile, open, lstat } from "node:fs/promises";
+ import { dirname, join, resolve } from "node:path";
+ import { createInterface } from "node:readline";
+ import { Transform } from "node:stream";
+@@ -444,10 +444,11 @@ function parseRequest(raw) {
+   return request;
+ }
+ 
+-function createProtocol(config, request, inputHash) {
++export function createProtocol(config, request, inputHash, restoredCounts) {
+   let sequence = 0;
+-  let modelCalls = 0;
+-  let toolCalls = 0;
++  let modelCalls = restoredCounts?.model_calls ?? 0;
++  let toolCalls = restoredCounts?.tool_calls ?? 0;
++  if (![modelCalls, toolCalls].every(n => Number.isSafeInteger(n) && n >= 0) || modelCalls > config.max_calls) throw new Error("invalid cumulative effect counts");
+   const pending = new Map();
+   let onControl;
+   let fatal, effectFailure;
+@@ -465,7 +466,7 @@ function createProtocol(config, request, inputHash) {
+     try {
+       if (Buffer.byteLength(line) > MAX_FRAME_BYTES) throw new Error("stdin acknowledgement exceeds frame limit");
+       const reply = parseWireJSON(line);
+-      if (object(reply) && (reply.version !== undefined || reply.type?.startsWith("stream."))) {
++      if (object(reply) && ((reply.version !== undefined && !reply.type?.startsWith("command.")) || reply.type?.startsWith("stream."))) {
+         streams.receive(reply);
+         return;
+       }
+@@ -549,7 +550,7 @@ function createProtocol(config, request, inputHash) {
+   }
+ 
+   return {
+-    ready: () => emit({ type: "context.ready", payload: { input_hash: `sha256:${inputHash}` } }),
++    ready: () => emit({ type: "context.ready", payload: { input_hash: `sha256:${inputHash}`, ...(request.pause_protocol === PAUSE_PROTOCOL ? { pause_protocol: PAUSE_PROTOCOL } : {}) } }),
+     effect,
+     model: async (payload, signal) => {
+       let state;
+@@ -560,10 +561,10 @@ function createProtocol(config, request, inputHash) {
+     initialize: binding => { initializedBinding = binding; },
+     streams,
+     emit,
+-    acknowledged: async (frame, key) => {
++    acknowledged: async (frame, key, registered) => {
+       let resolveReply, rejectReply;
+       const answer = new Promise((resolve, reject) => { resolveReply = resolve; rejectReply = reject; });
+-      await emit(frame, (seq) => pending.set(seq, { key, kind: "control", resolve: resolveReply, reject: rejectReply }));
++      await emit(frame, (seq) => { pending.set(seq, { key, kind: "control", resolve: resolveReply, reject: rejectReply }); registered?.(seq); });
+       return await answer;
+     },
+     control: (handler) => { onControl = handler; },
+@@ -583,8 +584,9 @@ function createProtocol(config, request, inputHash) {
+   };
+ }
+ 
+-function createCommandController(session, protocol, request) {
+-  const ledger = new Map();
++export function createCommandController(session, protocol, request, pause = {}) {
++  const ledger = new Map((pause.restored?.commands ?? []).map(entry => [entry.details.command_id, structuredClone(entry)]));
++  let pausing = false;
+   let binding, initialized = false, cancelled = false, preparing = null, sealed = false;
+   let chain = Promise.resolve();
+   let resolveSeal, rejectSeal;
+@@ -594,7 +596,7 @@ function createCommandController(session, protocol, request) {
+   const emit = (type, extra = {}) => protocol.emit({ type, payload: { ...binding, ...extra } });
+   const outstanding = () => [...ledger.values()].filter((entry) => entry.state !== "CONSUMED" && entry.state !== "DROPPED");
+   const idle = async () => {
+-    if (!initialized || sealed || !session.isIdle || session.agent.hasQueuedMessages()) return;
++    if (!initialized || sealed || pausing || !session.isIdle || session.agent.hasQueuedMessages()) return;
+     if (outstanding().length) return;
+     await emit("command.idle", { through: preparing ?? 0, sdk_queue_empty: true, sdk_idle: true, cancelled });
+   };
+@@ -634,8 +636,9 @@ function createCommandController(session, protocol, request) {
+     if (frame.type === "command.deliver") {
+       if (frame.initialize === true && frame.command === null) {
+         if (!initialized) {
++          if (request.pause_protocol === PAUSE_PROTOCOL && frame.pause_protocol !== PAUSE_PROTOCOL) throw new Error("pause capability not negotiated");
+           initialized = true;
+-          await protocol.acknowledged({ type: "command.accepted", payload: { ...binding, initialized: true } }, "command.initialize");
++          await protocol.acknowledged({ type: "command.accepted", payload: { ...binding, initialized: true, ...(request.pause_protocol === PAUSE_PROTOCOL ? { pause_protocol: PAUSE_PROTOCOL } : {}) } }, "command.initialize");
+           protocol.initialize(binding);
+           resolveReady();
+         }
+@@ -643,7 +646,7 @@ function createCommandController(session, protocol, request) {
+       }
+       if (!initialized || frame.command === null) throw new Error("command before initialization");
+       const command = frame.command;
+-      if (cancelled || !object(command) || !["STEER", "FOLLOW_UP"].includes(command.delivery) ||
++      if (pausing || cancelled || !object(command) || !["STEER", "FOLLOW_UP"].includes(command.delivery) ||
+           typeof command.command_id !== "string" || typeof command.message_id !== "string" ||
+           typeof command.content !== "string" || Buffer.byteLength(command.content) > 32 * 1024 ||
+           command.content_hash !== `sha256:${sha256(command.content)}` ||
+@@ -667,6 +670,38 @@ function createCommandController(session, protocol, request) {
+       const turn = session.sendCustomMessage({ customType: "researchos.command.v1", content, display: true, details }, { deliverAs: command.delivery === "STEER" ? "steer" : "followUp", triggerTurn: true });
+       turn.then(() => enqueue(idle), rejectSeal);
+       await emit("command.accepted", { ...details, message_id: command.message_id });
++    } else if (frame.type === "command.pause") {
++      if (request.pause_protocol !== PAUSE_PROTOCOL || frame.version !== PAUSE_PROTOCOL || cancelled || pausing || preparing !== null ||
++          typeof frame.pause_id !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(frame.pause_id) || typeof session.requestPause !== "function") throw new Error("pause unsupported or fenced");
++      pausing = true;
++      // Do not block the command actor: SDK consumption receipts already queued
++      // must drain before capturing the immutable command cut.
++      session.requestPause().then(() => enqueue(async () => {
++        if (!session.isIdle || !protocol.streams.closed()) throw new Error("pause before SDK/stream drain");
++        const sdk = session.exportPauseCheckpoint({ leaseEpoch: request.epoch, inputHash: pause.inputHash });
++        const snapshot = { version: PAUSE_PROTOCOL, pause_id: frame.pause_id, binding, input_hash: pause.inputHash,
++          config_hash: pause.configHash, counts: protocol.counts(), commands: [...ledger.values()], sdk };
++        snapshot.queue_state = pauseQueueState(snapshot);
++        validatePauseLedger(snapshot);
++        const raw = Buffer.from(JSON.stringify(snapshot));
++        if (raw.length > MAX_CHECKPOINT_BYTES) throw new Error("pause checkpoint exceeds 12 MiB");
++        const file = await open(join(pause.outputDir, PAUSE_FILE), "wx", 0o600);
++        try { await file.writeFile(raw); await file.sync(); } finally { await file.close(); }
++        const payload = { version: PAUSE_PROTOCOL, pause_id: frame.pause_id, binding, content_hash: `sha256:${sha256(raw)}`, bytes: raw.length,
++          input_hash: pause.inputHash, ...protocol.counts(), queue_cut: snapshot.queue_state.queue_cut,
++          command_ledger_hash: snapshot.queue_state.command_ledger_hash, sdk_watermarks: snapshot.queue_state.sdk_watermarks, sdk_session_id: sdk.payload.binding.sessionId };
++        let checkpointSequence;
++        const ack = await protocol.acknowledged({ type: "checkpoint", key: "checkpoint.sealed", path: PAUSE_FILE, payload }, "checkpoint.sealed", seq => { checkpointSequence = seq; });
++        if (!object(ack) || ack.type !== "checkpoint.sealed" || ack.version !== PAUSE_PROTOCOL || ack.checkpoint_sequence !== checkpointSequence ||
++            ack.content_hash !== payload.content_hash || ack.pause_id !== frame.pause_id || canonicalJSON(ack.binding) !== canonicalJSON(binding) ||
++            ["checkpoint_artifact_id", "checkpoint_use_receipt_hash", "checkpoint_use_principal", "journal_checkpoint_hash"].some(k => typeof ack[k] !== "string" || !ack[k]) ||
++            ![ack.checkpoint_use_receipt_hash, ack.journal_checkpoint_hash].every(h => /^sha256:[a-f0-9]{64}$/.test(h))) throw new Error("checkpoint durable seal ACK mismatch");
++        sealed = true;
++        await protocol.emit({ type: "turn.paused", payload: { ...payload, checkpoint_sequence: checkpointSequence, checkpoint_artifact_id: ack.checkpoint_artifact_id, checkpoint_use_receipt_hash: ack.checkpoint_use_receipt_hash, checkpoint_use_principal: ack.checkpoint_use_principal, journal_checkpoint_hash: ack.journal_checkpoint_hash } });
++        resolveSeal({ paused: true });
++      }), rejectSeal);
++    } else if (pausing) {
++      throw new Error("control during pause requires reconciliation");
+     } else if (frame.type === "command.prepare_seal") {
+       if (!initialized) throw new Error("seal before initialization");
+       if (!Number.isSafeInteger(frame.through) || frame.through < 0 || (preparing !== null && preparing !== frame.through)) throw new Error("invalid seal watermark");
+@@ -710,6 +745,83 @@ function makeTools(config, protocol) {
+   }));
+ }
+ 
++export const PAUSE_PROTOCOL = "RESEARCHOS_PAUSE_V1";
++export const PAUSE_FILE = "pause-checkpoint.json";
++export const MAX_CHECKPOINT_BYTES = 12 * 1024 * 1024;
++export function registerCommandPauseSchema(agent) {
++  agent.registerPauseDataSchema({ kind: "message", role: "custom", customType: "researchos.command.v1", version: "1", schema: {
++    type: "object", properties: { role: { type: "literal", value: "custom" }, customType: { type: "literal", value: "researchos.command.v1" },
++      content: { type: "array", items: { type: "object", properties: { type: { type: "literal", value: "text" }, text: { type: "string" } } } },
++      display: { type: "boolean" }, timestamp: { type: "number" }, details: { type: "object", properties: {
++        command_id: { type: "string" }, queue_generation: { type: "string" }, queue_sequence: { type: "number" }, content_hash: { type: "string" } } } } } });
++}
++// These are the fixed data contracts returned by the production Host tools.
++// A checkpoint cannot invent a schema or authorize an unknown extension type.
++export function registerToolPauseSchemas(agent, tools) {
++  const schema = fields => ({ type: "object", properties: Object.fromEntries(Object.entries(fields).map(([key, type]) => [key, { type }])) });
++  const write = { path: "string", content_hash: "string", size_bytes: "number", operation: "string" };
++  const registered = {
++    read: { path: "string", content_hash: "string", next_offset: "number", truncated: "boolean", size_bytes: "number" },
++    write, edit: write,
++    run_check: { check_id: "string", exit_code: "number", timed_out: "boolean", stdout_hash: "string", stderr_hash: "string", source_manifest_hash: "string",
++      source_count: "number", frozen_policy_hash: "string", toolchain_hash: "string", vendor_hash: "string", job_total_processes: "number",
++      children_stopped: "boolean", streams_drained: "boolean", cleanup_complete: "boolean", stdout_truncated: "boolean", stderr_truncated: "boolean",
++      stdout_omitted_bytes: "number", stderr_omitted_bytes: "number", stdout_raw_bytes: "number", stderr_raw_bytes: "number", stdout_utf8_replaced: "boolean", stderr_utf8_replaced: "boolean" },
++  };
++  for (const { function: fn } of tools) {
++    if (registered[fn.name]) agent.registerPauseDataSchema({ kind: "toolDetails", toolName: fn.name, version: "researchos.host-tool.v1", schema: schema(registered[fn.name]) });
++  }
++}
++export function pauseQueueState(snapshot) {
++  const agent = snapshot.sdk.payload.agent;
++  return { queue_cut: Math.max(0, ...snapshot.commands.map(e => e.details.queue_sequence)),
++    command_ledger_hash: digest(canonicalJSON(snapshot.commands)),
++    sdk_watermarks: { steering: agent.steering.lastConsumedSequence, follow_up: agent.followUp.lastConsumedSequence },
++    sdk_pending_mapping: [["STEER", agent.steering], ["FOLLOW_UP", agent.followUp]].flatMap(([delivery, queue]) =>
++      queue.pending.filter(p => p.message.customType === "researchos.command.v1").map(p => ({ delivery, sdk_sequence: p.sequence, command_id: p.message.details.command_id }))) };
++}
++export function validatePauseLedger(snapshot) {
++  if (!Array.isArray(snapshot.commands) || snapshot.commands.length > 32 || !object(snapshot.counts) ||
++      ![snapshot.counts.model_calls, snapshot.counts.tool_calls].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error("invalid checkpoint ledger/counts");
++  const agent = snapshot.sdk.payload.agent, pending = [...agent.steering.pending, ...agent.followUp.pending].map(p => p.message);
++  const ids = new Set(), sequences = new Set(), messages = new Set();
++  for (const entry of snapshot.commands) {
++    const command = JSON.parse(entry.frozen), d = entry.details;
++    if (!object(d) || ids.has(d.command_id) || sequences.has(d.queue_sequence) || messages.has(entry.message_id) ||
++        d.queue_generation !== snapshot.binding.queue_generation || !Number.isSafeInteger(d.queue_sequence) || d.queue_sequence < 1 ||
++        command.command_id !== d.command_id || command.message_id !== entry.message_id || command.content_hash !== d.content_hash ||
++        command.queue_sequence !== d.queue_sequence || d.content_hash !== `sha256:${sha256(command.content)}` ||
++        !["SDK_ACCEPTED", "CONSUMED", "DROPPED"].includes(entry.state)) throw new Error("invalid checkpoint command mapping");
++    ids.add(d.command_id);sequences.add(d.queue_sequence);messages.add(entry.message_id);
++    const matches = pending.filter(m => m.customType === "researchos.command.v1" && m.details?.command_id === d.command_id);
++    if (entry.state === "SDK_ACCEPTED" ? matches.length !== 1 : matches.length !== 0) throw new Error("checkpoint queue/ledger mismatch");
++    if (matches.length && canonicalJSON(matches[0].details) !== canonicalJSON(d)) throw new Error("checkpoint queue content mismatch");
++  }
++  if (pending.some(m => m.customType === "researchos.command.v1" && !ids.has(m.details?.command_id))) throw new Error("unmapped SDK command");
++  for (const entry of snapshot.commands.filter(e => e.state === "CONSUMED")) {
++    const consumed = agent.messages.filter(m => m.customType === "researchos.command.v1" && m.details?.command_id === entry.details.command_id);
++    if (consumed.length !== 1 || canonicalJSON(consumed[0].details) !== canonicalJSON(entry.details)) throw new Error("consumed command missing from SDK history");
++  }
++  if (canonicalJSON(snapshot.queue_state) !== canonicalJSON(pauseQueueState(snapshot))) throw new Error("checkpoint SDK watermark/mapping mismatch");
++}
++export async function loadPauseActivation(inputDir, request, configHash) {
++  const a = request.pause_activation;
++  if (request.pause_protocol !== PAUSE_PROTOCOL || request.queue_control !== true || !object(a) || a.version !== PAUSE_PROTOCOL ||
++      !Number.isSafeInteger(a.previous_epoch) || a.previous_epoch < 1 || a.new_epoch !== request.epoch || a.new_epoch !== a.previous_epoch + 1 ||
++      ["checkpoint_artifact_id", "checkpoint_use_receipt_hash", "checkpoint_use_principal", "carry_use_receipt_hash"].some(k => typeof a[k] !== "string" || !a[k]) ||
++      ![a.checkpoint_hash,a.checkpoint_use_receipt_hash,a.carry_use_receipt_hash].every(h => /^sha256:[a-f0-9]{64}$/.test(h))) throw new Error("invalid pause activation");
++  const path=join(inputDir, PAUSE_FILE), info=await lstat(path);
++  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_CHECKPOINT_BYTES) throw new Error("invalid checkpoint file");
++  const file=await open(path,"r");let raw;
++  try { raw=Buffer.alloc(MAX_CHECKPOINT_BYTES+1);const {bytesRead}=await file.read(raw,0,raw.length,0);raw=raw.subarray(0,bytesRead); } finally {await file.close();}
++  if (raw.length > MAX_CHECKPOINT_BYTES || `sha256:${sha256(raw)}` !== a.checkpoint_hash) throw new Error("checkpoint bytes/hash mismatch");
++  const s=JSON.parse(raw), b=s.binding, old=s.sdk?.payload.binding;
++  if (s.version !== PAUSE_PROTOCOL || s.config_hash !== configHash || s.input_hash !== a.original_input_hash || old?.inputHash !== s.input_hash ||
++      old.leaseEpoch !== a.previous_epoch || b.runtime_epoch !== a.previous_epoch || b.task_id !== request.task_id || b.run_id !== request.run_id ||
++      ["project_id", "session_id", "queue_generation"].some(k => b[k] !== request.queue_binding?.[k])) throw new Error("checkpoint original identity mismatch");
++  validatePauseLedger(s);return s;
++}
++
+ async function main() {
+   if (process.argv.length !== 3) throw new Error("usage: mu-worker.mjs request.json");
+   // stdout is reserved for BridgeFrame JSON lines, including when dependencies log.
+@@ -723,7 +835,8 @@ async function main() {
+   ]);
+   const request = parseRequest(requestRaw.toString("utf8"));
+   const config = parseConfig(configRaw);
+-  const protocol = createProtocol(config, request, sha256(requestRaw));
++  const restored = request.pause_activation ? await loadPauseActivation(inputDir, request, sha256(configRaw)) : null;
++  const protocol = createProtocol(config, request, sha256(requestRaw), restored?.counts);
+ 
+   const model = {
+     id: config.model, name: config.model, provider: config.provider, api: config.api,
+@@ -737,7 +850,8 @@ async function main() {
+     providerRetry: { maxRetries: 0 },
+   });
+   const cwd = process.cwd();
+-  const sessionManager = SessionManager.inMemory(cwd);
++  const sessionCwd = restored?.sdk.payload.session.payload.header.cwd ?? cwd;
++  const sessionManager = restored ? SessionManager.fromPauseCheckpoint(sessionCwd, restored.sdk.payload.session, restored.sdk.payload.binding.sessionId) : SessionManager.inMemory(cwd);
+   const resourceLoader = new DefaultResourceLoader({
+     cwd, agentDir: cwd, settingsManager,
+     noExtensions: true, noSkills: true, noPromptTemplates: true,
+@@ -794,10 +908,12 @@ async function main() {
+   });
+   const customTools = makeTools(config, protocol);
+   const { session, extensionsResult } = await createAgentSession({
+-    cwd, agentDir: cwd, sessionManager, settingsManager, resourceLoader,
++    cwd: sessionCwd, agentDir: cwd, sessionManager, settingsManager, resourceLoader,
+     modelRuntime, model, thinkingLevel: "off", noTools: "builtin",
+     tools: customTools.map((tool) => tool.name), customTools,
+   });
++  if (request.pause_protocol === PAUSE_PROTOCOL) { registerCommandPauseSchema(session.agent); registerToolPauseSchemas(session.agent, config.tools); }
++  if (restored) session.restorePauseCheckpoint(restored.sdk, restored.sdk.payload.binding);
+   if (extensionsResult.extensions.length !== 0) throw new Error("extensions unexpectedly loaded");
+   // Agent listeners are awaited by the real SDK; AgentSession.subscribe is
+   // intentionally retained only for its existing synchronous command ledger.
+@@ -814,15 +930,15 @@ async function main() {
+     const text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+     attachments.push({ id: artifact.id, content_hash: artifact.content_hash, media_type: artifact.media_type, text });
+   }
+-  const { queue_control: _queueControl, queue_binding: _queueBinding, ...taskRequest } = request;
++  const { queue_control: _queueControl, queue_binding: _queueBinding, pause_protocol: _pauseProtocol, pause_activation: _pauseActivation, ...taskRequest } = request;
+   const prompt = JSON.stringify({ ...taskRequest, attachments });
+   if (Buffer.byteLength(prompt) > MAX_FRAME_BYTES) throw new Error("task prompt exceeds 64 KiB; refusing hidden truncation");
+-  const controller = request.queue_control === true ? createCommandController(session, protocol, request) : null;
++  const controller = request.queue_control === true ? createCommandController(session, protocol, request, { restored, inputHash: sha256(requestRaw), configHash: sha256(configRaw), outputDir: join(dirname(inputDir), "output") }) : null;
+   await protocol.ready();
+   if (controller) await controller.ready;
+   let promptError;
+-  try { await session.prompt(prompt); } catch (error) { promptError = error; }
+-  if (controller) { controller.idle(); await controller.finished; }
++  try { if (restored) await session.resumePause(); else await session.prompt(prompt); } catch (error) { promptError = error; }
++  if (controller) { controller.idle(); const terminal = await controller.finished; if (terminal.paused) { session.dispose(); protocol.close(); return; } }
+   if (promptError) throw promptError;
+   if (!session.isIdle) throw new Error("SDK session did not settle after one prompt");
+   const finalMessage = session.messages.at(-1);
+diff --git a/internal/host/runtime_setup_windows.go b/internal/host/runtime_setup_windows.go
+index abf6bdf4..c8119981 100644
+--- a/internal/host/runtime_setup_windows.go
++++ b/internal/host/runtime_setup_windows.go
+@@ -4,10 +4,12 @@ package host
+ 
+ import (
+ 	"context"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -18,6 +20,7 @@ import (
+ // coordinator after recovery and before its scan. It never invokes a provider,
+ // begins a qualification Run, accepts a Task, or upgrades runtime status.
+ type RuntimeSetup struct {
++	candidate *TrustedCandidatePolicy
+ 	host      *Host
+ 	service   *domain.Service
+ 	schema    *domain.SchemaDoc
+@@ -147,7 +150,12 @@ func (setup *RuntimeSetup) prepare(ctx context.Context, coordinator *domain.Runt
+ 	if err = setup.service.ValidateRuntimeSetup(ctx, token, candidate, setup.schema, h); err != nil {
+ 		return err
+ 	}
+-	assets, err := LoadRuntimeSetupAssets(setup.assetsDir)
++	var assets domain.RuntimeSetupAssets
++	if setup.candidate != nil {
++		assets, err = LoadTrustedCandidateRuntimeSetupAssets(*setup.candidate)
++	} else {
++		assets, err = LoadRuntimeSetupAssets(setup.assetsDir)
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -181,3 +189,86 @@ func (setup *RuntimeSetup) prepare(ctx context.Context, coordinator *domain.Runt
+ 	installed = true
+ 	return nil
+ }
++
++// TrustedCandidatePolicy is supplied only by the host composition. It is never
++// decoded from request payloads or selected via environment variables.
++type TrustedCandidatePolicy struct {
++	AssetRoot    string
++	ManifestHash string
++	BundleHash   string
++	NodeHash     string
++	SourceHash   string
++}
++
++// LoadTrustedCandidateRuntimeSetupAssets leaves the installed loader and its
++// legacy pin untouched. The caller must pin the independently accepted build.
++func LoadTrustedCandidateRuntimeSetupAssets(policy TrustedCandidatePolicy) (domain.RuntimeSetupAssets, error) {
++	bad := func() (domain.RuntimeSetupAssets, error) {
++		return domain.RuntimeSetupAssets{}, domain.Fail(503, "MODEL_UNAVAILABLE", "trusted candidate runtime assets unavailable")
++	}
++	if !filepath.IsAbs(policy.AssetRoot) || !candidateHash(policy.BundleHash) || !candidateHash(policy.NodeHash) || !candidateHash(policy.SourceHash) || policy.ManifestHash != "sha256:9e5dd1e5d93f19c6a4aa5eb5c0e2ebd7f0d1e05a987f6ec03963b4b560139da9" {
++		return bad()
++	}
++	root, err := filepath.EvalSymlinks(policy.AssetRoot)
++	if err != nil || !strings.EqualFold(filepath.Clean(root), filepath.Clean(policy.AssetRoot)) {
++		return bad()
++	}
++	read := func(name string, limit int64) ([]byte, error) {
++		p := filepath.Join(root, name)
++		info, e := os.Lstat(p)
++		if e != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
++			return nil, errors.New("candidate resource invalid")
++		}
++		actual, e := filepath.EvalSymlinks(p)
++		if e != nil || !strings.EqualFold(actual, p) {
++			return nil, errors.New("candidate resource reparse")
++		}
++		return os.ReadFile(p)
++	}
++	raw, err := read("mu-worker.mjs.build.json", 64<<10)
++	if err != nil {
++		return bad()
++	}
++	var meta struct {
++		SourceMode string `json:"source_mode"`
++		Manifest   string `json:"candidate_manifest_sha256"`
++		Base       string `json:"candidate_base"`
++		Patch      string `json:"candidate_patch_sha256"`
++		Review     string `json:"independent_review_sha256"`
++		Protocol   string `json:"protocol_capability"`
++		Bundle     string `json:"bundle_sha256"`
++		Source     string `json:"source_sha256"`
++		Bytes      int64  `json:"bundle_bytes"`
++		Inputs     int    `json:"compiled_inputs"`
++		Census     string `json:"compiled_inputs_sha256"`
++	}
++	if json.Unmarshal(raw, &meta) != nil || meta.SourceMode != "ACCEPTED_M0_CANDIDATE" || "sha256:"+meta.Manifest != policy.ManifestHash || meta.Base != "7ec619a16a932ae02daa7c2e6132d266528a1da8" || meta.Patch != "f82f8b8f866ae920bb769b657faf0a1a8709844979422fa409cb5bbc5194ad67" || meta.Review != "13c6ce9fbad76c6e6f2b2c8537bbaa2e662dc5539709c0161fa5219d06dd7489" || meta.Protocol != "RESEARCHOS_PAUSE_V1" || "sha256:"+meta.Bundle != policy.BundleHash || "sha256:"+meta.Source != policy.SourceHash || meta.Inputs < 2 || !candidateHash("sha256:"+meta.Census) {
++		return bad()
++	}
++	bundle, err := read("mu-worker.mjs", 128<<20)
++	if err != nil || int64(len(bundle)) != meta.Bytes || domain.Digest(bundle) != policy.BundleHash {
++		return bad()
++	}
++	node, err := read("node.exe", 128<<20)
++	if err != nil || len(node) < 2 || string(node[:2]) != "MZ" || domain.Digest(node) != policy.NodeHash {
++		return bad()
++	}
++	return domain.RuntimeSetupAssets{Executable: filepath.Join(root, "node.exe"), BundleFile: filepath.Join(root, "mu-worker.mjs"), BuildHash: policy.NodeHash, BundleHash: policy.BundleHash}, nil
++}
++func candidateHash(value string) bool {
++	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
++		return false
++	}
++	_, err := hex.DecodeString(value[7:])
++	return err == nil
++}
++
++// NewTrustedCandidateRuntimeSetup is an explicit host-only composition point.
++func (h *Host) NewTrustedCandidateRuntimeSetup(service *domain.Service, schema *domain.SchemaDoc, policy TrustedCandidatePolicy) (*RuntimeSetup, error) {
++	if _, err := LoadTrustedCandidateRuntimeSetupAssets(policy); err != nil {
++		return nil, err
++	}
++	setup := h.NewRuntimeSetup(service, schema, policy.AssetRoot)
++	setup.candidate = &policy
++	return setup, nil
++}
+diff --git a/internal/host/runtime_setup_windows_test.go b/internal/host/runtime_setup_windows_test.go
+index 5daae57f..85f475c8 100644
+--- a/internal/host/runtime_setup_windows_test.go
++++ b/internal/host/runtime_setup_windows_test.go
+@@ -215,3 +215,50 @@ func testLocalRuntimeHostCommittedSession(t *testing.T, productionAssets string)
+ 	}
+ 	t.Logf("actual_windows_host=true ordinary_configure_and_session=true coordinator_scan=true restart_same_runtime=true registered_only=true model_calls=0 production_assets=%t assets_not_executed=true", productionAssets != "")
+ }
++
++func TestTrustedCandidateAssetsRequireExplicitPinnedPolicy(t *testing.T) {
++	root := t.TempDir()
++	bundle := []byte("candidate offline bytes")
++	node := []byte("MZ candidate node fixture")
++	policy := host.TrustedCandidatePolicy{AssetRoot: root, ManifestHash: "sha256:9e5dd1e5d93f19c6a4aa5eb5c0e2ebd7f0d1e05a987f6ec03963b4b560139da9", BundleHash: domain.Digest(bundle), NodeHash: domain.Digest(node), SourceHash: "sha256:" + strings.Repeat("a", 64)}
++	meta := domain.Object{"source_mode": "ACCEPTED_M0_CANDIDATE", "candidate_manifest_sha256": strings.TrimPrefix(policy.ManifestHash, "sha256:"), "candidate_base": "7ec619a16a932ae02daa7c2e6132d266528a1da8", "candidate_patch_sha256": "f82f8b8f866ae920bb769b657faf0a1a8709844979422fa409cb5bbc5194ad67", "independent_review_sha256": "13c6ce9fbad76c6e6f2b2c8537bbaa2e662dc5539709c0161fa5219d06dd7489", "protocol_capability": "RESEARCHOS_PAUSE_V1", "bundle_sha256": strings.TrimPrefix(policy.BundleHash, "sha256:"), "source_sha256": strings.TrimPrefix(policy.SourceHash, "sha256:"), "bundle_bytes": len(bundle), "compiled_inputs": 2, "compiled_inputs_sha256": strings.Repeat("b", 64)}
++	for name, raw := range map[string][]byte{"mu-worker.mjs": bundle, "node.exe": node, "mu-worker.mjs.build.json": domain.Bytes(meta)} {
++		if err := os.WriteFile(filepath.Join(root, name), raw, 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	got, err := host.LoadTrustedCandidateRuntimeSetupAssets(policy)
++	if err != nil || got.BundleHash != policy.BundleHash {
++		t.Fatal("explicit candidate refused", err)
++	}
++	if _, err = host.LoadRuntimeSetupAssets(root); err == nil {
++		t.Fatal("default installed loader accepted candidate")
++	}
++	for _, field := range []string{"source_mode", "candidate_manifest_sha256", "candidate_base", "candidate_patch_sha256", "independent_review_sha256", "protocol_capability", "bundle_sha256", "source_sha256"} {
++		t.Run(field, func(t *testing.T) {
++			original := meta[field]
++			meta[field] = "changed"
++			defer func() { meta[field] = original }()
++			if e := os.WriteFile(filepath.Join(root, "mu-worker.mjs.build.json"), domain.Bytes(meta), 0600); e != nil {
++				t.Fatal(e)
++			}
++			if _, e := host.LoadTrustedCandidateRuntimeSetupAssets(policy); e == nil {
++				t.Fatal("changed candidate accepted")
++			}
++		})
++	}
++	if err = os.WriteFile(filepath.Join(root, "mu-worker.mjs.build.json"), domain.Bytes(meta), 0600); err != nil {
++		t.Fatal(err)
++	}
++	foreign := policy
++	foreign.NodeHash = "sha256:" + strings.Repeat("c", 64)
++	if _, err = host.LoadTrustedCandidateRuntimeSetupAssets(foreign); err == nil {
++		t.Fatal("unpinned executable accepted")
++	}
++	if err = os.WriteFile(filepath.Join(root, "mu-worker.mjs"), []byte("changed"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = host.LoadTrustedCandidateRuntimeSetupAssets(policy); err == nil {
++		t.Fatal("changed bundle accepted")
++	}
++}

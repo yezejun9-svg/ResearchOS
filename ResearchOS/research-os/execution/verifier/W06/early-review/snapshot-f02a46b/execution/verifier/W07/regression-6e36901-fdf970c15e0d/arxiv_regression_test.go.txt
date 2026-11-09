@@ -1,0 +1,24 @@
+package sources
+import("bytes";"context";"encoding/json";"fmt";"net/http";"net/http/httptest";"sync/atomic";"testing";"time")
+func TestVerifierArxivIndependentRegression(t *testing.T){
+ fragment:=append([]byte("%PDF-1.7\n"),bytes.Repeat([]byte("incomplete-page-stream "),100)...)
+ for _,scenario:=range []string{"fragment_2309","foreign_redirect_valid_pdf","valid_pdf_positive"}{t.Run(scenario,func(t *testing.T){
+  var foreignHits atomic.Int32
+  valid:=validFixturePDF()
+  foreign:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){foreignHits.Add(1);w.Header().Set("Content-Type","application/pdf");w.Write(valid)}));defer foreign.Close()
+  configured:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+   switch r.URL.Path{case "/api/query":fmt.Fprint(w,`<feed><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
+   case "/pdf/2304.03442v2":if scenario=="foreign_redirect_valid_pdf"{http.Redirect(w,r,foreign.URL+"/valid.pdf",http.StatusFound);return};w.Header().Set("Content-Type","application/pdf");w.(http.Flusher).Flush();if scenario=="fragment_2309"{w.Write(fragment)}else{w.Write(valid)}
+   default:http.NotFound(w,r)}
+  }));defer configured.Close()
+  a:=&Arxiv{Client:configured.Client(),APIURL:configured.URL+"/api/query",PDFBaseURL:configured.URL+"/pdf",AllowedOrigins:[]string{configured.URL},MinInterval:time.Nanosecond}
+  p,e:=a.Fetch(context.Background(),Query{SourceID:"paper",Text:"id:2304.03442v2",From:time.Date(2023,1,1,0,0,0,0,time.UTC),To:time.Date(2026,9,30,0,0,0,0,time.UTC),Limit:1})
+  observation:=map[string]any{"scenario":scenario,"error":fmt.Sprint(e),"complete":p.Complete,"failure":p.Failure,"items":len(p.Items),"fragment_bytes":len(fragment),"valid_pdf_bytes":len(valid),"foreign_hits":foreignHits.Load()};raw,_:=json.Marshal(observation);fmt.Println("VERIFIER_OBSERVATION "+string(raw))
+  if e!=nil{t.Fatalf("unexpected transport error: %v",e)}
+  switch scenario{
+  case "fragment_2309":if len(fragment)!=2309||p.Complete||len(p.Items)!=0||p.Failure!="INVALID_FULLTEXT"{t.Fatalf("fragment promoted: %+v",observation)}
+  case "foreign_redirect_valid_pdf":if foreignHits.Load()!=0{t.Fatalf("unauthorized destination actually requested: %+v",observation)};if p.Complete||len(p.Items)!=0||p.Failure!="ORIGIN_DENIED"{t.Fatalf("redirect not rejected by origin boundary: %+v",observation)}
+  case "valid_pdf_positive":if !p.Complete||p.Failure!=""||len(p.Items)!=1{t.Fatalf("valid PDF rejected: %+v",observation)};if !bytes.Equal(p.Items[0].Body,valid)||p.Items[0].UpstreamRevision!="2304.03442v2"||p.Items[0].CanonicalURL!="https://arxiv.org/abs/2304.03442v2"{t.Fatal("positive content/version binding changed")}
+  }
+ })}
+}

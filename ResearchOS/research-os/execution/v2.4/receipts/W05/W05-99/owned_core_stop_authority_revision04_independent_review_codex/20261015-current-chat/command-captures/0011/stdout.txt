@@ -1,0 +1,339 @@
+FILE internal/ownedcorestop/proof_windows.go SHA256 70397504d4a98c6665b50a13e1fb2a9ea94001d72184e581d2cfb74f6540cd4f
+1: //go:build windows
+2: 
+3: package ownedcorestop
+4: 
+5: import (
+6: 	"errors"
+7: 	"fmt"
+8: 	"os"
+9: 	"path/filepath"
+10: 	"strings"
+11: 
+12: 	"researchos.local/research-os/internal/host"
+13: 	"researchos.local/research-os/internal/store"
+14: )
+15: 
+16: const proofSchema = "researchos.owned-core-stop-independent-evidence.v1"
+17: const planReviewSchema = "researchos.owned-core-stop-independent-plan-review.v1"
+18: const grantAuthoritySchema = "researchos.owned-core-stop-authority-document.v1"
+19: const historicalManifestSchema = "researchos.owned-core-stop-historical-manifest.v1"
+20: 
+21: var proofKinds = []string{"f01_ready", "retained_window", "native_entry_gates", "worker_native_exit", "verifier_native_exit", "effect_census", "independent_evidence_review"}
+22: 
+23: type grantAuthorityDocument struct {
+24: 	Schema                    string                           `json:"schema"`
+25: 	Role                      string                           `json:"role"`
+26: 	OperationID               string                           `json:"operation_id"`
+27: 	Action                    string                           `json:"action"`
+28: 	Subject                   store.OwnedStopSubject           `json:"subject"`
+29: 	Native                    grantNativeIdentity              `json:"native"`
+30: 	Host                      host.OwnedCoreStopPublicIdentity `json:"host"`
+31: 	OperationDir              grantFileIdentity                `json:"operation_dir"`
+32: 	HistoricalManifestSHA256  string                           `json:"historical_manifest_sha256"`
+33: 	PlanSHA256                string                           `json:"plan_sha256,omitempty"`
+34: 	PreflightManifestSHA256   string                           `json:"preflight_manifest_sha256,omitempty"`
+35: 	PreflightGrantSHA256      string                           `json:"preflight_grant_sha256,omitempty"`
+36: 	PreflightExecutableSHA256 string                           `json:"preflight_executable_sha256,omitempty"`
+37: 	Reviewer                  string                           `json:"reviewer"`
+38: 	Verdict                   string                           `json:"verdict"`
+39: }
+40: 
+41: type historicalManifest struct {
+42: 	Schema      string        `json:"schema"`
+43: 	OperationID string        `json:"operation_id"`
+44: 	Evidence    []EvidenceRef `json:"evidence"`
+45: }
+46: 
+47: func decodeCanonicalAuthority(raw []byte, v any) error {
+48: 	return strictJSON(raw, v)
+49: }
+50: 
+51: func validateAuthorityDocument(d grantAuthorityDocument, g operationGrant, role, action string) error {
+52: 	if d.Schema != grantAuthoritySchema || d.Role != role || d.OperationID != g.OperationID || d.Action != action || d.Subject != g.Subject || d.Native != g.Native || d.Host != g.Host || d.OperationDir != g.OperationDir || d.HistoricalManifestSHA256 != g.HistoricalManifest.SHA256 || d.Reviewer == "" || strings.Contains(d.Reviewer, "owned_core_stop_builder") || d.Verdict != "ACCEPTED" {
+53: 		return errors.New("authority document semantics differ")
+54: 	}
+55: 	if action == "preflight" {
+56: 		if d.PlanSHA256 != "" || d.PreflightManifestSHA256 != "" || d.PreflightGrantSHA256 != "" || d.PreflightExecutableSHA256 != "" {
+57: 			return errors.New("preflight authority refers to future output")
+58: 		}
+59: 	} else if d.PlanSHA256 != g.PlanSHA256 || d.PreflightManifestSHA256 != g.PreflightManifestSHA256 || d.PreflightGrantSHA256 != g.PreflightGrantSHA256 || d.PreflightExecutableSHA256 != g.PreflightExecutableSHA256 {
+60: 		return errors.New("stop authority predecessor differs")
+61: 	}
+62: 	return nil
+63: }
+64: 
+65: func validateHistoricalManifest(g operationGrant, d *heldDocuments, evidence []EvidenceRef) error {
+66: 	raw, err := d.read(g.HistoricalManifest, 128<<10)
+67: 	if err != nil {
+68: 		return err
+69: 	}
+70: 	var m historicalManifest
+71: 	if err = decodeCanonicalAuthority(raw, &m); err != nil {
+72: 		return err
+73: 	}
+74: 	if m.Schema != historicalManifestSchema || m.OperationID != g.OperationID || len(m.Evidence) != len(proofKinds) || len(evidence) != len(proofKinds) {
+75: 		return errors.New("historical manifest identity/count")
+76: 	}
+77: 	for i, k := range proofKinds {
+78: 		if m.Evidence[i] != evidence[i] || evidence[i].Kind != k || !validSHA(evidence[i].SHA256) {
+79: 			return errors.New("historical manifest class/order/binding")
+80: 		}
+81: 	}
+82: 	return nil
+83: }
+84: 
+85: func validatePreflightAuthority(g operationGrant, d *heldDocuments, in Input) error {
+86: 	if err := validateHistoricalManifest(g, d, in.Evidence); err != nil {
+87: 		return err
+88: 	}
+89: 	for _, item := range []struct {
+90: 		ref  grantDocument
+91: 		role string
+92: 	}{{g.PreflightScope, "root_preflight_scope"}, {g.PreflightReview, "independent_preflight_review"}} {
+93: 		if err := verifierPath(in.SourceRepository, item.ref.Path); err != nil {
+94: 			return err
+95: 		}
+96: 		raw, err := d.read(item.ref, 128<<10)
+97: 		if err != nil {
+98: 			return err
+99: 		}
+100: 		var doc grantAuthorityDocument
+101: 		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+102: 			return err
+103: 		}
+104: 		if err = validateAuthorityDocument(doc, g, item.role, "preflight"); err != nil {
+105: 			return err
+106: 		}
+107: 	}
+108: 	return nil
+109: }
+110: 
+111: func validateStopAuthority(g operationGrant, d *heldDocuments, p Plan, planSHA string) error {
+112: 	if err := validateHistoricalManifest(g, d, p.Input.Evidence); err != nil {
+113: 		return err
+114: 	}
+115: 	for _, item := range []struct {
+116: 		ref  grantDocument
+117: 		role string
+118: 	}{{g.StopReview, "independent_stop_review"}, {g.RootOperationScope, "root_operation_scope"}} {
+119: 		if err := verifierPath(p.Input.SourceRepository, item.ref.Path); err != nil {
+120: 			return err
+121: 		}
+122: 		raw, err := d.read(item.ref, 128<<10)
+123: 		if err != nil {
+124: 			return err
+125: 		}
+126: 		var doc grantAuthorityDocument
+127: 		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+128: 			return err
+129: 		}
+130: 		if err = validateAuthorityDocument(doc, g, item.role, "commit"); err != nil {
+131: 			return err
+132: 		}
+133: 	}
+134: 	if p.Input.PlanReviewPath != g.StopReview.Path || planSHA != g.PlanSHA256 {
+135: 		return errors.New("plan review path/hash differs")
+136: 	}
+137: 	return nil
+138: }
+139: 
+140: // These are observations in independent receipts, not caller-side booleans.
+141: // Every required digest names a separate raw artifact retained by its reviewer.
+142: type historicalEvidence struct {
+143: 	Schema                   string                 `json:"schema"`
+144: 	Kind                     string                 `json:"kind"`
+145: 	OperationID              string                 `json:"operation_id"`
+146: 	SourceCommit             string                 `json:"source_commit"`
+147: 	CorePID                  uint32                 `json:"core_pid"`
+148: 	CoreCreatedNS            int64                  `json:"core_created_ns"`
+149: 	CoreImageSHA256          string                 `json:"core_image_sha256"`
+150: 	HostID                   string                 `json:"host_id"`
+151: 	OwnerID                  string                 `json:"owner_id"`
+152: 	OwnerRoot                string                 `json:"owner_root"`
+153: 	Subject                  store.OwnedStopSubject `json:"subject"`
+154: 	Reviewer                 string                 `json:"reviewer"`
+155: 	RawSHA256                map[string]string      `json:"raw_sha256"`
+156: 	NativePID                uint32                 `json:"native_pid,omitempty"`
+157: 	NativeCreatedNS          int64                  `json:"native_created_ns,omitempty"`
+158: 	NativeExitCode           *uint32                `json:"native_exit_code,omitempty"`
+159: 	NativeWaitAPI            string                 `json:"native_wait_api,omitempty"`
+160: 	NativeWaitResult         *uint32                `json:"native_wait_result,omitempty"`
+161: 	NativeExitAPI            string                 `json:"native_exit_api,omitempty"`
+162: 	NativeHandleRecordSHA256 string                 `json:"native_handle_record_sha256,omitempty"`
+163: 	BaselineSHA256           string                 `json:"baseline_sha256,omitempty"`
+164: }
+165: 
+166: type operationPlanReview struct {
+167: 	Schema                   string `json:"schema"`
+168: 	OperationID              string `json:"operation_id"`
+169: 	PlanSHA256               string `json:"plan_sha256"`
+170: 	EvidenceSHA256           string `json:"evidence_sha256"`
+171: 	SourceCommit             string `json:"source_commit"`
+172: 	CoreCreatedNS            int64  `json:"core_created_ns"`
+173: 	CoreImageSHA256          string `json:"core_image_sha256"`
+174: 	Reviewer                 string `json:"reviewer"`
+175: 	Verdict                  string `json:"verdict"`
+176: 	RootOperationScopeSHA256 string `json:"root_operation_scope_sha256"`
+177: }
+178: 
+179: func verifierPath(repo, path string) error {
+180: 	if !filepath.IsAbs(repo) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+181: 		return errors.New("canonical independent evidence path required")
+182: 	}
+183: 	root := filepath.Join(repo, "execution", "verifier")
+184: 	rel, err := filepath.Rel(root, path)
+185: 	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+186: 		return errors.New("evidence outside independent verifier namespace")
+187: 	}
+188: 	actual, err := filepath.EvalSymlinks(path)
+189: 	if err != nil || !strings.EqualFold(actual, path) {
+190: 		return errors.New("evidence reparse or absence")
+191: 	}
+192: 	return nil
+193: }
+194: 
+195: func readEvidence(repo string, ref EvidenceRef) (historicalEvidence, error) {
+196: 	var out historicalEvidence
+197: 	if !validSHA(ref.SHA256) {
+198: 		return out, errors.New("evidence hash required")
+199: 	}
+200: 	if err := verifierPath(repo, ref.Path); err != nil {
+201: 		return out, err
+202: 	}
+203: 	raw, err := os.ReadFile(ref.Path)
+204: 	if err != nil {
+205: 		return out, err
+206: 	}
+207: 	if len(raw) == 0 || len(raw) > 128<<10 || digest(raw) != ref.SHA256 {
+208: 		return out, errors.New("evidence content/hash mismatch")
+209: 	}
+210: 	if err = strictJSON(raw, &out); err != nil {
+211: 		return out, err
+212: 	}
+213: 	if out.Schema != proofSchema || out.Kind != ref.Kind || out.Reviewer == "" || strings.Contains(out.Reviewer, "owned_core_stop_builder") {
+214: 		return out, errors.New("independent evidence identity invalid")
+215: 	}
+216: 	return out, nil
+217: }
+218: 
+219: func proofNeeds(kind string) []string {
+220: 	switch kind {
+221: 	case "f01_ready":
+222: 		return []string{"main4f_build", "store_open_ready", "wal_full_live_core", "startup_native_identity"}
+223: 	case "retained_window":
+224: 		return []string{"consumed_original_request", "begin_window_marker", "end_unresolved_return", "scan_durable_fence"}
+225: 	case "native_entry_gates":
+226: 		return []string{"all_entry_map", "durable_prepare_before_effect", "dispatch_before_worker", "serial_desktop_serve", "no_alternate_bypass"}
+227: 	case "worker_native_exit":
+228: 		return []string{"original_os_wait_capture", "numeric_exit_capture", "job_drained", "owner_lock_released"}
+229: 	case "verifier_native_exit":
+230: 		return []string{"original_os_wait_capture", "numeric_exit_capture", "original_verifier_registration"}
+231: 	case "effect_census":
+232: 		return []string{"complete_current_census", "original_model_receipt", "original_request_hash", "original_dispatch_hash"}
+233: 	case "independent_evidence_review":
+234: 		return proofKinds[:6]
+235: 	default:
+236: 		return nil
+237: 	}
+238: }
+239: 
+240: func nativeExitEvidenceComplete(receipt historicalEvidence, corePID uint32) bool {
+241: 	return receipt.NativePID != 0 && receipt.NativePID != corePID && receipt.NativeCreatedNS != 0 &&
+242: 		receipt.NativeWaitAPI == "WaitForSingleObject" && receipt.NativeWaitResult != nil && *receipt.NativeWaitResult == 0 &&
+243: 		receipt.NativeExitAPI == "GetExitCodeProcess" && receipt.NativeExitCode != nil &&
+244: 		validSHA(receipt.NativeHandleRecordSHA256)
+245: }
+246: 
+247: func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []string) {
+248: 	missing := []string{}
+249: 	refs := map[string]EvidenceRef{}
+250: 	for _, r := range plan.Input.Evidence {
+251: 		if _, exists := refs[r.Kind]; exists {
+252: 			missing = append(missing, "duplicate "+r.Kind)
+253: 		}
+254: 		refs[r.Kind] = r
+255: 	}
+256: 	if len(refs) != len(proofKinds) {
+257: 		missing = append(missing, "exact seven independent receipts required")
+258: 	}
+259: 	observed := map[string]string{}
+260: 	for _, kind := range proofKinds {
+261: 		ref, ok := refs[kind]
+262: 		if !ok {
+263: 			missing = append(missing, kind+": missing")
+264: 			continue
+265: 		}
+266: 		var receipt historicalEvidence
+267: 		var err error
+268: 		if len(held) > 0 && held[0] != nil {
+269: 			if err = verifierPath(plan.Input.SourceRepository, ref.Path); err == nil {
+270: 				var raw []byte
+271: 				raw, err = held[0].read(grantDocument{Path: ref.Path, SHA256: ref.SHA256}, 128<<10)
+272: 				if err == nil {
+273: 					err = decodeCanonicalAuthority(raw, &receipt)
+274: 				}
+275: 				if err == nil && (receipt.Schema != proofSchema || receipt.Kind != ref.Kind || receipt.Reviewer == "" || strings.Contains(receipt.Reviewer, "owned_core_stop_builder")) {
+276: 					err = errors.New("independent evidence identity invalid")
+277: 				}
+278: 			}
+279: 		} else {
+280: 			receipt, err = readEvidence(plan.Input.SourceRepository, ref)
+281: 		}
+282: 		if err != nil {
+283: 			missing = append(missing, kind+": "+err.Error())
+284: 			continue
+285: 		}
+286: 		if receipt.OperationID != plan.OperationID || receipt.SourceCommit != SourceBaseCommit || receipt.CorePID != plan.Native.PID || receipt.CoreCreatedNS != plan.Native.CreatedNS || receipt.CoreImageSHA256 != plan.Native.ImageSHA256 || receipt.HostID != plan.Host.HostID || receipt.OwnerID != plan.Host.OwnerID || receipt.OwnerRoot != plan.Host.OwnerRoot || receipt.Subject != plan.Input.Subject {
+287: 			missing = append(missing, kind+": subject/authority/core binding differs")
+288: 			continue
+289: 		}
+290: 		if kind == "worker_native_exit" || kind == "verifier_native_exit" {
+291: 			// An ignored cmd.Wait error, a PID-list absence, or an assumed exit 0
+292: 			// cannot satisfy this typed original OS wait and numeric-exit receipt.
+293: 			if !nativeExitEvidenceComplete(receipt, plan.Native.PID) {
+294: 				missing = append(missing, kind+": captured exact OS wait/exit/handle identity absent")
+295: 			}
+296: 		}
+297: 		if kind == "effect_census" && receipt.BaselineSHA256 != plan.Baseline.SHA256 {
+298: 			missing = append(missing, kind+": full baseline differs")
+299: 		}
+300: 		for _, name := range proofNeeds(kind) {
+301: 			hash := receipt.RawSHA256[name]
+302: 			if !validSHA(hash) {
+303: 				missing = append(missing, fmt.Sprintf("%s: %s raw receipt missing", kind, name))
+304: 			}
+305: 			if kind == "independent_evidence_review" && hash != observed[name] {
+306: 				missing = append(missing, kind+": evidence hash differs for "+name)
+307: 			}
+308: 		}
+309: 		observed[kind] = ref.SHA256
+310: 	}
+311: 	// Bind the seven references and their order into a single reviewable digest.
+312: 	raw, _ := canonicalJSON(plan.Input.Evidence)
+313: 	return digest(raw), missing
+314: }
+315: 
+316: func validatePlanReview(plan Plan, planSHA string) error {
+317: 	if plan.Input.PlanReviewPath == "" {
+318: 		return errors.New("independent operation plan review missing")
+319: 	}
+320: 	if err := verifierPath(plan.Input.SourceRepository, plan.Input.PlanReviewPath); err != nil {
+321: 		return err
+322: 	}
+323: 	raw, err := os.ReadFile(plan.Input.PlanReviewPath)
+324: 	if err != nil {
+325: 		return err
+326: 	}
+327: 	if len(raw) == 0 || len(raw) > 64<<10 {
+328: 		return errors.New("bounded plan review required")
+329: 	}
+330: 	var r operationPlanReview
+331: 	if err = strictJSON(raw, &r); err != nil {
+332: 		return err
+333: 	}
+334: 	if r.Schema != planReviewSchema || r.OperationID != plan.OperationID || r.PlanSHA256 != planSHA || r.EvidenceSHA256 != plan.EvidenceSHA256 || r.SourceCommit != SourceBaseCommit || r.CoreCreatedNS != plan.Native.CreatedNS || r.CoreImageSHA256 != plan.Native.ImageSHA256 || r.Reviewer == "" || strings.Contains(r.Reviewer, "owned_core_stop_builder") || r.Verdict != "ACCEPTED" || !validSHA(r.RootOperationScopeSHA256) {
+335: 		return errors.New("independent exact plan/root-scope review unavailable")
+336: 	}
+337: 	return nil
+338: }

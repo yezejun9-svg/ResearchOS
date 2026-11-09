@@ -1,0 +1,301 @@
+{
+  "schema": "researchos.attach-lease-producer-scope-review.v1",
+  "reviewer": "codex:/root/w05_merge_review",
+  "candidate": "22752a6a41732c8c158d7d7e1b8932ec958f8cb8",
+  "decision": "BOUNDED_SYNCHRONOUS_SCOPE_PROPOSED_FULL_ASYNC_ATTACH_NOT_CLOSED",
+  "implementation_authorized": false,
+  "source_accepted": false,
+  "findings": [
+    {
+      "id": "L01",
+      "path": "internal/domain/client_protocol.go",
+      "lines": [
+        1135,
+        1147
+      ],
+      "finding": "All renewals call HandoffEpoch. Same-owner renewal currently advances epoch and invalidates old queue claim generation, conflicting with B22:143."
+    },
+    {
+      "id": "L02",
+      "path": "internal/domain/client_protocol.go",
+      "lines": [
+        1147,
+        1187
+      ],
+      "finding": "Lease transfer plus CLIENT_HANDOFF already mutate in caller Tx but return permanent ACK/PendingResult. Execute731/768 replays exact immutable ACK, no attach finalizer exists."
+    },
+    {
+      "id": "L03",
+      "path": "internal/api/v2.go",
+      "lines": [
+        120,
+        133
+      ],
+      "finding": "API leaseTTL unset returns15minutes, B22:143 specifies90seconds. Service tests inject60s/1h; those do not establish production default."
+    },
+    {
+      "id": "L04",
+      "path": "internal/domain/client_protocol.go",
+      "lines": [
+        1137,
+        1143
+      ],
+      "finding": "Only head Run status and children_stopped/queue_empty are read. It does not establish all historical Run/unknown effect/pending permission/queue settlement. Do not relabel this predicate sufficient for transfer."
+    },
+    {
+      "id": "L05",
+      "path": "internal/domain/client_protocol_sessions.go",
+      "lines": [
+        103,
+        116
+      ],
+      "finding": "clientSessionOwner returns nil for an administratively mapped Session with no creation receipt; it is not a current project-role/local DeviceID check. Attach must explicitly reuse clientPrincipal and require DeviceID empty, then immutable same-principal ownership proof; missing attribution must fail closed rather than presume same OS owner."
+    }
+  ],
+  "minimum_source_scope": [
+    {
+      "path": "internal/domain/client_protocol.go",
+      "bounds": "Only attach(true) branch plus private helpers needed for its original-owner/role/DeviceID/current CAS, same-owner lease update, original Run/effect/queue settlement read, complete snapshot. Preserve generic Execute original journal, savepoint, response validation and all other methods."
+    },
+    {
+      "path": "internal/domain/client_protocol_atomic_test.go",
+      "bounds": "Add attach original completion/replay, old immutable ACK replay, typed rejection and SQL/snapshot/event/journal fault atomicity controls; preserve existing ValidateBinding rollback test."
+    },
+    {
+      "path": "internal/domain/client_protocol_control_windows_test.go",
+      "bounds": "TestClientSameWriterRenewsExpiredLease: replace incorrect ACK/epoch2 with actual COMPLETED full AttachResult/epoch1; retain real expiry extension and stale revision rejection. Add active same-owner renewal no queue/generation/Run mutation and foreign/lease absent cases."
+    },
+    {
+      "path": "internal/api/v2_sessions_test.go",
+      "bounds": "TestW14SessionWriterLeaseHandoff: actual expired different-client takeover returns COMPLETED snapshot and epoch2, preserve previous attribution/stale old writer/actual subsequent send; add original HTTP response/replay/lease policy and role/DeviceID controls."
+    },
+    {
+      "path": "internal/api/v2_workspace_files_windows_test.go",
+      "bounds": "TestW13WorkspaceFilesRealHostHTTPReadDiffImport: replace fake epoch advance through same-owner renewal with a genuinely different authenticated same-principal client attach; preserve actual-old-epoch rejection and every physical file/workspace assertion; do not merely change expected epoch or remove test."
+    },
+    {
+      "path": "internal/api/v2.go",
+      "bounds": "Optional required sixth path for full B22:143 producer-default correction: leaseTTL unset 15m -> frozen90s only; explicit valid configured TTL/error behavior unchanged; use existing v2_sessions_test.go to test. Without this extension default90 remains OPEN."
+    }
+  ],
+  "recommended_paths_count": 6,
+  "five_path_boundary": "Original five paths suffice only synchronous branch correction under existing explicit Host TTL. Full frozen default90 requires sixth API source path; no separate new test path required. None grants source lease.",
+  "state_design": {
+    "read": "Existing attach(false) unchanged snapshot/write_owner_acquired=false, no lease mutation.",
+    "same_owner": "Authenticated current local same owner, explicit current revision and null epoch; update lease_expires_at,updated_at,revision+1 with exact old epoch/client/revision CAS and RowsAffected1. Do not call HandoffEpoch, no CLIENT_HANDOFF, no invented SESSION_RENEWED; event_watermark unchanged. BuildSessionSnapshot after update in same Tx, COMPLETED/AttachResult write_owner_acquired=true. Running owner renewal is not new agent admission.",
+    "foreign_expired_or_no_lease": "Require authoritative identity and complete original settlement, preserve canonical Task/Run/effect/budget and queue bytes. Existing HandoffEpoch+lease assignment+CLIENT_HANDOFF produces oldepoch+1/revision+2/watermark+1; then BuildSessionSnapshot and COMPLETED in same Tx. No empty owner SQL representation: writer_client_id is NOTNULL nonempty; no lease is SQLNULL lease_expires_at, expired lease still appears as nonnull snapshot writer.",
+    "foreign_valid_owner": "B22:137 expressly requires ACK while another same-subject client retains valid writer, followed by settled takeover and final result139. Merely changing current ACK to COMPLETE does not implement this lifecycle. A five/six-path synchronous subset cannot claim this frozen branch complete. Preserve no unsafe transfer; any bounded refusal is declared unsupported branch, not a full contract pass. Root must decide separate durable pending/finalization design before claiming whole attach support.",
+    "events": "Only true owner acquisition/transfer emits existing CLIENT_HANDOFF schema with nonempty previous/target client and real writer lease; same-owner renewal uses original command journal as durable evidence, no invented event enum.",
+    "replay": "One immutable original response insert under existing SQL23/global identity; new COMPLETE only. Old ACK rows replay unchanged; no UPDATE/idempotency trigger bypass/SQL24/retroactive COMPLETE."
+  },
+  "complete_settlement_bound": "Do not reuse configurationSettled wholesale without evaluating its deliberate rejection of any queued input: frozen handoff must preserve unconsumed follow-ups. A narrow read-only predicate inside client_protocol.go may reuse originalSessionTasks/clientTurnSettled and typed receipts, refusing unsupported queued cases without deleting them. Durable safe queue transfer and pause/foreign-valid async remain separately OPEN.",
+  "schema_bindings": {
+    "AttachResult": "snapshot + write_owner_acquired only, both required, additionalProperties false",
+    "WriterLease": "client_id nonempty, epoch integer>=1, expires_at date-time",
+    "HandoffEventPayload": "previous_client_id,target_client_id nonempty; previous_epoch>=1; actual writer+effective_at; no fabricated renewal type",
+    "SQL23_sufficient_for_synchronous": true,
+    "new_migration": false,
+    "old_ACK_finalizer_available": false
+  },
+  "test_mapping": [
+    {
+      "path": "internal/domain/client_protocol_control_windows_test.go",
+      "function": "TestClientSameWriterRenewsExpiredLease",
+      "lines": [
+        46,
+        89
+      ],
+      "incorrect_expectations": [
+        59,
+        70
+      ],
+      "preserve": [
+        "stale revision rejection",
+        "real lease deadline"
+      ]
+    },
+    {
+      "path": "internal/api/v2_sessions_test.go",
+      "function": "TestW14SessionWriterLeaseHandoff",
+      "lines": [
+        292,
+        330
+      ],
+      "incorrect_expectations": [
+        310
+      ],
+      "preserve": [
+        "different client",
+        "epoch2",
+        "real send",
+        "previous client attribution"
+      ]
+    },
+    {
+      "path": "internal/api/v2_workspace_files_windows_test.go",
+      "function": "TestW13WorkspaceFilesRealHostHTTPReadDiffImport",
+      "lines": [
+        204,
+        279
+      ],
+      "incorrect_expectations": [
+        258,
+        262
+      ],
+      "preserve": [
+        "actual-old-epoch rejection265-268",
+        "file and workspace assertions"
+      ]
+    },
+    {
+      "path": "apps/cli/cli_sessions_test.go",
+      "lines": [
+        233,
+        251
+      ],
+      "change_authorized": false,
+      "note": "Existing true different-client epoch2 then3 use should remain; generic v2Call accepting ACK is not a real completion barrier. Current separate CLI8 owns future integration, no overlap edits."
+    }
+  ],
+  "future_scenarios": [
+    {
+      "id": "L01",
+      "scenario": "read-only attach does not renew/rotate/change revision/watermark",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L02",
+      "scenario": "same owner valid lease renew COMPLETED epoch unchanged revision+1 watermark unchanged",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L03",
+      "scenario": "same owner expired lease renew COMPLETED same epoch",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L04",
+      "scenario": "same owner active Run renewal does not pause/cancel/restart/drop queue or require fake settlement",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L05",
+      "scenario": "null lease same historical owner obtains valid lease without inventing empty writer_client_id",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L06",
+      "scenario": "expired/null lease different client plus complete original settlement transfers epoch+1 revision+2 event+1",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L07",
+      "scenario": "different client valid lease asynchronous path remains explicitly unsupported/held until original pending-intent/finalization is designed",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L08",
+      "scenario": "unsettled head Run refuses transfer before mutation",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L09",
+      "scenario": "older hidden Run or UNKNOWN effect refuses transfer",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L10",
+      "scenario": "pending/uncertain queue or permission refuses transfer; no delete-to-settle",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L11",
+      "scenario": "stale revision and competing takeover loser no automatic CAS refresh",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L12",
+      "scenario": "remote READER/OWNER DeviceID and ungranted/cross-principal caller no authority mutation",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L13",
+      "scenario": "future after_sequence refused before any lease mutation",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L14",
+      "scenario": "same new command exact replay returns original COMPLETE with full row multiset unchanged",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L15",
+      "scenario": "same command changed raw semantic payload/project/method conflicts",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L16",
+      "scenario": "existing old ACK replays exact ACK forever without backfill",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L17",
+      "scenario": "snapshot/schema or SQL fault after mutation rolls entire Tx back",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L18",
+      "scenario": "typed rejection journals once while business savepoint rolls back",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L19",
+      "scenario": "public HTTP original bytes/replay and sole identity/journal proof",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L20",
+      "scenario": "successful returned AttachResult writer/fullsnapshot matches committed DB and subsequent ordinary write",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L21",
+      "scenario": "sealed/archived refusal",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L22",
+      "scenario": "leaseTTL missing/invalid and counter overflow fail closed",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L23",
+      "scenario": "default90s producer and explicit configured TTL tests",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "L24",
+      "scenario": "old stale-writer import test uses real foreign takeover, not sameowner renewal",
+      "status": "NOT_RUN"
+    }
+  ],
+  "B22_143_open": [
+    "30-second authenticated client heartbeat scheduler is not implemented by producer-only scope; CLI/Desktop callers require separate owned design and actual timing/cancellation proof.",
+    "No automatic foreign takeover on renewal conflict; client refresh must reconfirm owner.",
+    "Default90 remains unverified until proposed sixth path is implemented and independently tested."
+  ],
+  "history": "Old five failure/history chains, retained tool origins and all prior receipts remain unchanged. This readonly scope neither retries cases nor erases prior SourceReady limitations.",
+  "execution_counts": {
+    "Go": 0,
+    "SQL": 0,
+    "Node": 0,
+    "HTTP": 0,
+    "models": 0,
+    "paid": 0
+  },
+  "input_audit": {
+    "path": "execution/v2.4/receipts/W05/W05-99/attach_lease_producer_scope_independent_review_codex/0303da054a7b449689f84aed9a043b04/input_audit.json",
+    "sha256": "992d51013222065e94ae7608400cff0374bbc1da5d64457086ba3c925900740a",
+    "bytes": 10606
+  }
+}

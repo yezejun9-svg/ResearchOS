@@ -1,0 +1,252 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	rt "researchos.local/research-os/adapters/runtime"
+	"sort"
+	"strings"
+	"testing"
+	"unsafe"
+)
+
+// This independent overlay adds no production code or acceptance hooks.
+func independentB2Census(t *testing.T, db *sql.DB) map[string][]string {
+	t.Helper()
+	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	out := map[string][]string{}
+	for _, n := range names {
+		rr, err := db.Query("SELECT * FROM \"" + strings.ReplaceAll(n, "\"", "\"\"") + "\"")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cols, err := rr.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents := []string{}
+		for rr.Next() {
+			values := make([]any, len(cols))
+			targets := make([]any, len(cols))
+			for i := range targets {
+				targets[i] = &values[i]
+			}
+			if err := rr.Scan(targets...); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contents = append(contents, string(raw))
+		}
+		if err := rr.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rr.Close()
+		sort.Strings(contents)
+		out[n] = contents
+	}
+	return out
+}
+func independentB2VersionKinds(t *testing.T, db *sql.DB) map[string]int {
+	t.Helper()
+	rows, err := db.Query("SELECT kind,count(*) FROM domain_versions GROUP BY kind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	m := map[string]int{}
+	for rows.Next() {
+		var k string
+		var n int
+		if err := rows.Scan(&k, &n); err != nil {
+			t.Fatal(err)
+		}
+		m[k] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation(t *testing.T) {
+	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+	var before map[string][]string
+	var beforeKinds map[string]int
+	hookCount := 0
+	c.boundaryHook = func(name string, _ Object) {
+		if name == "qualification_plan_frozen" {
+			hookCount++
+			before = independentB2Census(t, r.f.db)
+			beforeKinds = independentB2VersionKinds(t, r.f.db)
+		}
+	}
+	runErr := c.RunAdmitted(context.Background(), route, r.run, r.lease)
+	c.boundaryHook = nil
+	if runErr == nil || !strings.Contains(runErr.Error(), "qualification grants no unplanned effect authority") || calls.Load() != 1 || hookCount != 1 {
+		t.Fatalf("positive gate did not complete: %v calls=%d hooks=%d", runErr, calls.Load(), hookCount)
+	}
+	epoch, err := Num(r.run, "lease_epoch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func() error {
+		tx, err := r.f.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		_, err = r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch)
+		return err
+	}
+	if err := check(); err != nil {
+		t.Fatalf("positive private consumer: %v", err)
+	}
+	after := independentB2Census(t, r.f.db)
+	allowed := map[string]bool{"domain_versions": true, "domain_objects": true, "domain_refs": true, "uploaded_content": true, "runtime_observations": true, "runtime_dispatches": true, "outbox": true, "event_state_snapshots": true, "idempotency": true}
+	if len(before) != len(after) {
+		t.Fatal("closure altered table schema")
+	}
+	changed := []string{}
+	for name, rows := range before {
+		if !reflect.DeepEqual(rows, after[name]) {
+			changed = append(changed, name)
+			if !allowed[name] {
+				t.Errorf("unexpected logical table mutation %s", name)
+			}
+		}
+	}
+	sort.Strings(changed)
+	if len(after["domain_versions"])-len(before["domain_versions"]) != 5 || len(after["uploaded_content"])-len(before["uploaded_content"]) != 1 {
+		t.Fatal("closure exact five versions / one upload mismatch")
+	}
+	kinds := independentB2VersionKinds(t, r.f.db)
+	wantKinds := map[string]bool{"Artifact": true, "ImpactLink": true, "Run": true, "ProjectState": true, "EventEnvelope": true}
+	for k, n := range kinds {
+		delta := n - beforeKinds[k]
+		if wantKinds[k] {
+			if delta != 1 {
+				t.Errorf("version %s delta=%d", k, delta)
+			}
+		} else if delta != 0 {
+			t.Errorf("unexpected version kind %s delta=%d", k, delta)
+		}
+	}
+	t.Logf("all-table logical census=%d changed=%v; exact five version kinds + one upload", len(before), changed)
+	var locator, manifestHash, markerBefore string
+	if err := r.f.db.QueryRow("SELECT journal_locator,manifest_hash FROM runtime_dispatches WHERE project=? AND run=?", r.f.project, r.run["id"]).Scan(&locator, &manifestHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.f.db.QueryRow("SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure'", r.f.project).Scan(&markerBefore); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+	facts, err := rt.ReadQualificationNativeFacts(directory, manifestHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if facts.Journal.Frames != 3 || facts.Journal.Acknowledged != 2 || facts.Journal.ProtocolComplete || calls.Load() != 1 {
+		t.Fatal("raw3/ACK2/one model positive changed")
+	}
+	receipt, err := Decode(facts.Rejection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge := new(rt.Bridge)
+	field := reflect.ValueOf(bridge).Elem().FieldByName("directory")
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetString(directory)
+	denial := &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: errors.New("independent replay")}
+	if err := c.closeOnlineQualificationFailure(context.Background(), route, Str(r.run, "id"), epoch, locator, bridge, denial, qualificationBrokerDrain{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := independentB2Census(t, r.f.db); !reflect.DeepEqual(got, after) || calls.Load() != 1 {
+		t.Fatal("exact completed-marker replay altered full logical census")
+	}
+	t.Log("completed-marker actual closure replay zero logical delta across all tables")
+	for _, cut := range []struct{ name, path string }{
+		{"receipt_id", "$.receipt.receipt_id"}, {"request_body", "$.payload.payload.body.model"}, {"request_hash", "$.request_hash"}, {"route", "$.payload.route"}, {"credential_revision", "$.payload.credential_revision"}, {"key", "$.key"}, {"history", "$.sequence"},
+	} {
+		t.Run(cut.name, func(t *testing.T) {
+			tx, err := r.f.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			qualificationDropTableTriggers(t, tx, "resource_effects")
+			result, err := tx.Exec("UPDATE resource_effects SET body=json_set(body,?,'independent-forged') WHERE project=? AND run=? AND json_extract(body,'$.state')='CONFIRMED'", cut.path, r.f.project, r.run["id"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, err := result.RowsAffected(); err != nil || n != 1 {
+				t.Fatalf("mutation rows=%d err=%v", n, err)
+			}
+			if _, err := r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch); err == nil {
+				t.Fatal("private consumer accepted independent DB tamper")
+			}
+		})
+	}
+	if err := check(); err != nil {
+		t.Fatal("rollback did not restore baseline", err)
+	}
+	for _, name := range []string{"stdout.raw", "stderr.raw", "bridge.json", "qualification-rejection-00000000000000000003.json"} {
+		t.Run("raw_"+name, func(t *testing.T) {
+			path := filepath.Join(directory, name)
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.WriteFile(path, original, 0600); err != nil {
+					t.Error(err)
+				}
+			}()
+			if err := os.WriteFile(path, append(append([]byte(nil), original...), byte('x')), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if name != "qualification-rejection-00000000000000000003.json" {
+				if _, err := rt.ReadQualificationNativeFacts(directory, manifestHash); err == nil {
+					t.Fatal("tamper did not trip native source reader")
+				}
+			}
+			if err := check(); err == nil {
+				t.Errorf("private consumer accepted changed original %s while sealed marker/proof/DB were unchanged", name)
+			}
+		})
+	}
+	if err := check(); err != nil {
+		t.Fatal("raw restore did not restore baseline", err)
+	}
+	var markerAfter string
+	if err := r.f.db.QueryRow("SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure'", r.f.project).Scan(&markerAfter); err != nil {
+		t.Fatal(err)
+	}
+	if markerBefore != markerAfter || !reflect.DeepEqual(after, independentB2Census(t, r.f.db)) || calls.Load() != 1 {
+		t.Fatal("independent cuts changed baseline DB/marker or repeated MODEL")
+	}
+	t.Log(fmt.Sprintf("preserved full database/marker and one controlled-loopback MODEL after cuts"))
+}

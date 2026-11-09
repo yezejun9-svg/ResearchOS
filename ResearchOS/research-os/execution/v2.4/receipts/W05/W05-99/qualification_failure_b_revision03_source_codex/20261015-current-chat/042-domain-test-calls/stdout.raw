@@ -1,0 +1,138 @@
+420: 		if err := r.f.db.QueryRow(`SELECT body FROM domain_versions WHERE project=? AND kind=? AND id=? ORDER BY revision DESC LIMIT 1`, r.f.project, row.kind, row.id).Scan(&currentRaw); err != nil {
+421: 			t.Fatal(err)
+422: 		}
+423: 		if err := r.f.db.QueryRow(`SELECT body FROM domain_versions WHERE project=? AND kind=? AND id=? ORDER BY revision DESC LIMIT 1 OFFSET 1`, r.f.project, row.kind, row.id).Scan(&previousRaw); err != nil {
+424: 			t.Fatal(err)
+425: 		}
+426: 		previous, previousErr := Decode([]byte(previousRaw))
+427: 		current, currentErr := Decode([]byte(currentRaw))
+428: 		if previousErr != nil || currentErr != nil || Hash(previous) != row.beforeHash || current["updated_at"] != core["observed_at"] {
+429: 			t.Fatalf("closure %s did not add one bound version", row.kind)
+430: 		}
+431: 	}
+432: 	var money, operation string
+433: 	if scanErr := r.f.db.QueryRow("SELECT coalesce(json_extract(body,'$.money'),'null'),json_extract(body,'$.operation') FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", r.run["id"]).Scan(&money, &operation); scanErr != nil || money != "null" || operation != "UNKNOWN" {
+434: 		t.Fatalf("unknown cost changed: money=%s operation=%s err=%v", money, operation, scanErr)
+435: 	}
+436: 	epoch, err := Num(r.run, "lease_epoch")
+437: 	if err != nil {
+438: 		t.Fatal(err)
+439: 	}
+440: 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
+441: 		_, verifyErr := r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch)
+442: 		return verifyErr
+443: 	})
+444: 	if duplicateErr := c.RunAdmitted(context.Background(), route, r.run, r.lease); duplicateErr == nil {
+445: 		t.Fatal("duplicate dispatch admitted")
+446: 	}
+447: 	var replayClosure, replayObservation, replayProof int
+448: 	if err := r.f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='host:qualification-failure-closure' AND project=?", r.f.project).Scan(&replayClosure); err != nil {
+560: }
+561: 
+562: func TestQualificationFailurePrivateConsumerRejectsTampering(t *testing.T) {
+563: 	c, route, r, calls := qualificationFailureLoopbackFixture(t)
+564: 	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err == nil {
+565: 		t.Fatal("expected first-gate denial")
+566: 	}
+567: 	if calls.Load() != 1 {
+568: 		t.Fatal("real MODEL was not called once")
+569: 	}
+570: 	epoch, err := Num(r.run, "lease_epoch")
+571: 	if err != nil {
+572: 		t.Fatal(err)
+573: 	}
+574: 	check := func(tx *sql.Tx) error {
+575: 		_, e := r.f.s.validatedQualificationFailureTx(tx, r.f.project, Str(r.task, "id"), Str(r.run, "id"), epoch)
+576: 		return e
+577: 	}
+578: 	sourceTx(t, r.f.db, check)
+579: 	for _, mutation := range []struct {
+580: 		name, table, sql string
+581: 		args             []any
+582: 	}{
+680: 	if err = grantTx.Rollback(); err != nil {
+681: 		t.Fatal(err)
+682: 	}
+683: 	if err = r.f.s.RevokePrincipal(context.Background(), r.f.owner); err != nil {
+684: 		t.Fatal(err)
+685: 	}
+686: 	tx, err := r.f.db.Begin()
+687: 	if err != nil {
+688: 		t.Fatal(err)
+689: 	}
+690: 	defer tx.Rollback()
+691: 	if err = check(tx); err == nil {
+692: 		t.Fatal("revoked current Owner still authorized closure")
+693: 	}
+694: }
+695: 
+696: func TestQualificationFailureNativeSourceTamperingRefused(t *testing.T) {
+697: 	c, route, r, _ := qualificationFailureLoopbackFixture(t)
+698: 	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err == nil {
+699: 		t.Fatal("expected first-gate denial")
+700: 	}
+701: 	var locator, manifestHash string
+702: 	if err := r.f.db.QueryRow("SELECT journal_locator,manifest_hash FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&locator, &manifestHash); err != nil {
+703: 		t.Fatal(err)
+704: 	}
+705: 	directory := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+706: 	if _, err := rt.ReadQualificationNativeFacts(directory, manifestHash); err != nil {
+707: 		t.Fatal(err)
+708: 	}
+709: 	for _, name := range []string{"stdout.raw", "stderr.raw", "bridge.json"} {
+710: 		t.Run(name, func(t *testing.T) {
+711: 			path := filepath.Join(directory, name)
+712: 			original, readErr := os.ReadFile(path)
+713: 			if readErr != nil {
+714: 				t.Fatal(readErr)
+715: 			}
+716: 			defer os.WriteFile(path, original, 0600)
+717: 			if writeErr := os.WriteFile(path, append(append([]byte(nil), original...), byte('x')), 0600); writeErr != nil {
+718: 				t.Fatal(writeErr)
+719: 			}
+720: 			if _, verifyErr := rt.ReadQualificationNativeFacts(directory, manifestHash); verifyErr == nil {
+721: 				t.Fatal("damaged native source was accepted")
+722: 			}
+723: 		})
+724: 	}
+725: 	journalPath := filepath.Join(directory, "bridge.json")
+726: 	originalJournal, err := os.ReadFile(journalPath)
+727: 	if err != nil {
+728: 		t.Fatal(err)
+729: 	}
+730: 	for _, mutation := range []struct {
+731: 		name, section, field string
+732: 		value                any
+733: 	}{
+734: 		{"stopped_missing", "sandbox_receipt", "children_stopped", false},
+735: 		{"streams_not_drained", "sandbox_receipt", "streams_drained", false},
+736: 		{"cleanup_incomplete", "sandbox_receipt", "cleanup_complete", false},
+737: 		{"output_not_copied", "sandbox_receipt", "output_copied", false},
+738: 		{"receipt_pid_changed", "sandbox_receipt", "pid", 0},
+739: 		{"identity_pid_missing", "identity", "pid", 0},
+740: 		{"identity_job_changed", "identity", "job", "forged"},
+741: 		{"identity_sid_missing", "identity", "appcontainer_sid", ""},
+742: 		{"ended_missing", "", "ended", ""},
+743: 	} {
+744: 		t.Run(mutation.name, func(t *testing.T) {
+745: 			journal, decodeErr := Decode(originalJournal)
+746: 			if decodeErr != nil {
+747: 				t.Fatal(decodeErr)
+748: 			}
+749: 			if mutation.section == "" {
+750: 				journal[mutation.field] = mutation.value
+751: 			} else {
+752: 				section, ok := journal[mutation.section].(map[string]any)
+753: 				if !ok {
+754: 					t.Fatal("native field section unavailable")
+755: 				}
+756: 				section[mutation.field] = mutation.value
+757: 			}
+758: 			if err := os.WriteFile(journalPath, Bytes(journal), 0600); err != nil {
+759: 				t.Fatal(err)
+760: 			}
+761: 			defer os.WriteFile(journalPath, originalJournal, 0600)
+762: 			if _, err := rt.ReadQualificationNativeFacts(directory, manifestHash); err == nil {
+763: 				t.Fatal("damaged native terminal predicate was accepted")
+764: 			}
+765: 		})

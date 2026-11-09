@@ -1,0 +1,254 @@
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\internal\\host\\runtime_verifier_process_windows.go', 'sha256': '934a317d887bc5539c25657706a2c5b1d94957733e09b753e97a5ed4d7ac9aad', 'start': 104, 'end': 240, 'provenance': 'CURRENT_SOURCE_LOCATOR_NOT_HISTORICAL_VERIFIER_COMPILED_INPUT'}
+104: type runtimeVerifierProcess struct {
+105: 	cmd      *exec.Cmd
+106: 	in       io.WriteCloser
+107: 	out      io.ReadCloser
+108: 	cancel   context.CancelFunc
+109: 	identity supervisor.ProcessIdentity
+110: 	nonce    string
+111: 	waited   bool
+112: }
+113: 
+114: func startRuntimeVerifier(ctx context.Context, install RuntimeVerifierInstallation) (*runtimeVerifierProcess, error) {
+115: 	if e := verifyRuntimeVerifierImage(install); e != nil {
+116: 		return nil, e
+117: 	}
+118: 	deadline, cancel := context.WithTimeout(ctx, 3*time.Minute)
+119: 	p := &runtimeVerifierProcess{cancel: cancel}
+120: 	p.cmd = exec.CommandContext(deadline, install.Executable)
+121: 	p.cmd.Dir = filepath.Dir(install.Executable)
+122: 	p.cmd.Env = []string{}
+123: 	for _, name := range []string{"SystemRoot", "WINDIR", "TEMP", "TMP"} {
+124: 		if value := os.Getenv(name); value != "" {
+125: 			p.cmd.Env = append(p.cmd.Env, name+"="+value)
+126: 		}
+127: 	}
+128: 	p.cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+129: 	// These are dedicated inherited anonymous pipes. No token is placed in argv,
+130: 	// environment, a file, logs, worker configuration or the scheduler object.
+131: 	var e error
+132: 	if p.in, e = p.cmd.StdinPipe(); e != nil {
+133: 		cancel()
+134: 		return nil, e
+135: 	}
+136: 	if p.out, e = p.cmd.StdoutPipe(); e != nil {
+137: 		p.in.Close()
+138: 		cancel()
+139: 		return nil, e
+140: 	}
+141: 	p.cmd.Stderr = io.Discard
+142: 	if e = p.cmd.Start(); e != nil {
+143: 		p.in.Close()
+144: 		p.out.Close()
+145: 		cancel()
+146: 		return nil, errors.New("installed verifier process could not start")
+147: 	}
+148: 	ok := false
+149: 	defer func() {
+150: 		if !ok {
+151: 			p.close()
+152: 		}
+153: 	}()
+154: 	p.identity, e = supervisor.ObserveProcess(uint32(p.cmd.Process.Pid))
+155: 	if e != nil || "sha256:"+p.identity.ImageSHA256 != install.ExecutableHash {
+156: 		return nil, errors.New("verifier process does not match installed image")
+157: 	}
+158: 	var nonce [32]byte
+159: 	if _, e = rand.Read(nonce[:]); e != nil {
+160: 		return nil, e
+161: 	}
+162: 	p.nonce = hex.EncodeToString(nonce[:])
+163: 	if e = verifier.WriteFrame(p.in, verifier.Challenge{Protocol: verifier.Protocol, Nonce: p.nonce}); e != nil {
+164: 		return nil, errors.New("verifier handshake write failed")
+165: 	}
+166: 	var hello verifier.Hello
+167: 	if e = p.read(deadline, &hello); e != nil {
+168: 		return nil, e
+169: 	}
+170: 	if hello.Protocol != verifier.Protocol || hello.ServiceID != verifier.ServiceID || hello.Nonce != p.nonce || hello.PID != p.cmd.Process.Pid {
+171: 		return nil, errors.New("verifier process handshake identity differs")
+172: 	}
+173: 	ok = true
+174: 	return p, nil
+175: }
+176: func (p *runtimeVerifierProcess) read(ctx context.Context, target any) error {
+177: 	done := make(chan error, 1)
+178: 	go func() { done <- verifier.ReadFrame(p.out, target) }()
+179: 	timer := time.NewTimer(20 * time.Second)
+180: 	defer timer.Stop()
+181: 	select {
+182: 	case e := <-done:
+183: 		return e
+184: 	case <-ctx.Done():
+185: 		p.cancel()
+186: 		return errors.New("verifier process cancelled")
+187: 	case <-timer.C:
+188: 		p.cancel()
+189: 		return errors.New("verifier reply deadline exceeded")
+190: 	}
+191: }
+192: func (p *runtimeVerifierProcess) verify(ctx context.Context, job verifier.Job) (verifier.Result, error) {
+193: 	var result verifier.Result
+194: 	observed, e := supervisor.ObserveProcess(uint32(p.cmd.Process.Pid))
+195: 	if e != nil || observed != p.identity {
+196: 		return result, errors.New("verifier process identity changed before credential transfer")
+197: 	}
+198: 	job.Protocol, job.Nonce = verifier.Protocol, p.nonce
+199: 	if e = verifier.WriteFrame(p.in, job); e != nil {
+200: 		return result, errors.New("private verifier job transfer failed")
+201: 	}
+202: 	job.Token = ""
+203: 	_ = p.in.Close()
+204: 	if e = p.read(ctx, &result); e != nil {
+205: 		return result, e
+206: 	}
+207: 	e = p.cmd.Wait()
+208: 	p.waited = true
+209: 	if e != nil || result.Protocol != verifier.Protocol || result.Nonce != p.nonce || result.Status != "QUALIFIED" || result.ErrorCode != "" {
+210: 		for _, code := range []string{"TASK_RUN_BINDING", "PROFILE_EVIDENCE", "NATIVE_OBSERVATION", "OUTPUT_EVIDENCE", "FROZEN_CHECKS", "DETERMINISTIC_CHECK", "SERVER_ACCEPTANCE", "SERVER_QUALIFICATION"} {
+211: 			if result.ErrorCode == code {
+212: 				return result, errors.New("independent verifier rejected stage " + code)
+213: 			}
+214: 		}
+215: 		return result, errors.New("independent verifier did not qualify the runtime")
+216: 	}
+217: 	return result, nil
+218: }
+219: func (p *runtimeVerifierProcess) close() {
+220: 	p.cancel()
+221: 	_ = p.in.Close()
+222: 	_ = p.out.Close()
+223: 	if !p.waited {
+224: 		_ = p.cmd.Wait()
+225: 		p.waited = true
+226: 	}
+227: }
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\internal\\host\\runtime_qualification_windows.go', 'sha256': '5b3ef9203b204215345c20240dcda3ae84c2c40d71a1e2a8bb03df7b16257d8b', 'start': 155, 'end': 285, 'provenance': 'CURRENT_SOURCE_LOCATOR_NOT_HISTORICAL_VERIFIER_COMPILED_INPUT'}
+155: // coordinator remains the sole launcher; this administrative host has no model
+156: // client. Separate verifier credentials never enter the coordinator or worker.
+157: func (h *Host) QualifyLocalRuntime(ctx context.Context, service *domain.Service, coordinator *domain.RuntimeCoordinator, apiURL string, request domain.LocalRuntimeQualificationRequest, install RuntimeVerifierInstallation) (domain.Object, error) {
+158: 	if e := coordinator.BeginLocalQualificationWindow(ctx, request.RequestID); e != nil {
+159: 		return nil, e
+160: 	}
+161: 	defer coordinator.EndLocalQualificationWindow(context.Background())
+162: 	if _, e := h.reverify(); e != nil {
+163: 		return nil, e
+164: 	}
+165: 	owner := h.boundPrincipal()
+166: 	if owner == "" {
+167: 		return nil, errors.New("managed qualification requires existing OS-bound Owner")
+168: 	}
+169: 	if _, e := h.ConfigurationMetadata(ctx, owner, "", nil); e != nil {
+170: 		return nil, e
+171: 	}
+172: 	ownerToken, e := service.IssueCredential(ctx, owner, 5*time.Minute)
+173: 	if e != nil {
+174: 		return nil, e
+175: 	}
+176: 	defer h.revokeCredentialByHash(context.Background(), owner, domain.Digest([]byte(ownerToken)))
+177: 	if e = coordinator.ValidateLocalQualification(ctx, ownerToken, request); e != nil {
+178: 		return nil, e
+179: 	}
+180: 	process, e := startRuntimeVerifier(ctx, install)
+181: 	if e != nil {
+182: 		return nil, e
+183: 	}
+184: 	defer process.close()
+185: 	root, principal, e := h.ensureRuntimeVerifier(ctx, owner, request.ProjectID, install)
+186: 	if e != nil {
+187: 		return nil, e
+188: 	}
+189: 	provenance := domain.Object{"schema": "researchos.local-runtime-administration.v1", "action": "EXPLICIT_QUALIFICATION_REQUEST", "request": request, "request_hash": domain.Hash(request), "installation": install, "installation_hash": domain.Hash(install), "service_root": root, "verifier_principal": principal, "process_identity": process.identity, "handshake_nonce": process.nonce, "owner": owner, "owner_host": h.InstanceID(), "os_principal_ref": h.identity.Ref, "application_separation": true, "protected_holdout": false}
+190: 	proof, e := service.RecordLocalRuntimeAdministration(ctx, ownerToken, request.ProjectID, provenance)
+191: 	if e != nil {
+192: 		return nil, e
+193: 	}
+194: 	run, e := coordinator.ExecuteLocalQualification(ctx, ownerToken, request)
+195: 	if e != nil {
+196: 		return domain.Object{"administration_ref": domain.Ref(proof, "Artifact"), "run": run, "state": "QUALIFICATION_NOT_ACCEPTED"}, e
+197: 	}
+198: 	review, e := service.LocalQualificationReview(ctx, ownerToken, request, domain.Str(run, "id"))
+199: 	if e != nil {
+200: 		return nil, e
+201: 	}
+202: 	// Issue only after execution is settled. The child process is still the same
+203: 	// verified PID/image/creation identity; it alone receives the short token.
+204: 	token, e := service.IssueCredential(ctx, principal, 2*time.Minute)
+205: 	if e != nil {
+206: 		return nil, e
+207: 	}
+208: 	defer h.revokeCredentialByHash(context.Background(), principal, domain.Digest([]byte(token)))
+209: 	epoch, _ := domain.Num(review, "epoch")
+210: 	job := verifier.Job{APIURL: apiURL, Token: token, PrincipalID: principal, ServiceRoot: root, ProjectID: request.ProjectID, RuntimeID: request.RuntimeID, TaskRef: review["task_ref"].(map[string]any), RunRef: review["run_ref"].(map[string]any), ProfileRef: review["profile_ref"].(map[string]any), ObservationRef: review["observation_ref"].(map[string]any), PlanHash: domain.Str(review, "plan_hash"), ExecutorID: domain.Str(review, "executor_id"), Epoch: epoch}
+211: 	job.VerificationSnapshot = review["verification_snapshot"].(map[string]any)
+212: 	job.VerificationSnapshotHash = domain.Str(review, "verification_snapshot_hash")
+213: 	result, e := process.verify(ctx, job)
+214: 	job.Token = ""
+215: 	if e != nil {
+216: 		return domain.Object{"state": "QUALIFICATION_NOT_ACCEPTED", "check_status": review["diagnostic_status"], "check_reason": review["diagnostic_reason"], "administration_ref": domain.Ref(proof, "Artifact")}, e
+217: 	}
+218: 	if domain.Str(result.RuntimeRef, "id") != request.RuntimeID {
+219: 		return nil, errors.New("verified runtime differs from Owner request")
+220: 	}
+221: 	// This re-enters the unchanged admission checks, including actual accepted
+222: 	// receipt/root/profile evidence. A child stdout claim cannot authorize use.
+223: 	expires := time.Now().UTC().Add(time.Duration(request.PurposeSeconds) * time.Second)
+224: 	if e = service.AuthorizeRuntimePurpose(ctx, ownerToken, request.ProjectID, request.RuntimeID, "mu_turn", expires); e != nil {
+225: 		return nil, e
+226: 	}
+227: 	completed := domain.Object{"schema": "researchos.local-runtime-administration.v1", "action": "VERIFIED_PURPOSE_AUTHORIZATION", "request_hash": domain.Hash(request), "administration_ref": domain.Ref(proof, "Artifact"), "verifier_process": process.identity, "service_root": root, "verifier_principal": principal, "acceptance_ref": result.AcceptanceRef, "runtime_ref": result.RuntimeRef, "observation_ref": result.ObservationRef, "purpose": "mu_turn", "expires_at": expires.Format(time.RFC3339Nano), "application_separation": true, "protected_holdout": false}
+228: 	final, e := service.RecordLocalRuntimeAdministration(ctx, ownerToken, request.ProjectID, completed)
+229: 	if e != nil {
+230: 		return nil, e
+231: 	}
+232: 	return domain.Object{"state": "QUALIFIED_PURPOSE_AUTHORIZED", "runtime_ref": result.RuntimeRef, "acceptance_ref": result.AcceptanceRef, "administration_ref": domain.Ref(final, "Artifact"), "purpose": "mu_turn", "protected_holdout": false}, nil
+233: }
+EXACT_ARGV ['rg', '-n', '--glob', '*.go', '--glob', '!**/*_test.go', 'runtimeVerifierProcess|runtime_verifier|RuntimeVerifier|qualification.*status|Qualification.*Status|ProcessState|process_created|wait_result', 'internal/host']
+internal/host\desktop_management_windows.go:43:	installation  RuntimeVerifierInstallation
+internal/host\desktop_management_windows.go:51:func NewDesktopManagement(h *Host, s *domain.Service, c *domain.RuntimeCoordinator, apiURL string, install RuntimeVerifierInstallation, input, output *os.File, shutdown func(context.Context) error) (*DesktopManagement, error) {
+internal/host\desktop_management_windows.go:73:	if e = verifyRuntimeVerifierImage(install); e != nil {
+internal/host\desktop_management_windows.go:248:		return d.coordinator.LocalQualificationStatus(ctx, token, f.ProjectID, f.RequestID, f.RequestHash)
+internal/host\runtime_check_windows.go:561:		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": strconv.FormatInt(receipt.Created, 10), "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_raw_bytes": len(receipt.Stdout), "stderr_raw_bytes": len(receipt.Stderr), "stdout_raw": receipt.Stdout, "stderr_raw": receipt.Stderr}}
+internal/host\runtime_qualification_windows.go:76:	Installation   RuntimeVerifierInstallation `json:"installation"`
+internal/host\runtime_qualification_windows.go:79:func (h *Host) ensureRuntimeVerifier(ctx context.Context, owner, project string, install RuntimeVerifierInstallation) (string, string, error) {
+internal/host\runtime_qualification_windows.go:157:func (h *Host) QualifyLocalRuntime(ctx context.Context, service *domain.Service, coordinator *domain.RuntimeCoordinator, apiURL string, request domain.LocalRuntimeQualificationRequest, install RuntimeVerifierInstallation) (domain.Object, error) {
+internal/host\runtime_qualification_windows.go:180:	process, e := startRuntimeVerifier(ctx, install)
+internal/host\runtime_qualification_windows.go:185:	root, principal, e := h.ensureRuntimeVerifier(ctx, owner, request.ProjectID, install)
+internal/host\runtime_verifier_process_windows.go:25:type RuntimeVerifierInstallation struct {
+internal/host\runtime_verifier_process_windows.go:35:// LoadRuntimeVerifierInstallation reads a local administrator's bounded install
+internal/host\runtime_verifier_process_windows.go:38:func LoadRuntimeVerifierInstallation(path string) (RuntimeVerifierInstallation, error) {
+internal/host\runtime_verifier_process_windows.go:39:	var install RuntimeVerifierInstallation
+internal/host\runtime_verifier_process_windows.go:53:	if e = verifyRuntimeVerifierImage(install); e != nil {
+internal/host\runtime_verifier_process_windows.go:58:func verifyRuntimeVerifierImage(install RuntimeVerifierInstallation) error {
+internal/host\runtime_verifier_process_windows.go:104:type runtimeVerifierProcess struct {
+internal/host\runtime_verifier_process_windows.go:114:func startRuntimeVerifier(ctx context.Context, install RuntimeVerifierInstallation) (*runtimeVerifierProcess, error) {
+internal/host\runtime_verifier_process_windows.go:115:	if e := verifyRuntimeVerifierImage(install); e != nil {
+internal/host\runtime_verifier_process_windows.go:119:	p := &runtimeVerifierProcess{cancel: cancel}
+internal/host\runtime_verifier_process_windows.go:176:func (p *runtimeVerifierProcess) read(ctx context.Context, target any) error {
+internal/host\runtime_verifier_process_windows.go:192:func (p *runtimeVerifierProcess) verify(ctx context.Context, job verifier.Job) (verifier.Result, error) {
+internal/host\runtime_verifier_process_windows.go:219:func (p *runtimeVerifierProcess) close() {
+internal/host\runtime_setup_windows.go:21:// begins a qualification Run, accepts a Task, or upgrades runtime status.
+internal/host\runtime_verifier_replacement_journal_windows.go:304:	install, e := LoadRuntimeVerifierInstallation(p.Manifest)
+internal/host\runtime_verifier_replacement_journal_windows.go:315:func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, raw []byte) (RuntimeVerifierReplacementResult, error) {
+internal/host\runtime_verifier_replacement_journal_windows.go:439:// RuntimeVerifierReplacementStartupGate is read-only and must run while the
+internal/host\runtime_verifier_replacement_journal_windows.go:441:func RuntimeVerifierReplacementStartupGate(lease *rt.DataRootLease) error {
+internal/host\runtime_verifier_replacement_windows.go:33:type RuntimeVerifierReplacementInput struct {
+internal/host\runtime_verifier_replacement_windows.go:38:type RuntimeVerifierReplacementResult struct {
+internal/host\runtime_verifier_replacement_windows.go:84:	Installation            RuntimeVerifierInstallation `json:"installation"`
+internal/host\runtime_verifier_replacement_windows.go:221:	`SELECT count(*) FROM idempotency i LEFT JOIN domain_objects r ON r.project=i.project AND r.kind='Run' AND r.id=json_extract(i.body,'$.run_ref.id') WHERE i.operation='host:managed-runtime-qualification' AND (r.id IS NULL OR coalesce(json_extract(r.body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED') OR EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=i.project AND d.run=r.id AND d.state IN ('PREPARED','STARTED','UNKNOWN')) OR EXISTS(SELECT 1 FROM resource_effects x WHERE x.project=i.project AND x.run=r.id AND x.sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(x.body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')))`,
+internal/host\runtime_verifier_replacement_windows.go:457:func replacementCandidate(ctx context.Context, in RuntimeVerifierReplacementInput) (replacementPlan, error) {
+internal/host\runtime_verifier_replacement_windows.go:493:	p.Installation, e = LoadRuntimeVerifierInstallation(p.Manifest)
+internal/host\runtime_verifier_replacement_windows.go:497:	var decoded RuntimeVerifierInstallation
+internal/host\runtime_verifier_replacement_windows.go:580:// RuntimeVerifierReplacement owns the same native lease as normal control. It
+internal/host\runtime_verifier_replacement_windows.go:582:func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplacementInput) (out RuntimeVerifierReplacementResult, err error) {
+internal/host\runtime_verifier_replacement_windows.go:583:	out = RuntimeVerifierReplacementResult{Schema: replacementSchema, Action: in.Action, OperationID: in.OperationID, State: "REJECTED", Outcome: "NOT_APPLIED"}
+internal/host\runtime_verifier_replacement_windows.go:634:		if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
+internal/host\runtime_verifier_replacement_windows.go:699:	if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
+internal/host\runtime_verifier_replacement_windows.go:702:	fresh, e := replacementCandidate(ctx, RuntimeVerifierReplacementInput{DataRoot: p.DataRoot, OperationID: p.OperationID, Manifest: p.Manifest, ExpectRecordSHA256: p.OldSHA256, ExpectManifestSHA256: p.ManifestSHA256, RollbackOf: p.RollbackOf})
+internal/host\runtime_verifier_replacement_windows.go:742:	fresh, e = replacementCandidate(ctx, RuntimeVerifierReplacementInput{DataRoot: p.DataRoot, OperationID: p.OperationID, Manifest: p.Manifest, ExpectRecordSHA256: p.OldSHA256, ExpectManifestSHA256: p.ManifestSHA256, RollbackOf: p.RollbackOf})
+internal/host\runtime_verifier_replacement_windows.go:778:	if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
+internal/host\runtime_verifier_replacement_windows.go:784:func replacementResult(action string, p replacementPlan, digest, state, outcome string) RuntimeVerifierReplacementResult {
+internal/host\runtime_verifier_replacement_windows.go:785:	return RuntimeVerifierReplacementResult{Schema: replacementSchema, Action: action, OperationID: p.OperationID, State: state, Outcome: outcome, PlanSHA256: digest, OldRecordSHA256: p.OldSHA256, NewRecordSHA256: p.NewSHA256, RegistrationHash: p.NewHash, InstallationHash: p.NewInstallationHash, ReadonlyCensus: p.Census}
+
+
+rg_native_exit 0

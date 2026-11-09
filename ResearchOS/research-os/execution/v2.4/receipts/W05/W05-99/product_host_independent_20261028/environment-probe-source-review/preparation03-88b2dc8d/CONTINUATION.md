@@ -1,0 +1,24 @@
+# CP573 independent review continuation
+
+Current source review complete; no native authority. Parent Root and owner `product_host_resume_20261028` received verdict and hash. Wait for separately scoped follow-up; do not poll or rerun old tests/builds.
+
+- Base: `D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99`.
+- Reviewer root: `product_host_independent_20261028`.
+- Author package: `product_host_native_20261028/native-init-diagnosis-02/environment-probe/preparation03`.
+- Root scope: `resume_cp528_codex/20261025-current-chat/continuation-cp573/Native-folder-followup-preparation03-scope.json`, SHA256 `f43998c1617d0e7596b7ef9f05b618e8b30f7de789511b295d66be992af7bb7a`.
+- PREPARATION SHA256 `14772591b1998e1ee6de7d7d6b71f1bdfd2b99de10455fc5f35c491e8c8a22db`; controller `88b2dc8dfd736e16b9edd57d45dc39b6c2ad6053c3498148b7ff1e5139113d23`; diff `4030241a5ca6465793ee54a8f6fa8fb0bc32ac9e844411114f2d605007b94972`.
+- This directory `REVIEW.json` SHA256 `64a337d5858da908f8eaa06903b5dfb53e5c6345c92cf7691cfeaa628fb9ea17`: source accepted for separate finite C then A2-or-D scope, formal increment0. `review_changes.py` captures and checks frozen source, baseline and focused probes. No helper/native actions or Go build.
+
+C keeps original A seven keys/values and adds only approved OS keys and synthetic HOMEDRIVE/HOMEPATH, hidden startup. Stable visible owned dialog with successful exact IDCANCEL and expected cancellation error selects A2 (original A environment, hidden). Fast <=2s Shell-null without cancellation selects D (exact C environment, only clear STARTF_USESHOWWINDOW). Unexpected C aborts remaining plan; max2. No automatic retries or third case. Nine identity/window/hold/release functions are AST-identical to accepted prep02. Independent mocked main validates both branches and unexpected stop; wrong startup bit deltas refused; invalid UTF8 preserves raw bytes then errors; injected reparse refused.
+
+Explicit reusable synthetic state: worktree `.local/native-folder-environment-cp572-AB01`, current8entries, manifest SHA `e137a9c455e4ae06a27d18e1c8aa05077374e711dbd9d390a5b4aa49fa8269a0`. A env SHA `70d638420b1ba210ce8bef5f3edcbfdc8179285008647d0bdef516cd9271457e`; C env SHA `af8e86d4e4c767d24852e8df933276f6a911213eb204be7a7b735062c94e3a99`. Before/after manifests preserve state changes rather than erase them. Failed raw capture is a best-effort partial snapshot at hold entry; later bytes can remain in live reader memory. This is not product qualification.
+
+Canonical reused helper: worktree `.local/native-folder-environment-cp570/revision02/native-folder-environment.exe`, SHA `92573aacf6f2caab9baead612a13cf0eef688fc1e5a4177ac6bf5b1cbfa7a463`. Candidate worktree `D:/作品集/ResearchOS/research-os/.local/worktrees/desktop-installed-delivery-20261025`, commit `5c4c94022bd92da68ef544f2779527bfe065c428`. All Git commands need `-c gc.auto=0 -c maintenance.auto=false`; Python output UTF8, use `-B`.
+
+Recent prior evidence:
+
+- CP572 actual reviewer `environment-probe-actual-cp572-review/REVIEW.json`, SHA `83fdadc071e901a16ef6b6c394d17a83fa579fd714ccdad4cd52ecbd6153761e`. A PID61164 elapsed113.3683ms, B64276 elapsed96.2467ms, both `INVALID_REQUEST: folder selection cancelled`, helper/controller exit0 merely diagnostic completion; no IDCANCEL. A104ms captured invisible #32770; B no sample does not prove nonexistent. Adding SystemDrive alone did not rescue. Later PID61164 reused by svchost with different creation time; never act on numeric PID alone. CP572 actual scope SHA `e7d60fe901414bb2de327ce15aeae7bf9964f85714055cda80306e30a994e919`.
+- CP571 prep02 reviewer `environment-probe-source-review/preparation02-5fcc8477/REVIEW.json`, SHA `bdf7ed6b7c3a68c6fa2d69dad2ef4ae6c5e46b6815bbf7a8d2a565a882efa949`; independent offline rebuild byte-identical, hold fault probes accepted. Old prep01 rejected receipt-write escape and missing build provenance; original evidence retained.
+- CP569 native chooser failed but Root exact hidden HWND normal close succeeded (Electron/Core retained handles exit0, witness retired), controller then Root-released after two absence scans and exited1. Reviewer `native-chooser-execution-cp569-review/FINAL-REVIEW.json` SHA `780098be2380fecae77b3eaf83e2861058e7e48c36a59e5f1585f463a7b05d0d`. Raw cancellation means Shell selected==0, not proven human cancel. Post-reply pipe PID failure races normal disconnect and does not prove server identity changed.
+
+Protect all old source/receipts, no canonical/Main/shared-state mutations. Reviewer writes only explicitly assigned own review directories. No product process/window actions without explicit later task. All formal increments remain0. Parent selected safe OS environment group first based on historical same-chooser/same257/0 success evidence, retaining the startup-visibility D branch.

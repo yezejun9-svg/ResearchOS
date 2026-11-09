@@ -1,0 +1,40 @@
+import argparse,hashlib,json,os
+from datetime import datetime,timezone
+from pathlib import Path
+ROOT=Path('D:/作品集/ResearchOS/research-os');HERE=Path(__file__).resolve().parent;BASE=ROOT/'execution/product-v1/receipts/single-harness-20261104';CONTROL=HERE/'product-v1-owned-verification-20261104';OUT=BASE/'progress-cp663'
+def read(p):return json.loads(p.read_bytes())
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def put(p,v):
+ t=p.with_name(p.name+'.new');assert not t.exists();t.write_bytes((json.dumps(v,ensure_ascii=False,indent=2)+'\n').encode('utf8'));os.replace(t,p)
+ap=argparse.ArgumentParser();ap.add_argument('--review',required=True);ap.add_argument('--review-sha',required=True);ap.add_argument('--post-sha',required=True);a=ap.parse_args()
+cpf=ROOT/'execution/v2.4/checkpoint.json';raw=cpf.read_bytes();cp=read(cpf);assert cp['revision']==662 and len(cp['failure_counters'])>=2567 and not OUT.exists()
+flow=HERE/'product-v1-layout-visual-中文-run-03';outer=CONTROL/'runs/product-v1-layout-visual-03/RESULT.json';r=read(outer);v=read(flow/'receipts/result.json');g=read(flow/'receipts/workbench-responsive-visual.json')
+assert r['root_exit_code']==0 and r['stop_proved'] and r['job_active_zero'] and r['terminate_job_attempts']==r['terminate_original_root_attempts']==0 and not r['errors'] and not r['input_drift']
+assert v['status']=='REAL_NATIVE_PATH_ENTRY_AND_PROJECT_BINDING_OBSERVED_NOT_PRODUCT_ACCEPTED' and v['visual_status']==g['status']=='PASS_MEASURED_VISUAL_GEOMETRY' and not g['findings'] and v['actual_dom_submit_attempts']==v['actual_model_calls']==0 and v['close']['app_close_resolved']
+initial=[s for s in g['scenarios'] if s['phase']=='INITIAL_VIEWPORT'];assert len(initial)==4
+for s in initial:
+ assert s['document']['scroll_y']==s['transcript_scroll']['scroll_top']==s['main_area_scroll']['scroll_top']==0
+ assert s['viewport']['inner_width']==s['viewport']['requested_width'] and s['viewport']['inner_height']==s['viewport']['requested_height'] and not s['horizontal_overflow'] and not s['composer_overlaps_content']
+actions=[s for s in g['scenarios'] if s['phase']=='ACTION_SCROLLED_AND_FOCUSED'];assert len(actions)==12
+for s in actions:
+ i=s['action_index'];assert s['actions_center_hit'][i] and s['actions_visible'][i] and s['action_focused']
+assert all(not s['horizontal_overflow'] and not s['composer_overlaps_content'] for s in g['scenarios'])
+review=ROOT/a.review;assert sha(review)==a.review_sha;rv=read(review);assert rv['formal_increment']==0 and rv.get('product_increment',0)==0 and rv.get('source_head',cp['current_Main_HEAD'])==cp['current_Main_HEAD']
+post=HERE/'product-v1-build10-post-visual03-root-readback.json';assert sha(post)==a.post_sha;pv=read(post);assert pv['listed_files']==len(pv['rows'])==134 and not pv['mismatches'] and not pv['unlisted_paths']
+OUT.mkdir();(OUT/'checkpoint.before.json').write_bytes(raw)
+for name,p in [('outer.RESULT.json',outer),('postbundle.json',post),('independent-review.json',review)]:(OUT/name).write_bytes(p.read_bytes())
+for d in ['receipts','screenshots']:
+ dest=OUT/d;dest.mkdir()
+ for p in (flow/d).iterdir():
+  if p.is_file() and p.name!='launch-input.json':
+   assert p.suffix.lower() not in ['.db','.sqlite','.exe','.dll'] and p.stat().st_size<16*1024*1024;(dest/p.name).write_bytes(p.read_bytes())
+now=datetime.now(timezone.utc).isoformat();old=list(cp['failure_counters']);known={e.get('origin_key') for e in old}
+for e in rv.get('diagnostic_events',[]):
+ assert e.get('origin_key') and e.get('classification')
+ if e['origin_key'] not in known:cp['failure_counters'].append({'at':now,'attempts':1,'counter_reset':False,**e});known.add(e['origin_key'])
+assert cp['failure_counters'][:len(old)]==old
+progress=dict(checkpoint_revision=663,at=now,status='BUILD10_REAL_DESKTOP_AND_MOBILE_RESPONSIVE_GEOMETRY_OBSERVED_NOT_FULL_PRODUCT_ACCEPTANCE',main_head=cp['current_Main_HEAD'],consumed_scope='product-v1-layout-visual-03',automatic_retry=0,actual=dict(desktop_1440x1000_dark_light='MEASURED_GEOMETRY_NO_FINDINGS',mobile_390x844_dark_light='REAL_BOUNDED_MAIN_SCROLL_ABOVE_BOTTOM_NAVIGATION; MEASURED_GEOMETRY_NO_FINDINGS',all_initial_document_transcript_main_scroll_zero=True,all_requested_viewports_exact=True,all_12_actions_scrolled_focused_and_hit=True,horizontal_overflow=False,composer_overlap=False,findings=0,scenarios=len(g['scenarios']),native_main_binding='CONFIRMED',project_id=v['project_id'],authorized_workspace_ref=v['authorized_workspace_ref'],private_real_path='NOT_EXPOSED',app_close_resolved=True,original_job_processes=r['job_total_processes'],original_job_stop_proved=True,forced_termination=False,this_operation_task_submissions=0,this_operation_model_invocations=0,banner_states='Source supports natural variable banner heights; no manufactured banner or live offline/permission-banner coverage claimed'),postbundle=dict(listed_files=134,mismatches=[],unlisted_paths=[]),independent_review_ref=a.review,independent_review_sha256=a.review_sha,mxc_status='FIXED_LOCAL_STARTUP_ECHO_OBSERVED; SPLIT_READ_ENFORCEMENT_UNVERIFIED; TWO_OF_TWO_LOCAL_DIAGNOSTICS_CONSUMED',mxc_wiring_analysis_ref='execution/product-v1/receipts/single-harness-20261104/mxc-resource-check/wiring-analysis/product-v1-mxc-wiring-analysis-20261105-a72d/REPORT.md',real_model_requests=1,real_model_requests_unit='PRIOR_ONE_HOST_TASK_NATIVE_HARNESS_INVOCATION; INFERENCE_NOT_CONFIRMED',product_journeys_accepted=0,product_journeys_required=13,legacy_formal_accepted=0,legacy_formal_required=42,historical_records=len(cp['failure_counters']),old_records_reset=False,next='Keep new source11e0395/build10 and independently reviewed visual03 evidence; original visual01/02 failures remain. Next product slice should bind explicit Host-owned Windows sandbox mode and exact profile verification/capability gate together, preserving root-deny/minimal-read/source-read; current local MXC echo proves startup only. Read wiring analysis before design; no further echo, original Task/model replay or profile/config/OS changes. Full model/tool/artifact/cancel/recovery and J13 banner/keyboard/other viewport coverage still unaccepted; resume only scoped authorized work and preserve all historical counters/data.')
+put(OUT/'RESUME.json',progress)
+sf=ROOT/'execution/product-v1/state.json';sr=sf.read_bytes();s=read(sf);(OUT/'state.before.json').write_bytes(sr);s.update(revision=s['revision']+1,updated_at=now,status=progress['status'],last_progress_ref=str((OUT/'RESUME.json').relative_to(ROOT)),next=progress['next']);s.setdefault('runtime_evidence',[]).append(dict(kind='ACTUAL_BUILD10_DESKTOP_AND_MOBILE_RESPONSIVE_GEOMETRY_NO_FINDINGS',source_head=cp['current_Main_HEAD'],resume_ref=str((OUT/'RESUME.json').relative_to(ROOT)),business_acceptance=False));put(sf,s)
+cp.update(revision=663,expected_previous_revision=662,updated_at=now,next_command=progress['next']+' Read '+str((OUT/'RESUME.json').relative_to(ROOT)));cp['current_implementation']=dict(status=progress['status'],at=now,resume_ref=str((OUT/'RESUME.json').relative_to(ROOT)),active_construction_owners=[],formal_increment=0);assert cpf.read_bytes()==raw;put(cpf,cp)
+hf=ROOT/'execution/v2.4/HANDOFF_RESUME_PACK.md';old=hf.read_bytes();(OUT/'handoff.before.md').write_bytes(old);t=hf.with_name(hf.name+'.cp663.new');assert not t.exists();t.write_bytes(('# Current resume CP663 - BUILD10 REAL DESKTOP/MOBILE GEOMETRY OBSERVED; FULL PRODUCT UNACCEPTED\n\nRead '+str((OUT/'RESUME.json').relative_to(ROOT))+'. Source11e0395/build10: actual1440/390 dark/light, allinitial doc/transcript/main0, all12focus/hit/no geometry findings, normal App/Jobzero and134bundleintact. No real banner-state claim or new tasks/models. MXC fixed echo startup only,localbudget2/2 consumed;explicit Host sandbox/profile/capability gate remains next. Prior TaskInvocation1 failed closed before confirmed inference; no replay. Old records/data preserved;V1journeys0/13,legacy0/42.\n\n').encode('utf8')+old);os.replace(t,hf);(OUT/Path(__file__).name).write_bytes(Path(__file__).read_bytes());print(json.dumps(progress))

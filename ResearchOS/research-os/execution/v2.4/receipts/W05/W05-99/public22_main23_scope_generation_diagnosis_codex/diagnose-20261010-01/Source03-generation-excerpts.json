@@ -1,0 +1,98 @@
+{
+  "functions": [
+    {
+      "name": "lease",
+      "line": 90,
+      "end_line": 93,
+      "source": "def lease(q):\n    need(type(q['lease_id']) is str and re.fullmatch('[0-9a-f]{32}',q['lease_id']),'LEASE_ID')\n    issued,expires=when(q['lease_issued_at']),when(q['lease_expires_at'])\n    need(0<(expires-issued).total_seconds()<=3600 and issued<=datetime.now(timezone.utc)<expires,'LIVE_READONLY_LEASE')"
+    },
+    {
+      "name": "root_request",
+      "line": 271,
+      "end_line": 281,
+      "source": "def root_request(request_ref):\n    q=doc(request_ref);need(q['schema']=='researchos.root-public22-continuation-registration-request.v1' and q['issued_by']==ROOT\n        and q['mode']==MODE and q['formal_acceptance'] is False and q['parent_acceptance'] is False,'ROOT_READONLY_ENVELOPE')\n    i=inputs();need(q['case_request_ref']==i['case_request_ref'] and q['evidence']==i['evidence'],'ORIGINAL_CASE_REQUEST_UNCHANGED')\n    source=source_chain(q);original=original_evidence(i);current=current_four(q['before_canonical_refs'],q['expected_revisions']);lease(q)\n    need(type(q['continuation_id']) is str and re.fullmatch('[0-9a-f]{32}',q['continuation_id']),'RECHECK_ID')\n    root=B/'integration_codex'/('public22-continuation-registration-'+q['continuation_id']);out=B/'integration_codex'/('public22-continuation-'+q['continuation_id'])\n    need(q['registration_root']==str(root) and q['receipt_root']==str(out) and not out.exists(),'FRESH_REVIEW_RECEIPT_ROOT')\n    live=audit(q['postreview_live_audit_ref'],ROOT,q['before_canonical_refs']+[q['review_decision_ref'],q['case_request_ref']])\n    need(live['result_time']>when(source['review']['reviewed_utc']) and when(q['created_utc'])>=live['result_time'],'POSTREVIEW_CURRENT_ROOT_CAPTURE')\n    return q,current,source,original,[request_ref,*source['refs'],*original['refs'],*live['refs'],*runtime_refs(i)]"
+    },
+    {
+      "name": "projection",
+      "line": 283,
+      "end_line": 305,
+      "source": "def projection(cp0,ow0,scope_ref,owner_ref,worker_ref,facts_ref,owner,worker,created):\n    \"\"\"Pure TP callback: no reads or nested guard over its exclusive pair.\"\"\"\n    cp=copy.deepcopy(cp0);ow=copy.deepcopy(ow0)\n    need(KEY not in ow['card_path_bindings']['W05-99']['subtasks'] and not any(w.get('slice_id')==SLICE for w in cp['workers']),'READONLY_SLICE_ALREADY_REGISTERED')\n    need(owner['scope_ref']==worker['scope_ref']==scope_ref and worker['selected_owner_ref']==owner_ref\n        and owner['selected_worker_id']==worker['worker_id']==ROOT,'ACYCLIC_SCOPE_OWNER_WORKER')\n    ow['card_path_bindings']['W05-99']['subtasks'][KEY]=dict(owner,owner_document_ref=owner_ref,worker_document_ref=worker_ref,current_source_writer=None,formal_case_accepted_delta=0,parent_acceptance=False)\n    cp['workers'].append(dict(worker,worker_document_ref=worker_ref))\n    cp['work_in_progress']['public22_continuation_scope_ref']=scope_ref\n    cp['work_in_progress']['public22_continuation_facts_ref']=facts_ref\n    cp.update(revision=cp0['revision']+1,expected_previous_revision=cp0['revision'],updated_at=created,updated_by=ROOT)\n    ow.update(revision=ow0['revision']+1,updated_at=created,updated_by=ROOT)\n    restored_cp=copy.deepcopy(cp);restored_ow=copy.deepcopy(ow)\n    for key in ('workers','work_in_progress','revision','expected_previous_revision','updated_at','updated_by'):\n        if key in cp0:restored_cp[key]=copy.deepcopy(cp0[key])\n        else:restored_cp.pop(key,None)\n    del restored_ow['card_path_bindings']['W05-99']['subtasks'][KEY]\n    for key in ('revision','updated_at','updated_by'):\n        if key in ow0:restored_ow[key]=copy.deepcopy(ow0[key])\n        else:restored_ow.pop(key,None)\n    need(encoded(restored_cp)==encoded(cp0) and encoded(restored_ow)==encoded(ow0),'COMPLETE_CANONICAL_INVERSE')\n    need(cp.get('failure_counters')==cp0.get('failure_counters') and cp['work_in_progress'].get('root_next_failure_ordinal_live')==cp0['work_in_progress'].get('root_next_failure_ordinal_live'),'FAILURE_LEDGER_UNCHANGED')\n    return cp,ow"
+    },
+    {
+      "name": "scope_projection",
+      "line": 324,
+      "end_line": 328,
+      "source": "def scope_projection(q,request_ref,source,original):\n    return dict(schema='researchos.root-public22-continuation-scope.v1',issued_by=ROOT,mode=MODE,registration_request_ref=request_ref,\n        case_request_ref=q['case_request_ref'],evidence=q['evidence'],leaf_contract_ref=source['leaf']['contract_ref'],leaf_runner_ref=source['leaf']['runner_ref'],\n        original_case_root=original['case']['output_root'],receipt_root=q['receipt_root'],lease_id=q['lease_id'],lease_issued_at=q['lease_issued_at'],\n        lease_expires_at=q['lease_expires_at'],main23_bound_ref=inputs()['main23_bound_ref'],existing22_decision_ref=inputs()['existing22_decision_ref'],phases=['upgrade22to23','backup23','verify23'],maximum_new_native_children=3,original1025_result='FAILED_RETAINED',formal_acceptance=False,parent_acceptance=False)"
+    },
+    {
+      "name": "build",
+      "line": 330,
+      "end_line": 355,
+      "source": "def build(request_ref):\n    q,current,source,original,refs=root_request(request_ref);root=Path(q['registration_root']);need(not root.exists(),'NEW_REGISTRATION_NAMESPACE');physical(root,True)\n    guard=load(GUARD_REF,'existing_source_guard').SourceReadGuard(per_file_cap=MAX,total_cap=2*1024*1024*1024)\n    result=None;created=False;primary=None\n    try:\n        guard.acquire(refs_unique(refs+current['refs'],CANON[:2]));current_four(q['before_canonical_refs'],q['expected_revisions']);root.mkdir();created=True\n        scope=scope_projection(q,request_ref,source,original)\n        sr=save(root,'scope.root.json',scope)\n        common=dict(step_id='W05-99',slice_id=SLICE,state=STATE,owner=ROOT,scope_ref=sr,lease_status='ACTIVE',lease_id=q['lease_id'],\n            lease_issued_at=q['lease_issued_at'],lease_expires_at=q['lease_expires_at'],receipt_root=q['receipt_root'],mode=MODE)\n        owner=dict(common,owner_id=ROOT,selected_worker_id=ROOT);oref=save(root,'owner.root.json',owner)\n        worker=dict(common,worker_id=ROOT,selected_owner_ref=oref);wref=save(root,'worker.root.json',worker)\n        archives=[]\n        for index,raw in enumerate(current['raw']):\n            path=root/(str(index)+'.before.raw.json')\n            with path.open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())\n            archives.append(pin(path))\n        facts=dict(schema='researchos.root-public22-continuation-registration-facts.v1',issued_by=ROOT,request_ref=request_ref,scope_ref=sr,owner_ref=oref,\n            worker_ref=wref,before_canonical_refs=q['before_canonical_refs'],before_archive_refs=archives,expected_revisions=q['expected_revisions'],formal_acceptance=False)\n        fref=save(root,'facts.root.json',facts);after=projection(*current['documents'][:2],sr,oref,wref,fref,owner,worker,q['created_utc'])\n        for index,value in enumerate(after):save(root,str(index)+'.after.proposed.json',value)\n        result=fref\n    except BaseException as exc:primary=exc\n    finally:closed=close_guard(guard,root,'build.guard.closed.json',created)\n    if primary is not None or closed['errors']:raise SourceFailure('BUILD_FAILED_NO_RETRY',primary,closed['errors']) from primary\n    return result"
+    },
+    {
+      "name": "registration",
+      "line": 357,
+      "end_line": 390,
+      "source": "def registration(mode,facts_ref,activation_ref=None):\n    need(mode in ('check','activate'),'CHECK_OR_ACTIVATE')\n    facts=doc(facts_ref);q,current,source,original,refs=root_request(facts['request_ref']);root=Path(q['registration_root'])\n    need(same(facts_ref,pin(root/'facts.root.json')) and facts['before_canonical_refs']==q['before_canonical_refs'],'FACTS_REQUEST_BINDING')\n    scope=doc(facts['scope_ref']);owner=doc(facts['owner_ref']);worker=doc(facts['worker_ref'])\n    need(scope==scope_projection(q,facts['request_ref'],source,original),'EXACT_READONLY_SCOPE_PROJECTION')\n    need(scope['registration_request_ref']==facts['request_ref'] and scope['case_request_ref']==q['case_request_ref'] and scope['evidence']==q['evidence']\n        and scope['mode']==MODE and scope['receipt_root']==q['receipt_root'] and scope['original1025_result']=='FAILED_RETAINED','SCOPE_FROZEN_REQUEST')\n    for value in (scope,owner,worker):\n        lease(value);need(all(value[k]==q[k] for k in ('lease_id','lease_issued_at','lease_expires_at')),'SAME_REGISTERED_LEASE')\n    for value in (owner,worker):need(value['state']==STATE and value['owner']==ROOT and value['slice_id']==SLICE and value['scope_ref']==facts['scope_ref'],'REGISTERED_OWNER_WORKER')\n    need(len(facts['before_archive_refs'])==4 and all(checked(ref)==raw for ref,raw in zip(facts['before_archive_refs'],current['raw'])),'FOUR_EXACT_BEFORE_ARCHIVES')\n    if mode=='activate':\n        activation=doc(activation_ref)\n        need(activation['issued_by']==ROOT and activation['facts_ref']==facts_ref and activation['before_canonical_refs']==q['before_canonical_refs'],'ROOT_ACTIVATION')\n        seen=audit(activation['actual_audit_ref'],ROOT,[facts_ref,*q['before_canonical_refs']])\n        need(seen['result_time']>when(q['created_utc']),'FRESH_ACTIVATION_CAPTURE');refs.extend([activation_ref,*seen['refs']])\n    refs.extend([facts_ref,facts['scope_ref'],facts['owner_ref'],facts['worker_ref'],*facts['before_archive_refs'],GUARD_REF,TP_REF,*current['refs'][2:]])\n    tp=load(TP_REF,'existing_canonical_TP');guard=load(GUARD_REF,'registration_source_guard').SourceReadGuard(per_file_cap=MAX,total_cap=2*1024*1024*1024)\n    transaction=None;primary=None\n    def transform(cp,ow):\n        need(cp==current['documents'][0] and ow==current['documents'][1],'TP_EXPECTED_DOCUMENTS')\n        return projection(cp,ow,facts['scope_ref'],facts['owner_ref'],facts['worker_ref'],facts_ref,owner,worker,q['created_utc'])\n    try:\n        guard.acquire(refs_unique(refs,CANON[:2]));after=transform(*current['documents'][:2])\n        if mode=='activate':transaction=tp.update_pair(current['refs'][:2],transform,root,'activate')\n        else:current_four(q['before_canonical_refs'],q['expected_revisions'])\n        need(all(same(pin(p),r) for p,r in zip(CANON[2:],current['refs'][2:])),'SS_CM_UNCHANGED')\n    except BaseException as exc:primary=exc\n    finally:closed=close_guard(guard,root,mode+'.guard.closed.json',True)\n    if primary is not None or closed['errors']:raise SourceFailure('REGISTRATION_FAILED_NO_RETRY',primary,closed['errors']) from primary\n    return save(root,mode+'.result.json',dict(schema='researchos.root-public22-continuation-registration-result.v1',mode=mode,facts_ref=facts_ref,scope_ref=facts['scope_ref'],\n        transaction=transaction,proposed_after_refs=[dict(path=str(p),sha256=hashlib.sha256(encoded(v)).hexdigest(),bytes=len(encoded(v))) for p,v in zip(CANON[:2],after)],\n        SS_CM_unchanged=True,complete_inverse=True,original1025_result='FAILED_RETAINED',maximum_new_native_children=3,formal_acceptance=False))"
+    },
+    {
+      "name": "live",
+      "line": 392,
+      "end_line": 408,
+      "source": "def live(actual):\n    facts=doc(actual['facts_ref']);scope=doc(facts['scope_ref']);q=doc(facts['request_ref']);lease(scope)\n    need(actual['scope_ref']==facts['scope_ref'] and scope['registration_request_ref']==facts['request_ref']\n        and scope['case_request_ref']==actual['case_request_ref']==inputs()['case_request_ref'] and scope['mode']==MODE,'LIVE_EXACT_SCOPE')\n    revisions=dict(q['expected_revisions']);revisions['checkpoint']+=1;revisions['path_ownership']+=1\n    current=current_four(actual['current_canonical_refs'],revisions);cp,ow=current['documents'][:2]\n    need(cp['work_in_progress']['public22_continuation_scope_ref']==facts['scope_ref']\n        and cp['work_in_progress']['public22_continuation_facts_ref']==actual['facts_ref'],'LIVE_CURRENT_REGISTRATION')\n    owner=doc(facts['owner_ref']);worker=doc(facts['worker_ref']);workers=[w for w in cp['workers'] if w.get('slice_id')==SLICE]\n    need(len(workers)==1,'ONE_LIVE_WORKER');task=ow['card_path_bindings']['W05-99']['subtasks'][KEY]\n    need(task==dict(owner,owner_document_ref=facts['owner_ref'],worker_document_ref=facts['worker_ref'],current_source_writer=None,formal_case_accepted_delta=0,parent_acceptance=False)\n        and workers==[dict(worker,worker_document_ref=facts['worker_ref'])],'EXACT_CANON_OWNER_WORKER_DOCUMENTS')\n    for value in (owner,worker):\n        lease(value);need(value['owner']==ROOT and value['state']==STATE and value['lease_status']=='ACTIVE' and value['scope_ref']==facts['scope_ref']\n            and value['lease_id']==scope['lease_id'] and value['receipt_root']==scope['receipt_root'],'LIVE_OWNER_LEASE_STATE')\n    need(worker['selected_owner_ref']==facts['owner_ref'] and owner['selected_worker_id']==worker['worker_id']==ROOT,'LIVE_OWNER_WORKER_LINK')\n    return scope,facts,q,current"
+    }
+  ],
+  "KEY_SLICE_uses": [
+    {
+      "name": "KEY",
+      "line": 26,
+      "source": "KEY='public22_to_main23_continuation';SLICE='PUBLIC22_TO_MAIN23_CONTINUATION'"
+    },
+    {
+      "name": "SLICE",
+      "line": 26,
+      "source": "KEY='public22_to_main23_continuation';SLICE='PUBLIC22_TO_MAIN23_CONTINUATION'"
+    },
+    {
+      "name": "KEY",
+      "line": 289,
+      "source": "    ow['card_path_bindings']['W05-99']['subtasks'][KEY]=dict(owner,owner_document_ref=owner_ref,worker_document_ref=worker_ref,current_source_writer=None,formal_case_accepted_delta=0,parent_acceptance=False)"
+    },
+    {
+      "name": "KEY",
+      "line": 299,
+      "source": "    del restored_ow['card_path_bindings']['W05-99']['subtasks'][KEY]"
+    },
+    {
+      "name": "KEY",
+      "line": 401,
+      "source": "    need(len(workers)==1,'ONE_LIVE_WORKER');task=ow['card_path_bindings']['W05-99']['subtasks'][KEY]"
+    },
+    {
+      "name": "KEY",
+      "line": 286,
+      "source": "    need(KEY not in ow['card_path_bindings']['W05-99']['subtasks'] and not any(w.get('slice_id')==SLICE for w in cp['workers']),'READONLY_SLICE_ALREADY_REGISTERED')"
+    },
+    {
+      "name": "SLICE",
+      "line": 338,
+      "source": "        common=dict(step_id='W05-99',slice_id=SLICE,state=STATE,owner=ROOT,scope_ref=sr,lease_status='ACTIVE',lease_id=q['lease_id'],"
+    },
+    {
+      "name": "SLICE",
+      "line": 400,
+      "source": "    owner=doc(facts['owner_ref']);worker=doc(facts['worker_ref']);workers=[w for w in cp['workers'] if w.get('slice_id')==SLICE]"
+    },
+    {
+      "name": "SLICE",
+      "line": 367,
+      "source": "    for value in (owner,worker):need(value['state']==STATE and value['owner']==ROOT and value['slice_id']==SLICE and value['scope_ref']==facts['scope_ref'],'REGISTERED_OWNER_WORKER')"
+    },
+    {
+      "name": "SLICE",
+      "line": 286,
+      "source": "    need(KEY not in ow['card_path_bindings']['W05-99']['subtasks'] and not any(w.get('slice_id')==SLICE for w in cp['workers']),'READONLY_SLICE_ALREADY_REGISTERED')"
+    }
+  ]
+}

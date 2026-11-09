@@ -1,0 +1,235 @@
+{
+  "files": [
+    {
+      "baseline_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_controller_preparation_codex\\52998fc9c4d64166b10aa02e6eca11e4\\fixture_evaluator.proposed.py",
+        "sha256": "d3818eb399d6ee3794733efc05911d3940cb8947162c3e8ea72b6a60e0b1de28",
+        "bytes": 6474
+      },
+      "candidate_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_revision_preparation_codex\\736e757cdbc148a286c1d2426b8a7382\\fixture_evaluator.v2.proposed.py",
+        "sha256": "717cd3a2056e4d93f4a603b26519e44b8f149277c544f0450b1d4b36984fa0b5",
+        "bytes": 9760
+      },
+      "edits": [
+        {
+          "old": "def validate_case(state,leaf,case,export,job,scope):",
+          "new": "def observer_lifecycle(rows,parent,seen_pids):\n    need(rows and rows[0]['kind']=='observer-start' and rows[-1]['kind']=='observer-exit','Observer lifetime missing')\n    pid=rows[0]['pid']\n    need(type(pid) is int and pid>0 and parent.name==str(pid) and pid not in seen_pids,'Duplicate/foreign observer PID')\n    seen_pids.add(pid)\n    need(all(type(r['pid']) is int and r['pid']==pid and type(r['sequence']) is int for r in rows),'Observer PID/sequence type')\n    need([r['sequence'] for r in rows]==list(range(1,len(rows)+1)),'Observer sequence gap/duplicate')\n    requests={}\n    for event in rows[1:-1]:\n        kind=event['kind'];rid=event.get('id')\n        need(kind in ['request-received','request-body-complete','response-call-returned','response-finish','response-close'],\n             'Unknown/error/incomplete observer event')\n        need(type(rid) is int and rid>0,'Request id type')\n        if kind=='request-received':\n            need(rid not in requests and rid==len(requests)+1,'Duplicate/out-of-order request admission')\n            requests[rid]={'received':event,'body':None,'finish':None,'close':None,'writes':{}}\n            continue\n        need(rid in requests,'Orphan request event')\n        item=requests[rid]\n        if kind=='response-call-returned':\n            ordinal=event['ordinal']\n            need(type(ordinal) is int and ordinal>0 and ordinal not in item['writes'] and event['method'] in ['write','end'],\n                 'Duplicate/invalid response method ordinal')\n            need('accepted_argument' in event and event['actual_socket_bytes'] is None,'Response raw boundary missing')\n            item['writes'][ordinal]=event\n            continue\n        key={'request-body-complete':'body','response-finish':'finish','response-close':'close'}[kind]\n        need(item[key] is None,'Duplicate request lifecycle event')\n        if key=='body':\n            need('raw' in event and item['close'] is None,'Missing body raw or body completes after close: OPEN')\n        elif key=='finish':\n            need(item['close'] is None and type(event['reader_complete']) is bool and\n                 event['reader_complete']==(item['body'] is not None),'Finish/reader order mismatch')\n        else:\n            need(item['finish'] is not None and item['body'] is not None and event['finished'] is True and\n                 event['reader_complete'] is True,'Premature/incomplete response close: OPEN')\n        item[key]=event\n    for item in requests.values():\n        need(all(item[k] is not None for k in ['body','finish','close']),'Missing body/finish/close')\n        need(sorted(item['writes'])==list(range(1,len(item['writes'])+1)),'Response method ordinal gap')\n    final=rows[-1]\n    need(type(final['code']) is int and final['code']==0 and final['errors']==0 and final['active']==0,'Observer exit/outstanding failure')\n    need(type(final['requests_received']) is int and type(final['response_finished']) is int and\n         final['requests_received']==final['response_finished']==len(requests),'Exact lifecycle counters disagree')\n    return {'pid':pid,'requests':len(requests),'complete':True,'request_ids':sorted(requests),\n            'body_end_vs_finish_order':'EITHER; both must precede close','socket_bytes':None}\n\ndef validate_case(state,leaf,case,export,job,scope):",
+          "occurrences": 1
+        },
+        {
+          "old": "    received=0;finished=0;observer_pids=[]\n    for p in observers:\n        rows=[json.loads(x) for x in p.read_bytes().splitlines()]\n        need(rows and rows[0]['kind']=='observer-start' and rows[-1]['kind']=='observer-exit','Observer lifetime end missing')\n        need([x['sequence'] for x in rows]==list(range(1,len(rows)+1)),'Observer sequence gap')\n        final=rows[-1];need(final['code']==0 and final['errors']==0 and final['active']==0,'Observer failure/outstanding response')\n        need(not any('overflow' in x['kind'] or 'error' in x['kind'] for x in rows),'Observer incomplete evidence')\n        incoming=[x for x in rows if x['kind']=='request-received'];ends=[x for x in rows if x['kind']=='response-finish']\n        need(final['requests_received']==len(incoming) and final['response_finished']==len(ends),'Counter mismatch')\n        for item in rows:\n            for key in ['raw','accepted_argument','attempted']:\n                if key in item:\n                    rp=Path(item[key]['path']);need(rp.parent==p.parent,'Observer raw foreign path');verify(rp,item[key])\n        received+=len(incoming);finished+=len(ends);observer_pids.append(final['pid'])\n",
+          "new": "    received=0;finished=0;observer_pids=[];seen_pids=set();lifecycles=[]\n    for p in observers:\n        rows=[json.loads(x) for x in p.read_bytes().splitlines()]\n        for item in rows:\n            for key in ['raw','accepted_argument','attempted']:\n                if key in item:\n                    rp=Path(item[key]['path']);need(rp.parent==p.parent,'Observer raw foreign path');verify(rp,item[key])\n        try:report=observer_lifecycle(rows,p.parent,seen_pids)\n        except (RuntimeError,KeyError,TypeError,ValueError) as exc:\n            return {'qualified':False,'source_assertions_preserved':True,'source_assertions_passed':True,\n                    'transport_complete':False,'transport_qualification':'OPEN','lifecycle_error':str(exc),\n                    'observer_path':str(p),'completed_observer_lifecycles':lifecycles,'files':files,\n                    'socket_transmitted_byte_count':None,'auto_Date_ContentLength':None,\n                    'expected_abort_exception_authorized':False}\n        lifecycles.append(report);received+=report['requests'];finished+=report['requests'];observer_pids.append(report['pid'])\n",
+          "occurrences": 1
+        },
+        {
+          "old": "'server_received':received,'server_finished':finished,",
+          "new": "'transport_complete':True,'observer_lifecycles':lifecycles,\n        'server_received':received,'server_finished':finished,",
+          "occurrences": 1
+        }
+      ],
+      "whole_byte_inverse": true,
+      "unchanged_definitions_byte_AST": [
+        "need",
+        "read",
+        "rawref",
+        "verify"
+      ],
+      "changed_definitions": [
+        "validate_case"
+      ],
+      "new_definitions": [
+        "observer_lifecycle"
+      ]
+    },
+    {
+      "baseline_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_controller_preparation_codex\\52998fc9c4d64166b10aa02e6eca11e4\\desktop_controller.v2.proposed.py",
+        "sha256": "b17077205ee05228829a3d3e1639688c3888ed7759bad84cf520203c870552aa",
+        "bytes": 22322
+      },
+      "candidate_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_revision_preparation_codex\\736e757cdbc148a286c1d2426b8a7382\\desktop_controller.v3.proposed.py",
+        "sha256": "d63a3cc10150fabbae327ea38962661074a3fe6590a04d6a393219fa2d3cc02c",
+        "bytes": 23124
+      },
+      "edits": [
+        {
+          "old": "scope['cleanup_seconds']==5,'Explicit finite allocation')",
+          "new": "scope['cleanup_seconds']==5,'Explicit finite allocation')\n    need(type(scope['controller_evidence_reserve_seconds']) is int and scope['controller_evidence_reserve_seconds']>0, 'Root controller evidence IO reserve required')",
+          "occurrences": 1
+        },
+        {
+          "old": "stage=label;remaining=deadline-time.monotonic()-5\n            need(remaining>0 and native<scope['native_top_command_cap'],'Native/time allocation exhausted')\n            native+=1;timeout=min(seconds,remaining)",
+          "new": "stage=label;remaining=deadline-time.monotonic()\n            reserve=25+scope['cleanup_seconds']+scope['controller_evidence_reserve_seconds']\n            need(remaining>reserve and native<scope['native_top_command_cap'],'Native/time allocation exhausted before process start')\n            native+=1;timeout=min(seconds,remaining-reserve)\n            helper_deadline=deadline-scope['controller_evidence_reserve_seconds']",
+          "occurrences": 1
+        },
+        {
+          "old": "'remaining_before_start':remaining,'future_images':futures,",
+          "new": "'remaining_before_start':remaining,'helper_finalization_reserve':25,'cleanup_reserve':scope['cleanup_seconds'],\n                 'controller_evidence_reserve':scope['controller_evidence_reserve_seconds'],'helper_absolute_deadline':helper_deadline,'future_images':futures,",
+          "occurrences": 1
+        },
+        {
+          "old": "future_images=futures,future_context=context)",
+          "new": "future_images=futures,future_context=context,absolute_deadline=helper_deadline)",
+          "occurrences": 1
+        },
+        {
+          "old": "                    try:fn()\n                    except BaseException as exc:",
+          "new": "                    try:\n                        fn();need(time.monotonic()<=deadline,'Root inner deadline exceeded during evidence finalization')\n                    except BaseException as exc:",
+          "occurrences": 1
+        },
+        {
+          "old": "            evaluation=module(scope['fixture_evaluator_ref'],'desktop58_fixture_evaluator').validate_case(state,leaf if index else None,case,export,job,scope)\n            need(evaluation['qualified'] is True and evaluation['source_assertions_preserved'] is True,'Fixture evidence incomplete')",
+          "new": "            state['source_assertions_passed']=True\n            evaluation=module(scope['fixture_evaluator_ref'],'desktop58_fixture_evaluator').validate_case(state,leaf if index else None,case,export,job,scope)\n            save(case/'fixture-verdict.json',evaluation)\n            need(evaluation['qualified'] is True and evaluation['source_assertions_preserved'] is True,'Fixture evidence incomplete')",
+          "occurrences": 1
+        },
+        {
+          "old": "            save(case/'fixture-verdict.json',evaluation);state.update(state='QUALIFIED',qualified=True);rows.append(dict(state))",
+          "new": "            state.update(state='QUALIFIED',qualified=True);rows.append(dict(state))",
+          "occurrences": 1
+        }
+      ],
+      "whole_byte_inverse": true,
+      "unchanged_definitions_byte_AST": [
+        "need",
+        "strict",
+        "pin",
+        "verify",
+        "module",
+        "save",
+        "safe",
+        "inventory"
+      ],
+      "changed_definitions": [
+        "main"
+      ],
+      "new_definitions": []
+    },
+    {
+      "baseline_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_controller_preparation_codex\\52998fc9c4d64166b10aa02e6eca11e4\\windows_debug_job_tree.future_images.final.proposed.py",
+        "sha256": "7311b71bb1e1ff7e3dab1fe86161c5254d5f3c492f3af6fa86d1bd60bcf4a688",
+        "bytes": 45376
+      },
+      "candidate_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_revision_preparation_codex\\736e757cdbc148a286c1d2426b8a7382\\windows_debug_job_tree.future_images.deadline.proposed.py",
+        "sha256": "7f89cdd07a199a94848c7ecd5d5d474889c34ca34c343783b3d96338e0e0d3ee",
+        "bytes": 46898
+      },
+      "edits": [
+        {
+          "old": "future_images=None, future_context=None):",
+          "new": "future_images=None, future_context=None, absolute_deadline=None):",
+          "occurrences": 1
+        },
+        {
+          "old": "            raise ValueError('timeout must be a finite positive number')",
+          "new": "            raise ValueError('timeout must be a finite positive number')\r\n        if isinstance(absolute_deadline,bool) or not isinstance(absolute_deadline,(int,float)) or not math.isfinite(absolute_deadline):\r\n            raise ValueError('Explicit Root absolute helper deadline required')\r\n        result['requested_process_timeout_seconds']=timeout\r\n        result['absolute_deadline']=absolute_deadline\r\n        result['success_finalization_reserve_seconds']=25\r\n        result['failure_cleanup_reserve_seconds']=5\r\n        remaining=absolute_deadline-started\r\n        timeout=min(timeout,remaining-25.0-5.0)\r\n        result['effective_process_timeout_seconds']=timeout\r\n        result['remaining_at_helper_entry_seconds']=remaining\r\n        if timeout<=0:\r\n            raise TimeoutError('No process budget remains after finalization and cleanup reservation')",
+          "occurrences": 1
+        },
+        {
+          "old": "deadline = time.monotonic() + 5.0",
+          "new": "deadline = min(time.monotonic() + 5.0, absolute_deadline)",
+          "occurrences": 1
+        },
+        {
+          "old": "finalization_deadline = time.monotonic() + 25.0\r\n                result['evidence_finalization_timeout_seconds'] = 25",
+          "new": "finalization_deadline = min(time.monotonic() + 25.0, absolute_deadline)\r\n                result['evidence_finalization_deadline'] = finalization_deadline\r\n                result['evidence_finalization_timeout_seconds'] = 25\r\n                deadline_check(finalization_deadline, 'evidence finalization entry')",
+          "occurrences": 1
+        },
+        {
+          "old": "                for proc in generations:\r\n                    ph = HANDLE",
+          "new": "                for proc in generations:\r\n                    deadline_check(finalization_deadline, 'process generation evidence')\r\n                    ph = HANDLE",
+          "occurrences": 1
+        },
+        {
+          "old": "        result['elapsed_seconds'] = time.monotonic() - started\r\n    return result",
+          "new": "        result['elapsed_seconds'] = time.monotonic() - started\r\n        if isinstance(absolute_deadline,(int,float)) and not isinstance(absolute_deadline,bool) and math.isfinite(absolute_deadline):\r\n            try:deadline_check(absolute_deadline, 'helper final owned-handle closure')\r\n            except BaseException as exc:\r\n                debug['complete']=False\r\n                cleanup['errors'].append(error_text(exc))\r\n                record_error(exc)\r\n    return result",
+          "occurrences": 1
+        }
+      ],
+      "whole_byte_inverse": true,
+      "unchanged_definitions_byte_AST": [
+        "runtime_resource_paths"
+      ],
+      "changed_definitions": [
+        "run_owned"
+      ],
+      "new_definitions": []
+    },
+    {
+      "baseline_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_controller_preparation_codex\\52998fc9c4d64166b10aa02e6eca11e4\\desktop_launch.proposed.py",
+        "sha256": "c38d09995b36b00e65c89f0e15509c69a96756578610d0e84f967a90400d44d2",
+        "bytes": 4954
+      },
+      "candidate_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_revision_preparation_codex\\736e757cdbc148a286c1d2426b8a7382\\desktop_launch.v2.proposed.py",
+        "sha256": "a4b5d968cc1829971ada48f55743bb7f6cc790967f76c179ceca1cac978b2bf7",
+        "bytes": 6232
+      },
+      "edits": [
+        {
+          "old": "phase='ALLOCATE';candidate=util.safe(s['outer_output_root'],ROOT/'execution/v2.4/receipts/W13/W13-03',True)",
+          "new": "need(type(s['inner_seconds']) is int and s['inner_seconds']>0 and type(s['outer_seconds']) is int and\n             type(s['launcher_evidence_reserve_seconds']) is int and s['launcher_evidence_reserve_seconds']>0 and\n             s['outer_seconds']>s['inner_seconds']+25+5+s['launcher_evidence_reserve_seconds'],'Root complete outer phase allocation')\n        outer_deadline=started+s['outer_seconds']\n        need(outer_deadline-time.monotonic()>s['inner_seconds']+25+5+s['launcher_evidence_reserve_seconds'],'Outer preparation consumed allocation')\n        phase='ALLOCATE';candidate=util.safe(s['outer_output_root'],ROOT/'execution/v2.4/receipts/W13/W13-03',True)",
+          "occurrences": 1
+        },
+        {
+          "old": "        need(type(s['outer_seconds']) is int and s['outer_seconds']>s['inner_seconds']+5,'Root finite outer allocation')",
+          "new": "        remaining=outer_deadline-time.monotonic()\n        effective_timeout=remaining-5-s['launcher_evidence_reserve_seconds']\n        need(effective_timeout>s['inner_seconds']+25,'Root outer budget exhausted before owned child')",
+          "occurrences": 1
+        },
+        {
+          "old": "'timeout':s['outer_seconds'],'automatic_retry':False",
+          "new": "'timeout':effective_timeout,'requested_outer_seconds':s['outer_seconds'],'remaining_before_start':remaining,'cleanup_reserve':5,'launcher_evidence_reserve':s['launcher_evidence_reserve_seconds'],'absolute_outer_deadline':outer_deadline,'automatic_retry':False",
+          "occurrences": 1
+        },
+        {
+          "old": "result=normal.run_owned(argv,str(ROOT),env,so,se,s['outer_seconds'])",
+          "new": "result=normal.run_owned(argv,str(ROOT),env,so,se,effective_timeout)",
+          "occurrences": 1
+        },
+        {
+          "old": "            try:save(out/'result.json',{'first_error':first,",
+          "new": "            if time.monotonic()>outer_deadline:\n                item={'phase':'outer-evidence-deadline','error':'Root outer budget exceeded','actual_native_exit':None}\n                if first is None:first=item\n                else:secondary.append(item)\n            try:save(out/'result.json',{'first_error':first,",
+          "occurrences": 1
+        },
+        {
+          "old": "            except BaseException:traceback.print_exc();return 1\n    return 1 if first else 0",
+          "new": "            except BaseException:traceback.print_exc();return 1\n            if time.monotonic()>outer_deadline:\n                print('Root outer deadline exceeded after final result IO',file=sys.stderr);return 1\n    return 1 if first else 0",
+          "occurrences": 1
+        }
+      ],
+      "whole_byte_inverse": true,
+      "unchanged_definitions_byte_AST": [
+        "need",
+        "verify",
+        "doc",
+        "load",
+        "save"
+      ],
+      "changed_definitions": [
+        "main"
+      ],
+      "new_definitions": []
+    }
+  ],
+  "all_inverse_exact": true,
+  "unchanged_observer_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W13\\W13-03\\fresh58_desktop169_go3_controller_preparation_codex\\52998fc9c4d64166b10aa02e6eca11e4\\legacy_http_observer.proposed.cjs",
+    "sha256": "34ac15b03567af6475812bf66a331793746cea0c5aeadc2a2eb3a3f80e3df36a",
+    "bytes": 4442
+  },
+  "unchanged_roster_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w1303-desktop-http-r311\\execution\\v2.4\\receipts\\W13\\W13-03\\desktop_http_exact15_executor_codex\\revision-r317-a7f44ed9b4ae4225bd072adcf708e24b\\finite-roster.frozen.json",
+    "sha256": "6d97600d2adf812248fd7d2dcb1027e76d1066db9406fa114369f03930439899",
+    "bytes": 138614
+  },
+  "unchanged_builder_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\build-validator.py",
+    "sha256": "d7dbd66c5e98b26e1701ea00f918897092907d0afb1fc4912e59ecf05d569d46",
+    "bytes": 13612
+  },
+  "old_helper_remains_unchanged": true
+}

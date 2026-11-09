@@ -1,0 +1,86 @@
+11:func queueClientFixture(t *testing.T) (*fixture, *ClientService, string, string) {
+12-	t.Helper()
+13-	f, svc, client := goalFixture(t)
+14-	svc.ConfigurationAuthority = handlerMetadataFixture{f.owner}
+15-	saved, _ := handlerCommand(t, f, svc, handlerDefaultEnvelope(1))
+16-	if deref(saved.Status) != "COMPLETED" {
+17-		t.Fatal(string(Bytes(saved)))
+18-	}
+19-	configuredPort := svc.SessionRuntime.(goalClientPort)
+20-	configuredPort.model = Str(saved.Result, "model_config_ref")
+21-	svc.SessionRuntime = configuredPort
+22-	reply, _ := goalCommand(t, f, svc, goalEnvelope(f, client, "original finite task", false))
+23-	if deref(reply.Status) != "COMPLETED" {
+24-		t.Fatal(string(Bytes(reply)))
+25-	}
+26-	port := svc.SessionRuntime.(goalClientPort)
+27-	port.admitErr = nil
+28-	svc.SessionRuntime = port
+29-	return f, svc, client, Str(reply.Result["snapshot"].(map[string]any), "session_id")
+30-}
+31-func queueClientEnvelope(t *testing.T, f *fixture, client, sid, method string, payload Object) *Envelope {
+32-	t.Helper()
+33-	var rev, epoch int64
+34-	if err := f.db.QueryRow(`SELECT revision,writer_epoch FROM client_sessions WHERE id=?`, sid).Scan(&rev, &epoch); err != nil {
+35-		t.Fatal(err)
+36-	}
+37-	return &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: &sid, ExpectedRevision: &rev, WriterEpoch: &epoch, Method: &method, Payload: Bytes(payload)}
+38-}
+39-func TestClientQueueDurableReplayAndWriterFence(t *testing.T) {
+40-	f, svc, client, sid := queueClientFixture(t)
+41-	_, goals, tasks, runs := goalCounts(t, f)
+42-	payload := Object{"text": "同样的完整输入", "attachment_artifact_ids": Empty(), "delivery": "STEER"}
+43-	env := queueClientEnvelope(t, f, client, sid, "session.send", payload)
+44-	reply, replay := goalCommand(t, f, svc, env)
+45-	if replay || deref(reply.Status) != "COMPLETED" {
+46-		t.Fatalf("enqueue: %s", Bytes(reply))
+47-	}
+48-	repeated, replayed := goalCommand(t, f, svc, env)
+49-	if !replayed || Hash(repeated) != Hash(reply) {
+50-		t.Fatal("enqueue identity changed on replay")
+51-	}
+52-	env2 := queueClientEnvelope(t, f, client, sid, "session.send", payload)
+53-	second, _ := goalCommand(t, f, svc, env2)
+54-	if second.Result["message_id"] == reply.Result["message_id"] {
+55-		t.Fatal("duplicate text lost message identity")
+56-	}
+57-	pending := Arr(second.Result["snapshot"].(map[string]any), "pending_command_ids")
+58-	if len(pending) != 2 {
+59-		t.Fatalf("pending ids=%v", pending)
+60-	}
+61-	stale := *env
+62-	stale.CommandID = strptr(ID())
+63-	rejected, _ := goalCommand(t, f, svc, &stale)
+64-	if deref(rejected.Status) != "REJECTED" {
+65-		t.Fatal("stale CAS accepted")
+66-	}
+67-	fresh := queueClientEnvelope(t, f, client, sid, "session.send", payload)
+68-	fresh.WriterEpoch = revPtr(123)
+69-	rejected, _ = goalCommand(t, f, svc, fresh)
+70-	if deref(rejected.ErrorCode) != "STALE_WRITER_EPOCH" {
+71-		t.Fatal("stale writer accepted")
+72-	}
+73-	_, g, task, run := goalCounts(t, f)
+74-	if goals != g || tasks != task || runs != run {
+75-		t.Fatal("queue created business execution")
+76-	}
+77-	var count int
+78-	if err := f.db.QueryRow(`SELECT count(*) FROM client_command_queue`).Scan(&count); err != nil || count != 2 {
+79-		t.Fatalf("durable count=%d err=%v", count, err)
+80-	}
+81-}
+82-func TestClientQueueSealAndCapacityRejectBeforeSuccess(t *testing.T) {
+83-	for _, kind := range []string{"seal", "capacity"} {
+84-		t.Run(kind, func(t *testing.T) {
+85-			f, svc, client, sid := queueClientFixture(t)
+86-			payload := Object{"text": "bounded", "attachment_artifact_ids": Empty(), "delivery": "FOLLOW_UP"}
+87-			limit := 1
+88-			if kind == "capacity" {
+89-				limit = clientQueueCapacity
+90-			}
+91-			for i := 0; i < limit; i++ {
+92-				reply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.send", payload))
+93-				if deref(reply.Status) != "COMPLETED" {
+94-					t.Fatal(string(Bytes(reply)))
+95-				}
+96-			}

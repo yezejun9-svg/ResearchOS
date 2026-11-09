@@ -1,0 +1,41 @@
+--- v1/source_read_guard.py
++++ v2/source_read_guard.py
+@@ -20,17 +20,33 @@
+ _FILE_ATTRIBUTE_NORMAL = 0x00000080
+ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
++_LOCAL_DRIVE = re.compile(r"^[A-Za-z]:$")
++_DOS_DEVICE = re.compile(
++    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)",
++    re.IGNORECASE,
++)
+ _DEFAULT_PER_FILE_CAP = 128 * 1024 * 1024
+ _DEFAULT_TOTAL_CAP = 512 * 1024 * 1024
+ 
+ 
+ def _canonical(path: str) -> str:
+-    if not isinstance(path, str) or not path or path.startswith("\\\\?\\"):
+-        raise ValueError("reference path must be a regular absolute path")
+-    drive, tail = ntpath.splitdrive(path)
+-    if not drive or drive.startswith("\\\\") or not tail.startswith(("\\", "/")):
++    if not isinstance(path, str) or not path:
+         raise ValueError("reference path must be an absolute local drive path")
+-    return ntpath.normcase(ntpath.normpath(path))
++    regular = path.replace("/", "\\")
++    drive, tail = ntpath.splitdrive(regular)
++    # A local drive is exactly one ASCII letter and a colon. UNC, extended
++    # namespace and device drives can otherwise masquerade as rooted tails.
++    if (_LOCAL_DRIVE.fullmatch(drive) is None or not tail.startswith("\\")
++            or tail.startswith("\\\\") or ":" in tail
++            or any(ord(char) < 32 for char in regular)):
++        raise ValueError("reference path must be an absolute local drive path")
++    components = tail[1:].split("\\")
++    if (not components[0] or any(
++            not part or part in (".", "..") or part.endswith((" ", "."))
++            or _DOS_DEVICE.match(part) is not None
++            for part in components)):
++        raise ValueError("reference path must have regular file components")
++    return ntpath.normcase(ntpath.normpath(regular))
+ 
+ 
+ def _final_path(path: str) -> str:

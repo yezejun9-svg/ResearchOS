@@ -1,0 +1,177 @@
+{
+  "schema": "researchos.mu-m0-v3-independent-review/1",
+  "at": "2026-10-12T15:01:52.701Z",
+  "verdict": "REQUEST_CHANGES",
+  "scope": "SOURCE_BOUND_UNCOMMITTED_NONINSTALLED_CANDIDATE_ONLY",
+  "reviewer": "/root/mu_m0_v2_independent_review",
+  "requested_model": "gpt-6-astra",
+  "requested_reasoning": "high",
+  "source": "C:/Users/yqyyds/.codex/researchos-build-worktrees/mu-pause-checkpoint-m0-v2-20261012",
+  "base": "7ec619a16a932ae02daa7c2e6132d266528a1da8",
+  "final_manifest_sha256": "b9b02ecf2697648b03886f93829261f867606995bb7df00029e22fdf42ec02b0",
+  "patch_sha256": "01f3691bc17b846282da82643ba913272eddfd37e937bda65b95e0bffeac1e8c",
+  "scope_sha256": "f614294fd91e512ac4f138d3e5864313f89113fef1124728fcbc1b09af687b1b",
+  "source9_unchanged": true,
+  "modified_paths": 6,
+  "frozen_v2_preserved": true,
+  "findings": [
+    {
+      "id": "M0-V3-R1",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Pending-finish and after-turn checkpoints lose active model and replacement context",
+      "path": "packages/agent/src/agent.ts",
+      "line": 423,
+      "related_paths": [
+        "packages/agent/src/agent.ts:437",
+        "packages/agent/src/agent.ts:795",
+        "packages/agent/src/agent.ts:820",
+        "packages/agent/src/agent-loop.ts:252",
+        "packages/agent/src/agent-loop.ts:298"
+      ],
+      "tests": [
+        "V3-A runtime model and replacement context survive response pause",
+        "V3-A runtime model and replacement context survive finish pause"
+      ],
+      "actual": "prepareRequest returns selected-runtime-model plus compacted-context. Both no-pause controls call that model twice with compacted context. JSON pause/restore during response or finish produces second call to constructor model synthetic with original-context instead. Response-pause also passes original-context to the pending finish callback.",
+      "impact": "A resumed request can use the wrong model and restore context removed or replaced by preparation, despite callback counts being correct. Public PrepareRequest permits replacement runtime context/model; the uninterrupted controls prove its current behavior.",
+      "cause": "The request phase stores runtime data, but message_end/recordPendingFinish/recordTurnCompletion replace it with assistant index and booleans. ResumePendingFinish and ResumeAfterTurn reconstruct from Agent public state and fresh createLoopConfig, not the active loop context/config.",
+      "suggestion": "Persist active model, reasoning, exact runtime context and stable tool binding through every continuation phase, including pendingFinish and afterTurn. Restore the pending callback/next-turn transition from that runtime snapshot while preserving the public transcript separately.",
+      "evidence": "adjacent-5.stdout.txt"
+    },
+    {
+      "id": "M0-V3-R2",
+      "priority": "P1",
+      "severity": "blocker",
+      "title": "Resuming a tool batch re-enables a tool excluded from that request",
+      "path": "packages/agent/src/agent.ts",
+      "line": 469,
+      "related_paths": [
+        "packages/agent/src/agent.ts:472",
+        "packages/agent/src/agent.ts:774",
+        "packages/agent/src/agent.ts:957",
+        "packages/agent/src/agent-loop.ts:193"
+      ],
+      "tests": [
+        "V3-B restored tool batch retains per-request restricted tool loadout"
+      ],
+      "actual": "Initial registry contains allowed and excluded; prepareRequest restricts context.tools to allowed. Original assistant calls allowed then excluded. No-pause control executes only allowed and produces isError=true for excluded. Pausing after allowed, serializing to JSON and restoring executes excluded too, giving effects=[allowed,excluded] and isError=false.",
+      "impact": "Pause/restore broadens the executable tool set for a previously issued batch and can run an effect that the original request would reject.",
+      "cause": "The tools continuation preserves completion IDs but not that turn's effective tool set. resumePaused uses createContextSnapshot() from all public state tools, and runAgentLoopResumeTools executes against it.",
+      "suggestion": "Bind each pending tool batch to its original effective tool declarations and resolvable implementations, restore only that set, and fail closed if the exact binding is unavailable. Do not substitute the full current Agent registry.",
+      "evidence": "adjacent-5.stdout.txt"
+    }
+  ],
+  "previous_findings": {
+    "M0_V2_R1_N5": "CLOSED_FOR_ORIGINAL_REPRO: already-paused custom retained, including same-instance and restored session",
+    "M0_V2_R2_N1": "CLOSED_FOR_ORIGINAL_REPRO: next-turn preparation is not repeated",
+    "M0_V2_R3_N2": "CLOSED_FOR_ORIGINAL_REPRO: pending finish callback and decision run once",
+    "M0_original_R1_R3_R5": "Original provider-dispatch, whole-batch termination and invalid-watermark repros pass; new runtime continuity failures above remain blocking"
+  },
+  "verification": {
+    "candidate32": {
+      "total": 32,
+      "pass": 32,
+      "fail": 0,
+      "exit": 0,
+      "author_tests": 18,
+      "prior_independent_tests": 9,
+      "prior_v2_negative_tests": 5,
+      "evidence": "candidate-32.stdout.txt"
+    },
+    "new_adjacent_initial": {
+      "total": 5,
+      "pass": 1,
+      "source_assertion_failures": 3,
+      "review_harness_failure": 1,
+      "exit": 1,
+      "evidence": "adjacent-5.stdout.txt"
+    },
+    "queue_control_corrected": {
+      "total": 1,
+      "pass": 1,
+      "exit": 0,
+      "evidence": "corrected-queue-control.stdout.txt"
+    },
+    "new_unique_behaviors_after_harness_correction": {
+      "total": 5,
+      "pass": 2,
+      "source_fail": 3,
+      "source_findings": 2
+    },
+    "default_agent": {
+      "total": 40,
+      "pass": 40,
+      "exit": 0,
+      "evidence": "original-agent-40.stdout.txt"
+    },
+    "worker": {
+      "total": 2,
+      "pass": 2,
+      "exit": 0,
+      "evidence": "worker-2.stdout.txt"
+    },
+    "targeted_tsgo": {
+      "exit": 0,
+      "evidence": "targeted-tsgo.command.json"
+    },
+    "biome": "Author result only, not independently rerun"
+  },
+  "binding": {
+    "author_compiled_input_census_verified": 2125,
+    "main_independent_compile_inputs": 2126,
+    "all_independent_compile_inputs": 2127,
+    "actual_C_agent_source_alias": true,
+    "input_drift": 0,
+    "all_input_sha_and_realpath": "all-compiled-inputs-final.json",
+    "prior_fixture_bytes_identical": true,
+    "source_hash_before_after": true
+  },
+  "historical_failures_preserved": [
+    {
+      "type": "SOURCE_DRIFT",
+      "evidence": "freeze-audit-01.json",
+      "detail": "Root supplied intermediate c385 manifest while 3/9 source files had changed. No compile/test accepted against it. received-manifest-01 retained; final b9b02 independently bound by freeze-audit-02."
+    },
+    {
+      "type": "REVIEW_HARNESS_ASSUMPTION",
+      "evidence": "adjacent-5.stdout.txt",
+      "detail": "V3-C expected s1 still in continuation.pendingMessages after prepare, but existing pending s1 lets loop emit it before beforeRequest pause. Initial TypeError retained. Separate corrected queue control validates transcript count and ordinals and passes with identical candidate."
+    }
+  ],
+  "strengths": [
+    "Original five plus V2 three repros now pass",
+    "Prepared-request JSON state preserves repeated pauses without repeating prepareRequest",
+    "One-at-a-time steering consumed sequence and pending sequence remain distinct through JSON restore",
+    "CANCEL supersedes pending pause test and original default suite pass"
+  ],
+  "boundaries": {
+    "installed_sdk_pin": "8dfebe36508ac0c2508735bb866756dab9283e74",
+    "candidate_committed": false,
+    "candidate_installed": false,
+    "actual_provider_calls": 0,
+    "actual_model_calls": 0,
+    "external_tool_calls": 0,
+    "network_calls": 0,
+    "real_SQLite_access": 0,
+    "D_writes": 0,
+    "root_or_Canon_writes": 0,
+    "source_writes": 0,
+    "formal_increment": 0,
+    "formal_accepted": "0/42",
+    "all_22_current_obligations": "OPEN",
+    "parent_acceptance": false,
+    "CLI_WindowsDesktop_phone_acceptance": false
+  },
+  "next": "Repair effective runtime state continuity across tools/pendingFinish/afterTurn in the same authorized scope, then refreeze and replay these retained counterexamples plus affected controls.",
+  "repair_contract": {
+    "path": "state-contract.md",
+    "sha256": "ac31513da60e5cfdd4403fc4c12ecfd1d99da95eac8183e535b48d1bbda4410c",
+    "source_changes": false,
+    "requirements": [
+      "persist effective selected runtime state across request/tools/pendingFinish/afterTurn",
+      "serializable allowlist only; no API secret, getApiKey function, execute function or arbitrary extension object",
+      "resolve registered model/tool bindings and original tool subset; fail closed if exact reconstruction unavailable"
+    ]
+  }
+}

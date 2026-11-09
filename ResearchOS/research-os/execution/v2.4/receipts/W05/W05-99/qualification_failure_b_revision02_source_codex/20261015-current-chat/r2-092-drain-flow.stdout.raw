@@ -1,0 +1,141 @@
+535: 	inputs, e := c.inputs(tx, route.ProjectID, current, manifest["admission"].(map[string]any))
+536: 	if e != nil {
+537: 		tx.Rollback()
+538: 		return e
+539: 	}
+540: 	if e = c.projectSessionRun(tx, route.ProjectID, current, nil); e != nil {
+541: 		tx.Rollback()
+542: 		return e
+543: 	}
+544: 	if e = stageRuntimeProgram(route, dispatch, inputs); e != nil {
+545: 		tx.Rollback()
+546: 		return e
+547: 	}
+548: 	worker := ID()
+549: 	locator := Str(dispatch, "dispatch_key")
+550: 	result, e := tx.Exec("UPDATE runtime_dispatches SET state='STARTED',worker=?,journal_locator=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state='PREPARED' AND worker=''", worker, locator, Now(), route.ProjectID, runID, epoch)
+551: 	if e != nil {
+552: 		tx.Rollback()
+553: 		return e
+554: 	}
+555: 	n, e := result.RowsAffected()
+556: 	if e != nil || n != 1 {
+557: 		tx.Rollback()
+558: 		return Fail(409, "STATE_CONFLICT", "dispatch already attempted; no relaunch")
+559: 	}
+560: 	if e = tx.Commit(); e != nil {
+561: 		return e
+562: 	}
+563: 	c.boundary("dispatch_started", run)
+564: 	directory := filepath.Join(c.config.DataRoot, "runtime-dispatches", locator)
+565: 	bridge, e := rt.StartBridge(ctx, directory, rt.BridgeRequest{WorkerID: worker, Manifest: Bytes(dispatch["manifest"]), ManifestHash: Str(dispatch, "manifest_hash"), Executable: route.Executable, Inputs: inputs, BeforeResume: func(identity sandbox.Identity) error {
+566: 		tx, _, fresh, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+567: 		if e != nil {
+568: 			return e
+569: 		}
+570: 		defer tx.Rollback()
+571: 		if fresh["state"] != "STARTED" || fresh["worker"] != worker || len(fresh["identity"].(map[string]any)) != 0 {
+572: 			return Fail(409, "STATE_CONFLICT", "launch identity fence consumed")
+573: 		}
+574: 		_, e = tx.Exec("UPDATE runtime_dispatches SET identity=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state='STARTED' AND worker=?", string(Bytes(runtimeNativeIdentity(identity))), Now(), route.ProjectID, runID, epoch, worker)
+575: 		if e != nil {
+576: 			return e
+577: 		}
+578: 
+579: 		installed, e := clientQueueInstalled(tx)
+580: 		if e != nil {
+581: 			return e
+582: 		}
+583: 		if installed {
+584: 			if _, e = tx.Exec(`UPDATE client_queue_fences SET process_identity=?,revision=revision+1 WHERE project=? AND run_id=? AND runtime_epoch=? AND dispatch_key=? AND manifest_hash=?`, string(Bytes(runtimeNativeIdentity(identity))), route.ProjectID, runID, epoch, fresh["dispatch_key"], fresh["manifest_hash"]); e != nil {
+585: 				return e
+586: 			}
+587: 		}
+588: 		if e = tx.Commit(); e != nil {
+589: 			return e
+590: 		}
+591: 		c.boundary("suspended_identity", runtimeNativeIdentity(identity))
+592: 		return nil
+593: 	}})
+594: 	if e != nil {
+595: 		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "launch acknowledgement unavailable")
+596: 		return e
+597: 	}
+598: 	c.boundary("native_started", run)
+599: 	child, cancel := context.WithCancel(ctx)
+600: 	defer cancel()
+601: 	brokerContext, cancelBroker := context.WithCancel(child)
+602: 	defer cancelBroker()
+603: 	go func() {
+604: 		select {
+605: 		case <-bridge.Done():
+606: 			cancelBroker()
+607: 		case <-child.Done():
+608: 		}
+609: 	}()
+610: 	heartbeatDone := make(chan struct{})
+611: 	heartbeatError := make(chan error, 1)
+612: 	// A committed Owner cancel must stop transport and tools promptly; waiting
+613: 	// for the 15-second heartbeat would allow an already cancelled check to run.
+614: 	go func() {
+615: 		tick := time.NewTicker(200 * time.Millisecond)
+616: 		defer tick.Stop()
+617: 		for {
+618: 			select {
+619: 			case <-child.Done():
+620: 				return
+621: 			case <-bridge.Done():
+622: 				return
+623: 			case <-tick.C:
+624: 				var status string
+625: 				var currentEpoch int64
+626: 				err := c.service.DB.QueryRowContext(child, "SELECT json_extract(body,'$.status'),json_extract(body,'$.lease_epoch') FROM domain_objects WHERE project=? AND kind='Run' AND id=?", route.ProjectID, runID).Scan(&status, &currentEpoch)
+627: 				if err != nil || status == "CANCEL_REQUESTED" || currentEpoch != epoch {
+628: 					cancelBroker()
+629: 					if !bridge.Read().QueueRequired || err != nil || currentEpoch != epoch {
+630: 						bridge.Cancel("canonical run cancellation or epoch ended")
+631: 					}
+632: 					return
+633: 				}
+634: 			}
+635: 		}
+636: 	}()
+637: 	var mutation sync.Mutex
+638: 	go func() {
+639: 		defer close(heartbeatDone)
+640: 		tick := time.NewTicker(15 * time.Second)
+641: 		defer tick.Stop()
+642: 		for {
+643: 			mutation.Lock()
+644: 			e := c.heartbeat(child, route, runID, lease, epoch, locator, "")
+645: 			mutation.Unlock()
+646: 			if e != nil {
+647: 				heartbeatError <- e
+648: 				cancel()
+649: 				bridge.Cancel("control lease or authority unavailable")
+650: 				return
+651: 			}
+652: 			if e := bridge.Renew(epoch, 90*time.Second); e != nil {
+653: 				heartbeatError <- e
+654: 				cancel()
+655: 				bridge.Cancel("worker lease expired")
+656: 				return
+657: 			}
+658: 			select {
+659: 			case <-child.Done():
+660: 				return
+661: 			case <-tick.C:
+662: 			}
+663: 		}
+664: 	}()
+665: 	drain, protocolError := c.runCommandBridge(child, brokerContext, cancelBroker, route, runID, lease, epoch, locator, bridge, &mutation)
+666: 	if protocolError != nil {
+667: 		bridge.Cancel("protocol reconciliation failed")
+668: 	}
+669: 	<-bridge.Done()
+670: 	var qualificationRejection *qualificationPreEffectRejection
+671: 	if errors.As(protocolError, &qualificationRejection) {
+672: 		cancelBroker()
+673: 		cancel()
+674: 		<-heartbeatDone
+675: 		select {

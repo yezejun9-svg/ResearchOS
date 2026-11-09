@@ -1,0 +1,5 @@
+import hashlib,json
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=Path('D:/作品集/ResearchOS/research-os');bundle=ROOT/'.local/worktrees/product-v1-build-10-20261105/.local/desktop-v1-build-10'
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+mf=bundle/'development-manifest.json';assert sha(mf)=='be2cfd213234a5550a3241cfdbe49ce25effcfb41c0e1a96d36d422367441a8e';m=json.loads(mf.read_bytes());listed={r['path'] for r in m['files']};rows=[dict(path=r['path'],expected_sha256=r['sha256'],actual_sha256=sha(bundle/r['path']),bytes=(bundle/r['path']).stat().st_size) for r in m['files']];bad=[r['path'] for r in rows if r['expected_sha256']!=r['actual_sha256']];extra=sorted({p.relative_to(bundle).as_posix() for p in bundle.rglob('*') if p.is_file()}-listed-{'development-manifest.json'});out=HERE/'product-v1-build10-post-visual03-root-readback.json';assert not out.exists();out.write_bytes((json.dumps(dict(manifest_sha256=sha(mf),listed_files=len(listed),rows=rows,mismatches=bad,unlisted_paths=extra),indent=2)+'\n').encode());assert not bad and not extra;print(json.dumps(dict(path=str(out),sha256=sha(out))))

@@ -1,0 +1,93 @@
+--- old-helper
++++ new-helper
+@@ -22,6 +22,8 @@
+  "sync"
+  "testing"
+ 
++ "github.com/santhosh-tekuri/jsonschema/v6"
++ "researchos.local/research-os/internal/domain"
+  "researchos.local/research-os/internal/api"
+  "researchos.local/research-os/internal/canonical"
+ )
+@@ -156,12 +158,59 @@
+  if sid!=cfg.SessionID||project!=cfg.ProjectID||writer!="cli-client"||epoch!=1 {t.Fatal("export instrumentation original Session binding",sid,project,writer,epoch)}
+  if e:=cli43Save(dir,"session-"+label+".json",map[string]any{"session_id":sid,"project_id":project,"writer_client_id":writer,"writer_epoch":epoch,"revision":revision});e!=nil{t.Fatal(e)}
+ }
+-func cli43AssertBinding(t *testing.T,db *sql.DB,dir,name string,cfg cliConfig,requests []json.RawMessage,responses [][]byte,before,after []byte) {
++type cli43TransportFact struct {
++ RequestIndex int `json:"request_index"`
++ ResponseIndex int `json:"response_index"`
++ Method string `json:"method"`
++ RequestURI string `json:"request_uri"`
++ Status int `json:"status"`
++}
++type cli43LocalSchemaOnly struct{}
++func (cli43LocalSchemaOnly) Load(uri string)(any,error){return nil,fmt.Errorf("export-only unregistered schema resource: %s",uri)}
++func cli43EntityContracts(t *testing.T)*domain.Contracts{
++ t.Helper()
++ raw,e:=os.ReadFile(filepath.Join("..","..","internal","api","contracts","domain.schema.json"));if e!=nil{t.Fatal(e)}
++ if fmt.Sprintf("%x",sha256.Sum256(raw))!="b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54"{t.Fatal("export-only domain schema pin")}
++ body,e:=domain.Decode(raw);if e!=nil{t.Fatal(e)}
++ compiler:=jsonschema.NewCompiler();compiler.UseLoader(cli43LocalSchemaOnly{});compiler.AssertFormat();compiler.DefaultDraft(jsonschema.Draft2020)
++ const location="https://researchos.invalid/domain.schema.json"
++ if e=compiler.AddResource(location,body);e!=nil{t.Fatal(e)}
++ contracts:=&domain.Contracts{Schemas:map[string]*jsonschema.Schema{}}
++ for _,kind:=range []string{"Goal","Task"}{
++  compiled,e:=compiler.Compile(location+"#/$defs/"+kind);if e!=nil{t.Fatal(e)};contracts.Schemas[kind]=compiled
++ }
++ return contracts // Fixed fixture THIN_CORE route only; no V24/general route qualification.
++}
++
++func cli43AssertBinding(t *testing.T,db *sql.DB,dir,name string,cfg cliConfig,requests []json.RawMessage,responses [][]byte,transport []cli43TransportFact,before,after []byte) {
+  t.Helper();var a,b cliConfig
+  if json.Unmarshal(before,&a)!=nil||json.Unmarshal(after,&b)!=nil||a.SessionID!=cfg.SessionID||b.SessionID!=cfg.SessionID||b.WriterEpoch!=1{t.Fatal("original SID/epoch changed")}
+- if len(requests)!=len(responses){t.Fatal("request/response pairing")}
++ if len(requests)!=len(responses)||len(requests)!=len(transport){t.Fatal("request/response/transport pairing")}
+  doc,e:=api.ClientProtocolDocument();if e!=nil{t.Fatal(e)}
++ entities:=cli43EntityContracts(t)
++ sendGoal:="";completedSends:=0;goals:=[]map[string]any{};tasks:=[]map[string]any{}
+  for i,raw:=range requests{
++  fact:=transport[i]
++  if fact.RequestIndex!=i||fact.ResponseIndex!=i||fact.Status!=http.StatusOK{t.Fatal("exact transport index/status mismatch",i,fact)}
++  uri,e:=url.ParseRequestURI(fact.RequestURI);if e!=nil{t.Fatal(e)}
++  if uri.Scheme!=""||uri.Host!=""||uri.Opaque!=""||uri.RawPath!=""||uri.RawQuery!=""||uri.ForceQuery||uri.Fragment!=""||uri.String()!=fact.RequestURI{t.Fatal("noncanonical fixture request URI",fact.RequestURI)}
++  if fact.Method==http.MethodGet{
++   if len(raw)!=0||len(responses[i])==0||completedSends!=1{t.Fatal("REST exact empty request/nonempty response/send binding",i)}
++   parts:=strings.Split(strings.TrimPrefix(uri.Path,"/"),"/")
++   if len(parts)!=5||parts[0]!="v1"||parts[1]!="projects"||parts[2]!=cfg.ProjectID||parts[4]==""{t.Fatal("REST fixture project/path mismatch",fact.RequestURI)}
++   kind:="";switch parts[3]{case "goals":kind="Goal";case "tasks":kind="Task";default:t.Fatal("unexpected REST fixture entity",fact.RequestURI)}
++   reply,e:=domain.Decode(responses[i]);if e!=nil{t.Fatal(e)}
++   binding,ok:=reply["binding"].(map[string]any);if !ok||binding["route"]!="THIN_CORE"{t.Fatal("fixed REST fixture route must be THIN_CORE",kind)}
++   if e=entities.Validate(kind,reply);e!=nil{t.Fatal(e)}
++   if reply["id"]!=parts[4]||reply["project_id"]!=cfg.ProjectID{t.Fatal("REST entity exact path identity",kind)}
++   if kind=="Goal"{
++    if reply["id"]!=sendGoal{t.Fatal("REST Goal differs from completed send snapshot")};goals=append(goals,reply)
++   }else{
++    if reply["goal_id"]!=sendGoal{t.Fatal("REST Task differs from completed send Goal")};tasks=append(tasks,reply)
++   }
++   continue
++  }
++  if fact.Method!=http.MethodPost||uri.Path!="/v2/command"||len(raw)==0{t.Fatal("unexpected fixture transport method/path/body",i,fact)}
+   canonicalRequest,e:=canonical.JSON(raw);if e!=nil{t.Fatal(e)}
+   var env map[string]any;if e=json.Unmarshal(canonicalRequest,&env);e!=nil{t.Fatal(e)}
+   body,e:=canonical.JSON(responses[i]);if e!=nil{t.Fatal(e)}
+@@ -179,10 +228,18 @@
+    if method!="session.get"{snapshot,ok=result["snapshot"].(map[string]any);if !ok{t.Fatal("completed nested snapshot missing")}}
+    if snapshot["session_id"]!=cfg.SessionID||snapshot["project_id"]!=cfg.ProjectID{t.Fatal("snapshot original SID/project mismatch")}
+    if method=="session.attach"&&result["write_owner_acquired"]!=false{t.Fatal("readonly attach acquired writer")}
++   if method=="session.send"{completedSends++;sendGoal,ok=snapshot["goal_id"].(string);if !ok||sendGoal==""||completedSends!=1{t.Fatal("completed send Goal identity missing or repeated")}}
+   }
+  }
++ if completedSends==0{
++  if len(goals)!=0||len(tasks)!=0{t.Fatal("readonly fixture unexpectedly read Goal/Task")}
++ }else{
++  if completedSends!=1||len(goals)!=1||len(tasks)!=1{t.Fatal("completed send exact Goal/Task pairing")}
++  ids,ok:=goals[0]["task_ids"].([]any);if !ok{t.Fatal("REST Goal task_ids missing")}
++  matches:=0;for _,id:=range ids{if id==tasks[0]["id"]{matches++}};if matches!=1{t.Fatal("REST Goal does not uniquely link actual Task")}
++ }
+  cli43SessionBoundary(t,db,dir,"after",cfg)
+- if e=cli43Save(dir,"identity-proof.json",map[string]any{"fixture":name,"before_sid":a.SessionID,"after_sid":b.SessionID,"db_sid":cfg.SessionID,"epoch":b.WriterEpoch,"all_reply_sid_mirror_request":true,"session_request_sid_original":true,"SDK_MODEL_external_paid":0});e!=nil{t.Fatal(e)}
++ if e=cli43Save(dir,"identity-proof.json",map[string]any{"fixture":name,"before_sid":a.SessionID,"after_sid":b.SessionID,"db_sid":cfg.SessionID,"epoch":b.WriterEpoch,"all_command_reply_sid_mirror_request":true,"transport_entries":len(transport),"REST_goal_count":len(goals),"REST_task_count":len(tasks),"completed_send_goal_id":sendGoal,"REST_send_goal_task_links_validated":completedSends==1,"session_request_sid_original":true,"SDK_MODEL_external_paid":0});e!=nil{t.Fatal(e)}
+ }
+ 
+ type cli43Rows struct {Schema []string `json:"schema"`;Columns map[string][]string `json:"columns"`;Tables map[string][]string `json:"tables"`}

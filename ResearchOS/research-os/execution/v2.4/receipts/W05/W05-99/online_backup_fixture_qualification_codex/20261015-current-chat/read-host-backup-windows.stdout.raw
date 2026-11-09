@@ -1,0 +1,202 @@
+1:package host
+3:import (
+4:	"context"
+5:	"fmt"
+6:	"io"
+7:	"os"
+8:	"path/filepath"
+9:	"strings"
+11:	"researchos.local/research-os/internal/domain"
+12:)
+14:// SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+15:// current OS principal originally authorized. It rejects, rather than skips,
+16:// links, special files and any item outside the explicit resource bounds.
+17:func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+18:	var out domain.BackupWorkspaceSnapshot
+19:	if _, err := h.reverify(); err != nil {
+20:		return out, err
+21:	}
+22:	if h.boundPrincipal() == "" || h.boundPrincipal() != binding.PrincipalID || binding.Status != domain.WorkspaceActive {
+23:		return out, fmt.Errorf("BACKUP_WORKSPACE_OWNER_DENIED")
+24:	}
+25:	if limits.MaxFiles < 0 || limits.MaxDirs < 0 || limits.MaxBytes < 0 || limits.MaxFileBytes < 1 || limits.MaxFileBytes > domain.BackupWorkspaceMaxFileBytes {
+26:		return out, fmt.Errorf("BACKUP_WORKSPACE_LIMIT_INVALID")
+27:	}
+28:	var pinned *RootBinding
+29:	for _, root := range h.roots.List() {
+30:		if root.Revoked || !strings.EqualFold(filepath.Clean(root.RealPath), filepath.Clean(binding.RealPath)) {
+31:			continue
+32:		}
+33:		if binding.Access == AccessReadWrite && root.Access != AccessReadWrite {
+34:			return out, fmt.Errorf("BACKUP_WORKSPACE_ACCESS_MISMATCH")
+35:		}
+36:		if pinned != nil {
+37:			return out, fmt.Errorf("BACKUP_WORKSPACE_AMBIGUOUS_ROOT")
+38:		}
+39:		pinned = root
+40:	}
+41:	if pinned == nil {
+42:		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_NOT_PINNED")
+43:	}
+44:	// A restored workspace lives under its new data root by design. Allow only
+45:	// that exact, currently pinned ref and path; every other data-root overlap
+46:	// remains recursive/unsafe, as does any backup output inside the workspace.
+47:	dataRoot := filepath.Dir(h.dir)
+48:	if backupPathsOverlap(binding.RealPath, destination) ||
+49:		(backupPathsOverlap(binding.RealPath, dataRoot) && !backupRestoredWorkspacePath(dataRoot, binding.AuthorizedRef, pinned)) {
+50:		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
+51:	}
+52:	vol, id, _, err := fileIdentity(pinned.RealPath)
+53:	if err != nil || vol != pinned.VolumeID || id != pinned.FileID {
+54:		return out, fmt.Errorf("BACKUP_WORKSPACE_PIN_CHANGED")
+55:	}
+56:	if reparse, err := chainHasReparsePoint(pinned.RealPath); err != nil || reparse {
+57:		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_REPARSE")
+58:	}
+59:	root, err := os.OpenRoot(pinned.RealPath)
+60:	if err != nil {
+61:		return out, err
+62:	}
+63:	defer root.Close()
+64:	out.Directories = []string{}
+65:	out.Files = []domain.BackupWorkspaceFile{}
+66:	var total int64
+67:	err = filepath.WalkDir(pinned.RealPath, func(path string, entry os.DirEntry, walkErr error) error {
+68:		if walkErr != nil {
+69:			return walkErr
+70:		}
+71:		if err := ctx.Err(); err != nil {
+72:			return err
+73:		}
+74:		if path == pinned.RealPath {
+75:			return nil
+76:		}
+77:		rel, err := filepath.Rel(pinned.RealPath, path)
+78:		if err != nil {
+79:			return err
+80:		}
+81:		rel = filepath.ToSlash(rel)
+82:		if len(rel) > domain.BackupWorkspaceMaxPathBytes || CheckRelativePath(rel) != nil || rel != NormalizeRelative(rel) {
+83:			return fmt.Errorf("BACKUP_WORKSPACE_PATH_INVALID: %s", rel)
+84:		}
+85:		if _, err := h.roots.Resolve(pinned.Ref, rel, AccessReadOnly); err != nil {
+86:			return fmt.Errorf("BACKUP_WORKSPACE_PATH_CHANGED %s: %w", rel, err)
+87:		}
+88:		if reparse, err := chainHasReparsePoint(path); err != nil || reparse {
+89:			return fmt.Errorf("BACKUP_WORKSPACE_REPARSE: %s", rel)
+90:		}
+91:		info, err := entry.Info()
+92:		if err != nil {
+93:			return err
+94:		}
+95:		if info.IsDir() {
+96:			if len(out.Directories) >= limits.MaxDirs {
+97:				return fmt.Errorf("BACKUP_WORKSPACE_DIRECTORY_LIMIT: unbacked item %s", rel)
+98:			}
+99:			out.Directories = append(out.Directories, rel)
+100:			return nil
+101:		}
+102:		if !info.Mode().IsRegular() {
+103:			return fmt.Errorf("BACKUP_WORKSPACE_SPECIAL_FILE: %s", rel)
+104:		}
+105:		if len(out.Files) >= limits.MaxFiles || info.Size() > limits.MaxFileBytes || info.Size() > limits.MaxBytes-total {
+106:			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+107:		}
+108:		if err := runtimeToolPlainPath(root, rel, false); err != nil {
+109:			return err
+110:		}
+111:		file, err := root.Open(rel)
+112:		if err != nil {
+113:			return err
+114:		}
+115:		before, err := file.Stat()
+116:		if err != nil {
+117:			file.Close()
+118:			return err
+119:		}
+120:		data, readErr := io.ReadAll(io.LimitReader(file, limits.MaxFileBytes+1))
+121:		after, statErr := file.Stat()
+122:		closeErr := file.Close()
+123:		if readErr != nil || statErr != nil || closeErr != nil {
+124:			return fmt.Errorf("BACKUP_WORKSPACE_READ_FAILED: %s", rel)
+125:		}
+126:		current, err := root.Lstat(rel)
+127:		if err != nil || !current.Mode().IsRegular() || !os.SameFile(before, after) || !os.SameFile(after, current) ||
+128:			before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != after.Size() {
+129:			return fmt.Errorf("BACKUP_WORKSPACE_FILE_CHANGED: %s", rel)
+130:		}
+131:		if len(data) > int(limits.MaxFileBytes) || int64(len(data)) > limits.MaxBytes-total {
+132:			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+133:		}
+134:		total += int64(len(data))
+135:		out.Files = append(out.Files, domain.BackupWorkspaceFile{Path: rel, Data: data})
+136:		return nil
+137:	})
+138:	if err != nil {
+139:		return domain.BackupWorkspaceSnapshot{}, err
+140:	}
+141:	return out, nil
+142:}
+144:func backupRestoredWorkspacePath(dataRoot, authorizedRef string, pinned *RootBinding) bool {
+145:	if pinned == nil || pinned.Ref == "" || pinned.Ref != authorizedRef {
+146:		return false
+147:	}
+148:	actual, err := filepath.Abs(pinned.RealPath)
+149:	if err != nil {
+150:		return false
+151:	}
+152:	expected, err := filepath.Abs(domain.BackupWorkspaceDestination(dataRoot, pinned.Ref))
+153:	return err == nil && strings.EqualFold(filepath.Clean(actual), filepath.Clean(expected))
+154:}
+156:func backupPathsOverlap(left, right string) bool {
+157:	a, ea := filepath.Abs(left)
+158:	b, eb := filepath.Abs(right)
+159:	if ea != nil || eb != nil {
+160:		return true
+161:	}
+162:	a, b = filepath.Clean(a), filepath.Clean(b)
+163:	if strings.EqualFold(a, b) {
+164:		return true
+165:	}
+166:	for _, pair := range [][2]string{{a, b}, {b, a}} {
+167:		rel, err := filepath.Rel(pair[0], pair[1])
+168:		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+169:			return true
+170:		}
+171:	}
+172:	return false
+173:}
+175:// PinRestoredWorkspace creates a new Host root record after the data root has
+176:// reached its final path. It does not inherit the old host's private roots file.
+177:func (h *Host) PinRestoredWorkspace(ctx context.Context, request domain.WorkspaceRestoreRequest) (domain.WorkspaceRestorePin, error) {
+178:	var pin domain.WorkspaceRestorePin
+179:	if _, err := h.reverify(); err != nil {
+180:		return pin, err
+181:	}
+182:	if h.boundPrincipal() == "" || request.PrincipalID != h.boundPrincipal() {
+183:		return pin, fmt.Errorf("RESTORE_WORKSPACE_OWNER_DENIED")
+184:	}
+185:	dataRoot := filepath.Dir(h.dir)
+186:	expected := domain.BackupWorkspaceDestination(dataRoot, request.AuthorizedRef)
+187:	if request.AuthorizedRef == "" || request.RealPath != expected || (request.Access != AccessReadOnly && request.Access != AccessReadWrite) {
+188:		return pin, fmt.Errorf("RESTORE_WORKSPACE_PATH_DENIED")
+189:	}
+190:	if reparse, err := chainHasReparsePoint(request.RealPath); err != nil || reparse {
+191:		return pin, fmt.Errorf("RESTORE_WORKSPACE_REPARSE")
+192:	}
+193:	root, err := h.roots.Register(request.AuthorizedRef, request.RealPath, request.Access, h.nowUTC())
+194:	if err != nil {
+195:		return pin, err
+196:	}
+197:	if _, err := h.roots.Resolve(root.Ref, "__researchos_pin_probe__", AccessReadOnly); err != nil {
+198:		// Resolve checks the pin; it need not open the absent probe path.
+199:		_ = h.roots.Revoke(root.Ref)
+200:		return pin, err
+201:	}
+202:	if err := ctx.Err(); err != nil {
+203:		_ = h.roots.Revoke(root.Ref)
+204:		return pin, err
+205:	}
+206:	return domain.WorkspaceRestorePin{AuthorizedRef: request.AuthorizedRef,
+207:		RealPath: root.RealPath, HostPrincipalRef: h.identity.Ref}, nil
+208:}

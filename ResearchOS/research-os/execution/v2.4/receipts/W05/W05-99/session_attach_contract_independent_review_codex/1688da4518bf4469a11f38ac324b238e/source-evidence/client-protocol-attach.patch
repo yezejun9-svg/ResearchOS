@@ -1,0 +1,95 @@
+--- T6/internal/domain/client_protocol.go
++++ candidate-root/internal/domain/client_protocol.go
+@@ -1098,13 +1098,6 @@
+ }
+ 
+ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow, reject func(int64, any, string, string) *Response) (*Response, error) {
+-	// ack reports the session revision *after* every write this command performed, so a
+-	// client that journals one event and a client that transfers ownership both learn the
+-	// exact revision to refresh against.
+-	ack := func(revision int64, result map[string]any) *Response {
+-		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
+-			Status: strptr("ACKNOWLEDGED"), SessionID: env.SessionID, Revision: revPtr(revision), Result: result}
+-	}
+ 	complete := func(rev int64, result map[string]any) *Response {
+ 		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
+ 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
+@@ -1132,14 +1125,48 @@
+ 		if !p.RequestWriteOwner {
+ 			return reject(sess.revision, sess.epoch, "INVALID_REQUEST", "attach without write ownership is a read path"), nil
+ 		}
+-		// Reacquisition by the current client renews the writer lease through the
+-		// same CAS and epoch rotation as a handoff. Any queued old claim expires.
++		nowT := time.Now().UTC()
++		// A still-valid owner renews only its lease. Expired or missing leases
++		// must pass the settled reacquisition path and receive a fresh epoch.
++		if sess.writerClientID == deref(env.ClientID) {
++			var lease string
++			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(lease_expires_at,'') FROM client_sessions WHERE id=? AND project_id=?`,
++				sess.sessionID, sess.project).Scan(&lease); err != nil {
++				return nil, err
++			}
++			until, parseErr := time.Parse(time.RFC3339Nano, lease)
++			if parseErr == nil && nowT.Before(until) {
++				if s.Host.LeaseTTL <= 0 {
++					return nil, fmt.Errorf("HOST_LEASE_POLICY_MISSING")
++				}
++				renewed, err := tx.ExecContext(ctx, `UPDATE client_sessions SET lease_expires_at=?
++					WHERE id=? AND project_id=? AND revision=? AND writer_epoch=? AND writer_client_id=?
++					AND lease_expires_at=? AND sealed_at IS NULL AND archived_at IS NULL`,
++					nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), sess.sessionID, sess.project,
++					sess.revision, sess.epoch, deref(env.ClientID), lease)
++				if err != nil {
++					return nil, err
++				}
++				n, err := renewed.RowsAffected()
++				if err != nil {
++					return nil, err
++				}
++				if n != 1 {
++					return reject(sess.revision, sess.epoch, "VERSION_CONFLICT", "writer lease changed before renewal"), nil
++				}
++				snapshot, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
++				if err != nil {
++					return nil, err
++				}
++				return complete(sess.revision, map[string]any{"snapshot": snapshot, "write_owner_acquired": true}), nil
++			}
++		}
+ 		if sess.runID != "" {
+-			status, settled, err := runState(ctx, tx, sess.project, sess.runID)
++			_, settled, err := runState(ctx, tx, sess.project, sess.runID)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			if liveRunStatuses[status] && !settled {
++			if !settled {
+ 				return reject(sess.revision, sess.epoch, "SESSION_BUSY", "previous runtime must settle before writer takeover"), nil
+ 			}
+ 		}
+@@ -1152,7 +1179,7 @@
+ 			}
+ 			return reject(sess.revision, sess.epoch, code, err.Error()), nil
+ 		}
+-		nowT := time.Now().UTC()
++		nowT = time.Now().UTC()
+ 		if s.Host.LeaseTTL <= 0 {
+ 			// A handoff must publish a real writer lease; the TTL comes from host config,
+ 			// and the service refuses to invent one.
+@@ -1183,8 +1210,14 @@
+ 		}); err != nil {
+ 			return nil, err
+ 		}
+-		return ack(sess.revision+1, map[string]any{"accepted_at": now, "operation_id": "op-" + deref(env.CommandID),
+-			"after_sequence": sess.watermark + 1, "related_resource_ref": nil}), nil
++		// Ownership and CLIENT_HANDOFF are already written in this transaction.
++		// Persist their real terminal result through Execute's existing command
++		// identity/idempotency path; replay must not transfer or renew again.
++		snapshot, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
++		if err != nil {
++			return nil, err
++		}
++		return complete(sess.revision+1, map[string]any{"snapshot": snapshot, "write_owner_acquired": true}), nil
+ 	case "session.control":
+ 		var p struct {
+ 			Action   *string `json:"action"`

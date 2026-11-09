@@ -1,0 +1,473 @@
+
+FILE internal/ownedcorestop/stop_windows.go
+240: 		}
+241: 	}
+242: 	if p.Eligibility != "ELIGIBLE_FOR_INDEPENDENT_REVIEW" || len(p.Missing) != 0 {
+243: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "historical proof missing"), nil
+244: 	}
+245: 	if err = validateStopAuthority(g, docs, p, planSHA); err != nil {
+246: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+247: 	}
+248: 	proofSHA, missing := validateHistoricalEvidence(p, docs)
+249: 	if len(missing) != 0 || proofSHA != p.EvidenceSHA256 {
+250: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "independent evidence drift"), nil
+251: 	}
+252: 	backup, backupSHA, err := store.ReadOwnedStopBackup(ctx, p.BackupPath)
+253: 	if err != nil || backupSHA != p.BackupSHA256 || backup != p.Baseline {
+254: 		return stopResult(p, planSHA, "STALE_PLAN", "reviewed backup/hash/census differs"), nil
+255: 	}
+256: 	rootHandle, err := openHeldFile(g.DataRoot.Path, true)
+257: 	if err != nil {
+258: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+259: 	}
+260: 	docs.files = append(docs.files, rootHandle)
+261: 	if nativeFileIdentity(rootHandle.info, g.DataRoot.Path) != g.DataRoot {
+262: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "data-root native identity differs"), nil
+263: 	}
+264: 	if _, err = g.checkAction("commit", true); err != nil {
+265: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+266: 	}
+267: 	// PROCESS_TERMINATE is requested only after all external evidence and exact
+268: 	// operation-plan review checks have passed. The native handle stays retained.
+269: 	h, err := supervisor.OpenOwnedCoreRetained(p.Native)
+270: 	if err != nil {
+271: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+272: 	}
+273: 	defer h.Close()
+274: 	if _, err = writeOwnedJournal(p.OutputDir, "STOP_ATTEMPT.json", stopAttemptRecord{Schema: "researchos.owned-core-stop-attempt.v1", OperationID: p.OperationID, GrantSHA256: g.digest, PlanSHA256: planSHA}); err != nil {
+275: 		return Result{}, err
+276: 	}
+277: 	if _, err = g.checkAction("commit", true); err != nil {
+278: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "grant expired after consumed attempt"))
+279: 	}
+280: 	if _, err = writeOwnedJournal(p.OutputDir, "BEGIN.json", struct{ Schema, OperationID, PlanSHA256, GrantSHA256 string }{"researchos.owned-core-stop-begin.v1", p.OperationID, planSHA, g.digest}); err != nil {
+281: 		return Result{}, err
+282: 	}
+283: 	barrier, err := store.AcquireOwnedStopBarrier(ctx, p.Host.Database)
+284: 	if err != nil {
+285: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "writer reservation unavailable: "+err.Error()))
+286: 	}
+287: 	defer barrier.Close()
+288: 	current, err := barrier.Census(ctx)
+289: 	if err != nil || current != p.Baseline {
+290: 		return persistStopResult(p, stopResult(p, planSHA, "STALE_PLAN", "full logical baseline changed"))
+291: 	}
+292: 	safety, err := barrier.SafetySnapshot(ctx, p.Input.Subject)
+293: 	if err != nil || !safety.ExactOldSubjectSafe() {
+294: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current unresolved subject/effect census differs"))
+295: 	}
+296: 	authority, err := host.ReadOwnedCoreStopPublicIdentity(ctx, p.Input.DataRoot)
+297: 	if err != nil || authority != p.Host {
+298: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current Host/Owner/database identity differs"))
+299: 	}
+300: 	if err = checkCommitSignalBoundary(ctx, g); err != nil {
+301: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "caller/grant unavailable before native intent: "+err.Error()))
+302: 	}
+303: 	if _, err = writeOwnedJournal(p.OutputDir, "TERMINATE_INTENT.json", struct {
+304: 		Schema, OperationID, PlanSHA256, GrantSHA256 string
+305: 		Native                                       supervisor.OwnedCoreNativeIdentity `json:"native"`
+306: 	}{"researchos.owned-core-stop-terminate-intent.v1", p.OperationID, planSHA, g.digest, p.Native}); err != nil {
+307: 		return Result{}, err
+308: 	}
+309: 	if err = checkCommitSignalBoundary(ctx, g); err != nil {
+310: 		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "caller/grant unavailable after durable intent; zero signal: "+err.Error()))
+311: 	}
+312: 	exit, nativeErr := h.TerminateOnceAndWaitUntilContext(ctx, 15*time.Second, deadline, g.expires)
+313: 	if nativeErr != nil {
+314: 		result := stopResult(p, planSHA, "UNKNOWN", fmt.Sprintf("single native attempt or wait unknown: %v", nativeErr))
+315: 		result.Native = &exit
+316: 		return persistStopResult(p, result)
+317: 	}
+318: 	if _, err = writeOwnedJournal(p.OutputDir, "NATIVE_EXIT.json", struct {
+319: 		Schema, OperationID, PlanSHA256, GrantSHA256 string
+320: 		Native                                       supervisor.OwnedCoreNativeExit `json:"native"`
+321: 	}{"researchos.owned-core-stop-native-exit.v1", p.OperationID, planSHA, g.digest, exit}); err != nil {
+322: 		return Result{}, err
+323: 	}
+324: 	if err = barrier.Close(); err != nil {
+325: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "writer reservation release failed")
+326: 		result.Native = &exit
+327: 		return persistStopResult(p, result)
+328: 	}
+329: 	return finishAfterNativeExit(ctx, p, planSHA, exit)
+330: }
+331: 
+332: // Called only after an observed native exit and release of the reserved writer.
+333: // A real DataRootLease plus fresh database and authority reads determine state.
+334: func finishAfterNativeExit(ctx context.Context, p Plan, planSHA string, exit supervisor.OwnedCoreNativeExit) (Result, error) {
+335: 	if !exit.ExitObserved {
+336: 		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "native exit not observed"))
+337: 	}
+338: 	lease, err := rt.AcquireDataRootLease(p.Input.DataRoot)
+339: 	if err != nil {
+340: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease unavailable")
+341: 		result.Native = &exit
+342: 		return persistStopResult(p, result)
+343: 	}
+344: 	defer lease.Close()
+345: 	if !lease.Held() {
+346: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease not held")
+347: 		result.Native = &exit
+348: 		return persistStopResult(p, result)
+349: 	}
+350: 	post, postErr := store.ReadOwnedStopCensus(ctx, p.Host.Database)
+351: 	postAuthority, authorityErr := host.ReadOwnedCoreStopPublicIdentity(ctx, p.Input.DataRoot)
+352: 	result := stopResult(p, planSHA, "STOPPED_LEASE_VERIFIED", "")
+353: 	result.Native = &exit
+354: 	result.Postflight = &post
+355: 	if exit.BeforeSignal {
+356: 		result.State = "OBSERVED_BEFORE_SIGNAL"
+357: 	}
+358: 	if postErr != nil || authorityErr != nil || post != p.Baseline || postAuthority != p.Host {
+359: 		result.State = "STOP_OBSERVED_MAINTENANCE_BLOCKED"
+360: 		result.Reason = "poststop logical/schema/authority/integrity drift"
+361: 	}
+362: 	return persistStopResult(p, result)
+363: }
+
+FILE ops/supervisor/owned_core_handle_windows.go
+380: 	if err != nil {
+381: 		return nil, err
+382: 	}
+383: 	actualParent, e := windows.GetProcessId(out.parent.handle)
+384: 	if e != nil || actualParent != parentPID {
+385: 		return nil, errors.New("parent handle PID mismatch")
+386: 	}
+387: 	out.identity = OwnedCoreNativeIdentity{PID: pid, CreatedNS: out.core.created, SID: out.core.sid, ImagePath: out.core.path, ImageSHA256: out.core.sha, ImageVolume: out.core.volume, ImageIndex: out.core.index, ParentPID: parentPID, ParentCreatedNS: out.parent.created, ParentSID: out.parent.sid, ParentImagePath: out.parent.path, ParentImageSHA256: out.parent.sha, ParentImageVolume: out.parent.volume, ParentImageIndex: out.parent.index}
+388: 	return out, nil
+389: }
+390: 
+391: // ObserveOwnedCoreReadOnly cannot terminate. It is suitable for preflight.
+392: func ObserveOwnedCoreReadOnly(pid uint32) (OwnedCoreNativeIdentity, error) {
+393: 	h, err := ownedCoreOpen(pid, 0)
+394: 	if err != nil {
+395: 		return OwnedCoreNativeIdentity{}, err
+396: 	}
+397: 	defer h.Close()
+398: 	return h.identity, nil
+399: }
+400: 
+401: // OpenOwnedCoreRetained binds the sole termination handle to a complete exact
+402: // native identity obtained during reviewed preflight. It cannot accept a
+403: // partial PID-only expectation.
+404: func OpenOwnedCoreRetained(expected OwnedCoreNativeIdentity) (*OwnedCoreRetainedHandle, error) {
+405: 	if expected.PID == 0 || expected.CreatedNS == 0 || expected.SID == "" || expected.ImageSHA256 == "" || expected.ImagePath == "" || expected.ImageIndex == 0 || expected.ParentPID == 0 || expected.ParentCreatedNS == 0 || expected.ParentSID == "" || expected.ParentImageSHA256 == "" || expected.ParentImageIndex == 0 {
+406: 		return nil, errors.New("complete reviewed native identity required")
+407: 	}
+408: 	h, err := ownedCoreOpen(expected.PID, windows.PROCESS_TERMINATE)
+409: 	if err != nil {
+410: 		return nil, err
+411: 	}
+412: 	if h.identity != expected {
+413: 		h.Close()
+414: 		return nil, errors.New("retained native identity differs from plan")
+415: 	}
+416: 	return h, nil
+417: }
+418: 
+419: func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
+420: 	if h == nil {
+421: 		return OwnedCoreNativeIdentity{}
+422: 	}
+423: 	return h.identity
+424: }
+425: 
+426: func verifyOwnedImageFile(image *ownedImageFile, volume uint32, index uint64) error {
+427: 	if image == nil || image.file == nil || image.final.volume != volume || image.final.index != index {
+428: 		return errors.New("retained image identity absent")
+429: 	}
+430: 	for _, original := range image.ancestors {
+431: 		current, _, err := observeOwnedImageAnchor(original.handle, true)
+432: 		if err != nil || current.volume != original.volume || current.index != original.index || current.security != original.security {
+433: 			return errors.New("retained image ancestor identity/ACL changed")
+434: 		}
+435: 	}
+436: 	current, _, err := observeOwnedImageAnchor(windows.Handle(image.file.Fd()), false)
+437: 	if err != nil || current.volume != image.final.volume || current.index != image.final.index || current.security != image.final.security {
+438: 		return errors.New("retained image file identity/ACL changed")
+439: 	}
+440: 	return nil
+441: }
+442: 
+443: func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+444: 	if h == nil || h.closed || h.core.handle == 0 {
+445: 		return errors.New("native handle closed")
+446: 	}
+447: 	pid, err := windows.GetProcessId(h.core.handle)
+448: 	if err != nil || pid != h.identity.PID {
+449: 		return errors.New("retained PID changed")
+450: 	}
+451: 	var created, exited, kernel, user windows.Filetime
+452: 	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
+453: 		return errors.New("retained process creation changed")
+454: 	}
+455: 	// Every path component remains open without delete sharing. The final image
+456: 	// also denies write sharing; identity and security are rechecked by handle.
+457: 	if err = verifyOwnedImageFile(h.core.image, h.identity.ImageVolume, h.identity.ImageIndex); err != nil {
+458: 		return err
+459: 	}
+460: 	parentPID, err := windows.GetProcessId(h.parent.handle)
+461: 	if err != nil || parentPID != h.identity.ParentPID {
+462: 		return errors.New("retained parent PID changed")
+463: 	}
+464: 	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+465: 		return errors.New("retained parent creation changed")
+466: 	}
+467: 	parentStatus, err := h.nativeParentWait()
+468: 	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+469: 		return errors.New("retained parent no longer live")
+470: 	}
+471: 	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
+472: 		return err
+473: 	}
+474: 	return nil
+475: }
+476: 
+477: func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {
+478: 	return windows.WaitForSingleObject(h.parent.handle, 0)
+479: }
+480: 
+481: // OwnedCoreNativeExit records whether the one call was made and the numeric
+482: // exit code from the same retained handle. Unknown wait is never retried.
+483: type OwnedCoreNativeExit struct {
+484: 	TerminateCalls int    `json:"terminate_calls"`
+485: 	ExitObserved   bool   `json:"exit_observed"`
+486: 	ExitCode       uint32 `json:"exit_code"`
+487: 	BeforeSignal   bool   `json:"before_signal"`
+488: }
+489: 
+490: const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
+491: 
+492: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
+493: 	return h.TerminateOnceAndWaitUntil(timeout, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+494: }
+495: 
+496: // TerminateOnceAndWaitUntil applies both the invocation monotonic deadline and
+497: // the grant's wall expiry at the last native boundary, after pre-signal waits.
+498: // A failed deadline check returns with zero TerminateProcess calls; the caller's
+499: // already-durable intent remains consumed.
+500: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+501: 	return h.TerminateOnceAndWaitUntilContext(context.Background(), timeout, invocationDeadline, wallExpiry)
+502: }
+503: 
+504: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntilContext(ctx context.Context, timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+505: 	var out OwnedCoreNativeExit
+506: 	if ctx == nil {
+507: 		return out, errors.New("caller context required")
+508: 	}
+509: 	if timeout <= 0 || timeout > 30*time.Second {
+510: 		return out, errors.New("bounded native wait required")
+511: 	}
+512: 	if earlier, ok := ctx.Deadline(); ok && earlier.Before(invocationDeadline) {
+513: 		invocationDeadline = earlier
+514: 	}
+515: 	if err := ctx.Err(); err != nil {
+516: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+517: 	}
+518: 	if err := h.verifyRetained(); err != nil {
+519: 		return out, err
+520: 	}
+521: 	if h.terminateCalls != 0 {
+522: 		return out, errors.New("native termination already attempted")
+523: 	}
+524: 	status, err := h.nativeWait(0)
+525: 	if err != nil {
+526: 		return out, err
+527: 	}
+528: 	if status == windows.WAIT_OBJECT_0 {
+529: 		out.BeforeSignal = true
+530: 		out.ExitObserved = true
+531: 		if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+532: 			return out, err
+533: 		}
+534: 		return out, nil
+535: 	}
+536: 	if status != uint32(windows.WAIT_TIMEOUT) {
+537: 		return out, fmt.Errorf("unexpected native wait status %d", status)
+538: 	}
+539: 	if err := ctx.Err(); err != nil {
+540: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+541: 	}
+542: 	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+543: 		return out, errors.New("invocation or grant expired before native signal")
+544: 	}
+545: 	if err := ctx.Err(); err != nil {
+546: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+547: 	}
+548: 	h.terminateCalls = 1
+549: 	out.TerminateCalls = 1
+550: 	if err = h.nativeTerminate(OwnedCoreMaintenanceExitCode); err != nil {
+551: 		return out, fmt.Errorf("one TerminateProcess failed: %w", err)
+552: 	}
+553: 	status, err = h.nativeWait(uint32(timeout.Milliseconds()))
+554: 	if err != nil || status != windows.WAIT_OBJECT_0 {
+555: 		return out, fmt.Errorf("native wait unknown: status=%d err=%v", status, err)
+556: 	}
+557: 	out.ExitObserved = true
+558: 	if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+559: 		return out, err
+560: 	}
+561: 	return out, nil
+562: }
+563: 
+564: func (h *OwnedCoreRetainedHandle) Close() {
+565: 	if h == nil || h.closed {
+566: 		return
+567: 	}
+568: 	h.closed = true
+569: 	h.core.close()
+570: 	h.parent.close()
+571: }
+
+FILE adapters/runtime/qualification_failure_proof_windows.go
+15: 	"unsafe"
+16: 
+17: 	"golang.org/x/sys/windows"
+18: 	"researchos.local/research-os/internal/canonical"
+19: 	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+20: )
+21: 
+22: const qualificationRejectionFile = "qualification-rejection-00000000000000000003.json"
+23: 
+24: // These handles deny FILE_SHARE_DELETE while each pathname and its descendants
+25: // are inspected. Reparse points and a changed DACL fail closed; no caller path
+26: // is repaired or made private by the proof reader/writer.
+27: type qualificationPathGuard struct {
+28: 	handles []windows.Handle
+29: 	ids     []qualificationFileID
+30: 	current *windows.SID
+31: 	private bool
+32: }
+33: 
+34: type qualificationFileID struct {
+35: 	volume, high, low uint32
+36: }
+37: 
+38: func qualificationIdentity(h windows.Handle, directory bool) (qualificationFileID, error) {
+39: 	var info windows.ByHandleFileInformation
+40: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+41: 		return qualificationFileID{}, err
+42: 	}
+43: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+44: 		return qualificationFileID{}, errors.New("qualification source reparse or type mismatch")
+45: 	}
+46: 	return qualificationFileID{info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow}, nil
+47: }
+48: 
+49: type qualificationACLHeader struct {
+50: 	revision, reserved     byte
+51: 	size, count, reserved2 uint16
+52: }
+53: 
+54: func qualificationPrivateACL(h windows.Handle, current *windows.SID, protected bool) error {
+55: 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+56: 	if err != nil || sd == nil {
+57: 		return errors.New("qualification source security descriptor unavailable")
+58: 	}
+59: 	owner, _, err := sd.Owner()
+60: 	if err != nil || owner == nil || !owner.Equals(current) {
+61: 		return errors.New("qualification source owner differs")
+62: 	}
+63: 	control, _, err := sd.Control()
+64: 	if err != nil || protected && control&windows.SE_DACL_PROTECTED == 0 {
+65: 		return errors.New("qualification source DACL is not protected")
+66: 	}
+67: 	acl, _, err := sd.DACL()
+68: 	if err != nil || acl == nil {
+69: 		return errors.New("qualification source DACL unavailable")
+70: 	}
+71: 	header := (*qualificationACLHeader)(unsafe.Pointer(acl))
+72: 	if header.size < uint16(unsafe.Sizeof(qualificationACLHeader{})) || header.count == 0 || header.count > 32 {
+73: 		return errors.New("qualification source DACL shape invalid")
+74: 	}
+75: 	effectiveCurrent := false
+76: 	for i := uint16(0); i < header.count; i++ {
+77: 		var ace *windows.ACCESS_ALLOWED_ACE
+78: 		if err := windows.GetAce(acl, uint32(i), &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceSize < uint16(unsafe.Sizeof(windows.ACCESS_ALLOWED_ACE{})) {
+79: 			return errors.New("qualification source contains unsupported ACE")
+80: 		}
+81: 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+82: 		if !sid.IsValid() || !sid.Equals(current) {
+83: 			return errors.New("qualification source grants access to another principal")
+84: 		}
+85: 		// INHERIT_ONLY does not grant access on this object. The same SID may
+86: 		// inherit a second effective ACE on a child, but it cannot replace one.
+87: 		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
+88: 			const fileAllAccess = 0x001f01ff
+89: 			if uint32(ace.Mask)&fileAllAccess == fileAllAccess || uint32(ace.Mask)&windows.GENERIC_ALL != 0 {
+90: 				effectiveCurrent = true
+91: 			}
+92: 		}
+93: 	}
+94: 	if !effectiveCurrent {
+95: 		return errors.New("qualification source lacks current owner access")
+96: 	}
+97: 	return nil
+98: }
+99: 
+100: func qualificationGuardDirectory(directory string, protected bool) (*qualificationPathGuard, error) {
+101: 	if !filepath.IsAbs(directory) {
+102: 		return nil, errors.New("absolute qualification dispatch directory required")
+103: 	}
+104: 	currentUser, err := user.Current()
+105: 	if err != nil {
+106: 		return nil, err
+107: 	}
+108: 	current, err := windows.StringToSid(currentUser.Uid)
+109: 	if err != nil || current == nil {
+110: 		return nil, errors.New("current qualification SID unavailable")
+111: 	}
+112: 	g := &qualificationPathGuard{current: current, private: protected}
+113: 	paths := []string{}
+114: 	for path := filepath.Clean(directory); ; path = filepath.Dir(path) {
+115: 		paths = append(paths, path)
+116: 		if next := filepath.Dir(path); next == path {
+117: 			break
+118: 		}
+119: 	}
+120: 	for i := len(paths) - 1; i >= 0; i-- {
+121: 		name, err := windows.UTF16PtrFromString(paths[i])
+122: 		if err != nil {
+123: 			g.Close()
+124: 			return nil, err
+125: 		}
+126: 		// Metadata-only access does not participate in CreateFile sharing checks.
+127: 		// Listing access makes a retained directory handle reject DELETE opens,
+128: 		// including rename, while its children are opened by pathname.
+129: 		h, err := windows.CreateFile(name, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+130: 		if err != nil {
+131: 			g.Close()
+132: 			return nil, err
+133: 		}
+134: 		id, err := qualificationIdentity(h, true)
+135: 		if err != nil {
+136: 			windows.CloseHandle(h)
+137: 			g.Close()
+138: 			return nil, err
+139: 		}
+140: 		g.handles = append(g.handles, h)
+141: 		g.ids = append(g.ids, id)
+142: 	}
+143: 	if err := qualificationPrivateACL(g.handles[len(g.handles)-1], current, protected); err != nil {
+144: 		g.Close()
+145: 		return nil, err
+146: 	}
+147: 	return g, nil
+148: }
+149: 
+150: func (g *qualificationPathGuard) Check() error {
+151: 	for i, h := range g.handles {
+152: 		id, err := qualificationIdentity(h, true)
+153: 		if err != nil || id != g.ids[i] {
+154: 			return errors.New("qualification directory identity changed")
+155: 		}
+156: 	}
+157: 	return qualificationPrivateACL(g.handles[len(g.handles)-1], g.current, g.private)
+158: }
+159: 
+160: func (g *qualificationPathGuard) Close() {
+161: 	for i := len(g.handles) - 1; i >= 0; i-- {
+162: 		windows.CloseHandle(g.handles[i])
+163: 	}
+164: }
+165: 

@@ -1,0 +1,150 @@
+--- approved04/choose-owned-folder.ps1
++++ diagnostic01/choose-owned-folder.ps1
+@@ -11,7 +11,66 @@
+ $hwnd = [IntPtr]::Zero
+ $dialogValidated = $false
+ $okAttempted = $false
+-$result = @{ schema='researchos.owned-native-folder-automation/2'; status='BLOCKED'; clicked_ok=$false; cleanup=@{ attempted=$false; status='NOT_NEEDED' } }
++$result = @{ schema='researchos.owned-native-folder-diagnostic/1'; status='BLOCKED'; clicked_ok=$false; cleanup=@{ attempted=$false; status='NOT_NEEDED' } }
++
++function Assert-DiagnosticOnly($Value) {
++  if ($Value -isnot [bool] -or $Value -ne $true) { throw 'DIAGNOSTIC_ONLY_SCOPE_REQUIRED_NO_OK' }
++}
++function Limit-DiagnosticText($Value) {
++  if ($null -eq $Value) { return $null }
++  $text=[regex]::Replace([string]$Value,'[\x00-\x1f\x7f]',' ')
++  if ($text.Length -gt 96) { $text=$text.Substring(0,96) }
++  if ($text.Length -gt 0 -and [char]::IsHighSurrogate($text[$text.Length-1])) { $text=$text.Substring(0,$text.Length-1) }
++  return $text
++}
++function Read-DiagnosticField($Info,[string]$Property,$Failures) {
++  try { return $Info.$Property }
++  catch {
++    $Failures.Add(@{ property=$Property; reason=(Limit-DiagnosticText $_.Exception.Message) })
++    return $null
++  }
++}
++function Diagnostic-Number($Value) {
++  if ($null -eq $Value) { return $null }
++  $number=[double]$Value
++  if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $number.ToString([Globalization.CultureInfo]::InvariantCulture) }
++  return $number
++}
++function Project-TreeDiagnostic($Element,[int]$Index) {
++  try {
++    $info=$Element.Current
++    if ($null -eq $info) { throw 'ELEMENT_CURRENT_UNAVAILABLE' }
++  } catch {
++    return @{ index=$Index; status='ELEMENT_UNAVAILABLE'; reason=(Limit-DiagnosticText $_.Exception.Message) }
++  }
++  $failures=[Collections.Generic.List[object]]::new()
++  $control=Read-DiagnosticField $info 'ControlType' $failures
++  $rectangle=Read-DiagnosticField $info 'BoundingRectangle' $failures
++  $bounds=$null
++  if ($null -ne $rectangle) {
++    $bounds=@{
++      x=(Diagnostic-Number (Read-DiagnosticField $rectangle 'X' $failures))
++      y=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Y' $failures))
++      width=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Width' $failures))
++      height=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Height' $failures))
++      is_empty=(Read-DiagnosticField $rectangle 'IsEmpty' $failures)
++    }
++  }
++  $handle=Read-DiagnosticField $info 'NativeWindowHandle' $failures
++  return @{
++    index=$Index; status='METADATA_ONLY'
++    control_type=(Limit-DiagnosticText $control.ProgrammaticName)
++    process_id=(Read-DiagnosticField $info 'ProcessId' $failures)
++    native_window_handle=$(if ($null -eq $handle) { $null } else { [string]$handle })
++    class_name=(Limit-DiagnosticText (Read-DiagnosticField $info 'ClassName' $failures))
++    automation_id=(Limit-DiagnosticText (Read-DiagnosticField $info 'AutomationId' $failures))
++    is_offscreen=(Read-DiagnosticField $info 'IsOffscreen' $failures)
++    enabled=(Read-DiagnosticField $info 'IsEnabled' $failures)
++    bounding_rect=$bounds
++    name=(Limit-DiagnosticText (Read-DiagnosticField $info 'Name' $failures))
++    property_errors=@($failures)
++  }
++}
+ 
+ # These functions are pure string/evidence predicates. Tests extract their
+ # actual AST bodies without running Add-Type, UIAutomation or this script body.
+@@ -68,6 +127,7 @@
+   if ((Get-FileHash -LiteralPath $ScopePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ScopeSHA256) { throw 'SCOPE_PIN_MISMATCH' }
+   $scope = Get-Content -LiteralPath $ScopePath -Raw -Encoding UTF8 | ConvertFrom-Json
+   if ($scope.status -cne 'ROOT_APPROVED_REAL_RUN' -or $scope.scope_nonce -cne $ScopeNonce) { throw 'SCOPE_NOT_AUTHORIZED' }
++  Assert-DiagnosticOnly $scope.native_picker.diagnostic_only
+   $runRoot = [IO.Path]::GetFullPath($scope.run_root)
+   $fixture = [IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
+   $identityFile = [IO.Path]::GetFullPath($CoreIdentityPath)
+@@ -271,25 +331,52 @@
+       -not [OwnedFolderWin32]::IsWindowEnabled($button)) { throw 'OWNED_DIALOG_BUTTON_UNAVAILABLE' }
+     return $button
+   }
+-  Select-FixtureThroughRealTree
+-  $selectedBefore = Get-VerifiedSelection
+-  Assert-Dialog
+-  $selectedFinal = Get-VerifiedSelection
+-  $ok = Get-OwnedDialogButton 1
+-  $result.caption=[OwnedFolderWin32]::Text($hwnd)
+-  Assert-Core
+-  $okAttempted=$true
+-  $sent = [OwnedFolderWin32]::ClickTimeout($ok,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero,2,1000,[ref]$messageResult)
+-  if ($sent -eq [IntPtr]::Zero) { throw 'DIALOG_OK_UNCONFIRMED' }
+-  $result.status='REAL_SHELL_OK_CLICKED'
+-  $result.clicked_ok=$true
+-  $result.hwnd=$hwnd.ToInt64().ToString()
+-  $result.prompt='Select a ResearchOS workspace folder'
+-  $result.selection_verification=$selectedFinal.method
+-  $result.selection_absolute_values=$selectedFinal.absolute_values
+-  $result.reliable_absolute_path_count=$selectedFinal.reliable_count
+-  $result.fixture_path=$fixture
+-  $result.owned_core_identity=$core
++  function Read-OwnedTreeDiagnostic {
++    Assert-Dialog
++    $dialogElement=[Windows.Automation.AutomationElement]::FromHandle($hwnd)
++    $treeCondition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Tree)
++    $trees=$dialogElement.FindAll([Windows.Automation.TreeScope]::Descendants,$treeCondition)
++    $rows=[Collections.Generic.List[object]]::new()
++    $limit=16
++    for ($index=0; $index -lt [Math]::Min($trees.Count,$limit); $index++) {
++      Assert-Dialog
++      # Do not filter by PID/offscreen/enabled/HWND: record provider facts.
++      $rows.Add((Project-TreeDiagnostic $trees[$index] $index))
++    }
++    $children=$null
++    if ($trees.Count -eq 0) {
++      Assert-Dialog
++      $script:diagChildren=[Collections.Generic.List[object]]::new()
++      $script:diagChildTruncated=$false
++      $childCallback=[OwnedFolderWin32+EnumCallback]{ param($child,$unused)
++        if ($script:diagChildren.Count -ge 32) { $script:diagChildTruncated=$true; return $false }
++        [uint32]$childPid=0
++        $null=[OwnedFolderWin32]::GetWindowThreadProcessId($child,[ref]$childPid)
++        $script:diagChildren.Add(@{
++          hwnd=$child.ToInt64().ToString(); process_id=$childPid
++          class_name=(Limit-DiagnosticText ([OwnedFolderWin32]::Class($child)))
++          visible=[OwnedFolderWin32]::IsWindowVisible($child)
++          enabled=[OwnedFolderWin32]::IsWindowEnabled($child)
++        })
++        return $true
++      }
++      $null=[OwnedFolderWin32]::EnumChildWindows($hwnd,$childCallback,[IntPtr]::Zero)
++      $children=@{ limit=32; truncated=$script:diagChildTruncated; controls=@($script:diagChildren); text_or_items_read=$false }
++    }
++    Assert-Dialog
++    return @{
++      schema='researchos.owned-dialog-tree-metadata/1'; diagnostic_only=$true
++      dialog_hwnd=$hwnd.ToInt64().ToString(); dialog_owner_pid=$coreId
++      tree_count=$trees.Count; tree_limit=$limit; captured_count=$rows.Count
++      tree_truncated=($trees.Count -gt $limit); trees=@($rows)
++      win32_children_when_zero=$children
++      no_treeitem_navigation=$true; no_ok=$true; no_workspace_authorization=$true
++    }
++  }
++  $result.diagnostic=Read-OwnedTreeDiagnostic
++  # Dedicated diagnostic controller: never select/expand a TreeItem or lookup OK.
++  # The ordinary catch path can only revalidate and invoke owned IDCANCEL.
++  throw 'DIAGNOSTIC_ONLY_TREE_SNAPSHOT_COMPLETE_NO_OK'
+ } catch {
+   $result.reason=$_.Exception.Message
+   if ($okAttempted) {

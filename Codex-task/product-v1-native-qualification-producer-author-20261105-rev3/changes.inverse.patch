@@ -1,0 +1,2061 @@
+diff --git a/adapters/runtime/codex_qualification_windows.go b/adapters/runtime/codex_qualification_windows.go
+deleted file mode 100644
+--- a/adapters/runtime/codex_qualification_windows.go
++++ /dev/null
+@@ -1,758 +0,0 @@
+-//go:build windows
+-
+-package runtime
+-
+-import (
+-	"bufio"
+-	"bytes"
+-	"context"
+-	"crypto/rand"
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"encoding/json"
+-	"errors"
+-	"io"
+-	"net"
+-	"os"
+-	"path/filepath"
+-	"strconv"
+-	"strings"
+-	"sync"
+-	"time"
+-
+-	"golang.org/x/sys/windows"
+-	"researchos.local/research-os/internal/qualificationprobe"
+-)
+-
+-// Only actual Host composition may supply these installed source/build facts.
+-// No request decoder, environment override, PASS boolean, receipt path, or
+-// arbitrary qualification provider is accepted by this constructor.
+-type CodexNativeQualificationOptions struct {
+-	ApprovedRoot        string
+-	SyntheticSource     string
+-	ShippedHelper       string
+-	ShippedHelperSHA256 string
+-	HostBuildSHA256     string
+-}
+-type nativeQualificationObservation struct {
+-	TaskID, RunID, Epoch, SourceBindingHash, Source, Directory                                 string
+-	NativeHash, HelperHash, HostBuildHash, TemplateHash, EnvironmentHash, NormalHome, HostBoot string
+-	RenderedArgvHash                                                                           string
+-	ReceiptPath                                                                                string
+-	PreflightNoChild                                                                           bool
+-	Until                                                                                      time.Time
+-	Capture                                                                                    qualificationCapture
+-}
+-type nativeQualifier struct {
+-	mu          sync.Mutex
+-	state       string
+-	used        bool
+-	options     CodexNativeQualificationOptions
+-	rpc         *codexRPC
+-	boot        string
+-	observation nativeQualificationObservation
+-}
+-type qualifiedRPC struct {
+-	rpc *codexRPC
+-	q   *nativeQualifier
+-}
+-
+-// This is a scope fact for Host/domain admission, never a readiness or
+-// qualification grant. Arbitrary CodexDriver implementations cannot supply it.
+-func CodexNativeQualificationSource(driver CodexDriver) (string, bool) {
+-	d, ok := driver.(*qualifiedRPC)
+-	if !ok || d == nil || d.q == nil || d.q.options.SyntheticSource == "" {
+-		return "", false
+-	}
+-	return d.q.options.SyntheticSource, true
+-}
+-
+-type qualifiedHandle struct {
+-	mu                 sync.Mutex
+-	cancel             context.CancelFunc
+-	delegate           CodexHandle
+-	delegateAttempted  bool
+-	q                  *nativeQualifier
+-	launch             CodexLaunch
+-	done               chan struct{}
+-	result             CodexResult
+-	err                error
+-	preparationFailure *CodexPreparationFailure
+-}
+-
+-// A value-only projection of a terminal preparation failure. The only mint
+-// path is the private wrapper handle after its goroutine has ended; serialized
+-// reports or caller-created CodexHandle implementations cannot obtain it.
+-type CodexPreparationFailure struct {
+-	Reason                                                          string
+-	QualificationReceiptPath                                        string
+-	QualificationPID                                                uint32
+-	NoQualificationChild                                            bool
+-	QualificationJobZero                                            bool
+-	StreamsDrained                                                  bool
+-	CleanupComplete                                                 bool
+-	NoModelDelegation                                               bool
+-	TaskID, RunID, Epoch, SourceBindingHash, TemplateHash, HostBoot string
+-}
+-
+-func CodexPreparationFailureForHandle(handle CodexHandle) (CodexPreparationFailure, bool) {
+-	h, ok := handle.(*qualifiedHandle)
+-	if !ok || h == nil {
+-		return CodexPreparationFailure{}, false
+-	}
+-	select {
+-	case <-h.done:
+-	default:
+-		return CodexPreparationFailure{}, false
+-	}
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-	if h.delegateAttempted || h.delegate != nil || h.preparationFailure == nil || h.err == nil || h.q == nil {
+-		return CodexPreparationFailure{}, false
+-	}
+-	f := *h.preparationFailure
+-	if !knownQualificationFailure(f.Reason) || !f.NoModelDelegation || f.TaskID != h.launch.TaskID || f.RunID != h.launch.RunID || f.Epoch != h.launch.Epoch || f.SourceBindingHash != h.launch.SourceBindingHash ||
+-		f.TemplateHash != CodexRPCPolicyIdentity(h.q.rpc.options.Descriptor.ExecutableHash).RequestedConfigSHA256 || f.HostBoot != h.q.boot ||
+-		!(f.NoQualificationChild && f.QualificationPID == 0 || f.QualificationPID != 0 && f.QualificationJobZero && f.StreamsDrained && f.CleanupComplete) {
+-		return CodexPreparationFailure{}, false
+-	}
+-	return f, true
+-}
+-func knownQualificationFailure(reason string) bool {
+-	switch reason {
+-	case "QUALIFICATION_REQUIRED", "QUALIFICATION_SCOPE_MISMATCH", "QUALIFICATION_BOOTSTRAP_BLOCKED", "QUALIFICATION_POLICY_VIOLATION", "QUALIFICATION_CONTROL_INVALID", "QUALIFICATION_INCOMPLETE", "QUALIFICATION_IDENTITY_CHANGED", "QUALIFICATION_CLEANUP_UNKNOWN", "QUALIFICATION_RECEIPT_UNCERTAIN", "QUALIFICATION_CANCELLED_BEFORE_RPC", "QUALIFICATION_TIME_BUDGET_EXHAUSTED", "QUALIFICATION_TEMPLATE_CHANGED":
+-		return true
+-	}
+-	return false
+-}
+-func preparationFailure(reason string, obs nativeQualificationObservation) *CodexPreparationFailure {
+-	return &CodexPreparationFailure{Reason: reason, QualificationReceiptPath: obs.ReceiptPath, QualificationPID: obs.Capture.PID, NoQualificationChild: obs.PreflightNoChild, QualificationJobZero: obs.Capture.JobZero, StreamsDrained: obs.Capture.StreamsDrained, CleanupComplete: obs.Capture.CleanupComplete, NoModelDelegation: true, TaskID: obs.TaskID, RunID: obs.RunID, Epoch: obs.Epoch, SourceBindingHash: obs.SourceBindingHash, TemplateHash: obs.TemplateHash, HostBoot: obs.HostBoot}
+-}
+-
+-func NewCodexRPCWithNativeQualification(options CodexRPCOptions, scope CodexNativeQualificationOptions) (CodexDriver, error) {
+-	if options.Descriptor.Version != "0.166.0" || !filepath.IsAbs(scope.ApprovedRoot) || !filepath.IsAbs(scope.SyntheticSource) || !filepath.IsAbs(scope.ShippedHelper) ||
+-		filepath.Clean(scope.ApprovedRoot) != scope.ApprovedRoot || filepath.Clean(scope.SyntheticSource) != scope.SyntheticSource || filepath.Clean(scope.ShippedHelper) != scope.ShippedHelper ||
+-		!strings.EqualFold(scope.SyntheticSource, filepath.Join(scope.ApprovedRoot, "S")) || !strings.EqualFold(scope.ShippedHelper, filepath.Join(scope.SyntheticSource, "qualification-helper.exe")) ||
+-		!qualificationSHA(scope.ShippedHelperSHA256) || !qualificationSHA(scope.HostBuildSHA256) {
+-		return nil, errors.New("QUALIFICATION_REQUIRED")
+-	}
+-	d, err := NewCodexRPC(options)
+-	if err != nil {
+-		return nil, err
+-	}
+-	var nonce [16]byte
+-	if _, err = rand.Read(nonce[:]); err != nil {
+-		return nil, errors.New("QUALIFICATION_BOOT_UNAVAILABLE")
+-	}
+-	q := &nativeQualifier{state: "NOT_STARTED", options: scope, rpc: d.(*codexRPC), boot: hex.EncodeToString(nonce[:])}
+-	q.rpc.qualifier = q
+-	return &qualifiedRPC{rpc: q.rpc, q: q}, nil
+-}
+-func qualificationSHA(s string) bool {
+-	if len(s) != 71 || !strings.HasPrefix(s, "sha256:") {
+-		return false
+-	}
+-	_, err := hex.DecodeString(s[7:])
+-	return err == nil
+-}
+-func (d *qualifiedRPC) Descriptor() CodexDescriptor       { return d.rpc.Descriptor() }
+-func (d *qualifiedRPC) ReadinessSnapshot() CodexReadiness { return d.rpc.ReadinessSnapshot() }
+-func (h *qualifiedHandle) Cancel() {
+-	h.mu.Lock()
+-	delegate := h.delegate
+-	h.mu.Unlock()
+-	h.cancel()
+-	if delegate != nil {
+-		delegate.Cancel()
+-	}
+-}
+-func (h *qualifiedHandle) Wait(ctx context.Context) (CodexResult, error) {
+-	select {
+-	case <-h.done:
+-		h.mu.Lock()
+-		defer h.mu.Unlock()
+-		return h.result, h.err
+-	case <-ctx.Done():
+-		return CodexResult{}, ctx.Err()
+-	}
+-}
+-
+-// Mirror B1's pure launch gate before consuming the one-shot qualification.
+-// B1 still validates again immediately before its own child is created.
+-func validateQualificationLaunch(in CodexLaunch, cb CodexCallbacks) error {
+-	if !filepath.IsAbs(in.Workspace) || !filepath.IsAbs(in.Directory) || in.SourceBindingHash == "" ||
+-		in.TaskID == "" || in.RunID == "" || strings.TrimSpace(in.Prompt) == "" || len(in.Prompt) > 65536 ||
+-		in.Timeout <= 0 || in.Timeout > 15*time.Minute || cb.BeforeResume == nil || cb.BeforeModelTurn == nil || cb.Event == nil {
+-		return errors.New("CODEX_RPC_LAUNCH_INVALID")
+-	}
+-	epoch, err := strconv.ParseInt(in.Epoch, 10, 64)
+-	if err != nil || epoch <= 0 || strconv.FormatInt(epoch, 10) != in.Epoch {
+-		return errors.New("CODEX_EPOCH_INVALID")
+-	}
+-	_, err = codexExecutionInput(in.Workspace, filepath.Join(in.Directory, "cwd"), in.Prompt)
+-	return err
+-}
+-
+-func (d *qualifiedRPC) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks) (CodexHandle, error) {
+-	if d.rpc.readiness().State != "PREPARATION_READY" {
+-		return nil, errors.New("QUALIFICATION_REQUIRED")
+-	}
+-	if err := validateQualificationLaunch(in, cb); err != nil {
+-		return nil, err
+-	}
+-	if !strings.EqualFold(filepath.Clean(in.Workspace), d.q.options.SyntheticSource) || ctx.Err() != nil {
+-		return nil, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-	}
+-	if _, err := os.Lstat(in.Directory); !errors.Is(err, os.ErrNotExist) {
+-		return nil, errors.New("QUALIFICATION_LAUNCH_DIRECTORY_PRECREATED")
+-	}
+-	d.q.mu.Lock()
+-	if d.q.state != "NOT_STARTED" {
+-		d.q.mu.Unlock()
+-		return nil, errors.New("QUALIFICATION_ATTEMPT_CONSUMED")
+-	}
+-	d.q.state = "RUNNING"
+-	d.q.mu.Unlock()
+-	child, cancel := context.WithCancel(ctx)
+-	h := &qualifiedHandle{cancel: cancel, done: make(chan struct{}), q: d.q, launch: in}
+-	go func() {
+-		defer close(h.done)
+-		defer cancel()
+-		deadline := time.Now().Add(in.Timeout)
+-		prepBudget := 60 * time.Second
+-		if in.Timeout < prepBudget {
+-			prepBudget = in.Timeout
+-		}
+-		prepCtx, prepCancel := context.WithTimeout(child, prepBudget)
+-		obs, err := d.q.ensureLaunch(prepCtx, in)
+-		prepCancel()
+-		if err != nil {
+-			h.mu.Lock()
+-			h.result = CodexResult{State: "FAILED", Failure: err.Error(), Stopped: obs.Capture.JobZero, StreamsDrained: obs.Capture.StreamsDrained, CleanupComplete: obs.Capture.CleanupComplete}
+-			h.err = err
+-			h.preparationFailure = preparationFailure(err.Error(), obs)
+-			h.mu.Unlock()
+-			return
+-		}
+-		if child.Err() != nil {
+-			h.mu.Lock()
+-			h.err = child.Err()
+-			h.preparationFailure = preparationFailure("QUALIFICATION_CANCELLED_BEFORE_RPC", obs)
+-			h.mu.Unlock()
+-			return
+-		}
+-		remaining := time.Until(deadline)
+-		if remaining <= 0 {
+-			h.mu.Lock()
+-			h.err = errors.New("QUALIFICATION_TIME_BUDGET_EXHAUSTED")
+-			h.preparationFailure = preparationFailure("QUALIFICATION_TIME_BUDGET_EXHAUSTED", obs)
+-			h.mu.Unlock()
+-			return
+-		}
+-		in.Timeout = remaining
+-		h.mu.Lock()
+-		h.delegateAttempted = true
+-		h.mu.Unlock()
+-		delegate, err := d.rpc.Start(child, in, cb)
+-		if err != nil {
+-			h.mu.Lock()
+-			h.err = err
+-			h.mu.Unlock()
+-			return
+-		}
+-		h.mu.Lock()
+-		h.delegate = delegate
+-		h.mu.Unlock()
+-		if child.Err() != nil {
+-			delegate.Cancel()
+-		}
+-		result, err := delegate.Wait(context.Background())
+-		h.mu.Lock()
+-		h.result, h.err = result, err
+-		h.mu.Unlock()
+-	}()
+-	return h, nil
+-}
+-
+-func (q *nativeQualifier) Ensure(ctx context.Context, e CodexTurnEvidence) error {
+-	q.mu.Lock()
+-	defer q.mu.Unlock()
+-	o := q.observation
+-	if q.state != "OBSERVED_PASS" || q.used {
+-		return errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	q.used = true
+-	if ctx.Err() != nil || time.Now().After(o.Until) || o.HostBoot != q.boot ||
+-		e.TaskID != o.TaskID || e.RunID != o.RunID || e.Epoch != o.Epoch || e.SourceBindingHash != o.SourceBindingHash ||
+-		e.PolicyIdentity != CodexRPCPolicyIdentity(o.NativeHash) || e.Process.PID == 0 || e.Process.Created <= 0 || e.Process.Job == "" ||
+-		e.ProfileNonce == "" || e.ThreadID == "" || e.RenderedConfigSHA256 != codexRPCConfigHash(e.ProfileNonce, filepath.Join(o.Directory, "cwd"), o.Source) ||
+-		q.rpc.options.Descriptor.ExecutableHash != o.NativeHash || q.options.ShippedHelperSHA256 != o.HelperHash || q.options.HostBuildSHA256 != o.HostBuildHash ||
+-		CodexRPCPolicyIdentity(o.NativeHash).RequestedConfigSHA256 != o.TemplateHash || Hash(mustJSON(Environment(""))) != o.EnvironmentHash ||
+-		!strings.EqualFold(q.rpc.options.NormalHome, o.NormalHome) || !strings.EqualFold(q.options.SyntheticSource, o.Source) || !strings.EqualFold(q.options.ApprovedRoot, filepath.Dir(o.Source)) {
+-		return errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	if exactReal(o.Source) != nil || exactReal(q.options.ShippedHelper) != nil {
+-		return errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	if digest, err := fileDigest(q.options.ShippedHelper); err != nil || digest != o.HelperHash {
+-		return errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	if digest, err := fileDigest(q.rpc.options.Executable); err != nil || digest != o.NativeHash {
+-		return errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	return nil
+-}
+-func mustJSON(v any) []byte { raw, _ := json.Marshal(v); return raw }
+-func fileDigest(path string) (string, error) {
+-	f, err := os.Open(path)
+-	if err != nil {
+-		return "", err
+-	}
+-	h := sha256.New()
+-	_, e := io.Copy(h, f)
+-	c := f.Close()
+-	if e != nil || c != nil {
+-		return "", errors.Join(e, c)
+-	}
+-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+-}
+-func exactReal(path string) error {
+-	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+-		name, e := windows.UTF16PtrFromString(current)
+-		if e != nil {
+-			return errors.New("QUALIFICATION_REPARSE_OR_MISSING")
+-		}
+-		attributes, e := windows.GetFileAttributes(name)
+-		if e != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+-			return errors.New("QUALIFICATION_REPARSE_OR_MISSING")
+-		}
+-		parent := filepath.Dir(current)
+-		if parent == current {
+-			break
+-		}
+-	}
+-	actual, err := filepath.EvalSymlinks(path)
+-	if err != nil || !strings.EqualFold(filepath.Clean(actual), filepath.Clean(path)) {
+-		return errors.New("QUALIFICATION_REPARSE_OR_MISSING")
+-	}
+-	return nil
+-}
+-func createFixed(path string, raw []byte) error {
+-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+-	if err != nil {
+-		return err
+-	}
+-	n, e := f.Write(raw)
+-	if e == nil && n != len(raw) {
+-		e = io.ErrShortWrite
+-	}
+-	syncErr := f.Sync()
+-	closeErr := f.Close()
+-	return errors.Join(e, syncErr, closeErr)
+-}
+-func hostWriteControl(path string, expected []byte) error {
+-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+-	if err != nil {
+-		return err
+-	}
+-	defer f.Close()
+-	if _, err = f.WriteAt(bytes.Repeat([]byte{'C'}, len(expected)), 0); err != nil {
+-		return err
+-	}
+-	if err = f.Sync(); err != nil {
+-		return err
+-	}
+-	if _, err = f.WriteAt(expected, 0); err != nil {
+-		return err
+-	}
+-	if err = f.Sync(); err != nil {
+-		return err
+-	}
+-	raw, err := os.ReadFile(path)
+-	if err != nil || !bytes.Equal(raw, expected) {
+-		return errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	return nil
+-}
+-
+-func hostCreateControl(path string) error {
+-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+-	if err != nil {
+-		return err
+-	}
+-	_, writeErr := f.Write([]byte("researchos-host-create-control-v1\n"))
+-	syncErr := f.Sync()
+-	closeErr := f.Close()
+-	removeErr := os.Remove(path)
+-	if err := errors.Join(writeErr, syncErr, closeErr, removeErr); err != nil {
+-		return err
+-	}
+-	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+-		return errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	return nil
+-}
+-
+-type qualificationListener struct {
+-	listener              *net.TCPListener
+-	nonce                 string
+-	mu                    sync.Mutex
+-	pre, post, unexpected int
+-	done                  chan struct{}
+-}
+-
+-func startQualificationListener(nonce string) (*qualificationListener, error) {
+-	l, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+-	if err != nil {
+-		return nil, err
+-	}
+-	q := &qualificationListener{listener: l, nonce: nonce, done: make(chan struct{})}
+-	go q.serve()
+-	return q, nil
+-}
+-func (q *qualificationListener) serve() {
+-	defer close(q.done)
+-	for {
+-		c, err := q.listener.AcceptTCP()
+-		if err != nil {
+-			return
+-		}
+-		func() {
+-			defer c.Close()
+-			_ = c.SetDeadline(time.Now().Add(time.Second))
+-			line, err := bufio.NewReaderSize(io.LimitReader(c, 129), 128).ReadString('\n')
+-			q.mu.Lock()
+-			switch {
+-			case err == nil && len(line) <= 128 && line == q.nonce+":pre\n":
+-				q.pre++
+-			case err == nil && len(line) <= 128 && line == q.nonce+":post\n":
+-				q.post++
+-			default:
+-				q.unexpected++
+-			}
+-			q.mu.Unlock()
+-			if err == nil {
+-				_, _ = c.Write([]byte("OK\n"))
+-			}
+-		}()
+-	}
+-}
+-func (q *qualificationListener) control(phase string) error {
+-	c, err := net.DialTimeout("tcp4", q.listener.Addr().String(), time.Second)
+-	if err != nil {
+-		return err
+-	}
+-	defer c.Close()
+-	_ = c.SetDeadline(time.Now().Add(time.Second))
+-	if _, err = c.Write([]byte(q.nonce + ":" + phase + "\n")); err != nil {
+-		return err
+-	}
+-	var reply [3]byte
+-	if _, err = io.ReadFull(c, reply[:]); err != nil || string(reply[:]) != "OK\n" {
+-		return errors.New("QUALIFICATION_LISTENER_CONTROL_INVALID")
+-	}
+-	return nil
+-}
+-func (q *qualificationListener) closeAndCheck() (bool, error) {
+-	q.listener.Close()
+-	<-q.done
+-	q.mu.Lock()
+-	defer q.mu.Unlock()
+-	if q.unexpected != 0 {
+-		return true, errors.New("QUALIFICATION_POLICY_VIOLATION")
+-	}
+-	if q.pre != 1 || q.post != 1 {
+-		return false, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	return false, nil
+-}
+-
+-func qualificationArguments(nonce, source, working, helper, encoded string) ([]string, error) {
+-	args := codexRPCArguments(nonce, source)
+-	if len(args) < 3 || args[len(args)-3] != "app-server" || args[len(args)-2] != "--listen" || args[len(args)-1] != "stdio://" {
+-		return nil, errors.New("QUALIFICATION_TEMPLATE_CHANGED")
+-	}
+-	args = append(args[:len(args)-3], "sandbox", "--include-managed-config", "--permission-profile", nonce, "-C", working, "--", helper, "--plan-v1", encoded)
+-	return args, nil
+-}
+-
+-func qualificationReasonRank(reason string) int {
+-	switch reason {
+-	case "":
+-		return 0
+-	case "QUALIFICATION_POLICY_VIOLATION":
+-		return 6
+-	case "QUALIFICATION_IDENTITY_CHANGED":
+-		return 5
+-	case "QUALIFICATION_CLEANUP_UNKNOWN":
+-		return 4
+-	case "QUALIFICATION_CONTROL_INVALID":
+-		return 3
+-	case "QUALIFICATION_INCOMPLETE":
+-		return 2
+-	default:
+-		return 1
+-	}
+-}
+-
+-func qualificationPreferredReason(current, next string) string {
+-	if qualificationReasonRank(next) > qualificationReasonRank(current) {
+-		return next
+-	}
+-	return current
+-}
+-
+-func evaluateQualificationCase(name string, result qualificationprobe.Event, expectedDigest string, expectedBytes int) string {
+-	switch name {
+-	case "source_read":
+-		if !result.Opened || result.Errno != 0 || result.Digest != expectedDigest || result.Bytes != expectedBytes {
+-			return "QUALIFICATION_CONTROL_INVALID"
+-		}
+-	case "loopback_connect":
+-		if result.Opened {
+-			return "QUALIFICATION_POLICY_VIOLATION"
+-		}
+-		if result.Errno != 10013 {
+-			return "QUALIFICATION_INCOMPLETE"
+-		}
+-	default:
+-		if result.Opened {
+-			return "QUALIFICATION_POLICY_VIOLATION"
+-		}
+-		if result.Errno != 5 {
+-			return "QUALIFICATION_INCOMPLETE"
+-		}
+-	}
+-	return ""
+-}
+-
+-func (q *nativeQualifier) ensureLaunch(ctx context.Context, in CodexLaunch) (obs nativeQualificationObservation, err error) {
+-	defer func() {
+-		q.mu.Lock()
+-		defer q.mu.Unlock()
+-		if err != nil {
+-			q.state = "FAILED"
+-			if !obs.Capture.JobZero && obs.Capture.PID != 0 {
+-				q.state = "UNKNOWN"
+-			}
+-		} else {
+-			q.observation = obs
+-			q.state = "OBSERVED_PASS"
+-		}
+-	}()
+-	o := q.options
+-	source := o.SyntheticSource
+-	root := o.ApprovedRoot
+-	obs = nativeQualificationObservation{TaskID: in.TaskID, RunID: in.RunID, Epoch: in.Epoch, SourceBindingHash: in.SourceBindingHash, Source: source, Directory: in.Directory, NativeHash: q.rpc.options.Descriptor.ExecutableHash, HelperHash: o.ShippedHelperSHA256, HostBuildHash: o.HostBuildSHA256, TemplateHash: CodexRPCPolicyIdentity(q.rpc.options.Descriptor.ExecutableHash).RequestedConfigSHA256, EnvironmentHash: Hash(mustJSON(Environment(""))), NormalHome: q.rpc.options.NormalHome, HostBoot: q.boot, PreflightNoChild: true}
+-	receipt := qualificationReceiptContext{TaskID: obs.TaskID, RunID: obs.RunID, Epoch: obs.Epoch, SourceBindingHash: obs.SourceBindingHash, Source: source, NativeHash: obs.NativeHash, HelperHash: obs.HelperHash, HostBuildHash: obs.HostBuildHash, TemplateHash: obs.TemplateHash, EnvironmentHash: obs.EnvironmentHash, NormalHome: obs.NormalHome, HostBoot: obs.HostBoot, ExpectedCases: qualificationprobe.FixedCases()}
+-	if ctx.Err() != nil || in.SourceBindingHash == "" || in.TaskID == "" || in.RunID == "" || in.Epoch == "" || !strings.EqualFold(in.Workspace, source) || !strings.EqualFold(filepath.Dir(source), root) || !strings.EqualFold(q.rpc.options.NormalHome, os.Getenv("USERPROFILE")) {
+-		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-	}
+-	if exactReal(root) != nil || exactReal(source) != nil || exactReal(o.ShippedHelper) != nil {
+-		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-	}
+-	if _, e := PrivateDirectory(root); e != nil {
+-		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-	}
+-	receiptDir := filepath.Join(root, "receipts")
+-	if e := os.Mkdir(receiptDir, 0700); e != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if _, e := PrivateDirectory(receiptDir); e != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	receiptPath := filepath.Join(receiptDir, strings.TrimPrefix(Hash([]byte(in.RunID+"/"+in.Epoch)), "sha256:")+".json")
+-	obs.ReceiptPath = receiptPath
+-	persisted := false
+-	defer func() {
+-		if !persisted {
+-			reason := "QUALIFICATION_INCOMPLETE"
+-			if err != nil {
+-				reason = err.Error()
+-			}
+-			if e := persistQualificationCapture(receiptPath, obs.Capture, reason, receipt); e != nil {
+-				err = errors.New("QUALIFICATION_RECEIPT_UNCERTAIN")
+-			}
+-		}
+-	}()
+-	nativeHash, e := fileDigest(q.rpc.options.Executable)
+-	if e != nil || nativeHash != obs.NativeHash {
+-		return obs, errors.New("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	helperHash, e := fileDigest(o.ShippedHelper)
+-	if e != nil || helperHash != o.ShippedHelperSHA256 {
+-		return obs, errors.New("QUALIFICATION_BOOTSTRAP_BLOCKED")
+-	}
+-	working, denied := filepath.Join(root, "QW"), filepath.Join(root, "D")
+-	receipt.Working, receipt.Denied = working, denied
+-	for _, dir := range []string{working, denied} {
+-		if e = os.Mkdir(dir, 0700); e != nil {
+-			return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-		}
+-		if _, e = PrivateDirectory(dir); e != nil {
+-			return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-		}
+-		if exactReal(dir) != nil {
+-			return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-		}
+-	}
+-	allow := []byte("researchos-qualification-allow-v1\n")
+-	writeS := []byte("researchos-qualification-source-write-v1\n")
+-	writeW := []byte("researchos-qualification-working-write-v1\n")
+-	deniedRaw := []byte("researchos-qualification-denied-v1\n")
+-	for path, raw := range map[string][]byte{filepath.Join(source, "allow.txt"): allow, filepath.Join(source, "write-existing.txt"): writeS, filepath.Join(working, "write-existing.txt"): writeW, filepath.Join(denied, "denied.txt"): deniedRaw, filepath.Join(working, ".researchos-codex-root"): []byte("researchos-codex-owned-root-v1\n")} {
+-		if e = createFixed(path, raw); e != nil {
+-			return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-		}
+-	}
+-	fixtureFiles := []string{filepath.Join(source, "allow.txt"), filepath.Join(source, "write-existing.txt"), filepath.Join(working, "write-existing.txt"), filepath.Join(denied, "denied.txt"), filepath.Join(working, ".researchos-codex-root")}
+-	for _, path := range fixtureFiles {
+-		if exactReal(path) != nil {
+-			return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-		}
+-	}
+-	if _, e = os.Lstat(filepath.Join(source, "create-denied.txt")); !errors.Is(e, os.ErrNotExist) {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if _, e = os.Lstat(filepath.Join(working, "create-denied.txt")); !errors.Is(e, os.ErrNotExist) {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if err = hostWriteControl(filepath.Join(source, "write-existing.txt"), writeS); err != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if err = hostWriteControl(filepath.Join(working, "write-existing.txt"), writeW); err != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	for _, path := range []string{filepath.Join(source, "create-denied.txt"), filepath.Join(working, "create-denied.txt")} {
+-		if err = hostCreateControl(path); err != nil {
+-			return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-		}
+-	}
+-	if raw, e := os.ReadFile(filepath.Join(denied, "denied.txt")); e != nil || !bytes.Equal(raw, deniedRaw) {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if raw, e := os.ReadFile(filepath.Join(source, "allow.txt")); e != nil || !bytes.Equal(raw, allow) {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	listener, e := startQualificationListener(q.boot)
+-	if e != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	listenerClosed := false
+-	defer func() {
+-		if !listenerClosed {
+-			listener.listener.Close()
+-			<-listener.done
+-		}
+-	}()
+-	if e = listener.control("pre"); e != nil {
+-		return obs, errors.New("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	receipt.PreControlsComplete = true
+-	nonce, e := rpcNonce()
+-	if e != nil {
+-		return obs, errors.New("QUALIFICATION_BOOTSTRAP_BLOCKED")
+-	}
+-	plan := qualificationprobe.Plan{Schema: qualificationprobe.Schema, Source: source, Working: working, Denied: denied, Nonce: nonce, Port: uint16(listener.listener.Addr().(*net.TCPAddr).Port), Cases: qualificationprobe.FixedCases()}
+-	receipt.LoopbackPort = plan.Port
+-	encoded, e := qualificationprobe.Encode(plan)
+-	if e != nil {
+-		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+-	}
+-	receipt.Nonce, receipt.PlanHash, receipt.PlanEncoded = nonce, Hash([]byte(encoded)), encoded
+-	args, e := qualificationArguments(nonce, source, working, o.ShippedHelper, encoded)
+-	if e != nil {
+-		return obs, e
+-	}
+-	obs.RenderedArgvHash = Hash(mustJSON(args))
+-	receipt.RenderedArgvHash = obs.RenderedArgvHash
+-	receipt.RenderedArgv = append([]string(nil), args...)
+-	obs.PreflightNoChild = false
+-	obs.Capture = collectQualification(ctx, q.rpc.options.Executable, args, Environment(""), working, qualificationJobName(in.RunID, in.Epoch, nonce), receiptPath)
+-	reason := ""
+-	record := func(next string) {
+-		if next == "" {
+-			return
+-		}
+-		receipt.FindingCodes = append(receipt.FindingCodes, next)
+-		reason = qualificationPreferredReason(reason, next)
+-	}
+-	record(qualificationCaptureReason(obs.Capture))
+-	if e = listener.control("post"); e != nil {
+-		record("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	unexpected, listenerErr := listener.closeAndCheck()
+-	if unexpected {
+-		record("QUALIFICATION_POLICY_VIOLATION")
+-	} else if listenerErr != nil {
+-		record("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	listenerClosed = true
+-	if raw, e := os.ReadFile(filepath.Join(source, "allow.txt")); e != nil || !bytes.Equal(raw, allow) {
+-		record("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if raw, e := os.ReadFile(filepath.Join(denied, "denied.txt")); e != nil || !bytes.Equal(raw, deniedRaw) {
+-		record("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	if raw, e := os.ReadFile(filepath.Join(working, ".researchos-codex-root")); e != nil || string(raw) != "researchos-codex-owned-root-v1\n" {
+-		record("QUALIFICATION_CONTROL_INVALID")
+-	}
+-	for _, control := range []struct {
+-		path     string
+-		expected []byte
+-	}{{filepath.Join(source, "write-existing.txt"), writeS}, {filepath.Join(working, "write-existing.txt"), writeW}} {
+-		path, expected := control.path, control.expected
+-		if raw, e := os.ReadFile(path); e != nil || !bytes.Equal(raw, expected) || hostWriteControl(path, expected) != nil {
+-			record("QUALIFICATION_CONTROL_INVALID")
+-		}
+-	}
+-	for _, path := range []string{filepath.Join(source, "create-denied.txt"), filepath.Join(working, "create-denied.txt")} {
+-		if _, e := os.Lstat(path); e == nil {
+-			record("QUALIFICATION_POLICY_VIOLATION")
+-		} else if !errors.Is(e, os.ErrNotExist) {
+-			record("QUALIFICATION_CONTROL_INVALID")
+-		}
+-		if e := hostCreateControl(path); e != nil {
+-			record("QUALIFICATION_CONTROL_INVALID")
+-		}
+-	}
+-	if exactReal(source) != nil || exactReal(working) != nil || exactReal(denied) != nil || exactReal(o.ShippedHelper) != nil {
+-		record("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	for _, path := range fixtureFiles {
+-		if exactReal(path) != nil {
+-			record("QUALIFICATION_IDENTITY_CHANGED")
+-		}
+-	}
+-	if digest, e := fileDigest(q.rpc.options.Executable); e != nil || digest != obs.NativeHash {
+-		record("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	if digest, e := fileDigest(o.ShippedHelper); e != nil || digest != o.ShippedHelperSHA256 {
+-		record("QUALIFICATION_IDENTITY_CHANGED")
+-	}
+-	if len(obs.Capture.Stderr.raw) != 0 {
+-		record("QUALIFICATION_INCOMPLETE")
+-	}
+-	results, parseErr := qualificationprobe.ParseTranscript(obs.Capture.Stdout.raw)
+-	if parseErr != nil {
+-		record("QUALIFICATION_INCOMPLETE")
+-	} else {
+-		receipt.ObservedCaseBitmap = qualificationprobe.CompleteBitmap
+-		digest := Hash(allow)
+-		for _, name := range qualificationprobe.Cases {
+-			result := results[name]
+-			receipt.CaseResults = append(receipt.CaseResults, qualificationCaseOutcome{Name: name, Opened: result.Opened, Errno: result.Errno, Digest: result.Digest, Bytes: result.Bytes})
+-			record(evaluateQualificationCase(name, result, digest, len(allow)))
+-		}
+-	}
+-	receipt.PostControlsComplete = reason == ""
+-	if e = persistQualificationCapture(receiptPath, obs.Capture, reason, receipt); e != nil {
+-		return obs, errors.New("QUALIFICATION_RECEIPT_UNCERTAIN")
+-	}
+-	persisted = true
+-	if reason != "" {
+-		return obs, errors.New(reason)
+-	}
+-	obs.Until = time.Now().Add(2 * time.Minute)
+-	return obs, nil
+-}
+diff --git a/adapters/runtime/codex_qualification_capture_windows.go b/adapters/runtime/codex_qualification_capture_windows.go
+deleted file mode 100644
+--- a/adapters/runtime/codex_qualification_capture_windows.go
++++ /dev/null
+@@ -1,477 +0,0 @@
+-//go:build windows
+-
+-package runtime
+-
+-import (
+-	"bytes"
+-	"context"
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"encoding/json"
+-	"errors"
+-	"io"
+-	"os"
+-	"strings"
+-	"time"
+-	"unsafe"
+-
+-	"golang.org/x/sys/windows"
+-)
+-
+-const qualificationStreamCap = 1 << 20
+-const qualificationPrefixCap = 64 << 10
+-const qualificationProcessLimit = 16
+-const qualificationJobMemory = uintptr(2048 << 20)
+-
+-type qualificationStream struct {
+-	raw      []byte
+-	prefix   []byte
+-	hash     string
+-	drained  bool
+-	overflow bool
+-	err      error
+-}
+-type qualificationCapture struct {
+-	Stdout, Stderr                                   qualificationStream
+-	PID                                              uint32
+-	Created                                          int64
+-	JobName                                          string
+-	JobProcessLimit                                  uint32
+-	JobMemoryLimit                                   uint64
+-	JobLimitFlags                                    uint32
+-	JobLimitsVerified                                bool
+-	ExitCode                                         int
+-	Exited, JobZero, StreamsDrained, CleanupComplete bool
+-	TimedOut, LimitExceeded                          bool
+-	Err                                              error
+-}
+-
+-type qualificationSyncCloser interface {
+-	Sync() error
+-	Close() error
+-}
+-
+-func finishQualificationStream(result *qualificationStream, partial qualificationSyncCloser, digest []byte) {
+-	if err := partial.Sync(); err != nil {
+-		result.err = errors.Join(result.err, err)
+-	}
+-	if err := partial.Close(); err != nil {
+-		result.err = errors.Join(result.err, err)
+-	}
+-	if len(result.raw) > qualificationPrefixCap {
+-		result.prefix = bytes.Clone(result.raw[:qualificationPrefixCap])
+-	} else {
+-		result.prefix = bytes.Clone(result.raw)
+-	}
+-	if result.drained && !result.overflow && result.err == nil {
+-		result.hash = "sha256:" + hex.EncodeToString(digest)
+-	}
+-}
+-
+-func boundedQualificationStream(f *os.File, out chan<- qualificationStream, partialPath string) {
+-	defer f.Close()
+-	partial, openErr := os.OpenFile(partialPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+-	if openErr != nil {
+-		out <- qualificationStream{err: openErr}
+-		return
+-	}
+-	var data bytes.Buffer
+-	buf := make([]byte, 8192)
+-	h := sha256.New()
+-	var result qualificationStream
+-	for {
+-		readLimit := qualificationStreamCap - data.Len() + 1
+-		if readLimit > len(buf) {
+-			readLimit = len(buf)
+-		}
+-		n, err := f.Read(buf[:readLimit])
+-		if n > 0 {
+-			if data.Len() < qualificationPrefixCap {
+-				keep := qualificationPrefixCap - data.Len()
+-				if keep > n {
+-					keep = n
+-				}
+-				written, writeErr := partial.Write(buf[:keep])
+-				if writeErr == nil && written != keep {
+-					writeErr = io.ErrShortWrite
+-				}
+-				if writeErr == nil {
+-					writeErr = partial.Sync()
+-				}
+-				if writeErr != nil {
+-					result.err = writeErr
+-					break
+-				}
+-			}
+-			if data.Len()+n > qualificationStreamCap {
+-				result.overflow = true
+-				space := qualificationStreamCap - data.Len()
+-				if space > 0 {
+-					data.Write(buf[:space])
+-				}
+-				break
+-			}
+-			data.Write(buf[:n])
+-			h.Write(buf[:n])
+-		}
+-		if err == io.EOF {
+-			result.drained = true
+-			break
+-		}
+-		if err != nil {
+-			result.err = err
+-			break
+-		}
+-	}
+-	result.raw = bytes.Clone(data.Bytes())
+-	finishQualificationStream(&result, partial, h.Sum(nil))
+-	out <- result
+-}
+-
+-// newJob only supplies KILL_ON_JOB_CLOSE. Add and read back both hard limits
+-// before launch resumes its suspended original process.
+-type qualificationJobLimits struct {
+-	Flags, Processes uint32
+-	Memory           uint64
+-}
+-
+-func qualificationJob(name string) (windows.Handle, qualificationJobLimits, error) {
+-	job, err := newJob(name)
+-	if err != nil {
+-		return 0, qualificationJobLimits{}, err
+-	}
+-	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY
+-	limits.BasicLimitInformation.ActiveProcessLimit = qualificationProcessLimit
+-	limits.JobMemoryLimit = qualificationJobMemory
+-	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+-		closeJob(job)
+-		return 0, qualificationJobLimits{}, err
+-	}
+-	var actual windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+-	if err = windows.QueryInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&actual)), uint32(unsafe.Sizeof(actual)), nil); err != nil {
+-		closeJob(job)
+-		return 0, qualificationJobLimits{}, err
+-	}
+-	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
+-	if actual.BasicLimitInformation.LimitFlags&flags != flags || actual.BasicLimitInformation.ActiveProcessLimit != qualificationProcessLimit || actual.JobMemoryLimit != qualificationJobMemory {
+-		closeJob(job)
+-		return 0, qualificationJobLimits{}, errors.New("QUALIFICATION_JOB_LIMIT_UNVERIFIED")
+-	}
+-	return job, qualificationJobLimits{Flags: actual.BasicLimitInformation.LimitFlags, Processes: actual.BasicLimitInformation.ActiveProcessLimit, Memory: uint64(actual.JobMemoryLimit)}, nil
+-}
+-
+-func collectQualification(ctx context.Context, executable string, args, env []string, cwd, jobName, receiptBase string) qualificationCapture {
+-	var out qualificationCapture
+-	if ctx.Err() != nil {
+-		out.Err = ctx.Err()
+-		return out
+-	}
+-	stdinR, stdinW, err := os.Pipe()
+-	if err != nil {
+-		out.Err = err
+-		return out
+-	}
+-	stdoutR, stdoutW, err := os.Pipe()
+-	if err != nil {
+-		stdinR.Close()
+-		stdinW.Close()
+-		out.Err = err
+-		return out
+-	}
+-	stderrR, stderrW, err := os.Pipe()
+-	if err != nil {
+-		stdinR.Close()
+-		stdinW.Close()
+-		stdoutR.Close()
+-		stdoutW.Close()
+-		out.Err = err
+-		return out
+-	}
+-	closeAll := func() {
+-		for _, f := range []*os.File{stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW} {
+-			f.Close()
+-		}
+-	}
+-	job, jobLimits, err := qualificationJob(jobName)
+-	if err != nil {
+-		closeAll()
+-		out.Err = err
+-		return out
+-	}
+-	defer closeJob(job)
+-	out.JobProcessLimit = jobLimits.Processes
+-	out.JobMemoryLimit = jobLimits.Memory
+-	out.JobLimitFlags = jobLimits.Flags
+-	out.JobLimitsVerified = true
+-	p, err := launch(job, Command{Executable: executable, Args: args, Directory: cwd}, env, stdinR, stdoutW, stderrW)
+-	stdinR.Close()
+-	stdinW.Close()
+-	stdoutW.Close()
+-	stderrW.Close()
+-	if err != nil {
+-		stdoutR.Close()
+-		stderrR.Close()
+-		out.Err = err
+-		return out
+-	}
+-	defer p.close()
+-	out.PID, out.Created, out.JobName = p.pid, p.created, jobName
+-	outCh, errCh := make(chan qualificationStream, 1), make(chan qualificationStream, 1)
+-	go boundedQualificationStream(stdoutR, outCh, receiptBase+".stdout.partial")
+-	go boundedQualificationStream(stderrR, errCh, receiptBase+".stderr.partial")
+-	soft := time.NewTimer(35 * time.Second)
+-	hard := time.NewTimer(45 * time.Second)
+-	ticker := time.NewTicker(50 * time.Millisecond)
+-	defer soft.Stop()
+-	defer hard.Stop()
+-	defer ticker.Stop()
+-	stdoutReady, stderrReady := false, false
+-	ctxDone := ctx.Done()
+-loop:
+-	for !out.Exited {
+-		select {
+-		case <-ctxDone:
+-			out.TimedOut = true
+-			out.Err = ctx.Err()
+-			_ = killJob(job)
+-			ctxDone = nil
+-		case <-soft.C:
+-			out.TimedOut = true
+-			_ = killJob(job)
+-		case <-hard.C:
+-			out.TimedOut = true
+-			_ = killJob(job)
+-			break loop
+-		case stream := <-outCh:
+-			out.Stdout = stream
+-			stdoutReady = true
+-			if stream.overflow || stream.err != nil {
+-				out.LimitExceeded = stream.overflow
+-				_ = killJob(job)
+-			}
+-		case stream := <-errCh:
+-			out.Stderr = stream
+-			stderrReady = true
+-			if stream.overflow || stream.err != nil {
+-				out.LimitExceeded = out.LimitExceeded || stream.overflow
+-				_ = killJob(job)
+-			}
+-		case <-ticker.C:
+-			exited, code, e := p.exited()
+-			if e != nil {
+-				out.Err = e
+-				_ = killJob(job)
+-			} else if exited {
+-				out.Exited = true
+-				out.ExitCode = code
+-			}
+-		}
+-	}
+-	cleanup := time.NewTimer(5 * time.Second)
+-	defer cleanup.Stop()
+-	for {
+-		ids, e := jobPIDs(job)
+-		if e != nil {
+-			out.Err = errors.Join(out.Err, e)
+-			break
+-		}
+-		if len(ids) == 0 {
+-			out.JobZero = true
+-			break
+-		}
+-		select {
+-		case <-cleanup.C:
+-			out.Err = errors.Join(out.Err, errors.New("QUALIFICATION_CLEANUP_UNKNOWN"))
+-			_ = killJob(job)
+-			break
+-		case <-time.After(50 * time.Millisecond):
+-			continue
+-		}
+-		break
+-	}
+-	if !out.JobZero {
+-		_ = killJob(job)
+-	}
+-	if !out.Exited {
+-		exited, code, e := p.exited()
+-		if e == nil && exited {
+-			out.Exited = true
+-			out.ExitCode = code
+-		}
+-	}
+-	streamDeadline := time.NewTimer(5 * time.Second)
+-	defer streamDeadline.Stop()
+-	streamTimedOut := false
+-	for !stdoutReady || !stderrReady {
+-		select {
+-		case stream := <-outCh:
+-			out.Stdout = stream
+-			stdoutReady = true
+-		case stream := <-errCh:
+-			out.Stderr = stream
+-			stderrReady = true
+-		case <-streamDeadline.C:
+-			out.Err = errors.Join(out.Err, errors.New("QUALIFICATION_STREAMS_UNDRAINED"))
+-			_ = stdoutR.Close()
+-			_ = stderrR.Close()
+-			streamTimedOut = true
+-		}
+-		if streamTimedOut {
+-			break
+-		}
+-	}
+-	if streamTimedOut {
+-		joinDeadline := time.NewTimer(time.Second)
+-		defer joinDeadline.Stop()
+-		for !stdoutReady || !stderrReady {
+-			select {
+-			case stream := <-outCh:
+-				out.Stdout, stdoutReady = stream, true
+-			case stream := <-errCh:
+-				out.Stderr, stderrReady = stream, true
+-			case <-joinDeadline.C:
+-				out.Err = errors.Join(out.Err, errors.New("QUALIFICATION_STREAM_READER_UNJOINED"))
+-				stdoutReady, stderrReady = true, true
+-			}
+-		}
+-	}
+-	out.StreamsDrained = out.Stdout.drained && out.Stderr.drained && !out.Stdout.overflow && !out.Stderr.overflow
+-	out.LimitExceeded = out.Stdout.overflow || out.Stderr.overflow
+-	out.Err = errors.Join(out.Err, out.Stdout.err, out.Stderr.err)
+-	out.CleanupComplete = out.Exited && out.JobZero && out.StreamsDrained && out.Err == nil
+-	return out
+-}
+-
+-type qualificationReceiptContext struct {
+-	TaskID               string                     `json:"task_id"`
+-	RunID                string                     `json:"run_id"`
+-	Epoch                string                     `json:"epoch"`
+-	SourceBindingHash    string                     `json:"source_binding_hash"`
+-	Source               string                     `json:"source"`
+-	Working              string                     `json:"working"`
+-	Denied               string                     `json:"denied"`
+-	NativeHash           string                     `json:"native_hash"`
+-	HelperHash           string                     `json:"helper_hash"`
+-	HostBuildHash        string                     `json:"host_build_hash"`
+-	TemplateHash         string                     `json:"template_hash"`
+-	EnvironmentHash      string                     `json:"environment_hash"`
+-	NormalHome           string                     `json:"normal_home"`
+-	HostBoot             string                     `json:"host_boot"`
+-	RenderedArgvHash     string                     `json:"rendered_argv_hash"`
+-	RenderedArgv         []string                   `json:"rendered_argv"`
+-	PlanHash             string                     `json:"plan_hash"`
+-	PlanEncoded          string                     `json:"plan_encoded"`
+-	Nonce                string                     `json:"nonce"`
+-	LoopbackPort         uint16                     `json:"loopback_port"`
+-	ExpectedCases        []string                   `json:"expected_cases"`
+-	CaseResults          []qualificationCaseOutcome `json:"case_results"`
+-	FindingCodes         []string                   `json:"finding_codes"`
+-	ObservedCaseBitmap   uint32                     `json:"observed_case_bitmap"`
+-	PreControlsComplete  bool                       `json:"pre_controls_complete"`
+-	PostControlsComplete bool                       `json:"post_controls_complete"`
+-}
+-
+-type qualificationCaseOutcome struct {
+-	Name   string `json:"name"`
+-	Opened bool   `json:"opened"`
+-	Errno  int    `json:"errno"`
+-	Digest string `json:"digest"`
+-	Bytes  int    `json:"bytes"`
+-}
+-
+-func persistQualificationCapture(path string, c qualificationCapture, reason string, context ...qualificationReceiptContext) error {
+-	if path == "" {
+-		return errors.New("QUALIFICATION_RECEIPT_PATH_REQUIRED")
+-	}
+-	data := struct {
+-		Schema            string                      `json:"schema"`
+-		Reason            string                      `json:"reason"`
+-		PID               uint32                      `json:"pid"`
+-		Created           int64                       `json:"created"`
+-		Job               string                      `json:"job"`
+-		ExitCode          int                         `json:"exit_code"`
+-		Exited            bool                        `json:"exited"`
+-		JobZero           bool                        `json:"job_zero"`
+-		StreamsDrained    bool                        `json:"streams_drained"`
+-		CleanupComplete   bool                        `json:"cleanup_complete"`
+-		TimedOut          bool                        `json:"timed_out"`
+-		LimitExceeded     bool                        `json:"limit_exceeded"`
+-		CaptureError      string                      `json:"capture_error"`
+-		StdoutError       string                      `json:"stdout_error"`
+-		StderrError       string                      `json:"stderr_error"`
+-		JobProcessLimit   uint32                      `json:"job_process_limit"`
+-		JobMemoryLimit    uint64                      `json:"job_memory_limit"`
+-		JobLimitFlags     uint32                      `json:"job_limit_flags"`
+-		JobLimitsVerified bool                        `json:"job_limits_verified"`
+-		Context           qualificationReceiptContext `json:"context"`
+-		StdoutPartial     string                      `json:"stdout_partial"`
+-		StderrPartial     string                      `json:"stderr_partial"`
+-		StdoutPrefix      []byte                      `json:"stdout_prefix"`
+-		StderrPrefix      []byte                      `json:"stderr_prefix"`
+-		StdoutHash        string                      `json:"stdout_hash"`
+-		StderrHash        string                      `json:"stderr_hash"`
+-	}{Schema: "researchos.native-qualification-capture.v1", Reason: reason, PID: c.PID, Created: c.Created, Job: c.JobName, ExitCode: c.ExitCode, Exited: c.Exited, JobZero: c.JobZero, StreamsDrained: c.StreamsDrained, CleanupComplete: c.CleanupComplete, TimedOut: c.TimedOut, LimitExceeded: c.LimitExceeded, JobProcessLimit: c.JobProcessLimit, JobMemoryLimit: c.JobMemoryLimit, JobLimitFlags: c.JobLimitFlags, JobLimitsVerified: c.JobLimitsVerified, StdoutPartial: path + ".stdout.partial", StderrPartial: path + ".stderr.partial", StdoutPrefix: c.Stdout.prefix, StderrPrefix: c.Stderr.prefix, StdoutHash: c.Stdout.hash, StderrHash: c.Stderr.hash}
+-	if len(context) == 1 {
+-		data.Context = context[0]
+-	} else if len(context) > 1 {
+-		return errors.New("QUALIFICATION_RECEIPT_CONTEXT_AMBIGUOUS")
+-	}
+-	if c.Err != nil {
+-		data.CaptureError = c.Err.Error()
+-	}
+-	if c.Stdout.err != nil {
+-		data.StdoutError = c.Stdout.err.Error()
+-	}
+-	if c.Stderr.err != nil {
+-		data.StderrError = c.Stderr.err.Error()
+-	}
+-	raw, err := json.Marshal(data)
+-	if err != nil {
+-		return err
+-	}
+-	if len(raw) > 2*qualificationPrefixCap*4/3+8192 {
+-		return errors.New("QUALIFICATION_RECEIPT_TOO_LARGE")
+-	}
+-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+-	if err != nil {
+-		return err
+-	}
+-	n, e := f.Write(append(raw, '\n'))
+-	if e == nil && n != len(raw)+1 {
+-		e = io.ErrShortWrite
+-	}
+-	syncErr := f.Sync()
+-	closeErr := f.Close()
+-	return errors.Join(e, syncErr, closeErr)
+-}
+-
+-func qualificationCaptureReason(c qualificationCapture) string {
+-	if c.PID == 0 {
+-		return "QUALIFICATION_BOOTSTRAP_BLOCKED"
+-	}
+-	requiredFlags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
+-	if !c.JobLimitsVerified || c.JobProcessLimit != qualificationProcessLimit || c.JobMemoryLimit != uint64(qualificationJobMemory) || c.JobLimitFlags&requiredFlags != requiredFlags {
+-		return "QUALIFICATION_BOOTSTRAP_BLOCKED"
+-	}
+-	if !c.JobZero || !c.CleanupComplete {
+-		return "QUALIFICATION_CLEANUP_UNKNOWN"
+-	}
+-	if c.Stdout.err != nil || c.Stderr.err != nil {
+-		return "QUALIFICATION_INCOMPLETE"
+-	}
+-	if c.TimedOut || c.LimitExceeded || !c.StreamsDrained {
+-		return "QUALIFICATION_INCOMPLETE"
+-	}
+-	if c.Err != nil {
+-		return "QUALIFICATION_BOOTSTRAP_BLOCKED"
+-	}
+-	if c.ExitCode != 0 {
+-		return "QUALIFICATION_INCOMPLETE"
+-	}
+-	return ""
+-}
+-
+-func qualificationJobName(run, epoch, nonce string) string {
+-	return "researchos-codex-qualification-" + strings.TrimPrefix(Hash([]byte(run+"/"+epoch+"/"+nonce)), "sha256:")
+-}
+diff --git a/adapters/runtime/codex_qualification_windows_test.go b/adapters/runtime/codex_qualification_windows_test.go
+deleted file mode 100644
+--- a/adapters/runtime/codex_qualification_windows_test.go
++++ /dev/null
+@@ -1,241 +0,0 @@
+-//go:build windows
+-
+-package runtime
+-
+-import (
+-	"context"
+-	"errors"
+-	"os"
+-	"path/filepath"
+-	"reflect"
+-	"strings"
+-	"testing"
+-	"time"
+-
+-	"researchos.local/research-os/internal/qualificationprobe"
+-)
+-
+-func qualifiedFixture(t *testing.T) (*nativeQualifier, CodexTurnEvidence) {
+-	t.Helper()
+-	home := os.Getenv("USERPROFILE")
+-	root := t.TempDir()
+-	source := filepath.Join(root, "S")
+-	if err := os.Mkdir(source, 0700); err != nil {
+-		t.Fatal(err)
+-	}
+-	nativePath, helperPath := filepath.Join(root, "codex.exe"), filepath.Join(source, "qualification-helper.exe")
+-	if err := os.WriteFile(nativePath, []byte("synthetic native identity"), 0600); err != nil {
+-		t.Fatal(err)
+-	}
+-	if err := os.WriteFile(helperPath, []byte("synthetic helper identity"), 0600); err != nil {
+-		t.Fatal(err)
+-	}
+-	hash := Hash([]byte("synthetic native identity"))
+-	helperHash := Hash([]byte("synthetic helper identity"))
+-	rpc := &codexRPC{options: CodexRPCOptions{Executable: nativePath, Descriptor: CodexDescriptor{Present: true, Version: "0.166.0", ExecutableHash: hash, AuthState: "LOGGED_IN", ConfigurationControlled: true, NativeTransport: CodexRPCTransport}, NormalHome: home}}
+-	q := &nativeQualifier{state: "OBSERVED_PASS", rpc: rpc, boot: "private-boot", options: CodexNativeQualificationOptions{ApprovedRoot: root, SyntheticSource: source, ShippedHelper: helperPath, ShippedHelperSHA256: helperHash, HostBuildSHA256: "sha256:" + strings.Repeat("c", 64)}}
+-	dir := filepath.Join(root, "run")
+-	q.observation = nativeQualificationObservation{TaskID: "task", RunID: "run", Epoch: "1", SourceBindingHash: "sha256:source", Source: source, Directory: dir, NativeHash: hash, HelperHash: q.options.ShippedHelperSHA256, HostBuildHash: q.options.HostBuildSHA256, TemplateHash: CodexRPCPolicyIdentity(hash).RequestedConfigSHA256, EnvironmentHash: Hash(mustJSON(Environment(""))), NormalHome: home, HostBoot: q.boot, Until: time.Now().Add(time.Minute)}
+-	e := CodexTurnEvidence{PolicyIdentity: CodexRPCPolicyIdentity(hash), RenderedConfigSHA256: codexRPCConfigHash("researchos-readonly-0123456789abcdef0123456789abcdef", filepath.Join(dir, "cwd"), source), SourceBindingHash: "sha256:source", ProfileNonce: "researchos-readonly-0123456789abcdef0123456789abcdef", ThreadID: "thread", TaskID: "task", RunID: "run", Epoch: "1", Process: CodexIdentity{PID: 42, Created: 123, Job: "model-owned-job"}}
+-	return q, e
+-}
+-func TestCodexNativeQualificationEnsureIsSingleUseAndBound(t *testing.T) {
+-	q, e := qualifiedFixture(t)
+-	if err := q.Ensure(context.Background(), e); err != nil {
+-		t.Fatal(err)
+-	}
+-	if err := q.Ensure(context.Background(), e); err == nil {
+-		t.Fatal("reused qualification observation")
+-	}
+-	q, e = qualifiedFixture(t)
+-	wrong := e
+-	wrong.SourceBindingHash = "stale"
+-	if err := q.Ensure(context.Background(), wrong); err == nil {
+-		t.Fatal("stale first use qualified")
+-	}
+-	if err := q.Ensure(context.Background(), e); err == nil {
+-		t.Fatal("failed first use was retried")
+-	}
+-	for name, mutate := range map[string]func(*nativeQualifier, *CodexTurnEvidence){
+-		"task": func(_ *nativeQualifier, e *CodexTurnEvidence) { e.TaskID = "other" }, "run": func(_ *nativeQualifier, e *CodexTurnEvidence) { e.RunID = "other" },
+-		"epoch": func(_ *nativeQualifier, e *CodexTurnEvidence) { e.Epoch = "2" }, "source": func(_ *nativeQualifier, e *CodexTurnEvidence) { e.SourceBindingHash = "other" },
+-		"template": func(_ *nativeQualifier, e *CodexTurnEvidence) { e.RenderedConfigSHA256 = "other" }, "binary": func(q *nativeQualifier, _ *CodexTurnEvidence) {
+-			q.rpc.options.Descriptor.ExecutableHash = "sha256:" + strings.Repeat("d", 64)
+-		},
+-		"helper": func(q *nativeQualifier, _ *CodexTurnEvidence) {
+-			q.options.ShippedHelperSHA256 = "sha256:" + strings.Repeat("d", 64)
+-		}, "build": func(q *nativeQualifier, _ *CodexTurnEvidence) {
+-			q.options.HostBuildSHA256 = "sha256:" + strings.Repeat("d", 64)
+-		},
+-		"boot": func(q *nativeQualifier, _ *CodexTurnEvidence) { q.boot = "other" }, "expired": func(q *nativeQualifier, _ *CodexTurnEvidence) { q.observation.Until = time.Now().Add(-time.Second) },
+-		"helper_bytes": func(q *nativeQualifier, _ *CodexTurnEvidence) {
+-			_ = os.WriteFile(q.options.ShippedHelper, []byte("changed helper"), 0600)
+-		},
+-		"source_root": func(q *nativeQualifier, _ *CodexTurnEvidence) {
+-			q.options.SyntheticSource = filepath.Dir(q.options.SyntheticSource)
+-		},
+-	} {
+-		t.Run(name, func(t *testing.T) {
+-			q, e := qualifiedFixture(t)
+-			mutate(q, &e)
+-			if err := q.Ensure(context.Background(), e); err == nil {
+-				t.Fatal("changed live identity qualified")
+-			}
+-		})
+-	}
+-}
+-func TestQualificationArgvProjectsExactB1Policy(t *testing.T) {
+-	nonce := "researchos-readonly-0123456789abcdef0123456789abcdef"
+-	source := `C:\synthetic\S`
+-	working := `C:\synthetic\QW`
+-	helper := `C:\synthetic\S\qualification-helper.exe`
+-	args, err := qualificationArguments(nonce, source, working, helper, "fixed-plan")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	base := codexRPCArguments(nonce, source)
+-	if !reflect.DeepEqual(args[:len(base)-3], base[:len(base)-3]) {
+-		t.Fatal("qualification policy differs from B1 ordered builder")
+-	}
+-	if !reflect.DeepEqual(args[len(args)-10:], []string{"sandbox", "--include-managed-config", "--permission-profile", nonce, "-C", working, "--", helper, "--plan-v1", "fixed-plan"}) {
+-		t.Fatal("qualification suffix widened", args)
+-	}
+-}
+-
+-func TestMalformedLaunchDoesNotConsumeQualification(t *testing.T) {
+-	q, _ := qualifiedFixture(t)
+-	q.state = "NOT_STARTED"
+-	d := &qualifiedRPC{rpc: q.rpc, q: q}
+-	if gate := d.rpc.readiness(); gate.State != "PREPARATION_READY" {
+-		t.Fatal("fixture is not preparation ready", gate)
+-	}
+-	valid := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", Workspace: q.options.SyntheticSource, Prompt: "synthetic request", Directory: filepath.Join(q.options.ApprovedRoot, "run"), SourceBindingHash: "sha256:source", Timeout: time.Minute}
+-	validCallbacks := CodexCallbacks{BeforeResume: func(CodexIdentity) error { return nil }, BeforeModelTurn: func(CodexTurnEvidence) error { return nil }, Event: func(CodexEvent) error { return nil }}
+-	cases := map[string]func(*CodexLaunch, *CodexCallbacks){
+-		"epoch_noncanonical": func(v *CodexLaunch, _ *CodexCallbacks) { v.Epoch = "01" },
+-		"epoch_zero":         func(v *CodexLaunch, _ *CodexCallbacks) { v.Epoch = "0" },
+-		"prompt_empty":       func(v *CodexLaunch, _ *CodexCallbacks) { v.Prompt = "  " },
+-		"prompt_oversize":    func(v *CodexLaunch, _ *CodexCallbacks) { v.Prompt = strings.Repeat("x", 65537) },
+-		"callback_resume":    func(_ *CodexLaunch, v *CodexCallbacks) { v.BeforeResume = nil },
+-		"callback_turn":      func(_ *CodexLaunch, v *CodexCallbacks) { v.BeforeModelTurn = nil },
+-		"callback_event":     func(_ *CodexLaunch, v *CodexCallbacks) { v.Event = nil },
+-	}
+-	for name, change := range cases {
+-		t.Run(name, func(t *testing.T) {
+-			in, cb := valid, validCallbacks
+-			change(&in, &cb)
+-			if h, err := d.Start(context.Background(), in, cb); err == nil || h != nil {
+-				t.Fatal("malformed request reached qualification", h, err)
+-			}
+-			if q.state != "NOT_STARTED" {
+-				t.Fatal("malformed request consumed one-shot qualification", q.state)
+-			}
+-		})
+-	}
+-}
+-
+-func TestQualificationEvaluatorKeepsViolationAndHostControls(t *testing.T) {
+-	if got := qualificationPreferredReason("QUALIFICATION_POLICY_VIOLATION", "QUALIFICATION_INCOMPLETE"); got != "QUALIFICATION_POLICY_VIOLATION" {
+-		t.Fatal("violation overwritten", got)
+-	}
+-	if got := qualificationPreferredReason("QUALIFICATION_INCOMPLETE", "QUALIFICATION_POLICY_VIOLATION"); got != "QUALIFICATION_POLICY_VIOLATION" {
+-		t.Fatal("violation lost to ordering", got)
+-	}
+-	for _, tc := range []struct {
+-		name  string
+-		event qualificationprobe.Event
+-		want  string
+-	}{
+-		{"denied_wrong_errno", qualificationprobe.Event{Errno: 2}, "QUALIFICATION_INCOMPLETE"},
+-		{"denied_opened", qualificationprobe.Event{Opened: true}, "QUALIFICATION_POLICY_VIOLATION"},
+-		{"loopback_opened", qualificationprobe.Event{Opened: true}, "QUALIFICATION_POLICY_VIOLATION"},
+-		{"source_wrong_digest", qualificationprobe.Event{Opened: true, Digest: "wrong", Bytes: 4}, "QUALIFICATION_CONTROL_INVALID"},
+-	} {
+-		name := "denied_read"
+-		switch tc.name {
+-		case "loopback_opened":
+-			name = "loopback_connect"
+-		case "source_wrong_digest":
+-			name = "source_read"
+-		}
+-		if got := evaluateQualificationCase(name, tc.event, "sha256:expected", 4); got != tc.want {
+-			t.Fatal(tc.name, got, tc.want)
+-		}
+-	}
+-	root := t.TempDir()
+-	create := filepath.Join(root, "create-denied.txt")
+-	if err := hostCreateControl(create); err != nil {
+-		t.Fatal("Host positive create control failed", err)
+-	}
+-	if _, err := os.Lstat(create); !errors.Is(err, os.ErrNotExist) {
+-		t.Fatal("Host control left target", err)
+-	}
+-	if err := os.WriteFile(create, []byte("already exists"), 0600); err != nil {
+-		t.Fatal(err)
+-	}
+-	if err := hostCreateControl(create); err == nil {
+-		t.Fatal("existing target accepted as fresh create")
+-	}
+-}
+-
+-func TestCodexNativeQualificationSourcePrivateAccessor(t *testing.T) {
+-	q, _ := qualifiedFixture(t)
+-	d := &qualifiedRPC{rpc: q.rpc, q: q}
+-	if source, ok := CodexNativeQualificationSource(d); !ok || source != q.options.SyntheticSource {
+-		t.Fatal("private synthetic source missing", source, ok)
+-	}
+-	if source, ok := CodexNativeQualificationSource(q.rpc); ok || source != "" {
+-		t.Fatal("ordinary driver asserted B3 source", source, ok)
+-	}
+-	var nilQualified *qualifiedRPC
+-	if source, ok := CodexNativeQualificationSource(nilQualified); ok || source != "" {
+-		t.Fatal("nil wrapper asserted B3 source", source, ok)
+-	}
+-}
+-
+-type unrelatedQualificationHandle struct{}
+-
+-func (unrelatedQualificationHandle) Cancel() {}
+-func (unrelatedQualificationHandle) Wait(context.Context) (CodexResult, error) {
+-	return CodexResult{}, nil
+-}
+-func TestPreparationFailureRequiresPrivateTerminalUndelegatedHandle(t *testing.T) {
+-	q, _ := qualifiedFixture(t)
+-	launch := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", SourceBindingHash: "sha256:source"}
+-	obs := q.observation
+-	obs.PreflightNoChild = true
+-	makeHandle := func() *qualifiedHandle {
+-		h := &qualifiedHandle{q: q, launch: launch, done: make(chan struct{}), err: errors.New("QUALIFICATION_CONTROL_INVALID")}
+-		h.preparationFailure = preparationFailure("QUALIFICATION_CONTROL_INVALID", obs)
+-		return h
+-	}
+-	if _, ok := CodexPreparationFailureForHandle(unrelatedQualificationHandle{}); ok {
+-		t.Fatal("foreign handle minted preparation proof")
+-	}
+-	h := makeHandle()
+-	if _, ok := CodexPreparationFailureForHandle(h); ok {
+-		t.Fatal("running handle minted terminal proof")
+-	}
+-	close(h.done)
+-	if facts, ok := CodexPreparationFailureForHandle(h); !ok || !facts.NoModelDelegation || !facts.NoQualificationChild || facts.QualificationPID != 0 {
+-		t.Fatal("known preflight no-child proof rejected", facts, ok)
+-	}
+-	h = makeHandle()
+-	h.delegateAttempted = true
+-	close(h.done)
+-	if _, ok := CodexPreparationFailureForHandle(h); ok {
+-		t.Fatal("attempted RPC child minted pre-model proof")
+-	}
+-	h = makeHandle()
+-	h.preparationFailure.Reason = "PASS"
+-	close(h.done)
+-	if _, ok := CodexPreparationFailureForHandle(h); ok {
+-		t.Fatal("caller PASS string minted proof")
+-	}
+-	h = makeHandle()
+-	h.preparationFailure.NoQualificationChild = false
+-	close(h.done)
+-	if _, ok := CodexPreparationFailureForHandle(h); ok {
+-		t.Fatal("zero PID without known no-child minted stop proof")
+-	}
+-}
+diff --git a/adapters/runtime/codex_qualification_capture_windows_test.go b/adapters/runtime/codex_qualification_capture_windows_test.go
+deleted file mode 100644
+--- a/adapters/runtime/codex_qualification_capture_windows_test.go
++++ /dev/null
+@@ -1,150 +0,0 @@
+-//go:build windows
+-
+-package runtime
+-
+-import (
+-	"bytes"
+-	"context"
+-	"encoding/json"
+-	"errors"
+-	"os"
+-	"path/filepath"
+-	"testing"
+-	"time"
+-)
+-
+-func TestQualificationCaptureBoundsAndExclusiveReceipt(t *testing.T) {
+-	for _, size := range []int{19, qualificationStreamCap + 1} {
+-		r, w, err := os.Pipe()
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		out := make(chan qualificationStream, 1)
+-		partial := filepath.Join(t.TempDir(), "stream.partial")
+-		go boundedQualificationStream(r, out, partial)
+-		payload := bytes.Repeat([]byte{'x'}, size)
+-		written := make(chan error, 1)
+-		go func() { _, e := w.Write(payload); written <- e; _ = w.Close() }()
+-		stream := <-out
+-		if err = <-written; err != nil && size <= qualificationStreamCap {
+-			t.Fatal(err)
+-		}
+-		rawPartial, err := os.ReadFile(partial)
+-		if err != nil || !bytes.Equal(rawPartial, payload[:min(size, qualificationPrefixCap)]) {
+-			t.Fatal("durable partial prefix missing", err, len(rawPartial))
+-		}
+-		if size < qualificationStreamCap && (!stream.drained || stream.overflow || stream.hash == "") {
+-			t.Fatal("complete stream lost", stream)
+-		}
+-		if size > qualificationStreamCap && (!stream.overflow || len(stream.prefix) != qualificationPrefixCap || stream.hash != "") {
+-			t.Fatal("overflow claimed full hash", stream.overflow, len(stream.prefix), stream.hash)
+-		}
+-	}
+-	path := filepath.Join(t.TempDir(), "capture.json")
+-	context := qualificationReceiptContext{TaskID: "task", RunID: "run", Epoch: "1", SourceBindingHash: "sha256:source", NativeHash: "sha256:native", HelperHash: "sha256:helper", HostBuildHash: "sha256:build", TemplateHash: "sha256:template", Nonce: "researchos-readonly-fixed", ExpectedCases: []string{"source_read"}, FindingCodes: []string{"QUALIFICATION_INCOMPLETE"}}
+-	firstCapture := qualificationCapture{PID: 42, JobZero: true, Exited: true, StreamsDrained: true, CleanupComplete: true, JobLimitsVerified: true, JobProcessLimit: 16, JobMemoryLimit: 2048 << 20, Stdout: qualificationStream{prefix: []byte("out"), hash: "sha256:out"}, Stderr: qualificationStream{prefix: []byte("err"), hash: "sha256:err"}}
+-	if err := persistQualificationCapture(path, firstCapture, "QUALIFICATION_INCOMPLETE", context); err != nil {
+-		t.Fatal(err)
+-	}
+-	first, err := os.ReadFile(path)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	var fields map[string]json.RawMessage
+-	if err := json.Unmarshal(first, &fields); err != nil {
+-		t.Fatal(err)
+-	}
+-	for _, key := range []string{"stdout_prefix", "stderr_prefix", "stdout_hash", "stderr_hash", "job_process_limit", "job_memory_limit", "job_limits_verified", "context"} {
+-		if len(fields[key]) == 0 {
+-			t.Fatal("terminal receipt omitted", key)
+-		}
+-	}
+-	var bound qualificationReceiptContext
+-	if err := json.Unmarshal(fields["context"], &bound); err != nil || bound.TaskID != "task" || bound.SourceBindingHash != "sha256:source" || bound.NativeHash != "sha256:native" || bound.TemplateHash != "sha256:template" {
+-		t.Fatal("terminal receipt lost identity", bound, err)
+-	}
+-	if err = persistQualificationCapture(path, qualificationCapture{}, "PASS"); !errors.Is(err, os.ErrExist) {
+-		t.Fatal("exclusive receipt replaced", err)
+-	}
+-	second, _ := os.ReadFile(path)
+-	if !bytes.Equal(first, second) {
+-		t.Fatal("partial evidence overwritten")
+-	}
+-}
+-func TestQualificationStreamPersistenceErrorCannotQualify(t *testing.T) {
+-	c := qualificationCapture{PID: 42, JobZero: true, Exited: true, StreamsDrained: true, CleanupComplete: true, Stdout: qualificationStream{drained: true, err: errors.New("synthetic final sync failure")}, Stderr: qualificationStream{drained: true}}
+-	if reason := qualificationCaptureReason(c); reason == "" {
+-		t.Fatal("final stream persistence error qualified")
+-	}
+-}
+-
+-type failingQualificationPartial struct{ syncErr, closeErr error }
+-
+-func (f failingQualificationPartial) Sync() error  { return f.syncErr }
+-func (f failingQualificationPartial) Close() error { return f.closeErr }
+-func TestQualificationFinalSyncAndCloseErrorsRevokeHash(t *testing.T) {
+-	for name, partial := range map[string]failingQualificationPartial{
+-		"sync":  {syncErr: errors.New("synthetic final sync failure")},
+-		"close": {closeErr: errors.New("synthetic final close failure")},
+-	} {
+-		t.Run(name, func(t *testing.T) {
+-			stream := qualificationStream{raw: []byte("complete transcript"), drained: true}
+-			finishQualificationStream(&stream, partial, []byte{1, 2, 3})
+-			if stream.err == nil || stream.hash != "" || !bytes.Equal(stream.prefix, stream.raw) {
+-				t.Fatal("failed durable partial claimed complete hash", stream)
+-			}
+-		})
+-	}
+-}
+-func TestQualificationJobLimitsBeforeAnyChild(t *testing.T) {
+-	job, limits, err := qualificationJob("researchos-qualification-fake-" + time.Now().Format("150405.000000000"))
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if limits.Processes != qualificationProcessLimit || limits.Memory != uint64(qualificationJobMemory) || limits.Flags == 0 {
+-		t.Fatal("queried Job limits missing", limits)
+-	}
+-	defer closeJob(job)
+-	ids, err := jobPIDs(job)
+-	if err != nil || len(ids) != 0 {
+-		t.Fatal("empty limited job unverified", ids, err)
+-	}
+-}
+-
+-// The supervised Go fixture launches only its own test binary in the new Job.
+-// It never invokes Native, auth, sandbox setup, or a model.
+-func TestQualificationFakeChild(t *testing.T) {
+-	switch os.Getenv("RESEARCHOS_QUALIFICATION_FAKE_CHILD") {
+-	case "small":
+-		os.Stdout.Write([]byte("synthetic partial diagnostic\n"))
+-		return
+-	case "overflow":
+-		os.Stdout.Write(bytes.Repeat([]byte{'x'}, qualificationStreamCap+8192))
+-		return
+-	default:
+-		return
+-	}
+-}
+-func TestQualificationCollectorOwnedFakeChild(t *testing.T) {
+-	exe, err := os.Executable()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	for _, mode := range []string{"small", "overflow"} {
+-		t.Run(mode, func(t *testing.T) {
+-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+-			defer cancel()
+-			env := append(Environment(""), "RESEARCHOS_QUALIFICATION_FAKE_CHILD="+mode)
+-			capture := collectQualification(ctx, exe, []string{"-test.run=^TestQualificationFakeChild$"}, env, t.TempDir(), "researchos-qualification-fake-"+mode+"-"+time.Now().Format("150405.000000000"), filepath.Join(t.TempDir(), "receipt"))
+-			if capture.PID == 0 || !capture.JobZero || !capture.Exited {
+-				t.Fatal("owned fake child cleanup not proved", capture.PID, capture.JobZero, capture.Exited, capture.Err)
+-			}
+-			if mode == "small" && (!capture.StreamsDrained || capture.LimitExceeded || capture.Stdout.hash == "") {
+-				t.Fatal("small fake stream incomplete", capture)
+-			}
+-			if mode == "overflow" && (!capture.LimitExceeded || qualificationCaptureReason(capture) == "") {
+-				t.Fatal("overflow fake child qualified", capture)
+-			}
+-		})
+-	}
+-}
+diff --git a/internal/qualificationprobe/plan.go b/internal/qualificationprobe/plan.go
+deleted file mode 100644
+--- a/internal/qualificationprobe/plan.go
++++ /dev/null
+@@ -1,142 +0,0 @@
+-package qualificationprobe
+-
+-import (
+-	"bytes"
+-	"encoding/base64"
+-	"encoding/json"
+-	"errors"
+-	"path/filepath"
+-	"strings"
+-)
+-
+-const Schema = "researchos.native-qualification-plan.v1"
+-const EventSchema = "researchos.native-qualification-event.v1"
+-
+-var Cases = [...]string{"source_read", "denied_read", "source_write_open", "working_write_open", "source_create", "working_create", "loopback_connect"}
+-
+-const CompleteBitmap = (1 << len(Cases)) - 1
+-
+-type Plan struct {
+-	Schema  string   `json:"schema"`
+-	Source  string   `json:"source"`
+-	Working string   `json:"working"`
+-	Denied  string   `json:"denied"`
+-	Nonce   string   `json:"nonce"`
+-	Port    uint16   `json:"port"`
+-	Cases   []string `json:"cases"`
+-}
+-type Event struct {
+-	Schema string `json:"schema"`
+-	Phase  string `json:"phase"`
+-	Case   string `json:"case"`
+-	Errno  int    `json:"errno"`
+-	Opened bool   `json:"opened"`
+-	Digest string `json:"digest"`
+-	Bytes  int    `json:"bytes"`
+-	Bitmap uint32 `json:"bitmap"`
+-}
+-
+-func FixedCases() []string { return append([]string(nil), Cases[:]...) }
+-func Validate(p Plan) error {
+-	if p.Schema != Schema || p.Port == 0 || len(p.Cases) != len(Cases) || !strings.HasPrefix(p.Nonce, "researchos-readonly-") || len(p.Nonce) != len("researchos-readonly-")+32 {
+-		return errors.New("QUALIFICATION_PLAN_INVALID")
+-	}
+-	for i, c := range Cases {
+-		if p.Cases[i] != c {
+-			return errors.New("QUALIFICATION_PLAN_CASES_CHANGED")
+-		}
+-	}
+-	for _, c := range p.Nonce[len("researchos-readonly-"):] {
+-		if !strings.ContainsRune("0123456789abcdef", c) {
+-			return errors.New("QUALIFICATION_PLAN_NONCE_INVALID")
+-		}
+-	}
+-	paths := []string{p.Source, p.Working, p.Denied}
+-	for _, path := range paths {
+-		if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n;") {
+-			return errors.New("QUALIFICATION_PLAN_PATH_INVALID")
+-		}
+-	}
+-	if filepath.Base(p.Source) != "S" || filepath.Base(p.Working) != "QW" || filepath.Base(p.Denied) != "D" || !strings.EqualFold(filepath.Dir(p.Source), filepath.Dir(p.Working)) || !strings.EqualFold(filepath.Dir(p.Source), filepath.Dir(p.Denied)) {
+-		return errors.New("QUALIFICATION_PLAN_ROOTS_OVERLAP")
+-	}
+-	if strings.EqualFold(paths[0], paths[1]) || strings.EqualFold(paths[0], paths[2]) || strings.EqualFold(paths[1], paths[2]) {
+-		return errors.New("QUALIFICATION_PLAN_ROOTS_OVERLAP")
+-	}
+-	for _, other := range paths[1:] {
+-		rel, err := filepath.Rel(paths[0], other)
+-		if err != nil || rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+-			return errors.New("QUALIFICATION_PLAN_ROOTS_OVERLAP")
+-		}
+-	}
+-	return nil
+-}
+-func Encode(p Plan) (string, error) {
+-	if err := Validate(p); err != nil {
+-		return "", err
+-	}
+-	raw, err := json.Marshal(p)
+-	if err != nil {
+-		return "", err
+-	}
+-	if len(raw) > 4096 {
+-		return "", errors.New("QUALIFICATION_PLAN_TOO_LARGE")
+-	}
+-	return base64.RawURLEncoding.EncodeToString(raw), nil
+-}
+-func Decode(encoded string) (Plan, error) {
+-	var p Plan
+-	if len(encoded) == 0 || len(encoded) > 5500 {
+-		return p, errors.New("QUALIFICATION_PLAN_TOO_LARGE")
+-	}
+-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+-	if err != nil || len(raw) > 4096 {
+-		return p, errors.New("QUALIFICATION_PLAN_INVALID")
+-	}
+-	if json.Unmarshal(raw, &p) != nil {
+-		return p, errors.New("QUALIFICATION_PLAN_INVALID")
+-	}
+-	canonical, _ := json.Marshal(p)
+-	if !bytes.Equal(raw, canonical) || Validate(p) != nil {
+-		return Plan{}, errors.New("QUALIFICATION_PLAN_NONCANONICAL")
+-	}
+-	return p, nil
+-}
+-func ParseTranscript(raw []byte) (map[string]Event, error) {
+-	if len(raw) == 0 || len(raw) > 1<<20 || raw[len(raw)-1] != '\n' {
+-		return nil, errors.New("QUALIFICATION_TRANSCRIPT_INCOMPLETE")
+-	}
+-	lines := bytes.Split(raw[:len(raw)-1], []byte{'\n'})
+-	if len(lines) != 2*len(Cases)+1 {
+-		return nil, errors.New("QUALIFICATION_TRANSCRIPT_CASE_COUNT")
+-	}
+-	results := make(map[string]Event, len(Cases))
+-	for i, name := range Cases {
+-		for j, phase := range []string{"START", "RESULT"} {
+-			var e Event
+-			line := lines[2*i+j]
+-			if len(line) > 4096 || json.Unmarshal(line, &e) != nil {
+-				return nil, errors.New("QUALIFICATION_TRANSCRIPT_INVALID")
+-			}
+-			canonical, _ := json.Marshal(e)
+-			if !bytes.Equal(line, canonical) || e.Schema != EventSchema || e.Phase != phase || e.Case != name || e.Bitmap != 0 {
+-				return nil, errors.New("QUALIFICATION_TRANSCRIPT_INVALID")
+-			}
+-			if j == 0 && (e.Errno != 0 || e.Opened || e.Digest != "" || e.Bytes != 0) {
+-				return nil, errors.New("QUALIFICATION_TRANSCRIPT_INVALID")
+-			}
+-			if j == 1 {
+-				results[name] = e
+-			}
+-		}
+-	}
+-	var final Event
+-	if json.Unmarshal(lines[len(lines)-1], &final) != nil {
+-		return nil, errors.New("QUALIFICATION_TRANSCRIPT_INCOMPLETE")
+-	}
+-	canonical, _ := json.Marshal(final)
+-	if !bytes.Equal(lines[len(lines)-1], canonical) || final.Schema != EventSchema || final.Phase != "COMPLETE" || final.Case != "" || final.Bitmap != CompleteBitmap || final.Errno != 0 || final.Opened || final.Digest != "" || final.Bytes != 0 {
+-		return nil, errors.New("QUALIFICATION_TRANSCRIPT_INCOMPLETE")
+-	}
+-	return results, nil
+-}
+diff --git a/internal/qualificationprobe/plan_test.go b/internal/qualificationprobe/plan_test.go
+deleted file mode 100644
+--- a/internal/qualificationprobe/plan_test.go
++++ /dev/null
+@@ -1,58 +0,0 @@
+-package qualificationprobe
+-
+-import (
+-	"bytes"
+-	"encoding/base64"
+-	"encoding/json"
+-	"path/filepath"
+-	"testing"
+-)
+-
+-func fixturePlan(t *testing.T) Plan {
+-	t.Helper()
+-	root := t.TempDir()
+-	return Plan{Schema: Schema, Source: filepath.Join(root, "S"), Working: filepath.Join(root, "QW"), Denied: filepath.Join(root, "D"), Nonce: "researchos-readonly-0123456789abcdef0123456789abcdef", Port: 12345, Cases: FixedCases()}
+-}
+-func TestFixedPlanRejectsCallerAlternates(t *testing.T) {
+-	p := fixturePlan(t)
+-	encoded, err := Encode(p)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if got, err := Decode(encoded); err != nil || got.Source != p.Source {
+-		t.Fatal("canonical fixed plan rejected", err)
+-	}
+-	for _, change := range []func(*Plan){func(v *Plan) { v.Source = filepath.Join(t.TempDir(), "user-project") }, func(v *Plan) { v.Working = v.Source }, func(v *Plan) { v.Cases[0] = "generic_command" }, func(v *Plan) { v.Nonce = "fixed" }, func(v *Plan) { v.Port = 0 }} {
+-		q := p
+-		q.Cases = FixedCases()
+-		change(&q)
+-		if _, err := Encode(q); err == nil {
+-			t.Fatal("alternate plan accepted", q)
+-		}
+-	}
+-	raw, _ := json.Marshal(p)
+-	duplicate := bytes.Replace(raw, []byte(`"port":12345`), []byte(`"port":12345,"port":12345`), 1)
+-	if _, err := Decode(base64.RawURLEncoding.EncodeToString(duplicate)); err == nil {
+-		t.Fatal("duplicate plan key accepted")
+-	}
+-}
+-func TestTranscriptRequiresOrderedCompleteBitmap(t *testing.T) {
+-	rows := make([][]byte, 0, 2*len(Cases)+1)
+-	for _, name := range Cases {
+-		for _, phase := range []string{"START", "RESULT"} {
+-			raw, _ := json.Marshal(Event{Schema: EventSchema, Phase: phase, Case: name})
+-			rows = append(rows, raw)
+-		}
+-	}
+-	complete, _ := json.Marshal(Event{Schema: EventSchema, Phase: "COMPLETE", Bitmap: CompleteBitmap})
+-	rows = append(rows, complete)
+-	raw := append(bytes.Join(rows, []byte{'\n'}), '\n')
+-	if got, err := ParseTranscript(raw); err != nil || len(got) != len(Cases) {
+-		t.Fatal("complete canonical transcript rejected", err)
+-	}
+-	for _, bad := range [][]byte{raw[:len(raw)-1], append([]byte(nil), raw[:len(raw)-len(complete)-1]...), bytes.Replace(raw, []byte(`"bitmap":127`), []byte(`"bitmap":126`), 1), bytes.Replace(raw, []byte(`"phase":"START"`), []byte(`"phase":"RESULT"`), 1), append(raw, []byte("junk\n")...)} {
+-		if _, err := ParseTranscript(bad); err == nil {
+-			t.Fatal("incomplete/duplicate transcript accepted")
+-		}
+-	}
+-}
+diff --git a/cmd/researchos-qualification-helper/main_windows.go b/cmd/researchos-qualification-helper/main_windows.go
+deleted file mode 100644
+--- a/cmd/researchos-qualification-helper/main_windows.go
++++ /dev/null
+@@ -1,148 +0,0 @@
+-//go:build windows
+-
+-package main
+-
+-import (
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"encoding/json"
+-	"errors"
+-	"io"
+-	"net"
+-	"os"
+-	"path/filepath"
+-	"strconv"
+-	"syscall"
+-	"time"
+-
+-	"golang.org/x/sys/windows"
+-	"researchos.local/research-os/internal/qualificationprobe"
+-)
+-
+-func errorNumber(err error) int {
+-	var n syscall.Errno
+-	if errors.As(err, &n) {
+-		return int(n)
+-	}
+-	return -1
+-}
+-func emit(e qualificationprobe.Event) error {
+-	raw, err := json.Marshal(e)
+-	if err != nil {
+-		return err
+-	}
+-	raw = append(raw, '\n')
+-	n, err := os.Stdout.Write(raw)
+-	if err != nil {
+-		return err
+-	}
+-	if n != len(raw) {
+-		return io.ErrShortWrite
+-	}
+-	return nil
+-}
+-func fixedPath(root, name string) string { return filepath.Join(root, name) }
+-func readSource(path string) qualificationprobe.Event {
+-	e := qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "RESULT", Case: "source_read"}
+-	f, err := os.Open(path)
+-	if err != nil {
+-		e.Errno = errorNumber(err)
+-		return e
+-	}
+-	defer f.Close()
+-	e.Opened = true
+-	raw, err := io.ReadAll(io.LimitReader(f, 64<<10+1))
+-	if err != nil || len(raw) > 64<<10 {
+-		e.Errno = -1
+-		return e
+-	}
+-	sum := sha256.Sum256(raw)
+-	e.Digest = "sha256:" + hex.EncodeToString(sum[:])
+-	e.Bytes = len(raw)
+-	return e
+-}
+-func deniedRead(path string) qualificationprobe.Event {
+-	e := qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "RESULT", Case: "denied_read"}
+-	f, err := os.Open(path)
+-	if err != nil {
+-		e.Errno = errorNumber(err)
+-		return e
+-	}
+-	e.Opened = true
+-	f.Close()
+-	return e
+-}
+-func openWin(path string, create bool, name string) qualificationprobe.Event {
+-	e := qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "RESULT", Case: name}
+-	p, err := windows.UTF16PtrFromString(path)
+-	if err != nil {
+-		e.Errno = -1
+-		return e
+-	}
+-	mode := uint32(windows.OPEN_EXISTING)
+-	if create {
+-		mode = windows.CREATE_NEW
+-	}
+-	h, err := windows.CreateFile(p, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, mode, windows.FILE_ATTRIBUTE_NORMAL, 0)
+-	if err != nil {
+-		e.Errno = errorNumber(err)
+-		return e
+-	}
+-	e.Opened = true
+-	windows.CloseHandle(h)
+-	return e
+-}
+-func connectLoopback(port uint16) qualificationprobe.Event {
+-	e := qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "RESULT", Case: "loopback_connect"}
+-	c, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))), time.Second)
+-	if err != nil {
+-		e.Errno = errorNumber(err)
+-		return e
+-	}
+-	e.Opened = true
+-	c.Close()
+-	return e
+-}
+-func run(p qualificationprobe.Plan) error {
+-	paths := map[string]string{
+-		"source_read": fixedPath(p.Source, "allow.txt"), "denied_read": fixedPath(p.Denied, "denied.txt"),
+-		"source_write_open": fixedPath(p.Source, "write-existing.txt"), "working_write_open": fixedPath(p.Working, "write-existing.txt"),
+-		"source_create": fixedPath(p.Source, "create-denied.txt"), "working_create": fixedPath(p.Working, "create-denied.txt"),
+-	}
+-	for _, name := range qualificationprobe.Cases {
+-		if err := emit(qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "START", Case: name}); err != nil {
+-			return err
+-		}
+-		var result qualificationprobe.Event
+-		switch name {
+-		case "source_read":
+-			result = readSource(paths[name])
+-		case "denied_read":
+-			result = deniedRead(paths[name])
+-		case "source_write_open", "working_write_open":
+-			result = openWin(paths[name], false, name)
+-		case "source_create", "working_create":
+-			result = openWin(paths[name], true, name)
+-		case "loopback_connect":
+-			result = connectLoopback(p.Port)
+-		}
+-		if err := emit(result); err != nil {
+-			return err
+-		}
+-	}
+-	return emit(qualificationprobe.Event{Schema: qualificationprobe.EventSchema, Phase: "COMPLETE", Bitmap: qualificationprobe.CompleteBitmap})
+-}
+-func main() {
+-	if len(os.Args) != 3 || os.Args[1] != "--plan-v1" {
+-		os.Exit(64)
+-	}
+-	p, err := qualificationprobe.Decode(os.Args[2])
+-	if err != nil {
+-		os.Exit(64)
+-	}
+-	watchdog := time.AfterFunc(10*time.Second, func() { os.Exit(75) })
+-	defer watchdog.Stop()
+-	if run(p) != nil {
+-		os.Exit(74)
+-	}
+-}
+diff --git a/cmd/researchos-qualification-helper/main_windows_test.go b/cmd/researchos-qualification-helper/main_windows_test.go
+deleted file mode 100644
+--- a/cmd/researchos-qualification-helper/main_windows_test.go
++++ /dev/null
+@@ -1,47 +0,0 @@
+-//go:build windows
+-
+-package main
+-
+-import (
+-	"os"
+-	"path/filepath"
+-	"testing"
+-)
+-
+-// These user-mode fake cases check fixed operation shape, not Native policy.
+-func TestHelperFixedOperationsAreNarrow(t *testing.T) {
+-	root := t.TempDir()
+-	source := filepath.Join(root, "S")
+-	working := filepath.Join(root, "QW")
+-	denied := filepath.Join(root, "D")
+-	for _, dir := range []string{source, working, denied} {
+-		if err := os.Mkdir(dir, 0700); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	if err := os.WriteFile(filepath.Join(source, "allow.txt"), []byte("synthetic-allow"), 0600); err != nil {
+-		t.Fatal(err)
+-	}
+-	if err := os.WriteFile(filepath.Join(denied, "denied.txt"), []byte("synthetic-denied"), 0600); err != nil {
+-		t.Fatal(err)
+-	}
+-	read := readSource(filepath.Join(source, "allow.txt"))
+-	if !read.Opened || read.Errno != 0 || read.Bytes != len("synthetic-allow") || len(read.Digest) != 71 {
+-		t.Fatal("source read shape", read)
+-	}
+-	read = deniedRead(filepath.Join(denied, "denied.txt"))
+-	if !read.Opened || read.Errno != 0 || read.Digest != "" {
+-		t.Fatal("denied read must never emit contents", read)
+-	}
+-	missing := openWin(filepath.Join(working, "missing.txt"), false, "working_write_open")
+-	if missing.Opened || missing.Errno == 0 {
+-		t.Fatal("missing file misreported as write access", missing)
+-	}
+-	created := openWin(filepath.Join(working, "create-denied.txt"), true, "working_create")
+-	if !created.Opened || created.Errno != 0 {
+-		t.Fatal("create operation shape", created)
+-	}
+-	if _, err := os.Stat(filepath.Join(working, "create-denied.txt")); err != nil {
+-		t.Fatal("successful create evidence erased", err)
+-	}
+-}

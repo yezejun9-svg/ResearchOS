@@ -1,0 +1,92 @@
+--- sealed/publish.proposed.py
++++ new/publish.v2.proposed.py
+@@ -19,6 +19,7 @@
+ PUBLISH_PARENT = ROOT/'execution/v2.4/receipts/W13/W13-03/fresh58_public_source_authority_codex'
+ CANONICAL = ['execution/v2.4/'+x+'.json' for x in ['checkpoint','path_ownership','step_state','commands']]
+ READS = {}
++LIVE_OBSERVATIONS = []
+ 
+ 
+ def need(value, message):
+@@ -124,9 +125,36 @@
+     return sorted(names), oldnames, go
+ 
+ 
+-def stable():
++def live_guard(copies, expected_tuple):
++    # Mutable canonical files are observations, never immutable READS entries.
++    observation = {'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
++                   'point_in_time_only':True,'lifecycle_proof':False,'files':[],
++                   'tuple':None,'head':None,'matched':False}
++    LIVE_OBSERVATIONS.append(observation)
++    live_raw = []
++    for i, canonical in enumerate(CANONICAL):
++        need(copies[i]['canonical_path'] == canonical, 'Live canonical copy order')
++        expected = verify(copies[i]['ref'])
++        p = safe(ROOT/canonical)
++        need(p.is_file(), 'Live canonical is not a regular file')
++        raw = p.read_bytes()
++        observation['files'].append({'canonical_path':canonical,'live_ref':pin_bytes(p,raw),
++                                     'copy_ref':copies[i]['ref'],'byte_equal':raw == expected})
++        live_raw.append(raw)
++    need(all(x['byte_equal'] for x in observation['files']), 'Current live canonical bytes differ from reviewed copies')
++    cp, ow = [parse(x) for x in live_raw[:2]]
++    actual = [cp['revision'],ow['revision'],len(cp['failure_counters'])]
++    observation['tuple'], observation['head'] = actual, cp['head']
++    need(all(type(x) is int for x in actual) and actual == expected_tuple and cp['head'] == SOURCE,
++         'Current live canonical tuple/head differs from explicit reviewed authority')
++    observation['matched'] = True
++    observation['completed_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++
++def stable(copies, expected_tuple):
+     for p, raw in list(READS.items()):
+         need(read(p) == raw, 'Frozen input drift')
++    live_guard(copies, expected_tuple)
+ 
+ 
+ def encode(value):
+@@ -274,29 +302,31 @@
+     proposed('current43-authority.json',authority)
+     proposed('source-provenance.json',{'files':provenance,'selection_added_paths':sorted(set(names)-oldnames),
+              'selected_count':len(rows),'actual_compiler_graph':None,'loose_or_packed_git_objects_read':False})
+-    stable()
++    stable(copies, q['expected_current_tuple'])
+     need(not os.path.lexists(out), 'Output appeared before allocation')
+     out.mkdir()
+     try:
+         for name, raw in pending.items():
+             with Path(name).open('xb') as f:
+                 f.write(raw)
+-        stable()
++        stable(copies, q['expected_current_tuple'])
+         before = [pin_bytes(Path(p),raw) for p,raw in sorted(READS.items())]
+         with (out/'inputs.json').open('xb') as f:
+             f.write(encode({'files':before,'drift':[],'only_public_source_IO':True}))
+-        stable()
++        stable(copies, q['expected_current_tuple'])
+         entries = [pin_bytes(p,p.read_bytes()) for p in sorted(out.iterdir()) if p.is_file()]
+         with (out/'manifest.json').open('xb') as f:
+             f.write(encode({'entries':entries,'count':len(entries),'self_excluded':True}))
+-        stable()
++        stable(copies, q['expected_current_tuple'])
+         print(json.dumps({'status':'SOURCE_METADATA_PUBLISHED_NOT_QUALIFIED','output':str(out),'files':len(rows),
+-                          'source_acceptance':False,'formal_increment':0,'execution_authorized':False}))
++                          'source_acceptance':False,'formal_increment':0,'execution_authorized':False,
++                          'live_canonical_observations':LIVE_OBSERVATIONS}))
+     except BaseException as error:
+         try:
+             with (out/'failure.json').open('xb') as f:
+                 f.write(encode({'error':str(error),'traceback':traceback.format_exc(),'actual_native_exit':None,
+-                                'source_acceptance':False,'automatic_retry':False,'counter_reset':False}))
++                                'source_acceptance':False,'automatic_retry':False,'counter_reset':False,
++                                'live_canonical_observations':LIVE_OBSERVATIONS}))
+         except BaseException as secondary:
+             print('Secondary evidence write error: '+str(secondary),file=sys.stderr)
+         raise
+@@ -307,4 +337,5 @@
+         main()
+     except BaseException:
+         traceback.print_exc()
++        print(json.dumps({'live_canonical_observations':LIVE_OBSERVATIONS,'actual_native_exit':None}),file=sys.stderr)
+         sys.exit(1)

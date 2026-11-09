@@ -1,0 +1,11 @@
+# Optional managed Legacy 类型修订五
+
+仅C helper窄修，SOURCE_NOT_GUI，待独立复核。旧freeze04/actual05/type failure不覆盖，runner、P2同snapshot owner-first guard、nativeHWND/noOK/预算0/UTC/env/cwd/Job均不变。
+
+正常pwsh7.6.5被动加载既有UIAutomationClient/UIAutomationTypes，实际类型元数据确认AutomationElement、ValuePattern、SelectionPattern存在于managed UIAutomationClient v10，而LegacyIAccessiblePattern不存在。本包没有安装DLL/新COM/动态C#，没有FromHandle或任何真实UIA元素调用。
+
+Read-PublicPatterns现在按字符串feature-detect可选Legacy managed类型；缺失只记supported=false/status=UNSUPPORTED_TYPE，不构造会提前求值缺失class的数组。optional类型成员不可读也独立记状态，Value循环及原Selection继续，不把它当作整个provider失效。无Legacy COM或其它框架fallback，不猜新selector。
+
+4项针对性实际源码纯case通过：fake element的Value1次，随后原Selection分支1次；foreign owner时Name及所有pattern查询0；noOK仍无分支。首次夹具selection片段截取错误raw保留并修正，生产guard没有放宽。完整helper AST syntax通过，旧suite不重跑。
+
+所有候选仍非授权；若后续真实所有可用模式无可靠路径，按Root计划转Native BIF_EDITBOX产品slice，不继续UIA猜测。本次没有GUI/模型/任务资格或新费用授权。

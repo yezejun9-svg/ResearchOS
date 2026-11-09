@@ -1,0 +1,201 @@
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -7,6 +7,7 @@
+ import { workspaceProjectPath } from './startup.js'
+ import { composerSubmitKey, appendPrompt } from './activity.js'
+ import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
++import { HarnessRunProgress, HarnessPermissionNotice } from './components/harness-run-progress.jsx'
+ 
+ const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
+ const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
+@@ -480,10 +481,11 @@
+     <WorkbenchLayout hasSession={!!task} sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取真实任务…' : '尚无任务。选择授权工作区后输入目标。'}</p>}<label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <p>请先从项目入口选择并授权工作区；不需要 provider 模型配置。</p>}</Panel>}
+       conversation={<div className="session-center"><Panel className="conversation-canvas" title="Codex · 只读任务" aside={<span className="tag">{task ? harnessStatusLabel(task.status) : '等待输入'}</span>}>
+         <div className="button-row session-run-controls"><button disabled={disabled || !!state.pending || !task || task.terminal || !hasHarnessCapability(capabilities, 'cancel')} onClick={() => controller.current.cancel()}>取消当前任务</button><button disabled title="当前 Harness 不支持暂停">暂停</button><button disabled title="当前 Harness 不支持恢复执行">恢复执行</button></div>
++        <HarnessRunProgress task={task} events={state.events}/>
+         <div className="conversation-transcript" aria-label="Codex 任务记录">{task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>{assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}{task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}{task.failure && <p role="status">{task.failure.code}：{task.failure.message}</p>}<p className="small-muted">Task {task.task_ref.task_id} · 修订 {task.task_revision}{task.run ? ` · Run ${task.run.run_id} · epoch ${task.run.epoch}` : ' · 尚无 Run'}。执行状态不代表业务验收。</p></> : <ConversationWelcome setDraft={editDraft} composer={composer}/>}</div>
+         <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>模型由 Codex 配置决定</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div>{notice && <p role="status">{notice}</p>}</form>
+       </Panel></div>}
+-      context={<><Panel title="Codex 状态与能力">{capabilities ? <><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>执行验证：{capabilities.verification.execution} · 只读范围验证：{capabilities.verification.workspace_read_scope} · 取消验证：{capabilities.verification.cancellation}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '已由 Host 标记验证' : '未验证'}。登录与执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '已实现' : '不支持'}</span></div>)}</div>{!capabilities.can_submit && <p role="status">暂不能提交：{capabilities.reason_codes.join('、')}</p>}</> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p><button disabled>读取文件差异</button><button disabled>写入文件</button><button disabled>批准工具</button></details></>}/>
++      context={<><Panel title="Codex 状态与能力">{capabilities ? <><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>执行验证：{capabilities.verification.execution} · 只读范围验证：{capabilities.verification.workspace_read_scope} · 取消验证：{capabilities.verification.cancellation}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '已由 Host 标记验证' : '未验证'}。登录与执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '已实现' : '不支持'}</span></div>)}</div><HarnessPermissionNotice capabilities={capabilities}/></> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p><button disabled>读取文件差异</button><button disabled>写入文件</button><button disabled>批准工具</button></details></>}/>
+   </>
+ }
+ 
+--- a/apps/web/src/workbench.css
++++ b/apps/web/src/workbench.css
+@@ -18,3 +18,19 @@
+ 
+ body:has(.workbench-route){min-width:0}
+ @media(max-width:390px){.workbench-topbar{padding:0 6px;gap:3px}.workbench-topbar .connection-dot{display:none}.workbench-topbar .theme-button{padding:4px 7px;flex-shrink:0}.workbench-topbar .top-spacer{min-width:0}.workbench-topbar .icon-button,.workbench-topbar .brand{flex-shrink:0}}
++
++/* Read-only Host Task/Run projection inside the Native Codex conversation. */
++.harness-run-progress{margin:12px 0 4px;padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
++.harness-progress-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
++.harness-progress-heading strong{font-size:13px}.harness-progress-heading small,.harness-progress-empty{color:var(--muted);font-size:12px;line-height:1.6}
++.harness-progress-empty{margin:0}.harness-progress-stages{list-style:none;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0;padding:0}
++.harness-progress-stages li{display:flex;gap:8px;min-width:0}.harness-progress-dot{flex:none;width:8px;height:8px;margin-top:6px;border:1px solid var(--muted);border-radius:50%;background:var(--surface)}
++.harness-progress-stages li[data-state="done"] .harness-progress-dot,.harness-progress-stages li[data-state="observed"] .harness-progress-dot{border-color:var(--success);background:var(--success)}
++.harness-progress-stages li[data-state="active"] .harness-progress-dot{border-color:var(--accent);background:var(--accent)}
++.harness-progress-stages li[data-state="unresolved"] .harness-progress-dot{border-color:var(--warning);background:var(--warning)}
++.harness-progress-stages li>div{min-width:0}.harness-progress-stages strong{display:block;font-size:12px;font-weight:600}.harness-progress-stages li span:last-child{display:block;color:var(--muted);font-size:11px;line-height:1.55;overflow-wrap:anywhere}
++.harness-permission-notice{margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--subtle);font-size:12px;line-height:1.6}
++.harness-permission-notice strong{display:block}.harness-permission-notice ul{margin:7px 0;padding-left:18px}.harness-permission-notice p{margin:7px 0;color:var(--muted)}
++.harness-permission-notice details{margin-top:8px}.harness-permission-notice summary{cursor:pointer}.harness-permission-notice code{display:block;overflow-wrap:anywhere;margin-top:5px}
++@media(max-width:767px){.harness-progress-heading{display:block}.harness-progress-heading small{display:block;margin-top:3px}.harness-progress-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 10px}}
++@media(max-width:390px){.harness-run-progress{padding:12px}.harness-progress-stages{grid-template-columns:minmax(0,1fr);gap:10px}}
+--- a/apps/web/src/harness.js
++++ b/apps/web/src/harness.js
+@@ -17,6 +17,19 @@
+ export const harnessStatusLabel = status => STATES[status] || '状态待核对'
+ export const hasHarnessCapability = (value, name) => value?.harness_id === 'codex' && value?.capabilities?.[name] === true
+ export const canSubmitHarness = value => value?.can_submit === true && hasHarnessCapability(value, 'readonly_turn')
++const BLOCK_REASONS = {
++  NOT_INSTALLED: '本机尚未找到 Codex CLI。',
++  CONFIG_INHERITANCE_UNVERIFIED: '只读配置的隔离状态尚未确认。',
++  AUTH_METADATA_REQUIRED: '登录状态尚未确认。',
++  PERMISSION_PROFILE_UNVERIFIED: '只读权限配置尚未验证，暂不能提交。',
++  CODEX_POLICY_IDENTITY_MISMATCH: '当前 Codex 策略与要求的只读配置不一致。',
++}
++export function harnessSubmissionBlockers(value) {
++  if (!value || value.can_submit === true) return []
++  const codes = Array.isArray(value.reason_codes) ? [...new Set(value.reason_codes.filter(code => typeof code === 'string'))] : []
++  return codes.length ? codes.map(code => ({ code, message: BLOCK_REASONS[code] || '有一项提交条件尚未确认，请查看技术原因。' })) :
++    [{ code: 'READINESS_UNCONFIRMED', message: 'Host 尚未确认可以提交只读任务。' }]
++}
+ export function decimal(value, positive = false) {
+   return typeof value === 'string' && /^(0|[1-9][0-9]{0,18})$/.test(value) &&
+     (!positive || value !== '0') && (value.length < MAX.length || value.length === MAX.length && value <= MAX)
+--- a/apps/web/src/harness-progress.js
++++ b/apps/web/src/harness-progress.js
+@@ -0,0 +1,41 @@
++import { decimal, sameTask } from './harness.js'
++
++const terminalText = {
++  COMPLETED: 'Task 执行已结束；结果仍需独立核对',
++  FAILED: 'Task 执行失败；请查看失败回执',
++  CANCELLED: 'Task 已取消',
++  BLOCKED: 'Task 被阻止；请查看原因',
++  UNKNOWN: 'Task 结果未知；请核对原请求，勿重复提交',
++}
++
++const sameRun = (left, right) => !!left && !!right &&
++  left.run_id === right.run_id && left.epoch === right.epoch
++
++export function projectHarnessProgress(task, events = []) {
++  if (!task) return { empty: true, stages: [], observedToolCount: 0 }
++  const run = task.run
++  const seen = new Set()
++  const tools = (Array.isArray(events) ? events : []).filter(event => {
++    if (event?.kind !== 'TOOL_EVENT' || !sameTask(event.task_ref, task.task_ref) ||
++      !sameRun(event.run, run) || !event.event_id || !decimal(event.sequence, true) || seen.has(event.event_id)) return false
++    seen.add(event.event_id)
++    return true
++  })
++  const pendingCancel = task.status === 'CANCEL_REQUESTED'
++  const terminal = terminalText[task.status]
++  const runText = !run ? '尚未关联 Run' : pendingCancel ? '取消已请求，等待原 Run 结果' :
++    task.status === 'UNKNOWN' ? 'Run 结果未知，需核对' :
++    task.status === 'FAILED' ? 'Run 已失败' :
++    task.status === 'COMPLETED' ? 'Run 已结束' :
++    task.status === 'CANCELLED' ? 'Run 已取消' :
++    task.status === 'BLOCKED' ? 'Run 已阻止' :
++    task.status === 'QUEUED' ? 'Run 已关联，等待启动回执' : 'Run 已关联，执行状态见 Task 回执'
++  return { empty: false, observedToolCount: tools.length, stages: [
++    { key: 'submit', title: '提交', state: 'done', detail: 'Task 已由 Host 记录' },
++    { key: 'run', title: '运行', state: !run ? 'waiting' : terminal || pendingCancel ? 'unresolved' : 'active', detail: runText },
++    { key: 'tools', title: '工具', state: tools.length ? 'observed' : 'waiting',
++      detail: tools.length ? `当前事件窗口已观测 ${tools.length} 条工具事件` : '当前事件窗口未见工具事件；不代表此前从未使用' },
++    { key: 'result', title: '结果', state: terminal ? (task.status === 'COMPLETED' ? 'observed' : 'unresolved') : 'waiting',
++      detail: terminal || (pendingCancel ? '取消请求尚未形成终态' : '等待 Task 终态回执') },
++  ] }
++}
+--- a/apps/web/src/components/harness-run-progress.jsx
++++ b/apps/web/src/components/harness-run-progress.jsx
+@@ -0,0 +1,25 @@
++import React from 'react'
++import { projectHarnessProgress } from '../harness-progress.js'
++import { harnessSubmissionBlockers } from '../harness.js'
++
++export function HarnessRunProgress({ task, events }) {
++  const progress = projectHarnessProgress(task, events)
++  if (progress.empty) return <section className="harness-run-progress" aria-label="Codex 任务进度"><p className="harness-progress-empty">尚无选中的 Task。提交只读任务后，这里会显示实际回执。</p></section>
++  return <section className="harness-run-progress" aria-label="Codex 任务进度">
++    <div className="harness-progress-heading"><strong>任务进度</strong><small>仅展示 Host 已记录的状态和当前事件窗口</small></div>
++    <ol className="harness-progress-stages">{progress.stages.map(stage => <li key={stage.key} data-state={stage.state}>
++      <span className="harness-progress-dot" aria-hidden="true"/><div><strong>{stage.title}</strong><span>{stage.detail}</span></div>
++    </li>)}</ol>
++  </section>
++}
++
++export function HarnessPermissionNotice({ capabilities }) {
++  const blockers = harnessSubmissionBlockers(capabilities)
++  if (!blockers.length) return null
++  return <div className="harness-permission-notice" role="status">
++    <strong>暂不能提交只读任务</strong>
++    <ul>{blockers.map(item => <li key={item.code}>{item.message}</li>)}</ul>
++    <p>安装或登录状态不代表执行权限已验证。</p>
++    <details><summary>技术原因</summary><code>{blockers.map(item => item.code).join(' · ')}</code></details>
++  </div>
++}
+--- a/tests/ui/harness-progress.test.mjs
++++ b/tests/ui/harness-progress.test.mjs
+@@ -0,0 +1,59 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { projectHarnessProgress } from '../../apps/web/src/harness-progress.js'
++import { harnessSubmissionBlockers } from '../../apps/web/src/harness.js'
++
++const ref = { project_id: 'p', task_id: 't' }
++const run = { run_id: 'r2', epoch: '2' }
++const task = (status = 'QUEUED', currentRun = null) => ({ task_ref: ref, status, run: currentRun })
++const tool = (id, currentRun = run, extra = {}) => ({ event_id: id, task_ref: ref, run: currentRun,
++  sequence: String(Number(id.replace(/\D/g, '')) || 1), kind: 'TOOL_EVENT', payload: { tool: { name: 'command_execution', phase: 'COMPLETED' } }, ...extra })
++const stage = (view, key) => view.stages.find(row => row.key === key)
++
++test('no selected Task is an honest empty state; queued Task has no Run or result', () => {
++  assert.deepEqual(projectHarnessProgress(null), { empty: true, stages: [], observedToolCount: 0 })
++  const view = projectHarnessProgress(task())
++  assert.match(stage(view, 'run').detail, /尚未关联 Run/)
++  assert.equal(stage(view, 'result').state, 'waiting')
++  assert.match(stage(view, 'tools').detail, /不代表此前从未使用/)
++})
++
++test('failure before a Run, unknown outcome, and cancel request never look complete', () => {
++  const failed = projectHarnessProgress(task('FAILED'))
++  assert.match(stage(failed, 'run').detail, /尚未关联 Run/)
++  assert.equal(stage(failed, 'result').state, 'unresolved')
++  const unknown = projectHarnessProgress(task('UNKNOWN', run))
++  assert.match(stage(unknown, 'result').detail, /结果未知/)
++  assert.equal(stage(unknown, 'result').state, 'unresolved')
++  const cancel = projectHarnessProgress(task('CANCEL_REQUESTED', run))
++  assert.match(stage(cancel, 'run').detail, /等待原 Run 结果/)
++  assert.match(stage(cancel, 'result').detail, /尚未形成终态/)
++  assert.notEqual(stage(cancel, 'result').state, 'observed')
++})
++
++test('completed Task reports execution end without claiming independent verification', () => {
++  const result = stage(projectHarnessProgress(task('COMPLETED', run)), 'result')
++  assert.match(result.detail, /独立核对/)
++  assert.doesNotMatch(result.detail, /验收通过|验证通过/)
++})
++
++test('tool count is only the observed current Run window, deduplicated and scope-bound', () => {
++  const rows = [tool('e1'), tool('e1'), tool('e2', { run_id: 'r1', epoch: '1' }),
++    tool('e3', run, { task_ref: { project_id: 'p', task_id: 'foreign' } }),
++    tool('e4', run, { sequence: 'bad' }), { ...tool('e5'), kind: 'LOG' }]
++  const view = projectHarnessProgress(task('RUNNING', run), rows)
++  assert.equal(view.observedToolCount, 1)
++  assert.match(stage(view, 'tools').detail, /当前事件窗口已观测 1 条/)
++  const reset = projectHarnessProgress(task('RUNNING', run), [])
++  assert.equal(reset.observedToolCount, 0)
++  assert.match(stage(reset, 'tools').detail, /不代表此前从未使用/)
++})
++
++test('read-only permission blockers explain current reasons and retain raw codes', () => {
++  const blockers = harnessSubmissionBlockers({ can_submit: false, reason_codes: ['PERMISSION_PROFILE_UNVERIFIED', 'CODEX_POLICY_IDENTITY_MISMATCH', 'PERMISSION_PROFILE_UNVERIFIED'] })
++  assert.equal(blockers.length, 2)
++  assert.match(blockers[0].message, /只读权限/)
++  assert.match(blockers[1].message, /策略/)
++  assert.deepEqual(harnessSubmissionBlockers({ can_submit: true, reason_codes: [] }), [])
++  assert.match(harnessSubmissionBlockers({ can_submit: false, reason_codes: [] })[0].message, /尚未确认/)
++})

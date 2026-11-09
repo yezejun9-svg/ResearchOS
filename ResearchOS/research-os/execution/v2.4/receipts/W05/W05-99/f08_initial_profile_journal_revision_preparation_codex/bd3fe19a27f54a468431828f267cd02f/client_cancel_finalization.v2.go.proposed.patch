@@ -1,0 +1,236 @@
+--- b9/internal/domain/client_cancel_finalization.go
++++ proposed/internal/domain/client_cancel_finalization.go
+@@ -19,6 +19,7 @@
+ 	"errors"
+ 	"io"
+ 	"math/big"
++	"net/url"
+ 	"strings"
+ 	"sort"
+ 	"strconv"
+@@ -558,7 +559,12 @@
+ 	if !f08Equal(row[5],r["content_hash"]){return zero,f08Binding}
+ 	body,raw,err:=f08RawObject(row[4]);if err!=nil{return zero,err}
+ 	if err=v.entities.ValidateDefInput(kind,body);err!=nil{return zero,f08Schema}
+-	if body["id"]!=id || body["project_id"]!=project || !f08Equal(body["revision"],r["revision"]){return zero,f08Binding}
++	// Service.put stores schema-valid GLOBAL policies under Str(nil)=="".
++	// This exception follows full entity-schema validation above, and never
++	// applies to another entity, a foreign project or a non-GLOBAL policy.
++	projectMatches:=body["project_id"]==project
++	if project=="" && (kind=="BudgetPolicy" || kind=="RunPolicy") && body["project_id"]==nil && body["scope_type"]=="GLOBAL" && body["scope_id"]=="global" && body["parent_policy_id"]==nil { projectMatches=true }
++	if body["id"]!=id || !projectMatches || !f08Equal(body["revision"],r["revision"]){return zero,f08Binding}
+ 	if receipt,ok:=body["receipt_hash"];ok {
+ 		if receipt!=Receipt(Object(body)) || !f08Equal(receipt,row[5]){return zero,f08Binding}
+ 	} else if kind=="Artifact" {
+@@ -815,65 +821,52 @@
+ // A retained fence is the original Task/Session association; a Session's current
+ // task_id may have advanced, so it is not used to reassign old queue history.
+ func (v *f08ProofValidator) noSessionQueueHistory(s *f08Sources, project, task string) error {
+-	if len(s.selectRows("sessions", []int{1, 6}, []any{project, task})) != 0 || len(s.selectRows("fences", []int{0, 1}, []any{project, task})) != 0 { return f08Binding }
+-	for _, q := range s.rows["queue"] {
+-		fs := s.selectRows("fences", []int{3}, []any{q[6]})
+-		relevant := q[1] == project
+-		for _, f := range fs { relevant = relevant || f[0] == project }
+-		if !relevant { continue }
+-		// Even DROPPED/CONSUMED history belongs to its original Task. SQL22's
+-		// generation-only FK cannot justify the other denormalized columns.
+-		if q[1] == project && q[4] == task { return f08Binding }
+-		if len(fs) != 1 { return f08Binding }; f := fs[0]
+-		if f[0] != q[1] || f[1] != q[4] || f[2] != q[3] { return f08Binding }
+-		if _, e := s.one("sessions", []int{0, 1}, []any{q[3], q[1]}); e != nil { return e }
+-		owner, e := v.head(s, project, "Task", q[4].(string)); if e != nil || owner.body["goal_id"] != q[5] { return f08Binding }
+-		if _, e = v.head(s, project, "Goal", q[5].(string)); e != nil { return e }
+-		n, e := f08Integer(q[7], 1); if e != nil { return e }
+-		a, e := f08Integer(f[5], n); if e != nil || n > a { return f08Binding }
+-		_, raw, e := f08RawObject(q[12]); if e != nil || f08RawHash(raw) != q[13] { return f08Binding }
+-		if q[16] != nil {
+-			if _, e = s.one("receipts", []int{0,1,2,3}, []any{q[16],q[1],q[6],q[2]}); e != nil { return e }
++	if len(s.selectRows("sessions", []int{1,6}, []any{project,task}))!=0 || len(s.selectRows("fences", []int{0,1}, []any{project,task}))!=0 { return f08Binding }
++	// SQL22 nullable PRIMARY KEY semantics are not producer locator semantics.
++	// Validate every relevant receipt before any NULL/pointer/kind branch.
++	for _,r:=range s.rows["receipts"] {
++		fs:=s.selectRows("fences",[]int{3},[]any{r[2]}); relevant:=r[1]==project
++		for _,f:=range fs { relevant=relevant || f[0]==project }; if !relevant { continue }
++		id,e:=f08String(r[0]); if e!=nil || len(s.selectRows("receipts",[]int{0},[]any{id}))!=1 { return f08Binding }
++		if len(fs)!=1 || fs[0][0]!=r[1] || fs[0][1]==task { return f08Binding }
++		if _,e=f08String(r[3]);e!=nil { return e }
++		q,e:=s.one("queue",[]int{1,2,6},[]any{r[1],r[3],r[2]});if e!=nil{return e}
++		if q[3]!=fs[0][2] || q[4]!=fs[0][1] { return f08Binding }
++		if r[4]!="CANCEL_FENCE" { return f08NativeProofGap }
++		b,raw,e:=f08RawObject(r[5]);if e!=nil || f08RawHash(raw)!=r[6] { return f08Binding }
++		if _,e=f08Object(b,"task_id","from","to");e!=nil{return e}
++		if b["task_id"]!=q[4] { return f08Binding }
++		// ENQUEUED has no predecessor. The known producer atomically changes
++		// revision1 -> 2, state DROPPED and last_receipt_id to this receipt.
++		// A noncurrent receipt cannot be explained by mere association. Its
++		// actual successor's SDK semantics remain explicitly OPEN here.
++		if b["from"]!="ENQUEUED" || b["to"]!="DROPPED" { return f08NativeProofGap }
++		if r[7]!=nil || q[16]!=id || q[14]!="DROPPED" || !f08Equal(q[15],f08Number(2)) { return f08Binding }
++	}
++	for _,q:=range s.rows["queue"] {
++		fs:=s.selectRows("fences",[]int{3},[]any{q[6]}); relevant:=q[1]==project
++		for _,f:=range fs { relevant=relevant || f[0]==project };if !relevant{continue}
++		if q[1]==project && q[4]==task { return f08Binding }
++		if len(fs)!=1{return f08Binding};f:=fs[0]
++		if f[0]!=q[1] || f[1]!=q[4] || f[2]!=q[3] { return f08Binding }
++		if _,e:=s.one("sessions",[]int{0,1},[]any{q[3],q[1]});e!=nil{return e}
++		owner,e:=v.head(s,q[1].(string),"Task",q[4].(string));if e!=nil || owner.body["goal_id"]!=q[5]{return f08Binding}
++		if _,e=v.head(s,q[1].(string),"Goal",q[5].(string));e!=nil{return e}
++		n,e:=f08Integer(q[7],1);if e!=nil{return e};accepted,e:=f08Integer(f[5],n);if e!=nil || n>accepted{return f08Binding}
++		_,raw,e:=f08RawObject(q[12]);if e!=nil || f08RawHash(raw)!=q[13]{return f08Binding}
++		rs:=s.selectRows("receipts",[]int{1,2,3},[]any{q[1],q[6],q[2]})
++		switch q[14] {
++		case "ENQUEUED":
++			if q[16]!=nil || len(rs)!=0 || !f08Equal(q[15],f08Number(1)){return f08Binding}
++		case "DROPPED":
++			if _,e=f08String(q[16]);e!=nil{return e}
++			if len(rs)!=1 || rs[0][0]!=q[16] || rs[0][4]!="CANCEL_FENCE" || f[4]!="CANCEL_FENCED" || !f08Equal(q[15],f08Number(2)){return f08Binding}
++			sealed,e:=f08Integer(f[6],n);if e!=nil || sealed<n || sealed>accepted{return f08Binding}
++		default: return f08NativeProofGap
+ 		}
+ 	}
+-	// Receipts have no FK. Every same-project receipt must be attributable to
+-	// an original, different Task, rather than silently discarded as unrelated.
+-	for _, r := range s.rows["receipts"] {
+-		fs := s.selectRows("fences", []int{3}, []any{r[2]})
+-		relevant := r[1] == project
+-		for _, f := range fs { relevant = relevant || f[0] == project }
+-		if !relevant { continue }
+-		body, raw, e := f08RawObject(r[5]); if e != nil || f08RawHash(raw) != r[6] { return f08Binding }
+-		if len(fs) != 1 || fs[0][0] != r[1] || fs[0][1] == task { return f08Binding }; f := fs[0]
+-		if _, e = s.one("sessions", []int{0,1}, []any{f[2],r[1]}); e != nil { return e }
+-		// Only the exact, known CANCEL_FENCE producer is classified here. Other
+-		// receipt kinds need their own complete association proof; a kind label,
+-		// NULL command, or unknown payload cannot confer an absence exemption.
+-		if r[4] != "CANCEL_FENCE" { return f08NativeProofGap }
+-		if _, e = f08Object(body, "task_id", "from", "to"); e != nil { return e }
+-		if body["task_id"] != f[1] || body["task_id"] == task || r[3] == nil { return f08Binding }
+-		q, e := s.one("queue", []int{1,2,6}, []any{r[1],r[3],r[2]}); if e != nil { return e }
+-		if q[3] != f[2] || q[4] != f[1] { return f08Binding }
+-		from, to := body["from"], body["to"]
+-		if !(from == "ENQUEUED" && to == "DROPPED" || (from == "SENDING" || from == "SDK_ACCEPTED") && to == "DROP_REQUESTED") { return f08Binding }
+-		if r[7] != nil {
+-			// Resolve the entire retained chain, including nullable/duplicate IDs,
+-			// cycle and cross-command/generation substitutions. This proves only
+-			// association, never the SDK semantic meaning of a predecessor.
+-			seen := map[string]bool{}
+-			id, e := f08String(r[0]); if e != nil { return e }; seen[id] = true
+-			previous := r[7]
+-			for previous != nil {
+-				id, e = f08String(previous); if e != nil || seen[id] { return f08Binding }; seen[id] = true
+-				p, e := s.one("receipts", []int{0,1,2,3}, []any{id,r[1],r[2],r[3]}); if e != nil { return e }
+-				_, bytes, e := f08RawObject(p[5]); if e != nil || f08RawHash(bytes) != p[6] { return f08Binding }
+-				previous = p[7]
+-			}
+-		}
+-	}
+ 	return nil
+ }
+-
+ func (v *f08ProofValidator) queueAdmission(s *f08Sources,project,task string)(map[string]any,error){
+ 	q:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+ 	sessions:=s.selectRows("sessions",[]int{1,6},[]any{project,task})
+@@ -1118,6 +1111,80 @@
+ 	b,e:=f08Hex(o[3]);if e!=nil || !bytes.Equal(b,event.raw){return nil,f08Binding}
+ 	return map[string]any{"version_ref":event.ref(),"outbox_id":o[2],"sequence":o[1],"body_digest":f08RawHash(b)},nil
+ }
++// Pure mirror of the frozen dispatch/profile predicates. No filepath.IsLocal:
++// pinned Windows Go delegates reserved-name-with-extension decisions to an OS
++// function. Such a path remains explicitly OPEN rather than calling that API.
++const f08ProfilePathOSGap=f08Error("F08_PROFILE_PATH_REQUIRES_UNCAPTURED_OS_SEMANTICS")
++func f08WindowsLocalOutput(name string) error {
++	if name=="" || name[0]=='/' || name[0]=='\\' || strings.Contains(name,":") { return f08Binding }
++	depth:=0
++	for _,part:=range strings.FieldsFunc(name,func(r rune)bool{return r=='/'||r=='\\'}) {
++		base:=part;if at:=strings.IndexByte(base,'.');at>=0{base=base[:at]};base=strings.TrimRight(base," ")
++		upper:=strings.ToUpper(base)
++		reserved:=upper=="CON"||upper=="PRN"||upper=="AUX"||upper=="NUL"||upper=="CONIN$"||upper=="CONOUT$"
++		if strings.HasPrefix(upper,"COM")||strings.HasPrefix(upper,"LPT") { tail:=upper[3:];reserved=reserved||(len(tail)==1&&tail[0]>='1'&&tail[0]<='9')||tail=="¹"||tail=="²"||tail=="³" }
++		if reserved { if base!=part{return f08ProfilePathOSGap};return f08Binding }
++		switch part {case ".":case "..":depth--;if depth<0{return f08Binding};default:depth++}
++	}
++	return nil
++}
++// Pinned Go1.27.1 url.Parse has a GODEBUG-dependent multi-colon-host
++// branch, and an IPv6/netip branch whose transitive interning is not part of
++// this frozen pure proof. Admit neither branch through this UDF component.
++const f08ProfileEndpointGlobalGap=f08Error("F08_PROFILE_ENDPOINT_REQUIRES_UNCAPTURED_GLOBAL_SEMANTICS")
++func f08PureEndpointPrecondition(endpoint string) error {
++	rest:=endpoint
++	if i:=strings.Index(rest,"://");i>=0 {rest=rest[i+3:]} else if strings.HasPrefix(rest,"//"){rest=rest[2:]}else{return f08Binding}
++	if i:=strings.IndexAny(rest,"/?#");i>=0{rest=rest[:i]}
++	// Checking the entire authority, including any forbidden userinfo, is
++	// conservative: an OPEN result still refuses, never creates authority.
++	if strings.ContainsAny(rest,"[]") || strings.Count(rest,":")>1 {return f08ProfileEndpointGlobalGap}
++	return nil
++}
++
++func f08FrozenModelProfile(p map[string]any) error {
++	if p["backend"]!="mu-sdk-broker-v1"{return nil}
++	c,ok:=p["model_config"].(map[string]any);if !ok||c["api"]!="openai-completions"||!f08Equal(c["model"],p["model"]){return f08Binding}
++	for _,k:=range []string{"model","provider","ref","route"}{if _,e:=f08String(c[k]);e!=nil{return e}}
++	endpoint,e:=f08String(c["endpoint"]);if e!=nil{return e};if e=f08PureEndpointPrecondition(endpoint);e!=nil{return e};u,e:=url.Parse(endpoint)
++	if e!=nil||u.Hostname()==""||u.User!=nil||u.Fragment!=""||u.RawQuery!=""{return f08Binding}
++	// Exact producer predicate; this does not grant network route authority or
++	// invent an HTTPS gate absent from this frozen configuration function.
++	for k,max:=range map[string]int64{"max_output_tokens":8192,"max_calls":32}{n,e:=f08Integer(c[k],1);if e!=nil||n>max{return f08Binding}}
++	tools,e:=f08Array(c["tools"]);if e!=nil||len(tools)>16{return f08Binding}
++	for _,x:=range tools{tool,ok:=x.(map[string]any);if !ok||tool["type"]!="function"{return f08Binding};fn,ok:=tool["function"].(map[string]any);if !ok||fn["parameters"]==nil{return f08Binding};if _,e=f08String(fn["name"]);e!=nil{return e}}
++	bundle,e:=f08String(p["bundle_hash"]);if e!=nil||len(bundle)!=71{return f08Binding}
++	if value,exists:=p["model_qualification"];exists{q,e:=f08Object(value,"route","model_config_hash","max_calls");if e!=nil{return e};if !f08Equal(q["route"],c["route"])||q["model_config_hash"]!=Hash(c){return f08Binding};n,e:=f08Integer(q["max_calls"],1);if e!=nil||n>2{return f08Binding}}
++	return nil
++}
++func f08FrozenDispatchProfile(p map[string]any) error {
++	if e:=f08FrozenModelProfile(p);e!=nil{return e}
++	if p["sandbox"]!="appcontainer-zero-capabilities-v1"||p["adapter_revision"]!="windows-appcontainer-v1"||p["platform"]!="windows-amd64"{return f08Binding}
++	for _,k:=range []string{"command_id","build_hash"}{if _,e:=f08String(p[k]);e!=nil{return e}}
++	permissions,ok:=p["permissions"].(map[string]any);if !ok{return f08Shape}
++	caps,e:=f08Array(permissions["capabilities"]);if e!=nil||len(caps)!=0||permissions["network"]!="none"||permissions["environment"]!="staging-only"{return f08Binding}
++	processes,e:=f08Integer(permissions["process_limit"],1);if e!=nil||processes!=1{return f08Binding};memory,e:=f08Integer(permissions["memory_mib"],1);if e!=nil||memory!=256{return f08Binding}
++	max:=int64(300);if p["backend"]=="mu-sdk-broker-v1"{max=900};seconds,e:=f08Integer(p["timeout_seconds"],1);if e!=nil||seconds>max{return f08Binding}
++	outputs,e:=f08Array(p["outputs"]);if e!=nil||len(outputs)==0||len(outputs)>16{return f08Binding};seen:=map[string]bool{}
++	for _,x:=range outputs{name,e:=f08String(x);if e!=nil||seen[name]{return f08Binding};seen[name]=true;if e=f08WindowsLocalOutput(name);e!=nil{return e}}
++	if raw,exists:=p["argv"];exists{argv,e:=f08Array(raw);if e!=nil{return e};for _,x:=range argv{if _,ok:=x.(string);!ok{return f08Shape}}}
++	return nil
++}
++func f08FrozenQualificationProfile(p,runtime,task,plan,profileRef,artifact map[string]any) error {
++	if e:=f08FrozenDispatchProfile(p);e!=nil{return e}
++	for _,k:=range []string{"build_hash","sandbox","credential_revision","backend","model"}{if _,e:=f08String(p[k]);e!=nil{return e}}
++	if artifact["validity"]!="CURRENT"||artifact["sealed_at"]==nil||artifact["access_class"]=="VERIFIER_ONLY"||!f08Equal(artifact["content_hash"],profileRef["content_hash"]){return f08Binding}
++	if runtime["measurement_mode"]=="LIVE"{money,ok:=p["max_cost"].(map[string]any);if !ok{return f08Shape};amount,e:=f08String(money["amount"]);if e!=nil||len(amount)>4096{return f08Binding};n,ok:=new(big.Rat).SetString(amount);if !ok||n.Sign()<=0{return f08Binding};if _,e=f08String(money["currency"]);e!=nil{return e}}
++	input,e:=f08Array(task["input_refs"]);if e!=nil{return e};requirements,e:=f08Array(task["requirement_refs"]);if e!=nil{return e}
++	found:=false;for _,x:=range input{found=found||f08Equal(x,profileRef)};if !found{return f08Binding}
++	for _,xs:=range [][]any{input,requirements}{for _,x:=range xs{r,e:=f08Object(x,"entity_type","id","revision","content_hash");if e!=nil||r["entity_type"]=="RuntimeRegistration"{return f08Binding}}}
++	known:=map[string]bool{};caps,e:=f08Array(runtime["capabilities"]);if e!=nil{return e};for _,x:=range caps{c,e:=f08String(x);if e!=nil{return e};known[c]=true}
++	required,e:=f08Array(plan["required_capabilities"]);if e!=nil||len(required)==0{return f08Binding};seen:=map[string]bool{}
++	for _,x:=range required{c,e:=f08String(x);if e!=nil||!known[c]||seen[c]{return f08Binding};seen[c]=true}
++	if q,ok:=p["model_qualification"].(map[string]any);ok{if p["backend"]!="mu-sdk-broker-v1"||!f08Equal(plan["model_qualification"],q){return f08Binding}}else if _,exists:=plan["model_qualification"];exists{return f08Binding}
++	return nil
++}
++
+ func (v *f08ProofValidator) bootstrapAdmission(s *f08Sources,run,task f08Version,a map[string]any)([]f08Version,error){
+ 	if _,e:=f08Object(a,"mode","runtime_id","runtime_ref","profile_ref","profile_hash","profile","technical_hash","qualification_ids","qualification_evidence","permission","credential_revision","expires_at","requested_capabilities","qualification_bootstrap");e!=nil{return nil,e}
+ 	if a["qualification_bootstrap"]!=true || task.body["task_type"]!="runtime_qualification" || !f08EmptyArray(a["qualification_ids"]) || !f08EmptyArray(a["qualification_evidence"]){return nil,f08Binding}
+@@ -1133,6 +1200,7 @@
+ 	plan,_,e:=f08RawObject(planRow[3]);if e!=nil || Hash(plan)!=planRow[4]{return nil,f08Binding}
+ 	keys:=[]string{"runtime_id","profile_ref","task_hash","required_capabilities","max_validity_seconds","resume_check_id"};if _,ok:=plan["model_qualification"];ok{keys=append(keys,"model_qualification")};if _,e=f08Object(plan,keys...);e!=nil{return nil,e}
+ 	if plan["runtime_id"]!=runtime.id || !f08Equal(plan["profile_ref"],a["profile_ref"]) || !f08Equal(plan["required_capabilities"],a["requested_capabilities"]){return nil,f08Binding}
++	if e=f08FrozenQualificationProfile(p,runtime.body,task.body,plan,a["profile_ref"].(map[string]any),profile.body);e!=nil{return nil,e}
+ 	if plan["task_hash"]!=Hash([]any{task.body["goal_id"],task.body["task_type"],task.body["input_refs"],task.body["requirement_refs"],task.body["context_bundle_id"],task.body["dependency_task_ids"],task.body["acceptance_contract"],task.body["stop_policy"]}){return nil,f08Binding}
+ 	permission,e:=f08Object(a["permission"],"purpose","authorized_by","author_root","plan_hash");if e!=nil{return nil,e}
+ 	if permission["purpose"]!="runtime_qualification" || permission["authorized_by"]!=planRow[5] || permission["author_root"]!=planRow[6] || permission["plan_hash"]!=planRow[4] || b[5]!=planRow[5]{return nil,f08Binding}
+@@ -1145,9 +1213,11 @@
+ 	created,e:=time.Parse(time.RFC3339Nano,run.body["created_at"].(string));if e!=nil{return nil,f08Binding}
+ 	seconds,e:=f08Integer(plan["max_validity_seconds"],1);if e!=nil || seconds>30*24*3600{return nil,f08Binding}
+ 	if a["expires_at"]!=created.Add(time.Duration(seconds)*time.Second).UTC().Format(time.RFC3339Nano){return nil,f08Binding}
+-	// OPEN: sandbox/build/permission/timeout/output/model qualification predicates
+-	// are not fully implemented. Retained labels and hashes cannot authorize
+-	// an initial origin. Preserve the checked extraction above, then fail closed.
++	// Captured dispatch/model/profile predicates are implemented above. OPEN:
++	// the source34 vector contains no current authorRoot/OWNER/project grant,
++	// runtimeExecutorAllowed grant or captured effective-state/clock authority.
++	// Plan permission labels cannot prove those original producer checks.
++	// This is a profile component result, never complete qualification authority.
+ 	return nil,f08QualificationProfileGap
+ }
+ 

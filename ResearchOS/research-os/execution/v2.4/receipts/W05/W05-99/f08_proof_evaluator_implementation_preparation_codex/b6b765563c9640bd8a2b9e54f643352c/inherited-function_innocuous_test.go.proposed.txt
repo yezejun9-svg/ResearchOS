@@ -1,0 +1,29 @@
+package sqlite
+
+// Proposed additions to a separately approved pinned driver fork, not module
+// cache edits. No database SQL executed by these registration component tests.
+import (
+	"database/sql/driver"
+	"testing"
+
+	sqlite3 "modernc.org/sqlite/lib"
+)
+
+func TestFunctionImplInnocuousExplicitDefaultOff(t *testing.T) {
+	for _, tc := range []struct{name string; deterministic, innocuous bool}{
+		{"default",false,false}, {"deterministic-only",true,false},
+		{"innocuous-only",false,true}, {"both",true,true},
+	} {
+		t.Run(tc.name,func(t *testing.T){
+			d:=&Driver{}
+			impl:=&FunctionImpl{NArgs:0,Deterministic:tc.deterministic,Innocuous:tc.innocuous,
+				Scalar:func(*FunctionContext,[]driver.Value)(driver.Value,error){return int64(1),nil}}
+			if err:=d.registerFunction("fixture_"+tc.name,impl);err!=nil {t.Fatal(err)}
+			u:=d.udfs["fixture_"+tc.name]
+			if (u.eTextRep & sqlite3.SQLITE_INNOCUOUS != 0)!=tc.innocuous {t.Fatal("wrong innocuous flag")}
+			if (u.eTextRep & sqlite3.SQLITE_DETERMINISTIC != 0)!=tc.deterministic {t.Fatal("wrong deterministic flag")}
+			if u.eTextRep & sqlite3.SQLITE_DIRECTONLY != 0 {t.Fatal("DIRECTONLY was added")}
+			if u.eTextRep & 0xf != sqlite3.SQLITE_UTF8 {t.Fatal("encoding changed")}
+		})
+	}
+}

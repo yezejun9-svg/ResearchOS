@@ -1,0 +1,234 @@
+--- v4/w09_evidence_closure.py
++++ v5/w09_evidence_closure.v5.proposed.py
+@@ -4,6 +4,8 @@
+ import os
+ import platform
+ import re
++import stat
++from pathlib import PureWindowsPath
+ import tempfile
+ from pathlib import Path
+ 
+@@ -20,6 +22,42 @@
+ def file_pin(path):
+     raw = path.read_bytes()
+     return {"path": str(path), "sha256": digest(raw), "bytes": len(raw)}
++
++
++def safe_repo_rel(root, relative):
++    """Validate canonical REL and every component before any byte read."""
++    require(isinstance(relative, str) and relative and "\\" not in relative
++            and not relative.startswith("/") and not PureWindowsPath(relative).drive
++            and ":" not in relative and "//" not in relative
++            and all(piece not in ("", ".", "..") for piece in relative.split("/")),
++            "BAD_CANONICAL_REL")
++    root = root.resolve(strict=True)
++    path = root
++    for piece in relative.split("/"):
++        path = path / piece
++        item = path.lstat()
++        require(not path.is_symlink() and not getattr(path, "is_junction", lambda: False)()
++                and not (getattr(item, "st_file_attributes", 0) &
++                         getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
++                "REF_ALIAS_OR_REPARSE")
++    resolved = path.resolve(strict=True)
++    require(root in resolved.parents and resolved.relative_to(root).as_posix() == relative,
++            "FOREIGN_OR_ALIAS_REF")
++    return resolved
++
++
++def safe_repo_pin(root, claim):
++    require(isinstance(claim, dict) and set(claim) == {"path", "sha256", "bytes"}
++            and isinstance(claim.get("sha256"), str)
++            and re.fullmatch(r"[0-9a-f]{64}", claim["sha256"])
++            and type(claim.get("bytes")) is int and claim["bytes"] >= 0,
++            "TYPED_REF_REQUIRED")
++    path = safe_repo_rel(root, claim["path"])
++    require(path.is_file(), "REF_NOT_REGULAR_FILE")
++    raw = path.read_bytes()
++    require(digest(raw) == claim["sha256"] and len(raw) == claim["bytes"],
++            "REF_BYTES_CHANGED")
++    return path, raw
+ 
+ 
+ def verify_native(root, source, report, expected, selected):
+@@ -93,7 +131,7 @@
+     claims = report.get("owned_export", {}).get("members")
+     require(isinstance(claims, list) and claims, "OWNED_MANIFEST_MISSING")
+     members, events = {}, {}
+-    opaque = ("http-request", "http-response", "file-body-", "simulated-opinion-", "g02-junction-stdout")
++    opaque = ("http-request", "http-response", "file-body-", "g02-junction-stdout")
+     for claim in claims:
+         require(isinstance(claim, dict) and set(claim) == {"path", "sha256", "bytes"}, "OWNED_CLAIM_SHAPE")
+         lexical = root / claim["path"]
+@@ -107,7 +145,7 @@
+                           "sha256": digest(data), "bytes": len(data)}, "OWNED_PIN_DRIFT")
+         members[path] = claim
+         label = path.name.split("-", 1)[1][:-4]
+-        if label.startswith(opaque):
++        if label.startswith(opaque) or re.fullmatch(r"simulated-opinion-(?:0[0-9]|1[0-9])", label):
+             continue
+         item = json.loads(data)
+         require(isinstance(item, dict) and item.get("_run_id") == report["run_id"]
+@@ -205,11 +243,19 @@
+         else:
+             require(row.get("root_evidence_id") == b["evidence_id"]
+                     and row.get("origin_relation") == "CONFIRMED", "C19_ROOT_GRAPH_MISMATCH")
++    raw_labels = [path.name.split("-", 1)[1][:-4] for path in members
++                  if path.parent.name == test and
++                  re.fullmatch(r"[0-9]{8}-simulated-opinion-(?:0[0-9]|1[0-9])\.raw", path.name)]
++    require(len(raw_labels) == 20 and set(raw_labels) ==
++            {f"simulated-opinion-{i:02d}" for i in range(20)},
++            "C19_RAW_OPINION_BODY_SET_MISMATCH")
+     simulations = [x["value"] for x in events.get("simulated-opinion-binding", []) if x["test"] == test]
+     require(len(simulations) == 20 and {s.get("ordinal") for s in simulations} == set(range(20)),
+             "C19_TWENTY_SIM_INPUTS_MISSING")
+     for s in simulations:
+         body = _raw_pin(s.get("body"), members, test)
++        require(Path(s["body"]["path"]).name.endswith(
++                f"-simulated-opinion-{s['ordinal']:02d}.raw"), "SIM_ORDINAL_BODY_SWAP")
+         row = graph.get(s.get("evidence_id"))
+         require(body == f"simulated agent opinion {s['ordinal']}".encode()
+                 and s.get("content_hash") == "sha256:" + digest(body)
+@@ -218,6 +264,39 @@
+                 and row.get("evidence_kind") == "SIMULATED" and row.get("source_kind") == "SIMULATION",
+                 "C19_SIM_INPUT_GRAPH_MISMATCH")
+     require({s["evidence_id"] for s in simulations} | set(bmap) == set(graph), "C19_INPUT_GRAPH_SET_MISMATCH")
++    exchanges = [x["value"] for x in events.get("http-exchange", []) if x["test"] == test]
++    def exact_exchange(method, suffix, request_pred, response_pred):
++        matches = []
++        for event in exchanges:
++            if (event.get("method") != method or not event.get("path", "").endswith(suffix)
++                    or event.get("status") != 201):
++                continue
++            request = _raw_pin(event.get("request"), members, test)
++            response = _raw_pin(event.get("response"), members, test)
++            if request_pred(request) and response_pred(json.loads(response)):
++                matches.append(event)
++        require(len(matches) == 1, "C19_SIM_HTTP_CALL_NOT_UNIQUE_" + suffix)
++        return matches[0]
++    for s in simulations:
++        body = _raw_pin(s["body"], members, test)
++        content_call = exact_exchange("POST", "/content", lambda raw: raw == body,
++            lambda reply: reply.get("content_hash") == s["content_hash"])
++        upload = json.loads(_raw_pin(content_call["response"], members, test))
++        artifact_call = exact_exchange("POST", "/artifacts",
++            lambda raw: (lambda obj: obj.get("content_hash") == s["content_hash"]
++                        and obj.get("storage_key") == upload.get("storage_key")
++                        and obj.get("evidence_kind") == "SIMULATED"
++                        and obj.get("measurement_mode") == "FIXTURE")(json.loads(raw)),
++            lambda reply: reply.get("id") == s["artifact_id"]
++                          and reply.get("content_hash") == s["content_hash"])
++        evidence_call = exact_exchange("POST", "/evidence",
++            lambda raw: (lambda obj: obj.get("snapshot_artifact_ref", {}).get("id") == s["artifact_id"]
++                        and obj.get("evidence_kind") == "SIMULATED"
++                        and obj.get("source_kind") == "SIMULATION")(json.loads(raw)),
++            lambda reply: reply.get("id") == s["evidence_id"])
++        require(len({content_call["request"]["path"], artifact_call["request"]["path"],
++                     evidence_call["request"]["path"]}) == 3,
++                "C19_SIM_HTTP_CALL_REUSE")
+     require(before.get("counts", {}).get("independent_observed_count") == 2
+             and before["counts"].get("simulated_count") == 20 and before["counts"].get("unknown_count") == 1
+             and after.get("counts", {}).get("independent_observed_count") == 1
+@@ -278,6 +357,30 @@
+             and _raw_pin(files["revoked-body"]["body"], members, test) == b"delta for revocation v4"
+             and b"SECRET-B-UNAUTHORIZED" in _raw_pin(files["initial-denied"]["body"], members, test),
+             "A06_PHASE_BYTES_MISMATCH")
++    initial_bundle = only(events, "a06-bundle-initial", test)
++    stale_call = only(events, "a06-materialize-stale-rejected", test)
++    new_bundle = only(events, "a06-bundle-after-delete", test)
++    first_materialize = only(events, "a06-materialize-initial", test)
++    after_materialize = only(events, "a06-materialize-after-delete", test)
++    require(initial_bundle.get("root_id") == states[0]["root_id"]
++            and initial_bundle.get("principal_id") == states[0]["principal"]
++            and initial_bundle.get("task_id") == new_bundle.get("task_id")
++            and initial_bundle.get("source_artifact_id") in initial_bundle.get("authorized_snapshot_ids", [])
++            and initial_bundle.get("source_artifact_id") not in new_bundle.get("authorized_snapshot_ids", [])
++            and new_bundle.get("deleted_artifact_id") not in new_bundle.get("authorized_snapshot_ids", [])
++            and stale_call.get("task_id") == initial_bundle["task_id"]
++            and stale_call.get("accepted") is False and stale_call.get("actual_error")
++            and first_materialize.get("task_id") == after_materialize.get("task_id") == initial_bundle["task_id"]
++            and first_materialize.get("accepted") is True
++            and after_materialize.get("accepted") is True,
++            "A06_CONTEXT_PERMISSION_CALL_GRAPH_MISSING")
++    initial_manifest = _raw_pin(first_materialize.get("manifest"), members, test)
++    later_manifest = _raw_pin(after_materialize.get("manifest"), members, test)
++    require(initial_manifest and later_manifest and b"gamma deleted v3" not in later_manifest
++            and first_materialize.get("target_path") != after_materialize.get("target_path")
++            and stale_call.get("target_path") not in
++                {first_materialize.get("target_path"), after_materialize.get("target_path")},
++            "A06_MATERIALIZE_RAW_RESULT_MISSING")
+     original_hash = "sha256:" + digest(_raw_pin(files["initial-authorized"]["body"], members, test))
+     modified_hash = "sha256:" + digest(_raw_pin(files["modified"]["body"], members, test))
+     revoked_hash = "sha256:" + digest(_raw_pin(files["revoked-body"]["body"], members, test))
+@@ -345,9 +448,8 @@
+     """A later non-author decision must bind this run; absent facts fail closed."""
+     require(isinstance(decision_ref, str) and decision_ref and isinstance(decision_sha, str)
+             and re.fullmatch(r"[0-9a-f]{64}", decision_sha), "REVIEWED_MODE_DECISION_MISSING")
+-    decision_path = (root / decision_ref).resolve(strict=True)
+-    require(root in decision_path.parents and digest(decision_path.read_bytes()) == decision_sha,
+-            "MODE_DECISION_PIN_DRIFT")
++    decision_path = safe_repo_rel(root, decision_ref)
++    require(digest(decision_path.read_bytes()) == decision_sha, "MODE_DECISION_PIN_DRIFT")
+     decision = json.loads(decision_path.read_bytes())
+     mode = "LIVE_WINDOWS" if route[2] == "W09-G02" else "FIXTURE"
+     require(decision.get("schema") == "researchos.w09-mode-decision.v2"
+@@ -365,13 +467,10 @@
+     reviewer_pin = decision.get("independent_review_ref")
+     require(isinstance(reviewer_pin, dict) and set(reviewer_pin) == {"path", "sha256", "bytes"},
+             "INDEPENDENT_REVIEW_RECEIPT_MISSING")
+-    reviewer_path = (root / reviewer_pin["path"]).resolve(strict=True)
+-    report_dir = (root / source["report_reference"]).resolve(strict=True).parent
+-    require(root in reviewer_path.parents and report_dir not in reviewer_path.parents,
++    reviewer_path, reviewer_raw = safe_repo_pin(root, reviewer_pin)
++    report_dir = safe_repo_rel(root, source["report_reference"]).parent
++    require(report_dir not in reviewer_path.parents,
+             "REVIEWER_RECEIPT_OWNED_BY_PRODUCER")
+-    reviewer_raw = reviewer_path.read_bytes()
+-    require(digest(reviewer_raw) == reviewer_pin["sha256"] and len(reviewer_raw) == reviewer_pin["bytes"],
+-            "REVIEWER_RECEIPT_PIN_DRIFT")
+     review = json.loads(reviewer_raw)
+     require(review.get("schema") == "researchos.w09-independent-mode-review.v1"
+             and review.get("actor_id") == decision["reviewer_id"]
+@@ -401,22 +500,38 @@
+                 and int(platform.version().split(".")[-1]) >= 22000
+                 and decision.get("locked_go_sha256") == lock["tools"]["go"]["sha256"]
+                 and isinstance(host, dict) and isinstance(junction, dict), "LIVE_HOST_NOT_ACTUAL")
++        expected_witnesses = {json.dumps(host, sort_keys=True), json.dumps(junction, sort_keys=True)}
++        require(len(expected_witnesses) == 2 and
++                {json.dumps(item, sort_keys=True) for item in decision.get("witness_allowlist", [])}
++                == expected_witnesses, "HOST_WITNESS_NOT_IN_FROZEN_RUN_ALLOWLIST")
++        witness_values = {}
+         for item, schema in ((host, "researchos.w09-host-witness.v1"),
+                              (junction, "researchos.w09-junction-witness.v1")):
+-            raw = (root / item["path"]).read_bytes()
+-            require(item.get("sha256") == digest(raw) and item.get("bytes") == len(raw), "HOST_WITNESS_PIN")
++            _, raw = safe_repo_pin(root, item)
+             witness = json.loads(raw)
+             require(witness.get("schema") == schema and witness.get("run_id") == native["run_id"]
+                     and witness.get("report_sha256") == decision["report_sha256"]
+                     and witness.get("go_executable") == native["go"]
+                     and witness.get("source_sha256") == native["source_hashes"]
+                     and witness.get("actual_platform") == "Windows 11 x64", "HOST_WITNESS_CURRENT_RUN")
++            witness_values[schema] = witness
+         branch = only(ctx["events"], "g02-os-branch", "TestW09RootReplacementCannotFeedProduct")
+         junction_event = only(ctx["events"], "g02-junction-command", "TestW09RootReplacementCannotFeedProduct")
+         require(branch.get("goos") == "windows" and branch.get("goarch") == "amd64"
+                 and branch.get("junction_branch") is True
+                 and junction_event.get("exit_code") == 0
+-                and junction_event.get("command", [])[:3] == ["cmd.exe", "/c", "mklink"]
++                and isinstance(junction_event.get("root_path"), str)
++                and isinstance(junction_event.get("target_path"), str)
++                and Path(junction_event["root_path"]).is_absolute()
++                and Path(junction_event["target_path"]).is_absolute()
++                and junction_event["root_path"] != junction_event["target_path"]
++                and junction_event.get("command") == ["cmd.exe", "/c", "mklink", "/J",
++                                                      junction_event["root_path"],
++                                                      junction_event["target_path"]]
++                and junction_event.get("command") ==
++                    witness_values["researchos.w09-junction-witness.v1"].get("command")
++                and junction_event.get("root_path") == decision.get("junction_root_path")
++                and junction_event.get("target_path") == decision.get("junction_target_path")
+                 and junction_event.get("output") == junction.get("output_pin")
+                 and _raw_pin(junction_event["output"], ctx["members"], "TestW09RootReplacementCannotFeedProduct") is not None,
+                 "JUNCTION_RAW_NOT_BOUND")

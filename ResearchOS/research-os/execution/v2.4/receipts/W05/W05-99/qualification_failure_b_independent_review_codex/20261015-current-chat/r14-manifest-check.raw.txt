@@ -1,0 +1,218 @@
+schema
+status
+base_commit
+base_tree
+candidate_commit
+candidate_tree
+branch
+worktree
+source
+whole_binary_patch
+focused_test
+existing_regression
+command_ledger
+capture_gaps
+formal_increment
+{
+  "candidate": null,
+  "tree": null,
+  "source_files": null,
+  "files": null
+}
+func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
+	if !s.Contracts.Entities[kind] {
+		return Fail(400, "INVALID_REQUEST", "unknown entity")
+	}
+	if e := s.Contracts.Validate(kind, o); e != nil {
+		return Fail(400, "INVALID_REQUEST", "entity violates "+kind+" schema")
+	}
+	project := Str(o, "project_id")
+	id := Str(o, "id")
+	rev, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
+	old, e := load(tx, project, kind, id)
+	if e == nil {
+		if _, immutable := old["receipt_hash"]; immutable {
+			return Fail(409, "STATE_CONFLICT", "receipt immutable")
+		}
+		oldRevision, e := Num(old, "revision")
+		if e != nil {
+			return e
+		}
+		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
+			return Fail(409, "STATE_CONFLICT", "revision must advance once")
+		}
+		if kind == "Task" && !taskTransition(old, o) {
+			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
+		}
+	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {
+		return e
+	}
+	if e = s.invariants(kind, o); e != nil {
+		return e
+	}
+	var hash any
+	immutable := 0
+	if h, ok := o["receipt_hash"]; ok {
+		if h != Receipt(o) {
+			return Fail(422, "CONTENT_HASH_MISMATCH", "receipt hash mismatch")
+		}
+		hash = h
+		immutable = 1
+	} else if kind == "Artifact" {
+		hash = o["content_hash"]
+	}
+	if _, e = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)", project, kind, id, rev, string(Bytes(o)), hash); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body,content_hash=excluded.content_hash", project, kind, id, rev, string(Bytes(o)), hash, immutable); e != nil {
+		return e
+	}
+	return s.refs(tx, project, kind, id, rev, "", o)
+}
+func (s *Service) refs(tx *sql.Tx, project, kind, id string, rev int64, path string, value any) error {
+	switch v := value.(type) {
+	case map[string]any:
+		if _, ok := v["entity_type"]; ok {
+			if e := s.Contracts.Validate("VersionRef", v); e != nil {
+				return Fail(400, "INVALID_REQUEST", "invalid reference")
+			}
+			version, e := Num(v, "revision")
+			if e != nil {
+				return e
+			}
+			return s.ref(tx, project, kind, id, rev, path, project, Str(v, "entity_type"), Str(v, "id"), version, v["content_hash"], true)
+		}
+		for field, x := range v {
+			if field == "id" || field == "project_id" {
+				continue
+			}
+			target := relationKind(kind, field)
+			if field == "supersedes_id" {
+				target = kind
+			}
+			if field == "parent_policy_id" {
+				target = kind
+			}
+			if target != "" && x != nil {
+				values := []any{x}
+				if a, ok := x.([]any); ok {
+					values = a
+				}
+				for _, a := range values {
+					tid, ok := a.(string)
+					if !ok {
+						return Fail(400, "INVALID_REQUEST", "invalid relation")
+					}
+					tp := project
+					if field == "parent_policy_id" {
+						var found int
+						tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind=? AND id=?", project, target, tid).Scan(&found)
+						if found == 0 {
+							tp = ""
+						}
+					}
+					obj, e := load(tx, tp, target, tid)
+					if e != nil {
+						return Fail(422, "GATE_FAILED", "related object unavailable")
+					}
+					version, e := Num(obj, "revision")
+					if e != nil {
+						return e
+					}
+					if e = s.ref(tx, project, kind, id, rev, path+"/"+field, tp, target, tid, version, nil, false); e != nil {
+						return e
+					}
+				}
+			} else if e := s.refs(tx, project, kind, id, rev, path+"/"+field, x); e != nil {
+				return e
+			}
+		}
+	case []any:
+		for i, x := range v {
+			if e := s.refs(tx, project, kind, id, rev, fmt.Sprintf("%s/%d", path, i), x); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+func (s *Service) ref(tx *sql.Tx, project, kind, id string, rev int64, path, tp, tk, tid string, tr int64, hash any, exact bool) error {
+	var current int64
+	var h sql.NullString
+	e := tx.QueryRow("SELECT revision,content_hash FROM domain_objects WHERE project=? AND kind=? AND id=?", tp, tk, tid).Scan(&current, &h)
+	if e != nil {
+		return Fail(422, "GATE_FAILED", "reference unavailable")
+	}
+	history := kind == "Conflict" || kind == "Artifact" || kind == "ContextBundle" || kind == "DecisionReceipt" || kind == "AcceptanceReceipt" || kind == "AgentMessage" || kind == "ImpactLink" || kind == "ChangeProposal" || kind == "EventEnvelope" || kind == "SkillVersion" || ((kind == "Task" || kind == "Goal") && rev > 1)
+	if exact && kind == "ResearchCycle" && path == "/profile_ref" && tk == "ProjectProfile" && tp == project && rev > 1 {
+		var priorRaw, currentRaw string
+		e = tx.QueryRow("SELECT prior.body,current.body FROM domain_versions prior JOIN domain_versions current ON current.project=prior.project AND current.kind=prior.kind AND current.id=prior.id AND current.revision=prior.revision+1 WHERE prior.project=? AND prior.kind='ResearchCycle' AND prior.id=? AND prior.revision=?", project, id, rev-1).Scan(&priorRaw, &currentRaw)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "cycle cancellation needs its previous version")
+		}
+		prior, err := Decode([]byte(priorRaw))
+		if err != nil {
+			return err
+		}
+		currentCycle, err := Decode([]byte(currentRaw))
+		if err != nil {
+			return err
+		}
+		history = currentCycle["status"] == "CANCELLED" && Hash(currentCycle["profile_ref"]) == Hash(prior["profile_ref"])
+	}
+	if exact && history {
+		e = tx.QueryRow("SELECT revision,content_hash FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?", tp, tk, tid, tr).Scan(&current, &h)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "historical reference unavailable")
+		}
+	}
+	if exact && current != tr {
+		return Fail(412, "STALE_INPUT", "reference revision changed")
+	}
+	if exact && ((h.Valid && hash != h.String) || (!h.Valid && hash != nil)) {
+		return Fail(422, "CONTENT_HASH_MISMATCH", "reference hash mismatch")
+-- Internal operational evidence. No dependency on the later additive session schema.
+CREATE TABLE client_queue_fences (
+ project TEXT NOT NULL, task_id TEXT NOT NULL, session_id TEXT NOT NULL,
+ generation TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('OPEN','SEALING','SEALED','CANCEL_FENCED','RECONCILING')),
+ accepted_through INTEGER NOT NULL DEFAULT 0, sealed_through INTEGER NOT NULL DEFAULT 0,
+ run_id TEXT, runtime_epoch INTEGER, dispatch_key TEXT, manifest_hash TEXT, process_identity TEXT,
+ restore_fenced INTEGER NOT NULL DEFAULT 0 CHECK(restore_fenced IN (0,1)),
+ revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(project,task_id)
+);
+CREATE TABLE client_command_queue (
+ principal TEXT NOT NULL, project TEXT NOT NULL, command_id TEXT NOT NULL,
+ session_id TEXT NOT NULL, task_id TEXT NOT NULL, goal_id TEXT NOT NULL,
+ generation TEXT NOT NULL REFERENCES client_queue_fences(generation), queue_sequence INTEGER NOT NULL,
+ request_hash TEXT NOT NULL, message_id TEXT NOT NULL UNIQUE, accepted_writer_epoch INTEGER NOT NULL,
+ delivery TEXT NOT NULL CHECK(delivery IN ('STEER','FOLLOW_UP')), content TEXT NOT NULL, content_hash TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('ENQUEUED','SENDING','SDK_ACCEPTED','CONSUMED','DROP_REQUESTED','DROPPED','UNKNOWN')),
+ revision INTEGER NOT NULL DEFAULT 1, last_receipt_id TEXT, created_at TEXT NOT NULL,
+ PRIMARY KEY(principal,project,command_id), UNIQUE(generation,queue_sequence)
+);
+CREATE INDEX client_queue_pending ON client_command_queue(project,session_id,state);
+CREATE TABLE client_control_requests (
+ principal TEXT NOT NULL, project TEXT NOT NULL, command_id TEXT NOT NULL,
+ session_id TEXT NOT NULL, control_request_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL,
+ target_id TEXT NOT NULL, task_ids TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('REQUESTED','RECONCILING','CONFIRMED')),
+ original_response TEXT, final_response TEXT, created_at TEXT NOT NULL,
+ PRIMARY KEY(principal,project,command_id)
+);
+CREATE TABLE client_control_receipts (
+ receipt_id TEXT PRIMARY KEY, project TEXT NOT NULL, generation TEXT NOT NULL,
+ command_id TEXT, kind TEXT NOT NULL, body TEXT NOT NULL, body_hash TEXT NOT NULL,
+ previous_receipt_id TEXT, created_at TEXT NOT NULL
+);
+CREATE TRIGGER client_receipt_no_update BEFORE UPDATE ON client_control_receipts BEGIN SELECT RAISE(ABORT,'append-only control receipt'); END;
+CREATE TRIGGER client_receipt_no_delete BEFORE DELETE ON client_control_receipts BEGIN SELECT RAISE(ABORT,'append-only control receipt'); END;
+{
+  "GOPATH": "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\gopath",
+  "TEMP": "D:\\作品集\\ResearchOS\\research-os\\.local\\qualification-failure-b-independent-review-20261015\\gotmp",
+  "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\qualification-failure-b-20261015",
+  "GOTMPDIR": "D:\\作品集\\ResearchOS\\research-os\\.local\\qualification-failure-b-independent-review-20261015\\gotmp",
+  "TMP": "D:\\作品集\\ResearchOS\\research-os\\.local\\qualification-failure-b-independent-review-20261015\\gotmp",
+  "GOCACHE": "D:\\作品集\\ResearchOS\\research-os\\.local\\qualification-failure-b-independent-review-20261015\\gocache"
+}

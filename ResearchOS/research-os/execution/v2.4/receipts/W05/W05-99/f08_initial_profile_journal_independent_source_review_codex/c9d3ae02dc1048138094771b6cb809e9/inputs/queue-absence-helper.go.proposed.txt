@@ -1,0 +1,50 @@
+// Pure source classification; it authorizes neither SDK settlement nor a
+// missing-source exemption. Only the two known pre-SDK queue states below
+// have a complete retained producer explanation in this implementation.
+func (v *f08ProofValidator) noSessionQueueHistory(s *f08Sources, project, task string) error {
+	if len(s.selectRows("sessions", []int{1,6}, []any{project,task}))!=0 || len(s.selectRows("fences", []int{0,1}, []any{project,task}))!=0 { return f08Binding }
+	// SQL22 nullable PRIMARY KEY semantics are not producer locator semantics.
+	// Validate every relevant receipt before any NULL/pointer/kind branch.
+	for _,r:=range s.rows["receipts"] {
+		fs:=s.selectRows("fences",[]int{3},[]any{r[2]}); relevant:=r[1]==project
+		for _,f:=range fs { relevant=relevant || f[0]==project }; if !relevant { continue }
+		id,e:=f08String(r[0]); if e!=nil || len(s.selectRows("receipts",[]int{0},[]any{id}))!=1 { return f08Binding }
+		if len(fs)!=1 || fs[0][0]!=r[1] || fs[0][1]==task { return f08Binding }
+		if _,e=f08String(r[3]);e!=nil { return e }
+		q,e:=s.one("queue",[]int{1,2,6},[]any{r[1],r[3],r[2]});if e!=nil{return e}
+		if q[3]!=fs[0][2] || q[4]!=fs[0][1] { return f08Binding }
+		if r[4]!="CANCEL_FENCE" { return f08NativeProofGap }
+		b,raw,e:=f08RawObject(r[5]);if e!=nil || f08RawHash(raw)!=r[6] { return f08Binding }
+		if _,e=f08Object(b,"task_id","from","to");e!=nil{return e}
+		if b["task_id"]!=q[4] { return f08Binding }
+		// ENQUEUED has no predecessor. The known producer atomically changes
+		// revision1 -> 2, state DROPPED and last_receipt_id to this receipt.
+		// A noncurrent receipt cannot be explained by mere association. Its
+		// actual successor's SDK semantics remain explicitly OPEN here.
+		if b["from"]!="ENQUEUED" || b["to"]!="DROPPED" { return f08NativeProofGap }
+		if r[7]!=nil || q[16]!=id || q[14]!="DROPPED" || !f08Equal(q[15],f08Number(2)) { return f08Binding }
+	}
+	for _,q:=range s.rows["queue"] {
+		fs:=s.selectRows("fences",[]int{3},[]any{q[6]}); relevant:=q[1]==project
+		for _,f:=range fs { relevant=relevant || f[0]==project };if !relevant{continue}
+		if q[1]==project && q[4]==task { return f08Binding }
+		if len(fs)!=1{return f08Binding};f:=fs[0]
+		if f[0]!=q[1] || f[1]!=q[4] || f[2]!=q[3] { return f08Binding }
+		if _,e:=s.one("sessions",[]int{0,1},[]any{q[3],q[1]});e!=nil{return e}
+		owner,e:=v.head(s,q[1].(string),"Task",q[4].(string));if e!=nil || owner.body["goal_id"]!=q[5]{return f08Binding}
+		if _,e=v.head(s,q[1].(string),"Goal",q[5].(string));e!=nil{return e}
+		n,e:=f08Integer(q[7],1);if e!=nil{return e};accepted,e:=f08Integer(f[5],n);if e!=nil || n>accepted{return f08Binding}
+		_,raw,e:=f08RawObject(q[12]);if e!=nil || f08RawHash(raw)!=q[13]{return f08Binding}
+		rs:=s.selectRows("receipts",[]int{1,2,3},[]any{q[1],q[6],q[2]})
+		switch q[14] {
+		case "ENQUEUED":
+			if q[16]!=nil || len(rs)!=0 || !f08Equal(q[15],f08Number(1)){return f08Binding}
+		case "DROPPED":
+			if _,e=f08String(q[16]);e!=nil{return e}
+			if len(rs)!=1 || rs[0][0]!=q[16] || rs[0][4]!="CANCEL_FENCE" || f[4]!="CANCEL_FENCED" || !f08Equal(q[15],f08Number(2)){return f08Binding}
+			sealed,e:=f08Integer(f[6],n);if e!=nil || sealed<n || sealed>accepted{return f08Binding}
+		default: return f08NativeProofGap
+		}
+	}
+	return nil
+}

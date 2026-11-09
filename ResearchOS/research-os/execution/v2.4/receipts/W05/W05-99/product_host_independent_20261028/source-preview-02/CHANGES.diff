@@ -1,0 +1,654 @@
+--- prep-01/apps/desktop/main/main.js
++++ preview-02/apps/desktop/main/main.js
+@@ -20,7 +20,7 @@
+ const { createContextStore } = require('./lib/context.js');
+ const { createDesktopManagement } = require('./lib/desktop-management.js');
+ const { loadProductLayout, validateProductPaths, claimProductData, writeStartupWitness, writeSupervisorWitness,
+-  retireSupervisorWitness, acceptProductIntent, createProductSafeExit } = require('./lib/product-layout.js');
++  retireSupervisorWitness, acceptProductIntent, createProductSafeExit, verifyProductParent } = require('./lib/product-layout.js');
+ 
+ protocol.registerSchemesAsPrivileged([{ scheme: 'ros-app', privileges: {
+   standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: false,
+@@ -62,6 +62,9 @@
+ let productExitConfirmed = false;
+ let productSafeExit = null;
+ let productStartupWitness = null;
++let productWitness = null;
++let productTray = null;
++let productFailure = null;
+ if (productLayout) {
+   productPrimary = app.requestSingleInstanceLock({ intent: productIntent, installation_id: productLayout.installID });
+   if (!productPrimary) app.quit();
+@@ -259,6 +262,30 @@
+   codingResourceGeneration: () => codingDirectories.generation,
+   diagnostic: captureManagementDiagnostic,
+ });
++
++async function showProductDiagnostic() {
++  const summary = desktopManagement.summary();
++  return dialog.showMessageBox(productWindow || undefined, { type: productFailure ? 'warning' : 'info',
++    title: 'ResearchOS 宿主', message: productFailure ? '宿主启动未完成' : summary.state,
++    detail: productFailure || summary.reason || `Host ${desktopManagement.hostId || 'starting'}`,
++    buttons: ['关闭'] });
++}
++
++async function ensureProductTray() {
++  if (!productLayout || productTray) return;
++  const icon = await app.getFileIcon(process.execPath);
++  productTray = new Tray(icon);
++  productTray.setToolTip('ResearchOS');
++  productTray.setContextMenu(Menu.buildFromTemplate([
++    { label: '打开 ResearchOS', click: () => { void productShow?.(); } },
++    { label: '诊断', click: () => { void showProductDiagnostic(); } },
++    { label: '安全退出', click: () => {
++      if (productSafeExit) void productSafeExit().catch(() => {});
++      else void showProductDiagnostic();
++    } },
++  ]));
++  productTray.on('double-click', () => { void productShow?.(); });
++}
+ const v2Deps = Object.assign({}, deps, {
+   v2Transport: validatedV2Transport,
+   clientId: 'desktop-shell',
+@@ -406,7 +433,8 @@
+   if (productLayout) {
+     // Only the single-instance winner may claim the data root. This bounded
+     // STARTING record lets a CLI distinguish our live startup from a foreign Core.
+-    productStartupWitness = writeStartupWitness(productLayout, desktopManagement.observe(process.pid));
++    const parent = verifyProductParent(productLayout, desktopManagement.observe(process.pid));
++    productStartupWitness = writeStartupWitness(productLayout, parent);
+     claimProductData(productLayout);
+   }
+   const contextStore = createContextStore(path.join(app.getPath('userData'), 'desktop-context.json'));
+@@ -440,10 +468,12 @@
+   protocol.handle('ros-app', createAppProtocol({
+     dist: WEB_DIST, routes, ensureCore: () => host.ensureCore(deps), credentialFor: deps.credentialFor,
+   }));
++  if (productLayout) {
++    productShow = showProductDiagnostic;
++    await ensureProductTray();
++  }
+   const management = await desktopManagement.start();
+   const started = await host.ensureCore(deps);
+-  let productWitness = null;
+-  let productTray = null;
+   if (productLayout) {
+     if (management.state !== 'READY' || started.health !== 'UP' || !started.discovery ||
+         started.discovery.pid !== desktopManagement.identity?.PID)
+@@ -452,8 +482,7 @@
+     productSafeExit = createProductSafeExit({ management: desktopManagement,
+       ownedIdentity: ownedCoreIdentity, confirm: smokeShutdownConfirmation,
+       retire: () => retireSupervisorWitness(productLayout, productWitness),
+-      onExit: async retired => {
+-        if (!retired) console.error('PRODUCT_WITNESS_RETIRE_UNCONFIRMED');
++      onExit: async () => {
+         productExitConfirmed = true; productTray?.destroy(); app.quit();
+       },
+       onRefused: async error => {
+@@ -562,24 +591,12 @@
+   };
+   if (!productLayout) { await showWindow(); return; }
+   productShow = showWindow;
+-  const icon = await app.getFileIcon(process.execPath);
+-  productTray = new Tray(icon);
+-  productTray.setToolTip('ResearchOS');
+-  productTray.setContextMenu(Menu.buildFromTemplate([
+-    { label: '打开 ResearchOS', click: () => { void productShow(); } },
+-    { label: '诊断', click: () => {
+-      const summary = desktopManagement.summary();
+-      void dialog.showMessageBox(productWindow || undefined, { type: 'info', title: 'ResearchOS 宿主',
+-        message: summary.state, detail: summary.reason || `Host ${desktopManagement.hostId}`,
+-        buttons: ['关闭'] });
+-    } },
+-    { label: '安全退出', click: () => { void productSafeExit().catch(() => {}); } },
+-  ]));
+-  productTray.on('double-click', () => { void productShow(); });
+   if (productShowQueued) await productShow();
+ }
+ 
+ if (!productLayout || productPrimary) app.whenReady().then(boot).catch(async (e) => {
++  productFailure = String(e && e.message || e);
++  if (productLayout) productShow = showProductDiagnostic;
+   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'boot_failed', error: String(e && e.message || e) }));
+   if (desktopManagement.state === 'READY') {
+     try { await desktopManagement.shutdown(); }
+@@ -587,10 +604,16 @@
+   }
+   if (desktopManagement.hasUnconfirmedChild()) {
+     console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: desktopManagement.failure || 'CONTROL_EXIT_UNCONFIRMED' }));
++    if (productLayout) void showProductDiagnostic();
+     return;
+   }
+-  if (productLayout && productStartupWitness)
+-    retireSupervisorWitness(productLayout, productStartupWitness);
++  if (productLayout && productStartupWitness &&
++      !retireSupervisorWitness(productLayout, productWitness || productStartupWitness)) {
++    productFailure = 'PRODUCT_WITNESS_RETIRE_UNCONFIRMED';
++    void showProductDiagnostic();
++    return;
++  }
++  productTray?.destroy();
+   app.exit(2);
+ });
+ 
+--- prep-01/apps/desktop/main/lib/product-layout.js
++++ preview-02/apps/desktop/main/lib/product-layout.js
+@@ -58,7 +58,13 @@
+ function loadProductLayout(repo, fsImpl = fs) {
+   const root = path.resolve(repo);
+   const markerPath = path.join(root, 'installed-product.json');
+-  if (!fsImpl.existsSync(markerPath)) return null;
++  if (!fsImpl.existsSync(markerPath)) {
++    // A generated product tree must never silently become a development tree.
++    if (fsImpl.existsSync(path.join(root, 'runtime', 'electron')) ||
++        fsImpl.existsSync(path.join(root, 'bin', 'researchos.exe')))
++      throw refusal('PRODUCT_MANIFEST_UNAVAILABLE');
++    return null;
++  }
+   exactPath(root, 'directory', fsImpl);
+   const raw = fsImpl.readFileSync(exactPath(markerPath, 'file', fsImpl));
+   if (raw.length < 32 || raw.length > 1 << 20) throw refusal('PRODUCT_MANIFEST_SIZE');
+@@ -76,14 +82,14 @@
+       installationIdentity(marker) !== marker.installation_id)
+     throw refusal('PRODUCT_MANIFEST_INVALID');
+   const names = new Set();
+-  let previousName = '';
++  let previousPath = '';
+   for (const row of marker.files) {
+     if (!row || !HASH.test(row.sha256 || '') || !Number.isSafeInteger(row.bytes) || row.bytes < 0)
+       throw refusal('PRODUCT_MANIFEST_INVALID');
+     const name = row.path.toLocaleLowerCase('en-US');
+-    if (names.has(name) || (previousName && name <= previousName)) throw refusal('PRODUCT_MANIFEST_ALIAS');
++    if (names.has(name) || (previousPath && row.path <= previousPath)) throw refusal('PRODUCT_MANIFEST_ALIAS');
+     names.add(name);
+-    previousName = name;
++    previousPath = row.path;
+     const full = relativeFile(root, row.path, fsImpl);
+     const content = fsImpl.readFileSync(full);
+     if (content.length !== row.bytes || sha(content) !== row.sha256) throw refusal('PRODUCT_FILE_CHANGED');
+@@ -111,6 +117,15 @@
+     webDir: path.join(root, 'apps', 'web', 'dist'),
+     verifierManifest: path.join(root, 'apps', 'desktop', 'resources', 'control', 'runtime-verifier-installation.json'),
+     runtimeAssetsDir: path.join(root, 'apps', 'desktop', 'resources', 'control', 'runtime') });
++}
++
++function verifyProductParent(layout, parent, executable = process.execPath) {
++  if (folded(executable) !== folded(layout.electronExe) ||
++      parent?.PID !== process.pid ||
++      parent.ImageSHA256 !== layout.marker.binaries.electron.sha256 ||
++      !/^[0-9]+$/.test(parent.CreatedNS || ''))
++    throw refusal('PRODUCT_PARENT_IDENTITY');
++  return parent;
+ }
+ 
+ function validateProductPaths(layout, fsImpl = fs) {
+@@ -215,22 +230,24 @@
+ 
+ function createProductSafeExit({ management, ownedIdentity, confirm, retire, onExit, onRefused }) {
+   let pending = null;
++  let stopped = false;
+   return () => {
+     if (pending) return pending;
+     pending = (async () => {
+-      let owned;
+       try {
+-        owned = ownedIdentity(management);
+-        if (!owned) throw refusal('OWNED_CORE_IDENTITY_UNAVAILABLE');
+-        const result = await management.shutdown();
+-        if (!confirm(result, management, owned)) throw refusal('OWNED_EXIT_IDENTITY_UNCONFIRMED');
++        if (!stopped) {
++          const owned = ownedIdentity(management);
++          if (!owned) throw refusal('OWNED_CORE_IDENTITY_UNAVAILABLE');
++          const result = await management.shutdown();
++          if (!confirm(result, management, owned)) throw refusal('OWNED_EXIT_IDENTITY_UNCONFIRMED');
++          stopped = true;
++        }
++        if (retire() !== true) throw refusal('PRODUCT_WITNESS_RETIRE_UNCONFIRMED');
+       } catch (error) {
+         await onRefused(error);
+         throw error;
+       }
+-      let retired = false;
+-      try { retired = retire(); } catch {}
+-      await onExit(retired);
++      await onExit(true);
+     })().finally(() => { pending = null; });
+     return pending;
+   };
+@@ -239,4 +256,4 @@
+ module.exports = { SCHEMA, BINDING_SCHEMA, WITNESS_SCHEMA, installationIdentity,
+   inventoryIdentity, loadProductLayout, validateProductPaths, claimProductData,
+   writeStartupWitness, writeSupervisorWitness, retireSupervisorWitness,
+-  acceptProductIntent, createProductSafeExit };
++  acceptProductIntent, createProductSafeExit, verifyProductParent };
+--- prep-01/apps/cli/main.go
++++ preview-02/apps/cli/main.go
+@@ -37,14 +37,14 @@
+ 	}
+ 	// A product CLI owns no scheduler. Host-bound commands first discover or
+ 	// start the same per-user Electron parent that owns Core's private pipe.
+-	if requiresProductHost(cmd) {
++	if requiresProductHost(cmd, args[1:]...) {
+ 		if err := ensureProductHost(); err != nil {
+ 			fail(cmd, exitFailed, "PRODUCT_HOST_UNAVAILABLE", err.Error())
+ 		}
+ 	}
+ 	// The contract writes the interactive entry as `researchos [--project <path-or-id>]`, so an empty argv and a
+ 	// leading flag are the interactive command, not a help page. `chat` is not a contract command at all.
+-	if cmd == "" || (strings.HasPrefix(cmd, "--") && cmd != "--version" && cmd != "--help") {
++	if cmd == "" || cmd == "--project" {
+ 		cliInteractive(args)
+ 		return
+ 	}
+@@ -72,10 +72,14 @@
+ 	}
+ }
+ 
+-func requiresProductHost(cmd string) bool {
++func requiresProductHost(cmd string, rest ...string) bool {
+ 	switch cmd {
+ 	case "doctor", "version", "--version", "help", "--help", "/help", "commands":
+ 		return false
++	case "config":
++		return len(rest) > 0 && rest[0] == "set-model"
++	case "/model":
++		return true
+ 	}
+ 	if cmd == "" || cmd == "--project" || cmd == "task" || cmd == "run" || cmd == "worker" {
+ 		return true
+--- prep-01/apps/cli/cli_doctor.go
++++ preview-02/apps/cli/cli_doctor.go
+@@ -64,6 +64,10 @@
+ 	ip := net.ParseIP(u.Hostname())
+ 	if u.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback()) {
+ 		return fail("INVALID_LOCAL_URL", 2)
++	}
++	productHostID, err := productDoctorIdentity(d)
++	if err != nil {
++		return fail("PRODUCT_HOST_IDENTITY_UNCONFIRMED", 3)
+ 	}
+ 	out["host_url"], out["host_pid"] = d.URL, d.PID
+ 	client := &http.Client{Timeout: 6 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+@@ -147,6 +151,12 @@
+ 	if !ok || doc.ValidateDef("HostStatusResult", r) != nil || r["client_id"] != c.clientID {
+ 		return fail("INVALID_HOST_STATUS_RESULT", 1)
+ 	}
++	if productHostID != "" {
++		again, checkErr := productDoctorIdentity(d)
++		if checkErr != nil || again != productHostID || r["host_instance_id"] != productHostID {
++			return fail("PRODUCT_HOST_IDENTITY_CHANGED", 1)
++		}
++	}
+ 	protocols := r["protocol_versions"].([]any)
+ 	if len(protocols) != 1 || protocols[0] != clientProtocol {
+ 		return fail("UNSUPPORTED_HOST_PROTOCOL", 1)
+--- prep-01/apps/cli/cli_verbs.go
++++ preview-02/apps/cli/cli_verbs.go
+@@ -227,10 +227,19 @@
+ 	if err != nil || d.URL == "" {
+ 		fail("interactive", exitNotImplemented, "INTERACTIVE_HOST_UNAVAILABLE", path)
+ 	}
+-	cfg, _ := readConfig()
++	cfg, cfgErr := readConfig()
++	if productInstalled() && cfgErr != nil && !os.IsNotExist(cfgErr) {
++		fail("interactive", exitFailed, "CONFIG_UNREADABLE", cfgErr.Error())
++	}
+ 	c := newV2Context("interactive", args, cfg, d.URL)
+ 	if c.credential == "" {
+ 		fail("interactive", exitNotImplemented, "CREDENTIAL_ABSENT")
++	}
++	if productInstalled() {
++		if reason := productInteractiveSelectionReason(cfg, c.projectID); reason != "" {
++			fail("interactive", exitNotImplemented, reason,
++				"run researchos init <workspace-path> to select an owned project")
++		}
+ 	}
+ 	signals, stop := interruptGuard()
+ 	defer stop()
+@@ -321,6 +330,10 @@
+ 				}
+ 			}
+ 			if name == "run" || name == "/run" {
++				if productInstalled() && c.sessionID == "" && cfg.Model == "" {
++					fail("interactive", exitNotImplemented, "MODEL_CONFIGURATION_REQUIRED",
++						"save an offline model reference with researchos config set-model before creating a session")
++				}
+ 				prompt, _ := firstPositional(commandArgs)
+ 				if reason, code := cliInteractivePrepare(c, cfg, prompt, options, false); code != 0 {
+ 					out := map[string]any{"command": "interactive", "status": "REJECTED", "reason": reason, "exit_code": code, "requests_sent": c.requestLog}
+@@ -335,6 +348,16 @@
+ 			}
+ 		}
+ 	}
++}
++
++func productInteractiveSelectionReason(cfg cliConfig, requestedProject string) string {
++	if cfg.ProjectID == "" || cfg.WorkspaceRef == "" {
++		return "PROJECT_SELECTION_REQUIRED"
++	}
++	if requestedProject != cfg.ProjectID {
++		return "PROJECT_SELECTION_CONFLICT"
++	}
++	return ""
+ }
+ 
+ // Opening a session is read-only. An explicit ordinary message may acquire an
+--- prep-01/apps/cli/product_host_windows.go
++++ preview-02/apps/cli/product_host_windows.go
+@@ -396,6 +396,8 @@
+ 	return code != 259, nil // STILL_ACTIVE from GetExitCodeProcess.
+ }
+ 
++var productGone = productProcessGone
++
+ type productObservation struct {
+ 	State     string
+ 	Discovery discovery
+@@ -453,9 +455,12 @@
+ 		return bad("PRODUCT_DISCOVERY_URL")
+ 	}
+ 	if _, err := productObserve(uint32(d.PID)); err != nil {
+-		gone, checkErr := productProcessGone(uint32(d.PID))
++		gone, checkErr := productGone(uint32(d.PID))
+ 		if checkErr != nil {
+ 			return productObservation{State: "UNCERTAIN"}, checkErr
++		}
++		if gone && werr == nil && w.State == "STARTING" {
++			return productObservation{State: "STARTING", Witness: w}, nil
+ 		}
+ 		if gone && werr != nil {
+ 			return productObservation{State: "DEAD"}, nil
+@@ -581,6 +586,21 @@
+ 	return nil
+ }
+ 
++var productSnapshot = productReadSnapshot
++var productStatus = productNativeStatus
++
++func productDoctorIdentity(d discovery) (string, error) {
++	if currentProduct == nil {
++		return "", nil
++	}
++	observed, err := productReadSnapshot(currentProduct)
++	if err != nil || observed.State != "READY_CANDIDATE" || observed.Discovery.URL != d.URL ||
++		observed.Discovery.PID != d.PID || !productEqualPath(observed.Discovery.DataDir, d.DataDir) {
++		return "", errors.New("PRODUCT_HOST_IDENTITY_UNCONFIRMED")
++	}
++	return observed.HostID, nil
++}
++
+ func ensureProductHost() error {
+ 	p := currentProduct
+ 	if p == nil {
+@@ -589,27 +609,22 @@
+ 	if err := prepareProductData(p); err != nil {
+ 		return err
+ 	}
+-	observed, err := productReadSnapshot(p)
+-	if err != nil {
+-		return err
+-	}
+-	if observed.State == "READY_CANDIDATE" {
+-		return productNativeStatus(p, observed)
+-	}
+-	if observed.State != "ABSENT" && observed.State != "DEAD" && observed.State != "STARTING" {
++	observed, err := productSnapshot(p)
++	if err != nil {
++		return err
++	}
++	if observed.State != "READY_CANDIDATE" && observed.State != "ABSENT" && observed.State != "DEAD" && observed.State != "STARTING" {
+ 		return errors.New("PRODUCT_EXTERNAL_HOST_PRESENT")
+ 	}
+-	if observed.State != "STARTING" {
++	if observed.State == "ABSENT" || observed.State == "DEAD" {
+ 		if err := productLaunch(p); err != nil {
+ 			return err
+ 		}
+ 	}
+ 	deadline := productNow().Add(15 * time.Second)
+-	for productNow().Before(deadline) {
+-		productSleep(100 * time.Millisecond)
+-		observed, err = productReadSnapshot(p)
++	for {
+ 		if observed.State == "READY_CANDIDATE" && err == nil {
+-			if err = productNativeStatus(p, observed); err == nil {
++			if err = productStatus(p, observed); err == nil {
+ 				return nil
+ 			}
+ 		}
+@@ -617,6 +632,11 @@
+ 			strings.Contains(fmt.Sprint(err), "IDENTITY_CHANGED") || strings.Contains(fmt.Sprint(err), "CONFLICT") {
+ 			return err
+ 		}
++		if !productNow().Before(deadline) {
++			break
++		}
++		productSleep(100 * time.Millisecond)
++		observed, err = productSnapshot(p)
+ 	}
+ 	return fmt.Errorf("PRODUCT_HOST_READY_TIMEOUT:%v", err)
+ }
+--- prep-01/apps/cli/product_host_other.go
++++ preview-02/apps/cli/product_host_other.go
+@@ -13,8 +13,9 @@
+ func productConfigFile() string {
+ 	return cliEnv("RESEARCHOS_CLI_CONFIG", filepath.Join(".local", "v24_cli_config.json"))
+ }
+-func ensureProductHost() error      { return nil }
+-func productGuardPath(string) error { return nil }
++func ensureProductHost() error                        { return nil }
++func productGuardPath(string) error                   { return nil }
++func productDoctorIdentity(discovery) (string, error) { return "", nil }
+ func productNativeRequest(id string, request []byte) ([]byte, error) {
+ 	return cliNativeDial(host.PipeName(id), request)
+ }
+--- prep-01/apps/cli/product_host_windows_test.go
++++ preview-02/apps/cli/product_host_windows_test.go
+@@ -9,6 +9,7 @@
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"researchos.local/research-os/ops/supervisor"
+ )
+@@ -112,15 +113,108 @@
+ }
+ 
+ func TestProductHostStartsOnlyForBoundCommands(t *testing.T) {
+-	for _, command := range []string{"", "--project", "init", "goal", "status", "task"} {
++	for _, command := range []string{"", "--project", "init", "goal", "status", "task", "/model"} {
+ 		if !requiresProductHost(command) {
+ 			t.Fatalf("host-bound %q skipped", command)
+ 		}
+ 	}
+-	for _, command := range []string{"doctor", "version", "--version", "help", "--help", "/help", "commands", "typo"} {
++	if !requiresProductHost("config", "set-model") {
++		t.Fatal("config set-model skipped host")
++	}
++	for _, command := range []string{"doctor", "version", "--version", "help", "--help", "/help", "commands", "typo", "--unknown"} {
+ 		if requiresProductHost(command) {
+ 			t.Fatalf("read-only or invalid %q started host", command)
+ 		}
++	}
++	for _, args := range [][]string{{}, {"show"}, {"settle-run"}} {
++		if requiresProductHost("config", args...) {
++			t.Fatalf("local config %q started host", args)
++		}
++	}
++}
++
++func TestProductInteractiveRequiresSelectedProject(t *testing.T) {
++	if got := productInteractiveSelectionReason(cliConfig{}, ""); got != "PROJECT_SELECTION_REQUIRED" {
++		t.Fatal(got)
++	}
++	cfg := cliConfig{ProjectID: "project-one", WorkspaceRef: "workspace-one"}
++	if got := productInteractiveSelectionReason(cfg, "project-two"); got != "PROJECT_SELECTION_CONFLICT" {
++		t.Fatal(got)
++	}
++	if got := productInteractiveSelectionReason(cfg, "project-one"); got != "" {
++		t.Fatal(got)
++	}
++}
++
++func TestProductStartingIgnoresOnlyDeadPreviousDiscovery(t *testing.T) {
++	p := productFixture(t)
++	parent := productProcessIdentity{PID: 4102, CreatedNS: "124", ImageSHA256: strings.Repeat("c", 64)}
++	starting := productWitness{Schema: productWitnessSchema, State: "STARTING", InstallRoot: p.Root,
++		InstallationID: p.Marker.InstallationID, InventoryDigest: p.Marker.InventoryDigest,
++		DataRoot: p.Data, Nonce: "fresh", Parent: parent}
++	productWriteJSON(t, p.Witness, starting)
++	productWriteJSON(t, p.Discovery, map[string]any{"url": "http://127.0.0.1:4321/", "pid": 4101,
++		"data_dir": p.Data, "host_instance_id": "host-123456789abc"})
++	beforeObserve, beforeExtra, beforeGone := productObserve, productProcessExtra, productGone
++	productObserve = func(pid uint32) (supervisor.ProcessIdentity, error) {
++		if pid == parent.PID {
++			return supervisor.ProcessIdentity{PID: pid, CreatedNS: 124, ImageSHA256: parent.ImageSHA256}, nil
++		}
++		return supervisor.ProcessIdentity{}, errors.New("previous core exited")
++	}
++	productProcessExtra = func(pid uint32, image string, parentPID uint32) error {
++		if pid == parent.PID && image == p.Electron && parentPID == 0 {
++			return nil
++		}
++		return errors.New("wrong origin")
++	}
++	productGone = func(pid uint32) (bool, error) { return pid == 4101, nil }
++	t.Cleanup(func() { productObserve, productProcessExtra, productGone = beforeObserve, beforeExtra, beforeGone })
++	got, err := productReadSnapshot(p)
++	if err != nil || got.State != "STARTING" {
++		t.Fatalf("dead previous discovery: %s %v", got.State, err)
++	}
++	starting.State = "READY"
++	productWriteJSON(t, p.Witness, starting)
++	got, err = productReadSnapshot(p)
++	if err == nil || got.State != "FOREIGN" {
++		t.Fatalf("ready record with dead core: %s %v", got.State, err)
++	}
++}
++
++func TestEnsureProductHostWaitsForNativeReadyWithoutSecondLaunch(t *testing.T) {
++	p := productFixture(t)
++	previousProduct, previousSnapshot, previousStatus := currentProduct, productSnapshot, productStatus
++	previousLaunch, previousNow, previousSleep := productLaunch, productNow, productSleep
++	currentProduct = p
++	now := time.Unix(100, 0)
++	productNow = func() time.Time { return now }
++	productSleep = func(d time.Duration) { now = now.Add(d) }
++	launches, snapshots, checks := 0, 0, 0
++	productLaunch = func(*productLayout) error { launches++; return nil }
++	productSnapshot = func(*productLayout) (productObservation, error) {
++		snapshots++
++		if snapshots == 1 {
++			return productObservation{State: "ABSENT"}, nil
++		}
++		if snapshots == 2 {
++			return productObservation{State: "STARTING"}, nil
++		}
++		return productObservation{State: "READY_CANDIDATE"}, nil
++	}
++	productStatus = func(*productLayout, productObservation) error {
++		checks++
++		if checks == 1 {
++			return errors.New("native still starting")
++		}
++		return nil
++	}
++	t.Cleanup(func() {
++		currentProduct, productSnapshot, productStatus = previousProduct, previousSnapshot, previousStatus
++		productLaunch, productNow, productSleep = previousLaunch, previousNow, previousSleep
++	})
++	if err := ensureProductHost(); err != nil || launches != 1 || checks != 2 {
++		t.Fatalf("ready wait err=%v launches=%d checks=%d", err, launches, checks)
+ 	}
+ }
+ 
+--- prep-01/tests/ui/desktop/product-host.test.mjs
++++ preview-02/tests/ui/desktop/product-host.test.mjs
+@@ -29,6 +29,13 @@
+     fs.writeFileSync(full, bytes);
+     files.push({ path: rel, bytes: bytes.length, sha256: hash(bytes) });
+   }
++  for (const rel of ['runtime/LICENSE', 'runtime/chrome.pak']) {
++    const bytes = Buffer.from(`fixture ${rel}\n`);
++    const full = path.join(root, rel);
++    fs.mkdirSync(path.dirname(full), { recursive: true });
++    fs.writeFileSync(full, bytes);
++    files.push({ path: rel, bytes: bytes.length, sha256: hash(bytes) });
++  }
+   const binaries = Object.fromEntries(['cli', 'control', 'electron', 'verifier', 'validator']
+     .map((key, i) => [key, { path: files[i].path, sha256: files[i].sha256 }]));
+   files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+@@ -53,6 +60,26 @@
+   assert.throws(() => product.loadProductLayout(f.root), /PRODUCT_MANIFEST_INVALID/);
+ });
+ 
++test('generated tree refuses a removed marker while a development tree remains unmarked', t => {
++  const f = fixture(t);
++  fs.mkdirSync(path.join(f.root, 'runtime', 'electron'));
++  assert.equal(product.loadProductLayout(f.root).installID, f.marker.installation_id);
++  fs.rmSync(path.join(f.root, 'installed-product.json'));
++  assert.throws(() => product.loadProductLayout(f.root), /PRODUCT_MANIFEST_UNAVAILABLE/);
++  const dev = path.join(f.home, 'dev');
++  fs.mkdirSync(dev);
++  assert.equal(product.loadProductLayout(dev), null);
++});
++
++test('parent executable and image must match the bound Electron', t => {
++  const f = fixture(t);
++  const layout = product.loadProductLayout(f.root);
++  const parent = { PID: process.pid, CreatedNS: '123', ImageSHA256: f.marker.binaries.electron.sha256 };
++  assert.equal(product.verifyProductParent(layout, parent, layout.electronExe), parent);
++  assert.throws(() => product.verifyProductParent(layout, parent, process.execPath), /PRODUCT_PARENT_IDENTITY/);
++  assert.throws(() => product.verifyProductParent(layout, { ...parent, ImageSHA256: '0'.repeat(64) }, layout.electronExe), /PRODUCT_PARENT_IDENTITY/);
++});
++
+ test('duplicate intent is installation-bound; busy close retains host and confirmed stop exits', async () => {
+   const id = 'a'.repeat(64);
+   assert.equal(product.acceptProductIntent(id, { installation_id: id, intent: 'show-ui' }), 'show-ui');
+@@ -64,12 +91,26 @@
+     return { state: 'STOPPED', process_exit_confirmed: true }; } };
+   const safeExit = product.createProductSafeExit({ management,
+     ownedIdentity: () => ({ pid: 5 }), confirm: result => result.process_exit_confirmed,
+-    retire: () => false, onExit: async retired => { assert.equal(retired, false); exits++; },
++    retire: () => true, onExit: async retired => { assert.equal(retired, true); exits++; },
+     onRefused: async error => { assert.equal(error.code, 'SHUTDOWN_REFUSED'); refusals++; } });
+   await assert.rejects(safeExit(), /SHUTDOWN_REFUSED/);
+   assert.equal(exits, 0); assert.equal(refusals, 1);
+   await safeExit();
+   assert.equal(exits, 1); assert.equal(shutdownCalls, 2);
++});
++
++test('failed witness retirement keeps the host available and retries without a second shutdown', async () => {
++  let shutdowns = 0, retirements = 0, exits = 0;
++  const safeExit = product.createProductSafeExit({
++    management: { shutdown: async () => { shutdowns++; return { process_exit_confirmed: true }; } },
++    ownedIdentity: () => ({ pid: 5 }), confirm: result => result.process_exit_confirmed,
++    retire: () => ++retirements === 2,
++    onExit: async () => { exits++; }, onRefused: async () => {},
++  });
++  await assert.rejects(safeExit(), /PRODUCT_WITNESS_RETIRE_UNCONFIRMED/);
++  assert.equal(shutdowns, 1); assert.equal(exits, 0);
++  await safeExit();
++  assert.equal(shutdowns, 1); assert.equal(exits, 1);
+ });
+ 
+ test('data binding refuses another installation and witness retires only exact host', t => {
+--- prep-01/docs/installation/desktop-product-host.md
++++ preview-02/docs/installation/desktop-product-host.md
+@@ -9,3 +9,15 @@
+ The tray exposes Open, Diagnostics, and Safe Exit. Closing the window requests the same safe shutdown as Safe Exit. If shutdown is busy or uncertain, the window remains usable and exit is refused. Once exit is confirmed, a later open uses the same data, project, and session with a new Core process identity. An orphan Core is a refusal requiring diagnosis; this package does not adopt or kill it.
+ 
+ The build product and automated tests provide only source, package, and simulated identity evidence. They do not establish a real GUI session, nonempty-data reopen, installed Start Menu entry, upgrade, rollback, uninstall, or formal W20 acceptance.
++
++## Owned native qualification sequence
++
++This sequence is for a separately authorized native review of one freshly built layout. Set `LOCALAPPDATA` to a new, empty review directory before either entry point runs. Keep that value unchanged for every command and Desktop launch in the sequence; the data root will be `<LOCALAPPDATA>\ResearchOS\data`. Do not move the built layout after its marker is generated.
++
++1. Run `<layout>\bin\researchos.exe version` and inspect `installed-product.json` before any host-bound command. The product entry point is `<layout>\runtime\electron\electron.exe <layout>\apps\desktop`; the CLI starts the same Electron host for host-bound verbs.
++2. Start a local listener that only counts connections on a chosen loopback port. Run `<layout>\bin\researchos.exe config set-model --model openai/lifecycle-no-call --base-url https://127.0.0.1:<port>/v1 --config-revision 0 --default`. This sends `host.configure` with `credential_ref: null`; saving the unverified model reference does not call `provider.probe` or the listener. Confirm the listener count stays zero.
++3. Run `<layout>\bin\researchos.exe init <new-workspace-path>` and confirm the Native3 folder chooser. Record the resulting `project_id` and `workspace_ref`; keep the same config and data directory.
++4. Open the Desktop entry point. Select that project, then create one session using the saved `openai/lifecycle-no-call` model reference. Record the `session_id`. Session creation is an offline persistence check; do not send a message or request provider qualification.
++5. Run `<layout>\bin\researchos.exe status --project <project_id> --session <session_id>` while the Desktop host remains open. Use the tray Safe Exit or close the window. Confirm the private shutdown and process exit, then run the same status command again and open Desktop again. Compare the data, project and session IDs and observe a new Core process identity after the controlled restart.
++
++The local listener, data directory and workspace must be newly owned review inputs. A source or mock pass does not establish that this sequence succeeded; its native receipts are separate.

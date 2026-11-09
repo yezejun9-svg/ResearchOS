@@ -1,0 +1,84 @@
+--- freeze02/real-electron-flow.mjs
++++ revision03/real-electron-flow.mjs
+@@ -82,10 +82,61 @@
+     'PICKER_DEADLINE_MUST_FIT_FLOW_AND_CLEANUP');
+ }
+ 
++function decodeNativeReply(chosen) {
++  requireThat(typeof chosen?.stdout === 'string' && Buffer.byteLength(chosen.stdout) > 0 &&
++    Buffer.byteLength(chosen.stdout) <= 65536, 'NATIVE_REPLY_BOUNDED_UTF8_TEXT_REQUIRED');
++  let reply;
++  try { reply = JSON.parse(chosen.stdout); }
++  catch { throw Object.assign(new Error('NATIVE_REPLY_JSON_INVALID'), {code: 'NATIVE_REPLY_JSON_INVALID'}); }
++  requireThat(reply && typeof reply === 'object' && !Array.isArray(reply) &&
++    reply.schema === 'researchos.owned-native-path-entry/1', 'NATIVE_REPLY_SCHEMA_REQUIRED');
++  const phases = ['PREFLIGHT', 'DISCOVER_CHOOSER', 'INVALID_PATH', 'VALID_PATH'];
++  const statuses = ['BLOCKED', 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING'];
++  const authorizations = ['NOT_ESTABLISHED', 'UNKNOWN_NO_AUTHORIZATION_INFERRED_NO_RETRY',
++    'NO_VALID_OK_CONFIRMED', 'SHELL_CONFIRM_OBSERVED_MAIN_BINDING_NOT_YET_VERIFIED'];
++  const cleanups = ['NOT_NEEDED', 'OUTCOME_UNKNOWN_NO_FURTHER_CLICK_ROOT_JOB_REQUIRED',
++    'OWNED_IDCANCEL_CLOSED', 'OWNERSHIP_OR_CANCEL_UNKNOWN_ROOT_JOB_REQUIRED', 'OWNERSHIP_UNCONFIRMED_NO_CLICK'];
++  requireThat(phases.includes(reply.phase) && statuses.includes(reply.status) &&
++    authorizations.includes(reply.authorization_state) && cleanups.includes(reply.cleanup?.status) &&
++    typeof reply.cleanup.attempted === 'boolean' && Array.isArray(reply.history) && reply.history.length <= 512,
++    'NATIVE_REPLY_PHASE_STATUS_AUTH_CLEANUP_REQUIRED');
++  for (const field of ['clicked_ok', 'invalid_ok_attempted', 'valid_ok_attempted', 'outcome_uncertain']) {
++    requireThat(typeof reply[field] === 'boolean', 'NATIVE_REPLY_EXPLICIT_BOOLEAN_REQUIRED:' + field);
++  }
++  requireThat(reply.input_is_authorization === false && reply.actual_task_submissions === 0 &&
++    reply.model_outcome === 'NOT_RUN_ZERO_BUDGET' &&
++    (!Object.hasOwn(reply, 'invalid_kept_chooser_open') || typeof reply.invalid_kept_chooser_open === 'boolean'),
++    'NATIVE_REPLY_ZERO_BUDGET_INPUT_SEMANTICS_REQUIRED');
++  requireThat((reply.status === 'BLOCKED' && chosen.exit === 2 && typeof reply.reason === 'string' && reply.reason.length > 0 && reply.reason.length <= 2048) ||
++    (reply.status === 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING' && chosen.exit === 0), 'NATIVE_REPLY_EXIT_STATUS_MISMATCH');
++  requireThat((!reply.clicked_ok || reply.valid_ok_attempted) &&
++    (!reply.valid_ok_attempted || (reply.invalid_ok_attempted && reply.phase === 'VALID_PATH')) &&
++    (!reply.invalid_ok_attempted || ['INVALID_PATH', 'VALID_PATH'].includes(reply.phase)) &&
++    (!reply.invalid_kept_chooser_open || reply.invalid_ok_attempted) &&
++    (reply.authorization_state !== 'SHELL_CONFIRM_OBSERVED_MAIN_BINDING_NOT_YET_VERIFIED' || reply.clicked_ok) &&
++    (reply.status !== 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING' || reply.clicked_ok), 'NATIVE_REPLY_ATTEMPT_FLAGS_CONTRADICTORY');
++  return reply;
++}
++
++function observeNativeReply(reply) {
++  const noOk = reply.invalid_ok_attempted === false && reply.valid_ok_attempted === false && reply.clicked_ok === false;
++  let authorization = 'UNKNOWN_NO_AUTHORIZATION_INFERRED_NO_RETRY';
++  if (!reply.outcome_uncertain && noOk) authorization = 'NOT_ESTABLISHED_NO_OK_ATTEMPT_RECORDED';
++  else if (!reply.outcome_uncertain && !reply.valid_ok_attempted && reply.invalid_kept_chooser_open === true) {
++    authorization = 'INVALID_OK_REJECTED_NO_VALID_OK_CONFIRMED';
++  } else if (!reply.outcome_uncertain && reply.status === 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING') {
++    authorization = 'HELPER_REPORTED_SHELL_CONFIRM_REQUIRES_SUCCESS_EVIDENCE_AND_MAIN_BINDING';
++  }
++  return {phase: reply.phase, status: reply.status, reason: reply.reason || null,
++    invalid_ok_attempted: reply.invalid_ok_attempted, valid_ok_attempted: reply.valid_ok_attempted,
++    clicked_ok: reply.clicked_ok, outcome_uncertain: reply.outcome_uncertain,
++    helper_reported_authorization_state: reply.authorization_state, authorization_observation: authorization,
++    cleanup: reply.cleanup, no_ok_attempt_recorded: noOk};
++}
++
+ function parseNativeReply(chosen, core, fixture, invalid) {
+-  requireThat(chosen?.exit === 0 && typeof chosen.stdout === 'string' &&
+-    Buffer.byteLength(chosen.stdout) <= 65536, 'NATIVE_REPLY_COMPLETE_BOUNDED_UTF8_JSON_REQUIRED');
+-  const reply = JSON.parse(chosen.stdout);
++  const reply = decodeNativeReply(chosen);
++  requireThat(chosen.exit === 0, 'NATIVE_REPLY_NOT_SUCCESS');
+   requireThat(reply.schema === 'researchos.owned-native-path-entry/1' &&
+     reply.status === 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING' &&
+     reply.clicked_ok === true && reply.valid_ok_attempted === true && reply.invalid_ok_attempted === true &&
+@@ -326,6 +377,16 @@
+     // Preserve raw failure history before interpreting success. No truncation of
+     // helper JSON and no automatic second helper invocation after uncertainty.
+     write('native-folder-automation.json', chosen);
++    const envelope = decodeNativeReply(chosen);
++    state.native_helper_observation = observeNativeReply(envelope);
++    state.native_picker_cleanup = envelope.cleanup;
++    state.native_workspace_authorization = state.native_helper_observation.authorization_observation;
++    state.helper_pending = false;
++    activeRunEvidence.phase = 'NATIVE_HELPER_COMPLETE_' + envelope.phase;
++    if (envelope.status === 'BLOCKED') {
++      state.native_picker = state.native_helper_observation.no_ok_attempt_recorded ? 'BLOCKED_BEFORE_ANY_OK_ATTEMPT' : 'BLOCKED_AFTER_RECORDED_NATIVE_ATTEMPT';
++      throw Object.assign(new Error(envelope.reason), {code: 'NATIVE_HELPER_BLOCKED'});
++    }
+     const pickerResult = parseNativeReply(chosen, core, workspace, invalid);
+     requireThat(pickerResult.invalid_warning.caption === scope.native_picker.validation_warning.caption &&
+       pickerResult.invalid_warning.text === scope.native_picker.validation_warning.text, 'NATIVE_WARNING_PIN_MISMATCH');

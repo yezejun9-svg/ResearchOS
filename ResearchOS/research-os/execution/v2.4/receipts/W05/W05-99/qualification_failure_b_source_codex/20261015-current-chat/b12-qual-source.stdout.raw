@@ -1,0 +1,386 @@
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"time"
+)
+
+func runtimeTechnicalHash(r Object) string {
+	return Hash([]any{r["adapter"], r["adapter_revision"], r["capabilities"], r["platform"], r["measurement_mode"], r["credential_ref"]})
+}
+
+func qualificationTaskHash(t Object) string {
+	return Hash([]any{t["goal_id"], t["task_type"], t["input_refs"], t["requirement_refs"], t["context_bundle_id"], t["dependency_task_ids"], t["acceptance_contract"], t["stop_policy"]})
+}
+
+// qualificationUnlimitedPolicies is the explicit default-policy exception to
+// the LIVE upper-bound reservation. It never admits a CAPPED ancestor, even an
+// accounting-only one, and never reinterprets unknown cost as zero.
+func qualificationUnlimitedPolicies(policies []Object) error {
+	if len(policies) == 0 {
+		return Fail(422, "GATE_FAILED", "active budget ancestry required")
+	}
+	for _, p := range policies {
+		if p["mode"] != "UNLIMITED_AMOUNT" || p["cap"] != nil || p["unknown_cost_action"] != "ALLOW_AND_RECORD" {
+			return Fail(422, "GATE_FAILED", "LIVE unknown cost requires unlimited active ancestry")
+		}
+	}
+	return nil
+}
+
+func qualificationUnlimitedGoal(tx *sql.Tx, project, goalID string) error {
+	goal, e := load(tx, project, "Goal", goalID)
+	if e != nil {
+		return e
+	}
+	policies, e := budgetChain(tx, project, Str(goal, "budget_policy_id"))
+	if e != nil {
+		return e
+	}
+	return qualificationUnlimitedPolicies(policies)
+}
+
+// RegisterRuntimeQualificationPlan is a trusted local host decision, not an HTTP operation.
+// Its immutable profile is an ordinary sealed Artifact included in the Task inputs.
+func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, project, taskID, runtimeID string, profileRef Object, requiredCapabilities []any, maxValidity time.Duration, resumeCheckID string) error {
+	if maxValidity <= 0 || maxValidity > 30*24*time.Hour || profileRef["entity_type"] != "Artifact" || len(requiredCapabilities) == 0 {
+		return Fail(422, "GATE_FAILED", "bounded profile and capabilities required")
+	}
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	p, e := authenticate(tx, token)
+	if e != nil {
+		return e
+	}
+	if e = s.registerRuntimeQualificationPlanTx(tx, p, project, taskID, runtimeID, profileRef, requiredCapabilities, maxValidity, resumeCheckID); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+// registerRuntimeQualificationPlanTx preserves the trusted plan gates for atomic host preparation.
+func (s *Service) registerRuntimeQualificationPlanTx(tx *sql.Tx, p Principal, project, taskID, runtimeID string, profileRef Object, requiredCapabilities []any, maxValidity time.Duration, resumeCheckID string) error {
+	if maxValidity <= 0 || maxValidity > 30*24*time.Hour || profileRef["entity_type"] != "Artifact" || len(requiredCapabilities) == 0 {
+		return Fail(422, "GATE_FAILED", "bounded profile and capabilities required")
+	}
+	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
+		return Fail(403, "FORBIDDEN", "current project owner required")
+	}
+	t, e := load(tx, project, "Task", taskID)
+	if e != nil {
+		return e
+	}
+	r, e := load(tx, project, "RuntimeRegistration", runtimeID)
+	if e != nil {
+		return e
+	}
+	if t["status"] != "DRAFT" || t["task_type"] != "runtime_qualification" || len(Arr(t, "dependency_task_ids")) != 0 || r["status"] == "REVOKED" || r["status"] == "UNAVAILABLE" {
+		return Fail(409, "STATE_CONFLICT", "qualification plan requires an eligible draft and runtime")
+	}
+	profile, e := version(tx, project, profileRef)
+	if e != nil {
+		return e
+	}
+	if profile["validity"] != "CURRENT" || profile["sealed_at"] == nil || profile["content_hash"] != profileRef["content_hash"] || profile["access_class"] == "VERIFIER_ONLY" {
+		return Fail(422, "GATE_FAILED", "immutable sealed profile required")
+	}
+	if e = s.requireCurrentArtifactBody(tx, project, profile); e != nil {
+		return e
+	}
+	profileBody, e := runtimeProfileBody(tx, project, profile)
+	if e != nil {
+		return e
+	}
+	if profileBody["runtime_id"] != runtimeID || profileBody["technical_hash"] != runtimeTechnicalHash(r) || profileBody["adapter"] != r["adapter"] || profileBody["adapter_revision"] != r["adapter_revision"] || profileBody["platform"] != r["platform"] || Str(profileBody, "build_hash") == "" || Str(profileBody, "sandbox") == "" || Str(profileBody, "credential_revision") == "" || Str(profileBody, "backend") == "" || Str(profileBody, "model") == "" {
+		return Fail(422, "GATE_FAILED", "profile lacks frozen runtime identity or permission boundary")
+	}
+	if e = validateRuntimeModelConfig(profileBody); e != nil {
+		return e
+	}
+	if r["measurement_mode"] == "LIVE" {
+		maxCost, declared := profileBody["max_cost"]
+		if !declared {
+			return Fail(422, "GATE_FAILED", "LIVE qualification cost basis must be declared")
+		}
+		if maxCost == nil {
+			if e = qualificationUnlimitedGoal(tx, project, Str(t, "goal_id")); e != nil {
+				return e
+			}
+		} else {
+			cost, err := moneyAmount(maxCost)
+			if err != nil || cost.Sign() <= 0 || Str(maxCost.(map[string]any), "currency") == "" {
+				return Fail(422, "GATE_FAILED", "LIVE qualification needs positive frozen cost bound")
+			}
+		}
+	}
+	found := false
+	for _, v := range Arr(t, "input_refs") {
+		if Hash(v) == Hash(profileRef) {
+			found = true
+		}
+	}
+	if !found {
+		return Fail(422, "GATE_FAILED", "profile must be a frozen task input")
+	}
+	for _, v := range append(Arr(t, "input_refs"), Arr(t, "requirement_refs")...) {
+		if ref, ok := v.(map[string]any); !ok || ref["entity_type"] == "RuntimeRegistration" {
+			return Fail(422, "GATE_FAILED", "runtime lifecycle revision cannot be a qualification input")
+		}
+		if e = s.effective(tx, project, v.(map[string]any)); e != nil {
+			return e
+		}
+	}
+	known := map[string]bool{}
+	for _, v := range Arr(r, "capabilities") {
+		known[v.(string)] = true
+	}
+	for _, v := range requiredCapabilities {
+		cap, ok := v.(string)
+		if !ok || cap == "" || !known[cap] {
+			return Fail(422, "GATE_FAILED", "plan capability outside runtime registration")
+		}
+		if known["required:"+cap] {
+			return Fail(422, "GATE_FAILED", "duplicate plan capability")
+		}
+		known["required:"+cap] = true
+	}
+	root, e := authorityRoot(tx, p.ID)
+	if e != nil {
+		return e
+	}
+	plan := Object{"runtime_id": runtimeID, "profile_ref": profileRef, "task_hash": qualificationTaskHash(t), "required_capabilities": requiredCapabilities, "max_validity_seconds": int64(maxValidity.Seconds()), "resume_check_id": resumeCheckID}
+	if permission, ok := profileBody["model_qualification"].(map[string]any); ok {
+		if profileBody["backend"] != runtimeMuBackend {
+			return Fail(422, "GATE_FAILED", "model qualification requires the frozen Mu backend")
+		}
+		plan["model_qualification"] = permission
+	}
+	if _, e = tx.Exec("INSERT INTO runtime_bindings(project,runtime,profile_ref,profile_hash,technical_hash,owner) VALUES(?,?,?,?,?,?)", project, runtimeID, string(Bytes(profileRef)), Hash(profileRef), runtimeTechnicalHash(r), p.ID); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("INSERT INTO runtime_qualification_plans(project,task,runtime,plan,plan_hash,author,author_root) VALUES(?,?,?,?,?,?,?)", project, taskID, runtimeID, string(Bytes(plan)), Hash(plan), p.ID, root); e != nil {
+		return e
+	}
+	return nil
+}
+
+func qualificationPlan(tx *sql.Tx, project, taskID, runtimeID string) (Object, string, string, error) {
+	var raw, digest, root string
+	if e := tx.QueryRow("SELECT plan,plan_hash,author_root FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?", project, taskID, runtimeID).Scan(&raw, &digest, &root); e != nil {
+		return nil, "", "", Fail(422, "GATE_FAILED", "trusted host qualification plan required")
+	}
+	p, e := Decode([]byte(raw))
+	if e != nil || Hash(p) != digest {
+		return nil, "", "", Fail(422, "GATE_FAILED", "frozen qualification plan changed")
+	}
+	return p, digest, root, nil
+}
+
+func (s *Service) currentRuntimeBinding(tx *sql.Tx, project string, rt Object) (Object, Object, error) {
+	var raw, profileHash, technicalHash string
+	if e := tx.QueryRow("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?", project, rt["id"]).Scan(&raw, &profileHash, &technicalHash); e != nil {
+		return nil, nil, Fail(422, "GATE_FAILED", "runtime has no host profile binding")
+	}
+	ref, e := Decode([]byte(raw))
+	if e != nil || Hash(ref) != profileHash || runtimeTechnicalHash(rt) != technicalHash {
+		return nil, nil, Fail(412, "STALE_INPUT", "runtime technical profile changed")
+	}
+	profile, e := version(tx, project, ref)
+	if e != nil {
+		return nil, nil, e
+	}
+	if profile["content_hash"] != ref["content_hash"] {
+		return nil, nil, Fail(412, "STALE_INPUT", "profile changed")
+	}
+	if e = s.effective(tx, project, ref); e != nil {
+		return nil, nil, e
+	}
+	profileBody, e := runtimeProfileBody(tx, project, profile)
+	if e != nil {
+		return nil, nil, e
+	}
+	if profileBody["runtime_id"] != rt["id"] || profileBody["technical_hash"] != technicalHash {
+		return nil, nil, Fail(412, "STALE_INPUT", "frozen profile technical identity changed")
+	}
+	return ref, profile, nil
+}
+
+func runtimeProfileBody(tx *sql.Tx, project string, artifact Object) (Object, error) {
+	var raw []byte
+	if e := tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, artifact["storage_key"]).Scan(&raw); e != nil {
+		return nil, Fail(422, "GATE_FAILED", "sealed runtime profile unavailable")
+	}
+	if Digest(raw) != artifact["content_hash"] {
+		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "runtime profile bytes changed")
+	}
+	profile, e := Decode(raw)
+	if e != nil {
+		return nil, Fail(422, "GATE_FAILED", "runtime profile is not JSON")
+	}
+	return profile, nil
+}
+
+func runtimeProfileObserved(spec, profile Object) bool {
+	for _, field := range []string{"build_hash", "backend", "model", "sandbox", "platform", "adapter", "adapter_revision", "credential_revision"} {
+		if Str(profile, field) == "" || spec[field] != profile[field] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) reserveQualificationDispatch(tx *sql.Tx, project string, run, runtime Object) error {
+	_, profile, e := s.currentRuntimeBinding(tx, project, runtime)
+	if e != nil {
+		return e
+	}
+	profileBody, e := runtimeProfileBody(tx, project, profile)
+	if e != nil {
+		return e
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return e
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return e
+	}
+	requestID := "qualification-dispatch/" + Str(run, "id")
+	if profileBody["max_cost"] == nil {
+		if runtime["measurement_mode"] != "LIVE" {
+			return Fail(422, "GATE_FAILED", "LIVE unknown cost path required")
+		}
+		policies, _, err := runBudgetScopes(tx, project, Str(run, "id"))
+		if err != nil {
+			return err
+		}
+		if err = qualificationUnlimitedPolicies(policies); err != nil {
+			return err
+		}
+		// The actual MODEL effect records UNKNOWN/money=nil in brokerEffect.
+		// Do not create a second unresolved qualification-dispatch liability.
+		return nil
+	}
+	cost, e := moneyAmount(profileBody["max_cost"])
+	if e != nil || cost.Sign() <= 0 {
+		return Fail(422, "GATE_FAILED", "LIVE qualification cost bound missing")
+	}
+	_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": profileBody["max_cost"], "provider_request_id": requestID, "provider_event_id": requestID, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})
+	return e
+}
+
+func (s *Service) releaseQualificationReservation(tx *sql.Tx, project string, run Object) error {
+	requestID := "qualification-dispatch/" + Str(run, "id")
+	var raw string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.operation')='RESERVE'", project, requestID).Scan(&raw)
+	if e == sql.ErrNoRows {
+		return nil
+	}
+	if e != nil {
+		if !ok || tool["type"] != "function" {
+			return Fail(422, "GATE_FAILED", "only frozen function tools supported")
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok || Str(fn, "name") == "" || fn["parameters"] == nil {
+			return Fail(422, "GATE_FAILED", "complete function schema required")
+		}
+	}
+	if len(Str(profile, "bundle_hash")) != 71 {
+		return Fail(422, "GATE_FAILED", "frozen Mu bundle hash required")
+	}
+	if qualification, exists := profile["model_qualification"]; exists {
+		q, ok := qualification.(map[string]any)
+		if !ok || len(q) != 3 || q["route"] != config["route"] || Hash(q["model_config_hash"]) != Hash(Hash(config)) {
+			return Fail(422, "GATE_FAILED", "model qualification must bind the exact model configuration")
+		}
+		n, e := Num(q, "max_calls")
+		if e != nil || n < 1 || n > 2 {
+			return Fail(422, "GATE_FAILED", "model qualification allows at most two bounded calls")
+		}
+	}
+	return nil
+}
+
+func qualificationModelEffectAllowed(tx *sql.Tx, project string, task, payload Object) error {
+	if payload["capability"] != "MODEL" || task["task_type"] != "runtime_qualification" {
+		return Fail(503, "RESOURCE_UNAVAILABLE", "qualification grants no unplanned effect authority")
+	}
+	var runID, runtimeID string
+	var epoch int64
+	if e := tx.QueryRow("SELECT run,runtime,epoch FROM runtime_qualification_runs WHERE project=? AND task=?", project, task["id"]).Scan(&runID, &runtimeID, &epoch); e != nil {
+		return e
+	}
+	plan, _, _, e := qualificationPlan(tx, project, Str(task, "id"), runtimeID)
+	if e != nil {
+		return e
+	}
+	permission, ok := plan["model_qualification"].(map[string]any)
+	if !ok || permission["route"] != payload["route"] {
+		return Fail(403, "FORBIDDEN", "qualification has no exact model route permission")
+	}
+	dispatch, e := runtimeDispatch(tx, project, runID, epoch)
+	if e != nil {
+		return e
+	}
+	profile := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)["profile"].(map[string]any)
+	if profile["backend"] != runtimeMuBackend || Hash(profile["model_qualification"]) != Hash(permission) || permission["model_config_hash"] != Hash(profile["model_config"]) || plan["task_hash"] != qualificationTaskHash(task) {
+		return Fail(412, "STALE_INPUT", "model qualification authority changed")
+	}
+	return nil
+}
+
+// The SDK decides how to encode model context. The host checks authority and
+// bounded provider parameters before accepting that complete body for dispatch.
+func validateRuntimeModelRequest(config, payload Object) (Object, error) {
+	if len(payload) != 1 {
+		return nil, Fail(400, "INVALID_REQUEST", "model request must contain only body")
+	}
+	body, ok := payload["body"].(map[string]any)
+	if !ok || body["model"] != config["model"] || body["stream"] != true {
+		return nil, Fail(403, "FORBIDDEN", "model or transport differs from frozen configuration")
+	}
+	allowed := map[string]bool{"model": true, "messages": true, "stream": true, "stream_options": true, "max_tokens": true, "max_completion_tokens": true, "temperature": true, "top_p": true, "presence_penalty": true, "frequency_penalty": true, "reasoning_effort": true, "stop": true, "tools": true, "tool_choice": true, "parallel_tool_calls": true, "seed": true}
+	for key := range body {
+		if !allowed[key] {
+			return nil, Fail(403, "FORBIDDEN", "model parameter is not permitted: "+key)
+		}
+	}
+	max, _ := Num(config, "max_output_tokens")
+	bounded := false
+	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
+		if _, exists := body[key]; exists {
+			n, e := Num(body, key)
+			if e != nil || n < 1 || n > max {
+				return nil, Fail(403, "FORBIDDEN", "model output exceeds frozen bound")
+			}
+			bounded = true
+		}
+	}
+	if !bounded || len(Arr(body, "messages")) == 0 {
+		return nil, Fail(400, "INVALID_REQUEST", "complete bounded model context required")
+	}
+	tools := body["tools"]
+	if tools == nil {
+		tools = Empty()
+	}
+	if Hash(tools) != Hash(config["tools"]) {
+		return nil, Fail(403, "FORBIDDEN", "model tool schemas differ from frozen configuration")
+	}
+	raw, e := json.Marshal(body)
+	if e != nil || len(raw) > 48*1024 {
+		return nil, Fail(413, "INVALID_REQUEST", "model context exceeds bridge limit; context must be rebuilt")
+	}
+	return body, nil
+}
+adapters/runtime\bridge_windows.go:55:type BridgeFrame struct {
+adapters/runtime\bridge_windows.go:76:type BridgeJournal struct {
+internal/domain\runtime_broker_windows.go:335:func writeRuntimeFact(path string, raw []byte) error {
+internal/domain\runtime_dispatch.go:116:func runtimeDispatch(tx *sql.Tx, project, run string, epoch any) (Object, error) {
+internal/domain\runtime_tools_windows.go:16:func validateRuntimeToolArguments(config, payload Object) error {
+internal/domain\runtime_tools_windows.go:57:func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, route RuntimeCoordinatorRoute, task, dispatch Object, frame rt.BridgeFrame, payload Object) (RuntimeToolRequest, error) {

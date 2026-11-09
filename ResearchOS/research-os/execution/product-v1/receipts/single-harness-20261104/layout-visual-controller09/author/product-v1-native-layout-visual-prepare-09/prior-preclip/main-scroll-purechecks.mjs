@@ -1,0 +1,22 @@
+// Extract only candidate 09's initial scroll gate; no runner import or GUI.
+import fs from 'node:fs';
+import vm from 'node:vm';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+const here=path.dirname(fileURLToPath(import.meta.url));
+const source=fs.readFileSync(path.join(here,'real-electron-flow.mjs'),'utf8');
+const start=source.indexOf('const initialScrollReset = row =>');
+const end=source.indexOf('\n    visual.findings=',start);
+if(start<0||end<0||source.indexOf('const initialScrollReset = row =>',start+1)>=0) throw new Error('INITIAL_SCROLL_GATE_SOURCE_DRIFT');
+const gate=vm.runInNewContext(`(()=>{${source.slice(start,end)};return initialScrollReset})()`);
+const row=(document=0,transcript=0,main=0)=>({document:{scroll_y:document},transcript_scroll:{scroll_top:transcript},main_area_scroll:{scroll_top:main}});
+const check=(condition,name)=>{if(!condition)throw new Error(name)};
+check(gate(row()),'ZERO_SCROLL_REJECTED');
+check(!gate(row(1,0,0)),'DOCUMENT_SCROLL_ACCEPTED');
+check(!gate(row(0,1,0)),'TRANSCRIPT_SCROLL_ACCEPTED');
+check(!gate(row(0,0,1)),'MAIN_SCROLL_ACCEPTED');
+check(!gate({document:{scroll_y:0},transcript_scroll:{scroll_top:0}}),'MISSING_MAIN_ACCEPTED');
+check(source.includes("row.phase==='INITIAL_VIEWPORT' && !initialScrollReset(row)"),'INITIAL_ONLY_FINDING_MISSING');
+check(source.includes("mainArea.scrollTop=0"),'EXPLICIT_MAIN_RESET_MISSING');
+check(source.includes('main_area_scroll:{scroll_top:mainArea?.scrollTop??null'),'MAIN_OBSERVATION_MISSING');
+console.log(JSON.stringify({schema:'researchos.native-layout-visual09-main-scroll-pure/1',cases:['all_zero','document_nonzero','transcript_nonzero','main_nonzero','main_missing','initial_finding','explicit_reset','main_observation'],runner_import:0,app:0,native:0,cli:0,model:0,task:0}));

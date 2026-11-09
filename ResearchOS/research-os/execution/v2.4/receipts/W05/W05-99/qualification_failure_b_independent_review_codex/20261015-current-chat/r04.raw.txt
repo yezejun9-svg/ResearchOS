@@ -1,0 +1,433 @@
+241: 	subject     qualificationFailureSubject
+242: 	denial      *qualificationPreEffectRejection
+243: 	drain       qualificationBrokerDrain
+244: 	native      rt.QualificationNativeFacts
+245: 	observation Object
+246: 	run         Object
+247: 	task        Object
+248: 	dispatch    Object
+249: 	profileRef  Object
+250: 	ownerRoot   string
+251: }
+252: 
+253: type qualificationFailurePlan struct {
+254: 	core          Object
+255: 	proof         Object
+256: 	proofBytes    []byte
+257: 	proofArtifact Object
+258: 	link          Object
+259: 	run           Object
+260: 	state         Object
+261: 	event         Object
+262: 	observation   Object
+263: 	marker        Object
+264: 	uploadKey     string
+265: 	expiresAt     string
+266: 	observedAt    string
+267: 	sequence      int64
+268: 	dispatchSeq   int64
+269: 	author        Principal
+270: 	ownerRoot     string
+271: 	key           string
+272: 	requestHash   string
+273: }
+274: 
+275: func qualificationClosureKey(subject qualificationFailureSubject, digest string) string {
+276: 	return subject.run + "/" + strconv.FormatInt(subject.epoch, 10) + "/" + strings.TrimPrefix(digest, "sha256:")
+277: }
+278: 
+279: func cloneQualificationObject(source Object) (Object, error) { return Decode(Bytes(source)) }
+280: 
+281: func (c *RuntimeCoordinator) planQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, verified verifiedQualificationFailure) (qualificationFailurePlan, error) {
+282: 	var plan qualificationFailurePlan
+283: 	p, err := resourcePrincipal(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, "SCHEDULER")
+284: 	if err != nil {
+285: 		return plan, err
+286: 	}
+287: 	root, err := currentAuthorityRoot(tx, p.ID)
+288: 	if err != nil || root != verified.ownerRoot {
+289: 		return plan, qualificationDenialUnavailable("Host author root changed")
+290: 	}
+291: 	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, root)
+292: 	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(route.ProjectID, "", "", false) {
+293: 		return plan, qualificationDenialUnavailable("current Owner root unavailable")
+294: 	}
+295: 	state, err := singleton(tx, route.ProjectID, "ProjectState")
+296: 	if err != nil {
+297: 		return plan, err
+298: 	}
+299: 	stateCopy, err := cloneQualificationObject(state)
+300: 	if err != nil {
+301: 		return plan, err
+302: 	}
+303: 	runCopy, err := cloneQualificationObject(verified.run)
+304: 	if err != nil {
+305: 		return plan, err
+306: 	}
+307: 	observation, err := cloneQualificationObject(verified.observation)
+308: 	if err != nil {
+309: 		return plan, err
+310: 	}
+311: 	seq, err := Num(state, "event_sequence")
+312: 	if err != nil {
+313: 		return plan, err
+314: 	}
+315: 	var outboxSeq int64
+316: 	if err = tx.QueryRow(`SELECT coalesce(max(sequence),0) FROM outbox WHERE project=?`, route.ProjectID).Scan(&outboxSeq); err != nil {
+317: 		return plan, err
+318: 	}
+319: 	if outboxSeq > seq {
+320: 		seq = outboxSeq
+321: 	}
+322: 	if seq == 1<<63-1 {
+323: 		return plan, qualificationDenialUnavailable("event sequence exhausted")
+324: 	}
+325: 	seq++
+326: 	dispatchSeq, _ := Num(verified.dispatch, "observation_sequence")
+327: 	if verified.native.Journal.Sequence > dispatchSeq {
+328: 		dispatchSeq = verified.native.Journal.Sequence
+329: 	}
+330: 	if dispatchSeq == 1<<63-1 {
+331: 		return plan, qualificationDenialUnavailable("dispatch sequence exhausted")
+332: 	}
+333: 	dispatchSeq++
+334: 	observedAt := Now()
+335: 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+336: 	qf := observation["qualification_failure"].(map[string]any)
+337: 	qf["closure_observed_at"] = observedAt
+338: 	key := qualificationClosureKey(verified.subject, verified.denial.digest)
+339: 	uploadKey, artifactID, linkID, eventID, correlationID := ID(), ID(), ID(), ID(), ID()
+340: 	core := Object{"schema": "researchos.qualification-failure-plan-core.v1", "subject": Object{"project_id": route.ProjectID, "task_id": verified.subject.task, "run_id": verified.subject.run, "epoch": verified.subject.epoch}, "denial_digest": verified.denial.digest, "before_run_hash": Hash(verified.run), "before_state_hash": Hash(state), "before_dispatch_hash": Hash(verified.dispatch), "before_dispatch": verified.dispatch, "observation_hash": Hash(observation), "author": p.ID, "owner_root": root, "profile_ref": verified.profileRef, "upload_key": uploadKey, "artifact_id": artifactID, "impact_link_id": linkID, "event_id": eventID, "correlation_id": correlationID, "observed_at": observedAt, "expires_at": expiresAt, "event_sequence": seq, "dispatch_observation_sequence": dispatchSeq}
+341: 	proof := Object{"schema": "researchos.qualification-failure-proof.v1", "kind": onlineQualificationDenial, "plan_hash": Hash(core), "plan_core": core, "subject": core["subject"], "author": p.ID, "owner_root": root, "observed_at": observedAt, "rejection": verified.denial.receipt, "rejection_digest": verified.denial.digest, "model_effect_key": verified.native.Frames[1].Key, "model_route": verified.native.Frames[1].Route, "rejected_effect_key": verified.native.Frames[2].Key, "native": Object{"journal_hash": verified.native.RawJournalHash, "stdout_hash": verified.native.StdoutHash, "stderr_hash": verified.native.StderrHash, "ended": verified.native.Journal.Ended, "cancelled": verified.native.Journal.Cancelled, "timed_out": verified.native.Journal.Receipt.TimedOut, "exit_code": verified.native.Journal.Receipt.ExitCode, "frames": verified.native.Journal.Frames, "acknowledged": verified.native.Journal.Acknowledged}, "broker": Object{"accepted": verified.drain.accepted, "completed": verified.drain.completed, "pending": verified.drain.pending, "rejected_sequence": verified.drain.rejectedSeq, "frame_hashes": Object{"2": verified.drain.frameHashes[2], "3": verified.drain.frameHashes[3]}}, "derived_observation": observation, "limits": "specific Host first-gate TOOL dispatch only; no universal OS NO_EFFECT claim"}
+342: 	proofBytes := Bytes(proof)
+343: 	if len(proofBytes) == 0 || len(proofBytes) > 64*1024 {
+344: 		return plan, qualificationDenialUnavailable("bounded proof bytes unavailable")
+345: 	}
+346: 	artifact := Object{"id": artifactID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "media_type": "application/json", "content_hash": Digest(proofBytes), "storage_key": uploadKey, "byte_size": len(proofBytes), "input_refs": []any{verified.profileRef}, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": observedAt}
+347: 	link := Object{"id": linkID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "from_ref": Ref(artifact, "Artifact"), "to_ref": verified.profileRef, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty(), "status": "ACTIVE"}
+348: 	runRev, err := Num(runCopy, "revision")
+349: 	if err != nil || runRev == 1<<63-1 {
+350: 		return plan, qualificationDenialUnavailable("Run revision unavailable")
+351: 	}
+352: 	runCopy["revision"] = runRev + 1
+353: 	runCopy["updated_at"] = observedAt
+354: 	runCopy["status"] = "FAILED"
+355: 	runCopy["execution_report"] = "Host qualification first-gate TOOL denial; proof " + Digest(proofBytes) + "; native ended " + verified.native.Journal.Ended
+356: 	runCopy["exit_code"] = verified.native.Journal.Receipt.ExitCode
+357: 	runCopy["runtime_settled_at"] = observedAt
+358: 	runCopy["children_stopped"] = true
+359: 	runCopy["queue_empty"] = true
+360: 	runCopy["ended_at"] = observedAt
+361: 	stateRev, err := Num(stateCopy, "revision")
+362: 	if err != nil || stateRev == 1<<63-1 {
+363: 		return plan, qualificationDenialUnavailable("ProjectState revision unavailable")
+364: 	}
+365: 	stateCopy["revision"] = stateRev + 1
+366: 	stateCopy["updated_at"] = observedAt
+367: 	stateCopy["event_sequence"] = seq
+368: 	event := Object{"id": eventID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "sequence": seq, "event_type": "RUN_CHANGED", "aggregate_ref": Ref(runCopy, "Run"), "actor_id": p.ID, "correlation_id": correlationID, "causation_id": nil, "event_data_artifact_ref": nil}
+369: 	event["receipt_hash"] = Receipt(event)
+370: 	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": runCopy, "project_state": stateCopy, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": dispatchSeq, "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+371: 	requestHash := Digest(Bytes(Object{"core": core, "proof": proof}))
+372: 	marker := Object{"schema": "researchos.qualification-failure-closure.v1", "kind": onlineQualificationDenial, "key": key, "subject": core["subject"], "author": p.ID, "owner_root": root, "plan_hash": Hash(core), "plan_file_sha256": requestHash, "denial_digest": verified.denial.digest, "proof_ref": Ref(artifact, "Artifact"), "observation_hash": Hash(observation), "terminal_run_ref": Ref(runCopy, "Run"), "outcome_hash": outcomeHash}
+373: 	plan = qualificationFailurePlan{core: core, proof: proof, proofBytes: proofBytes, proofArtifact: artifact, link: link, run: runCopy, state: stateCopy, event: event, observation: observation, marker: marker, uploadKey: uploadKey, expiresAt: expiresAt, observedAt: observedAt, sequence: seq, dispatchSeq: dispatchSeq, author: p, ownerRoot: root, key: key, requestHash: requestHash}
+374: 	return plan, nil
+375: }
+376: 
+377: func (c *RuntimeCoordinator) verifyOnlineQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, runID string, epoch int64, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain, native rt.QualificationNativeFacts) (verifiedQualificationFailure, error) {
+378: 	var proof verifiedQualificationFailure
+379: 	bad := func(reason string) (verifiedQualificationFailure, error) {
+380: 		return proof, qualificationDenialUnavailable(reason)
+381: 	}
+382: 	if denial == nil || denial.digest == "" || denial.receipt == nil || denial.receipt["kind"] != onlineQualificationDenial || Hash(denial.receipt) != denial.digest || !drain.closed || drain.disqualified || drain.pending != 0 || drain.accepted != drain.completed || drain.rejectedSeq != 3 || drain.accepted != 2 || len(drain.frameHashes) != 2 || len(drain.completionSet) != 2 {
+383: 		return bad("private rejection or broker drain incomplete")
+384: 	}
+385: 	if drain.frameHashes[2] == "" || drain.frameHashes[3] == "" || drain.completionSet[2] == "" || drain.completionSet[3] == "" {
+386: 		return bad("broker completion census incomplete")
+387: 	}
+388: 	decoded, err := Decode(native.Rejection)
+389: 	if err != nil || Hash(decoded) != denial.digest || string(Bytes(decoded)) != string(Bytes(denial.receipt)) {
+390: 		return bad("immutable rejection differs")
+391: 	}
+392: 	j := native.Journal
+393: 	if len(native.Frames) != 3 || len(native.FrameHashes) != 3 || j.Frames != 3 || j.Acknowledged != 2 || !j.Cancelled || j.QueueRequired || j.QueueInitSequence != 0 || len(j.CommandReceipts) != 0 || j.Checkpoint != nil || j.CheckpointSequence != 0 || j.Paused || j.ProtocolComplete || native.AuxAfterThird || (j.State != "FAILED" && j.State != "UNKNOWN") || j.Reason != "qualification first dispatch gate denied TOOL" {
+394: 		return bad("raw native frame or cancellation closure differs")
+395: 	}
+396: 	f1, f2, f3 := native.Frames[0], native.Frames[1], native.Frames[2]
+397: 	if f1.Sequence != 1 || f1.Type != "context.ready" || f2.Sequence != 2 || f2.Type != "effect.request" || f2.Capability != "MODEL" || f3.Sequence != 3 || f3.Type != "effect.request" || f3.Capability != "TOOL" || f2.Key == "" || f3.Key == "" || f2.Key == f3.Key || Hash(f2) != drain.frameHashes[2] || Hash(f3) != drain.frameHashes[3] || Hash(f3) != denial.receipt["frame_hash"] || Digest(f3.Payload) != denial.receipt["raw_payload_hash"] {
+398: 		return bad("exact three-frame lineage differs")
+399: 	}
+400: 	if native.StdoutHash != j.StdoutHash || native.StderrHash != j.StderrHash || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
+401: 		return bad("native source closure incomplete")
+402: 	}
+403: 	run, err := load(tx, route.ProjectID, "Run", runID)
+404: 	if err != nil {
+405: 		return proof, err
+406: 	}
+407: 	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+408: 	if err != nil {
+409: 		return proof, err
+410: 	}
+411: 	dispatch, err := runtimeDispatch(tx, route.ProjectID, runID, epoch)
+412: 	if err != nil {
+413: 		return proof, err
+414: 	}
+415: 	manifest := dispatch["manifest"].(map[string]any)
+416: 	admission := manifest["admission"].(map[string]any)
+417: 	profile := admission["profile"].(map[string]any)
+418: 	modelConfig, configOK := profile["model_config"].(map[string]any)
+419: 	if !configOK || runTerminal(run) || run["status"] != "RUNNING" || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID || Hash(run["lease_epoch"]) != Hash(epoch) || dispatch["state"] != "STARTED" || dispatch["journal_locator"] != dispatch["dispatch_key"] || j.DispatchKey != dispatch["dispatch_key"] || j.ManifestHash != dispatch["manifest_hash"] || j.Worker != dispatch["worker"] || Hash(runtimeNativeIdentity(j.Identity)) != Hash(dispatch["identity"]) || admission["qualification_bootstrap"] != true || admission["mode"] != "LIVE" || Hash(admission["profile_ref"]) != admission["profile_hash"] || f2.Route != Str(modelConfig, "route") || f3.Route != f2.Route || run["checkpoint_artifact_id"] != nil {
+420: 		return bad("current qualification subject differs")
+421: 	}
+422: 	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+423: 	if err != nil {
+424: 		return proof, err
+425: 	}
+426: 	var markerCount int
+427: 	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND profile_hash=? AND owner_root=?`, route.ProjectID, task["id"], runID, route.RuntimeID, epoch, planHash, admission["profile_hash"], root).Scan(&markerCount); err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || denial.receipt["plan_hash"] != planHash {
+428: 		return bad("qualification marker changed")
+429: 	}
+430: 	for field, actual := range map[string]any{"project_id": route.ProjectID, "task_id": task["id"], "run_id": runID, "runtime_id": route.RuntimeID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "frame_key": f3.Key, "frame_route": f3.Route} {
+431: 		if Hash(denial.receipt[field]) != Hash(actual) {
+432: 			return bad("rejection subject changed: " + field)
+433: 		}
+434: 	}
+435: 	var queueCount int
+436: 	if err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=?`, route.ProjectID, runID).Scan(&queueCount); err != nil || queueCount != 0 {
+437: 		return bad("qualification has client queue state")
+438: 	}
+439: 	var effects, rejected, unknown int
+440: 	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END),sum(CASE WHEN json_extract(body,'$.state') IN ('UNKNOWN','NOT_APPLIED') THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, f3.Key, route.ProjectID, runID).Scan(&effects, &rejected, &unknown); err != nil || effects != 1 || rejected != 0 || unknown != 0 {
+441: 		return bad("effect history differs from sole confirmed MODEL")
+442: 	}
+443: 	effect, err := latestEffect(tx, route.ProjectID, runID, f2.Key)
+444: 	if err != nil {
+445: 		return proof, err
+446: 	}
+447: 	request, _ := effect["payload"].(map[string]any)
+448: 	modelPayload, payloadErr := Decode(f2.Payload)
+449: 	if payloadErr != nil || effect["state"] != "CONFIRMED" || request["capability"] != "MODEL" || request["route"] != f2.Route || Hash(request["payload"]) != Hash(modelPayload) || effect["receipt"] == nil || effect["key"] != f2.Key || effect["epoch"] != nil && Hash(effect["epoch"]) != Hash(epoch) {
+450: 		return bad("MODEL effect receipt or request differs")
+451: 	}
+452: 	var ledgerRows int
+453: 	var ledgerRaw string
+454: 	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, route.ProjectID, runID).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+455: 		return bad("monetary ledger census differs")
+456: 	}
+457: 	ledger, err := Decode([]byte(ledgerRaw))
+458: 	if err != nil || ledger["provider_request_id"] != f2.Key || ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["cost_basis"] != "UNKNOWN" {
+459: 		return bad("original MODEL unknown cost changed")
+460: 	}
+461: 	rawObservation, err := j.Observation()
+462: 	if err != nil {
+463: 		return proof, err
+464: 	}
+465: 	observation := Object(rawObservation)
+466: 	observation["state"] = "FAILED"
+467: 	observation["queue_empty"] = true
+468: 	observation["protocol"] = Object{"settled": false, "frames": int64(3), "acknowledged": int64(2), "verified_rejected": int64(1)}
+469: 	observation["qualification_failure"] = Object{"kind": onlineQualificationDenial, "denial_digest": denial.digest, "raw_bridge_hash": native.RawJournalHash, "raw_stdout_hash": native.StdoutHash, "raw_stderr_hash": native.StderrHash, "frame_hashes": []any{Hash(f1), Hash(f2), Hash(f3)}, "broker_accepted": drain.accepted, "broker_completed": drain.completed, "broker_pending": drain.pending, "original_cause": denial.receipt["first_cause"], "raw_cancelled": j.Cancelled, "raw_timed_out": j.Receipt.TimedOut, "raw_exit_code": j.Receipt.ExitCode, "native_ended": j.Ended, "closure_observed_at": Now()}
+470: 	profileRef, refOK := admission["profile_ref"].(map[string]any)
+471: 	if !refOK {
+472: 		return bad("profile reference missing")
+473: 	}
+474: 	proof = verifiedQualificationFailure{subject: qualificationFailureSubject{project: route.ProjectID, task: Str(task, "id"), run: runID, epoch: epoch}, denial: denial, drain: drain, native: native, observation: observation, run: run, task: task, dispatch: dispatch, profileRef: Object(profileRef), ownerRoot: root}
+475: 	return proof, nil
+476: }
+477: 
+478: func (c *RuntimeCoordinator) closeOnlineQualificationFailure(ctx context.Context, route RuntimeCoordinatorRoute, runID string, epoch int64, locator string, bridge *rt.Bridge, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain) error {
+479: 	if denial == nil || bridge == nil || locator == "" || !strings.EqualFold(filepath.Clean(bridge.Directory()), filepath.Clean(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator))) {
+480: 		return qualificationDenialUnavailable("native dispatch directory differs")
+481: 	}
+482: 	native, err := rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+483: 	if err != nil {
+484: 		return err
+485: 	}
+486: 	decodedRejection, decodeErr := Decode(native.Rejection)
+487: 	if decodeErr != nil || Hash(decodedRejection) != denial.digest || string(Bytes(decodedRejection)) != string(Bytes(denial.receipt)) {
+488: 		return qualificationDenialUnavailable("immutable rejection differs on replay")
+489: 	}
+490: 	// A repeated request can observe the already committed terminal marker.
+491: 	// The private consumer, not the caller's denial flag, proves that replay.
+492: 	replayTx, err := c.service.DB.BeginTx(ctx, nil)
+493: 	if err != nil {
+494: 		return err
+495: 	}
+496: 	priorClosure, priorErr := c.service.validatedQualificationFailureTx(replayTx, route.ProjectID, Str(denial.receipt, "task_id"), runID, epoch)
+497: 	if priorErr == nil && priorClosure.subject() == (qualificationFailureSubject{project: route.ProjectID, task: Str(denial.receipt, "task_id"), run: runID, epoch: epoch}) {
+498: 		key := qualificationClosureKey(priorClosure.subject(), denial.digest)
+499: 		var priorRaw string
+500: 		if readErr := replayTx.QueryRow(`SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND key=?`, route.ProjectID, key).Scan(&priorRaw); readErr == nil {
+501: 			marker, markerErr := Decode([]byte(priorRaw))
+502: 			if markerErr == nil && marker["denial_digest"] == denial.digest && Hash(marker["proof_ref"]) == Hash(priorClosure.proofRef()) {
+503: 				replayTx.Rollback()
+504: 				return nil
+505: 			}
+506: 		}
+507: 	}
+508: 	replayTx.Rollback()
+509: 	preflight, err := c.service.DB.BeginTx(ctx, nil)
+510: 	if err != nil {
+511: 		return err
+512: 	}
+513: 	if err = resourceWriteLock(preflight); err != nil {
+514: 		preflight.Rollback()
+515: 		return err
+516: 	}
+517: 	verified, err := c.verifyOnlineQualificationFailureTx(preflight, route, runID, epoch, denial, drain, native)
+518: 	if err != nil {
+519: 		preflight.Rollback()
+520: 		return err
+521: 	}
+522: 	plan, err := c.planQualificationFailureTx(preflight, route, verified)
+523: 	preflight.Rollback()
+524: 	if err != nil {
+525: 		return err
+526: 	}
+527: 	c.boundary("qualification_plan_frozen", plan.core)
+528: 	// Re-read the immutable native files after planning. No in-memory journal or
+529: 	// caller-supplied flag can stand in for the source bytes at the write gate.
+530: 	native, err = rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+531: 	if err != nil {
+532: 		return err
+533: 	}
+534: 	tx, err := c.service.DB.BeginTx(ctx, nil)
+535: 	if err != nil {
+536: 		return err
+537: 	}
+538: 	defer tx.Rollback()
+539: 	if err = resourceWriteLock(tx); err != nil {
+540: 		return err
+541: 	}
+542: 	var priorRaw string
+543: 	prior := tx.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-failure-closure' AND key=?`, plan.author.ID, route.ProjectID, plan.key).Scan(&priorRaw)
+544: 	if prior == nil {
+545: 		closure, checkErr := c.service.validatedQualificationFailureTx(tx, route.ProjectID, verified.subject.task, runID, epoch)
+546: 		if checkErr == nil && Hash(closure.proofRef()) == Hash(plan.marker["proof_ref"]) {
+547: 			return nil
+548: 		}
+549: 		return qualificationDenialUnavailable("conflicting completed closure marker")
+550: 	}
+551: 	if prior != sql.ErrNoRows {
+552: 		return prior
+553: 	}
+554: 	current, err := c.verifyOnlineQualificationFailureTx(tx, route, runID, epoch, denial, drain, native)
+555: 	if err != nil {
+556: 		return err
+557: 	}
+558: 	qf := current.observation["qualification_failure"].(map[string]any)
+559: 	qf["closure_observed_at"] = plan.observedAt
+560: 	if Hash(current.run) != plan.core["before_run_hash"] || Hash(current.dispatch) != plan.core["before_dispatch_hash"] || Hash(current.observation) != Hash(plan.observation) || Hash(current.profileRef) != Hash(verified.profileRef) || current.ownerRoot != plan.ownerRoot {
+561: 		return qualificationDenialUnavailable("planned qualification facts changed")
+562: 	}
+563: 	state, err := singleton(tx, route.ProjectID, "ProjectState")
+564: 	if err != nil || Hash(state) != plan.core["before_state_hash"] {
+565: 		return qualificationDenialUnavailable("ProjectState changed before closure")
+566: 	}
+567: 	if err = c.service.applyQualificationFailureTx(tx, current, plan); err != nil {
+568: 		return err
+569: 	}
+570: 	if err = tx.Commit(); err != nil {
+571: 		return err
+572: 	}
+573: 	return nil
+574: }
+575: 
+576: func (s *Service) applyQualificationFailureTx(tx *sql.Tx, verified verifiedQualificationFailure, plan qualificationFailurePlan) error {
+//go:build windows
+
+package runtime
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestQualificationRejectionReceiptPrivateCreateNew(t *testing.T) {
+	private := t.TempDir()
+	if _, err := PrivateDirectory(private); err != nil {
+		t.Fatal(err)
+	}
+	first := []byte(`{"schema":"first-gate","outcome":"NO_EFFECT"}`)
+	if err := PersistQualificationRejection(private, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistQualificationRejection(private, []byte(`{"replaced":true}`)); err == nil {
+		t.Fatal("immutable receipt overwritten")
+	}
+	got, err := os.ReadFile(filepath.Join(private, qualificationRejectionFile))
+	if err != nil || string(got) != string(first) {
+		t.Fatalf("create-new receipt changed: %v", err)
+	}
+	permissive := t.TempDir()
+	if err := PersistQualificationRejection(permissive, first); err == nil {
+		t.Fatal("permissive DACL accepted")
+	}
+	if _, err := os.Stat(filepath.Join(permissive, qualificationRejectionFile)); !os.IsNotExist(err) {
+		t.Fatal("rejected DACL wrote receipt")
+	}
+	if err := PersistQualificationRejection(private, nil); err == nil {
+		t.Fatal("empty receipt accepted")
+	}
+	if err := PersistQualificationRejection(private, make([]byte, 64*1024+1)); err == nil {
+		t.Fatal("oversized receipt accepted")
+	}
+}
+
+func TestQualificationRejectionReparseAncestorRefused(t *testing.T) {
+	private := t.TempDir()
+	if _, err := PrivateDirectory(private); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "dispatch-link")
+	if err := os.Symlink(private, link); err != nil {
+		quote := func(path string) string { return `'` + strings.ReplaceAll(path, `'`, `''`) + `'` }
+		command := `New-Item -ItemType Junction -Path ` + quote(link) + ` -Target ` + quote(private) + ` -ErrorAction Stop | Out-Null`
+		if output, junctionErr := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput(); junctionErr != nil {
+			t.Fatalf("cannot create reparse ancestor: symlink=%v junction=%v output=%s", err, junctionErr, output)
+		}
+	}
+	if err := PersistQualificationRejection(link, []byte(`{"outcome":"NO_EFFECT"}`)); err == nil {
+		t.Fatal("reparse ancestor accepted")
+	}
+	if _, err := os.Stat(filepath.Join(private, qualificationRejectionFile)); !os.IsNotExist(err) {
+		t.Fatal("reparse denial wrote target receipt")
+	}
+}
+
+func TestBridgeCancelKeepsFirstCause(t *testing.T) {
+	w := &Bridge{directory: t.TempDir(), cancel: func() {}, journal: BridgeJournal{State: "STARTED"}}
+	w.Cancel("qualification first dispatch gate denied TOOL")
+	w.Cancel("protocol reconciliation failed")
+	j := w.Read()
+	if !j.Cancelled || j.Reason != "qualification first dispatch gate denied TOOL" {
+		t.Fatalf("first cause lost: %+v", j)
+	}
+	if _, err := ReadBridgeTerminal(w.Directory(), "missing-manifest"); err == nil {
+		t.Fatal("cancel-only journal accepted as terminal")
+	}
+}
+
+154:func TestQualificationFailureFirstGateRefusalMatrix(t *testing.T) {
+240:func TestQualificationFailureControlledLiveFirstGate(t *testing.T) {
+347:func TestQualificationFailurePrivateConsumerRejectsTampering(t *testing.T) {
+410:				t.Fatalf("tamper fixture did not alter a row: rows=%d err=%v", rows, rowsErr)
+426:		t.Fatal("revoked current Owner still authorized closure")
+430:func TestQualificationFailureNativeSourceTamperingRefused(t *testing.T) {
+461:func TestQualificationFailureGenericThirdFrameDoesNotConvert(t *testing.T) {
+497:func TestQualificationFailureReceiptConflictStaysUnknown(t *testing.T) {
+560:func TestQualificationFailureHeartbeatAfterFrozenPlanRefused(t *testing.T) {
+613:func TestQualificationFailureBlockedModelBrokerCannotClose(t *testing.T) {
+685:func TestQualificationFailureClosureAtomicFaultMatrix(t *testing.T) {
+{
+  "tag": "b78-final-focused", "show_stdout": true, "show_stderr": true,
+  "argv": ["D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe", "test", "-count=1", "-timeout", "120s", "-run", "^Test(QualificationFailure|QualificationBrokerDrain|QualificationRejection|BridgeCancelKeepsFirstCause)", "-v", "./internal/domain", "./adapters/runtime"],
+  "cwd": "D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-20261015",
+  "env_allowlist": {
+    "GOPATH": "D:/作品集/ResearchOS/research-os/.local/tools/gopath", "GOCACHE": "D:/作品集/ResearchOS/research-os/.local/tools/gocache", "GOTMPDIR": "D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-20261015/.local-build/btmp", "TEMP": "D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-20261015/.local-build/btmp", "TMP": "D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-20261015/.local-build/btmp"
+  }
+}
+

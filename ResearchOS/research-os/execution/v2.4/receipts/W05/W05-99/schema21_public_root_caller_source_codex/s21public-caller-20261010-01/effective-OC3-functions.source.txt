@@ -1,0 +1,124 @@
+def validate_root_capture(binding, raw, expected_refs, operation=None, peer_actor=None):
+    """Three actual Root records, typed return provenance and complete exact refs."""
+    first, last = original_capture_rows(binding, raw)
+    need(operation in CAPTURE_OPERATIONS and binding.get('operation') == operation, 'EXTERNAL_CAPTURE_OPERATION')
+    call, output = (first['payload'], last['payload'])
+    call_id = binding.get('original_call_id')
+    need(type(call_id) is str and call_id, 'EXTERNAL_CALL_ID_REQUIRED')
+    need(first.get('type') == last.get('type') == 'response_item' and call.get('type') in ('custom_tool_call', 'function_call') and (output.get('type') in ('custom_tool_call_output', 'function_call_output')) and (call.get('call_id') == output.get('call_id') == call_id) and (call.get('name') in {'exec', 'functions.exec', 'exec_command', 'functions.exec_command'}) and (call.get('name') in {'exec_command', 'functions.exec_command'} or (type(call.get('input', call.get('arguments'))) is str and 'tools.exec_command' in call.get('input', call.get('arguments')))) and (type(call.get('input', call.get('arguments'))) is str) and ('PUBLIC21_CAPTURE_OPERATION:' + operation in call.get('input', call.get('arguments'))) and output.get('output'), 'COMPLETE_EXTERNAL_ROOT_PAIR_REQUIRED')
+    need(binding.get('tool_call_timestamp') == first['timestamp'] and binding.get('tool_result_timestamp') == last['timestamp'], 'EXTERNAL_PAIR_ORIGINAL_TIMESTAMPS')
+    hosts = [x for x in structured_documents(output['output']) if type(x.get('chunk_id')) is str and x.get('chunk_id') and (type(x.get('exit_code')) is int) and (x.get('exit_code') == 0) and (type(x.get('output')) is str)]
+    need(len(hosts) == 1, 'EXPECTED_ACTUAL_EXEC_HOST_RESULT')
+    result_docs = [x for x in structured_documents(hosts[0]['output']) if x.get('schema') == CAPTURE_RESULT_SCHEMA]
+    need(len(result_docs) == 1, 'EXPECTED_TYPED_ROOT_CAPTURE_RESULT')
+    observed = result_docs[0]
+    need(observed.get('issued_by') == observed.get('observer_actor') == ROOT and observed.get('root_thread_id') == ROOT_THREAD and (observed.get('operation') == operation) and (observed.get('source') == 'tools.exec_command') and (observed.get('formal_acceptance') is False) and (exact_ref_set(observed.get('observed_refs')) == exact_ref_set(expected_refs)), 'EXTERNAL_PAIR_DOES_NOT_BIND_REVIEW_REFS')
+    if peer_actor is not None:
+        need(observed.get('peer_actor') == peer_actor and binding.get('peer_delivery_binding_ref') is not None, 'ACTUAL_NONAUTHOR_PEER_REQUIRED')
+        _, received = validate_peer_delivery(binding['peer_delivery_binding_ref'], expected_refs, peer_actor, operation)
+        need(received <= when(first['timestamp']), 'ROOT_WITNESS_PRECEDES_PEER_DELIVERY')
+    else:
+        need(observed.get('peer_actor') is None, 'EXTERNAL_CAPTURE_ACTOR_CONTEXT')
+    return True
+
+def runtime_review_chain(qualification_ref, qualification, contract):
+    need(qualification.get('schema') == 'researchos.root-public21-qualified-runtime.v1' and qualification.get('root_thread_id') == ROOT_THREAD and (qualification.get('issued_by') == ROOT), 'QUALIFIED_RUNTIME_ACTUAL_REVIEW_CHAIN_REQUIRED')
+    payload = doc(qualification['payload_ref'])
+    projected = {k: v for k, v in qualification.items() if k not in {'payload_ref', 'root_issuance_binding_ref', 'schema', 'created_utc'}}
+    need(payload.get('schema') == 'researchos.root-public21-runtime-qualification-payload.v1' and {k: v for k, v in payload.items() if k != 'schema'} == projected, 'QUALIFICATION_PAYLOAD_EXACT_BINDING')
+    author = qualification.get('review_author')
+    need(type(author) is str and re.fullmatch('codex:/root/[a-z0-9_]+', author) and (author not in (ROOT, CALLER_AUTHOR, BUILDER_AUTHOR)), 'QUALIFIED_RUNTIME_REVIEW_REQUIRED')
+    source_ref, source_mf_ref = (qualification['source_hdf_ref'], qualification['source_mf_ref'])
+    source, source_mf = (doc(source_ref), manifest(source_mf_ref))
+    need(same_ref(source_ref, pin(N / 'HDF.json')) and same_ref(source_mf_ref, pin(N / 'MF.json')) and (source.get('source_author') == CALLER_AUTHOR) and same_ref(source['manifest_ref'], source_mf_ref) and same_ref(source['caller_ref'], qualification['caller_ref']) and same_ref(qualification['caller_ref'], pin(__file__)) and (doc(qualification['runner_contract_ref']) == contract), 'RUNTIME_REVIEW_SOURCE_PINS')
+    scope_ref = qualification['qualification_scope_ref']
+    scope = doc(scope_ref)
+    need(scope.get('schema') == 'researchos.root-public21-runtime-qualification-scope.v1' and scope.get('issued_by') == ROOT and (scope.get('root_thread_id') == ROOT_THREAD) and (scope.get('slice_id') == 'PUBLIC21_RUNTIME_RESOURCE_QUALIFICATION') and (scope.get('formal_acceptance') is False) and (scope.get('execution_grant') is False) and same_ref(scope['source_hdf_ref'], source_ref) and same_ref(scope['source_mf_ref'], source_mf_ref) and same_ref(scope['caller_ref'], qualification['caller_ref']) and same_ref(scope['runner_contract_ref'], qualification['runner_contract_ref']) and (when(scope['lease_expires_at']) > datetime.now(timezone.utc)), 'RUNTIME_ROOT_QUALIFICATION_SCOPE')
+    review_refs = [qualification[k] for k in ('review_hdf_ref', 'review_mf_ref', 'review_decision_ref')]
+    review, review_mf, decision = (doc(review_refs[0]), manifest(review_refs[1]), doc(review_refs[2]))
+    need(review.get('schema') == 'researchos.public21-runtime-independent-review-hdf.v1' and review.get('review_author') == decision.get('review_author') == author and (review.get('source_author') == decision.get('source_author') == CALLER_AUTHOR) and (review.get('runner_source_author') == decision.get('runner_source_author') == BUILDER_AUTHOR) and (review.get('root_thread_id') == decision.get('root_thread_id') == ROOT_THREAD) and same_ref(review['manifest_ref'], review_refs[1]) and same_ref(review['decision_ref'], review_refs[2]) and any((same_ref(review_refs[2], ref) for ref in review_mf['members'])), 'RUNTIME_REVIEW_HDF_MF_BINDING')
+    need(decision.get('schema') == 'researchos.public21-runtime-independent-review-decision.v1' and decision.get('independent_non_author') is True and (decision.get('verdict') == 'RUNTIME_CLOSURE_ACCEPTED') and (decision.get('formal_acceptance') is False) and (decision.get('execution_grant') is False) and (decision.get('resource_refs') == qualification['resource_refs']) and (exact_ref_set(decision['resource_refs']) == exact_ref_set(qualification['resource_refs'])), 'RUNTIME_DECISION_BINDING')
+    for name, ref in (('source_hdf_ref', source_ref), ('source_mf_ref', source_mf_ref), ('caller_ref', qualification['caller_ref']), ('runner_contract_ref', qualification['runner_contract_ref']), ('qualification_scope_ref', scope_ref), ('python_ref', qualification['python_ref']), ('control_ref', qualification['control_ref'])):
+        need(same_ref(review[name], ref) and same_ref(decision[name], ref), 'RUNTIME_REVIEW_SOURCE_SCOPE_REFS')
+    runtime_manifest_ref = qualification['runtime_manifest_ref']
+    runtime_manifest = doc(runtime_manifest_ref)
+    need(runtime_manifest.get('schema') == 'researchos.root-public21-runtime-manifest.v1' and runtime_manifest.get('issued_by') == ROOT and (runtime_manifest.get('root_thread_id') == ROOT_THREAD) and (runtime_manifest.get('source_author') == CALLER_AUTHOR) and (runtime_manifest.get('runner_source_author') == BUILDER_AUTHOR) and (runtime_manifest.get('formal_acceptance') is False) and (runtime_manifest.get('execution_grant') is False) and (exact_ref_set(runtime_manifest['resource_refs']) == exact_ref_set(qualification['resource_refs'])) and same_ref(decision['runtime_manifest_ref'], runtime_manifest_ref) and same_ref(review['runtime_manifest_ref'], runtime_manifest_ref), 'RUNTIME_MANIFEST_INDEPENDENT_BINDING')
+    for field, expected in (('source_hdf_ref', source_ref), ('source_mf_ref', source_mf_ref), ('caller_ref', qualification['caller_ref']), ('runner_contract_ref', qualification['runner_contract_ref']), ('qualification_scope_ref', scope_ref)):
+        need(same_ref(runtime_manifest[field], expected), 'RUNTIME_MANIFEST_SOURCE_SCOPE_BINDING')
+    peer_binding, received = validate_peer_delivery(qualification['review_hostpair_binding_ref'], review_refs, author, 'RUNTIME_QUALIFICATION_ISSUANCE')
+    root_binding = doc(qualification['root_issuance_binding_ref'])
+    expected = [qualification['payload_ref'], scope_ref] + review_refs + [qualification['review_hostpair_binding_ref']]
+    validate_root_capture(root_binding, checked(root_binding['original_capture_ref']), expected, 'RUNTIME_QUALIFICATION_ISSUANCE')
+    need(when(scope['created_utc']) <= when(review['reviewed_utc']) <= received <= when(qualification['payload_created_utc']) <= when(root_binding['tool_call_timestamp']) <= when(root_binding['tool_result_timestamp']) <= when(qualification['created_utc']) <= datetime.now(timezone.utc), 'RUNTIME_ORIGINAL_REVIEW_ISSUANCE_TIME_ORDER')
+    refs = [runtime_manifest_ref, qualification['payload_ref'], qualification['root_issuance_binding_ref'], root_binding['original_capture_ref'], qualification['review_hostpair_binding_ref'], peer_binding['original_capture_ref'], scope_ref, source_ref, source_mf_ref, qualification['caller_ref'], qualification['runner_contract_ref']] + review_refs
+    return refs + review_mf['members'] + source_mf['members']
+
+def own_review(request):
+    source = doc(request['source_hdf_ref'])
+    source_mf = manifest(request['source_mf_ref'])
+    review = doc(request['review_hdf_ref'])
+    review_mf = manifest(request['review_mf_ref'])
+    decision = doc(request['review_decision_ref'])
+    need(source.get('status') == 'SOURCE_ONLY_PENDING_NONAUTHOR_REVIEW_AND_ROOT_BINDING' and source.get('source_author') == AUTHOR and same_ref(source['manifest_ref'], request['source_mf_ref']) and same_ref(source['caller_ref'], pin(__file__)) and same_ref(source['registrar_ref'], pin(__file__)), 'CALLER_SOURCE_BINDING')
+    for field in ('caller_ref', 'contract_ref', 'source_inputs_ref'):
+        need(any((same_ref(source[field], x) for x in source_mf['members'])), 'CALLER_SOURCE_MANIFEST')
+    reviewer = decision.get('review_author')
+    need(decision.get('verdict') == 'SOURCE_ACCEPTED_FOR_ROOT_REGISTRATION' and type(reviewer) is str and (reviewer not in ('', ROOT, AUTHOR)) and (decision.get('source_author') == AUTHOR) and (decision.get('independent_non_author') is True) and (decision.get('formal_acceptance') is False) and (decision.get('execution_grant') is False), 'CALLER_NONAUTHOR_REVIEW_REQUIRED')
+    for field, expected in (('source_hdf_ref', request['source_hdf_ref']), ('source_mf_ref', request['source_mf_ref']), ('caller_ref', source['caller_ref']), ('registrar_ref', source['registrar_ref']), ('calling_contract_ref', source['contract_ref'])):
+        need(same_ref(decision[field], expected), 'CALLER_DECISION_REF_BINDING')
+    need(review.get('review_author') == reviewer and review.get('source_author') == AUTHOR and same_ref(review['manifest_ref'], request['review_mf_ref']) and same_ref(review['source_decision_ref'], request['review_decision_ref']) and same_ref(review['source_hdf_ref'], request['source_hdf_ref']) and same_ref(review['source_mf_ref'], request['source_mf_ref']), 'CALLER_REVIEW_HDF_CHAIN')
+    need(any((same_ref(request['review_decision_ref'], x) for x in review_mf['members'])), 'CALLER_REVIEW_MANIFEST')
+    witness = doc(request['review_hostpair_witness_ref'])
+    need(witness.get('issued_by') == ROOT and witness.get('schema') == 'researchos.root-public21-external-review-witness.v1', 'ROOT_REVIEW_WITNESS')
+    for field in ('review_hdf_ref', 'review_mf_ref', 'review_decision_ref'):
+        need(same_ref(witness[field], request[field]), 'ROOT_REVIEW_WITNESS_BINDING')
+    capture = doc(witness['capture_binding_ref'])
+    raw = checked(capture['original_capture_ref'])
+    validate_root_capture(capture, raw, [request[x] for x in ('review_hdf_ref', 'review_mf_ref', 'review_decision_ref')], 'SOURCE_REVIEW_WITNESS', reviewer)
+    need(when(capture['tool_result_timestamp']) >= when(review['reviewed_utc']) and when(witness['created_utc']) >= when(capture['tool_result_timestamp']), 'ROOT_REVIEW_WITNESS_NOT_AFTER_REVIEW')
+    refs = [request[x] for x in ('source_hdf_ref', 'source_mf_ref', 'review_hdf_ref', 'review_mf_ref', 'review_decision_ref', 'review_hostpair_witness_ref')]
+    refs += source_mf['members'] + review_mf['members'] + [source['source_inputs_ref'], witness['capture_binding_ref'], capture['original_capture_ref']]
+    peer_ref = capture['peer_delivery_binding_ref']
+    refs += [peer_ref, doc(peer_ref)['original_capture_ref']]
+    refs += doc(source['source_inputs_ref'])['references']
+    return {'source': source, 'review': review, 'reviewer': reviewer, 'witness': witness, 'refs': refs}
+
+def projection(old_cp, old_ow, scope_ref, owner_ref, worker_ref, facts_ref, owner, worker, pending, created):
+    """Pure TP transform. No file open, pin or reference validation in callback."""
+    start = old_cp['work_in_progress']['root_next_failure_ordinal_live']
+    next_ordinal = pending['next_original_failure_ordinal']
+    need(type(start) is int and type(next_ordinal) is int and (next_ordinal >= start), 'PENDING_CONTIGUOUS_CURRENT_COUNTER')
+    need(type(pending.get('pending')) is list and all((type(x) is dict and type(x.get('ordinal')) is int for x in pending['pending'])) and ([x['ordinal'] for x in pending['pending']] == list(range(start, next_ordinal))), 'PENDING_CONTIGUOUS_CURRENT_COUNTER')
+    cp = copy.deepcopy(old_cp)
+    ow = copy.deepcopy(old_ow)
+    need(KEY not in ow['card_path_bindings']['W05-99']['subtasks'] and (not any((x.get('slice_id') == SLICE for x in cp['workers']))), 'DUPLICATE_BUILD_SLICE')
+    need(owner['scope_ref'] == worker['scope_ref'] == scope_ref and worker['selected_owner_ref'] == owner_ref and (owner['selected_worker_id'] == worker['worker_id'] == ROOT), 'ACYCLIC_OWNER_WORKER')
+    ow['card_path_bindings']['W05-99']['subtasks'][KEY] = dict(owner, owner_document_ref=owner_ref, worker_document_ref=worker_ref, current_source_writer=None, formal_case_accepted_delta=0, parent_acceptance=False)
+    cp['workers'].append(dict(worker, worker_document_ref=worker_ref))
+    seen = {(x.get('original_payload', {}).get('immutable_origin_ref', {}).get('sha256'), x.get('original_payload', {}).get('origin_selector')) for x in cp['failure_counters']}
+    for row in pending['pending']:
+        identity = (row['origin_ref']['sha256'], row['origin_selector'])
+        need(identity not in seen, 'ORIGINAL_INVOCATION_REUSED')
+        seen.add(identity)
+        payload = {k: copy.deepcopy(v) for k, v in row.items() if k.startswith('actual_')}
+        payload.update(observed_ordinal=row['ordinal'], immutable_origin_ref=row['origin_ref'], origin_selector=row['origin_selector'], capture_binding_ref=row.get('capture_binding_ref'), diagnostic=row['description'])
+        cp['failure_counters'].append(dict(origin_key=hashlib.sha256((identity[0] + '#' + identity[1]).encode()).hexdigest(), evidence_ref=row['origin_ref'], original_payload=payload, counted_once=True, counter_reset=False, automatic_retry=False))
+    cp['work_in_progress'].update(public21_bootstrap_root_scope_ref=scope_ref, public21_bootstrap_registration_facts_ref=facts_ref, root_next_failure_ordinal_live=pending['next_original_failure_ordinal'])
+    cp['work_in_progress']['later_diagnostics_observed_after_cutoff'].extend(({k: copy.deepcopy(row[k]) for k in ('ordinal', 'origin_ref', 'description')} for row in pending['pending']))
+    cp.update(revision=old_cp['revision'] + 1, expected_previous_revision=old_cp['revision'], updated_at=created, updated_by=ROOT, note='Root registered a distinct public21 bootstrap-only observation; formal acceptance remains pending.')
+    ow.update(revision=old_ow['revision'] + 1, updated_at=created, updated_by=ROOT)
+    inverse_cp = copy.deepcopy(cp)
+    inverse_ow = copy.deepcopy(ow)
+    for key in ('workers', 'failure_counters', 'work_in_progress', 'revision', 'expected_previous_revision', 'updated_at', 'updated_by', 'note'):
+        if key in old_cp:
+            inverse_cp[key] = copy.deepcopy(old_cp[key])
+        else:
+            inverse_cp.pop(key, None)
+    del inverse_ow['card_path_bindings']['W05-99']['subtasks'][KEY]
+    for key in ('revision', 'updated_at', 'updated_by'):
+        if key in old_ow:
+            inverse_ow[key] = copy.deepcopy(old_ow[key])
+        else:
+            inverse_ow.pop(key, None)
+    need(encoded(inverse_cp) == encoded(old_cp) and encoded(inverse_ow) == encoded(old_ow), 'COMPLETE_INVERSE_PAIR')
+    return (cp, ow)

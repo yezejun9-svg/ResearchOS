@@ -1,0 +1,30 @@
+diff --git a/apps/desktop/main/lib/ipc.js b/apps/desktop/main/lib/ipc.js
+index f227f669..87089efb 100644
+--- a/apps/desktop/main/lib/ipc.js
++++ b/apps/desktop/main/lib/ipc.js
+@@ -45,10 +45,21 @@ async function callCore(deps, client, method, body) {
+   if (!started.discovery) {
+     return { ok: false, reason: started.health, launched: started.launched, attempts: started.attempts.length };
+   }
+-  const principal = host.principalFor(deps.fsImpl, deps.principalFile);
+-  if (!principal.ok) return { ok: false, reason: principal.reason, detail: principal.detail || null };
+-  const req = host.requestFor(client, method, body, principal.principal_id);
+-  if (!req.ok) return { ok: false, reason: req.reason, client, method };
++  let req;
++  if (client === 'status' && method === 'health') {
++    // /healthz is a public, empty observation. Fresh Native profiles need no
++    // legacy principal file; caller fields cannot select a request or identity.
++    const emptyBody = body == null || (typeof body === 'object' &&
++      (Object.getPrototypeOf(body) === Object.prototype || Object.getPrototypeOf(body) === null) &&
++      Reflect.ownKeys(body).length === 0);
++    if (!emptyBody) return { ok: false, reason: 'EMPTY_HEALTH_REQUEST_REQUIRED', client, method };
++    req = { verb: 'GET', path: '/healthz', payload: {}, headers: {} };
++  } else {
++    const principal = host.principalFor(deps.fsImpl, deps.principalFile);
++    if (!principal.ok) return { ok: false, reason: principal.reason, detail: principal.detail || null };
++    req = host.requestFor(client, method, body, principal.principal_id);
++    if (!req.ok) return { ok: false, reason: req.reason, client, method };
++  }
+   const reply = await deps.transport(req.verb, started.discovery.url + req.path, req.payload, req.headers);
+   if (client === 'provider' && method === 'probe') {
+     const cls = host.classifyProvider(reply);

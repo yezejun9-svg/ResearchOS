@@ -1,0 +1,278 @@
+diff --git a/apps/cli/cli_contract.go b/apps/cli/cli_contract.go
+index 36fc1c58..139d0320 100644
+--- a/apps/cli/cli_contract.go
++++ b/apps/cli/cli_contract.go
+@@ -119,7 +119,7 @@ func fail(command string, code int, reason string, detail ...string) {
+ 
+ // hostDiscovery reuses the discovery file the accepted W02-03 launcher wrote; it never invents a URL.
+ func hostDiscovery() (discovery, string, error) {
+-	path := cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath)
++	path := productDiscoveryFile()
+ 	raw, err := os.ReadFile(path)
+ 	if err != nil {
+ 		return discovery{}, path, err
+@@ -132,7 +132,7 @@ func hostDiscovery() (discovery, string, error) {
+ }
+ 
+ func configPath() string {
+-	return cliEnv("RESEARCHOS_CLI_CONFIG", filepath.Join(".local", "v24_cli_config.json"))
++	return productConfigFile()
+ }
+ 
+ type cliConfig struct {
+diff --git a/apps/cli/cli_doctor.go b/apps/cli/cli_doctor.go
+index 984a3627..8524be17 100644
+--- a/apps/cli/cli_doctor.go
++++ b/apps/cli/cli_doctor.go
+@@ -42,7 +42,7 @@ func doctorReport() (out map[string]any, code int) {
+ 		}
+ 	}()
+ 	fail := func(reason string, exit int) (map[string]any, int) { out["reason"] = reason; return out, exit }
+-	file := cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath)
++	file := productDiscoveryFile()
+ 	out["discovery_path"] = file
+ 	b, err := os.ReadFile(file)
+ 	if err != nil {
+diff --git a/apps/cli/cli_native.go b/apps/cli/cli_native.go
+index 2dde3304..d0a42000 100644
+--- a/apps/cli/cli_native.go
++++ b/apps/cli/cli_native.go
+@@ -31,7 +31,7 @@ type cliNativeReply struct {
+ func cliHostInstanceID(d discovery) (string, error) {
+ 	// Discovery is written by the local control process. Keep this field local to
+ 	// first-use until every older CLI call site has migrated to the new discovery.
+-	raw, err := os.ReadFile(cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath))
++	raw, err := os.ReadFile(productDiscoveryFile())
+ 	if err != nil {
+ 		return "", err
+ 	}
+diff --git a/apps/cli/cli_verbs.go b/apps/cli/cli_verbs.go
+index 5ed6a102..276bf41b 100644
+--- a/apps/cli/cli_verbs.go
++++ b/apps/cli/cli_verbs.go
+@@ -194,7 +194,7 @@ func newV2Context(name string, args []string, cfg cliConfig, baseURL string) *v2
+ 	if credential == "" {
+ 		if d, _, err := hostDiscovery(); err == nil && d.URL == baseURL {
+ 			credential, _ = cliSessionCredential(d)
+-			if credential == "" && cfg.ProjectID != "" && cfg.WorkspaceRef != "" {
++			if credential == "" && (productInstalled() || cfg.ProjectID != "" && cfg.WorkspaceRef != "") && name != "doctor" {
+ 				credential, _ = cliInitCredential(d, cliEnv("RESEARCHOS_CLI_CLIENT_ID", defaultClientID()))
+ 			}
+ 		}
+diff --git a/apps/cli/main.go b/apps/cli/main.go
+index 13b36667..b46e9971 100644
+--- a/apps/cli/main.go
++++ b/apps/cli/main.go
+@@ -32,6 +32,16 @@ func main() {
+ 	if len(args) > 0 {
+ 		cmd = args[0]
+ 	}
++	if err := initProductLayout(); err != nil {
++		fail("startup", exitFailed, "PRODUCT_LAYOUT_INVALID", err.Error())
++	}
++	// A product CLI owns no scheduler. Host-bound commands first discover or
++	// start the same per-user Electron parent that owns Core's private pipe.
++	if cmd != "version" && cmd != "--version" && cmd != "help" && cmd != "--help" && cmd != "doctor" {
++		if err := ensureProductHost(); err != nil {
++			fail(cmd, exitFailed, "PRODUCT_HOST_UNAVAILABLE", err.Error())
++		}
++	}
+ 	// The contract writes the interactive entry as `researchos [--project <path-or-id>]`, so an empty argv and a
+ 	// leading flag are the interactive command, not a help page. `chat` is not a contract command at all.
+ 	if cmd == "" || (strings.HasPrefix(cmd, "--") && cmd != "--version" && cmd != "--help") {
+diff --git a/apps/desktop/main/main.js b/apps/desktop/main/main.js
+index c8b7a90b..8905eb70 100644
+--- a/apps/desktop/main/main.js
++++ b/apps/desktop/main/main.js
+@@ -4,7 +4,7 @@
+ // when it is genuinely unreachable, and exposes the four native clients through the channels declared in
+ // main/lib/ipc.js. The registration and the routing are pure functions of injected collaborators, so
+ // tests/ui/check drives them without an Electron runtime; what only a real session can prove stays disclosed.
+-const { app, BrowserWindow, ipcMain, dialog, protocol } = require('electron');
++const { app, BrowserWindow, ipcMain, dialog, protocol, Tray, Menu } = require('electron');
+ const childProcess = require('node:child_process');
+ const crypto = require('node:crypto');
+ const http = require('node:http');
+@@ -19,32 +19,70 @@ const { createAppProtocol, routeTable, APP_ORIGIN } = require('./lib/app-protoco
+ const { chooseWorkspace } = require('./lib/first-use.js');
+ const { createContextStore } = require('./lib/context.js');
+ const { createDesktopManagement } = require('./lib/desktop-management.js');
++const { loadProductLayout, claimProductData, writeSupervisorWitness,
++  retireSupervisorWitness } = require('./lib/product-layout.js');
+ 
+ protocol.registerSchemesAsPrivileged([{ scheme: 'ros-app', privileges: {
+   standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: false,
+ } }]);
+-if (process.env.RESEARCHOS_DESKTOP_USER_DATA) {
++const ROOT = path.resolve(__dirname, '..');
++const REPO = path.resolve(ROOT, '..', '..');
++const productLayout = loadProductLayout(REPO);
++if (productLayout) {
++  // The lock and Chromium profile must be identical for CLI-started and
++  // Start-menu-started Electron before either can launch Core.
++  fs.mkdirSync(productLayout.userData, { recursive: true, mode: 0o700 });
++  app.setPath('userData', productLayout.userData);
++} else if (process.env.RESEARCHOS_DESKTOP_USER_DATA) {
+   const isolatedUserData = path.resolve(process.env.RESEARCHOS_DESKTOP_USER_DATA);
+   fs.mkdirSync(isolatedUserData, { recursive: true });
+   app.setPath('userData', isolatedUserData);
+ }
+ 
+-const ROOT = path.resolve(__dirname, '..');
+ const validatedV2Transport = createTransport({ appRoot: ROOT });
+-const REPO = path.resolve(ROOT, '..', '..');
+ const WEB_DIST = path.join(REPO, 'apps', 'web', 'dist');
+-const DISCOVERY = path.resolve(REPO, process.env.RESEARCHOS_CLI_DISCOVERY ||
++const DISCOVERY = productLayout?.discovery || path.resolve(REPO, process.env.RESEARCHOS_CLI_DISCOVERY ||
+   process.env.RESEARCHOS_HOST_DISCOVERY || path.join('.local', 'v24_host.json'));
+ const PRINCIPAL = path.join(REPO, '.local', 'v24_principal.json');
+-const SMOKE = process.env.ROS_DESKTOP_SMOKE === '1';
++const SMOKE = !productLayout && process.env.ROS_DESKTOP_SMOKE === '1';
+ const configuredCore = process.env.RESEARCHOS_CONTROL_EXE || '';
+-const coreExecutable = configuredCore ? path.resolve(REPO, configuredCore) : path.join(ROOT, 'resources', 'control', 'researchos-control.exe');
+-const dataRoot = path.resolve(REPO, process.env.RESEARCHOS_DATA_DIR || path.join('.local', 'data'));
+-const verifierManifest = process.env.RESEARCHOS_DESKTOP_VERIFIER_MANIFEST ||
++const coreExecutable = productLayout?.controlExe || (configuredCore ? path.resolve(REPO, configuredCore) : path.join(ROOT, 'resources', 'control', 'researchos-control.exe'));
++const dataRoot = productLayout?.dataRoot || path.resolve(REPO, process.env.RESEARCHOS_DATA_DIR || path.join('.local', 'data'));
++const verifierManifest = productLayout?.verifierManifest || process.env.RESEARCHOS_DESKTOP_VERIFIER_MANIFEST ||
+   path.join(path.dirname(coreExecutable), 'runtime-verifier-installation.json');
+-const runtimeAssetsDir = process.env.RESEARCHOS_DESKTOP_RUNTIME_ASSETS_DIR ||
++const runtimeAssetsDir = productLayout?.runtimeAssetsDir || process.env.RESEARCHOS_DESKTOP_RUNTIME_ASSETS_DIR ||
+   path.join(path.dirname(coreExecutable), 'runtime');
+ 
++const productIntent = process.argv.includes('--product-host-background') ? 'ensure-host' : 'show-ui';
++let productPrimary = true;
++let productWindow = null;
++let productShow = null;
++let productShowQueued = productIntent === 'show-ui';
++let productExitConfirmed = false;
++let productSafeExit = null;
++if (productLayout) {
++  productPrimary = app.requestSingleInstanceLock({ intent: productIntent, installation_id: productLayout.installID });
++  if (!productPrimary) app.quit();
++  else {
++    app.on('second-instance', (_event, _argv, _cwd, data) => {
++      if (data?.installation_id !== productLayout.installID ||
++          !['ensure-host', 'show-ui'].includes(data?.intent)) return;
++      if (data.intent === 'show-ui') {
++        productShowQueued = true;
++        if (productShow) void productShow();
++      }
++    });
++    // A Core may remain busy while a close is refused. Chromium's default
++    // window-all-closed quit must never bypass the private quiesce result.
++    app.on('window-all-closed', () => {});
++    app.on('before-quit', event => {
++      if (productExitConfirmed) return;
++      event.preventDefault();
++      if (productSafeExit) void productSafeExit();
++    });
++  }
++}
++
+ // The smoke report must describe the same owned process observed on the
+ // private management channel. A healthy HTTP endpoint alone is insufficient.
+ function ownedCoreIdentity(machine) {
+@@ -365,6 +403,7 @@ async function privilegedCodingConsent(event, frozen) {
+ // The directory picker answers from the native dialog, so the first-run path never sends the user to a
+ // terminal to type a path.
+ async function boot() {
++  if (productLayout) claimProductData(productLayout);
+   const contextStore = createContextStore(path.join(app.getPath('userData'), 'desktop-context.json'));
+   const saved = contextStore.load();
+   if (!sessionState.projectId) sessionState.projectId = saved.projectId;
+@@ -398,17 +437,64 @@ async function boot() {
+   }));
+   const management = await desktopManagement.start();
+   const started = await host.ensureCore(deps);
++  let productWitness = null;
++  let productTray = null;
++  if (productLayout) {
++    if (management.state !== 'READY' || started.health !== 'UP' || !started.discovery ||
++        started.discovery.pid !== desktopManagement.identity?.PID)
++      throw Object.assign(new Error(management.reason || 'PRODUCT_HOST_NOT_READY'), { code: 'PRODUCT_HOST_NOT_READY' });
++    productWitness = writeSupervisorWitness(productLayout, desktopManagement);
++    productSafeExit = (() => {
++      let pending = null;
++      return () => {
++        if (pending) return pending;
++        pending = (async () => {
++          const owned = ownedCoreIdentity(desktopManagement);
++          if (!owned) throw Object.assign(new Error('OWNED_CORE_IDENTITY_UNAVAILABLE'), { code: 'OWNED_CORE_IDENTITY_UNAVAILABLE' });
++          const result = await desktopManagement.shutdown();
++          if (!smokeShutdownConfirmation(result, desktopManagement, owned))
++            throw Object.assign(new Error('OWNED_EXIT_IDENTITY_UNCONFIRMED'), { code: 'OWNED_EXIT_IDENTITY_UNCONFIRMED' });
++          if (!retireSupervisorWitness(productLayout, productWitness))
++            throw Object.assign(new Error('PRODUCT_WITNESS_CHANGED'), { code: 'PRODUCT_WITNESS_CHANGED' });
++          productExitConfirmed = true;
++          productTray?.destroy();
++          app.quit();
++        })().catch(async error => {
++          // A busy or uncertain shutdown leaves the host and current window
++          // available. No pause/cancel/settle is inferred from the refusal.
++          if (!productWindow) await productShow?.();
++          await dialog.showMessageBox(productWindow || undefined, { type: 'warning',
++            title: '无法安全退出', message: '当前宿主未确认退出',
++            detail: String(error.code || error.message || error), buttons: ['返回'] });
++          throw error;
++        }).finally(() => { pending = null; });
++        return pending;
++      };
++    })();
++  }
++  const showWindow = async () => {
++  if (productLayout && productWindow && !productWindow.isDestroyed()) {
++    if (productWindow.isMinimized()) productWindow.restore();
++    productWindow.show(); productWindow.focus();
++    return productWindow;
++  }
+   const win = new BrowserWindow({
+     width: 1180, height: 760, title: 'ResearchOS', show: !SMOKE || !!process.env.ROS_DESKTOP_CAPTURE_PATH,
+     webPreferences: { preload: path.join(ROOT, 'preload', 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+   });
+   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
++  if (productLayout) productWindow = win;
++  win.on('closed', () => { if (productWindow === win) productWindow = null; });
+   win.webContents.on('will-navigate', (event, target) => {
+     const destination = new URL(target);
+     if (destination.protocol !== 'ros-app:' || destination.hostname !== 'desktop') event.preventDefault();
+   });
+   let closing = false;
+   win.on('close', event => {
++    if (productLayout) {
++      if (!productExitConfirmed) { event.preventDefault(); void productSafeExit?.().catch(() => {}); }
++      return;
++    }
+     if (closing || !desktopManagement.hasUnconfirmedChild()) return;
+     event.preventDefault();
+     if (desktopManagement.state !== 'READY') {
+@@ -480,9 +566,28 @@ async function boot() {
+     }
+     app.exit(code);
+   }
++  return win;
++  };
++  if (!productLayout) { await showWindow(); return; }
++  productShow = showWindow;
++  const icon = await app.getFileIcon(process.execPath);
++  productTray = new Tray(icon);
++  productTray.setToolTip('ResearchOS');
++  productTray.setContextMenu(Menu.buildFromTemplate([
++    { label: '打开 ResearchOS', click: () => { void productShow(); } },
++    { label: '诊断', click: () => {
++      const summary = desktopManagement.summary();
++      void dialog.showMessageBox(productWindow || undefined, { type: 'info', title: 'ResearchOS 宿主',
++        message: summary.state, detail: summary.reason || `Host ${desktopManagement.hostId}`,
++        buttons: ['关闭'] });
++    } },
++    { label: '安全退出', click: () => { void productSafeExit().catch(() => {}); } },
++  ]));
++  productTray.on('double-click', () => { void productShow(); });
++  if (productShowQueued) await productShow();
+ }
+ 
+-app.whenReady().then(boot).catch(async (e) => {
++if (!productLayout || productPrimary) app.whenReady().then(boot).catch(async (e) => {
+   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'boot_failed', error: String(e && e.message || e) }));
+   if (desktopManagement.state === 'READY') {
+     try { await desktopManagement.shutdown(); }

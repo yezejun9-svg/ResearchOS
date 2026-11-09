@@ -1,0 +1,67 @@
+--- Main43 original
++++ export-only-v2
+@@ -281,7 +281,7 @@
+ 		t.Fatal(err)
+ 	}
+ 	t.Cleanup(func() {
+-		if err := db.Close(); err != nil {
++		if err := cli43CloseEvidence(t, db, evidence); err != nil {
+ 			t.Error(err)
+ 		}
+ 	})
+@@ -307,8 +307,9 @@
+ 		t.Fatal(err)
+ 	}
+ 	var configuredRef string
+-	server := httptest.NewServer(api.HandlerWithConfigurationHost(db, t.TempDir(), svc, cliSessionBindingFixture{configuredRef: &configuredRef}, "", nil, nil, cliConfigurationMetadataFixture{"cli-owner"}))
++	server := httptest.NewServer(cli43RecordingHandler(t, evidence, api.HandlerWithConfigurationHost(db, t.TempDir(), svc, cliSessionBindingFixture{configuredRef: &configuredRef}, "", nil, nil, cliConfigurationMetadataFixture{"cli-owner"})))
+ 	t.Cleanup(server.Close)
++	cli43InstallHTTP(t, evidence, server)
+ 	profile := domain.Object{"name": "CLI session fixture", "intent": "one finite message", "facts": domain.Empty(), "accepted_scope": []any{"fixture"}, "constraints": domain.Empty(), "source_configs": domain.Empty(), "source_document_refs": domain.Empty(), "read_snapshot_ids": domain.Empty()}
+ 	req, _ := http.NewRequest("POST", server.URL+"/v1/projects", bytes.NewReader(domain.Bytes(profile)))
+ 	req.Header.Set("Authorization", "Bearer "+token)
+@@ -365,13 +366,14 @@
+ 				requests := []json.RawMessage{}
+ 				requestBytes := [][]byte{}
+ 				responses := [][]byte{}
+-				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				proxy := httptest.NewServer(cli43ProxyHandler(t, evidence, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 					raw, _ := io.ReadAll(r.Body)
+ 					mu.Lock()
+ 					requests = append(requests, append(json.RawMessage(nil), raw...))
+ 					requestBytes = append(requestBytes, append([]byte(nil), raw...))
+ 					mu.Unlock()
+ 					req, _ := http.NewRequest(r.Method, c.baseURL+r.URL.RequestURI(), bytes.NewReader(raw))
++					req = cli43PairProxy(req, r)
+ 					req.Header.Set("Authorization", "Bearer "+c.credential)
+ 					req.Header.Set("Content-Type", "application/json")
+ 					resp, err := http.DefaultClient.Do(req)
+@@ -386,7 +388,8 @@
+ 					responses = append(responses, append([]byte(nil), responseRaw...))
+ 					mu.Unlock()
+ 					w.Write(responseRaw)
+-				}))
++				})))
++				cli43RegisterProxy(evidence, proxy)
+ 				defer proxy.Close()
+ 				// The public Workspace fixture is bound to cli-client; override only the
+ 				// fixture metadata at process setup, never product identity validation.
+@@ -397,7 +400,8 @@
+ 					input = "one actual durable message\n"
+ 					expected = 3
+ 				}
+-				code, out, _, _ := cliProtocolProcess(t, proxy.URL, cfg, input)
++				cli43SessionBoundary(t, db, evidence, "before", cfg)
++				code, out, configBefore, configAfter := cliProtocolProcess(t, proxy.URL, cfg, input)
+ 				mu.Lock()
+ 				copyRequests := append([]json.RawMessage(nil), requests...)
+ 				responseEvidence := append([][]byte(nil), responses...)
+@@ -478,6 +482,8 @@
+ 						t.Fatal("create not exactly once", creates)
+ 					}
+ 				}
++				cli43AssertBinding(t, db, evidence, name, cfg, copyRequests, responseEvidence, configBefore, configAfter)
++				if err := cli43Save(evidence, "business-counts.json", map[string]any{"sends":sends,"tasks":tasks,"send_journal":journal,"read_only_attach":readonly,"cli_exit":code}); err != nil { t.Fatal(err) }
+ 				t.Logf("REAL_API synthetic admission only, durable sends=%d tasks=%d journal=%d CLI=%d", sends, tasks, journal, code)
+ 				return
+ 			}

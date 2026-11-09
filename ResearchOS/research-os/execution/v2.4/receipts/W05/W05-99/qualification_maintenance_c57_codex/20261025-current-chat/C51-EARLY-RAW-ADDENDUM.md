@@ -1,0 +1,14 @@
+# C51 early raw-output addendum
+
+The early runs did not persist separate numeric native-exit files. Their raw stdout still contains explicit Go `FAIL` results. Preserve these as **observed test failures with native exit unknown**, rather than generic capture gaps:
+
+| Raw file | Observed failure | Later evidence |
+| --- | --- | --- |
+| `002.stdout.raw` | `TestDataRootSourceGuardPinsFileAndAncestor`: replacement was admitted by the first source guard | `003.stdout.raw` passed after native access correction; later `042` passed in own environment |
+| `007.stdout.raw` | Replacement crash recovery failed at `directory` and `snapshots` with incomplete-inventory errors | `008.stdout.raw` passed; later `046` included the replacement suite |
+| `013.stdout.raw` | Five selected domain tests failed because sparse checkout omitted numbered migration inputs | `014` added migrations to the isolated sparse checkout; later selected fixtures ran |
+| `015.stdout.raw` | `TestConfigurationUpgradeNumberedOnlyAndMalformedRefusal`: fixture expected the source to stay broken, but its selected path was wrong | `016.stdout.raw` passed after the test path correction |
+
+The formatter overreach began before 009. `007-fmt.stdout.raw` lists four rewritten files: two allowed (`adapters/runtime/data_root_windows.go`, `internal/host/runtime_verifier_replacement_windows.go`) and two **outside the 57 allowlist** (`internal/host/host.go`, `internal/host/vault.go`). `009-fmt.stdout.raw` lists 28 rewritten files, including 14 **outside** the allowlist: `internal/domain/acceptance_w0601_step4f_test.go`, `backup.go`, `backup_historical14_resume_test.go`, `backup_prepared_abandonment_upgrade_test.go`, `client_protocol_atomic_test.go`, `client_protocol_schema.go`, `client_stream_transcript_test.go`, `evidence_w0902_test.go`, `prepared_abandonment_authority.go`, `prepared_abandonment_authority_test.go`, `prepared_run_abandonment.go`, `prepared_run_abandonment_windows_test.go`, `session_service.go`, and `session_w0602_test.go`. The other 14 paths in that raw list were allowed C57 paths, including some files with intended edits.
+
+`010.stdout.raw` records exact-HEAD byte restoration of 20 files: all 16 distinct out-of-scope paths from 007 and 009, plus four allowlisted test files that had no intended edits at that point (`backup_configuration_upgrade_test.go`, `backup_prepared_abandonment_handoff_test.go`, `backup_prepared_abandonment_upgrade_windows_test.go`, `backup_upgrade_test.go`). `011.stdout.raw` verifies the restored bytes against HEAD and the 40 inherited Source43 pins. Several of those four allowed tests were later changed intentionally within C57 scope. The pre-restoration full diff/hash was not separately captured; `FORMAT-DIAGNOSTIC.md` already records that limitation. No `reset` or `clean` was used.

@@ -1,0 +1,151 @@
+--- original/controller_common.py
++++ candidate/controller_common.py
+@@ -49,26 +49,128 @@
+  with p.open('xb') as f:f.write(data)
+  return file_ref(p)
+ def trusted_module(path,expected):
+- verify(expected)
++ raw=verified_raw(expected)
+  if str(path)!=expected['path']:raise Stop('Helper path mismatch')
+  mod=types.ModuleType(Path(path).stem);mod.__file__=str(path)
+- exec(compile(Path(path).read_bytes(),str(path),'exec'),mod.__dict__)
++ exec(compile(raw,str(path),'exec'),mod.__dict__)
+  return mod
++
++def verified_raw(row):
++ if not isinstance(row,dict) or set(row)!={'path','sha256','bytes'}:raise Stop('Exact file ref required')
++ p=no_alias(row['path']);before=p.stat();raw=p.read_bytes();after=p.stat()
++ if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns):raise Stop('Pinned read drift')
++ if str(p)!=row['path'] or type(row['bytes']) is not int or len(raw)!=row['bytes'] or hashlib.sha256(raw).hexdigest()!=row['sha256']:raise Stop('Consumed raw pin mismatch')
++ return raw
++
++def root_authority(g,spec,grant_ref):
++ # Proposed Root capsule. Its real producer/CAS adapter is an explicit OPEN prerequisite.
++ binding=spec.get('root_binding')
++ if not isinstance(binding,dict):raise Stop('UNBOUND: actual Root binding absent')
++ consumed=[grant_ref,g['spec_ref']]
++ def read(ref):
++  raw=verified_raw(ref);consumed.append(ref);return raw_json(raw)
++ def eq(a,b,label):
++  if a!=b:raise Stop('Root authority mismatch: '+label)
++ def pointer(obj,keys):
++  if not isinstance(keys,list) or not keys:raise Stop('Explicit canonical field path required')
++  for key in keys:obj=obj[key]
++  return obj
++ before=binding['before'];after=binding['after']
++ if any(not isinstance(x,list) or len(x)!=3 or any(type(n) is not int or n<0 for n in x) for x in (before,after)):raise Stop('Explicit Root transition required')
++ if after[0]!=before[0]+1 or after[1]!=before[1]+1 or after[2]<before[2]:raise Stop('Nonforward Root transition')
++ capsule=read(g['registration_evidence_ref'])
++ eq(capsule['schema'],'researchos.w09.root-registration-capsule.v1','capsule schema')
++ eq(capsule['actor'],'codex:/root','registration actor')
++ eq(capsule['before'],before,'before tuple');eq(capsule['after'],after,'after tuple')
++ eq(capsule['registration_namespace'],binding['registration_namespace'],'registration namespace')
++ root=no_alias(binding['registration_namespace'])
++ for ref in [g['registration_evidence_ref'],capsule['manifest_ref'],capsule['audit_ref'],capsule['invocation_ref'],capsule['request_ref'],capsule['intent_ref']]:
++  if not Path(ref['path']).is_relative_to(root):raise Stop('Foreign registration receipt')
++ manifest=read(capsule['manifest_ref']);members=manifest['members']
++ if not members or len({r['path'].casefold() for r in members})!=len(members):raise Stop('Registration manifest duplicate/empty')
++ for ref in members:
++  verified_raw(ref);consumed.append(ref)
++ for key in ['audit_ref','invocation_ref','request_ref','intent_ref','registration_review_ref']:
++  if capsule[key] not in members:raise Stop('Unsealed mandatory registration input '+key)
++ audit=read(capsule['audit_ref']);invocation=read(capsule['invocation_ref']);request=read(capsule['request_ref']);intent=read(capsule['intent_ref'])
++ eq(audit['status'],'REGISTRATION_COMPLETED','registration completion')
++ eq(audit['actual_registration_executed'],True,'actual registration')
++ eq(audit['before'],before,'audit before');eq(audit['after'],after,'audit after')
++ eq(audit['intent_ref'],capsule['intent_ref'],'intent');eq(audit['invocation_ref'],capsule['invocation_ref'],'invocation')
++ eq(invocation['request_ref'],capsule['request_ref'],'actual request')
++ eq(invocation['actualargv'],request['argv'],'actual argv');eq(invocation['cwd'],request['cwd'],'actual cwd')
++ if not request['argv'] or request['argv'][0]!=g['tools']['python']['path']:raise Stop('Registration Python substitution')
++ require_job(invocation['owned_result'])
++ if type(invocation['actual_native_exit']) is not int or invocation['actual_native_exit']!=0:raise Stop('Registration native completion absent')
++ rr=read(capsule['registration_review_ref'])
++ eq(rr['schema'],'researchos.w09.root-registration-review.v1','registration review schema')
++ eq(rr['reviewer'],'codex:/root/w05_merge_review','registration nonauthor')
++ eq(rr['decision'],'REGISTRATION_DRAFT_REVIEWED_FOR_ROOT_EXECUTION','registration review decision')
++ eq(rr['requested_changes'],[],'registration changes');eq(rr['actual_registration_executed'],False,'review timing')
++ eq(rr['before'],before,'review before');eq(rr['after'],after,'review after')
++ eq(rr['request_ref'],capsule['request_ref'],'reviewed actual request')
++ for key in ['register_ref','wrapper_ref','prepared_ref']:
++  eq(rr[key],request[key],'reviewed registration code');verified_raw(request[key]);consumed.append(request[key])
++ if request['register_ref']['path'] not in request['argv'] and request['wrapper_ref']['path'] not in request['argv']:raise Stop('Reviewed code absent from actual registration argv')
++ canonical=capsule['canonical_copies']
++ if [r['role'] for r in canonical]!=['checkpoint','ownership','step_state','commands']:raise Stop('Ordered four canonical copies required')
++ if len({r['original_path'].casefold() for r in canonical})!=4:raise Stop('Canonical original path collision')
++ eq(canonical,intent['canonical_copies'],'intent desired/original pairs');eq(audit['canonical_copies'],canonical,'actual installed canonical pairs')
++ documents=[]
++ for item in canonical:
++  for key in ['before_ref','after_ref']:
++   if item[key] not in members:raise Stop('Unsealed canonical bytes')
++  prior=read(item['before_ref']);current=read(item['after_ref']);documents.append((prior,current))
++  if item['role'] in ('step_state','commands') and item['before_ref']['sha256']!=item['after_ref']['sha256']:raise Stop('Unrelated canonical bytes changed')
++ fields=binding['canonical_fields']
++ cp0,cp=documents[0];ow0,ow=documents[1]
++ eq(pointer(cp0,fields['checkpoint_revision']),before[0],'original checkpoint');eq(pointer(cp,fields['checkpoint_revision']),after[0],'current checkpoint')
++ eq(pointer(ow0,fields['ownership_revision']),before[1],'original ownership');eq(pointer(ow,fields['ownership_revision']),after[1],'current ownership')
++ f0=pointer(cp0,fields['failure_origins']);f1=pointer(cp,fields['failure_origins'])
++ if not isinstance(f0,list) or not isinstance(f1,list) or len(f0)!=before[2] or len(f1)!=after[2] or f1[:len(f0)]!=f0:raise Stop('Failure prefix/cut changed')
++ eq(f1[len(f0):],binding['new_failure_origins'],'fixed new failure cut')
++ eq(pointer(cp,fields['scope_ref']),g['spec_ref'],'current checkpoint scope')
++ eq(pointer(cp,fields['review_ref']),g['controller_review_ref'],'current checkpoint nonauthor review')
++ lease=pointer(ow,fields['lease'])
++ eq(lease,{'owner':'codex:/root','status':'EXECUTION_AUTHORIZED_ONCE','scope_ref':g['spec_ref'],'run_nonce':g['run_nonce'],'source_commit':CANDIDATE},'current Root lease')
++ payload={k:g[k] for k in ['source_commit','base_commit','run_nonce','output_parent','output_root','spec_ref','controller_refs','tools','normal_helper_ref','debug_helper_ref','caps','resources','resource_files','runtime_catalog_ref','goroot','module_cache','go_tool_images','repository']}
++ review=read(g['controller_review_ref'])
++ eq(str(no_alias(g['controller_review_ref']['path'])),str(no_alias(binding['controller_review_path'])),'predeclared review path')
++ eq(review['schema'],'researchos.w09.finite-controller-bound-review.v1','controller review schema')
++ eq(review['reviewer'],'codex:/root/w05_merge_review','controller nonauthor')
++ eq(review['decision'],'READY_FOR_ROOT_W09_FINITE_ONCE','controller review decision')
++ eq(review['requested_changes'],[],'controller review changes');eq(review['execution_binding'],payload,'full bound inputs')
++ eq(review['scope_ref'],g['spec_ref'],'full reviewed spec')
++ issuance=read(g['root_issuance_ref'])
++ eq(issuance['schema'],'researchos.w09.root-once-issuance.v1','issuance schema');eq(issuance['actor'],'codex:/root','issuer')
++ eq(issuance['actual_registration_completed'],True,'actual Root registration')
++ eq(issuance['execution_binding'],payload,'issued inputs');eq(issuance['registration_evidence_ref'],g['registration_evidence_ref'],'issued registration')
++ eq(issuance['controller_review_ref'],g['controller_review_ref'],'issued nonauthor review')
++ eq(g['authority_refs'],[g['registration_evidence_ref'],g['root_issuance_ref']],'authority refs')
++ eq(g['independent_review_refs'],[g['controller_review_ref'],capsule['registration_review_ref']],'review refs')
++ return list({r['path']:r for r in consumed}.values())
+ 
+ def validate_grant(path,expected_sha):
+  if not sys.flags.isolated or not sys.flags.no_site or sys._xoptions.get('utf8') is not True:raise Stop('Require pinnedPython -I -S -X utf8')
+  actual=file_ref(path)
+  if actual['sha256']!=expected_sha:raise Stop('Root grant digest mismatch')
+- g=raw_json(Path(path).read_bytes())
++ g=raw_json(verified_raw(actual))
+  if g.get('authorized') is not True or g.get('schema')!='researchos.w09.finite-controller-root-grant.v1':raise Stop('No actual Root execution grant')
+  if g['source_commit']!=CANDIDATE or g['base_commit']!=BASE:raise Stop('Architecture/source substitution')
+  if not re.fullmatch('[0-9a-f]{32}',g['run_nonce']):raise Stop('Exclusive run nonce required')
+  if not g['authority_refs'] or not g['independent_review_refs']:raise Stop('Actual authority/review refs required')
+  for row in g['authority_refs']+g['independent_review_refs']+g['controller_refs']+[g['spec_ref']]:verify(row)
+- spec=raw_json(Path(g['spec_ref']['path']).read_bytes())
++ spec=raw_json(verified_raw(g['spec_ref']))
+  if spec['authorized'] is not False:raise Stop('Specification cannot manufacture authority')
+  if g['caps']!=spec['caps']:raise Stop('Cap substitution')
+  if g['controller_refs']!=spec['controller_refs']:raise Stop('Controller substitution')
++ roles=['common_ref','controller_ref','case_worker_ref','launcher_ref','sealer_ref','normal_helper_ref','debug_helper_ref']
++ if g['controller_refs']!=[spec[k] for k in roles] or len({r['path'].casefold() for r in g['controller_refs']})!=7:raise Stop('Exact reviewed mechanism closure required')
++ if g['normal_helper_ref']!=spec['normal_helper_ref'] or g['debug_helper_ref']!=spec['debug_helper_ref']:raise Stop('Helper role substitution')
++ if file_ref(Path(__file__).resolve())!=spec['common_ref']:raise Stop('Actual common module differs')
++ main=file_ref(Path(sys.modules['__main__'].__file__).resolve())
++ if main not in [spec[k] for k in ['controller_ref','case_worker_ref','launcher_ref','sealer_ref']]:raise Stop('Actual entry mechanism differs')
++ if set(g['tools'])!={'python','go','git','cmd'}:raise Stop('Exact tool roles required')
+  for name,row in g['tools'].items():verify(row)
+  if str(Path(sys.executable).resolve())!=g['tools']['python']['path']:raise Stop('Actual Python path mismatch')
+  if g['tools']['python']!=spec['python_ref'] or g['tools']['go']!=spec['go_ref'] or g['tools']['git']!=spec['git_ref']:raise Stop('Locked tool mismatch')
+@@ -91,12 +193,14 @@
+   expected_members={x['path'].casefold() for x in g['resource_files'] if Path(x['path']).is_relative_to(root)}
+   if actual_members!=expected_members:raise Stop('Incomplete fixed source resource root inventory')
+  if g['runtime_catalog_ref'] not in g['resource_files']:raise Stop('Runtime catalog not pinned')
++ g['_authorization_input_refs']=root_authority(g,spec,actual)
++ g['_grant_ref']=actual
+  return g,spec,out
+ 
+ def require_job(result,debug=False):
+  c=result.get('job_cleanup',{})
+  keys=['unnamed_exclusive_job','kill_on_job_close_configured','assigned_before_resume','job_idle_confirmed','primary_exit_confirmed','handles_closed']
+- if result.get('actual_exit')!=0 or result.get('error') or result.get('timed_out') or not result.get('creation_time_100ns') or not result.get('resumed') or c.get('errors') or any(c.get(k) is not True for k in keys) or c.get('active_processes_last_observed')!=0:raise Stop('Owned child did not complete cleanly')
++ if type(result.get('actual_exit')) is not int or result.get('actual_exit')!=0 or result.get('error') or result.get('timed_out') or not result.get('creation_time_100ns') or not result.get('resumed') or c.get('errors') or any(c.get(k) is not True for k in keys) or c.get('active_processes_last_observed')!=0:raise Stop('Owned child did not complete cleanly')
+  if debug and (result.get('debug_capture',{}).get('complete') is not True or c.get('explicit_owned_handles_remaining')!=0):raise Stop('Actual debug-module/process/handle closure incomplete')
+ 
+ class Ledger:

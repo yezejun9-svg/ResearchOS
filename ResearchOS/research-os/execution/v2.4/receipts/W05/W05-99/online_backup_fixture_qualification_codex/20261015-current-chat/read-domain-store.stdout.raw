@@ -1,0 +1,529 @@
+internal/store/sqlite.go:1:package store
+internal/store/sqlite.go:3:import (
+internal/store/sqlite.go:4:	"context"
+internal/store/sqlite.go:5:	"database/sql"
+internal/store/sqlite.go:6:	"fmt"
+internal/store/sqlite.go:7:	"net/url"
+internal/store/sqlite.go:8:	"os"
+internal/store/sqlite.go:9:	"path/filepath"
+internal/store/sqlite.go:10:	"time"
+internal/store/sqlite.go:12:	_ "modernc.org/sqlite"
+internal/store/sqlite.go:13:)
+internal/store/sqlite.go:15:// Open initializes the single local authoritative database connection.
+internal/store/sqlite.go:16:func Open(path string) (*sql.DB, error) {
+internal/store/sqlite.go:17:	abs, err := filepath.Abs(path)
+internal/store/sqlite.go:18:	if err != nil {
+internal/store/sqlite.go:19:		return nil, err
+internal/store/sqlite.go:20:	}
+internal/store/sqlite.go:21:	if err := os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
+internal/store/sqlite.go:22:		return nil, err
+internal/store/sqlite.go:23:	}
+internal/store/sqlite.go:24:	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(abs)}
+internal/store/sqlite.go:25:	q := u.Query()
+internal/store/sqlite.go:26:	q.Set("_foreign_keys", "1")
+internal/store/sqlite.go:27:	q.Set("_journal_mode", "WAL")
+internal/store/sqlite.go:28:	q.Set("_synchronous", "FULL")
+internal/store/sqlite.go:29:	q.Set("_busy_timeout", "5000")
+internal/store/sqlite.go:30:	u.RawQuery = q.Encode()
+internal/store/sqlite.go:31:	db, err := sql.Open("sqlite", u.String())
+internal/store/sqlite.go:32:	if err != nil {
+internal/store/sqlite.go:33:		return nil, err
+internal/store/sqlite.go:34:	}
+internal/store/sqlite.go:35:	db.SetMaxOpenConns(1)
+internal/store/sqlite.go:36:	db.SetMaxIdleConns(1)
+internal/store/sqlite.go:37:	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+internal/store/sqlite.go:38:	defer cancel()
+internal/store/sqlite.go:39:	if err := db.PingContext(ctx); err != nil {
+internal/store/sqlite.go:40:		db.Close()
+internal/store/sqlite.go:41:		return nil, err
+internal/store/sqlite.go:42:	}
+internal/store/sqlite.go:43:	if err := Ready(ctx, db); err != nil {
+internal/store/sqlite.go:44:		db.Close()
+internal/store/sqlite.go:45:		return nil, err
+internal/store/sqlite.go:46:	}
+internal/store/sqlite.go:47:	return db, nil
+internal/store/sqlite.go:48:}
+internal/store/sqlite.go:50:// Ready checks the live connection settings, rather than treating a file as readiness.
+internal/store/sqlite.go:51:func Ready(ctx context.Context, db *sql.DB) error {
+internal/store/sqlite.go:52:	for pragma, want := range map[string]string{
+internal/store/sqlite.go:53:		"foreign_keys": "1", "journal_mode": "wal", "synchronous": "2", "busy_timeout": "5000",
+internal/store/sqlite.go:54:	} {
+internal/store/sqlite.go:55:		var got string
+internal/store/sqlite.go:56:		if err := db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+internal/store/sqlite.go:57:			return fmt.Errorf("%s: %w", pragma, err)
+internal/store/sqlite.go:58:		}
+internal/store/sqlite.go:59:		if got != want {
+internal/store/sqlite.go:60:			return fmt.Errorf("%s=%s, want %s", pragma, got, want)
+internal/store/sqlite.go:61:		}
+internal/store/sqlite.go:62:	}
+internal/store/sqlite.go:63:	var integrity string
+internal/store/sqlite.go:64:	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&integrity); err != nil {
+internal/store/sqlite.go:65:		return err
+internal/store/sqlite.go:66:	}
+internal/store/sqlite.go:67:	if integrity != "ok" {
+internal/store/sqlite.go:68:		return fmt.Errorf("sqlite quick_check: %s", integrity)
+internal/store/sqlite.go:69:	}
+internal/store/sqlite.go:70:	return nil
+internal/store/sqlite.go:71:}
+internal/store/sqlite.go:73:// Bootstrap records only the empty storage baseline; W03 owns business tables.
+internal/store/sqlite.go:74:func Bootstrap(ctx context.Context, db *sql.DB, migrationFile string) error {
+internal/store/sqlite.go:75:	sqlText, err := os.ReadFile(migrationFile)
+internal/store/sqlite.go:76:	if err != nil {
+internal/store/sqlite.go:77:		return err
+internal/store/sqlite.go:78:	}
+internal/store/sqlite.go:79:	tx, err := db.BeginTx(ctx, nil)
+internal/store/sqlite.go:80:	if err != nil {
+internal/store/sqlite.go:81:		return err
+internal/store/sqlite.go:82:	}
+internal/store/sqlite.go:83:	defer tx.Rollback()
+internal/store/sqlite.go:84:	if _, err := tx.ExecContext(ctx, string(sqlText)); err != nil {
+internal/store/sqlite.go:85:		return err
+internal/store/sqlite.go:86:	}
+internal/store/sqlite.go:87:	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)`); err != nil {
+internal/store/sqlite.go:88:		return err
+internal/store/sqlite.go:89:	}
+internal/store/sqlite.go:90:	return tx.Commit()
+internal/store/sqlite.go:91:}
+internal/domain/store.go:1:package domain
+internal/domain/store.go:3:import (
+internal/domain/store.go:4:	"context"
+internal/domain/store.go:5:	"crypto/rand"
+internal/domain/store.go:6:	"database/sql"
+internal/domain/store.go:7:	"encoding/hex"
+internal/domain/store.go:8:	"errors"
+internal/domain/store.go:9:	"fmt"
+internal/domain/store.go:10:	"os"
+internal/domain/store.go:11:	"path/filepath"
+internal/domain/store.go:12:	"researchos.local/research-os/adapters/protectedstore"
+internal/domain/store.go:13:	"strconv"
+internal/domain/store.go:14:	"strings"
+internal/domain/store.go:15:	"time"
+internal/domain/store.go:16:	_ "time/tzdata"
+internal/domain/store.go:17:)
+internal/domain/store.go:19:type Service struct {
+internal/domain/store.go:20:	DB        *sql.DB
+internal/domain/store.go:21:	Contracts *Contracts
+internal/domain/store.go:22:	Protected protectedstore.Provider
+internal/domain/store.go:23:	// Fixed by a trusted constructor, never by a request or environment selector.
+internal/domain/store.go:24:	projectBindingRoute string
+internal/domain/store.go:25:	// Supplied only by a trusted local Root witness integration; nil fails closed.
+internal/domain/store.go:26:	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
+internal/domain/store.go:27:}
+internal/domain/store.go:28:type Fault struct {
+internal/domain/store.go:29:	Status        int
+internal/domain/store.go:30:	Code, Message string
+internal/domain/store.go:31:	Current       any
+internal/domain/store.go:32:}
+internal/domain/store.go:34:func (f *Fault) Error() string { return f.Code + ": " + f.Message }
+internal/domain/store.go:35:func Fail(status int, code, msg string) error {
+internal/domain/store.go:36:	return &Fault{Status: status, Code: code, Message: msg}
+internal/domain/store.go:37:}
+internal/domain/store.go:39:// NewCurrentMu is the installed current host's fixed construction policy. New
+internal/domain/store.go:40:// remains the legacy constructor so existing stored projects and fixtures keep
+internal/domain/store.go:41:// their historical binding semantics. Children inherit their stored parent.
+internal/domain/store.go:42:func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+internal/domain/store.go:43:	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+internal/domain/store.go:44:		return nil, err
+internal/domain/store.go:45:	}
+internal/domain/store.go:46:	s, err := New(db, contractsDir, migrationFile)
+internal/domain/store.go:47:	if err != nil {
+internal/domain/store.go:48:		return nil, err
+internal/domain/store.go:49:	}
+internal/domain/store.go:50:	s.projectBindingRoute = "MU_FORK"
+internal/domain/store.go:51:	return s, nil
+internal/domain/store.go:52:}
+internal/domain/store.go:54:func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+internal/domain/store.go:55:	c, e := LoadContracts(contractsDir)
+internal/domain/store.go:56:	if e != nil {
+internal/domain/store.go:57:		return nil, e
+internal/domain/store.go:58:	}
+internal/domain/store.go:59:	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
+internal/domain/store.go:60:	if e != nil {
+internal/domain/store.go:61:		return nil, e
+internal/domain/store.go:62:	}
+internal/domain/store.go:63:	if _, e = os.Stat(migrationFile); e != nil {
+internal/domain/store.go:64:		return nil, e
+internal/domain/store.go:65:	}
+internal/domain/store.go:66:	// Refuse future/gapped inventories before domain, additive or fence DDL.
+internal/domain/store.go:67:	// The lower storage layer has already opened the file and selected WAL.
+internal/domain/store.go:68:	if _, e = checkMigrationInventory(db, files); e != nil {
+internal/domain/store.go:69:		return nil, e
+internal/domain/store.go:70:	}
+internal/domain/store.go:71:	if e = CheckMigrationSafety(db, files); e != nil {
+internal/domain/store.go:72:		return nil, e
+internal/domain/store.go:73:	}
+internal/domain/store.go:74:	tx, e := db.Begin()
+internal/domain/store.go:75:	if e != nil {
+internal/domain/store.go:76:		return nil, e
+internal/domain/store.go:77:	}
+internal/domain/store.go:78:	defer tx.Rollback()
+internal/domain/store.go:79:	for _, file := range files {
+internal/domain/store.go:80:		version, err := strconv.Atoi(filepath.Base(file)[:4])
+internal/domain/store.go:81:		if err != nil {
+internal/domain/store.go:82:			return nil, err
+internal/domain/store.go:83:		}
+internal/domain/store.go:84:		if version < 2 {
+internal/domain/store.go:85:			continue
+internal/domain/store.go:86:		}
+internal/domain/store.go:87:		var applied int
+internal/domain/store.go:88:		if err := tx.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=?", version).Scan(&applied); err != nil {
+internal/domain/store.go:89:			return nil, err
+internal/domain/store.go:90:		}
+internal/domain/store.go:91:		if applied != 0 {
+internal/domain/store.go:92:			continue
+internal/domain/store.go:93:		}
+internal/domain/store.go:94:		b, err := os.ReadFile(file)
+internal/domain/store.go:95:		if err != nil {
+internal/domain/store.go:96:			return nil, err
+internal/domain/store.go:97:		}
+internal/domain/store.go:98:		if _, err = tx.Exec(string(b)); err != nil {
+internal/domain/store.go:99:			return nil, err
+internal/domain/store.go:100:		}
+internal/domain/store.go:101:		if _, err = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", version); err != nil {
+internal/domain/store.go:102:			return nil, err
+internal/domain/store.go:103:		}
+internal/domain/store.go:104:	}
+internal/domain/store.go:105:	// W03's additive session schema has its own unnumbered, idempotent path.
+internal/domain/store.go:106:	// The production host must install it as well as the tests and import tools.
+internal/domain/store.go:107:	// Keep it in the same transaction so a missing or invalid schema cannot
+internal/domain/store.go:108:	// leave the business migrations committed with the typed client unusable.
+internal/domain/store.go:109:	sessionSchema, err := os.ReadFile(filepath.Join(filepath.Dir(migrationFile), "next_v24_sessions.sql"))
+internal/domain/store.go:110:	if err != nil {
+internal/domain/store.go:111:		return nil, err
+internal/domain/store.go:112:	}
+internal/domain/store.go:113:	if _, err = tx.Exec(string(sessionSchema)); err != nil {
+internal/domain/store.go:114:		return nil, err
+internal/domain/store.go:115:	}
+internal/domain/store.go:116:	if err = installClientSessionFence(context.Background(), tx, false); err != nil {
+internal/domain/store.go:117:		return nil, err
+internal/domain/store.go:118:	}
+internal/domain/store.go:119:	if e = tx.Commit(); e != nil {
+internal/domain/store.go:120:		return nil, e
+internal/domain/store.go:121:	}
+internal/domain/store.go:122:	return &Service{DB: db, Contracts: c, projectBindingRoute: "THIN_CORE"}, nil
+internal/domain/store.go:123:}
+internal/domain/store.go:124:func ID() string {
+internal/domain/store.go:125:	var b [16]byte
+internal/domain/store.go:126:	if _, e := rand.Read(b[:]); e != nil {
+internal/domain/store.go:127:		panic(e)
+internal/domain/store.go:128:	}
+internal/domain/store.go:129:	return hex.EncodeToString(b[:])
+internal/domain/store.go:130:}
+internal/domain/store.go:131:func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+internal/domain/store.go:132:func Base(project string) Object {
+internal/domain/store.go:133:	now := Now()
+internal/domain/store.go:134:	return Object{"id": ID(), "project_id": project, "revision": 1, "created_at": now, "updated_at": now}
+internal/domain/store.go:135:}
+internal/domain/store.go:136:func Merge(o Object, fields Object) Object {
+internal/domain/store.go:137:	for k, v := range fields {
+internal/domain/store.go:138:		o[k] = v
+internal/domain/store.go:139:	}
+internal/domain/store.go:140:	return o
+internal/domain/store.go:141:}
+internal/domain/store.go:142:func Empty() []any { return []any{} }
+internal/domain/store.go:143:func load(tx *sql.Tx, project, kind, id string) (Object, error) {
+internal/domain/store.go:144:	var raw string
+internal/domain/store.go:145:	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind=? AND id=?", project, kind, id).Scan(&raw)
+internal/domain/store.go:146:	if errors.Is(e, sql.ErrNoRows) {
+internal/domain/store.go:147:		return nil, Fail(404, "NOT_FOUND", "object unavailable")
+internal/domain/store.go:148:	}
+internal/domain/store.go:149:	if e != nil {
+internal/domain/store.go:150:		return nil, e
+internal/domain/store.go:151:	}
+internal/domain/store.go:152:	return Decode([]byte(raw))
+internal/domain/store.go:153:}
+internal/domain/store.go:154:func singleton(tx *sql.Tx, project, kind string) (Object, error) {
+internal/domain/store.go:155:	var raw string
+internal/domain/store.go:156:	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind=?", project, kind).Scan(&raw)
+internal/domain/store.go:157:	if errors.Is(e, sql.ErrNoRows) {
+internal/domain/store.go:158:		return nil, Fail(404, "NOT_FOUND", "object unavailable")
+internal/domain/store.go:159:	}
+internal/domain/store.go:160:	if e != nil {
+internal/domain/store.go:161:		return nil, e
+internal/domain/store.go:162:	}
+internal/domain/store.go:163:	return Decode([]byte(raw))
+internal/domain/store.go:164:}
+internal/domain/store.go:165:func bump(o Object) error {
+internal/domain/store.go:166:	n, e := Num(o, "revision")
+internal/domain/store.go:167:	if e != nil {
+internal/domain/store.go:168:		return e
+internal/domain/store.go:169:	}
+internal/domain/store.go:170:	if n == 1<<63-1 {
+internal/domain/store.go:171:		return Fail(409, "STATE_CONFLICT", "revision exhausted")
+internal/domain/store.go:172:	}
+internal/domain/store.go:173:	o["revision"] = n + 1
+internal/domain/store.go:174:	o["updated_at"] = Now()
+internal/domain/store.go:175:	return nil
+internal/domain/store.go:176:}
+internal/domain/store.go:178:var idTargets = map[string]string{
+internal/domain/store.go:179:	"budget_policy_id": "BudgetPolicy", "run_policy_id": "RunPolicy", "goal_id": "Goal", "task_id": "Task", "task_ids": "Task", "dependency_task_ids": "Task", "active_run_id": "Run", "run_id": "Run", "run_ids": "Run", "runtime_id": "RuntimeRegistration", "context_bundle_id": "ContextBundle", "no_progress_record_id": "NoProgressRecord", "acceptance_id": "AcceptanceReceipt", "acceptance_ids": "AcceptanceReceipt", "output_artifact_ids": "Artifact", "result_artifact_ids": "Artifact", "checkpoint_artifact_id": "Artifact", "blocking_conflict_ids": "Conflict", "conflict_ids": "Conflict", "active_goal_ids": "Goal", "active_cycle_id": "ResearchCycle", "latest_release_id": "MilestoneRelease", "pending_change_ids": "ChangeProposal", "origin_evidence_id": "Evidence", "verified_by_run_id": "Run", "candidate_evidence_ids": "Evidence", "required_experiment_ids": "Experiment", "decision_ids": "DecisionReceipt", "follow_up_task_ids": "Task", "cycle_id": "ResearchCycle", "qualification_id": "Qualification", "qualification_ids": "Qualification", "impact_link_ids": "ImpactLink", "semantic_review_run_id": "Run", "blocked_task_ids": "Task", "continuable_task_ids": "Task", "parent_release_id": "MilestoneRelease", "open_resource_request_ids": "ResourceRequest", "baseline_skill_id": "SkillVersion", "experiment_id": "Experiment", "rollback_skill_id": "SkillVersion", "regression_acceptance_id": "AcceptanceReceipt", "canary_acceptance_id": "AcceptanceReceipt", "rollback_verified_receipt_id": "AcceptanceReceipt", "last_cycle_id": "ResearchCycle", "policy_id": "BudgetPolicy", "reservation_id": "BudgetLedgerEntry", "release_id": "MilestoneRelease", "resource_request_id": "ResourceRequest", "resolution_proposal_id": "ChangeProposal",
+internal/domain/store.go:180:}
+internal/domain/store.go:182:func relationKind(owner, field string) string {
+internal/domain/store.go:183:	if owner == "RuntimeRegistration" && field == "qualification_ids" {
+internal/domain/store.go:184:		return "AcceptanceReceipt"
+internal/domain/store.go:185:	}
+internal/domain/store.go:186:	return idTargets[field]
+internal/domain/store.go:187:}
+internal/domain/store.go:189:func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
+internal/domain/store.go:190:	if !s.Contracts.Entities[kind] {
+internal/domain/store.go:191:		return Fail(400, "INVALID_REQUEST", "unknown entity")
+internal/domain/store.go:192:	}
+internal/domain/store.go:193:	if e := s.Contracts.Validate(kind, o); e != nil {
+internal/domain/store.go:194:		return Fail(400, "INVALID_REQUEST", "entity violates "+kind+" schema")
+internal/domain/store.go:195:	}
+internal/domain/store.go:196:	project := Str(o, "project_id")
+internal/domain/store.go:197:	id := Str(o, "id")
+internal/domain/store.go:198:	rev, e := Num(o, "revision")
+internal/domain/store.go:199:	if e != nil {
+internal/domain/store.go:200:		return e
+internal/domain/store.go:201:	}
+internal/domain/store.go:202:	old, e := load(tx, project, kind, id)
+internal/domain/store.go:203:	if e == nil {
+internal/domain/store.go:204:		if _, immutable := old["receipt_hash"]; immutable {
+internal/domain/store.go:205:			return Fail(409, "STATE_CONFLICT", "receipt immutable")
+internal/domain/store.go:206:		}
+internal/domain/store.go:207:		oldRevision, e := Num(old, "revision")
+internal/domain/store.go:208:		if e != nil {
+internal/domain/store.go:209:			return e
+internal/domain/store.go:210:		}
+internal/domain/store.go:211:		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
+internal/domain/store.go:212:			return Fail(409, "STATE_CONFLICT", "revision must advance once")
+internal/domain/store.go:213:		}
+internal/domain/store.go:214:		if kind == "Task" && !taskTransition(old, o) {
+internal/domain/store.go:215:			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
+internal/domain/store.go:216:		}
+internal/domain/store.go:217:	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {
+internal/domain/store.go:218:		return e
+internal/domain/store.go:219:	}
+internal/domain/store.go:220:	if e = s.invariants(kind, o); e != nil {
+internal/domain/store.go:221:		return e
+internal/domain/store.go:222:	}
+internal/domain/store.go:223:	var hash any
+internal/domain/store.go:224:	immutable := 0
+internal/domain/store.go:225:	if h, ok := o["receipt_hash"]; ok {
+internal/domain/store.go:226:		if h != Receipt(o) {
+internal/domain/store.go:227:			return Fail(422, "CONTENT_HASH_MISMATCH", "receipt hash mismatch")
+internal/domain/store.go:228:		}
+internal/domain/store.go:229:		hash = h
+internal/domain/store.go:230:		immutable = 1
+internal/domain/store.go:231:	} else if kind == "Artifact" {
+internal/domain/store.go:232:		hash = o["content_hash"]
+internal/domain/store.go:233:	}
+internal/domain/store.go:234:	if _, e = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)", project, kind, id, rev, string(Bytes(o)), hash); e != nil {
+internal/domain/store.go:235:		return e
+internal/domain/store.go:236:	}
+internal/domain/store.go:237:	if _, e = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body,content_hash=excluded.content_hash", project, kind, id, rev, string(Bytes(o)), hash, immutable); e != nil {
+internal/domain/store.go:238:		return e
+internal/domain/store.go:239:	}
+internal/domain/store.go:240:	return s.refs(tx, project, kind, id, rev, "", o)
+internal/domain/store.go:241:}
+internal/domain/store.go:242:func (s *Service) refs(tx *sql.Tx, project, kind, id string, rev int64, path string, value any) error {
+internal/domain/store.go:243:	switch v := value.(type) {
+internal/domain/store.go:244:	case map[string]any:
+internal/domain/store.go:245:		if _, ok := v["entity_type"]; ok {
+internal/domain/store.go:246:			if e := s.Contracts.Validate("VersionRef", v); e != nil {
+internal/domain/store.go:247:				return Fail(400, "INVALID_REQUEST", "invalid reference")
+internal/domain/store.go:248:			}
+internal/domain/store.go:249:			version, e := Num(v, "revision")
+internal/domain/store.go:250:			if e != nil {
+internal/domain/store.go:251:				return e
+internal/domain/store.go:252:			}
+internal/domain/store.go:253:			return s.ref(tx, project, kind, id, rev, path, project, Str(v, "entity_type"), Str(v, "id"), version, v["content_hash"], true)
+internal/domain/store.go:254:		}
+internal/domain/store.go:255:		for field, x := range v {
+internal/domain/store.go:256:			if field == "id" || field == "project_id" {
+internal/domain/store.go:257:				continue
+internal/domain/store.go:258:			}
+internal/domain/store.go:259:			target := relationKind(kind, field)
+internal/domain/store.go:260:			if field == "supersedes_id" {
+internal/domain/store.go:261:				target = kind
+internal/domain/store.go:262:			}
+internal/domain/store.go:263:			if field == "parent_policy_id" {
+internal/domain/store.go:264:				target = kind
+internal/domain/store.go:265:			}
+internal/domain/store.go:266:			if target != "" && x != nil {
+internal/domain/store.go:267:				values := []any{x}
+internal/domain/store.go:268:				if a, ok := x.([]any); ok {
+internal/domain/store.go:269:					values = a
+internal/domain/store.go:270:				}
+internal/domain/store.go:271:				for _, a := range values {
+internal/domain/store.go:272:					tid, ok := a.(string)
+internal/domain/store.go:273:					if !ok {
+internal/domain/store.go:274:						return Fail(400, "INVALID_REQUEST", "invalid relation")
+internal/domain/store.go:275:					}
+internal/domain/store.go:276:					tp := project
+internal/domain/store.go:277:					if field == "parent_policy_id" {
+internal/domain/store.go:278:						var found int
+internal/domain/store.go:279:						tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind=? AND id=?", project, target, tid).Scan(&found)
+internal/domain/store.go:280:						if found == 0 {
+internal/domain/store.go:281:							tp = ""
+internal/domain/store.go:282:						}
+internal/domain/store.go:283:					}
+internal/domain/store.go:284:					obj, e := load(tx, tp, target, tid)
+internal/domain/store.go:285:					if e != nil {
+internal/domain/store.go:286:						return Fail(422, "GATE_FAILED", "related object unavailable")
+internal/domain/store.go:287:					}
+internal/domain/store.go:288:					version, e := Num(obj, "revision")
+internal/domain/store.go:289:					if e != nil {
+internal/domain/store.go:290:						return e
+internal/domain/store.go:291:					}
+internal/domain/store.go:292:					if e = s.ref(tx, project, kind, id, rev, path+"/"+field, tp, target, tid, version, nil, false); e != nil {
+internal/domain/store.go:293:						return e
+internal/domain/store.go:294:					}
+internal/domain/store.go:295:				}
+internal/domain/store.go:296:			} else if e := s.refs(tx, project, kind, id, rev, path+"/"+field, x); e != nil {
+internal/domain/store.go:297:				return e
+internal/domain/store.go:298:			}
+internal/domain/store.go:299:		}
+internal/domain/store.go:300:	case []any:
+internal/domain/store.go:301:		for i, x := range v {
+internal/domain/store.go:302:			if e := s.refs(tx, project, kind, id, rev, fmt.Sprintf("%s/%d", path, i), x); e != nil {
+internal/domain/store.go:303:				return e
+internal/domain/store.go:304:			}
+internal/domain/store.go:305:		}
+internal/domain/store.go:306:	}
+internal/domain/store.go:307:	return nil
+internal/domain/store.go:308:}
+internal/domain/store.go:309:func (s *Service) ref(tx *sql.Tx, project, kind, id string, rev int64, path, tp, tk, tid string, tr int64, hash any, exact bool) error {
+internal/domain/store.go:310:	var current int64
+internal/domain/store.go:311:	var h sql.NullString
+internal/domain/store.go:312:	e := tx.QueryRow("SELECT revision,content_hash FROM domain_objects WHERE project=? AND kind=? AND id=?", tp, tk, tid).Scan(&current, &h)
+internal/domain/store.go:313:	if e != nil {
+internal/domain/store.go:314:		return Fail(422, "GATE_FAILED", "reference unavailable")
+internal/domain/store.go:315:	}
+internal/domain/store.go:316:	history := kind == "Conflict" || kind == "Artifact" || kind == "ContextBundle" || kind == "DecisionReceipt" || kind == "AcceptanceReceipt" || kind == "AgentMessage" || kind == "ImpactLink" || kind == "ChangeProposal" || kind == "EventEnvelope" || kind == "SkillVersion" || ((kind == "Task" || kind == "Goal") && rev > 1)
+internal/domain/store.go:317:	if exact && kind == "ResearchCycle" && path == "/profile_ref" && tk == "ProjectProfile" && tp == project && rev > 1 {
+internal/domain/store.go:318:		var priorRaw, currentRaw string
+internal/domain/store.go:319:		e = tx.QueryRow("SELECT prior.body,current.body FROM domain_versions prior JOIN domain_versions current ON current.project=prior.project AND current.kind=prior.kind AND current.id=prior.id AND current.revision=prior.revision+1 WHERE prior.project=? AND prior.kind='ResearchCycle' AND prior.id=? AND prior.revision=?", project, id, rev-1).Scan(&priorRaw, &currentRaw)
+internal/domain/store.go:320:		if e != nil {
+internal/domain/store.go:321:			return Fail(422, "GATE_FAILED", "cycle cancellation needs its previous version")
+internal/domain/store.go:322:		}
+internal/domain/store.go:323:		prior, err := Decode([]byte(priorRaw))
+internal/domain/store.go:324:		if err != nil {
+internal/domain/store.go:325:			return err
+internal/domain/store.go:326:		}
+internal/domain/store.go:327:		currentCycle, err := Decode([]byte(currentRaw))
+internal/domain/store.go:328:		if err != nil {
+internal/domain/store.go:329:			return err
+internal/domain/store.go:330:		}
+internal/domain/store.go:331:		history = currentCycle["status"] == "CANCELLED" && Hash(currentCycle["profile_ref"]) == Hash(prior["profile_ref"])
+internal/domain/store.go:332:	}
+internal/domain/store.go:333:	if exact && history {
+internal/domain/store.go:334:		e = tx.QueryRow("SELECT revision,content_hash FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?", tp, tk, tid, tr).Scan(&current, &h)
+internal/domain/store.go:335:		if e != nil {
+internal/domain/store.go:336:			return Fail(422, "GATE_FAILED", "historical reference unavailable")
+internal/domain/store.go:337:		}
+internal/domain/store.go:338:	}
+internal/domain/store.go:339:	if exact && current != tr {
+internal/domain/store.go:340:		return Fail(412, "STALE_INPUT", "reference revision changed")
+internal/domain/store.go:341:	}
+internal/domain/store.go:342:	if exact && ((h.Valid && hash != h.String) || (!h.Valid && hash != nil)) {
+internal/domain/store.go:343:		return Fail(422, "CONTENT_HASH_MISMATCH", "reference hash mismatch")
+internal/domain/store.go:344:	}
+internal/domain/store.go:345:	_, e = tx.Exec("INSERT INTO domain_refs(project,kind,id,revision,field,target_project,target_kind,target_id,target_revision) VALUES(?,?,?,?,?,?,?,?,?)", project, kind, id, rev, path, tp, tk, tid, tr)
+internal/domain/store.go:346:	return e
+internal/domain/store.go:347:}
+internal/domain/store.go:348:func (s *Service) invariants(kind string, o Object) error {
+internal/domain/store.go:349:	if tz := Str(o, "timezone"); tz != "" {
+internal/domain/store.go:350:		if _, e := time.LoadLocation(tz); e != nil {
+internal/domain/store.go:351:			return Fail(400, "INVALID_REQUEST", "invalid IANA timezone")
+internal/domain/store.go:352:		}
+internal/domain/store.go:353:	}
+internal/domain/store.go:354:	if kind == "RunPolicy" {
+internal/domain/store.go:355:		lease, e := Num(o, "lease_seconds")
+internal/domain/store.go:356:		if e != nil {
+internal/domain/store.go:357:			return e
+internal/domain/store.go:358:		}
+internal/domain/store.go:359:		heartbeat, e := Num(o, "heartbeat_seconds")
+internal/domain/store.go:360:		if e != nil {
+internal/domain/store.go:361:			return e
+internal/domain/store.go:362:		}
+internal/domain/store.go:363:		if lease <= heartbeat {
+internal/domain/store.go:364:			return Fail(422, "GATE_FAILED", "lease must exceed heartbeat")
+internal/domain/store.go:365:		}
+internal/domain/store.go:366:	}
+internal/domain/store.go:367:	if kind == "BudgetPolicy" || kind == "RunPolicy" {
+internal/domain/store.go:368:		scope := Str(o, "scope_type")
+internal/domain/store.go:369:		if scope == "PROJECT" && o["scope_id"] != o["project_id"] {
+internal/domain/store.go:370:			return Fail(422, "GATE_FAILED", "policy scope mismatch")
+internal/domain/store.go:371:		}
+internal/domain/store.go:372:	}
+internal/domain/store.go:373:	return nil
+internal/domain/store.go:374:}
+internal/domain/store.go:375:func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, correlation, eventType string) error {
+internal/domain/store.go:376:	state, e := singleton(tx, project, "ProjectState")
+internal/domain/store.go:377:	if e != nil {
+internal/domain/store.go:378:		return e
+internal/domain/store.go:379:	}
+internal/domain/store.go:380:	seq, e := Num(state, "event_sequence")
+internal/domain/store.go:381:	if e != nil {
+internal/domain/store.go:382:		return e
+internal/domain/store.go:383:	}
+internal/domain/store.go:384:	// Typed session events share this outbox and allocate from its committed
+internal/domain/store.go:385:	// watermark. Continue the same sequence inside the existing transaction;
+internal/domain/store.go:386:	// ProjectState may predate intervening typed events.
+internal/domain/store.go:387:	var outboxSequence int64
+internal/domain/store.go:388:	if e = tx.QueryRow("SELECT COALESCE(MAX(sequence),0) FROM outbox WHERE project=?", project).Scan(&outboxSequence); e != nil {
+internal/domain/store.go:389:		return e
+internal/domain/store.go:390:	}
+internal/domain/store.go:391:	if outboxSequence > seq {
+internal/domain/store.go:392:		seq = outboxSequence
+internal/domain/store.go:393:	}
+internal/domain/store.go:394:	if seq == 1<<63-1 {
+internal/domain/store.go:395:		return Fail(409, "STATE_CONFLICT", "event sequence exhausted")
+internal/domain/store.go:396:	}
+internal/domain/store.go:397:	seq++
+internal/domain/store.go:398:	if e = bump(state); e != nil {
+internal/domain/store.go:399:		return e
+internal/domain/store.go:400:	}
+internal/domain/store.go:401:	state["event_sequence"] = seq
+internal/domain/store.go:402:	if e = s.put(tx, "ProjectState", state); e != nil {
+internal/domain/store.go:403:		return e
+internal/domain/store.go:404:	}
+internal/domain/store.go:405:	ev := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "sequence": seq, "event_type": eventType, "aggregate_ref": Ref(o, kind), "actor_id": actor, "correlation_id": correlation, "causation_id": nil, "event_data_artifact_ref": nil}
+internal/domain/store.go:406:	ev["receipt_hash"] = Receipt(ev)
+internal/domain/store.go:407:	if e = s.put(tx, "EventEnvelope", ev); e != nil {
+internal/domain/store.go:408:		return e
+internal/domain/store.go:409:	}
+internal/domain/store.go:410:	_, e = tx.Exec("INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)", project, seq, ev["id"], string(Bytes(ev)))
+internal/domain/store.go:411:	if e != nil {
+internal/domain/store.go:412:		return e
+internal/domain/store.go:413:	}
+internal/domain/store.go:414:	_, e = tx.Exec("INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)", project, ev["id"], state["revision"], string(Bytes(state)))
+internal/domain/store.go:415:	return e
+internal/domain/store.go:416:}
+internal/domain/store.go:418:// AcknowledgeEvent is idempotent. Unacknowledged events remain durable for retry.
+internal/domain/store.go:419:func (s *Service) AcknowledgeEvent(ctx context.Context, project, id string) error {
+internal/domain/store.go:420:	res, e := s.DB.ExecContext(ctx, "UPDATE outbox SET acknowledged=1 WHERE project=? AND id=?", project, id)
+internal/domain/store.go:421:	if e != nil {
+internal/domain/store.go:422:		return e
+internal/domain/store.go:423:	}
+internal/domain/store.go:424:	n, _ := res.RowsAffected()
+internal/domain/store.go:425:	if n != 1 {
+internal/domain/store.go:426:		return Fail(404, "NOT_FOUND", "event unavailable")
+internal/domain/store.go:427:	}
+internal/domain/store.go:428:	return nil
+internal/domain/store.go:429:}
+internal/domain/store.go:430:func (s *Service) PendingEvents(ctx context.Context, project string) ([]Object, error) {
+internal/domain/store.go:431:	rows, e := s.DB.QueryContext(ctx, "SELECT body FROM outbox WHERE project=? AND acknowledged=0 ORDER BY sequence", project)
+internal/domain/store.go:432:	if e != nil {
+internal/domain/store.go:433:		return nil, e
+internal/domain/store.go:434:	}
+internal/domain/store.go:435:	defer rows.Close()
+internal/domain/store.go:436:	out := []Object{}
+internal/domain/store.go:437:	for rows.Next() {
+internal/domain/store.go:438:		var b string
+internal/domain/store.go:439:		if e = rows.Scan(&b); e != nil {
+internal/domain/store.go:440:			return nil, e
+internal/domain/store.go:441:		}
+internal/domain/store.go:442:		o, e := Decode([]byte(b))
+internal/domain/store.go:443:		if e != nil {
+internal/domain/store.go:444:			return nil, e
+internal/domain/store.go:445:		}
+internal/domain/store.go:446:		out = append(out, o)
+internal/domain/store.go:447:	}
+internal/domain/store.go:448:	return out, rows.Err()
+internal/domain/store.go:449:}
+internal/domain/store.go:450:func safeRole(role string) bool {
+internal/domain/store.go:451:	return strings.Contains(" OWNER PLANNER EXECUTOR VERIFIER SCHEDULER RELEASE_SERVICE SOURCE_ADAPTER READER ", " "+role+" ")
+internal/domain/store.go:452:}

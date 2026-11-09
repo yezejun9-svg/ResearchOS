@@ -1,0 +1,173 @@
+diff --git a/adapters/runtime/codex_qualification_capture_windows.go b/adapters/runtime/codex_qualification_capture_windows.go
+index 2bf070b6..83212699 100644
+--- a/adapters/runtime/codex_qualification_capture_windows.go
++++ b/adapters/runtime/codex_qualification_capture_windows.go
+@@ -244,7 +244,7 @@ func qualificationIntentRecord(executable string, args, env []string, cwd, jobNa
+ 	if err != nil || !slices.Equal(args, expectedArgs) || !filepath.IsAbs(executable) ||
+ 		cwd != context.Working || jobName != qualificationJobName(context.RunID, context.Epoch, context.Nonce) ||
+ 		filepath.Clean(executable) != executable || context.NormalHome == "" || !filepath.IsAbs(context.NormalHome) ||
+-		!strings.EqualFold(context.NormalHome, os.Getenv("USERPROFILE")) ||
++		!sameQualificationNormalHome(context.NormalHome, os.Getenv("USERPROFILE")) ||
+ 		!strings.EqualFold(filepath.Dir(context.Working), root) || !strings.EqualFold(filepath.Dir(context.Denied), root) ||
+ 		!strings.EqualFold(filepath.Dir(receiptBase), filepath.Join(root, "receipts")) ||
+ 		filepath.Base(receiptBase) != strings.TrimPrefix(Hash([]byte(context.RunID+"/"+context.Epoch)), "sha256:")+".json" {
+diff --git a/adapters/runtime/codex_qualification_capture_windows_test.go b/adapters/runtime/codex_qualification_capture_windows_test.go
+index ea844e0a..b19009f2 100644
+--- a/adapters/runtime/codex_qualification_capture_windows_test.go
++++ b/adapters/runtime/codex_qualification_capture_windows_test.go
+@@ -254,6 +254,28 @@ func (w *qualificationFaultWriter) Close() error {
+ 	return errors.Join(w.file.Close(), w.closeErr)
+ }
+ 
++func TestQualificationNormalHomeIntentSpelling(t *testing.T) {
++	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "home-spelling")
++	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
++	limits := qualificationJobLimits{Flags: flags, Processes: qualificationProcessLimit, Memory: uint64(qualificationJobMemory)}
++	receipt.NormalHome = filepath.Clean(receipt.NormalHome)
++	t.Setenv("USERPROFILE", filepath.ToSlash(receipt.NormalHome))
++	if _, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, receipt, limits); err != nil {
++		t.Fatal("separator-equivalent OS-account home rejected by intent validator", err)
++	}
++	for _, tc := range []struct{ name, profile string }{
++		{"changed", filepath.Join(filepath.Dir(receipt.NormalHome), "different-user")},
++		{"empty", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("USERPROFILE", tc.profile)
++			if _, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, receipt, limits); err == nil {
++				t.Fatal("changed or empty home accepted by prelaunch intent validator")
++			}
++		})
++	}
++}
++
+ func TestQualificationPrelaunchIntentProvenanceAndMutation(t *testing.T) {
+ 	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "record")
+ 	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
+diff --git a/adapters/runtime/codex_qualification_windows.go b/adapters/runtime/codex_qualification_windows.go
+index dde617ef..bba5d823 100644
+--- a/adapters/runtime/codex_qualification_windows.go
++++ b/adapters/runtime/codex_qualification_windows.go
+@@ -160,6 +160,36 @@ func NewCodexRPCWithNativeQualification(options CodexRPCOptions, scope CodexNati
+ 	q.rpc.qualifier = q
+ 	return &qualifiedRPC{rpc: q.rpc, q: q, prepareLaunch: q.ensureLaunch, delegateStart: q.rpc.Start}, nil
+ }
++
++// The Host-supplied OS-account NormalHome is the only trusted side of this
++// comparison. Accept ordinary Windows separator and case spelling only;
++// never resolve a different path or take authority from USERPROFILE.
++func sameQualificationNormalHome(normalHome, userProfile string) bool {
++	for _, path := range []string{normalHome, userProfile} {
++		if path == "" {
++			return false
++		}
++		normalized := filepath.FromSlash(path)
++		if !filepath.IsAbs(normalized) || filepath.Clean(normalized) != normalized ||
++			strings.ContainsAny(normalized, `<>"|?*;`) {
++			return false
++		}
++		for _, r := range normalized {
++			if r < ' ' {
++				return false
++			}
++		}
++		if colon := strings.IndexByte(normalized, ':'); colon >= 0 {
++			if colon != 1 || !((normalized[0] >= 'A' && normalized[0] <= 'Z') ||
++				(normalized[0] >= 'a' && normalized[0] <= 'z')) ||
++				strings.Contains(normalized[colon+1:], ":") {
++				return false
++			}
++		}
++	}
++	return strings.EqualFold(filepath.FromSlash(normalHome), filepath.FromSlash(userProfile))
++}
++
+ func qualificationSHA(s string) bool {
+ 	if len(s) != 71 || !strings.HasPrefix(s, "sha256:") {
+ 		return false
+@@ -568,7 +598,7 @@ func (q *nativeQualifier) ensureLaunch(ctx context.Context, in CodexLaunch) (obs
+ 	root := o.ApprovedRoot
+ 	obs = nativeQualificationObservation{TaskID: in.TaskID, RunID: in.RunID, Epoch: in.Epoch, SourceBindingHash: in.SourceBindingHash, Source: source, Directory: in.Directory, NativeHash: q.rpc.options.Descriptor.ExecutableHash, HelperHash: o.ShippedHelperSHA256, HostBuildHash: o.HostBuildSHA256, TemplateHash: CodexRPCPolicyIdentity(q.rpc.options.Descriptor.ExecutableHash).RequestedConfigSHA256, EnvironmentHash: Hash(mustJSON(Environment(""))), NormalHome: q.rpc.options.NormalHome, HostBoot: q.boot, PreflightNoChild: true}
+ 	receipt := qualificationReceiptContext{TaskID: obs.TaskID, RunID: obs.RunID, Epoch: obs.Epoch, SourceBindingHash: obs.SourceBindingHash, Source: source, NativeHash: obs.NativeHash, HelperHash: obs.HelperHash, HostBuildHash: obs.HostBuildHash, TemplateHash: obs.TemplateHash, EnvironmentHash: obs.EnvironmentHash, NormalHome: obs.NormalHome, HostBoot: obs.HostBoot, ExpectedCases: qualificationprobe.FixedCases()}
+-	if ctx.Err() != nil || in.SourceBindingHash == "" || in.TaskID == "" || in.RunID == "" || in.Epoch == "" || !strings.EqualFold(in.Workspace, source) || !strings.EqualFold(filepath.Dir(source), root) || !strings.EqualFold(q.rpc.options.NormalHome, os.Getenv("USERPROFILE")) {
++	if ctx.Err() != nil || in.SourceBindingHash == "" || in.TaskID == "" || in.RunID == "" || in.Epoch == "" || !strings.EqualFold(in.Workspace, source) || !strings.EqualFold(filepath.Dir(source), root) || !sameQualificationNormalHome(q.rpc.options.NormalHome, os.Getenv("USERPROFILE")) {
+ 		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
+ 	}
+ 	if exactReal(root) != nil || exactReal(source) != nil || exactReal(o.ShippedHelper) != nil {
+diff --git a/adapters/runtime/codex_qualification_windows_test.go b/adapters/runtime/codex_qualification_windows_test.go
+index 0d8b800a..30c3b7e8 100644
+--- a/adapters/runtime/codex_qualification_windows_test.go
++++ b/adapters/runtime/codex_qualification_windows_test.go
+@@ -42,6 +42,72 @@ func qualifiedFixture(t *testing.T) (*nativeQualifier, CodexTurnEvidence) {
+ 	e := CodexTurnEvidence{PolicyIdentity: CodexRPCPolicyIdentity(hash), RenderedConfigSHA256: codexRPCConfigHash("researchos-readonly-0123456789abcdef0123456789abcdef", filepath.Join(dir, "cwd"), source), SourceBindingHash: "sha256:source", ProfileNonce: "researchos-readonly-0123456789abcdef0123456789abcdef", ThreadID: "thread", TaskID: "task", RunID: "run", Epoch: "1", Process: CodexIdentity{PID: 42, Created: 123, Job: "model-owned-job"}}
+ 	return q, e
+ }
++func TestQualificationNormalHomeSpelling(t *testing.T) {
++	trusted := `C:\Users\yqyyds`
++	for _, tc := range []struct {
++		name, normalHome, userProfile string
++		want                          bool
++	}{
++		{"same", trusted, trusted, true},
++		{"forward slashes", trusted, "C:/Users/yqyyds", true},
++		{"mixed case and separators", trusted, "c:/uSeRs/YQYYDS", true},
++		{"changed user", trusted, `C:\Users\other`, false},
++		{"prefix sibling", trusted, `C:\Users\yqyyds2`, false},
++		{"changed drive", trusted, `D:\Users\yqyyds`, false},
++		{"changed root", trusted, `C:\Other\yqyyds`, false},
++		{"empty profile", trusted, "", false},
++		{"empty trusted home", "", trusted, false},
++		{"relative", trusted, `Users\yqyyds`, false},
++		{"drive relative", trusted, `C:Users\yqyyds`, false},
++		{"dot segment", trusted, `C:\Users\.\yqyyds`, false},
++		{"parent segment", trusted, `C:\Users\other\..\yqyyds`, false},
++		{"NUL", trusted, trusted + "\x00", false},
++		{"CRLF", trusted, trusted + "\r\n", false},
++		{"semicolon", trusted, trusted + ";", false},
++		{"invalid character", trusted, trusted + "?", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := sameQualificationNormalHome(tc.normalHome, tc.userProfile); got != tc.want {
++				t.Fatalf("sameQualificationNormalHome(%q, %q) = %t, want %t", tc.normalHome, tc.userProfile, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestQualificationNormalHomeEarlyGateAcceptsSlashEquivalentProfile(t *testing.T) {
++	q, _ := qualifiedFixture(t)
++	q.rpc.options.NormalHome = filepath.Clean(q.rpc.options.NormalHome)
++	t.Setenv("USERPROFILE", filepath.ToSlash(q.rpc.options.NormalHome))
++	// A deliberately mismatched synthetic helper digest stops before collector
++	// launch, after the home gate and its existing private-root checks.
++	q.options.ShippedHelperSHA256 = Hash([]byte("different synthetic helper"))
++	in := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", Workspace: q.options.SyntheticSource, Directory: filepath.Join(q.options.ApprovedRoot, "run"), SourceBindingHash: "sha256:source"}
++	obs, err := q.ensureLaunch(context.Background(), in)
++	if err == nil || err.Error() != "QUALIFICATION_BOOTSTRAP_BLOCKED" || obs.ReceiptPath == "" || !obs.PreflightNoChild || obs.Capture.PID != 0 || q.state != "FAILED" {
++		t.Fatal("separator-equivalent home failed the early gate or reached a child", obs.ReceiptPath, obs.Capture.PID, q.state, err)
++	}
++}
++
++func TestQualificationNormalHomeEarlyGateRejectsChangedOrEmptyProfile(t *testing.T) {
++	for _, tc := range []struct{ name, profile string }{
++		{"changed", `C:\Users\a-different-user`},
++		{"empty", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			q, _ := qualifiedFixture(t)
++			t.Setenv("USERPROFILE", tc.profile)
++			in := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", Workspace: q.options.SyntheticSource, Directory: filepath.Join(q.options.ApprovedRoot, "run"), SourceBindingHash: "sha256:source"}
++			obs, err := q.ensureLaunch(context.Background(), in)
++			if err == nil || err.Error() != "QUALIFICATION_SCOPE_MISMATCH" || obs.ReceiptPath != "" || q.state != "FAILED" {
++				t.Fatal("changed or empty profile passed the prelaunch gate", obs.ReceiptPath, q.state, err)
++			}
++			if _, err := os.Stat(filepath.Join(q.options.ApprovedRoot, "receipts")); !errors.Is(err, os.ErrNotExist) {
++				t.Fatal("prelaunch gate created qualification artifacts", err)
++			}
++		})
++	}
++}
++
+ func TestCodexNativeQualificationEnsureIsSingleUseAndBound(t *testing.T) {
+ 	q, e := qualifiedFixture(t)
+ 	if err := q.Ensure(context.Background(), e); err != nil {

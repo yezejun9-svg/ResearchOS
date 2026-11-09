@@ -1,0 +1,34 @@
+[
+  {
+    "old": " \"researchos.local/research-os/internal/api\"",
+    "new": " \"github.com/santhosh-tekuri/jsonschema/v6\"\n \"researchos.local/research-os/internal/domain\"\n \"researchos.local/research-os/internal/api\""
+  },
+  {
+    "old": "func cli43AssertBinding(",
+    "new": "type cli43TransportFact struct {\n RequestIndex int `json:\"request_index\"`\n ResponseIndex int `json:\"response_index\"`\n Method string `json:\"method\"`\n RequestURI string `json:\"request_uri\"`\n Status int `json:\"status\"`\n}\ntype cli43LocalSchemaOnly struct{}\nfunc (cli43LocalSchemaOnly) Load(uri string)(any,error){return nil,fmt.Errorf(\"export-only unregistered schema resource: %s\",uri)}\nfunc cli43EntityContracts(t *testing.T)*domain.Contracts{\n t.Helper()\n raw,e:=os.ReadFile(filepath.Join(\"..\",\"..\",\"internal\",\"api\",\"contracts\",\"domain.schema.json\"));if e!=nil{t.Fatal(e)}\n if fmt.Sprintf(\"%x\",sha256.Sum256(raw))!=\"b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54\"{t.Fatal(\"export-only domain schema pin\")}\n body,e:=domain.Decode(raw);if e!=nil{t.Fatal(e)}\n compiler:=jsonschema.NewCompiler();compiler.UseLoader(cli43LocalSchemaOnly{});compiler.AssertFormat();compiler.DefaultDraft(jsonschema.Draft2020)\n const location=\"https://researchos.invalid/domain.schema.json\"\n if e=compiler.AddResource(location,body);e!=nil{t.Fatal(e)}\n contracts:=&domain.Contracts{Schemas:map[string]*jsonschema.Schema{}}\n for _,kind:=range []string{\"Goal\",\"Task\"}{\n  compiled,e:=compiler.Compile(location+\"#/$defs/\"+kind);if e!=nil{t.Fatal(e)};contracts.Schemas[kind]=compiled\n }\n return contracts // Fixed fixture THIN_CORE route only; no V24/general route qualification.\n}\n\nfunc cli43AssertBinding("
+  },
+  {
+    "old": "requests []json.RawMessage,responses [][]byte,before,after []byte)",
+    "new": "requests []json.RawMessage,responses [][]byte,transport []cli43TransportFact,before,after []byte)"
+  },
+  {
+    "old": " if len(requests)!=len(responses){t.Fatal(\"request/response pairing\")}",
+    "new": " if len(requests)!=len(responses)||len(requests)!=len(transport){t.Fatal(\"request/response/transport pairing\")}"
+  },
+  {
+    "old": " doc,e:=api.ClientProtocolDocument();if e!=nil{t.Fatal(e)}\n for i,raw:=range requests{",
+    "new": " doc,e:=api.ClientProtocolDocument();if e!=nil{t.Fatal(e)}\n entities:=cli43EntityContracts(t)\n sendGoal:=\"\";completedSends:=0;goals:=[]map[string]any{};tasks:=[]map[string]any{}\n for i,raw:=range requests{\n  fact:=transport[i]\n  if fact.RequestIndex!=i||fact.ResponseIndex!=i||fact.Status!=http.StatusOK{t.Fatal(\"exact transport index/status mismatch\",i,fact)}\n  uri,e:=url.ParseRequestURI(fact.RequestURI);if e!=nil{t.Fatal(e)}\n  if uri.Scheme!=\"\"||uri.Host!=\"\"||uri.Opaque!=\"\"||uri.RawPath!=\"\"||uri.RawQuery!=\"\"||uri.ForceQuery||uri.Fragment!=\"\"||uri.String()!=fact.RequestURI{t.Fatal(\"noncanonical fixture request URI\",fact.RequestURI)}\n  if fact.Method==http.MethodGet{\n   if len(raw)!=0||len(responses[i])==0||completedSends!=1{t.Fatal(\"REST exact empty request/nonempty response/send binding\",i)}\n   parts:=strings.Split(strings.TrimPrefix(uri.Path,\"/\"),\"/\")\n   if len(parts)!=5||parts[0]!=\"v1\"||parts[1]!=\"projects\"||parts[2]!=cfg.ProjectID||parts[4]==\"\"{t.Fatal(\"REST fixture project/path mismatch\",fact.RequestURI)}\n   kind:=\"\";switch parts[3]{case \"goals\":kind=\"Goal\";case \"tasks\":kind=\"Task\";default:t.Fatal(\"unexpected REST fixture entity\",fact.RequestURI)}\n   reply,e:=domain.Decode(responses[i]);if e!=nil{t.Fatal(e)}\n   binding,ok:=reply[\"binding\"].(map[string]any);if !ok||binding[\"route\"]!=\"THIN_CORE\"{t.Fatal(\"fixed REST fixture route must be THIN_CORE\",kind)}\n   if e=entities.Validate(kind,reply);e!=nil{t.Fatal(e)}\n   if reply[\"id\"]!=parts[4]||reply[\"project_id\"]!=cfg.ProjectID{t.Fatal(\"REST entity exact path identity\",kind)}\n   if kind==\"Goal\"{\n    if reply[\"id\"]!=sendGoal{t.Fatal(\"REST Goal differs from completed send snapshot\")};goals=append(goals,reply)\n   }else{\n    if reply[\"goal_id\"]!=sendGoal{t.Fatal(\"REST Task differs from completed send Goal\")};tasks=append(tasks,reply)\n   }\n   continue\n  }\n  if fact.Method!=http.MethodPost||uri.Path!=\"/v2/command\"||len(raw)==0{t.Fatal(\"unexpected fixture transport method/path/body\",i,fact)}"
+  },
+  {
+    "old": "   if method==\"session.attach\"&&result[\"write_owner_acquired\"]!=false{t.Fatal(\"readonly attach acquired writer\")}",
+    "new": "   if method==\"session.attach\"&&result[\"write_owner_acquired\"]!=false{t.Fatal(\"readonly attach acquired writer\")}\n   if method==\"session.send\"{completedSends++;sendGoal,ok=snapshot[\"goal_id\"].(string);if !ok||sendGoal==\"\"||completedSends!=1{t.Fatal(\"completed send Goal identity missing or repeated\")}}"
+  },
+  {
+    "old": " cli43SessionBoundary(t,db,dir,\"after\",cfg)",
+    "new": " if completedSends==0{\n  if len(goals)!=0||len(tasks)!=0{t.Fatal(\"readonly fixture unexpectedly read Goal/Task\")}\n }else{\n  if completedSends!=1||len(goals)!=1||len(tasks)!=1{t.Fatal(\"completed send exact Goal/Task pairing\")}\n  ids,ok:=goals[0][\"task_ids\"].([]any);if !ok{t.Fatal(\"REST Goal task_ids missing\")}\n  matches:=0;for _,id:=range ids{if id==tasks[0][\"id\"]{matches++}};if matches!=1{t.Fatal(\"REST Goal does not uniquely link actual Task\")}\n }\n cli43SessionBoundary(t,db,dir,\"after\",cfg)"
+  },
+  {
+    "old": "\"all_reply_sid_mirror_request\":true",
+    "new": "\"all_command_reply_sid_mirror_request\":true,\"transport_entries\":len(transport),\"REST_goal_count\":len(goals),\"REST_task_count\":len(tasks),\"completed_send_goal_id\":sendGoal,\"REST_send_goal_task_links_validated\":completedSends==1"
+  }
+]

@@ -1,0 +1,94 @@
+--- freeze02/choose-owned-folder.ps1
++++ revision03/choose-owned-folder.ps1
+@@ -43,6 +43,15 @@
+ function Assert-ExactText([string]$Actual,[string]$Expected,[int]$Copied,[int]$Capacity) {
+   if ($Capacity -lt 2 -or $Copied -lt 0 -or $Copied -ge ($Capacity-1) -or
+     $Copied -ne $Actual.Length -or -not [string]::Equals($Actual,$Expected,[StringComparison]::Ordinal)) {throw 'INPUT_READBACK_NOT_EXACT_OR_TRUNCATED'}
++}
++function Assert-DialogThreadFacts($Snapshot,[int]$ExpectedPid,[long]$ExpectedDialog) {
++  if ($Snapshot.query_succeeded -ne $true -or $Snapshot.dialog_hwnd -ne $ExpectedDialog -or
++    $Snapshot.dialog_pid_before -ne $ExpectedPid -or $Snapshot.dialog_pid_after -ne $ExpectedPid -or
++    $Snapshot.dialog_tid_before -le 0 -or $Snapshot.dialog_tid_after -ne $Snapshot.dialog_tid_before -or
++    $Snapshot.active_hwnd -ne $ExpectedDialog -or $Snapshot.active_pid -ne $ExpectedPid -or
++    $Snapshot.active_tid -ne $Snapshot.dialog_tid_before -or
++    $Snapshot.focus_hwnd -le 0 -or $Snapshot.focus_pid -ne $ExpectedPid -or
++    $Snapshot.focus_is_dialog_or_child -ne $true) {throw 'DIALOG_THREAD_ACTIVE_OR_FOCUS_UNCONFIRMED_NO_POST'}
+ }
+ function Assert-MessageDeadline([DateTime]$Now,[DateTime]$Limit) {
+   if ($Now.Kind -ne [DateTimeKind]::Utc -or $Limit.Kind -ne [DateTimeKind]::Utc -or $Now -ge $Limit) {
+@@ -110,6 +119,23 @@
+   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+   [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
++  [StructLayout(LayoutKind.Sequential)]
++  public struct WindowRect { public int left, top, right, bottom; }
++  [StructLayout(LayoutKind.Sequential)]
++  public struct GuiThreadInfo {
++    public uint cbSize, flags;
++    public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
++    public WindowRect rcCaret;
++  }
++  [DllImport("user32.dll",SetLastError=true)]
++  public static extern bool GetGUIThreadInfo(uint threadId, ref GuiThreadInfo info);
++  [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
++  public static bool ReadThreadInfo(uint threadId, out GuiThreadInfo info) {
++    info = new GuiThreadInfo();
++    info.cbSize = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
++    return GetGUIThreadInfo(threadId, ref info);
++  }
++
+   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
+   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd,uint flags);
+   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
+@@ -214,10 +240,40 @@
+     Record 'INPUT_READBACK_EXACT' @{hwnd=$fresh.ToInt64();path=$read.text;input_is_authorization=$false}
+     return @{hwnd=$fresh.ToInt64();dialog_hwnd=$chooser.ToInt64();path=$read.text;method='SYSTEM_MARSHALLED_WM_SETTEXT_WM_GETTEXT';input_is_authorization=$false}
+   }
++  function Assert-DialogThreadState([IntPtr]$Dialog,[switch]$ForCleanup) {
++    Assert-Core -ForCleanup:$ForCleanup
++    [uint32]$beforePid=0
++    $beforeTid=[OwnedPathWin32]::GetWindowThreadProcessId($Dialog,[ref]$beforePid)
++    if ($beforePid -ne $coreId -or $beforeTid -eq 0) {throw 'DIALOG_THREAD_IDENTITY_UNCONFIRMED_NO_POST'}
++    $info=[OwnedPathWin32+GuiThreadInfo]::new()
++    $succeeded=[OwnedPathWin32]::ReadThreadInfo($beforeTid,[ref]$info)
++    [uint32]$afterPid=0
++    $afterTid=[OwnedPathWin32]::GetWindowThreadProcessId($Dialog,[ref]$afterPid)
++    [uint32]$activePid=0;[uint32]$activeTid=0
++    [uint32]$focusPid=0;[uint32]$focusTid=0
++    if ($succeeded -and $info.hwndActive -ne [IntPtr]::Zero) {
++      $activeTid=[OwnedPathWin32]::GetWindowThreadProcessId($info.hwndActive,[ref]$activePid)
++    }
++    if ($succeeded -and $info.hwndFocus -ne [IntPtr]::Zero) {
++      $focusTid=[OwnedPathWin32]::GetWindowThreadProcessId($info.hwndFocus,[ref]$focusPid)
++    }
++    $focusOwned=$false
++    if ($focusPid -eq $coreId -and $info.hwndFocus -ne [IntPtr]::Zero) {
++      $focusOwned=($info.hwndFocus -eq $Dialog -or [OwnedPathWin32]::IsChild($Dialog,$info.hwndFocus))
++    }
++    $snapshot=@{dialog_hwnd=$Dialog.ToInt64();dialog_pid_before=$beforePid;dialog_tid_before=$beforeTid
++      dialog_pid_after=$afterPid;dialog_tid_after=$afterTid;query_succeeded=$succeeded
++      cb_size=$info.cbSize;flags=$info.flags;active_hwnd=$info.hwndActive.ToInt64();active_pid=$activePid;active_tid=$activeTid
++      focus_hwnd=$info.hwndFocus.ToInt64();focus_pid=$focusPid;focus_tid=$focusTid;focus_is_dialog_or_child=$focusOwned
++      global_foreground_hwnd=[OwnedPathWin32]::GetForegroundWindow().ToInt64()
++      global_foreground_is_diagnostic_only=$true;window_text_read=$false;activation_attempted=$false}
++    Record 'DIALOG_THREAD_ACTIVE_SNAPSHOT' $snapshot
++    Assert-DialogThreadFacts $snapshot $coreId $Dialog.ToInt64()
++  }
+   function Post-OwnedButton([IntPtr]$Dialog,[int]$Id,[string]$Purpose,[switch]$Warning,[switch]$ForCleanup) {
+     Assert-Chooser -WithWarning:$Warning -ForCleanup:$ForCleanup
+     if ($Warning) {Assert-Warning $Dialog}
+-    if ([OwnedPathWin32]::GetForegroundWindow() -ne $Dialog) {throw 'BUTTON_DIALOG_NOT_FOREGROUND_NO_CLICK'}
++    Assert-DialogThreadState $Dialog -ForCleanup:$ForCleanup
+     $button=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$row=Facts $button
+     if ($row.parent -ne $Dialog.ToInt64() -or $row.class_name -cne 'Button' -or -not $row.visible -or -not $row.enabled) {throw 'OWNED_BUTTON_IDENTITY_OR_STATE'}
+     Record 'BUTTON_QUEUE_INTENT' @{dialog=$Dialog.ToInt64();button=$button.ToInt64();control_id=$Id;purpose=$Purpose}
+@@ -226,7 +282,8 @@
+     Assert-Core -ForCleanup:$ForCleanup
+     $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
+     if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
+-      -not $now.visible -or -not $now.enabled -or [OwnedPathWin32]::GetForegroundWindow() -ne $Dialog) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++      -not $now.visible -or -not $now.enabled) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    Assert-DialogThreadState $Dialog -ForCleanup:$ForCleanup
+     $messageDeadline=$actionDeadline
+     if ($ForCleanup) {$messageDeadline=$cleanupDeadline}
+     Assert-MessageDeadline ([DateTime]::UtcNow) $messageDeadline

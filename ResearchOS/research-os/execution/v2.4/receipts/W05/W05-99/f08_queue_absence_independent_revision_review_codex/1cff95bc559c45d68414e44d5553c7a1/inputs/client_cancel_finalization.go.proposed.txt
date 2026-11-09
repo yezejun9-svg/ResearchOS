@@ -1,0 +1,1536 @@
+package domain
+
+// PREPARATION ONLY. This source is deliberately not installed in the product.
+// Requires the separately reviewed modernc FunctionImpl.Innocuous patch.
+// Request validation and local response validation are implemented below.
+// Source-derived subset implementations are appended below. Native settlement,
+// ordinary qualified admission, complete historical backup and later-epoch
+// authority are explicitly OPEN. This is not a complete modes0..8 evaluator.
+// Installing it with SQL24 would still block legitimate operations. No build,
+// SQL execution, migration, runtime qualification or source acceptance exists.
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"math/big"
+	"strings"
+	"sort"
+	"strconv"
+	"time"
+	"unicode/utf8"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	"modernc.org/sqlite"
+	"researchos.local/research-os/internal/canonical"
+)
+
+const f08ProtocolHash = "sha256:8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b"
+const f08ExternalHash = "sha256:b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54"
+const f08IdentityFormat = "researchos.f08.cancel-identity/1"
+const f08HeaderSchema = "researchos.private-command-envelope.v1"
+const f08HeaderMaximum = 1398200
+const f08Base64Maximum = 1398104
+const f08EnvelopeMaximum = 1048576
+
+// Values are fixed non-secret codes. Never concatenate argument values, schema
+// diagnostics, recovered panic text, or arbitrary function-context data.
+type f08Error string
+
+func (e f08Error) Error() string { return string(e) }
+
+const (
+	f08Arguments = f08Error("F08_ARGUMENT_TYPE_OR_ARITY")
+	f08JSON = f08Error("F08_STRICT_JSON")
+	f08Shape = f08Error("F08_CLOSED_SHAPE")
+	f08Schema = f08Error("F08_FROZEN_SCHEMA")
+	f08Binding = f08Error("F08_ORIGINAL_BINDING")
+	f08Header = f08Error("F08_PRIVATE_HEADER")
+	f08Mode = f08Error("F08_MODE")
+	f08Panic = f08Error("F08_CALLBACK_INTERNAL_PANIC")
+	f08StorageClass = f08Error("F08_STORAGE_CLASS")
+	f08Unimplemented = f08Error("F08_SOURCE_EVALUATOR_NOT_IMPLEMENTED")
+)
+
+type f08Scalar func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error)
+
+// The private schema is captured by the three closures. It is not exported or
+// installed into backupConfigurationSchemaDoc or any Host/Service/cache.
+// This initializer is a candidate, not an assertion that registration was run.
+func init() {
+	functions, err := f08BuildCallbacks(backupConfigurationProtocol, backupConfigurationDomain)
+	if err != nil {
+		panic("F08_SCHEMA_INITIALIZATION_FAILED")
+	}
+	for _, registration := range []struct {
+		name string
+		arity int32
+		call f08Scalar
+	}{
+		{"researchos_f08_cancel_request_v1", 2, functions[0]},
+		{"researchos_f08_cancel_response_v1", 5, functions[1]},
+		{"researchos_f08_proof_v1", 2, functions[2]},
+	} {
+		if err := sqlite.RegisterFunction(registration.name, &sqlite.FunctionImpl{
+			NArgs: registration.arity,
+			Deterministic: true,
+			Innocuous: true, // DOES NOT COMPILE against the unpatched pinned driver.
+			Scalar: registration.call,
+			VolatileArgs: false,
+		}); err != nil {
+			panic("F08_FUNCTION_REGISTRATION_FAILED")
+		}
+	}
+}
+
+func f08BuildCallbacks(protocol, external []byte) ([3]f08Scalar, error) {
+	var zero [3]f08Scalar
+	p, e := bytes.Clone(protocol), bytes.Clone(external)
+	if f08RawHash(p) != f08ProtocolHash || f08RawHash(e) != f08ExternalHash {
+		return zero, f08Schema
+	}
+	doc, err := LoadSchemaWithExternals(p, map[string][]byte{"domain.schema.json": e})
+	if err != nil {
+		return zero, f08Schema
+	}
+	validator, err := f08NewProofValidator(doc, e)
+	if err != nil { return zero, err }
+	return [3]f08Scalar{
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 2 { return nil, f08Arguments }
+			header, err := f08Blob(args[0]); if err != nil { return nil, err }
+			identity, err := f08Blob(args[1]); if err != nil { return nil, err }
+			if _, err = f08Request(doc, header, identity); err != nil { return nil, err }
+			return int64(1), nil
+		}),
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 5 { return nil, f08Arguments }
+			header, err := f08Blob(args[0]); if err != nil { return nil, err }
+			binding, err := f08Blob(args[1]); if err != nil { return nil, err }
+			var old []byte
+			if args[2] != nil { old, err = f08Blob(args[2]); if err != nil { return nil, err } }
+			current, err := f08Blob(args[3]); if err != nil { return nil, err }
+			mode, ok := args[4].(int64); if !ok { return nil, f08Arguments }
+			if err = f08Response(doc, header, binding, old, current, mode); err != nil { return nil, err }
+			return int64(1), nil
+		}),
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 2 { return nil, f08Arguments }
+			mode, ok := args[0].(int64); if !ok { return nil, f08Arguments }
+			input, err := f08Blob(args[1]); if err != nil { return nil, err }
+			switch mode {
+			case -2:
+				// This mode accepts any BLOB bytes, including empty/NUL/non-UTF8.
+				// Its digest has no authority to authorize a database mutation.
+				return f08RawHash(input), nil
+			case -1:
+				_, canonicalBytes, err := f08Strict(input)
+				if err != nil { return nil, err }
+				return f08RawHash(canonicalBytes), nil
+			case 9:
+				// SQL view's type-violation branch is unconditional refusal.
+				return nil, f08StorageClass
+			case 0, 1, 2, 3, 4, 5, 6, 7, 8:
+				return validator.evaluate(mode, input)
+			default:
+				return nil, f08Mode
+			}
+		}),
+	}, nil
+}
+
+// No FunctionContext, SQL argument, or input-derived closure survives a call.
+// Recoverable programmer/parser panic becomes a fixed error, never SQL NULL
+// with nil error. Go fatal OOM/stack exhaustion is not claimed recoverable.
+func f08Boundary(call func([]driver.Value) (driver.Value, error)) f08Scalar {
+	return func(_ *sqlite.FunctionContext, args []driver.Value) (result driver.Value, err error) {
+		defer func() {
+			if recover() != nil { result, err = nil, f08Panic }
+		}()
+		result, err = call(args)
+		if err != nil { return nil, err }
+		if result == nil { return nil, f08Panic }
+		return result, nil
+	}
+}
+
+func f08Blob(value driver.Value) ([]byte, error) {
+	b, ok := value.([]byte)
+	if !ok || b == nil { return nil, f08Arguments }
+	return b, nil
+}
+
+func f08RawHash(raw []byte) string {
+	h := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+// Strict validation precedes map/struct parsing. Preserve the original numeric
+// lexemes with UseNumber and compare values to canonical output before hashing.
+// There is no response/witness byte ceiling invented here. Future qualification
+// must measure existing parser/number-library resource behaviour explicitly.
+func f08Strict(raw []byte) (any, []byte, error) {
+	if !utf8.Valid(raw) || len(raw) == 0 { return nil, nil, f08JSON }
+	c, err := canonical.JSON(raw)
+	if err != nil { return nil, nil, f08JSON }
+	decode := func(b []byte) (any, error) {
+		d := json.NewDecoder(bytes.NewReader(b)); d.UseNumber()
+		var v any
+		if err := d.Decode(&v); err != nil { return nil, f08JSON }
+		var trailing any
+		if err := d.Decode(&trailing); !errors.Is(err, io.EOF) { return nil, f08JSON }
+		return v, nil
+	}
+	v, err := decode(raw); if err != nil { return nil, nil, err }
+	w, err := decode(c); if err != nil || !sameNumbers(v, w) { return nil, nil, f08JSON }
+	return v, c, nil
+}
+
+func f08Object(v any, keys ...string) (map[string]any, error) {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != len(keys) { return nil, f08Shape }
+	for _, key := range keys { if _, ok := m[key]; !ok { return nil, f08Shape } }
+	return m, nil
+}
+
+func f08String(v any) (string, error) {
+	s, ok := v.(string)
+	if !ok || s == "" || !utf8.ValidString(s) { return "", f08Shape }
+	return s, nil
+}
+
+func f08Integer(v any, minimum int64) (int64, error) {
+	n, ok := v.(json.Number)
+	if !ok { return 0, f08Shape }
+	r, ok := new(big.Rat).SetString(string(n))
+	if !ok || !r.IsInt() || !r.Num().IsInt64() { return 0, f08Shape }
+	i := r.Num().Int64()
+	if i < minimum { return 0, f08Shape }
+	return i, nil
+}
+
+func f08HashString(v any) (string, error) {
+	s, err := f08String(v)
+	if err != nil || len(s) != 71 || !strings.HasPrefix(s, "sha256:") { return "", f08Shape }
+	b, err := hex.DecodeString(s[7:])
+	if err != nil || len(b) != 32 || hex.EncodeToString(b) != s[7:] { return "", f08Shape }
+	return s, nil
+}
+
+func f08Encode(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil { return nil, f08JSON }
+	return b, nil
+}
+
+func f08ValueHash(v any) (string, error) {
+	b, err := f08Encode(v); if err != nil { return "", err }
+	_, c, err := f08Strict(b); if err != nil { return "", err }
+	return f08RawHash(c), nil
+}
+
+type f08CancelRequest struct {
+	envelope *Envelope
+	identity map[string]any
+	command string
+	project string
+	session string
+	client string
+	target string
+	principal string
+	requestHash string
+	headerDigest string
+	revision int64
+	epoch int64
+}
+
+// f08Request is not authentication. The immutable SQL row producer supplies
+// principal; this function checks the exact original tuple, never caller role.
+func f08Request(doc *SchemaDoc, header, identityRaw []byte) (f08CancelRequest, error) {
+	var zero f08CancelRequest
+	if doc == nil || len(header) == 0 || len(header) > f08HeaderMaximum { return zero, f08Header }
+	v, _, err := f08Strict(header); if err != nil { return zero, err }
+	h, err := f08Object(v, "schema", "encoding", "raw_envelope_base64"); if err != nil { return zero, err }
+	encoded, ok := h["raw_envelope_base64"].(string)
+	if !ok || h["schema"] != f08HeaderSchema || h["encoding"] != "base64" || len(encoded) > f08Base64Maximum { return zero, f08Header }
+	stored, err := json.Marshal(struct {
+		Schema string `json:"schema"`
+		Encoding string `json:"encoding"`
+		Raw string `json:"raw_envelope_base64"`
+	}{f08HeaderSchema, "base64", encoded})
+	if err != nil || !bytes.Equal(stored, header) { return zero, f08Header }
+	raw, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(raw) == 0 || len(raw) > f08EnvelopeMaximum || base64.StdEncoding.EncodeToString(raw) != encoded { return zero, f08Header }
+	v, _, err = f08Strict(raw); if err != nil { return zero, err }
+	em, err := f08Object(v, "protocol_version", "command_id", "client_id", "project_id", "session_id", "expected_revision", "writer_epoch", "method", "payload")
+	if err != nil { return zero, err }
+	if em["protocol_version"] != ProtocolV2 || em["method"] != "session.control" { return zero, f08Binding }
+	if err = doc.ValidateDefInput("CommandEnvelope", v); err != nil { return zero, f08Schema }
+	payload, err := f08Object(em["payload"], "action", "target_id", "reason"); if err != nil { return zero, err }
+	if payload["action"] != "CANCEL" { return zero, f08Binding }
+	if err = doc.ValidateDefInput("ControlPayload", payload); err != nil { return zero, f08Schema }
+	// Restrict method before DecodeEnvelope so unrelated host configuration or
+	// method-specific branches cannot enter the callback's reachable graph.
+	env, err := DecodeEnvelope(raw); if err != nil { return zero, f08Schema }
+	q, err := env.ContentHash(); if err != nil { return zero, f08Binding }
+	iv, _, err := f08Strict(identityRaw); if err != nil { return zero, err }
+	im, err := f08Object(iv, "format", "principal", "project", "operation", "key", "request_hash", "command_id", "method", "client_id", "session_id", "writer_epoch", "expected_revision", "target_id")
+	if err != nil { return zero, err }
+	if im["format"] != f08IdentityFormat || im["method"] != "session.control" || im["operation"] != "v2:session.control" || im["request_hash"] != q { return zero, f08Binding }
+	for _, field := range []string{"format", "principal", "project", "operation", "key", "request_hash", "command_id", "method", "client_id", "session_id", "target_id"} {
+		if _, err = f08String(im[field]); err != nil { return zero, err }
+	}
+	for ik, ek := range map[string]string{"project":"project_id", "command_id":"command_id", "client_id":"client_id", "session_id":"session_id", "method":"method"} {
+		if im[ik] != em[ek] { return zero, f08Binding }
+	}
+	if im["key"] != im["command_id"] || im["target_id"] != payload["target_id"] { return zero, f08Binding }
+	revision, err := f08Integer(em["expected_revision"], 1); if err != nil { return zero, err }
+	epoch, err := f08Integer(em["writer_epoch"], 1); if err != nil { return zero, err }
+	ir, err := f08Integer(im["expected_revision"], 1); if err != nil || ir != revision { return zero, f08Binding }
+	ie, err := f08Integer(im["writer_epoch"], 1); if err != nil || ie != epoch { return zero, f08Binding }
+	return f08CancelRequest{env, im, im["command_id"].(string), im["project"].(string), im["session_id"].(string), im["client_id"].(string), im["target_id"].(string), im["principal"].(string), q, f08RawHash(header), revision, epoch}, nil
+}
+
+type f08ValidatedResponse struct {
+	revision int64
+	result map[string]any
+	snapshot map[string]any
+	eventSequence int64
+}
+
+func f08ResponseBody(doc *SchemaDoc, req f08CancelRequest, raw []byte, status string) (f08ValidatedResponse, error) {
+	var zero f08ValidatedResponse
+	v, _, err := f08Strict(raw); if err != nil { return zero, err }
+	m, err := f08Object(v, "protocol_version", "command_id", "method", "status", "session_id", "revision", "error_code", "error", "result")
+	if err != nil { return zero, err }
+	if m["protocol_version"] != ProtocolV2 || m["command_id"] != req.command || m["method"] != "session.control" || m["status"] != status || m["session_id"] != req.session || m["error"] != nil || m["error_code"] != nil { return zero, f08Binding }
+	if err = doc.ValidateDef("CommandResponse", v); err != nil { return zero, f08Schema }
+	parsed, err := DecodeResponse(raw); if err != nil { return zero, f08Schema }
+	if err = ValidateResultAgainstMethod("session.control", parsed, doc); err != nil { return zero, f08Schema }
+	rev, err := f08Integer(m["revision"], req.revision); if err != nil { return zero, err }
+	result, ok := m["result"].(map[string]any); if !ok { return zero, f08Shape }
+	if status == "ACKNOWLEDGED" {
+		if err = doc.ValidateDef("PendingResult", result); err != nil { return zero, f08Schema }
+		if result["operation_id"] != "op-"+req.command { return zero, f08Binding }
+		sequence, err := f08Integer(result["after_sequence"], 0); if err != nil { return zero, err }
+		return f08ValidatedResponse{revision: rev, result: result, eventSequence: sequence}, nil
+	}
+	if status != "COMPLETED" { return zero, f08Mode }
+	if err = doc.ValidateDef("ControlResult", result); err != nil { return zero, f08Schema }
+	if result["action"] != "CANCEL" || result["target_id"] != req.target || result["control_request_id"] != "ctrl-"+req.command || result["settled"] != true || result["children_stopped"] != true || result["queue_empty"] != true { return zero, f08Binding }
+	snapshot, ok := result["snapshot"].(map[string]any); if !ok { return zero, f08Shape }
+	if err = doc.ValidateDef("SessionSnapshot", snapshot); err != nil { return zero, f08Schema }
+	if snapshot["session_id"] != req.session || snapshot["project_id"] != req.project || snapshot["protocol_version"] != ProtocolV2 { return zero, f08Binding }
+	sr, err := f08Integer(snapshot["revision"], 1); if err != nil || sr != rev { return zero, f08Binding }
+	sequence, err := f08Integer(snapshot["event_sequence"], 0); if err != nil { return zero, err }
+	pending, ok := snapshot["pending_command_ids"].([]any); if !ok { return zero, f08Shape }
+	for _, id := range pending { if id == req.command { return zero, f08Binding } }
+	return f08ValidatedResponse{rev, result, snapshot, sequence}, nil
+}
+
+// This validates local wire bindings. It cannot establish that response_proof
+// originated in real SQL source rows: proof modes 0/1/5/6 must recompute those
+// rows and preserve every other pending command before calling this helper.
+// Until that evaluator exists, this helper's success NEVER grants an UPDATE.
+func f08Response(doc *SchemaDoc, header, binding, old, current []byte, mode int64) error {
+	if mode < 0 || mode > 2 { return f08Mode }
+	if (mode == 2) != (old != nil) { return f08Arguments }
+	v, _, err := f08Strict(binding); if err != nil { return err }
+	m, err := f08Object(v, "identity", "response_proof"); if err != nil { return err }
+	identity, err := f08Encode(m["identity"]); if err != nil { return err }
+	req, err := f08Request(doc, header, identity); if err != nil { return err }
+	proof, err := f08Object(m["response_proof"], "admitted_root_hash", "original_response_digest", "final_root_hash", "final_response_digest", "final_snapshot_binding")
+	if err != nil { return err }
+	if _, err = f08HashString(proof["admitted_root_hash"]); err != nil { return err }
+	originalDigest, err := f08HashString(proof["original_response_digest"]); if err != nil { return err }
+	if mode == 0 {
+		if proof["final_root_hash"] != nil || proof["final_response_digest"] != nil || proof["final_snapshot_binding"] != nil || originalDigest != f08RawHash(current) { return f08Binding }
+		_, err = f08ResponseBody(doc, req, current, "ACKNOWLEDGED")
+		return err
+	}
+	if _, err = f08HashString(proof["final_root_hash"]); err != nil { return err }
+	finalDigest, err := f08HashString(proof["final_response_digest"]); if err != nil || finalDigest != f08RawHash(current) { return f08Binding }
+	response, err := f08ResponseBody(doc, req, current, "COMPLETED"); if err != nil { return err }
+	if mode == 1 {
+		if originalDigest != finalDigest { return f08Binding }
+	} else {
+		if originalDigest != f08RawHash(old) || bytes.Equal(old, current) { return f08Binding }
+		prior, err := f08ResponseBody(doc, req, old, "ACKNOWLEDGED"); if err != nil { return err }
+		if response.revision < prior.revision || response.eventSequence < prior.eventSequence { return f08Binding }
+	}
+	sb, err := f08Object(proof["final_snapshot_binding"], "session_id", "project_id", "revision", "event_sequence", "pending_command_ids_digest")
+	if err != nil { return err }
+	if sb["session_id"] != req.session || sb["project_id"] != req.project { return f08Binding }
+	sr, err := f08Integer(sb["revision"], 1); if err != nil || sr != response.revision { return f08Binding }
+	es, err := f08Integer(sb["event_sequence"], 0); if err != nil || es != response.eventSequence { return f08Binding }
+	digest, err := f08ValueHash(response.snapshot["pending_command_ids"]); if err != nil { return err }
+	if sb["pending_command_ids_digest"] != digest { return f08Binding }
+	return nil
+}
+
+// Structural precondition only. This does not turn an arbitrary source bundle
+// into authority. Complete mode-specific evaluation is still missing; see the
+// explicit refusal in f08BuildCallbacks and mode-implementation-matrix.json.
+func f08ProofFrame(mode int64, raw []byte) error {
+	v, _, err := f08Strict(raw); if err != nil { return err }
+	m, err := f08Object(v, "action", "row", "old", "sources"); if err != nil { return err }
+	action, err := f08String(m["action"]); if err != nil { return err }
+	allowed := false
+	switch mode {
+	case 0: allowed = action == "admitted.insert"
+	case 1: allowed = action == "final.insert"
+	case 2: allowed = action == "origin.insert"
+	case 3: allowed = false // No mode3 action literal exists in the frozen SQL; caller contract must be supplied.
+	case 4: allowed = action == "dispatch.update"
+	case 5: allowed = action == "journal.insert" || action == "journal.update" || action == "commit.insert"
+	case 6: allowed = action == "control.insert" || action == "control.update"
+	case 7: allowed = action == "admitted_member.insert" || action == "final_member.insert" || action == "pin.insert"
+	case 8: allowed = action == "origin.derive"
+	}
+	if !allowed { return f08Mode }
+	row, ok := m["row"].([]any); if !ok || len(row) == 0 { return f08Shape }
+	if strings.HasSuffix(action, ".update") {
+		old, ok := m["old"].([]any); if !ok || len(old) != len(row) { return f08Shape }
+	} else if m["old"] != nil { return f08Shape }
+	sources, ok := m["sources"].([]any); if !ok { return f08Shape }
+	for _, item := range sources {
+		tuple, ok := item.([]any); if !ok || len(tuple) != 2 { return f08Shape }
+		if _, err := f08String(tuple[0]); err != nil { return err }
+		columns, ok := tuple[1].([]any); if !ok || len(columns) == 0 { return f08Shape }
+	}
+	return nil
+}
+
+
+// Static extraction of exact original SQL; no SQL evaluation.
+func f08SourceRules() map[string]f08SourceRule {
+ return map[string]f08SourceRule{
+  "domain_versions": {mask:"sssihS", unique:[][]int{{0,1,2,3}}},
+  "domain_objects": {mask:"sssihSi", unique:[][]int{{0,1,2}, {0,1,2,3}}},
+  "domain_refs": {mask:"sssissssi", unique:[][]int{}},
+  "outbox": {mask:"sishi", unique:[][]int{{2}, {0,1}}},
+  "idempotency": {mask:"sssssihhsss", unique:[][]int{{0,1,2,3}}},
+  "identities": {mask:"ssssssss", unique:[][]int{{0,1}, {0,1,6}}},
+  "dispatches": {mask:"ssishsssshissss", unique:[][]int{{3}, {0,1,2}}},
+  "observations": {mask:"ssishs", unique:[][]int{{0,1,2,3}}},
+  "effects": {mask:"sssih", unique:[][]int{{0,1,2,3}}},
+  "routes": {mask:"Sssh", unique:[][]int{{0}}},
+  "uploads": {mask:"Sssi", unique:[][]int{{0}}},
+  "content": {mask:"Ssshssi", unique:[][]int{{0}}},
+  "fences": {mask:"sssssiiSISSHii", unique:[][]int{{3}, {0,1}}},
+  "queue": {mask:"sssssssissishssiSs", unique:[][]int{{9}, {0,1,2}, {6,7}}},
+  "controls": {mask:"ssssssshsHHs", unique:[][]int{{4}, {0,1,2}}},
+  "receipts": {mask:"SssSshsSs", unique:[][]int{{0}}},
+  "sessions": {mask:"SsissSSSisSisSSSSSSSiSSs", unique:[][]int{{0}, {7}}},
+  "legacy": {mask:"sshs", unique:[][]int{{0,1}}},
+  "origins": {mask:"ssishs", unique:[][]int{{3}, {0,1,2}, {0,1,2,5}}},
+  "admitted": {mask:"ssssshssh", unique:[][]int{{0,1,2,3}, {0,1,2}, {0,1,2,3,6}}},
+  "admitted_members": {mask:"sssssissh", unique:[][]int{{0,1,2,3,4}, {0,1,2,3,5}, {0,1,2,3,4,7}}},
+  "final": {mask:"sssssssh", unique:[][]int{{0,1,2,3}, {0,1,2,3,5}}},
+  "final_members": {mask:"sssssissh", unique:[][]int{{0,1,2,3,4}, {0,1,2,3,5}}},
+  "commits": {mask:"sssssss", unique:[][]int{{0,1,2,3}, {0,1,2,3,4}}},
+  "pins": {mask:"ssssssssiS", unique:[][]int{{0,1,2,3,4,5,6,7,8}}},
+  "obligations": {mask:"ssiis", unique:[][]int{{0,1,2,3}}},
+  "runtime_bindings": {mask:"sshsss", unique:[][]int{{0,1}}},
+  "qualification_plans": {mask:"ssshsss", unique:[][]int{{0,1}}},
+  "qualification_runs": {mask:"ssssisssshs", unique:[][]int{{0,1}, {0,2}}},
+  "qualification_approvals": {mask:"ssisshs", unique:[][]int{{0,1,2}}},
+  "artifact_uses": {mask:"sssisssh", unique:[][]int{{0,1,2,3,4}, {5}}},
+  "artifact_use_proofs": {mask:"sssish", unique:[][]int{{0,1,2,3}}},
+  "checkpoint_carries": {mask:"ssih", unique:[][]int{{0,1,2}}},
+  "run_dependencies": {mask:"ssh", unique:[][]int{{0,1}}},
+ }
+}
+
+
+// Append to the proposed internal/domain/client_cancel_finalization.go.
+// Required imports added by the receipt assembler: sort, strconv and jsonschema.
+// No SQL, Service, Host, filesystem, environment, clock or random call occurs.
+
+type f08SourceRule struct { mask string; unique [][]int }
+type f08Sources struct { rows map[string][][]any }
+type f08ProofValidator struct { protocol, entities *SchemaDoc }
+type f08Version struct {
+	project, kind, id string
+	revision int64
+	contentHash any
+	raw []byte
+	body map[string]any
+}
+
+func f08NewProofValidator(protocol *SchemaDoc, external []byte) (*f08ProofValidator,error) {
+	if protocol==nil || f08RawHash(external)!=f08ExternalHash { return nil,f08Schema }
+	// Never reuse the shared backup schema cache or caller's mutable schema.
+	parsed,err:=Decode(bytes.Clone(external)); if err!=nil{return nil,f08Schema}
+	id,ok:=parsed["$id"].(string);if !ok || id=="" {return nil,f08Schema}
+	n,checks,err:=neutralizePatterns(parsed);if err!=nil{return nil,f08Schema}
+	c:=jsonschema.NewCompiler();c.UseLoader(localOnly{});c.AssertFormat();c.DefaultDraft(jsonschema.Draft2020)
+	if err=c.AddResource(id,parsed);err!=nil{return nil,f08Schema}
+	defs,ok:=parsed["$defs"].(map[string]any);if !ok{return nil,f08Schema}
+	d:=&SchemaDoc{byName:map[string]*jsonschema.Schema{},writeOnly:map[string]bool{},pathProps:map[string]bool{},defChecks:checks,Location:id,NeutralizedPatterns:n}
+	collectWriteOnly(parsed,d.writeOnly);collectPathProps(parsed,d.pathProps)
+	for name:=range defs {
+		schema,err:=c.Compile(id+"#/$defs/"+name);if err!=nil{return nil,f08Schema}
+		d.byName[name]=schema;d.defNames=append(d.defNames,name)
+	}
+	return &f08ProofValidator{protocol,d},nil
+}
+
+func f08Equal(a,b any) bool {
+	ab,e:=f08Encode(a);if e!=nil{return false};bb,e:=f08Encode(b);if e!=nil{return false}
+	_,ac,e:=f08Strict(ab);if e!=nil{return false};_,bc,e:=f08Strict(bb)
+	return e==nil && bytes.Equal(ac,bc)
+}
+func f08Key(v any)(string,error){b,e:=f08Encode(v);if e!=nil{return "",e};_,c,e:=f08Strict(b);return string(c),e}
+func f08Number(n int64) json.Number{return json.Number(strconv.FormatInt(n,10))}
+func f08StringValue(v any)(string,bool){s,ok:=v.(string);return s,ok}
+func f08Hex(v any)([]byte,error){
+	s,ok:=v.(string);if !ok || len(s)%2!=0{return nil,f08Shape}
+	b,e:=hex.DecodeString(s);if e!=nil || strings.ToUpper(hex.EncodeToString(b))!=s{return nil,f08Shape}
+	return b,nil
+}
+func f08RawObject(v any)(map[string]any,[]byte,error){
+	b,e:=f08Hex(v);if e!=nil{return nil,nil,e};x,_,e:=f08Strict(b);if e!=nil{return nil,nil,e}
+	m,ok:=x.(map[string]any);if !ok{return nil,nil,f08Shape};return m,b,nil
+}
+func f08Array(v any)([]any,error){a,ok:=v.([]any);if !ok{return nil,f08Shape};return a,nil}
+
+func f08DecodeSources(value any)(*f08Sources,error){
+	wire,err:=f08Array(value);if err!=nil{return nil,err}
+	rules:=f08SourceRules();s:=&f08Sources{rows:map[string][][]any{}}
+	seen:=map[string]map[string]bool{}
+	for _,item:=range wire {
+		pair,err:=f08Array(item);if err!=nil || len(pair)!=2{return nil,f08Shape}
+		category,ok:=pair[0].(string);if !ok{return nil,f08Shape}
+		rule,ok:=rules[category];if !ok{return nil,f08Shape}
+		row,err:=f08Array(pair[1]);if err!=nil || len(row)!=len(rule.mask){return nil,f08Shape}
+		for i,k:=range rule.mask {
+			v:=row[i]
+			if v==nil && k>='A' && k<='Z'{continue}
+			switch k {
+			case 's','S':if _,ok:=v.(string);!ok{return nil,f08StorageClass}
+			case 'i','I':if _,e:=f08Integer(v,-1<<63);e!=nil{return nil,f08StorageClass}
+			case 'h','H':if _,e:=f08Hex(v);e!=nil{return nil,e}
+			default:return nil,f08Shape
+			}
+		}
+		for keyIndex,columns:=range rule.unique {
+			key:=[]any{};nullKey:=false
+			for _,i:=range columns {if row[i]==nil{nullKey=true};key=append(key,row[i])}
+			// SQLite rowid-table nullable PRIMARY/UNIQUE keys do not collide.
+			if nullKey{continue}
+			encoded,e:=f08Key(key);if e!=nil{return nil,e}
+			group:=category+":"+strconv.Itoa(keyIndex)
+			if seen[group]==nil{seen[group]=map[string]bool{}}
+			if seen[group][encoded]{return nil,f08Binding};seen[group][encoded]=true
+		}
+		// domain_refs has no unique key: repeated rows are retained verbatim.
+		s.rows[category]=append(s.rows[category],row)
+	}
+	return s,nil
+}
+
+func (s *f08Sources) selectRows(category string, columns []int, values []any)[][]any{
+	var found [][]any
+	for _,row:=range s.rows[category]{
+		matches:=len(columns)==len(values)
+		for i,column:=range columns{if !f08Equal(row[column],values[i]){matches=false;break}}
+		if matches{found=append(found,row)}
+	}
+	return found
+}
+func (s *f08Sources) one(category string, columns []int, values []any)([]any,error){
+	rows:=s.selectRows(category,columns,values);if len(rows)!=1{return nil,f08Binding};return rows[0],nil
+}
+func (v *f08ProofValidator) version(s *f08Sources,project string,reference any)(f08Version,error){
+	var zero f08Version
+	r,err:=f08Object(reference,"entity_type","id","revision","content_hash");if err!=nil{return zero,err}
+	if err=v.entities.ValidateDefInput("VersionRef",r);err!=nil{return zero,f08Schema}
+	kind,err:=f08String(r["entity_type"]);if err!=nil{return zero,err}
+	id,err:=f08String(r["id"]);if err!=nil{return zero,err}
+	revision,err:=f08Integer(r["revision"],1);if err!=nil{return zero,err}
+	row,err:=s.one("domain_versions",[]int{0,1,2,3},[]any{project,kind,id,f08Number(revision)});if err!=nil{return zero,err}
+	if !f08Equal(row[5],r["content_hash"]){return zero,f08Binding}
+	body,raw,err:=f08RawObject(row[4]);if err!=nil{return zero,err}
+	if err=v.entities.ValidateDefInput(kind,body);err!=nil{return zero,f08Schema}
+	if body["id"]!=id || body["project_id"]!=project || !f08Equal(body["revision"],r["revision"]){return zero,f08Binding}
+	if receipt,ok:=body["receipt_hash"];ok {
+		if receipt!=Receipt(Object(body)) || !f08Equal(receipt,row[5]){return zero,f08Binding}
+	} else if kind=="Artifact" {
+		if !f08Equal(body["content_hash"],row[5]){return zero,f08Binding}
+	} else if row[5]!=nil{return zero,f08Binding}
+	return f08Version{project,kind,id,revision,row[5],raw,body},nil
+}
+func (o f08Version) ref() map[string]any{return map[string]any{"entity_type":o.kind,"id":o.id,"revision":f08Number(o.revision),"content_hash":o.contentHash}}
+func (o f08Version) anchor() map[string]any{return map[string]any{"project":o.project,"version_ref":o.ref(),"body_digest":f08RawHash(o.raw)}}
+func (v *f08ProofValidator) head(s *f08Sources,project,kind,id string)(f08Version,error){
+	var zero f08Version
+	r,e:=s.one("domain_objects",[]int{0,1,2},[]any{project,kind,id});if e!=nil{return zero,e}
+	o,e:=v.version(s,project,map[string]any{"entity_type":kind,"id":id,"revision":r[3],"content_hash":r[5]});if e!=nil{return zero,e}
+	raw,e:=f08Hex(r[4]);if e!=nil || !bytes.Equal(raw,o.raw){return zero,f08Binding};return o,nil
+}
+
+type f08ReferenceOccurrence struct {field,targetKind,targetID string; exact map[string]any; globalFallback bool}
+func (v *f08ProofValidator) occurrences(owner f08Version,path string,value any)([]f08ReferenceOccurrence,error){
+	var result []f08ReferenceOccurrence
+	switch x:=value.(type){
+	case map[string]any:
+		if _,ok:=x["entity_type"];ok {
+			if err:=v.entities.ValidateDefInput("VersionRef",x);err!=nil{return nil,f08Schema}
+			return []f08ReferenceOccurrence{{path,x["entity_type"].(string),x["id"].(string),x,false}},nil
+		}
+		keys:=make([]string,0,len(x));for key:=range x{keys=append(keys,key)};sort.Strings(keys)
+		for _,field:=range keys {
+			if field=="id" || field=="project_id"{continue}
+			value:=x[field];kind:=relationKind(owner.kind,field)
+			if field=="supersedes_id" || field=="parent_policy_id"{kind=owner.kind}
+			if kind!="" && value!=nil {
+				values:=[]any{value};if a,ok:=value.([]any);ok{values=a}
+				for _,item:=range values{id,err:=f08String(item);if err!=nil{return nil,err};result=append(result,f08ReferenceOccurrence{path+"/"+field,kind,id,nil,field=="parent_policy_id"})}
+			} else {nested,err:=v.occurrences(owner,path+"/"+field,value);if err!=nil{return nil,err};result=append(result,nested...)}
+		}
+	case []any:
+		for i,item:=range x{nested,err:=v.occurrences(owner,path+"/"+strconv.Itoa(i),item);if err!=nil{return nil,err};result=append(result,nested...)}
+	}
+	return result,nil
+}
+
+// Derives R1 from real immutable owner/version/ref rows. ID-only relations
+// resolve retained original tuples, never current target heads. Captured
+// historical closure must subsequently be compared in full by the caller.
+func (v *f08ProofValidator) referenceClosure(s *f08Sources,roots []f08Version)([]any,[]any,error){
+	pending:=append([]f08Version(nil),roots...);visited:=map[string]bool{};anchors:=map[string]any{};closures:=map[string]any{}
+	for len(pending)>0 {
+		owner:=pending[0];pending=pending[1:]
+		key,e:=f08Key([]any{owner.project,owner.ref()});if e!=nil{return nil,nil,e}
+		if visited[key]{continue};visited[key]=true;anchors[key]=owner.anchor()
+		rows:=s.selectRows("domain_refs",[]int{0,1,2,3},[]any{owner.project,owner.kind,owner.id,f08Number(owner.revision)})
+		occurrences,e:=v.occurrences(owner,"",owner.body);if e!=nil{return nil,nil,e}
+		if len(rows)!=len(occurrences){return nil,nil,f08Binding}
+		used:=make([]bool,len(rows));targets:=map[string]any{};sameID:=map[string]string{}
+		for _,occurrence:=range occurrences{
+			matched:=-1
+			for i,row:=range rows {
+				if used[i] || row[4]!=occurrence.field || row[6]!=occurrence.targetKind || row[7]!=occurrence.targetID {continue}
+				tp,ok:=row[5].(string);if !ok{return nil,nil,f08Shape}
+				if tp!=owner.project && !(occurrence.globalFallback && tp=="" && (occurrence.targetKind=="BudgetPolicy" || occurrence.targetKind=="RunPolicy")){continue}
+				if occurrence.exact!=nil && !f08Equal(row[8],occurrence.exact["revision"]){continue}
+				matched=i;break
+			}
+			if matched<0{return nil,nil,f08Binding}
+			used[matched]=true;row:=rows[matched]
+			targetRow,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{row[5],row[6],row[7],row[8]});if e!=nil{return nil,nil,e}
+			if occurrence.exact!=nil && !f08Equal(targetRow[5],occurrence.exact["content_hash"]){return nil,nil,f08Binding}
+			target,e:=v.version(s,row[5].(string),map[string]any{"entity_type":row[6],"id":row[7],"revision":row[8],"content_hash":targetRow[5]});if e!=nil{return nil,nil,e}
+			destination,e:=f08Key([]any{target.project,target.ref()});if e!=nil{return nil,nil,e}
+			// All repeated ID-only occurrences from one producer resolve the same tuple.
+			if occurrence.exact==nil {
+				shape,_:=f08Key([]any{occurrence.field,occurrence.targetKind,occurrence.targetID})
+				if old,ok:=sameID[shape];ok && old!=destination{return nil,nil,f08Binding};sameID[shape]=destination
+			}
+			targets[destination]=target.anchor();anchors[destination]=target.anchor();pending=append(pending,target)
+		}
+		rowValues:=make([]any,len(rows));for i,row:=range rows{rowValues[i]=row}
+		f08SortTuples(rowValues)
+		closures[key]=map[string]any{"owner_project":owner.project,"owner_ref":owner.ref(),"owner_body_digest":f08RawHash(owner.raw),"rows":rowValues,"targets":f08SortedAnchors(targets)}
+	}
+	result:=make([]any,0,len(closures));for _,item:=range closures{result=append(result,item)}
+	sort.Slice(result,func(i,j int)bool{
+		x:=result[i].(map[string]any);y:=result[j].(map[string]any);xr:=x["owner_ref"].(map[string]any);yr:=y["owner_ref"].(map[string]any)
+		return f08TupleLess([]any{x["owner_project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["owner_project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})
+	})
+	return result,f08SortedAnchors(anchors),nil
+}
+
+// SQL tuple lexicographic ordering compares scalar columns, not encoded JSON
+// strings (which would put numeric revision10 before2). String order is UTF8.
+func f08ScalarCompare(a,b any) int {
+	if a==nil{if b==nil{return 0};return -1};if b==nil{return 1}
+	if x,ok:=a.(json.Number);ok {
+		if y,ok:=b.(json.Number);ok{xr,_:=new(big.Rat).SetString(string(x));yr,_:=new(big.Rat).SetString(string(y));return xr.Cmp(yr)}
+	}
+	x,xok:=a.(string);y,yok:=b.(string);if xok && yok{return strings.Compare(x,y)}
+	xk,_:=f08Key(a);yk,_:=f08Key(b);return strings.Compare(xk,yk)
+}
+func f08TupleLess(a,b []any)bool{for i:=0;i<len(a)&&i<len(b);i++{c:=f08ScalarCompare(a[i],b[i]);if c!=0{return c<0}};return len(a)<len(b)}
+func f08SortTuples(rows []any){sort.Slice(rows,func(i,j int)bool{return f08TupleLess(rows[i].([]any),rows[j].([]any))})}
+func f08SortedAnchors(values map[string]any)[]any{
+	a:=make([]any,0,len(values));for _,v:=range values{a=append(a,v)}
+	sort.Slice(a,func(i,j int)bool{
+		x:=a[i].(map[string]any);y:=a[j].(map[string]any);xr:=x["version_ref"].(map[string]any);yr:=y["version_ref"].(map[string]any)
+		return f08TupleLess([]any{x["project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})
+	});return a
+}
+
+
+// Same future domain/client_cancel_finalization.go; receipt fragment only.
+const f08Format="researchos.cancel-finalization/1"
+const f08Unwired=f08Error("F08_CALLER_CONTRACT_UNBOUND")
+const f08NativeProofGap=f08Error("F08_NATIVE_PROOF_IMPLEMENTATION_INCOMPLETE")
+const f08QualificationProfileGap=f08Error("F08_INITIAL_QUALIFICATION_PROFILE_PROOF_INCOMPLETE")
+
+type f08Group struct {
+	phase string
+	row []any
+	root map[string]any
+	members []any
+	pins []any
+	rootHash,groupHash string
+}
+func f08Hash(value any)(string,error){return f08ValueHash(value)}
+func f08JSONHex(value any)(any,[]byte,error){b,e:=f08Hex(value);if e!=nil{return nil,nil,e};x,_,e:=f08Strict(b);return x,b,e}
+func f08ValidateTuple(category string,row []any)error{
+	_,e:=f08DecodeSources([]any{[]any{category,row}});return e
+}
+func f08RootReference(phase,hash string)map[string]any{return map[string]any{"phase":phase,"task_id":nil,"content_hash":hash}}
+func f08MemberReference(phase,id,hash string)map[string]any{return map[string]any{"phase":phase,"task_id":id,"content_hash":hash}}
+
+// Recompute every group hash and its exact materialization shape. This does
+// not itself authorize the admission or finalization represented by the group.
+func f08ParseGroup(category string,row []any)(*f08Group,error){
+	if category!="admitted" && category!="final"{return nil,f08Mode}
+	if e:=f08ValidateTuple(category,row);e!=nil{return nil,e}
+	docIndex,rootIndex,groupIndex:=8,6,7;phase:="ADMITTED"
+	if category=="final"{docIndex,rootIndex,groupIndex=7,5,6;phase="FINALIZED"}
+	document,_,e:=f08RawObject(row[docIndex]);if e!=nil{return nil,e}
+	if _,e=f08Object(document,"root","members","pins");e!=nil{return nil,e}
+	root,ok:=document["root"].(map[string]any);if !ok{return nil,f08Shape}
+	if category=="admitted" {
+		_,e=f08Object(root,"format","phase","principal","project","command_id","method","operation","key","request_hash","client_id","session_binding","target_binding","private_header_digest","member_task_ids","member_count")
+	} else {
+		_,e=f08Object(root,"format","phase","admitted_root_ref","principal","project","command_id","request_hash","control_request_id","completion_mode","original_response_digest","final_response_digest","final_snapshot_binding","member_count")
+	}
+	if e!=nil{return nil,e}
+	if root["format"]!=f08Format || root["phase"]!=phase{return nil,f08Binding}
+	for i,key:=range []string{"principal","project","command_id","request_hash"}{if root[key]!=row[i]{return nil,f08Binding}}
+	rootHash,e:=f08Hash(root);if e!=nil || rootHash!=row[rootIndex]{return nil,f08Binding}
+	members,e:=f08Array(document["members"]);if e!=nil || len(members)==0{return nil,f08Shape}
+	count,e:=f08Integer(root["member_count"],1);if e!=nil || count!=int64(len(members)){return nil,f08Binding}
+	pins,e:=f08Array(document["pins"]);if e!=nil{return nil,e}
+	var digests []any;last:=""
+	for _,item:=range members{
+		member,ok:=item.(map[string]any);if !ok{return nil,f08Shape}
+		refKey:="task_ref"
+		if phase=="ADMITTED"{
+			_,e=f08Object(member,"format","phase","admitted_root_ref","task_ref","goal_ref","run_ref","runtime_binding","dispatch_stage","dispatch_origin_ref","queue_admission","reference_closure")
+			if !f08Equal(member["admitted_root_ref"],f08RootReference(phase,rootHash)){return nil,f08Binding}
+		} else {
+			refKey="task_admitted_ref"
+			_,e=f08Object(member,"format","phase","admitted_member_ref","proof_kind","task_admitted_ref","run_admitted_ref","run_before_settlement_ref","run_final_ref","task_final_ref","dispatch_origin_ref","dispatch_final_binding","queue_final_binding","effect_closure","observation_ref","native_artifact_refs","sdk_receipt_refs","run_event_ref","task_event_ref","reference_closure","prior_epoch_closure","prelaunch_checkpoint_carry")
+		}
+		if e!=nil || member["format"]!=f08Format || member["phase"]!=phase{return nil,f08Shape}
+		ref,e:=f08Object(member[refKey],"entity_type","id","revision","content_hash");if e!=nil || ref["entity_type"]!="Task"{return nil,f08Shape}
+		id,e:=f08String(ref["id"]);if e!=nil || id<=last{return nil,f08Binding};last=id
+		h,e:=f08Hash(member);if e!=nil{return nil,e};digests=append(digests,map[string]any{"task_id":id,"member_hash":h})
+	}
+	groupHash,e:=f08Hash(digests);if e!=nil || groupHash!=row[groupIndex]{return nil,f08Binding}
+	if phase=="ADMITTED"{
+		ids,e:=f08Array(root["member_task_ids"]);if e!=nil || len(ids)!=len(members){return nil,f08Binding}
+		for i,d:=range digests{if ids[i]!=d.(map[string]any)["task_id"]{return nil,f08Binding}}
+		if root["method"]!="session.control" || root["operation"]!="v2:session.control" || root["key"]!=row[2] || row[4]!=root["operation"]{return nil,f08Binding}
+	} else if !f08Equal(root["admitted_root_ref"],f08RootReference("ADMITTED",row[4].(string))) {return nil,f08Binding}
+	var lastPin []any
+	for _,item:=range pins{
+		pin,e:=f08Object(item,"project","kind","id","revision","content_hash");if e!=nil{return nil,e}
+		p,ok:=pin["project"].(string);if !ok{return nil,f08Shape}
+		kind,e:=f08String(pin["kind"]);if e!=nil{return nil,e};id,e:=f08String(pin["id"]);if e!=nil{return nil,e}
+		if _,e=f08Integer(pin["revision"],1);e!=nil{return nil,e}
+		if pin["content_hash"]!=nil{if _,e=f08HashString(pin["content_hash"]);e!=nil{return nil,e}}
+		key:=[]any{p,kind,id,pin["revision"],pin["content_hash"]}
+		if lastPin!=nil && !f08TupleLess(lastPin,key){return nil,f08Binding};lastPin=key
+	}
+	return &f08Group{phase,row,root,members,pins,rootHash,groupHash},nil
+}
+func f08FindGroup(s *f08Sources,category string,locator []any)(*f08Group,error){
+	r,e:=s.one(category,[]int{0,1,2,3},locator);if e!=nil{return nil,e};return f08ParseGroup(category,r)
+}
+
+func (v *f08ProofValidator) materialization(s *f08Sources,action string,row []any)error{
+	if action=="pin.insert"{
+		if e:=f08ValidateTuple("pins",row);e!=nil{return e};category:="admitted"
+		if row[4]=="FINALIZED"{category="final"}else if row[4]!="ADMITTED"{return f08Shape}
+		parent,e:=f08FindGroup(s,category,row[:4]);if e!=nil{return e}
+		want:=map[string]any{"project":row[5],"kind":row[6],"id":row[7],"revision":row[8],"content_hash":row[9]}
+		matches:=0;for _,pin:=range parent.pins{if f08Equal(pin,want){matches++}}
+		if matches!=1{return f08Binding}
+		_,e=v.version(s,row[5].(string),map[string]any{"entity_type":row[6],"id":row[7],"revision":row[8],"content_hash":row[9]});return e
+	}
+	category,child:="admitted","admitted_members";if action=="final_member.insert"{category,child="final","final_members"}else if action!="admitted_member.insert"{return f08Mode}
+	if e:=f08ValidateTuple(child,row);e!=nil{return e};parent,e:=f08FindGroup(s,category,row[:4]);if e!=nil{return e}
+	index,e:=f08Integer(row[5],0);if e!=nil || index>=int64(len(parent.members)){return f08Binding}
+	want:=parent.members[index].(map[string]any);actual,_,e:=f08RawObject(row[8]);if e!=nil || !f08Equal(actual,want){return f08Binding}
+	h,e:=f08Hash(actual);if e!=nil || h!=row[7]{return f08Binding}
+	key:="task_ref";if category=="final"{key="task_admitted_ref"}
+	if actual[key].(map[string]any)["id"]!=row[4]{return f08Binding}
+	if category=="admitted" {if row[6]!=parent.rootHash{return f08Binding}} else {
+		admitted,e:=f08FindGroup(s,"admitted",row[:4]);if e!=nil || index>=int64(len(admitted.members)){return f08Binding}
+		original:=admitted.members[index].(map[string]any);h,e:=f08Hash(original);if e!=nil || h!=row[6]{return f08Binding}
+		if !f08Equal(actual["admitted_member_ref"],f08MemberReference("ADMITTED",row[4].(string),h)){return f08Binding}
+	}
+	return nil
+}
+func (v *f08ProofValidator) completeMaterializations(s *f08Sources,g *f08Group)error{
+	category,action:="admitted_members","admitted_member.insert";if g.phase=="FINALIZED"{category,action="final_members","final_member.insert"}
+	rows:=s.selectRows(category,[]int{0,1,2,3},g.row[:4]);if len(rows)!=len(g.members){return f08Binding}
+	for _,row:=range rows{if e:=v.materialization(s,action,row);e!=nil{return e}}
+	pins:=s.selectRows("pins",[]int{0,1,2,3,4},append(append([]any(nil),g.row[:4]...),g.phase))
+	if len(pins)!=len(g.pins){return f08Binding};for _,row:=range pins{if e:=v.materialization(s,"pin.insert",row);e!=nil{return e}}
+	return nil
+}
+
+func f08Pins(anchors []any)[]any{
+	result:=make([]any,0,len(anchors));for _,item:=range anchors{
+		a:=item.(map[string]any);r:=a["version_ref"].(map[string]any)
+		result=append(result,map[string]any{"project":a["project"],"kind":r["entity_type"],"id":r["id"],"revision":r["revision"],"content_hash":r["content_hash"]})
+	};return result
+}
+func f08SameVersion(a,b f08Version)bool{return a.project==b.project && f08Equal(a.ref(),b.ref()) && bytes.Equal(a.raw,b.raw)}
+func f08EmptyArray(v any)bool{a,ok:=v.([]any);return ok && len(a)==0}
+func f08NullFields(m map[string]any,keys ...string)bool{for _,key:=range keys{if m[key]!=nil{return false}};return true}
+
+
+// Source-derived original request and NO_RUN admission. Native admission is
+// routed to the separately implemented origin checker, never inferred from a
+// stage label or absence of a dispatch row.
+func (v *f08ProofValidator) groupRequest(s *f08Sources,g *f08Group)(f08CancelRequest,error){
+	var zero f08CancelRequest
+	if g.phase!="ADMITTED"{return zero,f08Mode}
+	r:=g.root;binding,e:=f08Object(r["session_binding"],"session_id","accepted_revision","writer_client_id","writer_epoch","lease_expires_at","event_watermark");if e!=nil{return zero,e}
+	target,e:=f08Object(r["target_binding"],"kind","id","version_ref");if e!=nil{return zero,e}
+	id,e:=s.one("identities",[]int{0,1},[]any{g.row[0],g.row[2]});if e!=nil{return zero,e}
+	if id[2]!=ProtocolV2 || id[3]!=g.row[1] || id[4]!="session.control" || id[5]!=g.row[4] || id[6]!=g.row[3]{return zero,f08Binding}
+	header,e:=f08Hex(g.row[5]);if e!=nil{return zero,e}
+	identity:=map[string]any{"format":f08IdentityFormat,"principal":id[0],"project":id[3],"operation":id[5],"key":id[1],"request_hash":id[6],"command_id":id[1],"method":id[4],"client_id":r["client_id"],"session_id":binding["session_id"],"writer_epoch":binding["writer_epoch"],"expected_revision":binding["accepted_revision"],"target_id":target["id"]}
+	b,e:=f08Encode(identity);if e!=nil{return zero,e};req,e:=f08Request(v.protocol,header,b);if e!=nil{return zero,e}
+	if r["private_header_digest"]!=req.headerDigest || binding["writer_client_id"]!=req.client{return zero,f08Binding}
+	return req,nil
+}
+// Pure absence check over the complete typed source vector. It does not prove
+// SDK settlement and does not infer absence from a missing current Session.
+// A retained fence is the original Task/Session association; a Session's current
+// task_id may have advanced, so it is not used to reassign old queue history.
+func (v *f08ProofValidator) noSessionQueueHistory(s *f08Sources, project, task string) error {
+	if len(s.selectRows("sessions", []int{1, 6}, []any{project, task})) != 0 || len(s.selectRows("fences", []int{0, 1}, []any{project, task})) != 0 { return f08Binding }
+	for _, q := range s.rows["queue"] {
+		fs := s.selectRows("fences", []int{3}, []any{q[6]})
+		relevant := q[1] == project
+		for _, f := range fs { relevant = relevant || f[0] == project }
+		if !relevant { continue }
+		// Even DROPPED/CONSUMED history belongs to its original Task. SQL22's
+		// generation-only FK cannot justify the other denormalized columns.
+		if q[1] == project && q[4] == task { return f08Binding }
+		if len(fs) != 1 { return f08Binding }; f := fs[0]
+		if f[0] != q[1] || f[1] != q[4] || f[2] != q[3] { return f08Binding }
+		if _, e := s.one("sessions", []int{0, 1}, []any{q[3], q[1]}); e != nil { return e }
+		owner, e := v.head(s, project, "Task", q[4].(string)); if e != nil || owner.body["goal_id"] != q[5] { return f08Binding }
+		if _, e = v.head(s, project, "Goal", q[5].(string)); e != nil { return e }
+		n, e := f08Integer(q[7], 1); if e != nil { return e }
+		a, e := f08Integer(f[5], n); if e != nil || n > a { return f08Binding }
+		_, raw, e := f08RawObject(q[12]); if e != nil || f08RawHash(raw) != q[13] { return f08Binding }
+		if q[16] != nil {
+			if _, e = s.one("receipts", []int{0,1,2,3}, []any{q[16],q[1],q[6],q[2]}); e != nil { return e }
+		}
+	}
+	// Receipts have no FK. Every same-project receipt must be attributable to
+	// an original, different Task, rather than silently discarded as unrelated.
+	for _, r := range s.rows["receipts"] {
+		fs := s.selectRows("fences", []int{3}, []any{r[2]})
+		relevant := r[1] == project
+		for _, f := range fs { relevant = relevant || f[0] == project }
+		if !relevant { continue }
+		body, raw, e := f08RawObject(r[5]); if e != nil || f08RawHash(raw) != r[6] { return f08Binding }
+		if len(fs) != 1 || fs[0][0] != r[1] || fs[0][1] == task { return f08Binding }; f := fs[0]
+		if _, e = s.one("sessions", []int{0,1}, []any{f[2],r[1]}); e != nil { return e }
+		// Only the exact, known CANCEL_FENCE producer is classified here. Other
+		// receipt kinds need their own complete association proof; a kind label,
+		// NULL command, or unknown payload cannot confer an absence exemption.
+		if r[4] != "CANCEL_FENCE" { return f08NativeProofGap }
+		if _, e = f08Object(body, "task_id", "from", "to"); e != nil { return e }
+		if body["task_id"] != f[1] || body["task_id"] == task || r[3] == nil { return f08Binding }
+		q, e := s.one("queue", []int{1,2,6}, []any{r[1],r[3],r[2]}); if e != nil { return e }
+		if q[3] != f[2] || q[4] != f[1] { return f08Binding }
+		from, to := body["from"], body["to"]
+		if !(from == "ENQUEUED" && to == "DROPPED" || (from == "SENDING" || from == "SDK_ACCEPTED") && to == "DROP_REQUESTED") { return f08Binding }
+		if r[7] != nil {
+			// Resolve the entire retained chain, including nullable/duplicate IDs,
+			// cycle and cross-command/generation substitutions. This proves only
+			// association, never the SDK semantic meaning of a predecessor.
+			seen := map[string]bool{}
+			id, e := f08String(r[0]); if e != nil { return e }; seen[id] = true
+			previous := r[7]
+			for previous != nil {
+				id, e = f08String(previous); if e != nil || seen[id] { return f08Binding }; seen[id] = true
+				p, e := s.one("receipts", []int{0,1,2,3}, []any{id,r[1],r[2],r[3]}); if e != nil { return e }
+				_, bytes, e := f08RawObject(p[5]); if e != nil || f08RawHash(bytes) != p[6] { return f08Binding }
+				previous = p[7]
+			}
+		}
+	}
+	return nil
+}
+
+func (v *f08ProofValidator) queueAdmission(s *f08Sources,project,task string)(map[string]any,error){
+	q:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+	sessions:=s.selectRows("sessions",[]int{1,6},[]any{project,task})
+	fences:=s.selectRows("fences",[]int{0,1},[]any{project,task})
+	if len(sessions)==0{if e:=v.noSessionQueueHistory(s,project,task);e!=nil{return nil,e};return q,nil}
+	if len(sessions)!=1{return nil,f08Binding};session:=sessions[0];q["session_id"]=session[0]
+	if len(fences)==0{q["variant"]="REAL_SESSION_NO_ORIGINAL_FENCE";return q,nil}
+	if len(fences)!=1 || fences[0][2]!=session[0]{return nil,f08Binding}
+	f:=fences[0];q["variant"]="ORIGINAL_FENCE"
+	for key,i:=range map[string]int{"generation":3,"revision":13,"state":4,"accepted_through":5,"sealed_through":6,"run_id":7,"runtime_epoch":8,"dispatch_key":9,"manifest_hash":10,"restore_fenced":12}{q[key]=f[i]}
+	// The registry fixes actual fence tuple positions; process_identity is raw
+	// nullable JSON, and revision is the last column (index13 in SQL22).
+	q["revision"]=f[13]
+	if f[11]!=nil{identity,_,e:=f08JSONHex(f[11]);if e!=nil{return nil,e};q["process_identity"]=identity}
+	accepted,e:=f08Integer(f[5],0);if e!=nil{return nil,e};sealed,e:=f08Integer(f[6],0);if e!=nil || sealed>accepted{return nil,f08Binding}
+	for _,entry:=range s.selectRows("queue",[]int{1,4,6},[]any{project,task,f[3]}){
+		seq,e:=f08Integer(entry[7],1);if e!=nil || seq>accepted || entry[3]!=session[0]{return nil,f08Binding}
+		_,contentRaw,e:=f08JSONHex(entry[12]);if e!=nil{return nil,e};if f08RawHash(contentRaw)!=entry[13]{return nil,f08Binding}
+		if entry[16]!=nil{
+			r,e:=s.one("receipts",[]int{0,1,2,3},[]any{entry[16],project,f[3],entry[2]});if e!=nil{return nil,e}
+			_,receiptRaw,e:=f08JSONHex(r[5]);if e!=nil || f08RawHash(receiptRaw)!=r[6]{return nil,f08Binding}
+		}
+	}
+	return q,nil
+}
+func (v *f08ProofValidator) noRun(s *f08Sources,task f08Version)error{
+	if task.body["active_run_id"]!=nil{return f08Binding}
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=task.project || row[1]!="Run"{continue}
+		body,_,e:=f08RawObject(row[4]);if e!=nil{return e};if body["task_id"]==task.id{return f08Binding}
+	}
+	for _,row:=range s.rows["dispatches"]{
+		if row[0]!=task.project{continue};body,_,e:=f08RawObject(row[4]);if e!=nil{return e};if body["task_id"]==task.id{return f08Binding}
+	}
+	// Effects bind a Run, not a Task. Every same-project effect must resolve a
+	// real Run version; an orphan effect cannot be ignored as "not this Task".
+	for _,row:=range s.rows["effects"]{
+		if row[0]!=task.project{continue};runs:=s.selectRows("domain_versions",[]int{0,1,2},[]any{task.project,"Run",row[1]});if len(runs)==0{return f08Binding}
+		for _,run:=range runs{body,_,e:=f08RawObject(run[4]);if e!=nil || body["task_id"]==task.id{return f08Binding}}
+	}
+	return nil
+}
+func (v *f08ProofValidator) admitted(s *f08Sources,row []any,current bool)(*f08Group,error){
+	g,e:=f08ParseGroup("admitted",row);if e!=nil{return nil,e};req,e:=v.groupRequest(s,g);if e!=nil{return nil,e}
+	root:=g.root;binding:=root["session_binding"].(map[string]any);target:=root["target_binding"].(map[string]any)
+	if target["kind"]!="Goal" && target["kind"]!="Run"{return nil,f08Shape}
+	targetVersion,e:=v.version(s,req.project,target["version_ref"]);if e!=nil || targetVersion.kind!=target["kind"] || targetVersion.id!=target["id"]{return nil,f08Binding}
+	if current{
+		if len(s.selectRows("admitted",[]int{0,1,2},row[:3]))!=0 || len(s.selectRows("idempotency",[]int{0,1,2,3},[]any{row[0],row[1],row[4],row[2]}))!=0{return nil,f08Binding}
+		session,e:=s.one("sessions",[]int{0,1},[]any{req.session,req.project});if e!=nil{return nil,e}
+		for key,index:=range map[string]int{"accepted_revision":2,"writer_client_id":9,"writer_epoch":8,"lease_expires_at":10,"event_watermark":11}{if !f08Equal(binding[key],session[index]){return nil,f08Binding}}
+		if session[21]!=nil || session[22]!=nil || session[23]!=ProtocolV2 || binding["lease_expires_at"]==nil{return nil,f08Binding}
+		head,e:=v.head(s,req.project,targetVersion.kind,targetVersion.id);if e!=nil || !f08SameVersion(head,targetVersion){return nil,f08Binding}
+		if targetVersion.kind=="Goal" && session[5]!=targetVersion.id || targetVersion.kind=="Run" && session[7]!=targetVersion.id{return nil,f08Binding}
+	}
+	var wantIDs []any
+	if targetVersion.kind=="Run"{wantIDs=[]any{targetVersion.body["task_id"]}}else if current{
+		for _,o:=range s.rows["domain_objects"]{
+			if o[0]!=req.project || o[1]!="Task"{continue};task,e:=v.head(s,req.project,"Task",o[2].(string));if e!=nil{return nil,e}
+			if task.body["goal_id"]==targetVersion.id{wantIDs=append(wantIDs,task.id)}
+		};sort.Slice(wantIDs,func(i,j int)bool{return wantIDs[i].(string)<wantIDs[j].(string)})
+	}
+	if current && !f08Equal(wantIDs,root["member_task_ids"]){return nil,f08Binding}
+	all:=map[string]any{};targetClosure,targetAnchors,e:=v.referenceClosure(s,[]f08Version{targetVersion});if e!=nil{return nil,e};_ = targetClosure
+	for _,a:=range targetAnchors{k,_:=f08Key(a);all[k]=a}
+	for _,item:=range g.members{
+		m:=item.(map[string]any);task,e:=v.version(s,req.project,m["task_ref"]);if e!=nil || task.kind!="Task"{return nil,f08Binding}
+		if e=f08QueueAdmissionShape(m["queue_admission"]);e!=nil{return nil,e}
+		goal,e:=v.version(s,req.project,m["goal_ref"]);if e!=nil || goal.kind!="Goal" || task.body["goal_id"]!=goal.id{return nil,f08Binding}
+		if targetVersion.kind=="Goal" && goal.id!=targetVersion.id || targetVersion.kind=="Run" && targetVersion.body["task_id"]!=task.id{return nil,f08Binding}
+		if current{head,e:=v.head(s,req.project,"Task",task.id);if e!=nil || !f08SameVersion(task,head){return nil,f08Binding}}
+		roots:=[]f08Version{task,goal}
+		if m["dispatch_stage"]=="NO_RUN"{
+			if !f08NullFields(m,"run_ref","runtime_binding","dispatch_origin_ref") || task.body["active_run_id"]!=nil{return nil,f08Binding}
+			if current{if e=v.noRun(s,task);e!=nil{return nil,e}}
+		}else{
+			// Native/legacy Run authorization needs the complete R2/SDK/ledger
+			// closure. Absence or caller stage never reaches a success here.
+			return nil,f08NativeProofGap
+		}
+		closure,anchors,e:=v.referenceClosure(s,roots);if e!=nil || !f08Equal(m["reference_closure"],closure){return nil,f08Binding}
+		for _,a:=range anchors{k,_:=f08Key(a);all[k]=a}
+		if current{queue,e:=v.queueAdmission(s,req.project,task.id);if e!=nil || !f08Equal(m["queue_admission"],queue){return nil,f08Binding}}
+	}
+	if !f08Equal(g.pins,f08Pins(f08SortedAnchors(all))){return nil,f08Binding}
+	return g,nil
+}
+func f08QueueAdmissionShape(value any)error{
+	q,e:=f08Object(value,"variant","session_id","generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced");if e!=nil{return e}
+	nullKeys:=[]string{"generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced"}
+	if q["variant"]=="NO_SESSION"{if q["session_id"]!=nil || !f08NullFields(q,nullKeys...){return f08Binding};return nil}
+	if _,e=f08String(q["session_id"]);e!=nil{return e}
+	if q["variant"]=="REAL_SESSION_NO_ORIGINAL_FENCE"{if !f08NullFields(q,nullKeys...){return f08Binding};return nil}
+	if q["variant"]!="ORIGINAL_FENCE"{return f08Shape}
+	for _,key:=range []string{"generation","state"}{if _,e=f08String(q[key]);e!=nil{return e}}
+	if _,e=f08Integer(q["revision"],1);e!=nil{return e};accepted,e:=f08Integer(q["accepted_through"],0);if e!=nil{return e};sealed,e:=f08Integer(q["sealed_through"],0);if e!=nil || sealed>accepted{return f08Binding}
+	restored,e:=f08Integer(q["restore_fenced"],0);if e!=nil || restored>1{return f08Shape}
+	if q["runtime_epoch"]!=nil{if _,e=f08Integer(q["runtime_epoch"],1);e!=nil{return e}}
+	for _,key:=range []string{"run_id","dispatch_key"}{if q[key]!=nil{if _,e=f08String(q[key]);e!=nil{return e}}}
+	if q["manifest_hash"]!=nil{if _,e=f08HashString(q["manifest_hash"]);e!=nil{return e}}
+	if q["process_identity"]!=nil{id,ok:=q["process_identity"].(map[string]any);if !ok{return f08Shape};if e=f08BoundIdentity(id);e!=nil{return e}}
+	return nil
+}
+
+
+// Dispatch transition checks operate on actual SQL OLD/NEW/source tuples.
+// Observation INSERT remains deferred: the transition does not invent an
+// observation or grant finalization before its actual immutable row exists.
+func (v *f08ProofValidator) dispatchManifest(s *f08Sources,row []any,run,task f08Version)(map[string]any,error){
+	if e:=f08ValidateTuple("dispatches",row);e!=nil{return nil,e}
+	m,_,e:=f08RawObject(row[4]);if e!=nil{return nil,e}
+	if _,e=f08Object(m,"version","project_id","run_id","task_id","epoch","runtime_id","executor_principal_id","contract_hash","input_refs","context_bundle_id","checkpoint_artifact_id","admission","dispatch_key");e!=nil{return nil,e}
+	contract,ok:=task.body["acceptance_contract"].(map[string]any);if !ok{return nil,f08Shape}
+	if Hash(m)!=row[5] || m["project_id"]!=row[0] || m["run_id"]!=row[1] || m["dispatch_key"]!=row[3] || !f08Equal(m["epoch"],row[2]) || !f08Equal(m["version"],f08Number(1)){return nil,f08Binding}
+	if task.project!=run.project || run.project!=row[0] || run.id!=row[1] || run.body["task_id"]!=task.id || task.body["active_run_id"]!=run.id{return nil,f08Binding}
+	for key,want:=range map[string]any{"task_id":task.id,"epoch":run.body["lease_epoch"],"runtime_id":run.body["runtime_id"],"executor_principal_id":run.body["executor_principal_id"],"contract_hash":contract["contract_hash"],"input_refs":run.body["input_refs"],"context_bundle_id":run.body["context_bundle_id"],"checkpoint_artifact_id":run.body["checkpoint_artifact_id"]}{if !f08Equal(m[key],want){return nil,f08Binding}}
+	if _,ok:=m["admission"].(map[string]any);!ok{return nil,f08Shape};return m,nil
+}
+func f08Identity(rawHex any)(map[string]any,error){
+	id,_,e:=f08RawObject(rawHex);if e!=nil{return nil,e};return id,nil
+}
+func f08BoundIdentity(id map[string]any)error{
+	if _,e:=f08Object(id,"pid","process_created_ns","job","appcontainer_sid","profile","staging_directory");e!=nil{return e}
+	pid,e:=f08Integer(id["pid"],1);if e!=nil || pid>4294967295{return f08Binding}
+	created,e:=f08String(id["process_created_ns"]);if e!=nil{return e};n,e:=strconv.ParseInt(created,10,64)
+	if e!=nil || n<=0 || strconv.FormatInt(n,10)!=created{return f08Binding}
+	for _,key:=range []string{"job","appcontainer_sid","profile","staging_directory"}{if _,e=f08String(id[key]);e!=nil{return e}}
+	return nil
+}
+func f08RetainedColumns(old,row []any,mutable ...int)bool{
+	allowed:=map[int]bool{};for _,i:=range mutable{allowed[i]=true}
+	if len(old)!=len(row){return false};for i:=range row{if !allowed[i] && !f08Equal(old[i],row[i]){return false}};return true
+}
+func (v *f08ProofValidator) dispatchUpdate(s *f08Sources,old,row []any)error{
+	if e:=f08ValidateTuple("dispatches",old);e!=nil{return e};if e:=f08ValidateTuple("dispatches",row);e!=nil{return e}
+	actual,e:=s.one("dispatches",[]int{0,1,2},old[:3]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+	if !f08RetainedColumns(old,row,6,7,8,9,10,11,13,14){return f08Binding}
+	before,e:=f08Identity(old[9]);if e!=nil{return e};after,e:=f08Identity(row[9]);if e!=nil{return e}
+	oldSequence,e:=f08Integer(old[10],0);if e!=nil{return e};sequence,e:=f08Integer(row[10],0);if e!=nil{return e}
+	state0,state:=old[6].(string),row[6].(string)
+	switch {
+	case state0=="PREPARED" && state=="STARTED":
+		if old[7]!="" || old[8]!="" || len(before)!=0 || oldSequence!=0 || old[11]!="" || row[7]=="" || row[8]!=row[3] || len(after)!=0 || sequence!=0 || row[11]!="" || row[14]!=old[14]{return f08Binding}
+		run,e:=v.head(s,row[0].(string),"Run",row[1].(string));if e!=nil{return e}
+		if run.body["status"]!="RUNNING" && run.body["status"]!="QUEUED"{return f08Binding}
+		if !f08NullFields(run.body,"cancel_requested_at","cancel_confirmed_at","ended_at") || !f08Equal(run.body["lease_epoch"],row[2]){return f08Binding}
+		taskID,e:=f08String(run.body["task_id"]);if e!=nil{return e};task,e:=v.head(s,run.project,"Task",taskID);if e!=nil{return e}
+		if _,e=v.dispatchManifest(s,row,run,task);e!=nil{return e}
+		goalID,e:=f08String(task.body["goal_id"]);if e!=nil{return e};goal,e:=v.head(s,run.project,"Goal",goalID);if e!=nil || goal.body["status"]!="ACTIVE"{return f08Binding}
+		for _,member:=range s.rows["final_members"]{
+			if member[1]!=row[0]{continue};m,_,e:=f08RawObject(member[8]);if e!=nil{return e}
+			if m["proof_kind"]!="NEVER_LAUNCHED_NATIVE"{continue}
+			d,ok:=m["dispatch_final_binding"].(map[string]any);if !ok{return f08Shape}
+			if d["run_id"]==row[1] && f08Equal(d["epoch"],row[2]){return f08Binding}
+		}
+		return nil
+	case state0=="STARTED" && state=="STARTED":
+		if !f08RetainedColumns(old,row,9,13) || old[7]=="" || old[8]!=old[3] || sequence!=0 || row[11]!=""{return f08Binding}
+		if len(before)==0 {if len(after)==0{return f08Binding}} else if !f08Equal(before,after){return f08Binding}
+		return f08BoundIdentity(after)
+	case (state0=="PREPARED" || state0=="STARTED" || state0=="UNKNOWN") && state=="UNKNOWN":
+		if !f08RetainedColumns(old,row,6,13,14){return f08Binding};return nil
+	case (state0=="STARTED" || state0=="UNKNOWN" || state0=="OBSERVED") && state=="OBSERVED":
+		if !f08RetainedColumns(old,row,6,10,11,13) || row[7]=="" || row[8]!=row[3] || len(after)==0 || sequence<oldSequence || sequence<=0{return f08Binding}
+		if sequence==oldSequence && row[11]!=old[11]{return f08Binding}
+		if _,e=f08HashString(row[11]);e!=nil{return e}
+		return f08BoundIdentity(after)
+	default:return f08Binding
+	}
+}
+
+func (v *f08ProofValidator) eventFor(s *f08Sources,aggregate f08Version,eventType string)(f08Version,map[string]any,error){
+	var zero f08Version;var selected f08Version;var result map[string]any;count:=0
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=aggregate.project || row[1]!="EventEnvelope"{continue}
+		event,e:=v.version(s,aggregate.project,map[string]any{"entity_type":"EventEnvelope","id":row[2],"revision":row[3],"content_hash":row[5]});if e!=nil{return zero,nil,e}
+		if event.body["event_type"]!=eventType || !f08Equal(event.body["aggregate_ref"],aggregate.ref()){continue}
+		outbox,e:=s.one("outbox",[]int{0,1,2},[]any{aggregate.project,event.body["sequence"],event.id});if e!=nil{return zero,nil,e}
+		raw,e:=f08Hex(outbox[3]);if e!=nil || !bytes.Equal(raw,event.raw){return zero,nil,f08Binding}
+		selected=event;result=map[string]any{"version_ref":event.ref(),"outbox_id":outbox[2],"sequence":outbox[1],"body_digest":f08RawHash(raw)};count++
+	}
+	if count!=1{return zero,nil,f08Binding};return selected,result,nil
+}
+func f08VersionAnchor(version f08Version)map[string]any{return map[string]any{"ref":version.ref(),"body_digest":f08RawHash(version.raw)}}
+func (v *f08ProofValidator) resolveAnchor(s *f08Sources,project string,value any)(f08Version,error){
+	var zero f08Version;m,e:=f08Object(value,"ref","body_digest");if e!=nil{return zero,e}
+	x,e:=v.version(s,project,m["ref"]);if e!=nil || m["body_digest"]!=f08RawHash(x.raw){return zero,f08Binding};return x,nil
+}
+
+
+// R2 initial qualification epoch, selected from actual immutable facts. The
+// later-epoch route/carry derivation below is independently usable, but cannot
+// authorize its absent original admission.operation predicate.
+const f08LaterOperationUnbound=f08Error("F08_R2_ADMISSION_OPERATION_NOT_RETAINED")
+
+func (v *f08ProofValidator) artifactContent(s *f08Sources,a f08Version)([]byte,error){
+	if a.kind!="Artifact" || a.body["sealed_at"]==nil{return nil,f08Binding}
+	row,e:=s.one("content",[]int{0,1},[]any{a.body["storage_key"],a.project});if e!=nil{return nil,e}
+	raw,e:=f08Hex(row[3]);if e!=nil{return nil,e}
+	if !f08Equal(row[6],f08Number(1)) || f08RawHash(raw)!=row[4] || row[4]!=a.body["content_hash"]{return nil,f08Binding}
+	n,e:=f08Integer(a.body["byte_size"],0);if e!=nil || n!=int64(len(raw)){return nil,f08Binding};return raw,nil
+}
+func (v *f08ProofValidator) originalBirth(s *f08Sources,project,runID string,admission map[string]any)(map[string]any,[]f08Version,error){
+	r,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{project,"Run",runID,f08Number(1)});if e!=nil{return nil,nil,e}
+	run,e:=v.version(s,project,map[string]any{"entity_type":"Run","id":runID,"revision":r[3],"content_hash":r[5]});if e!=nil{return nil,nil,e}
+	if run.body["status"]!="QUEUED" || !f08NullFields(run.body,"cancel_requested_at","cancel_confirmed_at","started_at","ended_at","external_run_id"){return nil,nil,f08Binding}
+	runtime,e:=v.version(s,project,admission["runtime_ref"]);if e!=nil || runtime.kind!="RuntimeRegistration" || runtime.id!=run.body["runtime_id"]{return nil,nil,f08Binding}
+	var claimTask,runEvent,taskEvent f08Version;var runRef,taskRef map[string]any;pairs:=0
+	for _,row:=range s.rows["domain_versions"]{
+		if row[0]!=project || row[1]!="EventEnvelope"{continue}
+		event,e:=v.version(s,project,map[string]any{"entity_type":"EventEnvelope","id":row[2],"revision":row[3],"content_hash":row[5]});if e!=nil{return nil,nil,e}
+		if event.body["event_type"]!="RUN_CHANGED" || !f08Equal(event.body["aggregate_ref"],run.ref()){continue}
+		for _,candidate:=range s.rows["domain_versions"]{
+			if candidate[0]!=project || candidate[1]!="Task" || candidate[2]!=run.body["task_id"]{continue}
+			task,e:=v.version(s,project,map[string]any{"entity_type":"Task","id":candidate[2],"revision":candidate[3],"content_hash":candidate[5]});if e!=nil{return nil,nil,e}
+			if task.body["status"]!="RUNNING" || task.body["active_run_id"]!=runID || task.body["assigned_principal_id"]!=run.body["executor_principal_id"]{continue}
+			for _,er:=range s.rows["domain_versions"]{
+				if er[0]!=project || er[1]!="EventEnvelope"{continue}
+				te,e:=v.version(s,project,map[string]any{"entity_type":"EventEnvelope","id":er[2],"revision":er[3],"content_hash":er[5]});if e!=nil{return nil,nil,e}
+				if te.body["event_type"]!="TASK_CHANGED" || !f08Equal(te.body["aggregate_ref"],task.ref()) || te.body["actor_id"]!=event.body["actor_id"] || te.body["correlation_id"]!=event.body["correlation_id"]{continue}
+				re,e:=v.exactEvent(s,event);if e!=nil{return nil,nil,e};tr,e:=v.exactEvent(s,te);if e!=nil{return nil,nil,e}
+				claimTask,runEvent,taskEvent=task,event,te;runRef,taskRef=re,tr;pairs++
+			}
+		}
+	}
+	if pairs!=1{return nil,nil,f08Binding}
+	if !f08Equal(run.body["input_refs"],claimTask.body["input_refs"]) || run.body["context_bundle_id"]!=claimTask.body["context_bundle_id"]{return nil,nil,f08Binding}
+	dep,e:=s.one("run_dependencies",[]int{0,1},[]any{project,runID});if e!=nil{return nil,nil,e}
+	doc,raw,e:=f08RawObject(dep[2]);if e!=nil{return nil,nil,e};if _,e=f08Object(doc,"refs");e!=nil{return nil,nil,e}
+	refs,e:=f08Array(doc["refs"]);if e!=nil{return nil,nil,e}
+	// Qualification plans require no dependencies in the actual producer. A
+	// nonempty dependency vector requires the ordinary admission branch below,
+	// including ordered accepted-output/contribution proofs; never deduplicate.
+	if !f08EmptyArray(claimTask.body["dependency_task_ids"]) || len(refs)!=0{return nil,nil,f08NativeProofGap}
+	epoch,e:=f08Integer(run.body["lease_epoch"],1);if e!=nil{return nil,nil,e}
+	birth:=map[string]any{"run_birth":f08VersionAnchor(run),"task_at_claim":f08VersionAnchor(claimTask),"run_birth_event":runRef,"task_claim_event":taskRef,"claim_principal":runEvent.body["actor_id"],"claim_correlation_id":runEvent.body["correlation_id"],"birth_epoch":f08Number(epoch),"birth_runtime_ref":runtime.ref(),"executor_principal_id":run.body["executor_principal_id"],"birth_lease_token_hash":run.body["lease_token_hash"],"dependency_snapshot":map[string]any{"category":"run_dependencies","key":[]any{project,runID},"body_digest":f08RawHash(raw)}}
+	return birth,[]f08Version{run,claimTask,runtime,runEvent,taskEvent},nil
+}
+func (v *f08ProofValidator) exactEvent(s *f08Sources,event f08Version)(map[string]any,error){
+	if event.kind!="EventEnvelope"{return nil,f08Binding}
+	o,e:=s.one("outbox",[]int{0,1,2},[]any{event.project,event.body["sequence"],event.id});if e!=nil{return nil,e}
+	b,e:=f08Hex(o[3]);if e!=nil || !bytes.Equal(b,event.raw){return nil,f08Binding}
+	return map[string]any{"version_ref":event.ref(),"outbox_id":o[2],"sequence":o[1],"body_digest":f08RawHash(b)},nil
+}
+func (v *f08ProofValidator) bootstrapAdmission(s *f08Sources,run,task f08Version,a map[string]any)([]f08Version,error){
+	if _,e:=f08Object(a,"mode","runtime_id","runtime_ref","profile_ref","profile_hash","profile","technical_hash","qualification_ids","qualification_evidence","permission","credential_revision","expires_at","requested_capabilities","qualification_bootstrap");e!=nil{return nil,e}
+	if a["qualification_bootstrap"]!=true || task.body["task_type"]!="runtime_qualification" || !f08EmptyArray(a["qualification_ids"]) || !f08EmptyArray(a["qualification_evidence"]){return nil,f08Binding}
+	runtime,e:=v.version(s,run.project,a["runtime_ref"]);if e!=nil || runtime.kind!="RuntimeRegistration" || runtime.id!=run.body["runtime_id"] || runtime.id!=a["runtime_id"] || runtime.body["measurement_mode"]!=a["mode"]{return nil,f08Binding}
+	if runtime.body["status"]=="REVOKED" || runtime.body["status"]=="UNAVAILABLE"{return nil,f08Binding}
+	profile,e:=v.version(s,run.project,a["profile_ref"]);if e!=nil{return nil,e};raw,e:=v.artifactContent(s,profile);if e!=nil{return nil,e}
+	pv,_,e:=f08Strict(raw);if e!=nil || !f08Equal(pv,a["profile"]){return nil,f08Binding};p,ok:=pv.(map[string]any);if !ok{return nil,f08Shape}
+	technical:=Hash([]any{runtime.body["adapter"],runtime.body["adapter_revision"],runtime.body["capabilities"],runtime.body["platform"],runtime.body["measurement_mode"],runtime.body["credential_ref"]})
+	if a["technical_hash"]!=technical || a["profile_hash"]!=Hash(a["profile_ref"]) || p["runtime_id"]!=runtime.id || p["technical_hash"]!=technical || p["credential_revision"]!=a["credential_revision"]{return nil,f08Binding}
+	for _,key:=range []string{"adapter","adapter_revision","platform"}{if p[key]!=runtime.body[key]{return nil,f08Binding}}
+	b,e:=s.one("runtime_bindings",[]int{0,1},[]any{run.project,runtime.id});if e!=nil{return nil,e};ref,_,e:=f08JSONHex(b[2]);if e!=nil || !f08Equal(ref,a["profile_ref"]) || b[3]!=a["profile_hash"] || b[4]!=technical{return nil,f08Binding}
+	planRow,e:=s.one("qualification_plans",[]int{0,1,2},[]any{run.project,task.id,runtime.id});if e!=nil{return nil,e}
+	plan,_,e:=f08RawObject(planRow[3]);if e!=nil || Hash(plan)!=planRow[4]{return nil,f08Binding}
+	keys:=[]string{"runtime_id","profile_ref","task_hash","required_capabilities","max_validity_seconds","resume_check_id"};if _,ok:=plan["model_qualification"];ok{keys=append(keys,"model_qualification")};if _,e=f08Object(plan,keys...);e!=nil{return nil,e}
+	if plan["runtime_id"]!=runtime.id || !f08Equal(plan["profile_ref"],a["profile_ref"]) || !f08Equal(plan["required_capabilities"],a["requested_capabilities"]){return nil,f08Binding}
+	if plan["task_hash"]!=Hash([]any{task.body["goal_id"],task.body["task_type"],task.body["input_refs"],task.body["requirement_refs"],task.body["context_bundle_id"],task.body["dependency_task_ids"],task.body["acceptance_contract"],task.body["stop_policy"]}){return nil,f08Binding}
+	permission,e:=f08Object(a["permission"],"purpose","authorized_by","author_root","plan_hash");if e!=nil{return nil,e}
+	if permission["purpose"]!="runtime_qualification" || permission["authorized_by"]!=planRow[5] || permission["author_root"]!=planRow[6] || permission["plan_hash"]!=planRow[4] || b[5]!=planRow[5]{return nil,f08Binding}
+	marker,e:=s.one("qualification_runs",[]int{0,1,2,3},[]any{run.project,task.id,run.id,runtime.id});if e!=nil{return nil,e}
+	contract,ok:=task.body["acceptance_contract"].(map[string]any);if !ok{return nil,f08Shape}
+	if !f08Equal(marker[4],run.body["lease_epoch"]) || marker[5]!=planRow[4] || marker[6]!=a["profile_hash"] || marker[7]!=contract["contract_hash"] || marker[8]!=Hash(run.body["input_refs"]) || marker[10]!=planRow[6]{return nil,f08Binding}
+	contextRef,_,e:=f08JSONHex(marker[9]);if e!=nil{return nil,e};context,e:=v.version(s,run.project,contextRef);if e!=nil || context.kind!="ContextBundle" || context.id!=run.body["context_bundle_id"]{return nil,f08Binding}
+	// Literal timestamps are validated without time.Now; exact elapsed policy
+	// is a retained source equality, not a new wall-clock authorization.
+	created,e:=time.Parse(time.RFC3339Nano,run.body["created_at"].(string));if e!=nil{return nil,f08Binding}
+	seconds,e:=f08Integer(plan["max_validity_seconds"],1);if e!=nil || seconds>30*24*3600{return nil,f08Binding}
+	if a["expires_at"]!=created.Add(time.Duration(seconds)*time.Second).UTC().Format(time.RFC3339Nano){return nil,f08Binding}
+	// OPEN: sandbox/build/permission/timeout/output/model qualification predicates
+	// are not fully implemented. Retained labels and hashes cannot authorize
+	// an initial origin. Preserve the checked extraction above, then fail closed.
+	return nil,f08QualificationProfileGap
+}
+
+func (v *f08ProofValidator) deriveInitialOrigin(s *f08Sources,d []any)(map[string]any,error){
+	if e:=f08ValidateTuple("dispatches",d);e!=nil{return nil,e}
+	if len(s.selectRows("legacy",[]int{0,1},d[:2]))!=0{return nil,f08Binding}
+	actual,e:=s.one("dispatches",[]int{0,1,2},d[:3]);if e!=nil || !f08Equal(actual,d){return nil,f08Binding}
+	id,e:=f08Identity(d[9]);if e!=nil || d[6]!="PREPARED" || d[7]!="" || d[8]!="" || len(id)!=0 || !f08Equal(d[10],f08Number(0)) || d[11]!=""{return nil,f08Binding}
+	run,e:=v.head(s,d[0].(string),"Run",d[1].(string));if e!=nil{return nil,e}
+	taskID,e:=f08String(run.body["task_id"]);if e!=nil{return nil,e};task,e:=v.head(s,run.project,"Task",taskID);if e!=nil{return nil,e}
+	manifest,e:=v.dispatchManifest(s,d,run,task);if e!=nil{return nil,e};admission:=manifest["admission"].(map[string]any)
+	if run.revision!=1{return nil,f08LaterOperationUnbound}
+	if admission["qualification_bootstrap"]!=true{return nil,f08NativeProofGap}
+	if len(s.selectRows("dispatches",[]int{0,1},d[:2]))!=1{return nil,f08Binding}
+	birth,roots,e:=v.originalBirth(s,run.project,run.id,admission);if e!=nil{return nil,e}
+	if !f08Equal(birth["run_birth"],f08VersionAnchor(run)) || !f08Equal(birth["task_at_claim"],f08VersionAnchor(task)){return nil,f08Binding}
+	more,e:=v.bootstrapAdmission(s,run,task,admission);if e!=nil{return nil,e};roots=append(roots,more...)
+	closure,versions,e:=v.referenceClosure(s,roots);if e!=nil{return nil,e}
+	admissionDigest,e:=f08Hash(admission);if e!=nil{return nil,e};manifestBytes,e:=f08Hex(d[4]);if e!=nil{return nil,e}
+	authority:=map[string]any{"kind":"INITIAL_CLAIM","run_at_prepare":f08VersionAnchor(run),"task_at_prepare":f08VersionAnchor(task),"runtime_ref":admission["runtime_ref"],"executor_principal_id":run.body["executor_principal_id"],"lease_epoch":run.body["lease_epoch"],"lease_token_hash":run.body["lease_token_hash"],"lease_expires_at":run.body["lease_expires_at"],"admission_digest":admissionDigest,"previous_run":nil,"previous_origin":nil,"previous_dispatch":nil,"session_rebuild":nil,"resource_switch":nil,"checkpoint_carry":nil,"prior_epochs":[]any{}}
+	return map[string]any{"format":f08Format,"project":run.project,"run_id":run.id,"epoch":run.body["lease_epoch"],"dispatch_key":d[3],"manifest_digest":d[5],"manifest_bytes_digest":f08RawHash(manifestBytes),"birth":birth,"epoch_authority":authority,"source_closure":map[string]any{"versions":versions,"reference_closure":closure}},nil
+}
+func (v *f08ProofValidator) originInsert(s *f08Sources,row []any)error{
+	if e:=f08ValidateTuple("origins",row);e!=nil{return e}
+	d,e:=s.one("dispatches",[]int{0,1,2,3},row[:4]);if e!=nil{return e}
+	want,e:=v.deriveInitialOrigin(s,d);if e!=nil{return e};actual,_,e:=f08RawObject(row[4]);if e!=nil{return e}
+	h,e:=f08Hash(actual);if e!=nil || row[5]!=h || !f08Equal(actual,want){return f08Binding};return nil
+}
+
+
+// Exact complete histories are derived before any settled predicate is used.
+// Each sequence keeps its original epoch. UNKNOWN is accepted as an earlier
+// row only when a genuine later row in the same history closes that outcome.
+type f08EffectHistory struct {key string;rows [][]any;bodies []map[string]any;reservation f08Version;costs []f08Version}
+func (v *f08ProofValidator) effectHistories(s *f08Sources,project,runID string,through int64)([]f08EffectHistory,[]f08Version,error){
+	groups:=map[string][][]any{};for _,row:=range s.selectRows("effects",[]int{0,1},[]any{project,runID}){groups[row[2].(string)]=append(groups[row[2].(string)],row)}
+	ledger:=map[string]f08Version{}
+	for _,r:=range s.rows["domain_versions"]{
+		if r[0]!=project || r[1]!="BudgetLedgerEntry"{continue};b,_,e:=f08RawObject(r[4]);if e!=nil{return nil,nil,e};if b["run_id"]!=runID{continue}
+		o,e:=v.version(s,project,map[string]any{"entity_type":"BudgetLedgerEntry","id":r[2],"revision":r[3],"content_hash":r[5]});if e!=nil{return nil,nil,e};if o.revision!=1{return nil,nil,f08Binding};ledger[o.id]=o
+	}
+	keys:=make([]string,0,len(groups));for key:=range groups{keys=append(keys,key)};sort.Strings(keys)
+	var result []f08EffectHistory;claimed:=map[string]bool{}
+	for _,key:=range keys{
+		rows:=groups[key];sort.Slice(rows,func(i,j int)bool{return f08ScalarCompare(rows[i][3],rows[j][3])<0})
+		history:=f08EffectHistory{key:key,rows:rows};var prior map[string]any
+		for i,row:=range rows{
+			sequence,e:=f08Integer(row[3],1);if e!=nil || sequence!=int64(i+1){return nil,nil,f08Binding}
+			b,_,e:=f08RawObject(row[4]);if e!=nil{return nil,nil,e}
+			if _,e=f08Object(b,"project_id","goal_id","task_id","run_id","key","request_hash","payload","reservation_id","state","epoch","context_bundle_id","checkpoint_artifact_id","receipt","sequence","observed_at");e!=nil{return nil,nil,e}
+			epoch,e:=f08Integer(b["epoch"],1);if e!=nil || epoch>through{return nil,nil,f08Binding}
+			if b["project_id"]!=project || b["run_id"]!=runID || b["key"]!=key || !f08Equal(b["sequence"],row[3]){return nil,nil,f08Binding}
+			if _,e=f08HashString(b["request_hash"]);e!=nil{return nil,nil,e}
+			if i==0{
+				if b["state"]!="PREPARED" || b["receipt"]!=nil{return nil,nil,f08Binding}
+				reserveID,e:=f08String(b["reservation_id"]);if e!=nil{return nil,nil,e};reserve,ok:=ledger[reserveID];if !ok{return nil,nil,f08Binding}
+				if reserve.body["reservation_id"]!=nil || reserve.body["provider_request_id"]!=key || reserve.body["operation"]!="RESERVE" && reserve.body["operation"]!="UNKNOWN"{return nil,nil,f08Binding}
+				cost:=map[string]any{};for _,name:=range []string{"policy_id","run_id","operation","money","provider_request_id","provider_event_id","reservation_id","cost_basis","occurred_at"}{cost[name]=reserve.body[name]}
+				if Hash([]any{b["payload"],cost})!=b["request_hash"]{return nil,nil,f08Binding};history.reservation=reserve;claimed[reserveID]=true
+			}else{
+				for _,name:=range []string{"project_id","goal_id","task_id","run_id","key","request_hash","payload","reservation_id","context_bundle_id","checkpoint_artifact_id"}{if !f08Equal(b[name],prior[name]){return nil,nil,f08Binding}}
+				from,to:=prior["state"],b["state"]
+				if from=="PREPARED"{if to!="STARTED" || b["receipt"]!=nil{return nil,nil,f08Binding}}else{
+					if from!="STARTED" && from!="UNKNOWN" || to!="UNKNOWN" && to!="CONFIRMED" && to!="NOT_APPLIED"{return nil,nil,f08Binding}
+					receipt,ok:=b["receipt"].(map[string]any);if !ok || len(receipt)==0 || !f08Equal(b["epoch"],prior["epoch"]){return nil,nil,f08Binding}
+				}
+			}
+			history.bodies=append(history.bodies,b);prior=b
+		}
+		if prior["state"]!="CONFIRMED" && prior["state"]!="NOT_APPLIED"{return nil,nil,f08Binding}
+		for id,cost:=range ledger{
+			if cost.body["reservation_id"]!=history.reservation.id{continue}
+			if cost.body["provider_request_id"]!=key || cost.body["policy_id"]!=history.reservation.body["policy_id"] || cost.body["operation"]=="RESERVE"{return nil,nil,f08Binding}
+			if cost.body["operation"]=="UNKNOWN" || cost.body["cost_basis"]!="ACTUAL" || cost.body["money"]==nil{return nil,nil,f08Binding}
+			history.costs=append(history.costs,cost);claimed[id]=true
+		}
+		// Selecting "the latest" ledger row by ID/time would invent the missing
+		// SQL rowid ordering. More than one settlement is preserved but blocked
+		// until the exact receipt-to-cost causal policy is implemented.
+		if len(history.costs)!=1{return nil,nil,f08NativeProofGap}
+		if prior["state"]=="CONFIRMED" && history.costs[0].body["operation"]!="COMMIT" && history.costs[0].body["operation"]!="RECONCILE"{return nil,nil,f08Binding}
+		if prior["state"]=="NOT_APPLIED" && history.costs[0].body["operation"]!="RELEASE" && history.costs[0].body["operation"]!="RECONCILE"{return nil,nil,f08Binding}
+		result=append(result,history)
+	}
+	var unclaimed []f08Version;for id,row:=range ledger{if !claimed[id]{unclaimed=append(unclaimed,row)}}
+	sort.Slice(unclaimed,func(i,j int)bool{return unclaimed[i].id<unclaimed[j].id});return result,unclaimed,nil
+}
+func f08EffectRows(histories []f08EffectHistory)[]any{
+	var rows []any
+	for _,h:=range histories{for i,row:=range h.rows{raw,_:=f08Hex(row[4]);rows=append(rows,map[string]any{"effect_key":h.key,"sequence":row[3],"epoch":h.bodies[i]["epoch"],"body_digest":f08RawHash(raw)})}}
+	sort.Slice(rows,func(i,j int)bool{x:=rows[i].(map[string]any);y:=rows[j].(map[string]any);return f08TupleLess([]any{x["epoch"],x["effect_key"],x["sequence"]},[]any{y["epoch"],y["effect_key"],y["sequence"]})});if rows==nil{return []any{}};return rows
+}
+
+// A captured prefix is compared per original key/sequence/raw digest. New
+// legal rows are not mistaken for replacement or silently used as old facts.
+func f08EffectPrefix(captured,current []any)error{
+	lookup:=map[string]any{};for _,row:=range current{m,e:=f08Object(row,"effect_key","sequence","epoch","body_digest");if e!=nil{return e};key,e:=f08Key([]any{m["effect_key"],m["sequence"]});if e!=nil{return e};if _,ok:=lookup[key];ok{return f08Binding};lookup[key]=m}
+	seen:=map[string]bool{};for _,row:=range captured{m,e:=f08Object(row,"effect_key","sequence","epoch","body_digest");if e!=nil{return e};key,e:=f08Key([]any{m["effect_key"],m["sequence"]});if e!=nil || seen[key] || !f08Equal(m,lookup[key]){return f08Binding};seen[key]=true}
+	return nil
+}
+
+
+// Source-derived NO_EXECUTION finalization. Native settlement is deliberately
+// refused until its accounting, original observation and SDK chains are all
+// implemented. No proof_kind label or supplied hash selects a weaker branch.
+func f08Pending(s *f08Sources,project,session,settling string)[]any{
+	ids:=map[string]bool{}
+	for _,q:=range s.selectRows("queue",[]int{1,3},[]any{project,session}){if q[14]!="CONSUMED" && q[14]!="DROPPED"{ids[q[2].(string)]=true}}
+	for _,c:=range s.selectRows("controls",[]int{1,3},[]any{project,session}){if c[8]!="CONFIRMED" && c[2]!=settling{ids[c[2].(string)]=true}}
+	result:=[]any{};for id:=range ids{result=append(result,id)};sort.Slice(result,func(i,j int)bool{return result[i].(string)<result[j].(string)});return result
+}
+
+func (v *f08ProofValidator) emptyQueueFinal(s *f08Sources,project,task string,original any)(map[string]any,error){
+	before,e:=f08Object(original,"variant","session_id","generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced");if e!=nil{return nil,e}
+	q,e:=v.queueAdmission(s,project,task);if e!=nil{return nil,e}
+	if before["variant"]=="NO_SESSION"{
+		if e=v.noSessionQueueHistory(s,project,task);e!=nil{return nil,e}
+		if !f08Equal(q,before){return nil,f08Binding}
+	}else{
+		if q["session_id"]!=before["session_id"] || q["variant"]!="ORIGINAL_FENCE"{return nil,f08Binding}
+		if q["state"]!="CANCEL_FENCED" && q["state"]!="SEALED"{return nil,f08Binding}
+		if !f08Equal(q["restore_fenced"],f08Number(0)) || !f08NullFields(q,"run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity"){return nil,f08Binding}
+		accepted,e:=f08Integer(q["accepted_through"],0);if e!=nil{return nil,e};sealed,e:=f08Integer(q["sealed_through"],0);if e!=nil || sealed!=accepted{return nil,f08Binding}
+		// Nonempty canonical delivery/receipt histories require the distinct
+		// full queue-chain evaluator, never an empty-chain shortcut.
+		if accepted!=0 || len(s.selectRows("queue",[]int{1,4},[]any{project,task}))!=0 || len(s.selectRows("receipts",[]int{1,2},[]any{project,q["generation"]}))!=0{return nil,f08NativeProofGap}
+		if before["variant"]=="REAL_SESSION_NO_ORIGINAL_FENCE"{
+			q["variant"]="CREATED_SAME_TRANSACTION"
+		}else if before["variant"]=="ORIGINAL_FENCE"{
+			if before["generation"]!=q["generation"] || !f08Equal(before["accepted_through"],f08Number(0)) || !f08Equal(before["sealed_through"],f08Number(0)){return nil,f08Binding}
+			prior,e:=f08Integer(before["revision"],1);if e!=nil{return nil,e};now,e:=f08Integer(q["revision"],prior);if e!=nil || now<prior{return nil,f08Binding}
+		}else{return nil,f08Shape}
+	}
+	q["entry_refs"]=[]any{};q["receipt_refs"]=[]any{};return q,nil
+}
+
+func (v *f08ProofValidator) finalGroup(s *f08Sources,row []any,current bool)(*f08Group,error){
+	g,e:=f08ParseGroup("final",row);if e!=nil{return nil,e}
+	ar,e:=s.one("admitted",[]int{0,1,2,3},row[:4]);if e!=nil{return nil,e};a,e:=v.admitted(s,ar,false);if e!=nil{return nil,e}
+	if e=v.completeMaterializations(s,a);e!=nil{return nil,e}
+	if row[4]!=a.rootHash || len(g.members)!=len(a.members) || g.root["control_request_id"]!="ctrl-"+row[2].(string){return nil,f08Binding}
+	req,e:=v.groupRequest(s,a);if e!=nil{return nil,e}
+	control,e:=s.one("controls",[]int{0,1,2,5},row[:4]);if e!=nil{return nil,e}
+	if control[3]!=req.session || control[4]!=g.root["control_request_id"] || control[6]!=req.target{return nil,f08Binding}
+	taskIDs,_,e:=f08JSONHex(control[7]);if e!=nil || !f08Equal(taskIDs,a.root["member_task_ids"]){return nil,f08Binding}
+	switch g.root["completion_mode"]{
+	case "ACK_TO_COMPLETED":
+		original,e:=f08Hex(control[9]);if e!=nil || f08RawHash(original)!=g.root["original_response_digest"]{return nil,f08Binding}
+		if _,e=v.responseBody(req,original,"ACKNOWLEDGED");e!=nil{return nil,e}
+	case "ORIGINAL_COMPLETED":
+		if g.root["original_response_digest"]!=g.root["final_response_digest"]{return nil,f08Binding}
+		if control[9]!=nil{raw,e:=f08Hex(control[9]);if e!=nil || f08RawHash(raw)!=g.root["original_response_digest"]{return nil,f08Binding}}
+	default:return nil,f08Shape
+	}
+	for _,key:=range []string{"original_response_digest","final_response_digest"}{if _,e=f08HashString(g.root[key]);e!=nil{return nil,e}}
+	sb,e:=f08Object(g.root["final_snapshot_binding"],"session_id","project_id","revision","event_sequence","pending_command_ids_digest");if e!=nil{return nil,e}
+	if sb["session_id"]!=req.session || sb["project_id"]!=req.project{return nil,f08Binding}
+	if current{
+		session,e:=s.one("sessions",[]int{0,1},[]any{req.session,req.project});if e!=nil{return nil,e}
+		if !f08Equal(sb["revision"],session[2]) || !f08Equal(sb["event_sequence"],session[11]){return nil,f08Binding}
+		h,e:=f08Hash(f08Pending(s,req.project,req.session,req.command));if e!=nil || sb["pending_command_ids_digest"]!=h{return nil,f08Binding}
+	}
+	all:=map[string]any{}
+	for i,item:=range g.members{
+		m:=item.(map[string]any);original:=a.members[i].(map[string]any)
+		originalTask,e:=v.version(s,req.project,original["task_ref"]);if e!=nil{return nil,e};mh,e:=f08Hash(original);if e!=nil{return nil,e}
+		if !f08Equal(m["admitted_member_ref"],f08MemberReference("ADMITTED",originalTask.id,mh)) || !f08Equal(m["task_admitted_ref"],original["task_ref"]) || !f08Equal(m["run_admitted_ref"],original["run_ref"]){return nil,f08Binding}
+		if original["dispatch_stage"]!="NO_RUN" || m["proof_kind"]!="NO_EXECUTION"{return nil,f08NativeProofGap}
+		if !f08NullFields(m,"run_admitted_ref","run_before_settlement_ref","run_final_ref","dispatch_origin_ref","dispatch_final_binding","observation_ref","run_event_ref","prelaunch_checkpoint_carry") || !f08EmptyArray(m["native_artifact_refs"]) || !f08EmptyArray(m["sdk_receipt_refs"]) || !f08EmptyArray(m["prior_epoch_closure"]){return nil,f08Binding}
+		task,e:=v.version(s,req.project,m["task_final_ref"]);if e!=nil || task.kind!="Task" || task.id!=originalTask.id || task.body["goal_id"]!=originalTask.body["goal_id"] || task.revision<originalTask.revision{return nil,f08Binding}
+		if task.body["status"]!="CANCELLED" && task.body["status"]!="ACCEPTED"{return nil,f08Binding}
+		if current{head,e:=v.head(s,req.project,"Task",task.id);if e!=nil || !f08SameVersion(head,task){return nil,f08Binding};if e=v.noRun(s,task);e!=nil{return nil,e}}
+		if !f08Equal(m["effect_closure"],map[string]any{"run_id":nil,"epoch":nil,"histories":[]any{},"non_effect_reservations":[]any{}}){return nil,f08Binding}
+		// Historical queue-binding validation still requires an immutable
+		// chain evaluator. Do not substitute today's fence for history.
+		if !current{return nil,f08NativeProofGap}
+		queue,e:=v.emptyQueueFinal(s,req.project,task.id,original["queue_admission"]);if e!=nil || !f08Equal(queue,m["queue_final_binding"]){return nil,f08Binding}
+		event,e:=v.eventClaim(s,req.project,m["task_event_ref"],task,"TASK_CHANGED");if e!=nil{return nil,e}
+		if task.revision>originalTask.revision && event.body["correlation_id"]!=req.command{return nil,f08Binding}
+		goal,e:=v.version(s,req.project,original["goal_ref"]);if e!=nil{return nil,e}
+		closure,anchors,e:=v.referenceClosure(s,[]f08Version{originalTask,goal,task,event});if e!=nil || !f08Equal(closure,m["reference_closure"]){return nil,f08Binding}
+		for _,anchor:=range anchors{k,_:=f08Key(anchor);all[k]=anchor}
+	}
+	if !f08Equal(g.pins,f08Pins(f08SortedAnchors(all))){return nil,f08Binding};return g,nil
+}
+func(v *f08ProofValidator) responseBody(req f08CancelRequest,raw []byte,status string)(f08ValidatedResponse,error){return f08ResponseBody(v.protocol,req,raw,status)}
+func(v *f08ProofValidator) eventClaim(s *f08Sources,project string,claim any,aggregate f08Version,kind string)(f08Version,error){
+	var zero f08Version;m,e:=f08Object(claim,"version_ref","outbox_id","sequence","body_digest");if e!=nil{return zero,e}
+	event,e:=v.version(s,project,m["version_ref"]);if e!=nil || event.kind!="EventEnvelope" || event.body["event_type"]!=kind || !f08Equal(event.body["aggregate_ref"],aggregate.ref()){return zero,f08Binding}
+	want,e:=v.exactEvent(s,event);if e!=nil || !f08Equal(want,m){return zero,f08Binding};return event,nil
+}
+
+
+// Sole-journal closure. All raw digests below consume the hex-decoded original
+// SQL column bytes; re-encoding a response never substitutes for those bytes.
+func (v *f08ProofValidator) journalEnvelope(s *f08Sources,row []any)(map[string]any,map[string]any,error){
+	if e:=f08ValidateTuple("idempotency",row);e!=nil{return nil,nil,e}
+	if row[2]!="v2:session.control" || row[10]!="text" || row[9]!="text" && row[9]!="blob"{return nil,nil,f08Binding}
+	hraw,e:=f08Hex(row[7]);if e!=nil || len(hraw)>f08HeaderMaximum{return nil,nil,f08Header}
+	h,_,e:=f08Strict(hraw);if e!=nil{return nil,nil,e};hm,e:=f08Object(h,"schema","encoding","raw_envelope_base64");if e!=nil{return nil,nil,e}
+	encoded,ok:=hm["raw_envelope_base64"].(string);if !ok || len(encoded)>f08Base64Maximum || hm["schema"]!=f08HeaderSchema || hm["encoding"]!="base64"{return nil,nil,f08Header}
+	canonicalHeader,e:=json.Marshal(struct{Schema string `json:"schema"`;Encoding string `json:"encoding"`;Raw string `json:"raw_envelope_base64"`}{f08HeaderSchema,"base64",encoded});if e!=nil || !bytes.Equal(canonicalHeader,hraw){return nil,nil,f08Header}
+	raw,e:=base64.StdEncoding.Strict().DecodeString(encoded);if e!=nil || len(raw)==0 || len(raw)>f08EnvelopeMaximum || base64.StdEncoding.EncodeToString(raw)!=encoded{return nil,nil,f08Header}
+	parsed,_,e:=f08Strict(raw);if e!=nil{return nil,nil,e};env,e:=f08Object(parsed,"protocol_version","command_id","client_id","project_id","session_id","expected_revision","writer_epoch","method","payload");if e!=nil{return nil,nil,e}
+	if env["method"]!="session.control" || env["project_id"]!=row[1] || env["command_id"]!=row[3] || env["protocol_version"]!=ProtocolV2{return nil,nil,f08Binding}
+	if e=v.protocol.ValidateDefInput("CommandEnvelope",env);e!=nil{return nil,nil,f08Schema}
+	decoded,e:=DecodeEnvelope(raw);if e!=nil{return nil,nil,f08Schema};q,e:=decoded.ContentHash();if e!=nil || q!=row[4]{return nil,nil,f08Binding}
+	id,e:=s.one("identities",[]int{0,1},[]any{row[0],row[3]});if e!=nil{return nil,nil,e}
+	if id[2]!=ProtocolV2 || id[3]!=row[1] || id[4]!=env["method"] || id[5]!=row[2] || id[6]!=row[4]{return nil,nil,f08Binding}
+	body,rawBody,e:=f08RawObject(row[6]);if e!=nil{return nil,nil,e}
+	if e=v.protocol.ValidateDef("CommandResponse",body);e!=nil{return nil,nil,f08Schema}
+	response,e:=DecodeResponse(rawBody);if e!=nil{return nil,nil,f08Schema};if e=ValidateResultAgainstMethod("session.control",response,v.protocol);e!=nil{return nil,nil,f08Schema}
+	for _,key:=range []string{"protocol_version","command_id","method","session_id"}{if !f08Equal(body[key],env[key]){return nil,nil,f08Binding}}
+	return env,body,nil
+}
+func f08ControlLocator(row []any)[]any{return []any{row[0],row[1],row[2],row[5]}}
+func f08JournalLocator(row []any)[]any{return []any{row[0],row[1],row[3],row[4]}}
+
+func (v *f08ProofValidator) finalResponse(s *f08Sources,g *f08Group,currentRaw []byte,oldRaw []byte)error{
+	a,e:=f08FindGroup(s,"admitted",g.row[:4]);if e!=nil{return e};req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	header,e:=f08Hex(a.row[5]);if e!=nil{return e}
+	mode:=int64(1);if g.root["completion_mode"]=="ACK_TO_COMPLETED"{mode=2}else if g.root["completion_mode"]!="ORIGINAL_COMPLETED"{return f08Shape}
+	proof:=map[string]any{"admitted_root_hash":a.rootHash,"original_response_digest":g.root["original_response_digest"],"final_root_hash":g.rootHash,"final_response_digest":g.root["final_response_digest"],"final_snapshot_binding":g.root["final_snapshot_binding"]}
+	binding,e:=f08Encode(map[string]any{"identity":req.identity,"response_proof":proof});if e!=nil{return e}
+	return f08Response(v.protocol,header,binding,oldRaw,currentRaw,mode)
+}
+
+func (v *f08ProofValidator) control(s *f08Sources,action string,old,row []any)error{
+	if e:=f08ValidateTuple("controls",row);e!=nil{return e}
+	if action=="control.update"{
+		if e:=f08ValidateTuple("controls",old);e!=nil{return e};actual,e:=s.one("controls",[]int{0,1,2},old[:3]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+		if !f08RetainedColumns(old,row,8,9,10){return f08Binding}
+		if f08Equal(row,old){return nil}
+		// Existing genuine recovery can move only its pending state. It does
+		// not create original membership, change bytes or finalize legacy ACK.
+		if old[8]=="REQUESTED" && row[8]=="RECONCILING" && f08RetainedColumns(old,row,8){return nil}
+		if old[8]=="CONFIRMED" || old[9]!=nil && old[9]!=row[9] || old[10]!=nil && old[10]!=row[10]{return f08Binding}
+	}else if action!="control.insert"{return f08Mode}
+	a,e:=f08FindGroup(s,"admitted",f08ControlLocator(row));if e!=nil{return e}
+	if _,e=v.admitted(s,a.row,false);e!=nil{return e};if e=v.completeMaterializations(s,a);e!=nil{return e}
+	req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	tasks,_,e:=f08JSONHex(row[7]);if e!=nil || !f08Equal(tasks,a.root["member_task_ids"]) || row[3]!=req.session || row[4]!="ctrl-"+req.command || row[6]!=req.target{return f08Binding}
+	if action=="control.insert"{if row[8]!="REQUESTED" || row[9]!=nil || row[10]!=nil || len(s.selectRows("controls",[]int{0,1,2},row[:3]))!=0{return f08Binding};return nil}
+	if row[8]!="REQUESTED" && row[8]!="RECONCILING" && row[8]!="CONFIRMED"{return f08Shape}
+	if row[10]==nil{
+		if row[8]=="CONFIRMED" || row[8]!=old[8] || old[9]!=nil || row[9]==nil || len(s.selectRows("final",[]int{0,1,2,3},a.row[:4]))!=0{return f08Binding}
+		raw,e:=f08Hex(row[9]);if e!=nil{return e};_,e=v.responseBody(req,raw,"ACKNOWLEDGED");return e
+	}
+	f,e:=f08FindGroup(s,"final",a.row[:4]);if e!=nil{return e};if _,e=v.finalGroup(s,f.row,true);e!=nil{return e}
+	if e=v.completeMaterializations(s,f);e!=nil{return e}
+	raw,e:=f08Hex(row[10]);if e!=nil{return e};var prior []byte
+	if f.root["completion_mode"]=="ACK_TO_COMPLETED"{prior,e=f08Hex(row[9]);if e!=nil{return e}}else if row[9]!=row[10]{return f08Binding}
+	if e=v.finalResponse(s,f,raw,prior);e!=nil{return e}
+	// Both staged final bytes (same pending state) and the subsequent genuine
+	// CONFIRMED transition bind this already-complete group. SQL deferred
+	// commit obligation still requires the sole journal completed write.
+	if row[8]!=old[8] && row[8]!="CONFIRMED"{return f08Binding};return nil
+}
+
+func (v *f08ProofValidator) journal(s *f08Sources,action string,old,row []any)error{
+	if action=="commit.insert"{
+		if e:=f08ValidateTuple("commits",row);e!=nil{return e};f,e:=f08FindGroup(s,"final",row[:4]);if e!=nil{return e}
+		if row[4]!=f.rootHash || row[5]!=f.root["original_response_digest"] || row[6]!=f.root["final_response_digest"]{return f08Binding}
+		j,e:=s.one("idempotency",[]int{0,1,2,3},[]any{row[0],row[1],"v2:session.control",row[2]});if e!=nil{return e}
+		return v.completedJournal(s,j,f)
+	}
+	if action!="journal.insert" && action!="journal.update"{return f08Mode}
+	env,response,e:=v.journalEnvelope(s,row);if e!=nil{return e}
+	if action=="journal.update"{
+		if e=f08ValidateTuple("idempotency",old);e!=nil{return e};actual,e:=s.one("idempotency",[]int{0,1,2,3},old[:4]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+		if !f08RetainedColumns(old,row,6) || old[6]==row[6]{return f08Binding}
+	}else if len(s.selectRows("idempotency",[]int{0,1,2,3},row[:4]))!=0{return f08Binding}
+	payload,ok:=env["payload"].(map[string]any);if !ok{return f08Shape};locator:=f08JournalLocator(row)
+	if payload["action"]!="CANCEL" || response["status"]=="REJECTED"{
+		// F08 does not confer PAUSE/RESUME authority or alter typed rejection
+		// business semantics. No witness/control may survive this branch.
+		if action!="journal.insert" || len(s.selectRows("admitted",[]int{0,1,2,3},locator))!=0 || len(s.selectRows("final",[]int{0,1,2,3},locator))!=0 || len(s.selectRows("controls",[]int{0,1,2,5},locator))!=0{return f08Binding};return nil
+	}
+	a,e:=f08FindGroup(s,"admitted",locator);if e!=nil{return e};if _,e=v.admitted(s,a.row,false);e!=nil{return e};if e=v.completeMaterializations(s,a);e!=nil{return e}
+	if row[7]!=a.row[5]{return f08Binding};req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	c,e:=s.one("controls",[]int{0,1,2,5},locator);if e!=nil{return e}
+	if response["status"]=="ACKNOWLEDGED"{
+		if action!="journal.insert" || c[8]=="CONFIRMED" || c[9]!=row[6] || c[10]!=nil || len(s.selectRows("final",[]int{0,1,2,3},locator))!=0{return f08Binding}
+		raw,e:=f08Hex(row[6]);if e!=nil{return e};_,e=v.responseBody(req,raw,"ACKNOWLEDGED");return e
+	}
+	if response["status"]!="COMPLETED"{return f08Binding}
+	f,e:=f08FindGroup(s,"final",locator);if e!=nil{return e}
+	if action=="journal.update"{if f.root["completion_mode"]!="ACK_TO_COMPLETED" || old[6]!=c[9]{return f08Binding}}else if f.root["completion_mode"]!="ORIGINAL_COMPLETED"{return f08Binding}
+	return v.completedJournal(s,row,f)
+}
+func (v *f08ProofValidator) completedJournal(s *f08Sources,row []any,f *f08Group)error{
+	_,response,e:=v.journalEnvelope(s,row);if e!=nil || response["status"]!="COMPLETED"{return f08Binding}
+	if _,e=v.finalGroup(s,f.row,true);e!=nil{return e};if e=v.completeMaterializations(s,f);e!=nil{return e}
+	c,e:=s.one("controls",[]int{0,1,2,5},f.row[:4]);if e!=nil || c[8]!="CONFIRMED" || c[10]!=row[6] || c[9]==nil{return f08Binding}
+	a,e:=f08FindGroup(s,"admitted",f.row[:4]);if e!=nil || row[7]!=a.row[5]{return f08Binding}
+	raw,e:=f08Hex(row[6]);if e!=nil{return e};var prior []byte
+	if f.root["completion_mode"]=="ACK_TO_COMPLETED"{prior,e=f08Hex(c[9]);if e!=nil{return e}}else if c[9]!=row[6]{return f08Binding}
+	return v.finalResponse(s,f,raw,prior)
+}
+
+
+// R2 later-epoch component. It proves immediate immutable Run versions and
+// the real rebuild/switch/carry rows. It does NOT authorize a later origin:
+// qualified admission, every prior native proof and accounting remain OPEN.
+type f08LaterParts struct{run,previous,task f08Version;rebuild,route,carry map[string]any;anchors []any}
+func f08RowAnchor(category string,key []any,raw []byte)map[string]any{return map[string]any{"category":category,"key":key,"body_digest":f08RawHash(raw)}}
+func (v *f08ProofValidator) laterParts(s *f08Sources,d []any)(f08LaterParts,error){
+	var out f08LaterParts
+	run,e:=v.head(s,d[0].(string),"Run",d[1].(string));if e!=nil || run.revision<2{return out,f08Binding}
+	priorRow,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{run.project,"Run",run.id,f08Number(run.revision-1)});if e!=nil{return out,e}
+	previous,e:=v.version(s,run.project,map[string]any{"entity_type":"Run","id":run.id,"revision":priorRow[3],"content_hash":priorRow[5]});if e!=nil{return out,e}
+	previousEpoch,e:=f08Integer(previous.body["lease_epoch"],1);if e!=nil || previousEpoch==1<<63-1{return out,f08Binding}
+	if !f08Equal(run.body["lease_epoch"],f08Number(previousEpoch+1)) || !f08Equal(d[2],run.body["lease_epoch"]) || run.body["status"]!="QUEUED" || run.body["lease_token_hash"]==previous.body["lease_token_hash"]{return out,f08Binding}
+	for _,b:=range []map[string]any{previous.body,run.body}{if !f08NullFields(b,"cancel_requested_at","cancel_confirmed_at","ended_at"){return out,f08Binding};if b["status"]=="CANCELLED" || b["status"]=="SUCCEEDED" || b["status"]=="FAILED"{return out,f08Binding}}
+	for _,key:=range []string{"task_id","executor_principal_id","input_refs","checkpoint_artifact_id"}{if !f08Equal(run.body[key],previous.body[key]){return out,f08Binding}}
+	if run.body["external_run_id"]!=nil || run.body["checkpoint_artifact_id"]==nil{return out,f08Binding}
+	task,e:=v.head(s,run.project,"Task",run.body["task_id"].(string));if e!=nil || task.body["active_run_id"]!=run.id{return out,f08Binding}
+	goal,e:=v.head(s,run.project,"Goal",task.body["goal_id"].(string));if e!=nil || goal.body["status"]!="ACTIVE"{return out,f08Binding}
+	manifest,e:=v.dispatchManifest(s,d,run,task);if e!=nil{return out,e};admission:=manifest["admission"].(map[string]any)
+	var rebuild map[string]any;var rebuildAnchor map[string]any;count:=0
+	for _,row:=range s.selectRows("routes",[]int{1,2},[]any{run.project,run.id}){
+		body,raw,e:=f08RawObject(row[3]);if e!=nil{return out,e}
+		if body["kind"]!="SESSION_REBUILT" || !f08Equal(body["next_lease_epoch"],run.body["lease_epoch"]){continue}
+		// native_resume=false is present in the ACTUAL producer, although the
+		// prose's abbreviated field list omits it; it cannot be discarded.
+		if _,e=f08Object(body,"kind","reason","native_resume","run_id","runtime_id","previous_external_run_id","previous_lease_epoch","next_lease_epoch","checkpoint_artifact_id","actor","at");e!=nil{return out,e}
+		if row[0]==nil || body["native_resume"]!=false || body["run_id"]!=run.id || body["runtime_id"]!=run.body["runtime_id"] || !f08Equal(body["previous_lease_epoch"],previous.body["lease_epoch"]) || !f08Equal(body["previous_external_run_id"],previous.body["external_run_id"]) || body["checkpoint_artifact_id"]!=run.body["checkpoint_artifact_id"]{return out,f08Binding}
+		rebuild=body;rebuildAnchor=f08RowAnchor("routes",[]any{row[0]},raw);count++
+	};if count!=1{return out,f08Binding}
+	var route map[string]any;anchors:=[]any{rebuildAnchor}
+	switch rebuild["reason"]{
+	case "CHECKPOINT_AND_CURRENT_CONTEXT":
+		if run.body["runtime_id"]!=previous.body["runtime_id"]{return out,f08Binding}
+		if admission["operation"]==nil{return out,f08LaterOperationUnbound};if admission["operation"]!="checkpoint_resume"{return out,f08Binding}
+	case "RESOURCE_SWITCH":
+		if admission["operation"]==nil{return out,f08LaterOperationUnbound};if admission["operation"]!="replacement"{return out,f08Binding}
+		count=0
+		for _,row:=range s.selectRows("routes",[]int{1,2},[]any{run.project,run.id}){
+			b,raw,e:=f08RawObject(row[3]);if e!=nil{return out,e};if b["kind"]=="SESSION_REBUILT"{continue}
+			to,ok:=b["to_runtime_ref"].(map[string]any);if !ok || to["id"]!=run.body["runtime_id"] || b["checkpoint_artifact_id"]!=run.body["checkpoint_artifact_id"] || b["actor"]!=rebuild["actor"]{continue}
+			if _,e=f08Object(b,"from_runtime_ref","to_runtime_ref","grant","run_id","task_id","acceptance_contract_hash","context_bundle_id","checkpoint_artifact_id","at","actor");e!=nil{return out,e}
+			fromRuntime,e:=v.version(s,run.project,b["from_runtime_ref"]);if e!=nil || fromRuntime.kind!="RuntimeRegistration" || fromRuntime.id!=previous.body["runtime_id"]{return out,f08Binding}
+			toRuntime,e:=v.version(s,run.project,to);if e!=nil || toRuntime.kind!="RuntimeRegistration" || !f08Equal(to,admission["runtime_ref"]){return out,f08Binding}
+			grant,ok:=b["grant"].(map[string]any);if !ok || !f08Equal(grant["admission"],admission) || b["run_id"]!=run.id || b["task_id"]!=task.id || b["context_bundle_id"]!=task.body["context_bundle_id"] || b["acceptance_contract_hash"]!=task.body["acceptance_contract"].(map[string]any)["contract_hash"] || row[0]==nil{return out,f08Binding}
+			route=b;anchors=append(anchors,f08RowAnchor("routes",[]any{row[0]},raw));count++
+		};if count!=1{return out,f08Binding}
+	default:return out,f08Binding
+	}
+	carryRow,e:=s.one("checkpoint_carries",[]int{0,1,2},d[:3]);if e!=nil{return out,e};carry,carryRaw,e:=f08RawObject(carryRow[3]);if e!=nil{return out,e}
+	if _,e=f08Object(carry,"actor","artifact_ref","from_use_receipt_hash","from_epoch","to_epoch","new_upload_key","reason","at");e!=nil{return out,e}
+	if carry["actor"]!=rebuild["actor"] || carry["reason"]!="CHECKPOINT_CARRY_NOT_NEW_RESULT" || !f08Equal(carry["to_epoch"],d[2]){return out,f08Binding}
+	fromEpoch,e:=f08Integer(carry["from_epoch"],1);if e!=nil || fromEpoch>previousEpoch{return out,f08Binding}
+	artifact,e:=v.version(s,run.project,carry["artifact_ref"]);if e!=nil || artifact.kind!="Artifact" || artifact.id!=run.body["checkpoint_artifact_id"]{return out,f08Binding}
+	oldUse,e:=s.one("artifact_uses",[]int{0,1,2,3,6},[]any{run.project,artifact.id,run.id,carry["from_epoch"],carry["from_use_receipt_hash"]});if e!=nil{return out,e}
+	newUse,e:=s.one("artifact_uses",[]int{0,1,2,3,5},[]any{run.project,artifact.id,run.id,d[2],carry["new_upload_key"]});if e!=nil{return out,e}
+	for _,use:=range [][]any{oldUse,newUse}{body,_,e:=f08RawObject(use[7]);if e!=nil || Receipt(body)!=use[6]{return out,f08Binding};content,e:=s.one("content",[]int{0,1},[]any{use[5],run.project});if e!=nil{return out,e};raw,e:=f08Hex(content[3]);if e!=nil || f08RawHash(raw)!=artifact.body["content_hash"] || content[4]!=artifact.body["content_hash"] || !f08Equal(content[6],f08Number(1)){return out,f08Binding}}
+	anchors=append(anchors,f08RowAnchor("checkpoint_carries",d[:3],carryRaw))
+	return f08LaterParts{run,previous,task,rebuild,route,carry,anchors},nil
+}
+
+
+// One stateless dispatch boundary for the actual frozen SQL action literals.
+// Successful subset evaluation is not permission to install SQL24: remaining
+// legitimate native/legacy/history branches intentionally fail closed.
+func(v *f08ProofValidator) evaluate(mode int64,raw []byte)(driver.Value,error){
+	if mode==3{return nil,f08Unwired}
+	if e:=f08ProofFrame(mode,raw);e!=nil{return nil,e};decoded,_,e:=f08Strict(raw);if e!=nil{return nil,e}
+	frame:=decoded.(map[string]any);s,e:=f08DecodeSources(frame["sources"]);if e!=nil{return nil,e};action:=frame["action"].(string);row:=frame["row"].([]any)
+	var old []any;if frame["old"]!=nil{old=frame["old"].([]any)}
+	switch mode{
+	case 0:_,e=v.admitted(s,row,true)
+	case 1:_,e=v.finalGroup(s,row,true)
+	case 2:e=v.originInsert(s,row)
+	case 4:e=v.dispatchUpdate(s,old,row)
+	case 5:e=v.journal(s,action,old,row)
+	case 6:e=v.control(s,action,old,row)
+	case 7:e=v.materialization(s,action,row)
+	case 8:
+		if e=f08ValidateTuple("dispatches",row);e!=nil{return nil,e}
+		run,re:=v.head(s,row[0].(string),"Run",row[1].(string));if re!=nil{return nil,re}
+		if run.revision>1{if _,e=v.laterParts(s,row);e!=nil{return nil,e};return nil,f08NativeProofGap}
+		origin,e:=v.deriveInitialOrigin(s,row);if e!=nil{return nil,e};b,e:=f08Encode(origin);if e!=nil{return nil,e};_,canonical,e:=f08Strict(b);if e!=nil{return nil,e};return string(canonical),nil
+	default:return nil,f08Mode
+	}
+	if e!=nil{return nil,e};return int64(1),nil
+}

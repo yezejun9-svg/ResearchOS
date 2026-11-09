@@ -1,0 +1,77 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\sdk_five_go_root_adoption_preparation_codex\04a454a98b164aa2983f16245f273e9d\actual-cli-bootstrap-v2-d873bd7f77ab4d0a927d93c28a636dac\bootstrap_actual_cli.v2.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\sdk_five_go_root_adoption_preparation_codex\04a454a98b164aa2983f16245f273e9d\actual-cli-bootstrap-v3-80c7b29a01c341a884597b7da9e17c4a\bootstrap_actual_cli.v3.py
+@@ -78,24 +78,41 @@
+  def wc(hwnd):
+   b=ctypes.create_unicode_buffer(2048);u.GetClassNameW(hwnd,b,len(b));return b.value
+  def wt(hwnd):
+-  b=ctypes.create_unicode_buffer(2048);u.GetWindowTextW(hwnd,b,len(b));return b.value
++  b=ctypes.create_unicode_buffer(2048);message_result=ctypes.c_size_t();ctypes.set_last_error(0)
++  sent=bool(u.SendMessageTimeoutW(hwnd,0x000D,len(b),ctypes.addressof(b),0x0002,500,ctypes.byref(message_result)))
++  if not sent:raise RuntimeError("actual WM_GETTEXT transport timed out: "+str(ctypes.get_last_error()))
++  if message_result.value>=len(b):raise RuntimeError("actual WM_GETTEXT result exceeds buffer")
++  return b.value
+  def pid(hwnd):
+   p=wintypes.DWORD();u.GetWindowThreadProcessId(hwnd,ctypes.byref(p));return int(p.value)
+  deadline=time.monotonic()+15
+  try:
+   while not picker_stop.is_set() and time.monotonic()<deadline:
+    matches=[];expected_pid=jobs["normal-host"]["identity"]["runner_pid"]
++   callback_errors=[]
+    @callback
+    def enum_top(hwnd,_):
+-    if pid(hwnd)==expected_pid and wc(hwnd)=="#32770" and u.IsWindowVisible(hwnd):
+-     children=[]
+-     @callback
+-     def enum_child(child,_):children.append({"hwnd":int(child),"class":wc(child),"text":wt(child),"pid":pid(child)});return True
+-     u.EnumChildWindows(hwnd,enum_child,0)
+-     if any(c["class"]=="Static" and c["text"]=="Select a ResearchOS workspace folder" for c in children):
+-      matches.append((int(hwnd),children))
+-    return True
+-   assert u.EnumWindows(enum_top,0),"EnumWindows failed"
++    try:
++     if pid(hwnd)==expected_pid and wc(hwnd)=="#32770" and u.IsWindowVisible(hwnd):
++      children=[]
++      @callback
++      def enum_child(child,_):
++       try:
++        child_class=wc(child)
++        children.append({"hwnd":int(child),"class":child_class,"text":wt(child) if child_class in ("Static","Button") else "","pid":pid(child)})
++        return True
++       except BaseException as exc:callback_errors.append({"callback":"CHILD","error":repr(exc)});return False
++      u.EnumChildWindows(hwnd,enum_child,0)
++      if callback_errors:return False
++      if any(c["class"]=="Static" and c["text"]=="Select a ResearchOS workspace folder" for c in children):
++       matches.append((int(hwnd),children))
++     return True
++    except BaseException as exc:callback_errors.append({"callback":"TOP","error":repr(exc)});return False
++   enum_success=bool(u.EnumWindows(enum_top,0))
++   if callback_errors:
++    picker_observation["callback_errors"]=callback_errors
++    raise RuntimeError("actual window enumeration callback failed; partial results rejected")
++   assert enum_success,"EnumWindows failed"
+    if matches:
+     assert len(matches)==1,"ambiguous owned Host folder dialogs"
+     hwnd,children=matches[0];button=u.GetDlgItem(hwnd,1)
+@@ -132,10 +149,20 @@
+  init_rows=invoke("cli-init",[str(CLI),"init",str(workspace)],cli_env,20)
+  picker_stop.set();picker_thread.join(2)
+  assert not picker_thread.is_alive() and picker_observation.get("error") is None and picker_observation["clicked_once"] is True and picker_observation.get("actual_dialog_closed") is True,"actual Shell chooser confirmation incomplete"
+- picker_observation["confirmed_by_native_cli_result"]=True
+- write("workspace-picker.actual.json",picker_observation)
+  projects={row["project_id"] for row in init_rows if row.get("project_id")};assert len(projects)==1
+  project_id=projects.pop();initial_config=config.read_bytes();before_config=json.loads(initial_config);assert before_config["project_id"]==project_id and before_config["session_id"]==""
++ assert len(init_rows)==1 and init_rows[0]["command"]=="init" and init_rows[0]["status"]=="COMPLETED"
++ binding_db=sqlite3.connect((data/"researchos.sqlite").as_uri()+"?mode=ro",uri=True)
++ try:
++  binding_rows=binding_db.execute("SELECT body FROM domain_objects WHERE kind='WorkspaceBinding' AND json_extract(body,'$.authorized_workspace_ref')=?",(before_config["workspace_ref"],)).fetchall()
++  assert len(binding_rows)==1
++  actual_binding=json.loads(binding_rows[0][0])
++  assert actual_binding["project_id"]==project_id and actual_binding["status"]=="ACTIVE" and actual_binding["authorized_workspace_ref"]==before_config["workspace_ref"] and Path(actual_binding["real_path"])==workspace,"actual Host returned workspace binding differs from unique isolated directory"
++ finally:binding_db.close()
++ binding_ref=write("workspace-binding.actual.json",{"source":"ACTUAL_HOST_DURABLE_DOMAIN_OBJECT","project_id":project_id,"workspace_ref":before_config["workspace_ref"],"expected_directory":str(workspace),"actual_binding":actual_binding,"matches_unique_isolated_workspace":True,"provider_requests":0})
++ picker_observation.update({"confirmed_by_native_cli_result":True,"actual_workspace_binding_ref":binding_ref,"actual_workspace_binding_matches_unique_directory":True})
++ write("workspace-picker.actual.json",picker_observation)
++
+  with (O/"cli-init.config.after.raw").open("xb") as f:f.write(initial_config)
+  goal_rows=invoke("cli-goal",[str(CLI),"goal","Verify the isolated Mu SDK model and read tool roundtrip","--project",project_id,"--draft"],cli_env,10)
+  assert len(goal_rows)==1 and goal_rows[0]["execution"]=={"status":"NOT_STARTED","independent_acceptance":"NOT_EVALUATED"}

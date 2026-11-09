@@ -1,0 +1,782 @@
+--- revision05/choose-owned-folder.ps1
++++ native-path-entry01/choose-owned-folder.ps1
+@@ -2,493 +2,319 @@
+   [Parameter(Mandatory=$true)][string]$ScopePath,
+   [Parameter(Mandatory=$true)][string]$ScopeSHA256,
+   [Parameter(Mandatory=$true)][string]$ScopeNonce,
+-  [Parameter(Mandatory=$true)][string]$CoreIdentityPath
++  [Parameter(Mandatory=$true)][string]$CoreIdentityPath,
++  [Parameter(Mandatory=$true)][string]$HistoryPath
+ )
+-$ErrorActionPreference = 'Stop'
+-$ProgressPreference = 'SilentlyContinue'
+-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+-$process = $null
+-$hwnd = [IntPtr]::Zero
+-$dialogValidated = $false
+-$okAttempted = $false
+-$result = @{ schema='researchos.owned-native-folder-diagnostic/1'; status='BLOCKED'; clicked_ok=$false; cleanup=@{ attempted=$false; status='NOT_NEEDED' } }
+-
+-function Assert-DiagnosticOnly($Value) {
+-  if ($Value -isnot [bool] -or $Value -ne $true) { throw 'DIAGNOSTIC_ONLY_SCOPE_REQUIRED_NO_OK' }
+-}
+-function Select-UniqueNativeTree($Candidates,[int]$OwnerPid,[bool]$Truncated) {
+-  if ($Truncated) { throw 'NATIVE_TREE_ENUMERATION_TRUNCATED_NO_OK' }
+-  $matchesFound=@($Candidates | Where-Object {
+-    $_.class_name -ceq 'SysTreeView32' -and $_.process_id -eq $OwnerPid -and $_.visible -eq $true -and $_.enabled -eq $true
+-  })
+-  if ($matchesFound.Count -ne 1) { throw 'NATIVE_TREE_NOT_UNIQUE_NO_OK' }
+-  return $matchesFound[0]
+-}
+-function Assert-DirectNativeFacts($Facts,[int]$OwnerPid) {
+-  if ($Facts.process_id -ne $OwnerPid -or $Facts.is_child -ne $true -or
+-    $Facts.class_name -cne 'SysTreeView32' -or $Facts.visible -ne $true -or $Facts.enabled -ne $true) {
+-    throw 'DIRECT_NATIVE_TREE_OWNER_OR_STATE_CHANGED_NO_OK'
+-  }
+-}
+-function Project-PublicUiaValue([string]$Source,$Value) {
+-  $raw=$(if ($null -eq $Value) { '' } else { [string]$Value })
+-  $absolute=$false
+-  try { $absolute=[IO.Path]::IsPathRooted($raw) } catch {}
+-  $truncated=$raw.Length -gt 1024
+-  $text=$raw
+-  if ($truncated) { $text=$raw.Substring(0,1024) }
+-  if ($text.Length -gt 0 -and [char]::IsHighSurrogate($text[$text.Length-1])) { $text=$text.Substring(0,$text.Length-1);$truncated=$true }
+-  return @{source=$Source;value=$text;truncated=$truncated;absolute_candidate=$absolute;selection_authority=$false}
+-}
+-function Limit-DiagnosticText($Value) {
+-  if ($null -eq $Value) { return $null }
+-  $text=[regex]::Replace([string]$Value,'[\x00-\x1f\x7f]',' ')
+-  if ($text.Length -gt 96) { $text=$text.Substring(0,96) }
+-  if ($text.Length -gt 0 -and [char]::IsHighSurrogate($text[$text.Length-1])) { $text=$text.Substring(0,$text.Length-1) }
+-  return $text
+-}
+-function Read-DiagnosticField($Info,[string]$Property,$Failures) {
+-  try { return $Info.$Property }
+-  catch {
+-    $Failures.Add(@{ property=$Property; reason=(Limit-DiagnosticText $_.Exception.Message) })
+-    return $null
+-  }
+-}
+-function Diagnostic-Number($Value) {
+-  if ($null -eq $Value) { return $null }
+-  $number=[double]$Value
+-  if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $number.ToString([Globalization.CultureInfo]::InvariantCulture) }
+-  return $number
+-}
+-function Project-TreeDiagnostic($Element,[int]$Index,[int]$OwnerPid) {
+-  if ($OwnerPid -le 0) { throw 'EXPECTED_METADATA_OWNER_REQUIRED' }
+-  try {
+-    $info=$Element.Current
+-    if ($null -eq $info) { throw 'ELEMENT_CURRENT_UNAVAILABLE' }
+-    $observedPid=$info.ProcessId
+-    if ($null -eq $observedPid) { throw 'ELEMENT_OWNER_UNAVAILABLE' }
+-  } catch {
+-    return @{ status='PROVIDER_IDENTITY_UNAVAILABLE'; process_id=$null }
+-  }
+-  # No other Current getter may run before this same-snapshot owner check.
+-  if ($observedPid -ne $OwnerPid) { return @{ status='FOREIGN_PROVIDER_OWNER'; process_id=$observedPid } }
+-  $failures=[Collections.Generic.List[object]]::new()
+-  $control=Read-DiagnosticField $info 'ControlType' $failures
+-  $rectangle=Read-DiagnosticField $info 'BoundingRectangle' $failures
+-  $bounds=$null
+-  if ($null -ne $rectangle) {
+-    $bounds=@{
+-      x=(Diagnostic-Number (Read-DiagnosticField $rectangle 'X' $failures))
+-      y=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Y' $failures))
+-      width=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Width' $failures))
+-      height=(Diagnostic-Number (Read-DiagnosticField $rectangle 'Height' $failures))
+-      is_empty=(Read-DiagnosticField $rectangle 'IsEmpty' $failures)
+-    }
+-  }
+-  $handle=Read-DiagnosticField $info 'NativeWindowHandle' $failures
+-  return @{
+-    index=$Index; status='METADATA_ONLY'
+-    control_type=(Limit-DiagnosticText $control.ProgrammaticName)
+-    process_id=$observedPid
+-    native_window_handle=$(if ($null -eq $handle) { $null } else { [string]$handle })
+-    class_name=(Limit-DiagnosticText (Read-DiagnosticField $info 'ClassName' $failures))
+-    automation_id=(Limit-DiagnosticText (Read-DiagnosticField $info 'AutomationId' $failures))
+-    is_offscreen=(Read-DiagnosticField $info 'IsOffscreen' $failures)
+-    enabled=(Read-DiagnosticField $info 'IsEnabled' $failures)
+-    bounding_rect=$bounds
+-    name=(Limit-DiagnosticText (Read-DiagnosticField $info 'Name' $failures))
+-    property_errors=@($failures)
+-  }
+-}
+-
+-# These functions are pure string/evidence predicates. Tests extract their
+-# actual AST bodies without running Add-Type, UIAutomation or this script body.
++$ErrorActionPreference='Stop'
++$ProgressPreference='SilentlyContinue'
++[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
++$process=$null;$chooser=[IntPtr]::Zero;$dialogValidated=$false
++$phase='PREFLIGHT';$uncertain=$false;$validOkAttempted=$false;$invalidOkAttempted=$false
++$history=[Collections.Generic.List[object]]::new()
++$historyFile=$null
++$result=@{schema='researchos.owned-native-path-entry/1';status='BLOCKED';clicked_ok=$false
++  input_is_authorization=$false;actual_task_submissions=0;model_outcome='NOT_RUN_ZERO_BUDGET'
++  authorization_state='NOT_ESTABLISHED';cleanup=@{attempted=$false;status='NOT_NEEDED'}}
++function Record([string]$Event,$Evidence) {
++  $row=@{sequence=$history.Count+1;at=[DateTime]::UtcNow.ToString('o');phase=$script:phase;event=$Event;evidence=$Evidence}
++  $history.Add($row)
++  if ($null -ne $script:historyFile) {
++    try {[IO.File]::AppendAllText($script:historyFile,(($row | ConvertTo-Json -Depth 8 -Compress)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}
++    catch {$script:journalFailure=$_.Exception.Message;throw 'HELPER_HISTORY_WRITE_FAILED_NO_NEW_ACTION'}
++  }
++}
++function Require([bool]$Condition,[string]$Code) {
++  Record 'GUARD' @{code=$Code;passed=$Condition}
++  if (-not $Condition) {throw $Code}
++}
+ function Convert-NativeDeadlineUtc($Value) {
+-  if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z') {
+-    throw 'NATIVE_UI_DEADLINE_UTC_WIRE_STRING_REQUIRED'
+-  }
+-  try {
+-    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+-    return [DateTimeOffset]::ParseExact($Value, "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+-      [Globalization.CultureInfo]::InvariantCulture, $styles).UtcDateTime
+-  } catch {
+-    throw 'NATIVE_UI_DEADLINE_INVALID_UTC_WIRE_VALUE'
+-  }
+-}
+-function Convert-UiaAbsolutePath($Value) {
+-  if ($null -eq $Value -or $Value -ceq '') { return $null }
+-  if ($Value -isnot [string] -or $Value.Contains([char]0)) { throw 'UIA_MALFORMED_PATH_NO_OK' }
+-  if (-not [IO.Path]::IsPathRooted($Value)) {
+-    if ($Value -match '^\s*[A-Za-z]:' -or $Value -match '^\s*[\\/]' ) { throw 'UIA_MALFORMED_PATH_NO_OK' }
+-    return $null
+-  }
+-  if ($Value -notmatch '^[A-Za-z]:[\\/]' -and $Value -notmatch '^\\\\[^\\]+\\[^\\]+') { throw 'UIA_NOT_FULLY_QUALIFIED_PATH_NO_OK' }
+-  try { return [IO.Path]::GetFullPath($Value) }
+-  catch { throw 'UIA_MALFORMED_PATH_NO_OK' }
+-}
+-function Assert-UiaPathEvidence($Readings, [string]$Expected, [bool]$RequireProof) {
+-  $expectedPath = [IO.Path]::GetFullPath($Expected)
+-  $absoluteValues = [Collections.Generic.List[object]]::new()
+-  $reliableCount = 0
+-  foreach ($reading in $Readings) {
+-    $absolute = Convert-UiaAbsolutePath $reading.value
+-    if ($null -eq $absolute) { continue }
+-    if (-not [string]::Equals($absolute,$expectedPath,[StringComparison]::OrdinalIgnoreCase)) { throw 'UIA_CONTRADICTORY_ABSOLUTE_PATH_NO_OK' }
+-    $absoluteValues.Add(@{ source=$reading.source; path=$absolute })
+-    if ($reading.source -cin @('ValuePattern','LegacyIAccessiblePattern')) { $reliableCount++ }
+-  }
+-  if ($RequireProof -and $reliableCount -lt 1) { throw 'UIA_RELIABLE_ABSOLUTE_PATH_MISSING_NO_OK' }
+-  return @{ reliable_count=$reliableCount; absolute_values=@($absoluteValues); path=$expectedPath }
+-}
+-function Test-UiaPathCandidate([string]$Name, [string]$ExpectedName, $Readings, [string]$ExpectedPath) {
+-  $candidate = -not [string]::IsNullOrEmpty($ExpectedName) -and $Name -ieq $ExpectedName
+-  foreach ($reading in $Readings) {
+-    $absolute = Convert-UiaAbsolutePath $reading.value
+-    if ($null -ne $absolute -and [string]::Equals($absolute,[IO.Path]::GetFullPath($ExpectedPath),[StringComparison]::OrdinalIgnoreCase)) { $candidate=$true }
+-  }
+-  if (-not $candidate) { return $false }
+-  # Even an exact display-name match cannot override a contradictory absolute
+-  # value exposed by either provider or the element's Name.
+-  $null = Assert-UiaPathEvidence $Readings $ExpectedPath $false
+-  return $true
++  if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z') {throw 'UTC_WIRE_STRING_REQUIRED'}
++  try {return [DateTimeOffset]::ParseExact($Value,"yyyy-MM-dd'T'HH:mm:ss.fff'Z'",[Globalization.CultureInfo]::InvariantCulture,
++    ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)).UtcDateTime}
++  catch {throw 'UTC_WIRE_VALUE_INVALID'}
++}
++function Select-UniqueEdit($Rows,[int]$ExpectedPid,[long]$ExpectedParent,[bool]$Truncated) {
++  if ($Truncated) {throw 'CHILD_ENUMERATION_TRUNCATED'}
++  $edits=@($Rows | Where-Object {$_.process_id -eq $ExpectedPid -and $_.parent -eq $ExpectedParent -and
++    $_.class_name -ceq 'Edit' -and $_.visible -eq $true -and $_.enabled -eq $true})
++  if ($edits.Count -ne 1) {throw 'OWNED_DIRECT_EDIT_NOT_UNIQUE'}
++  return $edits[0]
++}
++function Assert-ExactText([string]$Actual,[string]$Expected,[int]$Copied,[int]$Capacity) {
++  if ($Capacity -lt 2 -or $Copied -lt 0 -or $Copied -ge ($Capacity-1) -or
++    $Copied -ne $Actual.Length -or -not [string]::Equals($Actual,$Expected,[StringComparison]::Ordinal)) {throw 'INPUT_READBACK_NOT_EXACT_OR_TRUNCATED'}
+ }
+ try {
+-  if ((Get-FileHash -LiteralPath $ScopePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ScopeSHA256) { throw 'SCOPE_PIN_MISMATCH' }
+-  $scope = Get-Content -LiteralPath $ScopePath -Raw -Encoding UTF8 | ConvertFrom-Json
+-  if ($scope.status -cne 'ROOT_APPROVED_REAL_RUN' -or $scope.scope_nonce -cne $ScopeNonce) { throw 'SCOPE_NOT_AUTHORIZED' }
+-  Assert-DiagnosticOnly $scope.native_picker.diagnostic_only
+-  Assert-DiagnosticOnly $scope.native_picker.direct_native_tree
+-  $runRoot = [IO.Path]::GetFullPath($scope.run_root)
+-  $fixture = [IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
+-  $identityFile = [IO.Path]::GetFullPath($CoreIdentityPath)
+-  if ($identityFile -ine (Join-Path $runRoot 'receipts\owned-core.json')) { throw 'IDENTITY_PATH_OUTSIDE_SCOPE' }
+-  $identity = Get-Content -LiteralPath $identityFile -Raw -Encoding UTF8 | ConvertFrom-Json -DateKind String
+-  if ($identity.scope_nonce -cne $ScopeNonce -or $identity.identity_source -cne 'ROS_DESKTOP_REPORT.ready_to_show') { throw 'CORE_IDENTITY_SOURCE_MISMATCH' }
+-  $core = $identity.owned_core_identity
+-  $actionDeadline = Convert-NativeDeadlineUtc $identity.action_deadline_utc
+-  $cleanupDeadline = $actionDeadline.AddMilliseconds([int]$scope.deadlines.close_ms)
+-  $coreId = [int]$core.pid
+-  if ($coreId -le 0 -or $core.created_ns -cnotmatch '^[0-9]+$' -or $core.image_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'CORE_IDENTITY_INVALID' }
+-  if ($core.image_sha256 -cne $scope.bundle.control_sha256) { throw 'CORE_IMAGE_PIN_MISMATCH' }
+-  $expectedImage = [IO.Path]::GetFullPath((Join-Path $scope.bundle.root 'apps\desktop\resources\control\researchos-control.exe'))
+-  $process = [Diagnostics.Process]::GetProcessById($coreId)
+-  # Retain the process handle throughout selection; PID or HWND alone is insufficient.
+-  $null = $process.Handle
++  Require ((Get-FileHash -LiteralPath $ScopePath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $ScopeSHA256) 'SCOPE_PIN'
++  $scope=Get-Content -LiteralPath $ScopePath -Raw -Encoding UTF8 | ConvertFrom-Json -DateKind String
++  Require ($scope.status -ceq 'ROOT_APPROVED_REAL_RUN' -and $scope.scope_nonce -ceq $ScopeNonce) 'SCOPE_AUTHORIZED'
++  Require ($scope.budget.task_submissions -eq 0 -and $scope.budget.model_calls -eq 0 -and $scope.budget.automatic_retries -eq 0 -and
++    $scope.native_picker.profile -ceq 'INVALID_VALID_PATH_ENTRY_ONLY' -and $scope.native_picker.operator_fallback -eq $false) 'ZERO_BUDGET_PATH_PROFILE'
++  Require ($scope.native_picker.validation_warning.caption -is [string] -and $scope.native_picker.validation_warning.caption.Length -gt 0 -and
++    $scope.native_picker.validation_warning.text -is [string] -and $scope.native_picker.validation_warning.text.Length -gt 0 -and
++    $scope.native_picker.validation_warning.source_sha256 -cmatch '^[a-f0-9]{64}$') 'FROZEN_PRODUCTION_WARNING_PINS_REQUIRED'
++  Require (@($scope.source.pins | Where-Object {$_.path -ceq 'internal/host/native_folder_windows.go' -and
++    $_.sha256 -ceq $scope.native_picker.validation_warning.source_sha256}).Count -eq 1) 'WARNING_NATIVE_SOURCE_BINDING'
++  $runRoot=[IO.Path]::GetFullPath($scope.run_root)
++  $fixture=[IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
++  $invalid=[IO.Path]::GetFullPath((Join-Path $runRoot ('invalid-nonexistent-'+$ScopeNonce)))
++  Require ([IO.Path]::GetFullPath($CoreIdentityPath) -ieq (Join-Path $runRoot 'receipts\owned-core.json')) 'IDENTITY_RECEIPT_PATH'
++  Require ([IO.Path]::GetFullPath($HistoryPath) -ieq (Join-Path $runRoot 'receipts\native-helper-history.ndjson')) 'HISTORY_RECEIPT_PATH'
++  Require ((Test-Path -LiteralPath $HistoryPath -PathType Leaf) -and (Get-Item -LiteralPath $HistoryPath).Length -eq 0) 'FRESH_EMPTY_HISTORY_RECEIPT'
++  $historyFile=[IO.Path]::GetFullPath($HistoryPath)
++  foreach ($row in $history.ToArray()) {[IO.File]::AppendAllText($historyFile,(($row|ConvertTo-Json -Depth 8 -Compress)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}
++  $identity=Get-Content -LiteralPath $CoreIdentityPath -Raw -Encoding UTF8 | ConvertFrom-Json -DateKind String
++  Require ($identity.scope_nonce -ceq $ScopeNonce -and $identity.identity_source -ceq 'ROS_DESKTOP_REPORT.ready_to_show') 'IDENTITY_SOURCE'
++  $core=$identity.owned_core_identity;$coreId=[int]$core.pid
++  Require ($coreId -gt 0 -and $core.created_ns -cmatch '^[0-9]+$' -and $core.image_sha256 -ceq $scope.bundle.control_sha256) 'CORE_IDENTITY'
++  $actionDeadline=Convert-NativeDeadlineUtc $identity.action_deadline_utc
++  $cleanupDeadline=$actionDeadline.AddMilliseconds([int]$scope.deadlines.close_ms)
++  $expectedImage=[IO.Path]::GetFullPath((Join-Path $scope.bundle.root 'apps\desktop\resources\control\researchos-control.exe'))
++  $process=[Diagnostics.Process]::GetProcessById($coreId);$null=$process.Handle
+   function Assert-Core([switch]$ForCleanup) {
+-    $limit = $actionDeadline
+-    if ($ForCleanup) { $limit=$cleanupDeadline }
+-    if ([DateTime]::UtcNow -ge $limit) { throw 'NATIVE_UI_ACTION_DEADLINE_EXPIRED' }
+-    if ($process.HasExited) { throw 'OWNED_CORE_EXITED' }
+-    $created = [decimal]($process.StartTime.ToUniversalTime().Ticks - 621355968000000000) * 100
+-    if ($created.ToString('0', [Globalization.CultureInfo]::InvariantCulture) -cne $core.created_ns) { throw 'OWNED_CORE_CREATION_MISMATCH' }
+-    if ([IO.Path]::GetFullPath($process.MainModule.FileName) -ine $expectedImage) { throw 'OWNED_CORE_PATH_MISMATCH' }
+-    if ((Get-FileHash -LiteralPath $expectedImage -Algorithm SHA256).Hash.ToLowerInvariant() -cne $core.image_sha256) { throw 'OWNED_CORE_HASH_MISMATCH' }
+-    $discovery = Get-Content -LiteralPath (Join-Path $runRoot 'discovery.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+-    if ($discovery.pid -ne $coreId -or [IO.Path]::GetFullPath($discovery.data_dir) -ine (Join-Path $runRoot 'data')) { throw 'FRESH_DISCOVERY_MISMATCH' }
++    $limit=$actionDeadline;if ($ForCleanup) {$limit=$cleanupDeadline}
++    if ([DateTime]::UtcNow -ge $limit) {throw 'NATIVE_DEADLINE'}
++    if ($process.HasExited) {throw 'OWNED_CORE_EXITED'}
++    $created=[decimal]($process.StartTime.ToUniversalTime().Ticks-621355968000000000)*100
++    if ($created.ToString('0',[Globalization.CultureInfo]::InvariantCulture) -cne $core.created_ns) {throw 'CORE_CREATION_CHANGED'}
++    if ([IO.Path]::GetFullPath($process.MainModule.FileName) -ine $expectedImage) {throw 'CORE_IMAGE_PATH_CHANGED'}
++    if ((Get-FileHash -LiteralPath $expectedImage -Algorithm SHA256).Hash.ToLowerInvariant() -cne $core.image_sha256) {throw 'CORE_IMAGE_HASH_CHANGED'}
++    $discovery=Get-Content -LiteralPath (Join-Path $runRoot 'discovery.json') -Raw -Encoding UTF8 | ConvertFrom-Json -DateKind String
++    if ($discovery.pid -ne $coreId -or [IO.Path]::GetFullPath($discovery.data_dir) -ine (Join-Path $runRoot 'data')) {throw 'FRESH_DISCOVERY_CHANGED'}
++    if ([DateTime]::UtcNow -ge $limit) {throw 'NATIVE_DEADLINE_AFTER_IDENTITY_CHECK'}
+   }
+   Assert-Core
+-  $item = Get-Item -LiteralPath $fixture
+-  if (-not $item.PSIsContainer) { throw 'FIXTURE_NOT_DIRECTORY' }
+-  $cursor = $item
+-  while ($null -ne $cursor) {
+-    if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'FIXTURE_ALIAS_REFUSED' }
+-    $cursor = $cursor.Parent
+-  }
++  function Assert-Fixture {
++    $cursor=Get-Item -LiteralPath $fixture
++    Require $cursor.PSIsContainer 'FIXTURE_DIRECTORY'
++    while ($null -ne $cursor) {Require (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'FIXTURE_NO_REPARSE';$cursor=$cursor.Parent}
++  }
++  Assert-Fixture
++  Require (-not (Test-Path -LiteralPath $invalid)) 'INVALID_TARGET_ABSENT'
+   Add-Type -TypeDefinition @'
+ using System;
+ using System.Text;
+ using System.Runtime.InteropServices;
+-public static class OwnedFolderWin32 {
++public static class OwnedPathWin32 {
+   public delegate bool EnumCallback(IntPtr hwnd, IntPtr extra);
+   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumCallback callback, IntPtr extra);
+   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumCallback callback, IntPtr extra);
+   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, StringBuilder text, int length);
+-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int length);
++  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd,StringBuilder b,int length);
++  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
+   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+   [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+-  [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+-  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hwnd);
+-  [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
+-  [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)] public static extern IntPtr ClickTimeout(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+-  public static string Class(IntPtr hwnd) { var b=new StringBuilder(256); GetClassName(hwnd,b,b.Capacity); return b.ToString(); }
+-  public static string Text(IntPtr hwnd) { var b=new StringBuilder(1024); GetWindowText(hwnd,b,b.Capacity); return b.ToString(); }
++  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
++  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
++  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd,uint flags);
++  [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
++  [DllImport("user32.dll",SetLastError=true)] public static extern bool PostMessageW(IntPtr hwnd,uint msg,IntPtr w,IntPtr l);
++  [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode,SetLastError=true)]
++  public static extern IntPtr SetText(IntPtr hwnd,uint msg,UIntPtr w,[MarshalAs(UnmanagedType.LPWStr)]string text,uint flags,uint timeout,out UIntPtr result);
++  [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode,SetLastError=true)]
++  public static extern IntPtr ReadText(IntPtr hwnd,uint msg,UIntPtr w,[Out]StringBuilder text,uint flags,uint timeout,out UIntPtr result);
++  public static string Class(IntPtr hwnd) {var b=new StringBuilder(256);GetClassNameW(hwnd,b,b.Capacity);return b.ToString();}
+ }
+ '@
+-  Add-Type -AssemblyName UIAutomationClient
+-  Add-Type -AssemblyName UIAutomationTypes
+-  $dialogs = [Collections.Generic.List[IntPtr]]::new()
+-  $enum = [OwnedFolderWin32+EnumCallback]{ param($hwnd,$unused)
+-    [uint32]$ownerId = 0
+-    $null = [OwnedFolderWin32]::GetWindowThreadProcessId($hwnd,[ref]$ownerId)
+-    if ($ownerId -eq $coreId -and [OwnedFolderWin32]::IsWindowVisible($hwnd) -and [OwnedFolderWin32]::Class($hwnd) -ceq '#32770') { $dialogs.Add($hwnd) }
+-    return $true
+-  }
+-  $until = [DateTime]::UtcNow.AddSeconds(20)
+-  do {
+-    Assert-Core
+-    $dialogs.Clear()
+-    $null = [OwnedFolderWin32]::EnumWindows($enum,[IntPtr]::Zero)
+-    if ($dialogs.Count -gt 1) { throw 'MULTIPLE_OWNED_DIALOGS' }
+-    if ($dialogs.Count -eq 0) { Start-Sleep -Milliseconds 200 }
+-  } while ($dialogs.Count -eq 0 -and [DateTime]::UtcNow -lt $until)
+-  if ($dialogs.Count -ne 1) { throw 'OWNED_DIALOG_NOT_FOUND' }
+-  $hwnd = $dialogs[0]
+-  function Assert-Dialog([switch]$ForCleanup) {
++  function Facts([IntPtr]$Handle) {
++    [uint32]$owner=0;$null=[OwnedPathWin32]::GetWindowThreadProcessId($Handle,[ref]$owner)
++    # Identity first: never read text/provider values on an unverified PID.
++    if ($owner -ne $coreId) {throw 'FOREIGN_WINDOW_PID'}
++    return @{hwnd=$Handle.ToInt64();process_id=$owner;class_name=[OwnedPathWin32]::Class($Handle)
++      parent=[OwnedPathWin32]::GetAncestor($Handle,1).ToInt64();owner=[OwnedPathWin32]::GetWindow($Handle,4).ToInt64()
++      visible=[OwnedPathWin32]::IsWindowVisible($Handle);enabled=[OwnedPathWin32]::IsWindowEnabled($Handle)}
++  }
++  function Read-OwnedText([IntPtr]$Handle) {
++    $null=Facts $Handle
++    $capacity=4096;$buffer=[Text.StringBuilder]::new($capacity);[UIntPtr]$copied=[UIntPtr]::Zero
++    $sent=[OwnedPathWin32]::ReadText($Handle,0x000D,[UIntPtr]$capacity,$buffer,0x23,1000,[ref]$copied)
++    if ($sent -eq [IntPtr]::Zero) {$script:uncertain=$true;throw 'WM_GETTEXT_OUTCOME_UNKNOWN'}
++    $null=Facts $Handle
++    if ($copied.ToUInt64() -ge ($capacity-1) -or $copied.ToUInt64() -ne $buffer.Length) {throw 'WM_GETTEXT_TRUNCATED'}
++    return @{text=$buffer.ToString();copied=[int]$copied.ToUInt64();capacity=$capacity}
++  }
++  function OwnedDialogs([switch]$ForCleanup) {
+     Assert-Core -ForCleanup:$ForCleanup
+-    $dialogs.Clear()
+-    $null = [OwnedFolderWin32]::EnumWindows($enum,[IntPtr]::Zero)
+-    if ($dialogs.Count -ne 1 -or $dialogs[0] -ne $hwnd) { throw 'OWNED_DIALOG_NOT_UNIQUE_OR_CHANGED' }
+-    [uint32]$dialogOwner = 0
+-    $null = [OwnedFolderWin32]::GetWindowThreadProcessId($hwnd,[ref]$dialogOwner)
+-    if ($dialogOwner -ne $coreId -or -not [OwnedFolderWin32]::IsWindowVisible($hwnd) -or [OwnedFolderWin32]::Class($hwnd) -cne '#32770') { throw 'DIALOG_IDENTITY_CHANGED' }
+-    $script:prompts = [Collections.Generic.List[string]]::new()
+-    $childEnum = [OwnedFolderWin32+EnumCallback]{ param($child,$unused)
+-      if ([OwnedFolderWin32]::Text($child) -ceq 'Select a ResearchOS workspace folder') { $script:prompts.Add('match') }
+-      return $true
++    $script:dialogs=[Collections.Generic.List[object]]::new()
++    $script:enumError=$null
++    $callback=[OwnedPathWin32+EnumCallback]{param($window,$unused)
++      try {
++        [uint32]$owner=0;$null=[OwnedPathWin32]::GetWindowThreadProcessId($window,[ref]$owner)
++        if ($owner -eq $coreId -and [OwnedPathWin32]::IsWindowVisible($window) -and [OwnedPathWin32]::Class($window) -ceq '#32770') {
++          if ($script:dialogs.Count -ge 8) {throw 'OWNED_DIALOG_ENUMERATION_LIMIT'}
++          $script:dialogs.Add((Facts $window))
++        };return $true
++      } catch {$script:enumError=$_.Exception.Message;return $false}
+     }
+-    $null = [OwnedFolderWin32]::EnumChildWindows($hwnd,$childEnum,[IntPtr]::Zero)
+-    # lpszTitle is an instruction label, not necessarily the localized caption.
+-    if ($script:prompts.Count -ne 1) { throw 'DIALOG_PROMPT_NOT_UNIQUE' }
+-  }
+-  Assert-Dialog
+-  $dialogValidated=$true
+-  [UIntPtr]$messageResult = [UIntPtr]::Zero
+-  # Never send BFFM_SETSELECTIONW/WM_USER pointers across processes. That old
+-  # candidate is preserved as REJECTED_NOT_RUN. Only real UIAutomation patterns
+-  # below may navigate/select; no remote memory, injection or fabricated reply.
+-  function Assert-UiaElement($element) {
+-    Assert-Dialog
+-    if ($null -eq $element -or $element.Current.ProcessId -ne $coreId -or -not $element.Current.IsEnabled) { throw 'UIA_ELEMENT_NOT_OWNED_AND_ENABLED' }
+-  }
+-  function Read-UiaPathFacts($element) {
+-    $readings = [Collections.Generic.List[object]]::new()
+-    $readings.Add(@{ source='Name'; value=$element.Current.Name })
+-    foreach ($provider in @(
+-      @{ source='ValuePattern'; id=[Windows.Automation.ValuePattern]::Pattern },
+-      @{ source='LegacyIAccessiblePattern'; id=[Windows.Automation.LegacyIAccessiblePattern]::Pattern }
+-    )) {
+-      $pattern = $null
+-      if ($element.TryGetCurrentPattern($provider.id,[ref]$pattern)) {
+-        $readings.Add(@{ source=$provider.source; value=$pattern.Current.Value })
++    $null=[OwnedPathWin32]::EnumWindows($callback,[IntPtr]::Zero)
++    if ($null -ne $script:enumError) {throw $script:enumError}
++    return $script:dialogs.ToArray()
++  }
++  function ChildFacts([IntPtr]$Parent) {
++    $null=Facts $Parent
++    $script:children=[Collections.Generic.List[object]]::new();$script:truncated=$false
++    $script:childEnumError=$null
++    $callback=[OwnedPathWin32+EnumCallback]{param($child,$unused)
++      try {
++        if ($script:children.Count -ge 128) {$script:truncated=$true;return $false}
++        $script:children.Add((Facts $child));return $true
++      } catch {$script:childEnumError=$_.Exception.Message;return $false}
++    }
++    $null=[OwnedPathWin32]::EnumChildWindows($Parent,$callback,[IntPtr]::Zero)
++    if ($null -ne $script:childEnumError) {throw $script:childEnumError}
++    if ($script:truncated) {throw 'CHILD_ENUMERATION_TRUNCATED'}
++    return $script:children.ToArray()
++  }
++  function Assert-Chooser([switch]$WithWarning,[switch]$ForCleanup) {
++    Assert-Core -ForCleanup:$ForCleanup
++    $rows=@(OwnedDialogs -ForCleanup:$ForCleanup)
++    if ((-not $WithWarning -and $rows.Count -ne 1) -or ($WithWarning -and $rows.Count -ne 2)) {throw 'OWNED_DIALOG_SET_CHANGED'}
++    $found=@($rows|Where-Object {$_.hwnd -eq $chooser.ToInt64()})
++    if ($found.Count -ne 1 -or (-not $WithWarning -and $found[0].enabled -ne $true)) {throw 'CHOOSER_CHANGED_OR_DISABLED'}
++    $prompt=@()
++    foreach ($row in @(ChildFacts $chooser)) {
++      if ($row.class_name -ceq 'Static') {
++        $text=Read-OwnedText ([IntPtr]$row.hwnd)
++        if ($text.text -ceq 'Select a ResearchOS workspace folder') {$prompt+=1}
+       }
+     }
+-    return @($readings)
+-  }
+-  function Expand-UiaNode($element) {
+-    Assert-UiaElement $element
+-    $pattern = $null
+-    if ($element.TryGetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$pattern)) {
+-      if ($pattern.Current.ExpandCollapseState -eq [Windows.Automation.ExpandCollapseState]::Collapsed) {
+-        $pattern.Expand()
+-        Start-Sleep -Milliseconds 150
++    if ($prompt.Count -ne 1) {throw 'CHOOSER_FIXED_PROMPT_NOT_UNIQUE'}
++  }
++  function Discover-Edit {
++    Assert-Chooser
++    $rows=@(ChildFacts $chooser)
++    $row=Select-UniqueEdit $rows $coreId $chooser.ToInt64() $false
++    $edit=[IntPtr]$row.hwnd
++    $again=Facts $edit
++    if ($again.parent -ne $chooser.ToInt64() -or $again.class_name -cne 'Edit' -or -not $again.visible -or -not $again.enabled) {throw 'EDIT_IDENTITY_CHANGED'}
++    return $edit
++  }
++  function Enter-Path([string]$Path) {
++    Require ($Path.Length -gt 0 -and $Path.Length -lt 3000 -and -not $Path.Contains([char]0)) 'BOUNDED_PATH_INPUT'
++    $edit=Discover-Edit
++    [UIntPtr]$messageResult=[UIntPtr]::Zero
++    Record 'WM_SETTEXT_INTENT' @{hwnd=$edit.ToInt64();path=$Path;input_is_authorization=$false}
++    # Standard WM_SETTEXT (0xC) / WM_GETTEXT (0xD), below WM_USER.
++    # Windows marshals these system messages; no custom LPWSTR or remote memory.
++    Assert-Core
++    if ((Discover-Edit) -ne $edit) {throw 'EDIT_CHANGED_IMMEDIATELY_BEFORE_INPUT'}
++    $sent=[OwnedPathWin32]::SetText($edit,0x000C,[UIntPtr]::Zero,$Path,0x23,1000,[ref]$messageResult)
++    if ($sent -eq [IntPtr]::Zero) {$script:uncertain=$true;throw 'WM_SETTEXT_OUTCOME_UNKNOWN_NO_RETRY'}
++    if ($messageResult.ToUInt64() -ne 1) {throw 'WM_SETTEXT_REJECTED'}
++    $fresh=Discover-Edit
++    if ($fresh -ne $edit) {throw 'EDIT_REPLACED_AFTER_INPUT'}
++    $read=Read-OwnedText $fresh
++    Assert-ExactText $read.text $Path $read.copied $read.capacity
++    Record 'INPUT_READBACK_EXACT' @{hwnd=$fresh.ToInt64();path=$read.text;input_is_authorization=$false}
++    return @{hwnd=$fresh.ToInt64();dialog_hwnd=$chooser.ToInt64();path=$read.text;method='SYSTEM_MARSHALLED_WM_SETTEXT_WM_GETTEXT';input_is_authorization=$false}
++  }
++  function Post-OwnedButton([IntPtr]$Dialog,[int]$Id,[string]$Purpose,[switch]$Warning,[switch]$ForCleanup) {
++    Assert-Chooser -WithWarning:$Warning -ForCleanup:$ForCleanup
++    if ($Warning) {Assert-Warning $Dialog}
++    if ([OwnedPathWin32]::GetForegroundWindow() -ne $Dialog) {throw 'BUTTON_DIALOG_NOT_FOREGROUND_NO_CLICK'}
++    $button=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$row=Facts $button
++    if ($row.parent -ne $Dialog.ToInt64() -or $row.class_name -cne 'Button' -or -not $row.visible -or -not $row.enabled) {throw 'OWNED_BUTTON_IDENTITY_OR_STATE'}
++    Record 'BUTTON_QUEUE_INTENT' @{dialog=$Dialog.ToInt64();button=$button.ToInt64();control_id=$Id;purpose=$Purpose}
++    # Async standard BM_CLICK avoids blocking the controller in the modal
++    # validation callback. Queue acceptance alone never establishes its result.
++    Assert-Core -ForCleanup:$ForCleanup
++    $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
++    if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
++      -not $now.visible -or -not $now.enabled -or [OwnedPathWin32]::GetForegroundWindow() -ne $Dialog) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    $script:uncertain=$true
++    if ($Purpose -ceq 'INVALID_OK') {$script:invalidOkAttempted=$true}
++    if ($Purpose -ceq 'VALID_OK') {$script:validOkAttempted=$true}
++    if (-not [OwnedPathWin32]::PostMessageW($button,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero)) {throw 'BUTTON_QUEUE_FAILED_OUTCOME_UNKNOWN'}
++    Record 'BUTTON_POST_ACCEPTED_EFFECT_UNKNOWN' @{dialog=$Dialog.ToInt64();button=$button.ToInt64();control_id=$Id;purpose=$Purpose}
++  }
++  function Assert-Warning([IntPtr]$Warning) {
++    Assert-Chooser -WithWarning
++    $rows=@(OwnedDialogs);$other=@($rows|Where-Object {$_.hwnd -ne $chooser.ToInt64()})
++    if ($other.Count -ne 1 -or $other[0].hwnd -ne $Warning.ToInt64() -or $other[0].owner -ne $chooser.ToInt64() -or -not $other[0].enabled) {throw 'WARNING_OWNER_OR_IDENTITY_CHANGED'}
++    $caption=Read-OwnedText $Warning
++    if ($caption.text -cne $scope.native_picker.validation_warning.caption) {throw 'WARNING_CAPTION_PIN_MISMATCH'}
++    $matches=0
++    foreach ($row in @(ChildFacts $Warning)) {
++      if ($row.class_name -ceq 'Static') {
++        $text=Read-OwnedText ([IntPtr]$row.hwnd)
++        if ($text.text -ceq $scope.native_picker.validation_warning.text) {$matches++}
+       }
+     }
+-  }
+-  function Select-FixtureThroughRealTree {
+-    $dialogElement = [Windows.Automation.AutomationElement]::FromHandle($hwnd)
+-    $treeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Tree)
+-    $itemCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::TreeItem)
+-    $trees = $dialogElement.FindAll([Windows.Automation.TreeScope]::Descendants,$treeCondition)
+-    if ($trees.Count -ne 1) { throw 'UIA_TREE_NOT_UNIQUE_NO_CLICK' }
+-    $tree = $trees[0]
+-    Assert-UiaElement $tree
+-    $drivePattern = '(^|\()' + [regex]::Escape($fixture.Substring(0,2)) + '(\)|\\)?$'
+-    $driveMatches = [Collections.Generic.List[object]]::new()
+-    for ($round=0; $round -lt 3; $round++) {
+-      $driveMatches.Clear()
+-      $nodes = $tree.FindAll([Windows.Automation.TreeScope]::Descendants,$itemCondition)
+-      foreach ($node in $nodes) {
+-        $facts = Read-UiaPathFacts $node
+-        $driveName = ''
+-        if ($node.Current.Name -match $drivePattern) { $driveName=$node.Current.Name }
+-        if (Test-UiaPathCandidate $node.Current.Name $driveName $facts $fixture.Substring(0,3)) { $driveMatches.Add($node) }
+-      }
+-      if ($driveMatches.Count -gt 0) { break }
+-      # Only standard Shell navigation containers are expanded. No type-ahead,
+-      # global keyboard, clipboard, search box or arbitrary window receives input.
+-      foreach ($node in $nodes) {
+-        if ($node.Current.Name -cin @('Desktop','This PC','Computer','桌面','此电脑','计算机')) { Expand-UiaNode $node }
+-      }
+-    }
+-    if ($driveMatches.Count -ne 1) { throw 'UIA_DRIVE_NOT_UNIQUE_OR_NOT_EXPOSED_OPERATOR_REQUIRED' }
+-    $current = $driveMatches[0]
+-    $prefix = $fixture.Substring(0,3)
+-    foreach ($segment in $fixture.Substring(3).Split([char]'\')) {
+-      Expand-UiaNode $current
+-      $prefix = Join-Path $prefix $segment
+-      $childMatches = [Collections.Generic.List[object]]::new()
+-      foreach ($child in $current.FindAll([Windows.Automation.TreeScope]::Children,$itemCondition)) {
+-        $facts = Read-UiaPathFacts $child
+-        if (Test-UiaPathCandidate $child.Current.Name $segment $facts $prefix) { $childMatches.Add($child) }
+-      }
+-      if ($childMatches.Count -ne 1) { throw ('UIA_PATH_COMPONENT_NOT_UNIQUE_OR_NOT_EXPOSED:' + $segment) }
+-      $current = $childMatches[0]
+-    }
+-    Assert-UiaElement $current
+-    $selectionPattern = $null
+-    if (-not $current.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selectionPattern)) { throw 'UIA_SELECTION_PATTERN_UNAVAILABLE_NO_CLICK' }
+-    $selectionPattern.Select()
+-    Start-Sleep -Milliseconds 150
+-    Assert-Dialog
+-  }
+-  function Get-VerifiedSelection {
+-  $element = [Windows.Automation.AutomationElement]::FromHandle($hwnd)
+-  $treeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Tree)
+-  $trees = $element.FindAll([Windows.Automation.TreeScope]::Descendants,$treeCondition)
+-  $selection = [Collections.Generic.List[object]]::new()
+-  foreach ($tree in $trees) {
+-    $pattern = $null
+-    if ($tree.TryGetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern,[ref]$pattern)) {
+-      foreach ($selected in $pattern.GetCurrentSelection()) { $selection.Add($selected) }
+-    }
+-  }
+-  if ($selection.Count -ne 1) { throw 'DIALOG_SELECTION_NOT_UNIQUE' }
+-  $selected = $selection[0]
+-  Assert-UiaElement $selected
+-  $facts = Read-UiaPathFacts $selected
+-  $proof = Assert-UiaPathEvidence $facts $fixture $true
+-  return @{ method='CONSISTENT_RELIABLE_ABSOLUTE_PATHS_ONLY'; absolute_values=$proof.absolute_values; reliable_count=$proof.reliable_count }
+-  }
+-  function Get-OwnedDialogButton([int]$Id, [switch]$ForCleanup) {
+-    Assert-Dialog -ForCleanup:$ForCleanup
+-    $button = [OwnedFolderWin32]::GetDlgItem($hwnd,$Id)
+-    [uint32]$buttonOwner = 0
+-    $null = [OwnedFolderWin32]::GetWindowThreadProcessId($button,[ref]$buttonOwner)
+-    if ($button -eq [IntPtr]::Zero -or $buttonOwner -ne $coreId -or
+-      [OwnedFolderWin32]::GetParent($button) -ne $hwnd -or
+-      [OwnedFolderWin32]::Class($button) -ine 'Button' -or
+-      -not [OwnedFolderWin32]::IsWindowVisible($button) -or
+-      -not [OwnedFolderWin32]::IsWindowEnabled($button)) { throw 'OWNED_DIALOG_BUTTON_UNAVAILABLE' }
+-    return $button
+-  }
+-  function Read-OwnedTreeDiagnostic {
+-    Assert-Dialog
+-    $script:directChildren=[Collections.Generic.List[object]]::new()
+-    $script:directTruncated=$false
+-    $childCallback=[OwnedFolderWin32+EnumCallback]{ param($child,$unused)
+-      if ($script:directChildren.Count -ge 64) { $script:directTruncated=$true;return $false }
+-      [uint32]$childPid=0
+-      $null=[OwnedFolderWin32]::GetWindowThreadProcessId($child,[ref]$childPid)
+-      $script:directChildren.Add(@{hwnd=$child.ToInt64().ToString();process_id=$childPid
+-        class_name=[OwnedFolderWin32]::Class($child)
+-        visible=[OwnedFolderWin32]::IsWindowVisible($child);enabled=[OwnedFolderWin32]::IsWindowEnabled($child)})
+-      return $true
+-    }
+-    $null=[OwnedFolderWin32]::EnumChildWindows($hwnd,$childCallback,[IntPtr]::Zero)
+-    Assert-Dialog
+-    $native=Select-UniqueNativeTree @($script:directChildren) $coreId $script:directTruncated
+-    $nativeHwnd=[IntPtr][long]::Parse($native.hwnd,[Globalization.CultureInfo]::InvariantCulture)
+-    function Assert-DirectNativeTree {
+-      Assert-Dialog
+-      [uint32]$nativePid=0
+-      $null=[OwnedFolderWin32]::GetWindowThreadProcessId($nativeHwnd,[ref]$nativePid)
+-      Assert-DirectNativeFacts @{
+-        process_id=$nativePid;is_child=[OwnedFolderWin32]::IsChild($hwnd,$nativeHwnd)
+-        class_name=[OwnedFolderWin32]::Class($nativeHwnd)
+-        visible=[OwnedFolderWin32]::IsWindowVisible($nativeHwnd)
+-        enabled=[OwnedFolderWin32]::IsWindowEnabled($nativeHwnd)
+-      } $coreId
+-    }
+-    Assert-DirectNativeTree
+-    $direct=@{native_window=$native;provider_status='NOT_READ';patterns=@{};public_values=@();absolute_candidates=@();selected=@();selection_count=$null;selected_limit=4;selected_truncated=$false;can_authorize_selection=$false}
+-    $current=@{index=0;status='ELEMENT_UNAVAILABLE'}
+-    function Read-PublicPatterns($Element) {
+-      $support=@{};$values=[Collections.Generic.List[object]]::new()
+-      $info=$Element.Current
+-      if ($null -eq $info -or $info.ProcessId -ne $coreId) { throw 'UIA_PROVIDER_OWNER_UNCONFIRMED_NO_VALUES' }
+-      $values.Add((Project-PublicUiaValue 'Name' $info.Name))
+-      $providers=[Collections.Generic.List[object]]::new()
+-      $providers.Add(@{source='ValuePattern';id=[Windows.Automation.ValuePattern]::Pattern})
+-      # Optional managed Legacy type is absent in some installed UIA clients.
+-      # Resolve it by name; never eagerly evaluate a missing class in an array.
+-      $legacyType=([Management.Automation.PSTypeName]::new('System.Windows.Automation.LegacyIAccessiblePattern')).Type
+-      if ($null -eq $legacyType) {
+-        $support.LegacyIAccessiblePattern=@{supported=$false;status='UNSUPPORTED_TYPE'}
+-      } else {
+-        try { $providers.Add(@{source='LegacyIAccessiblePattern';id=$legacyType::Pattern}) }
+-        catch { $support.LegacyIAccessiblePattern=@{supported=$null;status='UNAVAILABLE_TYPE_MEMBER';error=(Limit-DiagnosticText $_.Exception.Message)} }
+-      }
+-      foreach ($provider in $providers) {
+-        Assert-DirectNativeTree
+-        try {
+-          $pattern=$null;$supported=$Element.TryGetCurrentPattern($provider.id,[ref]$pattern)
+-          $support[$provider.source]=@{supported=$supported}
+-          if ($supported) { $values.Add((Project-PublicUiaValue $provider.source $pattern.Current.Value)) }
+-        } catch { $support[$provider.source]=@{supported=$null;error=(Limit-DiagnosticText $_.Exception.Message)} }
+-      }
+-      return @{support=$support;values=@($values)}
+-    }
+-    try {
+-      $element=[Windows.Automation.AutomationElement]::FromHandle($nativeHwnd)
+-      $current=Project-TreeDiagnostic $element 0 $coreId
+-      $direct.provider_status='FROM_HANDLE_RETURNED'
+-      $read=Read-PublicPatterns $element
+-      $direct.patterns=$read.support;$direct.public_values=$read.values
+-      $direct.absolute_candidates=@($read.values|Where-Object {$_.absolute_candidate})
+-      Assert-DirectNativeTree
+-      $selection=$null;$supported=$element.TryGetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern,[ref]$selection)
+-      $direct.patterns.SelectionPattern=@{supported=$supported}
+-      if ($supported) {
+-        $selected=$selection.GetCurrentSelection();$direct.selection_count=$selected.Count
+-        $direct.selected_truncated=$selected.Count -gt 4
+-        $rows=[Collections.Generic.List[object]]::new()
+-        for ($i=0;$i -lt [Math]::Min($selected.Count,4);$i++) {
+-          Assert-DirectNativeTree
+-          try {
+-            $read=Read-PublicPatterns $selected[$i]
+-            $rows.Add(@{index=$i;current=(Project-TreeDiagnostic $selected[$i] $i $coreId);patterns=$read.support
+-              public_values=$read.values;absolute_candidates=@($read.values|Where-Object {$_.absolute_candidate});can_authorize_selection=$false})
+-          } catch { $rows.Add(@{index=$i;status='SELECTED_ELEMENT_UNAVAILABLE';error=(Limit-DiagnosticText $_.Exception.Message)}) }
+-        }
+-        $direct.selected=@($rows)
+-      }
+-    } catch {
+-      $direct.provider_status='PROVIDER_UNAVAILABLE_OR_UNCONFIRMED'
+-      $direct.error=Limit-DiagnosticText $_.Exception.Message
+-    }
+-    Assert-DirectNativeTree
+-    return @{
+-      schema='researchos.owned-dialog-tree-metadata/1'; diagnostic_only=$true
+-      dialog_hwnd=$hwnd.ToInt64().ToString(); dialog_owner_pid=$coreId
+-      tree_source='VERIFIED_NATIVE_SYSTREEVIEW32_FROM_HANDLE'
+-      tree_count=1; tree_limit=16; captured_count=1;tree_truncated=$false;trees=@($current)
+-      direct_native_tree=$direct
+-      win32_children_when_zero=$null
+-      no_treeitem_navigation=$true; no_ok=$true; no_workspace_authorization=$true
+-    }
+-  }
+-  $result.diagnostic=Read-OwnedTreeDiagnostic
+-  # Dedicated diagnostic controller: never select/expand a TreeItem or lookup OK.
+-  # The ordinary catch path can only revalidate and invoke owned IDCANCEL.
+-  throw 'DIAGNOSTIC_ONLY_TREE_SNAPSHOT_COMPLETE_NO_OK'
++    if ($matches -ne 1) {throw 'WARNING_TEXT_PIN_MISMATCH'}
++  }
++  $phase='DISCOVER_CHOOSER'
++  $waitUntil=[DateTime]::UtcNow.AddSeconds(15)
++  do {$rows=@(OwnedDialogs);if ($rows.Count -gt 1) {throw 'CHOOSER_NOT_UNIQUE'}
++    if ($rows.Count -eq 0) {Start-Sleep -Milliseconds 100}
++  } while ($rows.Count -eq 0 -and [DateTime]::UtcNow -lt $waitUntil)
++  Require ($rows.Count -eq 1) 'CHOOSER_FOUND'
++  $chooser=[IntPtr]$rows[0].hwnd;Assert-Chooser;$dialogValidated=$true
++  $result.dialog_hwnd=$chooser.ToInt64()
++  Record 'CHOOSER_VERIFIED' @{hwnd=$chooser.ToInt64();owner_pid=$coreId;prompt='Select a ResearchOS workspace folder'}
++  $phase='INVALID_PATH'
++  $result.invalid_input=Enter-Path $invalid
++  Require (-not (Test-Path -LiteralPath $invalid)) 'INVALID_TARGET_STILL_ABSENT'
++  Post-OwnedButton $chooser 1 'INVALID_OK'
++  $warning=[IntPtr]::Zero;$waitUntil=[DateTime]::UtcNow.AddSeconds(10)
++  do {
++    $rows=@(OwnedDialogs)
++    if ($rows.Count -gt 2) {throw 'INVALID_WARNING_DIALOG_SET_UNEXPECTED'}
++    $other=@($rows|Where-Object {$_.hwnd -ne $chooser.ToInt64()})
++    if ($other.Count -eq 1) {$warning=[IntPtr]$other[0].hwnd;Assert-Warning $warning;break}
++    Start-Sleep -Milliseconds 100
++  } while ([DateTime]::UtcNow -lt $waitUntil)
++  Require ($warning -ne [IntPtr]::Zero) 'INVALID_WARNING_OBSERVED'
++  $uncertain=$false
++  $result.invalid_warning=@{hwnd=$warning.ToInt64();owner=$chooser.ToInt64();owner_pid=$coreId
++    caption=$scope.native_picker.validation_warning.caption;text=$scope.native_picker.validation_warning.text;observed=$true}
++  Record 'INVALID_WARNING_VERIFIED' $result.invalid_warning
++  Post-OwnedButton $warning 1 'WARNING_DISMISS' -Warning
++  $waitUntil=[DateTime]::UtcNow.AddSeconds(5)
++  do {$rows=@(OwnedDialogs);if ($rows.Count -eq 1 -and $rows[0].hwnd -eq $chooser.ToInt64() -and $rows[0].enabled) {break};Start-Sleep -Milliseconds 100}
++  while ([DateTime]::UtcNow -lt $waitUntil)
++  Assert-Chooser;$uncertain=$false
++  Require (-not (Test-Path -LiteralPath $invalid)) 'INVALID_INPUT_DID_NOT_CREATE_TARGET'
++  $result.invalid_kept_chooser_open=$true;Record 'INVALID_DISMISSED_SAME_CHOOSER_RETAINED' @{hwnd=$chooser.ToInt64()}
++  $phase='VALID_PATH'
++  Assert-Fixture
++  $result.valid_input=Enter-Path $fixture
++  # Input text remains non-authoritative. The real Shell must produce its PIDL,
++  # then production canonical/reparse/selectionRef checks and Main bootstrap run.
++  Assert-Fixture
++  Post-OwnedButton $chooser 1 'VALID_OK'
++  $waitUntil=[DateTime]::UtcNow.AddSeconds(10)
++  do {$rows=@(OwnedDialogs);if ($rows.Count -eq 0 -and -not [OwnedPathWin32]::IsWindow($chooser)) {break};Start-Sleep -Milliseconds 100}
++  while ([DateTime]::UtcNow -lt $waitUntil)
++  Require ($rows.Count -eq 0 -and -not [OwnedPathWin32]::IsWindow($chooser)) 'VALID_SHELL_DIALOG_CLOSED'
++  $uncertain=$false;$result.clicked_ok=$true;$result.status='VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING'
++  $result.authorization_state='SHELL_CONFIRM_OBSERVED_MAIN_BINDING_NOT_YET_VERIFIED'
++  Record 'VALID_SHELL_DIALOG_CLOSED' @{main_binding_required=$true;path=$fixture}
+ } catch {
+   $result.reason=$_.Exception.Message
+-  if ($okAttempted) {
+-    $result.cleanup.status='OK_OUTCOME_UNKNOWN_NO_FURTHER_CLICK'
+-  } elseif ($dialogValidated -and $hwnd -ne [IntPtr]::Zero) {
++  try {Record 'FAILURE' @{reason=$result.reason;uncertain=$uncertain;invalid_ok_attempted=$invalidOkAttempted;valid_ok_attempted=$validOkAttempted}} catch {}
++  if ($null -ne $script:journalFailure) {$uncertain=$true;$result.history_write_failure=$script:journalFailure}
++  if ($uncertain -or $validOkAttempted -or ($invalidOkAttempted -and -not $result.invalid_kept_chooser_open)) {
++    $result.cleanup.status='OUTCOME_UNKNOWN_NO_FURTHER_CLICK_ROOT_JOB_REQUIRED'
++    $result.authorization_state='UNKNOWN_NO_AUTHORIZATION_INFERRED_NO_RETRY'
++  } elseif ($dialogValidated) {
+     $result.cleanup.attempted=$true
+     try {
+-      # Failed path proof never permits OK. Cleanup may only use the same owned
+-      # dialog's normal IDCANCEL, revalidated through the bounded close window.
+-      $cancel = Get-OwnedDialogButton 2 -ForCleanup
+-      Assert-Dialog -ForCleanup
+-      [UIntPtr]$cancelResult = [UIntPtr]::Zero
+-      $cancelSent = [OwnedFolderWin32]::ClickTimeout($cancel,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero,2,1000,[ref]$cancelResult)
+-      if ($cancelSent -eq [IntPtr]::Zero) { throw 'IDCANCEL_CLICK_OUTCOME_UNCONFIRMED' }
+-      $result.cleanup.status='OWNED_IDCANCEL_CLICKED'
+-      $result.cleanup.hwnd=$hwnd.ToInt64().ToString()
+-      $result.authorization_state='NO_OK_CLICKED_NO_WORKSPACE_AUTHORIZATION_REQUESTED_BY_RUNNER'
+-    } catch {
+-      $result.cleanup.status='OWNERSHIP_OR_CANCEL_UNCONFIRMED_NO_FURTHER_ACTION'
+-      $result.cleanup.reason=$_.Exception.Message
+-    }
+-  } else {
+-    $result.cleanup.status='OWNERSHIP_UNCONFIRMED_NO_CLICK'
+-  }
++      Post-OwnedButton $chooser 2 'CANCEL' -ForCleanup
++      $limit=$cleanupDeadline
++      do {
++        Assert-Core -ForCleanup
++        if (-not [OwnedPathWin32]::IsWindow($chooser)) {break}
++        Start-Sleep -Milliseconds 100
++      } while ([DateTime]::UtcNow -lt $limit)
++      if ([OwnedPathWin32]::IsWindow($chooser)) {throw 'CANCEL_CLOSE_UNCONFIRMED'}
++      $uncertain=$false;$result.cleanup.status='OWNED_IDCANCEL_CLOSED'
++      $result.authorization_state='NO_VALID_OK_CONFIRMED'
++    } catch {$result.cleanup.status='OWNERSHIP_OR_CANCEL_UNKNOWN_ROOT_JOB_REQUIRED';$result.cleanup.reason=$_.Exception.Message}
++  } else {$result.cleanup.status='OWNERSHIP_UNCONFIRMED_NO_CLICK'}
+ } finally {
+-  $result.ok_attempted=$okAttempted
+-  if ($null -ne $process) { $process.Dispose() }
+-}
+-$result | ConvertTo-Json -Depth 12 -Compress
+-if (-not $result.clicked_ok) { exit 2 }
++  $result.phase=$phase;$result.invalid_ok_attempted=$invalidOkAttempted;$result.valid_ok_attempted=$validOkAttempted
++  $result.history=$history.ToArray();$result.outcome_uncertain=$uncertain
++  if ($null -ne $process) {$process.Dispose()}
++}
++$result | ConvertTo-Json -Depth 14 -Compress
++if (-not $result.clicked_ok) {exit 2}

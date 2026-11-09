@@ -1,0 +1,24 @@
+# W09 C19 caller 独立 Source 审查
+
+结论：SOURCE_ACCEPTED_PENDING_ROOT_SCOPE_REGISTRATION_AND_ACTUAL。接受本次固定 prepare/producer caller 与 choice 的 Source；不授予执行权限，不登记 commands，不签发 C19/W09/formal42 接受。
+
+输入 handoff93b284118a5f099fc9281930416cdd2671666db409b17791bec16473c06aa72e /2931，manifest85f0727b213249252fdaa19d3e183f480860b97cbb691350139ce0eb7503e2d8 /8040，27成员全部匹配。prepare e5233b68d50faa0777ce2de8319399bcc9139640fff55589da8157e31955e1b4 /9127；producer caller3d088a5f91493b9138eee4a45787914f31a7ebdacfc98cbae2edd23ed8b78d3d /15910；choice6a232e50cfdf942e36f8588066cabf1a571562264cb0f02275dbc6a042930b3c /9407。
+
+563项独立检查、153个输入pin通过。原六份v6 Source与既有非作者review.json批准的六个ref集合完全相同；packet内六份copy逐字节一致。既有APPROVE_SOURCE_ONLY结论、reader next-task、原H20 sparse caller独立审查的固定HDF/MF用于有限增量复核，未重跑原六Source实现审查或旧大规模检查。
+
+prepare所有函数、六次owned Git的完整try主体及finally与已接受base AST一致。变化限于五个新路径所需prepare部分、固定CP364/hash/bytes断言、Git pin、仅新receipt父目录创建及fresh环境检查。producer六个通用函数保持；完整caller diff连续且old/new切片逐块匹配，独立SequenceMatcher结果一致，完整前向/反向字节重建通过。producer finally仅移除不再存在的binary_guard，其余compiler/candidate/runtime/input四组收尾原样保留。新invoke会在异常时保留receipt；timeout判失败移到归档后，success路径仍拒绝timeout。
+
+新producer逻辑只复制六个原v6文件，不跑gofmt。先一次bounded owned Go list -test -deps -compiled -json，保留原全部编译字段、product范围、实际embeds、Go/tool refs并取得compiler guard；新增PACKAGE_MANIFEST属于明确输入。再一次420秒bounded owned locked-Python retrieval.py，W09/空check/C19/fixture环境固定。Git/Go/Python及helper pins与原资源策略保留，producer所有Git/Go子进程继承exclusive Job。此处仅确认Source保留了实际闭包采集路径，未采集/执行未来的Go编译闭包。
+
+一次producer结束后只接受此前不存在base下唯一新run-[0-9a-f]{32}目录，并与producer发出的report/tool-run引用核对。先将新目录原始文件复制到官方receipt native-packet并核对original/archive SHA和bytes，再断言producer成功、五个native IDs、两项selected/pass及tool/report同run与reportSHA。不存在latest选择、重试或第二次producer。失败时原receipt/streams及任何已复制partial保持，原worktree亦保留；后续消费者仍使用原始引用，不改写路径。receipt closure不是formal接受，Root actual复核必须另核每个guard和Job收尾，不能仅看validation.closed状态。
+
+独立确认实际顺序为ChainInvalidation然后ExplicitOriginAndUnknown：producer由TESTS有序列表再按CASE过滤，并非使用CASE列表排序。router只比较sorted roster，再把source selected_tests原顺序交给closure重建argv。新增独立内存AST桥接检查对test.research.fixture与test.retrieval两route得到完全相同run/ref/argv，未执行模块main、producer、真实formal consumer或业务校验。作者53个pure controls的固定结果和Source边界完整核验；不把这些synthetic对象当作native证据。旧reader示例的另一regex顺序只是示例，与当前实际producer顺序的有限修正已在本packet明确，不需要修改router或六Source。
+
+调用参数及五个新路径只以root-calling-contract.json为准，已逐一比对Source常量，审查前后均不存在。preparation为三个checkpoint参数，producer caller为choice SHA/bytes、checkpoint SHA/bytes/revision和新isolation.ready SHA/bytes；最后两个必须来自未来本次prepare实际结果。四个canonical bytes仍为固定CP364，未持有其OS guard句柄或写入。Root若登记范围导致canonical移动，必须先处理新的Source注册/固定checkpoint契约；本审查不允许将sealed CP364断言静默改成新值或重用旧ready。当前formal consumers仍NOT_RUN_REGISTRY_UNBOUND，registry和Main均未采用。
+
+本次独立SourceReadGuard已关闭，无error或retained handle。Python工具chunk55dc37 outer0/明确REVIEW_PYTHON_EXIT=0。没有运行Git、Go、SQL、producer、product native/API、私钥或模型；只写本次独立review目录。作者机械921的原IO按manifest保留，未改写为成功、未清零历史计数；本审查没有新机械失败。
+
+Root后续顺序仍为：窄范围实际注册与资源核验，一次producer，独立actual原始证据审查，两份route-specific FIXTURE决定绑定同一原run/report/tool-run，Root/W02串行登记两个exact C19 route，两个只读consumer消费同一份证据，再独立正式C19验收。正式42、其他cases和历史I01均没有新增接受。
+
+STOP/FINAL。
+

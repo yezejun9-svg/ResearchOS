@@ -1,0 +1,77 @@
+
+def validate_source_package(req,refs):
+    h=decode(add_ref(refs,req['source_package_hdf_ref']))
+    m=decode(add_ref(refs,req['source_package_mf_ref']))
+    add_ref(refs,req['source_contract_ref'])
+    need(h.get('source_helper_ref')==req['source_helper_ref']
+        and h.get('contract_ref')==req['source_contract_ref'],'OWN_SOURCE_PACKAGE_BINDING')
+    need(m.get('HDF_ref')==req['source_package_hdf_ref'],'OWN_MANIFEST_HDF_BINDING')
+    members=m.get('files')
+    need(type(members) is list and req['source_helper_ref'] in members
+        and req['source_contract_ref'] in members and req['source_package_hdf_ref'] in members,'OWN_PACKAGE_REQUIRED_MEMBERS')
+    home=Path(req['source_helper_ref']['path']).parent
+    for ref in members:
+        need(Path(ref['path']).is_relative_to(home),'OWN_PACKAGE_LOCAL_MEMBER')
+        add_ref(refs,ref)
+
+def validate_review_package(grant,req,review,refs):
+    h=decode(add_ref(refs,grant['independent_source_review_hdf_ref']))
+    m=decode(add_ref(refs,grant['independent_source_review_mf_ref']))
+    need(h.get('decision_ref')==grant['independent_source_review_ref']
+        and h.get('manifest_ref')==grant['independent_source_review_mf_ref'],'REVIEW_TRIPLET_BINDING')
+    bindings=dict(source_handoff_ref=req['source_package_hdf_ref'],source_manifest_ref=req['source_package_mf_ref'],
+        source_ref=req['source_helper_ref'],calling_contract_ref=req['source_contract_ref'],
+        review_author=review['review_author'],source_author=AUTHOR,independent_non_author=True,verdict='ACCEPTED_SOURCE_ONLY')
+    need(all(h.get(k)==v and review.get(k)==v for k,v in bindings.items()),'REVIEW_PACKAGE_CURRENT_SOURCE')
+    members=m.get('members')
+    need(type(members) is list and grant['independent_source_review_ref'] in members,'REVIEW_DECISION_MANIFEST_MEMBER')
+    home=Path(grant['independent_source_review_ref']['path']).parent
+    for ref in members:
+        need(Path(ref['path']).is_relative_to(home),'REVIEW_LOCAL_MEMBER')
+        add_ref(refs,ref)
+
+def root_observation_candidates(result):
+    output=result.get('payload',{}).get('output')
+    texts=[]
+    if type(output) is str:texts=[output]
+    elif type(output) is list:
+        need(all(type(item) is dict and item.get('type')=='input_text' and type(item.get('text')) is str for item in output),'ROOT_OUTPUT_TEXT_BLOCKS')
+        texts=[item['text'] for item in output]
+    else:raise Refusal('ROOT_OUTPUT_SHAPE')
+    found=[]
+    def inspect(value):
+        if type(value) is not dict:return
+        if value.get('schema')=='researchos.main24-authority-observation.v1':found.append(value);return
+        if 'chunk_id' in value:
+            need(value.get('exit_code')==0 and type(value.get('output')) is str,'ROOT_OBSERVATION_TOOL_SUCCESS')
+            for line in value['output'].splitlines():
+                if line.strip().startswith('{'):inspect(decode(line))
+    for text in texts:
+        stripped=text.strip()
+        if stripped.startswith('{'):inspect(decode(stripped))
+        elif stripped.startswith('Script completed\n'):
+            body=stripped.partition('Output:\n')[2]
+            if body.strip().startswith('{'):inspect(decode(body.strip()))
+        else:need(not stripped.startswith('Script failed'),'ROOT_OBSERVATION_OUTER_FAILED')
+    return found
+
+def validate_root_observation(records,payload_ref,payload):
+    need(type(records) is list and len(records)==3,'ROOT_OBSERVATION_THREE_RECORDS')
+    _,call,result=records
+    found=root_observation_candidates(result)
+    need(len(found)==1,'ROOT_TYPED_OBSERVATION_UNIQUE')
+    observed=found[0]
+    need(set(observed)=={'schema','actor_id','Root_thread_id','payload_ref','payload','observed_at'},'ROOT_TYPED_OBSERVATION_FIELDS')
+    need(observed['actor_id']==ROOT_ACTOR and observed['Root_thread_id']==ROOT_THREAD_ID
+        and observed['payload_ref']==payload_ref and observed['payload']==payload,'ROOT_TYPED_FULL_PAYLOAD_BINDING')
+    called=parse_stamp(call['timestamp']);seen=parse_stamp(observed['observed_at']);returned=parse_stamp(result['timestamp'])
+    issued=parse_stamp(payload['issued_at']);expires=parse_stamp(payload['expires_at'])
+    need(issued<=called<=seen<=returned<expires and returned<=datetime.now(timezone.utc),'ROOT_ACTUAL_CAUSAL_LEASE_ORDER')
+    return observed
+
+def verified_root_observation(audit_ref,payload_ref,payload,refs):
+    actual=actual_audit_gate(audit_ref,ROOT_ACTOR,payload_ref['sha256'],refs)
+    records=[decode(line) for line in checked(actual[1])[1].splitlines()]
+    return validate_root_observation(records,payload_ref,payload)
+
+

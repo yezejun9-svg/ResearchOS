@@ -1,0 +1,80 @@
+441: 	var initialized time.Time
+442: 	var cancelSent time.Time
+443: 	var deferredError error
+444: 	var firstError error
+445: 	var closing bool
+446: 	ctxDone := ctx.Done()
+447: 	var fence *time.Timer
+448: 	var fenceExpired <-chan time.Time
+449: 	defer func() {
+450: 		if fence != nil {
+451: 			fence.Stop()
+452: 		}
+453: 	}()
+454: 	closeAdmission := func(cause error, rejectedSeq int64) {
+455: 		if firstError == nil {
+456: 			firstError = cause
+457: 		}
+458: 		if closing {
+459: 			if rejectedSeq > 0 {
+460: 				registry.disqualify()
+461: 			}
+462: 			return
+463: 		}
+464: 		closing = true
+465: 		registry.close(rejectedSeq)
+466: 		cancelBroker()
+467: 		if rejectedSeq > 0 {
+468: 			bridge.Cancel("qualification first dispatch gate denied TOOL")
+469: 		} else {
+470: 			bridge.Cancel("protocol reconciliation failed")
+471: 		}
+472: 		fence = time.NewTimer(15 * time.Second)
+473: 		fenceExpired = fence.C
+474: 	}
+475: 	for frames != nil || inflight > 0 {
+476: 		select {
+477: 		case observation := <-bridge.ModelObservations():
+478: 			if closing {
+479: 				registry.disqualify()
+480: 				continue
+481: 			}
+482: 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+483: 			if err != nil {
+484: 				closeAdmission(err, 0)
+485: 				continue
+486: 			}
+487: 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+488: 				closeAdmission(err, 0)
+489: 				continue
+490: 			}
+491: 		case frame, ok := <-frames:
+492: 			if !ok {
+493: 				frames = nil
+494: 				continue
+495: 			}
+496: 			if closing {
+497: 				registry.disqualify()
+498: 				continue
+499: 			}
+500: 			if frame.Type == "effect.request" {
+501: 				if inflight >= 16 {
+502: 					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
+503: 					continue
+504: 				}
+505: 				if !registry.admit(frame) {
+506: 					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
+507: 					continue
+508: 				}
+509: 				inflight++
+510: 				go func(f rt.BridgeFrame) {
+511: 					r, e := c.brokerEffect(brokerCtx, route, run, lease, epoch, bridge, f)
+512: 					results <- completion{f.Sequence, r, e}
+513: 				}(frame)
+514: 			} else {
+515: 				var response any
+516: 				var err error
+517: 				if strings.HasPrefix(frame.Type, "command.") {
+518: 					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+519: 					if err == nil && frame.Type == "command.accepted" {
+520: 						payload, e := Decode(frame.Payload)

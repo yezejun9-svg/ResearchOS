@@ -1,0 +1,36 @@
+--- a/internal/domain/backup_configuration_upgrade_test.go
++++ b/internal/domain/backup_configuration_upgrade_test.go
+@@ -18,7 +18,10 @@
+ 
+ func configurationMigrationFiles(t *testing.T) []string {
+ 	t.Helper()
+-	files, err := filepath.Glob("../../migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql")
++	// Historical startup-guard tests retain their exact schema23 release even
++	// when the current checkout also contains the independently pinned0024.
++	root := configurationUpgradeReleaseFixture(t, 23)
++	files, err := filepath.Glob(filepath.Join(root, "migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql"))
+ 	if err != nil || len(files) != 23 {
+ 		t.Fatalf("actual migration inputs: %d %v", len(files), err)
+ 	}
+@@ -864,16 +867,18 @@
+ }
+ 
+ func TestConfigurationUpgradeFreshAndAdditiveGuard(t *testing.T) {
+-	ctx := context.Background()
++	ctx := context.Background()
++	// This historical guard verifies release23 even when Main has SQL24.
++	root := configurationUpgradeReleaseFixture(t, 23)
+ 	db, err := store.Open(filepath.Join(t.TempDir(), "empty.sqlite"))
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	defer db.Close()
+-	if err = store.Bootstrap(ctx, db, "../../migrations/sqlite/0001_bootstrap.sql"); err != nil {
++	if err = store.Bootstrap(ctx, db, filepath.Join(root, "migrations/sqlite/0001_bootstrap.sql")); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if _, err = New(db, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql"); err != nil {
++	if _, err = New(db, filepath.Join(root, "spec/v2.0/contracts"), filepath.Join(root, "migrations/sqlite/0002_domain.sql")); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if _, err = db.Exec(`INSERT INTO auth_principals(id,roles) VALUES('fixture-owner','["OWNER"]')`); err != nil {

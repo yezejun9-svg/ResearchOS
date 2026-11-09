@@ -1,0 +1,27 @@
+{
+  "diff": "--- R1\n+++ R2\n@@ -4,6 +4,7 @@\n  \"bytes\"\n  \"context\"\n  \"encoding/json\"\n+ \"errors\"\n  \"database/sql\"\n  \"os\"\n  \"path/filepath\"\n@@ -25,7 +26,10 @@\n  _, sqls, err := upgradeHistory20Release(source, 20)\n  if err != nil { t.Fatal(err) }\n  base := t.TempDir()\n- opt := LocalUpgradeOptions{Source: filepath.Join(base,\"source.sqlite\"), Snapshot: filepath.Join(base,\"backup\"), Destination: filepath.Join(base,\"candidate\"), KeyFile: filepath.Join(base,\"recovery.key\"), SourceRoot:source, TargetRoot:target, SourceProgram:filepath.Join(base,\"source.program\"), TargetProgram:filepath.Join(base,\"target.program\"), Plan:History20SchemaUpgradePlan}\n+ opt := LocalUpgradeOptions{Source: filepath.Join(base,\"source\",\"source.sqlite\"), Snapshot: filepath.Join(base,\"backup\"), Destination: filepath.Join(base,\"candidate\"), KeyFile: filepath.Join(base,\"key\",\"recovery.key\"), SourceRoot:source, TargetRoot:target, SourceProgram:filepath.Join(base,\"source.program\"), TargetProgram:filepath.Join(base,\"target.program\"), Plan:History20SchemaUpgradePlan}\n+ for _, dir := range []string{filepath.Dir(opt.Source),filepath.Dir(opt.KeyFile)} {\n+  if err = os.MkdirAll(dir,0700); err != nil { t.Fatal(err) }\n+ }\n  for path, data := range map[string][]byte{opt.KeyFile:bytes.Repeat([]byte{7},32), opt.SourceProgram:[]byte(\"PUBLIC_FIXTURE_SOURCE_PROGRAM_BYTES\"), opt.TargetProgram:[]byte(\"PUBLIC_FIXTURE_TARGET_PROGRAM_BYTES\")} {\n   if err = os.WriteFile(path,data,0600); err != nil { t.Fatal(err) }\n  }\n@@ -107,7 +111,13 @@\n     before=history20Rows(t,opt.Source)\n    }\n    _,err:=UpgradeLocal(context.Background(),opt)\n-   if err==nil {t.Fatal(\"source/release drift accepted\")}\n+   expectedError := map[string]string{\n+    \"migration-hash\":\"UPGRADE_RELEASE_HASH: 0021_research_pending_windows.sql\",\n+    \"extra-numbered-migration\":\"UPGRADE_RELEASE_MIGRATIONS: require exact 1..20\",\n+    \"foreign-table\":\"UPGRADE_SOURCE_SCHEMA\",\n+    \"session-addon\":\"UPGRADE_SOURCE_SCHEMA\",\n+   }[tc]\n+   if err==nil || err.Error()!=expectedError {t.Fatalf(\"expected %s for %s, got %v\",expectedError,tc,err)}\n    for _,p:=range []string{opt.Destination,opt.Snapshot} {if _,err:=os.Stat(p);!os.IsNotExist(err){t.Fatalf(\"early rejection published %s: %v\",p,err)}}\n    if Hash(history20Rows(t,opt.Source))!=Hash(before){t.Fatal(\"rejection mutated source\")}\n   })\n@@ -134,13 +144,19 @@\n  contracts,err:=LoadContracts(filepath.Join(opt.SourceRoot,\"spec/v2.0/contracts\"));if err!=nil {t.Fatal(err)}\n  svc:=&Service{DB:db,Contracts:contracts}\n  if _,err=svc.CreateBackup(context.Background(),opt.Snapshot,key);err!=nil {t.Fatal(err)}\n+ // This is a generic RestoreBackup component failure, not the public UpgradeLocal failure path.\n+ backupManifestBefore,err:=os.ReadFile(filepath.Join(opt.Snapshot,\"manifest.json\"));if err!=nil {t.Fatal(err)}\n+ callbackCalled:=false\n  _,err=RestoreBackup(context.Background(),opt.Snapshot,opt.Destination,RestoreOptions{Key:key,SupportedMigrations:upgradeVersions(20),Contracts:contracts,Migration:func(ctx context.Context,target *sql.DB) error {\n+  callbackCalled=true\n   if _,err:=target.ExecContext(ctx,\"CREATE TABLE fixture_unpublished(value TEXT)\");err!=nil{return err}\n   return context.Canceled\n  }})\n- if err==nil {t.Fatal(\"injected migration failure accepted\")}\n+ if !callbackCalled || !errors.Is(err,context.Canceled) {t.Fatalf(\"expected invoked migration callback and context.Canceled, called=%t err=%v\",callbackCalled,err)}\n  if _,err=os.Stat(opt.Destination);!os.IsNotExist(err){t.Fatalf(\"failed destination published: %v\",err)}\n  if _,err=os.Stat(opt.Snapshot);err!=nil {t.Fatal(\"backup lost\",err)}\n+ backupManifestAfter,err:=os.ReadFile(filepath.Join(opt.Snapshot,\"manifest.json\"));if err!=nil {t.Fatal(err)}\n+ if !bytes.Equal(backupManifestBefore,backupManifestAfter){t.Fatal(\"retained backup manifest changed\")}\n  now,err:=upgradeRows(db);if err!=nil {t.Fatal(err)}\n  if Hash(now)!=Hash(before){t.Fatal(\"source changed after isolated failure\")}\n }\n",
+  "expected_errors": {
+    "migration-hash": "UPGRADE_RELEASE_HASH: 0021_research_pending_windows.sql",
+    "extra-numbered-migration": "UPGRADE_RELEASE_MIGRATIONS: require exact 1..20",
+    "foreign-table": "UPGRADE_SOURCE_SCHEMA",
+    "session-addon": "UPGRADE_SOURCE_SCHEMA"
+  },
+  "selected_parents": [
+    "TestHistory20PublicUpgradePreservesSourceAndRevokesRestoredCredentials",
+    "TestHistory20RejectsReleaseAndSourceDrift",
+    "TestHistory20MigrationRollsBackDDLWhenLedgerInsertFails",
+    "TestHistory20RestoreFailureRetainsEncryptedBackupAndSource",
+    "TestHistory20ImplicitStartupStillRejectsPopulatedSource"
+  ],
+  "expected_terminals": [
+    "TestHistory20ImplicitStartupStillRejectsPopulatedSource",
+    "TestHistory20MigrationRollsBackDDLWhenLedgerInsertFails",
+    "TestHistory20PublicUpgradePreservesSourceAndRevokesRestoredCredentials",
+    "TestHistory20RejectsReleaseAndSourceDrift",
+    "TestHistory20RejectsReleaseAndSourceDrift/extra-numbered-migration",
+    "TestHistory20RejectsReleaseAndSourceDrift/foreign-table",
+    "TestHistory20RejectsReleaseAndSourceDrift/migration-hash",
+    "TestHistory20RejectsReleaseAndSourceDrift/session-addon",
+    "TestHistory20RestoreFailureRetainsEncryptedBackupAndSource"
+  ]
+}

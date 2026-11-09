@@ -1,0 +1,537 @@
+FILE docs/installation/README.md SHA256=da38a91af6a1dfdd235511a5d0575f476ddc53e7ed5d1b5550ff8a770126c2b0
+1:# Windows x64 R1 fixture bundle
+2:
+3:This ZIP is a reproducible **development fixture**. It does not install an SCM service, enable normal LIVE runtime execution, qualify a provider, activate a populated database, or satisfy clean Windows A15.
+4:
+5:The [Chinese workbench guide](user-guide.md) explains all eleven implemented screens, permissions, result states, and the existing screenshot index. Those screenshots are external historical evidence in the source checkout; they are not bundled. Using the UI requires an already authorized service and credentials; the fixture launcher does not issue login credentials or remove activation restrictions.
+6:
+7:Build from a frozen source commit on a Windows x64 build host with the exact locally provisioned Go 1.27.1, Node 24.9.0, npm 11.6.0, and Python 3.14.3 recorded in `execution/toolchains/locked.json`. The builder rejects dirty, missing, and untracked files across the package and Go/web build input trees, checks the source against HEAD before and after building, verifies tool hashes, uses `GOTOOLCHAIN=local`, runs `npm ci --offline`, and never invokes the repository's full-test CI script. Unrelated execution evidence can remain untracked. Its external JSON output records the archive SHA-256. Use two separate invocations and compare both archive hashes and every manifest file hash before distributing a candidate.
+8:
+9:```powershell
+10:$py = '<verified Python 3.14.3 path>'
+11:& $py ops/release/build.py --output 'C:\release-output\researchos-r1-a.zip'
+12:& $py ops/release/build.py --output 'C:\release-output\researchos-r1-b.zip'
+13:Get-FileHash -Algorithm SHA256 'C:\release-output\researchos-r1-*.zip'
+14:```
+15:
+16:Extract one ZIP into a new directory. Keep that directory read-only during operation. The manifest lists every packaged file except itself; verify it and compare the archive hash with a separately approved distribution receipt. The manifest and hashes establish integrity, not independent source trust or a signature. The package contains no development tool paths. Its `licenses/` entries contain locally present license texts; `sbom.license_gaps` remains an explicit release gap where a text was unavailable. The bundled `execution/commands.json` is the real construction registry; `release.reproduce` and other `UNBOUND` entries remain nonzero. Construction checks require an exact source checkout, pinned tools, and their own evidence roots. The bundled scripts do not turn those checks into installed-product acceptance.
+17:
+18:Use a new **absolute** data path outside the extracted package and a free loopback port other than 32736 or 79136. The example runs without credentials and creates only a fresh fixture database. `-Fresh` rejects existing data. It never points at the protected broker, an existing ResearchOS product database, or a production provider.
+19:
+20:```powershell
+21:$release = 'C:\release-output\researchos-r1-extracted'
+22:$data = 'C:\release-output\researchos-r1-fixture-data'
+23:& "$release\scripts\verify.ps1" -ReleaseRoot $release
+24:& "$release\scripts\start.ps1" -DataDir $data -Listen '127.0.0.1:19878' -Fresh
+25:Invoke-WebRequest 'http://127.0.0.1:19878/healthz' -UseBasicParsing
+26:& "$release\scripts\stop.ps1" -DataDir $data
+27:```
+28:
+29:The fixture stop script validates the recorded PID, process creation time, executable, and OS command-line instance/data/release binding before stopping the owned process. A missing or mismatched process leaves the identity file and data untouched. It preserves that directory, logs, and database. It is not the production drain/checkpoint/SCM protocol. To disable this fixture, stop it and leave data in place. To remove the package, delete only the extracted release directory after stopping it; retain data and receipts separately.
+30:
+31:The existing exact `schema13-to14-remote-access-v1` upgrade remains unchanged. The separate `schema13-to20-research-runtime-v1` plan pins all twenty frozen migrations and has bounded fixture evidence for preservation and recovery. Actual populated-database activation remains blocked; the fresh fixture launcher does not perform either upgrade.
+32:
+33:The package also includes `bin/release_host.exe`, the existing same-user fixture supervisor. Its persistent actual-control host, private READY checks, exclusive data-root lease and encrypted cutover snapshot mechanisms have bounded evidence. Restricted offline replay of the real control executable has bounded no-gain evidence and retains the stable slot. The scripts above still use the direct fixture start/stop path. Current-authority release proof and complete different-build cutover/rollback remain closed; the supervisor binary does not grant that qualification.
+34:
+35:Clean Windows installation, independent service identities and ACLs, actual update/rollback, W19 overnight evidence, and the full 42-case acceptance index remain incomplete. A successful current-user fixture run is evidence only for the packaged fixture start/stop path.
+FILE docs/installation/user-guide.md SHA256=c3aea987e0bcd0527d82b1b460e16b79edcb93dc91cd825220f6cfbb72d3bcb0
+1:# ResearchOS 工作台使用指南
+2:
+3:本指南按当前实现说明 11 个页面、可用操作和已有截图。当前分发包仍是 Windows x64 开发夹具，安装范围与启动方法见同目录的 [README](README.md)。夹具启动成功不等于已完成生产激活、获得登录凭据、运行器资格或真实手机验收。以下页面操作以已获授权、已能访问对应项目的服务为前提；包内启动脚本不提供凭据签发或解除激活限制的步骤。
+4:
+5:页面行为核对基线为源码提交 `a418d503f29646f62010905f9dc9338630aa0108`。截图来自末尾列出的历史冻结回执，演示真实产品页面配合开发数据的状态，并非本指南编写时重新拍摄。
+6:
+7:## 进入工作台与权限
+8:
+9:在已批准的服务地址打开浏览器。电脑登录页显示“访问令牌”和“打开工作台”；仅填写受保护管理流程已提供的有效令牌。令牌只留在当前页面内存，刷新或关闭页面后需重新认证。若现有分发环境只显示登录页且没有获授权凭据，应停留在该边界，本指南不提供额外激活或凭据生成办法。
+10:
+11:所有读取还需要项目授权；页面能显示一个按钮，不代表当前身份可以执行。无权访问、记录不存在、限流、超时和服务能力未提供会显示对应提示及可能的请求编号。不要把读取失败后的空区域理解为“没有数据”。
+12:
+13:| 操作 | 当前服务权限前置 |
+14:| --- | --- |
+15:| 查看获授权项目、证据、成果等 | 具备相应读取角色和项目范围；`READER` 可只读监督，受限产物另行检查权限。 |
+16:| 创建项目 | `OWNER`，并额外获准创建项目。 |
+17:| 工作台提交原始想法 | 当前项目 `OWNER`；原话确认须由同一提交者完成。 |
+18:| 任务暂停、恢复 | `OWNER`、`PLANNER` 或 `SCHEDULER`，且任务处于服务允许的状态。 |
+19:| 请求取消运行 | `OWNER` 或 `SCHEDULER`；仍需执行器确认。 |
+20:| 修改项目费用上限、运行策略 | 当前项目 `OWNER`。 |
+21:| 登记资源请求已解决 | `OWNER` 或 `SCHEDULER`，并提供当前可读的依据。 |
+22:| 标记自己的通知已读 | `OWNER` 或 `READER`，且通知属于当前身份。 |
+23:| 提交背景修改候选 | 创建提案需 `OWNER`、`PLANNER` 或 `SCHEDULER`；本页面还会封存产物，身份另需具备 `EXECUTOR`、`VERIFIER`、`SOURCE_ADAPTER` 或 `SCHEDULER` 之一。只有 `OWNER` 角色不保证整条表单成功。 |
+24:| 管理配对和设备 | 本机 `OWNER`；已配对设备不能再管理设备、创建项目或修改全局策略。 |
+25:
+26:独立验收还会检查来源、输入版本与验收者独立性。拥有多个角色、执行结束或点击提交都不能替代验收。
+27:
+28:## 页面入口速查
+29:
+30:地址中的 `{projectId}`、`{id}` 是已有记录的 ID，不是可照抄的字面地址。可从产品链接进入；没有指定详情 ID 时，周期、任务、成果和实验地址会先显示记录选择页。列表展示当前服务返回的记录，当前界面没有遍历全部历史页的通用翻页控件。
+31:
+32:| 页面 | 路径 | 通常从哪里进入 |
+33:| --- | --- | --- |
+34:| 1. 项目入口 | `/` | 点击顶部 ResearchOS 标识或左侧“切换项目”。 |
+35:| 2. 研究工作台 | `/p/{projectId}` | 点击已有项目，或导航“工作台”。 |
+36:| 3. 研究周期 | `/p/{projectId}/cycles/{id}` | 导航“研究周期”；有活动周期时直接打开，否则选择已保存记录。 |
+37:| 4. 任务详情 | `/p/{projectId}/tasks/{id}` | 工作台任务、意图规划或周期后续任务链接；也可打开 `/p/{projectId}/tasks` 选择。 |
+38:| 5. 成果审查 | `/p/{projectId}/releases/{id}` | 导航“成果审查”、最近成果、阶段侧栏或通知。 |
+39:| 6. 来源证据 | `/p/{projectId}/evidence` | 导航“来源证据”或周期候选链接。 |
+40:| 7. 实验与评测 | `/p/{projectId}/experiments/{id}` | 导航“实验评测”先选择，或从周期、技能详情进入。 |
+41:| 8. 知识与技能 | `/p/{projectId}/knowledge` | 导航“知识技能”。 |
+42:| 9. 团队与运行器 | `/p/{projectId}/team` | 导航“团队运行器”。 |
+43:| 10. 费用与资源 | `/p/{projectId}/resources` | 导航“费用资源”、工作台下一步或资源通知。 |
+44:| 11. 设置与设备 | `/p/{projectId}/settings` | 导航“设置设备”。 |
+45:
+46:## 1. 项目入口
+47:
+48:“已有项目”只列当前身份可访问的项目，点击项目名称打开工作台。“建立项目”要求填写项目名称、要解决的问题和首个明确范围，然后点击“创建项目”。服务创建成功后自动进入新项目。
+49:
+50:当前表单仅建立这些基本信息，初始事实、约束、来源配置和文档引用为空。它没有同时上传知识库、配置模型或接入来源的步骤。不能创建时先看权限或服务错误；不要把新项目创建成功当成运行器已就绪。
+51:
+52:## 2. 研究工作台
+53:
+54:先看“持续目标”“业务已验收”“待评审”，再查看意图规划、当前推进、来源覆盖、最近成果和下一步。业务统计排除意图规划及运行器资格任务；规划提案检查通过只说明规划可追溯、可检验，业务成果另行验收。
+55:
+56:提出工作时点击“提出新想法”，填写原话，再点击“确认原话并开始规划”。页面先保存原始 Requirement，再由同一用户确认原话，授权生成可审查规划。未完成提交的原话及提交身份保存在当前浏览器的项目草稿中；刷新后“继续提交”延续同一份提交，已开始的原话会锁定。若出现版本变化，核对原话后使用“核对后重试”，不要反复另建相同想法。
+57:
+58:提交成功后从“意图规划”打开对应任务，查看规划、资源缺口及独立检查。点击“当前推进”中的任务可查看执行细节。此页面没有一键宣布业务成功或绕过验收的功能。
+59:
+60:阶段侧栏显示各阶段“已验收 / 计划”及进行中、待评审、受阻数量，同时显示计划修订与事件水位。新计划增加任务时分母可能变大；这不表示已验收结果被撤回。未取得投影时显示尚不可用，不推算完成百分比。
+61:
+62:## 3. 研究周期
+63:
+64:打开周期后，先核对研究时间窗口和来源覆盖，再查看候选与核验、必需实验、后续任务和本轮结论。候选链接会定位到具体证据；实验与后续任务分别打开对应详情。
+65:
+66:`PARTIAL` 表示本轮仍有缺口。`NOT_CONFIGURED`、`RATE_LIMITED` 等来源状态以及 `gap_reason` 必须保留解释；来源没有配置、受限或抓取失败，不能解释为“已扫描且没有发现”。只有实际完成覆盖且记录数为零，才有对应窗口内的空结果含义，也不能外推成整个网络没有相关来源。
+67:
+68:“本轮尚无候选”可以是合法记录，但是否完成还要看必需来源、实验与结论。负向结论、`NO_IMPROVEMENT` 或证据不足不自动产生采纳，也不自动替换稳定版本。当前页面用于查看回执，未提供手工创建、关闭周期或直接改判候选的按钮。
+69:
+70:## 4. 任务详情
+71:
+72:页面上方显示任务状态、修订、冻结输入数量和当前 Run 状态。通过“摘要 / 过程 / 产物 / 检查”切换：摘要看执行报告和输入；过程看运行器、执行者、时间与最近关联事件；产物查看封存内容；检查查看独立验收结论及实际检查命令。标签支持方向键、Home 和 End。
+73:
+74:| 看到的状态 | 含义与下一步 |
+75:| --- | --- |
+76:| 结果提交／`EXECUTION_REPORTED` | 执行者已上报结果。任务显示“结果已提交”，还不计入已验收。若交接记录使用 `RUN_RESULT`，应核对实际 Task 状态；当前页面没有名为 RUN_RESULT 的状态或独立通过标志。 |
+77:| `VERIFYING`／验收中 | 检查正在进行，仍不是已验收。 |
+78:| `ACCEPTED`／已验收 | 任务通过独立验收；可在“检查”核对回执。意图规划任务的 ACCEPTED 仍不等于业务目标完成。 |
+79:| Run `SETTLED`／执行已结束 | 运行收尾状态，与 Task 的业务验收状态分开。 |
+80:| `CANCEL_REQUESTED`／取消请求中 | 请求已送达，执行器尚未确认；不能当成已取消。 |
+81:
+82:READY 或 RUNNING 任务显示“暂停”；BLOCKED 或 DEFERRED_NO_PROGRESS 显示“恢复”；尚未结束、尚未确认取消的活动运行显示“请求取消”。点击后等待服务回执，权限、依赖、状态和版本仍可能使操作被拒绝。页面没有人工填写 PASS、提交运行结果或直接创建验收回执的表单。
+83:
+84:## 5. 成果审查
+85:
+86:从最近成果或通知进入后，核对成果序号、创建时间、实际变化、开放问题、独立验收、采用决定和下一步。顶部“选择成果版本”可切换已有里程碑；成果序号与软件语义版本分别记录，未发布软件版本会明确显示。
+87:
+88:“查看实际检查与命令”展开关联验收回执。“封存产物”固定到该成果引用的修订和哈希；点击“受控预览”后先读取并核对内容。支持文本、简单 Markdown、JSON、图片、PDF 和隔离的无脚本 HTML 预览。普通预览成功后可“下载已核对的内容”；超过 5 MiB 的行内上限或预览出错时可尝试“受控下载”，下载仍核对权限与哈希，不会绕过失效状态。其他格式可下载后查看。
+89:
+90:原有产物保持只读。页面没有直接编辑封存内容、将未验收任务变成果或点击采用候选的操作。无采用决定就显示没有关联决定；空白成果列表也不表示执行没有发生，可回到任务检查是否仍在待评审。
+91:
+92:## 6. 来源证据
+93:
+94:使用检索词、来源、有效性、UTC 抓取日期范围及独立来源标识筛选列表。点击一条证据打开右侧详情；选中 ID 写入 `?focus={id}`，复制地址、前进后退或重新认证后可回到该证据。其他筛选条件是当前页面状态，不承诺刷新后保留。
+95:
+96:“服务端检索”需要非空检索词及筛选结果中的封存快照。它检索这些快照，最多请求 20 条命中，不是在线全网搜索。结果显示原文定位、摘录和有效性，点击“定位证据”可返回该条证据。出现警告或检索失败时保留其含义，不将失败改称无结果。
+97:
+98:详情包含证据种类、核验状态、有效性、原文 URL、上游版本、抓取时间、源头关系及快照哈希。未建立独立来源关系、模拟判断和已过期来源不能仅凭条目数当成独立支持。该页没有重新抓取来源、手工建立独立源关系或更改核验结论的控件；来源受限应回研究周期查看覆盖缺口。
+99:
+100:## 7. 实验与评测
+101:
+102:选中实验后核对假设、预注册哈希、测量模式、冻结范围和验收回执，再比较逐指标基线、候选与结果。`NO_IMPROVEMENT`、`INCONCLUSIVE` 都是合法结果，不触发稳定版本自动替换。
+103:
+104:“评测资格”列出服务返回的资格记录，不能将任意一条列表记录当成当前实验的资格证明；开发夹具也不替代正式资格。费用与完整性以关联报告为准，没有报告时保持未知。对于可访问的聚合评测 JSON，受控预览可展示预期、观测、通过、失败、错误、弃权、缺失、重复计数，以及费用、完整性和固定哈希。正式留出逐题内容不在工作台展示。
+105:
+106:当前页面用于核对结果及报告，没有新建、预注册、启动实验或直接授予正式资格的表单。
+107:
+108:## 8. 知识与技能
+109:
+110:点击技能版本查看状态、作用范围、修订、来源覆盖、失败来源、待处理冲突、独立验收、回滚版本与许可信息。存在关联实验时可跳转，内容产物使用同样的受控预览。
+111:
+112:“已处理 / 预期来源”要与失败数、冲突数一起看；候选与稳定版本的状态不能互换解释。当前页面没有技能创建、晋升、撤回或回滚按钮，记录中存在回滚版本 ID 也不表示这里可以执行回滚。缺服务能力时看明确错误，不把空列表当作已完成知识归纳。
+113:
+114:## 9. 团队与运行器
+115:
+116:“运行器”列出名称、状态和健康检查时间，点击“查看”展开能力与资格原始信息。“当前执行”展示服务返回的最近运行记录及状态，可能包含已经结束的运行；不是只有在线执行者。“Agent 消息”展示最近记录。
+117:
+118:登记、健康探针、真实运行与独立资格分别核对。一个角色名称或一条运行器记录不代表有在线员工，也不代表供应商已获正式资格。页面没有安装、登录、登记运行器、启动外部 CLI 或改变执行者权限的操作。无法运行时应查看资源请求与实际阻塞原因。
+119:
+120:## 10. 费用与资源
+121:
+122:先看当前金额策略和待处理资源，再读逐笔账目。“未知或待结算”对应缺少金额的记录，底层 `money=null` 不是金额 0；`UNKNOWN` 也不应计为已结算。页面按运行与供应商请求的最新记录区分已结算、在途预留和未知，同时保留逐笔金额、币种及费用依据，不提供跨币种合并总额。
+123:
+124:获授权 Owner 可在“修改项目上限”选择“不设金额上限”或“设定上限”。设定上限时填写金额、币种，并选择严格上限或按估算执行，点击“保存上限”。严格上限在费用未知时阻止新执行；估算方式允许记录未知费用，不能保证最终账单不超额。不设上限也不代表无限余额、供应商可用或没有并发限制。
+125:
+126:每条资源请求列明原因、受阻任务、可继续任务、保留产物、预计费用与恢复检查点。处理完实际缺口后，点击“登记解决”，填写解决依据，选择封存产物或来源证据，输入已有 ID，再点击“提交服务核查”。页面先读取并固定依据的修订，服务检查请求状态与引用有效性后登记解决；这不证明外部资源已恢复可用，也不直接恢复任务。输入错误、权限不足或版本变化时根据提示修正后再试，仍需核对后续执行状态。
+127:
+128:## 11. 设置与设备
+129:
+130:“研究与运行策略”可修改并发上限、研究周期秒数和时区，再“保存运行策略”；其余策略字段沿用已加载值。界面最小输入为并发 1、周期 60 秒，最终约束仍由服务检查。该操作不能替代来源接入或运行器资格。
+131:
+132:“项目背景候选”只编辑项目意图文本。点击“编辑项目背景草稿”冻结当前修订，编辑后选择“封存候选并请求重验”。成功表示已生成封存 JSON 候选和 ChangeProposal，等待独立验收，尚未直接覆盖项目背景。
+133:
+134:若外部修订已变化，页面并列保留本地草稿与外部背景，要求填写“人工合并后的背景”，再点“保存双方并提交合并候选”。双方文本与合并候选分别封存，不自动覆盖旧稿。可随时“导出保留的草稿”；与工作台原始想法不同，这里的未提交编辑主要在当前页面状态，离开或刷新前应导出。权限不足时保留当前草稿，并交由有封存权限的执行者处理，不能通过按钮绕过角色检查。
+135:
+136:“来源配置”当前只读展示类型、范围、启用与必需标记；凭据不返回前端，没有公开的凭据配置表单。
+137:
+138:“设备”仅在已获批准并启用的入口下使用：电脑 Owner 填写设备名称与已审核的入口 origin（不含路径），点击“生成只读配对链接”，再复制给目标设备。外部入口要求 HTTPS；链接五分钟内一次有效。手机打开链接、填写名称并“配对并打开工作台”，默认只读当前项目。电脑可显式“允许项目控制”、恢复只读或撤销设备。配对会话只留在页面内存，刷新或关闭后需重新配对；设备不能据此获得其他项目、受限产物或电脑管理权限。此流程的实现与开发证据不等于真实手机已验收；入口尚未批准启用时保持本机访问。
+139:
+140:## 双主题、窄屏、通知与恢复
+141:
+142:顶部“深色 / 浅色”切换主题，偏好保存在当前浏览器。桌面显示左侧导航及右侧阶段进度；中等宽度会收起文字与进度栏，可用顶部进度按钮打开。小于 768 CSS 像素时使用左上“打开导航”抽屉、右上“打开阶段进度”抽屉，以及底部工作台、周期、成果、资源四个入口。抽屉可用关闭按钮、遮罩或 Escape 关闭；打开时焦点限制在抽屉内，关闭后返回原按钮。截图中的 390px 是浏览器视口宽度，不是真实手机型号。
+143:
+144:顶部通知按钮打开自己的通知，可“标记已读”并跳转到关联成果或资源。已读状态与业务验收分开；重复接收事件不应生成重复业务结果。
+145:
+146:连接断开时页面提示“状态可能过期”及最后同步时间；尚未取得数据时显示尚未同步。最后同步表示收到快照或业务事件的时间，空闲心跳不是新的业务进展。普通请求超过约 30 秒会报超时；SSE 长时间静默会中止旧连接并重新核对快照。重新可见、页面恢复或检测到长时间停顿也会触发快照核对。
+147:
+148:连接恢复后先确认最新状态，再决定是否重试。使用统一写入入口的任务、策略、通知操作会在已同步后断线时阻止发送；其他表单仍可能尝试请求并显示失败，不能假定所有按钮都被禁用。界面没有统一离线写入队列，也不会在重连后自动重发全部控制操作。原始想法有自己的同一提交重试机制；其他表单应先核对服务记录与当前版本，避免把超时理解成必然未执行。
+149:
+150:当前已有静默流故障、断线提示、事件补齐、重复事件与项目切换的开发浏览器证据；完整 C26、真实浏览器冻结恢复、操作系统休眠恢复和真实手机仍未通过验收。请勿把连接图标恢复或一张窄屏截图当成这些条件已完成。
+151:
+152:## 已有截图与证据索引（分发包外部）
+153:
+154:以下链接相对本文件定位到**原源码仓库**的 `execution` 证据目录；需要打开完整源码仓库中的本指南才能查看。分发 ZIP 不包含这些截图或完整执行证据，所以包内链接不是内置图片资源。文件和哈希已在文档回执中机械核对，未新拍截图，也未用参考设计板充当产品截图。
+155:
+156:主要截图均为 Windows 上实际产品前端、开发服务与固定数据的浏览器观察，`1440`、`390` 表示 CSS 视口宽度。它们来自不同历史冻结版本，不能证明当前版本重新执行了整套验收。core 对应 `be8f6a7`、content 对应 `77c899b`、workflow 对应 `43ded7c`；当前行为仍以本指南基线源码和服务回执为准。项目入口与工作台部分主题截图没有现成文件，下面明确留空，不推断已通过。
+157:
+158:| 页面 | 浅色桌面 1440px | 深色桌面 1440px | 浅色窄屏 390px | 深色窄屏 390px |
+159:| --- | --- | --- | --- | --- |
+160:| 项目入口 | 未存独立截图 | 未存独立截图 | 未存独立截图 | 未存独立截图 |
+161:| 研究工作台 | [浅色桌面](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/workbench-1440.png) | 未存独立截图 | [浅色窄屏](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/workbench-390.png) | [深色窄屏](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/workbench-dark-390.png) |
+162:| 研究周期 | [light-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/cycles-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/cycles-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/cycles-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/cycles-dark-390.png) |
+163:| 任务详情 | [light-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/tasks-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/tasks-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/tasks-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/tasks-dark-390.png) |
+164:| 成果审查 | [light-1440](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/release-populated-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/release-populated-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/release-populated-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/release-populated-dark-390.png) |
+165:| 来源证据 | [light-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/evidence-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/evidence-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/evidence-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/evidence-dark-390.png) |
+166:| 实验与评测 | [light-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/experiment-populated-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/experiment-populated-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/experiment-populated-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/experiment-populated-dark-390.png) |
+167:| 知识与技能 | [light-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/knowledge-populated-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/knowledge-populated-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/knowledge-populated-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/knowledge-populated-dark-390.png) |
+168:| 团队与运行器 | [light-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/team-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/team-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/team-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/team-dark-390.png) |
+169:| 费用与资源 | [light-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/resources-populated-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/resources-populated-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/resources-populated-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/resources-populated-dark-390.png) |
+170:| 设置与设备 | [light-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/settings-light-1440.png) | [dark-1440](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/settings-dark-1440.png) | [light-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/settings-light-390.png) | [dark-390](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/settings-dark-390.png) |
+171:
+172:| 具体行为 | 已有截图或回执 | 观察边界 |
+173:| --- | --- | --- |
+174:| 背景冲突保留双方 | [冲突草稿](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/draft-conflict.png) | 本地开发 fixture；不是已应用背景修订。 |
+175:| 来源缺口 | [PARTIAL 周期](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/partial-cycle-detail.png) | 保留缺失来源，不解释为全面扫描。 |
+176:| 执行后仍待验收 | [结果已提交](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/task-awaiting-review.png) | 结果提交不等于 ACCEPTED。 |
+177:| 取消尚待确认 | [取消等待](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/task-cancel-waiting.png) | CANCEL_REQUESTED 不等于已取消。 |
+178:| 断线最后同步 | [断线提示](../../execution/receipts/W13/c26-recovery/browser/78b668c25d2c41d599c1cca1d8541eb2/offline-last-sync.png) | 窄屏/断线观察不是真实手机与 OS 休眠。 |
+179:| 单条事件流静默 | [状态过期提示](../../execution/receipts/W13/c26-recovery/browser/a1cf4f7592fe4cf387c46c929de845a1/silent-stream-stale.png) | 受控流故障；所属整轮 runner 失败，不改称整体 PASS。 |
+180:
+181:截图来源回执：[core](../../execution/receipts/W13/frontend/29c776dbf04f4fd3bdf5e64bf8669a42/report.json)、[content](../../execution/receipts/W13/frontend/88c7be0324ee4191b0459452e33fde11/report.json)、[workflow](../../execution/receipts/W13/frontend/2b1f7326c1374823b2ad6dc2a4380911/report.json)。独立范围说明见[UI 审查](../../execution/verifier/W13/ui-70db969/review.json)与[C26 部分证据审查](../../execution/verifier/W13/ui-recovery-c26/review.json)；后者明确保留五次整轮失败与未验证条件。完整原始证据可能包含施工环境信息，分发包不复制这些记录。
+SOURCE adapters/protectedstore/broker_windows.go SHA256=0f7a9d4bd97430feff311d3f552e7a34a86088d93460e20c3d81c0d6a26bf8e1
+16-	"golang.org/x/sys/windows/svc"
+17-	"golang.org/x/sys/windows/svc/mgr"
+18-)
+19-
+20:const CanaryServiceName = "ResearchOSVerifierCanary"
+21:const canaryPipe = `\\.\pipe\ResearchOSVerifierCanary-v1`
+22-const pipeClientRights = windows.FILE_READ_DATA | windows.FILE_WRITE_DATA | windows.SYNCHRONIZE
+23-
+24-// Windows also checks FILE_READ_ATTRIBUTES when opening the client endpoint.
+25-// Do not grant FILE_CREATE_PIPE_INSTANCE (0x4) through generic write access.
+26-const pipeClientACL = "0x100083"
+27-
+28-var brokerFiles = []string{"input.canary", "label.canary", "detail.canary", "log.canary"}
+29-
+30:// CanaryInstallRoot is fixed, not accepted from an IPC request or environment.
+31:func CanaryInstallRoot() (string, error) {
+32-	root, e := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
+33-	if e != nil {
+34-		return "", ErrUnavailable
+35-	}
+36:	return filepath.Join(root, CanaryServiceName), nil
+37-}
+38-
+39:func brokerSummary() (SafeSummary, *CanaryStore, error) {
+40:	root, e := CanaryInstallRoot()
+41-	if e != nil {
+42-		return SafeSummary{}, nil, e
+43-	}
+44-	private := filepath.Join(root, "data", "private")
+45:	store, e := OpenCanary(private)
+46-	if e != nil {
+47-		if _, stat := os.Stat(private); !os.IsNotExist(stat) {
+48-			return SafeSummary{}, nil, ErrBoundary
+49-		}
+50:		store, e = NewCanary(private)
+51-		if e != nil {
+52-			return SafeSummary{}, nil, e
+53-		}
+54-		for _, name := range brokerFiles {
+--
+67-	}
+68-	return SafeSummary{Schema: "researchos.protected-summary.v1", Status: "EXECUTION_REPORTED", Total: 4, Correct: 4, MaximumMode: "ADVISORY"}, store, nil
+69-}
+70-
+71:// RunCanaryService is the fixed installed verifier service. Its public pipe
+72-// accepts no filename, provider URL, credential, threshold or evaluation case.
+73:func RunCanaryService(readerSID string) error {
+74-	interactive, e := svc.IsWindowsService()
+75-	if e != nil || !interactive {
+76-		return ErrIsolation
+77-	}
+78:	account, _, _, e := windows.LookupSID("", `NT SERVICE\`+CanaryServiceName)
+79-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+80-	if e != nil || err != nil || user.User.Sid.String() != account.String() {
+81-		return ErrIsolation
+82-	}
+83-	reader, e := windows.StringToSid(readerSID)
+84-	if e != nil || !reader.IsValid() || readerSID == account.String() || !strings.HasPrefix(readerSID, "S-1-5-21-") {
+85-		return ErrBoundary
+86-	}
+87:	root, e := CanaryInstallRoot()
+88-	exe, err := os.Executable()
+89-	if e != nil || err != nil || !strings.EqualFold(exe, filepath.Join(root, "broker.exe")) {
+90-		return ErrBoundary
+91-	}
+92:	return svc.Run(CanaryServiceName, &canaryService{readerSID: readerSID})
+93-}
+94-
+95-type canaryService struct{ readerSID string }
+96-
+97:func (s *canaryService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+98:	changes <- svc.Status{State: svc.StartPending}
+99-	summary, store, e := brokerSummary()
+100-	if e != nil {
+101-		return true, 1
+102-	}
+--
+127-	}
+128-	defer windows.CloseHandle(configuration)
+129-	done := make(chan struct{})
+130-	configured := make(chan struct{})
+131:	go func() { defer close(done); serveCanaryPipe(ctx, h, summary, store, engine) }()
+132-	go func() { defer close(configured); serveConfigPipe(ctx, configuration, engine) }()
+133-	stop := func() { cancel(); <-done; <-configured; engine.wait() }
+134-	defer stop()
+135-	current := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+--
+182-	}
+183-	return false, 0
+184-}
+185-
+186:func waitBroker(ctx context.Context) bool {
+187-	select {
+188-	case <-ctx.Done():
+189-		return false
+190-	case <-time.After(25 * time.Millisecond):
+191-		return true
+192-	}
+193-}
+194:func pipeReadFrame(ctx context.Context, h windows.Handle, timeout time.Duration) (string, error) {
+195-	deadline := time.Now().Add(timeout)
+196-	for time.Now().Before(deadline) && ctx.Err() == nil {
+197-		var n uint32
+198-		buffer := make([]byte, 64)
+--
+208-		}
+209-	}
+210-	return "", ErrUnavailable
+211-}
+212:func serveCanaryPipe(ctx context.Context, h windows.Handle, summary SafeSummary, store *CanaryStore, engines ...*frozenEngine) {
+213-	for ctx.Err() == nil {
+214-		e := windows.ConnectNamedPipe(h, nil)
+215-		if e != nil && !errors.Is(e, windows.ERROR_PIPE_CONNECTED) {
+216-			if !errors.Is(e, windows.ERROR_PIPE_LISTENING) {
+--
+252-		windows.DisconnectNamedPipe(h)
+253-	}
+254-}
+255-
+256:// ProbeCanaryService verifies that SCM's running, expected virtual-account
+257-// service owns the connected pipe. It returns only a validated fixed aggregate.
+258:func ProbeCanaryService() (SafeSummary, error) {
+259-	return queryServiceSummary("summary-v1")
+260-}
+261-
+262-// QueryFrozenService exposes only the frozen start/status/aggregate vocabulary.
+263-// A status response during RUNNING contains no changing counters or key rows.
+264:func QueryFrozenService(command string) (SafeSummary, error) {
+265-	if command != "start-frozen-run" && command != "status" && command != "aggregate" {
+266-		return SafeSummary{}, ErrBoundary
+267-	}
+268-	summary, e := queryServiceSummary(command)
+--
+270-		return SafeSummary{}, ErrIntegrity
+271-	}
+272-	return summary, e
+273-}
+274:func queryServiceSummary(command string) (SafeSummary, error) {
+275-	deadline := time.Now().Add(3 * time.Second)
+276-	type result struct {
+277-		summary SafeSummary
+278-		err     error
+--
+288-		return SafeSummary{}, ErrUnavailable
+289-	}
+290-}
+291-
+292:func openClientPipe(pipeName string, deadline time.Time) (windows.Handle, error) {
+293-	for {
+294-		pipe, e := windows.CreateFile(windows.StringToUTF16Ptr(pipeName), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+295-		if !errors.Is(e, windows.ERROR_PIPE_BUSY) || !time.Now().Before(deadline) {
+296-			return pipe, e
+--
+299-		time.Sleep(min(10*time.Millisecond, time.Until(deadline)))
+300-	}
+301-}
+302-
+303:func connectServicePipe(pipeName string, deadline time.Time) (*os.File, *mgr.Service, uint32, error) {
+304:	scm, e := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+305-	if e != nil {
+306-		return nil, nil, 0, ErrUnavailable
+307-	}
+308-	m := &mgr.Mgr{Handle: scm}
+309-	defer m.Disconnect()
+310:	h, e := windows.OpenService(m.Handle, windows.StringToUTF16Ptr(CanaryServiceName), windows.SERVICE_QUERY_STATUS|windows.SERVICE_QUERY_CONFIG)
+311-	if e != nil {
+312-		return nil, nil, 0, ErrUnavailable
+313-	}
+314:	s := &mgr.Service{Name: CanaryServiceName, Handle: h}
+315-	ok := false
+316-	defer func() {
+317-		if !ok {
+318-			s.Close()
+319-		}
+320-	}()
+321-	config, e := s.Config()
+322:	if e != nil || !strings.EqualFold(config.ServiceStartName, `NT SERVICE\`+CanaryServiceName) {
+323-		return nil, nil, 0, ErrIsolation
+324-	}
+325:	root, err := CanaryInstallRoot()
+326:	if err != nil || !strings.HasPrefix(strings.ToLower(config.BinaryPathName), strings.ToLower(`"`+filepath.Join(root, "broker.exe")+`" --service --reader-sid S-1-5-21-`)) {
+327-		return nil, nil, 0, ErrBoundary
+328-	}
+329-	status, e := s.Query()
+330-	if e != nil || status.State != svc.Running || status.ProcessId == 0 {
+--
+342-	}
+343-	ok = true
+344-	return file, s, pid, nil
+345-}
+346:func probeServiceSummary(deadline time.Time, command string) (SafeSummary, error) {
+347-	file, s, pid, e := connectServicePipe(canaryPipe, deadline)
+348-	if e != nil {
+349-		return SafeSummary{}, e
+350-	}
+--
+358-	if e != nil || after.ProcessId != pid || after.State != svc.Running {
+359-		return SafeSummary{}, ErrIsolation
+360-	}
+361-	if summary.Frozen != nil {
+362:		root, e := CanaryInstallRoot()
+363-		if e != nil {
+364-			return SafeSummary{}, e
+365-		}
+366-		raw, e := os.ReadFile(filepath.Join(root, "broker.exe"))
+--
+370-	}
+371-	return summary, nil
+372-}
+373-
+374:func requestCanarySummary(file *os.File, deadline time.Time) (SafeSummary, error) {
+375-	return requestServiceSummary(file, deadline, "summary-v1")
+376-}
+377:func requestServiceSummary(file *os.File, deadline time.Time, command string) (SafeSummary, error) {
+378-	// Overlapped pipe handles are integrated with Go's Windows poller. One
+379-	// absolute deadline covers request, response and acknowledgement; timeout
+380-	// cancels the native operation even if the server never sends any bytes.
+381-	if file.SetDeadline(deadline) != nil {
+NATIVE_RG_EXIT=0
+SOURCE adapters/protectedstore/config_pipe_windows.go SHA256=b0423da2f121caacec704fe9288313a508b0480783a133f0928fef0ec9d3e9e7
+13-	"time"
+14-	"unsafe"
+15-)
+16-
+17:const configPipe = `\\.\pipe\ResearchOSVerifierCanary-config-v1`
+18-const configPrefix = "configure-v1:"
+19-
+20:func newConfigPipe(serviceSID string) (windows.Handle, error) {
+21-	return newConfigPipeNamed(configPipe, serviceSID)
+22-}
+23:func newConfigPipeNamed(pipeName, serviceSID string) (windows.Handle, error) {
+24-	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + serviceSID + ")(A;;" + pipeClientACL + ";;;BA)(A;;" + pipeClientACL + ";;;SY)")
+25-	if e != nil {
+26-		return 0, ErrBoundary
+27-	}
+--
+31-		return 0, ErrUnavailable
+32-	}
+33-	return h, nil
+34-}
+35:func readConfigFrame(ctx context.Context, h windows.Handle) ([]byte, error) {
+36-	deadline := time.Now().Add(2 * time.Second)
+37-	for time.Now().Before(deadline) && ctx.Err() == nil {
+38-		buffer := make([]byte, 8192)
+39-		var n uint32
+--
+50-		}
+51-	}
+52-	return nil, ErrUnavailable
+53-}
+54:func (e *frozenEngine) installCredential(raw []byte) error {
+55-	e.mu.Lock()
+56-	defer e.mu.Unlock()
+57-	if e.ctx.Err() != nil || privateExists(e.store, runMarkerFile) || privateExists(e.store, serviceCredentialFile) {
+58-		return ErrBoundary
+--
+65-	}
+66-	e.summary = newFrozenSummary("READY")
+67-	return nil
+68-}
+69:func serveConfigPipe(ctx context.Context, h windows.Handle, engine *frozenEngine) {
+70-	for ctx.Err() == nil {
+71-		err := windows.ConnectNamedPipe(h, nil)
+72-		if err != nil && !errors.Is(err, windows.ERROR_PIPE_CONNECTED) {
+73-			if !errors.Is(err, windows.ERROR_PIPE_LISTENING) {
+--
+93-}
+94-
+95-// ConfigureServiceCredential is callable only from the fixed installed binary
+96-// in an elevated installer process. The credential is never an argv/env value.
+97:func ConfigureServiceCredential(raw []byte) error {
+98-	if !windows.GetCurrentProcessToken().IsElevated() || !validCredential(raw) {
+99-		return ErrIsolation
+100-	}
+101:	root, e := CanaryInstallRoot()
+102-	exe, err := os.Executable()
+103-	if e != nil || err != nil || !strings.EqualFold(exe, filepath.Join(root, "broker.exe")) {
+104-		return ErrBoundary
+105-	}
+--
+116-	case <-timer.C:
+117-		return ErrUnavailable
+118-	}
+119-}
+120:func configureServiceCredential(raw []byte, deadline time.Time) error {
+121-	file, service, pid, e := connectServicePipe(configPipe, deadline)
+122-	if e != nil {
+123-		return e
+124-	}
+NATIVE_RG_EXIT=0
+CONTROL_DEFAULT_PRODUCT_FILE_EXISTENCE_ONLY
+{
+  "error": "Cannot find path 'D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\researchos-control.exe' because it does not exist.",
+  "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\researchos-control.exe",
+  "status": "UNKNOWN_OR_ABSENT"
+}
+{
+  "error": "Cannot find path 'D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime-verifier.exe' because it does not exist.",
+  "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime-verifier.exe",
+  "status": "UNKNOWN_OR_ABSENT"
+}
+{
+  "error": "Cannot find path 'D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime\\node.exe' because it does not exist.",
+  "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime\\node.exe",
+  "status": "UNKNOWN_OR_ABSENT"
+}
+{
+  "error": "Cannot find path 'D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime\\mu-worker.mjs' because it does not exist.",
+  "path": "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\resources\\control\\runtime\\mu-worker.mjs",
+  "status": "UNKNOWN_OR_ABSENT"
+}
+COMPACT_NATIVE_TARGET_TABLE_FROM_OWN_READS
+{
+  "rows": 67,
+  "original_full_descriptors": "file-ancestor-metadata.json",
+  "all_fileid_aux_success": true,
+  "interpretation": "Filtered ACE summary is not full effective AccessCheck or authorization"
+}

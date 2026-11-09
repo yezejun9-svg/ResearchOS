@@ -1,0 +1,196 @@
+package domain
+
+// This file is compiled ONLY in Root's isolated copy of the pinned schema22
+// source. It is not part of the current product's source overlay.
+import (
+    "context"
+    "database/sql"
+    _ "embed"
+    "encoding/json"
+    "fmt"
+    "io"
+    "os"
+    "path/filepath"
+    "strings"
+    "testing"
+    "time"
+)
+
+//go:embed schema22_bridge_inputs.json
+var historical22BridgeInputs []byte
+
+const historical22BridgeProfile = "schema22-public-fixture-v1"
+const historical22BridgePrefix = "SCHEMA22_FIXTURE_RESULT "
+const historical22BridgeInputSHA = "sha256:dac30037bdc1b6ebae7b9effd74fe84511f710560be259d1035ddf2887918981"
+
+type historical22BridgeRequest struct {
+    Profile string `json:"profile"`
+    Nonce string `json:"nonce"`
+    FixtureRoot string `json:"fixture_root"`
+    ReleaseRoot string `json:"release_root"`
+    Owner string `json:"owner"`
+}
+type historical22BridgeRelease struct {
+    Profile string `json:"profile"`
+    Nonce string `json:"nonce"`
+    Release bool `json:"release"`
+}
+type historical22BridgeCommand struct {
+    Envelope *Envelope `json:"envelope"`
+    Response *Response `json:"response"`
+}
+type historical22BridgeResult struct {
+    Profile string `json:"profile"`
+    Nonce string `json:"nonce"`
+    Source string `json:"source"`
+    Snapshot string `json:"snapshot"`
+    Destination string `json:"destination"`
+    KeyFile string `json:"key_file"`
+    SourceRoot string `json:"source_root"`
+    SourceProgram string `json:"source_program"`
+    SourceProgramSHA string `json:"source_program_sha256"`
+    SourceDatabaseSHA string `json:"source_database_sha256"`
+    SourceSchemaSHA string `json:"source_schema_sha256"`
+    SourceRowsSHA string `json:"source_rows_sha256"`
+    InputManifestSHA string `json:"input_manifest_sha256"`
+    Versions []int `json:"versions"`
+    Project string `json:"project"`
+    Session string `json:"session"`
+    RunID string `json:"run_id"`
+    RunEpoch int64 `json:"run_epoch"`
+    Commands []historical22BridgeCommand `json:"commands"`
+    FixturePhaseReceiptCount int `json:"fixture_phase_receipt_count"`
+    ExternalDispatchCount int `json:"external_dispatch_count"`
+}
+
+// All data paths must resolve inside a parent-created, fresh fixture directory.
+// Nonexistent output leaves are allowed only below an existing contained parent.
+func historical22FixturePath(root, path string) error {
+    resolvedRoot, err := filepath.EvalSymlinks(root)
+    if err != nil { return err }
+    if !filepath.IsAbs(path) { return fmt.Errorf("fixture path must be absolute") }
+    parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+    if err != nil { return err }
+    rel, err := filepath.Rel(resolvedRoot, parent)
+    if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+        return fmt.Errorf("fixture path escaped parent temporary root")
+    }
+    if _, err = os.Lstat(path); err == nil {
+        resolved, resolveErr := filepath.EvalSymlinks(path)
+        if resolveErr != nil { return resolveErr }
+        rel, resolveErr = filepath.Rel(resolvedRoot, resolved)
+        if resolveErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+            return fmt.Errorf("fixture member escaped parent temporary root")
+        }
+    } else if !os.IsNotExist(err) { return err }
+    return nil
+}
+
+func historical22CheckSource(t *testing.T, root string) {
+    t.Helper()
+    if Digest(historical22BridgeInputs) != historical22BridgeInputSHA {
+        t.Fatal("historical input manifest bytes changed")
+    }
+    var inputs struct { Commit string `json:"commit"`; Files map[string]string `json:"files"` }
+    if err := json.Unmarshal(historical22BridgeInputs, &inputs); err != nil { t.Fatal(err) }
+    if inputs.Commit != "396287cc5427eb125aaedb8a2b7fadf63e6b9322" || len(inputs.Files) != 502 {
+        t.Fatal("historical input manifest profile mismatch")
+    }
+    for rel, expected := range inputs.Files {
+        path := filepath.Join(root, filepath.FromSlash(rel))
+        if err := historical22FixturePath(root, path); err != nil { t.Fatal(err) }
+        raw, err := os.ReadFile(path)
+        if err != nil || Digest(raw) != "sha256:"+expected {
+            t.Fatalf("historical input changed: %s", rel)
+        }
+    }
+}
+
+type historical22FixturePort struct { workspace string; admitErr error }
+func (p historical22FixturePort) ResolveGoalBinding(context.Context, *sql.Tx, string, string, string) (string, string, error) {
+    return p.workspace, "fixture-unqualified-model", nil
+}
+func (p historical22FixturePort) ValidateBinding(_ context.Context, _ *sql.Tx, _, _, workspace, model string) error {
+    if workspace != p.workspace || model != "fixture-unqualified-model" { return fmt.Errorf("fixture binding mismatch") }
+    return nil
+}
+func (p historical22FixturePort) AdmitTurn(context.Context, *sql.Tx, string, string, Object) error { return p.admitErr }
+
+func historical22ProtocolSchema(t *testing.T, root string) *SchemaDoc {
+    t.Helper()
+    raw, err := os.ReadFile(filepath.Join(root, "internal/api/contracts/client.protocol.schema.json"))
+    if err != nil { t.Fatal(err) }
+    external, err := os.ReadFile(filepath.Join(root, "internal/api/contracts/domain.schema.json"))
+    if err != nil { t.Fatal(err) }
+    doc, err := LoadSchemaWithExternals(raw, map[string][]byte{"domain.schema.json": external})
+    if err != nil { t.Fatal(err) }
+    return doc
+}
+
+func TestConfigurationHistorical22FixtureBridge(t *testing.T) {
+    // This test is a private stdin bridge. Absence is an error, never a skip.
+    if os.Getenv("RESEARCHOS_CONFIGURATION_SCHEMA22_BRIDGE") != "1" {
+        t.Fatal("explicit schema22 fixture bridge invocation required")
+    }
+    decoder := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024))
+    decoder.DisallowUnknownFields()
+    var request historical22BridgeRequest
+    if err := decoder.Decode(&request); err != nil { t.Fatal("private fixture request decode failed") }
+    if request.Profile != historical22BridgeProfile || len(request.Nonce) < 16 || request.Owner != "queue-upgrade-owner" {
+        t.Fatal("private fixture request scope mismatch")
+    }
+    // Only the non-secret nonce is persisted. Principal and credentials are not.
+    marker, err := os.ReadFile(filepath.Join(request.FixtureRoot, ".schema22-fixture-nonce"))
+    if err != nil || string(marker) != request.Nonce { t.Fatal("fixture parent marker mismatch") }
+    actualTemp, err := filepath.EvalSymlinks(os.TempDir())
+    if err != nil { t.Fatal(err) }
+    expectedTemp, err := filepath.EvalSymlinks(request.FixtureRoot)
+    if err != nil || !strings.EqualFold(actualTemp, expectedTemp) { t.Fatal("fixture temporary root mismatch") }
+    cwd, err := os.Getwd()
+    if err != nil { t.Fatal(err) }
+    codeRoot, err := filepath.EvalSymlinks(filepath.Join(cwd, "../.."))
+    if err != nil { t.Fatal(err) }
+    requestedCodeRoot, err := filepath.EvalSymlinks(request.ReleaseRoot)
+    if err != nil || !strings.EqualFold(codeRoot, requestedCodeRoot) { t.Fatal("fixture historical release root mismatch") }
+    historical22CheckSource(t, codeRoot)
+
+    // Reuse the original public fixture entry points in this old package.
+    // Credentials are minted inside this child and remain in memory only.
+    opt, f := queueUpgradeFixture(t)
+    if f.owner != request.Owner { t.Fatal("private fixture owner mismatch") }
+    raw, err := os.ReadFile(filepath.Join(codeRoot, "migrations/sqlite/0022_client_command_queue.sql"))
+    if err != nil { t.Fatal(err) }
+    additive, err := os.ReadFile(filepath.Join(codeRoot, "migrations/sqlite/next_v24_sessions.sql"))
+    if err != nil { t.Fatal(err) }
+    if err = upgradeQueueMigration(context.Background(), f.db, raw, additive); err != nil { t.Fatal(err) }
+    opt.SourceRoot = codeRoot
+    // The matched old New path must be a no-op on exact populated22.
+    schemaBefore, err := backupSchema(f.db)
+    if err != nil { t.Fatal(err) }
+    rowsBefore, err := upgradeRows(f.db)
+    if err != nil { t.Fatal(err) }
+    f.s, err = New(f.db, filepath.Join(codeRoot, "spec/v2.0/contracts"), filepath.Join(codeRoot, "migrations/sqlite/0002_domain.sql"))
+    if err != nil { t.Fatal(err) }
+    f.h = f.s.Handler()
+    schemaAfter, err := backupSchema(f.db)
+    if err != nil || schemaAfter != schemaBefore { t.Fatal("historical22 New changed schema") }
+    rowsAfter, err := upgradeRows(f.db)
+    if err != nil || Hash(rowsAfter) != Hash(rowsBefore) { t.Fatal("historical22 New changed rows") }
+    versions, err := backupMigrations(f.db)
+    if err != nil || Hash(versions) != Hash(upgradeVersions(22)) { t.Fatal("historical22 version inventory mismatch") }
+
+    var svc *ClientService
+    commands := []historical22BridgeCommand{}
+    publicCommand := func(env *Envelope) *Response {
+        decoded, err := DecodeEnvelope(Bytes(env))
+        if err != nil { t.Fatal(err) }
+        tx, err := f.db.Begin()
+        if err != nil { t.Fatal(err) }
+        defer tx.Rollback()
+        reply, _, err := svc.Execute(context.Background(), tx, decoded, f.owner)
+        if err != nil { t.Fatal(err) }
+        if err = tx.Commit(); err != nil { t.Fatal(err) }
+        commands = append(commands, historical22BridgeCommand{Envelope: decoded, Response: reply})
+        return reply
+    }
+

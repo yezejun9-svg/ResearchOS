@@ -1,0 +1,387 @@
+--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/typed_runtime_goal_fixture_source_codex/4396cf0cc13f1f247afbd3c567b1d931/candidate-root/internal/domain/runtime_typed_client_fixture_windows_test.go
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/typed_runtime_goal_fixture_jsonl_revision_codex/3adf21aec07c4b5db6eb2fcf317f85e9/candidate-root/internal/domain/runtime_typed_client_fixture_windows_test.go
+@@ -15,9 +15,12 @@
+ 	"os/exec"
+ 	"path/filepath"
+ 	"regexp"
++	"runtime"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
++	"unicode/utf8"
+ )
+ 
+ // These ports are SYNTHETIC fixtures, not a live provider, protected credential,
+@@ -67,9 +70,211 @@
+ 	}
+ }
+ 
+-// Each original native case runs its complete original assertions in an exact
+-// child. The Root-owned Go Job must cover this child and all SDK descendants;
+-// a zero child exit alone never certifies descendant closure or formal acceptance.
++const typedRuntimeFixtureJSONPackage = "researchos.local/research-os/internal/domain"
++const typedRuntimeFixtureGoSHA256 = "d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490"
++
++type typedRuntimeFixtureEvent struct {
++	Action string
++	Package string
++	Test string
++	Time string
++	Output *string
++	Elapsed *float64
++}
++
++// Decode each JSONL object once, rejecting duplicate or unknown keys and trailing
++// values. Ordinary text output never supplies run/pass evidence.
++func typedRuntimeFixtureDecodeEvent(raw []byte) (typedRuntimeFixtureEvent, error) {
++	var event typedRuntimeFixtureEvent
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	token, err := decoder.Token()
++	if err != nil || token != json.Delim('{') {
++		return event, fmt.Errorf("event is not a JSON object")
++	}
++	fields := map[string]bool{}
++	for decoder.More() {
++		token, err = decoder.Token()
++		key, ok := token.(string)
++		if err != nil || !ok || fields[key] {
++			return event, fmt.Errorf("invalid or duplicate event field")
++		}
++		fields[key] = true
++		var value json.RawMessage
++		if err := decoder.Decode(&value); err != nil || bytes.Equal(value, []byte("null")) {
++			return event, fmt.Errorf("invalid event field value")
++		}
++		switch key {
++		case "Action":
++			err = json.Unmarshal(value, &event.Action)
++		case "Package":
++			err = json.Unmarshal(value, &event.Package)
++		case "Test":
++			err = json.Unmarshal(value, &event.Test)
++			if err == nil && event.Test == "" {
++				err = fmt.Errorf("empty scoped Test")
++			}
++		case "Time":
++			err = json.Unmarshal(value, &event.Time)
++		case "Output":
++			var output string
++			err = json.Unmarshal(value, &output)
++			event.Output = &output
++		case "Elapsed":
++			var elapsed float64
++			err = json.Unmarshal(value, &elapsed)
++			event.Elapsed = &elapsed
++			if err == nil && elapsed < 0 {
++				err = fmt.Errorf("negative elapsed duration")
++			}
++		default:
++			return event, fmt.Errorf("unexpected event field")
++		}
++		if err != nil {
++			return event, fmt.Errorf("event field type or value differs")
++		}
++	}
++	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
++		return event, fmt.Errorf("event object not closed")
++	}
++	var trailing any
++	if err = decoder.Decode(&trailing); err != io.EOF {
++		return event, fmt.Errorf("event contains trailing value")
++	}
++	if !fields["Action"] || !fields["Package"] || !fields["Time"] || event.Action == "" || event.Package != typedRuntimeFixtureJSONPackage {
++		return event, fmt.Errorf("event lacks exact action, package or timestamp")
++	}
++	if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
++		return event, fmt.Errorf("event timestamp differs")
++	}
++	return event, nil
++}
++
++// A finite state machine requires one run and one terminal pass for the exact
++// parent and every expected original leaf, plus one package start/terminal pass.
++// Test output, elapsed text, or a partial successful scope never grants a pass.
++func typedRuntimeFixtureVerifyJSONL(raw []byte, parent string, expected []string) (Object, error) {
++	if len(raw) == 0 || raw[len(raw)-1] != '\n' || !utf8.Valid(raw) {
++		return nil, fmt.Errorf("JSONL is empty, incomplete or not UTF-8")
++	}
++	states := map[string]int{parent: 0}
++	for _, leaf := range expected {
++		if leaf != parent && !strings.HasPrefix(leaf, parent+"/") {
++			return nil, fmt.Errorf("expected leaf is outside exact parent")
++		}
++		if _, exists := states[leaf]; exists && leaf != parent {
++			return nil, fmt.Errorf("duplicate expected leaf")
++		}
++		states[leaf] = 0
++	}
++	started, ended := false, false
++	lines := bytes.Split(raw[:len(raw)-1], []byte{'\n'})
++	for index, line := range lines {
++		if len(bytes.TrimSpace(line)) == 0 {
++			return nil, fmt.Errorf("JSONL line %d is empty", index+1)
++		}
++		event, err := typedRuntimeFixtureDecodeEvent(line)
++		if err != nil {
++			return nil, fmt.Errorf("JSONL line %d: %w", index+1, err)
++		}
++		if ended {
++			return nil, fmt.Errorf("JSONL event follows package terminal pass")
++		}
++		if event.Test != "" {
++			if _, allowed := states[event.Test]; !allowed {
++				return nil, fmt.Errorf("JSONL line %d has unexpected scoped Test", index+1)
++			}
++		}
++		switch event.Action {
++		case "start":
++			if started || event.Test != "" || event.Output != nil || event.Elapsed != nil || index != 0 {
++				return nil, fmt.Errorf("package start missing, misplaced or duplicate")
++			}
++			started = true
++		case "run":
++			if !started || event.Test == "" || states[event.Test] != 0 || event.Output != nil || event.Elapsed != nil {
++				return nil, fmt.Errorf("scoped run missing, misplaced or duplicate")
++			}
++			if event.Test != parent && states[parent] != 1 {
++				return nil, fmt.Errorf("leaf run is outside running parent")
++			}
++			states[event.Test] = 1
++		case "output":
++			if !started || event.Output == nil || event.Elapsed != nil || (event.Test != "" && states[event.Test] != 1) {
++				return nil, fmt.Errorf("output is outside active package or Test")
++			}
++		case "pass":
++			if !started || event.Output != nil || event.Elapsed == nil {
++				return nil, fmt.Errorf("terminal pass has invalid fields")
++			}
++			if event.Test == "" {
++				for _, state := range states {
++					if state != 2 {
++						return nil, fmt.Errorf("package passed with incomplete exact Test scope")
++					}
++				}
++				ended = true
++			} else {
++				if states[event.Test] != 1 {
++					return nil, fmt.Errorf("scoped terminal pass missing run or duplicate")
++				}
++				if event.Test == parent {
++					for test, state := range states {
++						if test != parent && state != 2 {
++							return nil, fmt.Errorf("parent passed with incomplete original leaf")
++						}
++					}
++				}
++				states[event.Test] = 2
++			}
++		default:
++			return nil, fmt.Errorf("JSONL line %d rejects fail, skip or unexpected action", index+1)
++		}
++	}
++	if !started || !ended {
++		return nil, fmt.Errorf("JSONL lacks unique package start and terminal pass")
++	}
++	tests := Object{}
++	for test, state := range states {
++		if state != 2 {
++			return nil, fmt.Errorf("JSONL lacks complete exact Test scope")
++		}
++		tests[test] = Object{"run_count": 1, "terminal_count": 1, "terminal_action": "pass"}
++	}
++	return Object{"package": typedRuntimeFixtureJSONPackage, "parent": parent, "expected_leaf_cases": expected, "line_count": len(lines), "tests": tests, "package_start_count": 1, "package_terminal_count": 1, "package_terminal_action": "pass"}, nil
++}
++
++func typedRuntimeFixturePin(t *testing.T, path, expectedSHA string) Object {
++	t.Helper()
++	if path == "" || !filepath.IsAbs(path) {
++		t.Fatal("explicit absolute pinned tool resource required")
++	}
++	resolved, err := filepath.EvalSymlinks(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(resolved)
++	if err != nil || !info.Mode().IsRegular() {
++		t.Fatal("pinned tool resource is not a regular file:", err)
++	}
++	raw, err := os.ReadFile(resolved)
++	if err != nil {
++		t.Fatal(err)
++	}
++	requested, err := os.ReadFile(path)
++	if err != nil || Digest(raw) != Digest(requested) {
++		t.Fatal("tool alias differs from resolved resource:", err)
++	}
++	if expectedSHA != "" && Digest(raw) != expectedSHA {
++		t.Fatal("tool resource differs from Root frozen SHA256")
++	}
++	return Object{"requested_path": path, "resolved_path": resolved, "sha256": Digest(raw), "bytes": len(raw)}
++}
++
++// Every original native case runs its complete original assertions in the same
++// compiled child through Root's frozen official cmd/test2json binary. Go/GOROOT
++// are pinned provenance; no automatic Go-tool/cache build is invoked. The Root
++// Go Job must cover test2json, the child and all SDK descendants; evidence alone
++// cannot certify actual parent exit, native child PID/exit or descendant closure.
+ func typedRuntimeFixtureChild(t *testing.T) bool {
+ 	t.Helper()
+ 	name := t.Name()
+@@ -92,18 +297,18 @@
+ 		t.Fatal("synthetic TLS child requested outside the eight native leaf scope")
+ 	}
+ 	exactRun := "-test.run=^" + regexp.QuoteMeta(name) + "$"
++	childArgs := []string{exactRun, "-test.v=test2json", "-test.count=1", "-test.timeout=180s"}
+ 	if child := os.Getenv(typedRuntimeFixtureChildEnv); child != "" {
+-		if child != name {
+-			t.Fatal("synthetic TLS child scope differs")
+-		}
+-		exact := false
+-		for _, arg := range os.Args[1:] {
+-			if arg == exactRun {
+-				exact = true
+-			}
+-		}
+-		if !exact || !strings.Contains(os.Getenv("GODEBUG"), "x509usefallbackroots=1") {
+-			t.Fatal("synthetic TLS child lacks exact isolated case and normal fallback trust")
++		exact := len(os.Args)-1 == len(childArgs)
++		if exact {
++			for index, arg := range childArgs {
++				if os.Args[index+1] != arg {
++					exact = false
++				}
++			}
++		}
++		if child != name || !exact || !strings.Contains(os.Getenv("GODEBUG"), "x509usefallbackroots=1") {
++			t.Fatal("synthetic TLS child lacks exact isolated argv and normal fallback trust")
+ 		}
+ 		return false
+ 	}
+@@ -118,19 +323,45 @@
+ 	if err := os.Mkdir(dir, 0700); err != nil {
+ 		t.Fatal("synthetic child evidence must use a fresh run directory:", err)
+ 	}
++	goResource := typedRuntimeFixturePin(t, os.Getenv("RESEARCHOS_GO"), typedRuntimeFixtureGoSHA256)
++	goroot := os.Getenv("GOROOT")
++	if goroot == "" || !filepath.IsAbs(goroot) {
++		t.Fatal("explicit absolute Root frozen GOROOT required")
++	}
++	goroot, err := filepath.EvalSymlinks(goroot)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rootGo := typedRuntimeFixturePin(t, filepath.Join(goroot, "bin", "go.exe"), typedRuntimeFixtureGoSHA256)
++	goInfo, goErr := os.Stat(Str(goResource, "resolved_path"))
++	rootInfo, rootErr := os.Stat(Str(rootGo, "resolved_path"))
++	if goErr != nil || rootErr != nil || !os.SameFile(goInfo, rootInfo) {
++		t.Fatal("RESEARCHOS_GO is not GOROOT/bin/go.exe")
++	}
++	versionResource := typedRuntimeFixturePin(t, filepath.Join(goroot, "VERSION"), "")
++	versionRaw, err := os.ReadFile(Str(versionResource, "resolved_path"))
++	if err != nil || strings.Split(strings.TrimSpace(string(versionRaw)), "\n")[0] != "go1.27.1" {
++		t.Fatal("Root GOROOT VERSION differs from go1.27.1:", err)
++	}
++	if runtime.GOOS != "windows" {
++		t.Fatal("typed native fixture requires Windows Go tool resources")
++	}
++	test2jsonSHA := os.Getenv("RESEARCHOS_TEST2JSON_SHA256")
++	if !regexp.MustCompile("^[0-9a-f]{64}$").MatchString(test2jsonSHA) {
++		t.Fatal("explicit Root frozen test2json SHA256 required")
++	}
++	test2json := typedRuntimeFixturePin(t, os.Getenv("RESEARCHOS_TEST2JSON"), test2jsonSHA)
+ 	executable, err := os.Executable()
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	binary, err := os.ReadFile(executable)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
++	childResource := typedRuntimeFixturePin(t, executable, "")
+ 	cwd, err := os.Getwd()
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	command := exec.Command(executable, exactRun, "-test.v", "-test.timeout=180s")
++	args := append([]string{"-p", typedRuntimeFixtureJSONPackage, "-t", Str(childResource, "resolved_path")}, childArgs...)
++	command := exec.Command(Str(test2json, "resolved_path"), args...)
+ 	debug := []string{}
+ 	for _, entry := range strings.Split(os.Getenv("GODEBUG"), ",") {
+ 		if entry != "" && !strings.HasPrefix(entry, "x509usefallbackroots=") {
+@@ -138,13 +369,18 @@
+ 		}
+ 	}
+ 	debug = append(debug, "x509usefallbackroots=1")
++	changed := Object{"GODEBUG": strings.Join(debug, ","), typedRuntimeFixtureChildEnv: name, "GOROOT": goroot, "GOTOOLCHAIN": "local", "GOENV": "off", "GOOS": runtime.GOOS, "GOARCH": runtime.GOARCH}
+ 	for _, entry := range os.Environ() {
+-		if !strings.HasPrefix(entry, "GODEBUG=") && !strings.HasPrefix(entry, typedRuntimeFixtureChildEnv+"=") {
++		key := strings.SplitN(entry, "=", 2)[0]
++		if _, replaced := changed[key]; !replaced {
+ 			command.Env = append(command.Env, entry)
+ 		}
+ 	}
+-	command.Env = append(command.Env, "GODEBUG="+strings.Join(debug, ","), typedRuntimeFixtureChildEnv+"="+name)
+-	invocation := Object{"case": name, "leaf_cases": expected, "executable": executable, "executable_hash": Digest(binary), "argv": command.Args[1:], "cwd": cwd, "started_at": Now(), "changed_environment": Object{"GODEBUG": strings.Join(debug, ","), typedRuntimeFixtureChildEnv: name}, "provider_kind": "SYNTHETIC_LOOPBACK_TLS", "formal_acceptance": false, "authority": "NONE"}
++	for key, value := range changed {
++		command.Env = append(command.Env, key+"="+value.(string))
++	}
++	resources := Object{"go": goResource, "GOROOT_go": rootGo, "GOROOT_VERSION": versionResource, "test2json": test2json, "compiled_child": childResource}
++	invocation := Object{"case": name, "leaf_cases": expected, "package": typedRuntimeFixtureJSONPackage, "runner_executable": command.Path, "argv": command.Args[1:], "child_argv": childArgs, "tool_resources": resources, "GOROOT": goroot, "cwd": cwd, "started_at": Now(), "changed_environment": changed, "provider_kind": "SYNTHETIC_LOOPBACK_TLS", "Root_Go_Job_required": true, "formal_acceptance": false, "authority": "NONE"}
+ 	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child-invocation.json"), Bytes(invocation))
+ 	var stdout, stderr bytes.Buffer
+ 	command.Stdout, command.Stderr = &stdout, &stderr
+@@ -161,27 +397,42 @@
+ 	if command.ProcessState != nil {
+ 		exit = command.ProcessState.ExitCode()
+ 	}
++	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child.stdout.jsonl"), stdout.Bytes())
+ 	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child.stdout.raw"), stdout.Bytes())
+ 	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child.stderr.raw"), stderr.Bytes())
+ 	var failure any
+ 	if err != nil {
+ 		failure = strings.ReplaceAll(err.Error(), typedRuntimeFixtureBearer, "[SYNTHETIC_CREDENTIAL_REDACTED]")
+ 	}
+-	childResult := Object{"case": name, "process_created": created, "pid": pid, "exit_code": exit, "error": failure, "finished_at": Now(), "stdout_hash": Digest(stdout.Bytes()), "stdout_bytes": stdout.Len(), "stderr_hash": Digest(stderr.Bytes()), "stderr_bytes": stderr.Len(), "formal_acceptance": false, "authority": "NONE"}
++	resourceChecks := Object{}
++	resourcesStable := true
++	for key, value := range resources {
++		resource := value.(map[string]any)
++		raw, readErr := os.ReadFile(Str(resource, "resolved_path"))
++		stable := readErr == nil && Digest(raw) == Str(resource, "sha256") && len(raw) == resource["bytes"].(int)
++		resourcesStable = resourcesStable && stable
++		var readFailure any
++		if readErr != nil {
++			readFailure = readErr.Error()
++		}
++		resourceChecks[key] = Object{"stable": stable, "read_error": readFailure}
++	}
++	eventVerdict, eventErr := typedRuntimeFixtureVerifyJSONL(stdout.Bytes(), name, expected)
++	var eventFailure any
++	if eventErr != nil {
++		eventFailure = eventErr.Error()
++	}
++	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child-event-verdict.json"), Bytes(Object{"verified": eventErr == nil, "events": eventVerdict, "error": eventFailure, "stdout_hash": Digest(stdout.Bytes()), "formal_acceptance": false, "authority": "NONE"}))
++	passed := created && err == nil && exit == 0 && resourcesStable && eventErr == nil
++	childResult := Object{"case": name, "runner_process_created": created, "actual_runner_pid": pid, "actual_runner_exit": exit, "runner_kind": "ROOT_FROZEN_OFFICIAL_TEST2JSON", "actual_native_child_pid": nil, "actual_native_child_exit": nil, "native_child_reconciliation": "PENDING_ROOT_GO_JOB", "error": failure, "finished_at": Now(), "stdout_hash": Digest(stdout.Bytes()), "stdout_bytes": stdout.Len(), "stderr_hash": Digest(stderr.Bytes()), "stderr_bytes": stderr.Len(), "resources_stable": resourcesStable, "resource_checks": resourceChecks, "child_jsonl_verified": eventErr == nil, "event_verdict": "child-event-verdict.json", "passed_observed_scope": passed, "formal_acceptance": false, "authority": "NONE"}
+ 	typedRuntimeFixtureWrite(t, filepath.Join(dir, "child-result.json"), Bytes(childResult))
+-	passed := created && err == nil && exit == 0 && !bytes.Contains(stdout.Bytes(), []byte("--- SKIP:")) && !bytes.Contains(stdout.Bytes(), []byte("--- FAIL:"))
+-	for _, leaf := range expected {
+-		if !bytes.Contains(stdout.Bytes(), []byte("=== RUN   "+leaf)) || !bytes.Contains(stdout.Bytes(), []byte("--- PASS: "+leaf+" (")) {
+-			passed = false
+-		}
+-	}
+-	typedRuntimeFixtureWrite(t, filepath.Join(dir, "parent-result.json"), Bytes(Object{"case": name, "expected_leaf_cases": expected, "child_assertions_passed": passed, "descendant_closure": "REQUIRES_ROOT_GO_JOB_RECEIPT", "formal_acceptance": false, "authority": "NONE", "child_result": "child-result.json", "finished_at": Now()}))
++	typedRuntimeFixtureWrite(t, filepath.Join(dir, "parent-result.json"), Bytes(Object{"case": name, "expected_leaf_cases": expected, "child_assertions_passed": passed, "actual_parent_exit": nil, "parent_reconciliation": "PENDING_ROOT_RECONCILIATION", "descendant_closure": "REQUIRES_ROOT_GO_JOB_RECEIPT", "formal_acceptance": false, "authority": "NONE", "child_result": "child-result.json", "finished_at": Now()}))
+ 	redactedStdout := strings.ReplaceAll(stdout.String(), typedRuntimeFixtureBearer, "[SYNTHETIC_CREDENTIAL_REDACTED]")
+ 	redactedStderr := strings.ReplaceAll(stderr.String(), typedRuntimeFixtureBearer, "[SYNTHETIC_CREDENTIAL_REDACTED]")
+ 	if !passed {
+-		t.Fatalf("synthetic TLS child failed; evidence=%s\n%s\n%s", dir, redactedStdout, redactedStderr)
+-	}
+-	t.Logf("SYNTHETIC_TYPED_RUNTIME_CHILD evidence=%s\n%s", dir, redactedStdout)
++		t.Fatalf("synthetic TLS child failed; evidence=%s event_error=%v\n%s\n%s", dir, eventFailure, redactedStdout, redactedStderr)
++	}
++	t.Logf("SYNTHETIC_TYPED_RUNTIME_CHILD_JSONL evidence=%s\n%s", dir, redactedStdout)
+ 	return true
+ }
+ 

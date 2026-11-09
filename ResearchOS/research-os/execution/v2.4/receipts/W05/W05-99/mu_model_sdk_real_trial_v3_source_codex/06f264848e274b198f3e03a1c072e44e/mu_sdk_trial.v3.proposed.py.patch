@@ -1,0 +1,327 @@
+--- a/mu_sdk_trial.v2.proposed.py
++++ b/mu_sdk_trial.v3.proposed.py
+@@ -33,6 +33,19 @@
+ MAX_RAW_BYTES = 2 * 1024 * 1024
+ SOURCE_COMMIT = "e2ee22a0e4d697bf98b46f10ebb58ae7e23159a7"
+ ROOT = Path("D:/作品集/ResearchOS/research-os")
++PHASE_BASIS_KEYS = (
++    "schema", "source_commit", "phase", "run_uuid",
++    "maximum_provider_requests", "qualification_requests", "ordinary_requests",
++    "requested_output_tokens_total", "total_wall_seconds",
++    "cli_binary", "intake_review", "public_route_manifest", "runtime_profile",
++    "cancel_fixture_receipt", "bootstrap_receipt", "credential_revision",
++    "data_root", "workspace", "repository_root", "discovery_file",
++    "cli_config_file", "outcome_dir", "once_path", "root_registration_started_at_utc",
++    "project_id", "goal_id", "runtime_id", "qualification_task_id",
++    "qualification_run_id", "qualification_epoch", "qualification_owner_root",
++    "qualification_profile_hash", "profile_entity_ref", "config_revision",
++    "prompt", "workspace_witness", "goal_objective",
++)
+ 
+ 
+ def require(ok, message):
+@@ -96,6 +109,47 @@
+     assigned = ctypes.c_int()
+     ok = kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, ctypes.byref(assigned))
+     require(ok != 0 and assigned.value != 0, "runner process outside Windows Job")
++
++
++def phase_basis(doc, mode):
++    """Closed consumed-input projection; excludes only later Root authority refs."""
++    require(all(key in doc for key in PHASE_BASIS_KEYS), "PHASE_BASIS_FIELD_MISSING")
++    cli = str(Path(doc["cli_binary"]["path"]))
++    if mode == "bootstrap":
++        commands = {
++            "cli-init": [cli, "init", doc["workspace"]],
++            "cli-goal": [cli, "goal", doc["goal_objective"], "--project",
++                         "<CLI_INIT_PROJECT_ID>"],
++        }
++    else:
++        commands = {
++            "cli-config": [cli, "config", "set-model", "--model", PROVIDER + "/" + MODEL,
++                           "--base-url", BASE, "--config-revision",
++                           str(doc["config_revision"]), "--credential-ref",
++                           CREDENTIAL_REF, "--default"],
++            "cli-run": [cli, "run", doc["prompt"], "--project", doc["project_id"],
++                        "--output", "jsonl"],
++        }
++    return {"schema": "researchos.mu-sdk-trial-phase-basis.v1",
++            "phase": mode, "run_uuid": doc["run_uuid"],
++            "source_ref": pin_path(Path(__file__).resolve()),
++            "consumed_input": {key: doc[key] for key in PHASE_BASIS_KEYS},
++            "child_argv": commands, "cwd": str(Path(doc["repository_root"])),
++            "child_environment": cli_environment(doc)}
++
++
++def authorized_child(doc, label, argv, cwd, env):
++    frozen = parse_pinned_json(doc["input_basis_ref"], "input_basis_ref")
++    require(frozen == phase_basis(doc, doc["phase"]) and
++            frozen == doc.get("_sealed_phase_basis"), "PHASE_BASIS_CHANGED_BEFORE_CHILD")
++    expected = frozen["child_argv"].get(label)
++    require(expected is not None, "UNAUTHORIZED_CHILD_LABEL")
++    if label == "cli-goal":
++        project = doc.get("_init_project_id")
++        require(isinstance(project, str) and project, "CLI_INIT_PROJECT_ID_MISSING")
++        expected = [project if value == "<CLI_INIT_PROJECT_ID>" else value for value in expected]
++    require(argv == expected and str(cwd) == frozen["cwd"] and
++            env == frozen["child_environment"], "CHILD_ARGV_CWD_ENV_CHANGED")
+ 
+ 
+ def authority_binding(doc, mode):
+@@ -116,10 +170,13 @@
+     limits = {"maximum_provider_requests": 3, "requested_output_tokens_total": 8192,
+               "total_wall_seconds": 300}
+     source_pin = pin_path(Path(__file__).resolve())
++    basis = parse_pinned_json(doc["input_basis_ref"], "input_basis_ref")
++    require(basis == phase_basis(doc, mode), "IMMUTABLE_PHASE_BASIS_CHANGED")
+     require(reg.get("schema") == "researchos.mu-sdk-trial-root-registration.v1" and
+             reg.get("actor_id") == "codex:/root" and reg.get("run_uuid") == uuid and
+             reg.get("phase") == mode and reg.get("source_commit") == SOURCE_COMMIT and
+             reg.get("source_ref") == source_pin and reg.get("limits") == limits and
++            reg.get("input_basis_ref") == doc["input_basis_ref"] and
+             reg.get("data_root") == doc["data_root"] and
+             reg.get("workspace") == doc["workspace"] and
+             reg.get("repository_root") == doc["repository_root"] and
+@@ -140,6 +197,7 @@
+             review.get("run_uuid") == uuid and
+             review.get("registration_ref") == doc["root_registration"] and
+             review.get("source_ref") == source_pin and
++            review.get("input_basis_ref") == doc["input_basis_ref"] and
+             review.get("runtime_profile_ref") == doc.get("runtime_profile") and
+             review.get("public_route_manifest_ref") == doc.get("public_route_manifest"),
+             "non-author source/scope review absent")
+@@ -150,6 +208,7 @@
+             grant.get("registration_ref") == doc["root_registration"] and
+             grant.get("review_ref") == doc["root_review"] and
+             grant.get("source_ref") == source_pin and grant.get("limits") == limits and
++            grant.get("input_basis_ref") == doc["input_basis_ref"] and
+             grant.get("once_path") == doc["once_path"] and
+             grant.get("data_root") == doc["data_root"] and
+             grant.get("workspace") == doc["workspace"] and
+@@ -220,6 +279,7 @@
+     require(once.is_absolute() and once.parent == data / "trial-once" and
+             once.name == uuid + ".json" and once.parent.is_dir() and not once.exists(),
+             "Root one-time grant already consumed or foreign")
++    doc["_sealed_phase_basis"] = basis
+     return deadline
+ 
+ 
+@@ -249,6 +309,39 @@
+     rows = [json.loads(row[0]) for row in db.execute(query, args)]
+     require(len(rows) == 1, kind + " exact identity missing or ambiguous")
+     return rows[0]
++
++
++def go_hash(value):
++    # The checked qualification vectors use JSON strings, integers and maps.
++    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
++                     separators=(",", ":"), allow_nan=False).encode("utf-8")
++    return "sha256:" + hashlib.sha256(raw).hexdigest()
++
++
++def exact_ref(ref, obj, kind):
++    expected = {"entity_type": kind, "id": obj["id"], "revision": obj["revision"],
++                "content_hash": obj.get("content_hash") if kind == "Artifact" else
++                obj.get("receipt_hash")}
++    require(ref == expected, kind + " EntityRef id/revision/content_hash changed")
++
++
++def object_by_ref(db, project, ref, kind):
++    require(isinstance(ref, dict) and ref.get("entity_type") == kind and
++            type(ref.get("revision")) is int and ref["revision"] > 0 and
++            isinstance(ref.get("id"), str), kind + " EntityRef shape changed")
++    rows = list(db.execute(
++        "SELECT body FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?",
++        (project, kind, ref["id"], ref["revision"])))
++    require(len(rows) == 1, kind + " EntityRef original version absent")
++    obj = json.loads(rows[0][0])
++    exact_ref(ref, obj, kind)
++    return obj
++
++
++def exact_artifact_ref(db, project, identity):
++    artifact = object_by_id(db, "Artifact", identity, project)
++    return {"entity_type": "Artifact", "id": artifact["id"],
++            "revision": artifact["revision"], "content_hash": artifact["content_hash"]}
+ 
+ 
+ def budget_chain(db, project, goal_id):
+@@ -437,9 +530,10 @@
+     guard_deadline(deadline, "one-time grant consumption completion")
+ 
+ 
+-def command_once(argv, cwd, env, directory, label, deadline):
++def command_once(doc, argv, cwd, env, directory, label, deadline):
+     # Reserve time for raw closure before spawning; the Root Job owns the hard kill.
+     require(deadline - time.monotonic() > 1.0, "absolute Root deadline lacks launch/evidence reserve")
++    authorized_child(doc, label, argv, cwd, env)
+     os_job_membership()
+     stdout = directory / (label + ".stdout.raw")
+     stderr = directory / (label + ".stderr.raw")
+@@ -475,6 +569,9 @@
+                         secondary.append(type(cleanup_exc).__name__ + ":" + str(cleanup_exc))
+     except BaseException as exc:
+         first_cause = first_cause or type(exc).__name__ + ":" + str(exc)
++    # Native exit is known now. Freeze it before any later raw hash/parse error.
++    if actual_exit is not None and actual_exit != 0 and first_cause is None:
++        first_cause = "CHILD_NONZERO_EXIT:" + str(actual_exit)
+     raw_refs = {}
+     for name, path in (("stdout_ref", stdout), ("stderr_ref", stderr)):
+         try:
+@@ -509,7 +606,7 @@
+     project, runtime_id, run_id = doc["project_id"], doc["runtime_id"], doc["qualification_run_id"]
+     task_id = doc["qualification_task_id"]
+     markers = list(db.execute(
+-        "SELECT task,run,runtime,epoch,plan_hash,profile_hash,owner_root FROM runtime_qualification_runs WHERE project=? AND run=?",
++        "SELECT task,run,runtime,epoch,plan_hash,profile_hash,contract_hash,input_hash,context_bundle,owner_root FROM runtime_qualification_runs WHERE project=? AND run=?",
+         (project, run_id)))
+     require(len(markers) == 1 and markers[0][:4] ==
+             (task_id, run_id, runtime_id, doc["qualification_epoch"]),
+@@ -517,9 +614,13 @@
+     task = object_by_id(db, "Task", task_id, project)
+     run = object_by_id(db, "Run", run_id, project)
+     runtime = object_by_id(db, "RuntimeRegistration", runtime_id, project)
++    marker = markers[0]
+     require(task.get("task_type") == "runtime_qualification" and task.get("status") == "ACCEPTED" and
++            task.get("active_run_id") == run_id and
+             run.get("task_id") == task_id and run.get("runtime_id") == runtime_id and
+-            run.get("lease_epoch") == markers[0][3] and runtime.get("status") == "AVAILABLE" and
++            run.get("status") == "SETTLED" and run.get("children_stopped") is True and
++            run.get("queue_empty") is True and
++            run.get("lease_epoch") == marker[3] and runtime.get("status") == "AVAILABLE" and
+             runtime.get("measurement_mode") == "LIVE", "qualification Task/Run/runtime state mismatch")
+     require(run.get("created_at", "") >= doc["root_registration_started_at_utc"],
+             "qualification was created before this Root trial")
+@@ -527,29 +628,97 @@
+                             (project, task_id, runtime_id)))
+     bindings = list(db.execute("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?",
+                                (project, runtime_id)))
+-    require(len(plans) == len(bindings) == 1 and plans[0][1] == markers[0][4] and
+-            plans[0][2] == markers[0][6] == doc["qualification_owner_root"] and
+-            bindings[0][1] == markers[0][5] == doc["qualification_profile_hash"],
++    require(len(plans) == len(bindings) == 1 and plans[0][1] == marker[4] and
++            plans[0][2] == marker[9] == doc["qualification_owner_root"] and
++            bindings[0][1] == marker[5] == doc["qualification_profile_hash"] and
++            marker[6] == task.get("acceptance_contract", {}).get("contract_hash") and
++            marker[7] == go_hash(task.get("input_refs")) and
++            marker[8] == task.get("context_bundle_id") == run.get("context_bundle_id"),
+             "current frozen plan/profile binding changed")
+     plan = json.loads(plans[0][0])
+     profile_ref = json.loads(bindings[0][0])
+-    require(plan.get("runtime_id") == runtime_id and plan.get("profile_ref") == profile_ref and
++    require(go_hash(plan) == marker[4] and go_hash(profile_ref) == marker[5] and
++            plan.get("runtime_id") == runtime_id and plan.get("profile_ref") == profile_ref and
+             profile_ref == doc["profile_entity_ref"] and
++            profile_ref in task.get("input_refs", []) and
+             task.get("acceptance_id") in runtime.get("qualification_ids", []) and
+             len(runtime.get("qualification_ids", [])) == 1,
+             "qualified runtime does not contain this accepted profile receipt")
++    acceptance = object_by_id(db, "AcceptanceReceipt", task["acceptance_id"], project)
++    subject = object_by_ref(db, project, acceptance["subject_ref"], "Task")
++    accepted_hash = go_hash({key: value for key, value in acceptance.items()
++                             if key != "receipt_hash"})
++    created = datetime.fromisoformat(acceptance["created_at"].replace("Z", "+00:00"))
++    valid = plan.get("max_validity_seconds")
++    require(acceptance.get("verdict") == "PASS" and
++            acceptance.get("receipt_hash") == accepted_hash and
++            acceptance.get("run_id") == run_id and
++            acceptance.get("measurement_mode") == "LIVE" and
++            acceptance.get("contract_hash") == marker[6] and
++            acceptance.get("input_refs") == task.get("input_refs") and
++            acceptance.get("executor_principal_ids") == [run.get("executor_principal_id")] and
++            acceptance.get("verifier_principal_id") not in (None, "", run.get("executor_principal_id")) and
++            subject.get("task_type") == "runtime_qualification" and
++            subject.get("status") == "EXECUTION_REPORTED" and
++            type(valid) is int and valid > 0 and
++            0 <= (datetime.now(timezone.utc) - created).total_seconds() < valid,
++            "independent current acceptance receipt changed or expired")
+     approvals = list(db.execute("SELECT run,receipt_ref,qualification_hash FROM runtime_qualification_approvals WHERE project=? AND runtime=? ORDER BY revision DESC LIMIT 1",
+                                 (project, runtime_id)))
+     require(len(approvals) == 1 and approvals[0][0] == run_id and
+-            json.loads(approvals[0][1]).get("entity_id") == task["acceptance_id"],
+-            "current approval belongs to another qualification")
+-    artifact = object_by_id(db, "Artifact", profile_ref["entity_id"], project)
++            approvals[0][2] == go_hash(runtime["qualification_ids"]),
++            "current approval belongs to another qualification vector")
++    log_ref = json.loads(approvals[0][1])
++    log_artifact = object_by_ref(db, project, log_ref, "Artifact")
++    output_ids = task.get("output_artifact_ids", [])
++    require(output_ids and output_ids == run.get("result_artifact_ids") and
++            acceptance.get("artifact_refs") ==
++            [exact_artifact_ref(db, project, item) for item in output_ids],
++            "independently accepted Run output vector changed")
++    uses = list(db.execute(
++        "SELECT storage_key FROM artifact_uses WHERE project=? AND artifact=? AND run=? AND epoch=?",
++        (project, log_ref["id"], run_id, marker[3])))
++    require(len(uses) == 1 and uses[0][0] == log_artifact["storage_key"],
++            "approved log Artifact does not belong to this Run epoch")
++    observations = list(db.execute(
++        "SELECT body,receipt_hash FROM runtime_observations WHERE project=? AND run=? AND epoch=? ORDER BY observed_at DESC LIMIT 1",
++        (project, run_id, marker[3])))
++    raw_log = list(db.execute(
++        "SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1",
++        (project, log_artifact["storage_key"])))
++    require(len(observations) == len(raw_log) == 1 and
++            len(raw_log[0][0]) == log_artifact["byte_size"] and
++            "sha256:" + hashlib.sha256(raw_log[0][0]).hexdigest() ==
++            log_artifact["content_hash"] == log_ref["content_hash"] and
++            json.loads(raw_log[0][0]) == json.loads(observations[0][0]) and
++            go_hash(json.loads(observations[0][0])) == observations[0][1],
++            "approved log bytes differ from trusted Run observation")
++    observation = json.loads(observations[0][0])
++    spec, protocol = observation.get("spec", {}), observation.get("protocol", {})
++    require(observation.get("state") == "SETTLED" and
++            observation.get("children_stopped") is True and
++            observation.get("queue_empty") is True and
++            protocol.get("settled") is True and
++            spec.get("run_id") == run_id and spec.get("task_id") == task_id and
++            spec.get("epoch") == marker[3] and spec.get("profile_hash") == marker[5] and
++            spec.get("technical_hash") == bindings[0][2],
++            "trusted native observation is not this qualification")
++    artifact = object_by_ref(db, project, profile_ref, "Artifact")
+     raw_profile = list(db.execute("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1",
+                                   (project, artifact["storage_key"])))
+-    require(len(raw_profile) == 1 and raw_profile[0][0] ==
+-            Path(doc["runtime_profile"]["path"]).read_bytes() and
++    technical = go_hash([runtime.get(key) for key in
++                         ("adapter", "adapter_revision", "capabilities", "platform",
++                          "measurement_mode", "credential_ref")])
++    require(len(raw_profile) == 1 and
++            len(raw_profile[0][0]) == doc["runtime_profile"]["bytes"] and
++            hashlib.sha256(raw_profile[0][0]).hexdigest() ==
++            doc["runtime_profile"]["sha256"] and
+             "sha256:" + hashlib.sha256(raw_profile[0][0]).hexdigest() == artifact["content_hash"] ==
+-            profile_ref["content_hash"], "sealed profile original bytes mismatch")
++            profile_ref["content_hash"] and
++            technical == bindings[0][2] and
++            json.loads(raw_profile[0][0]).get("runtime_id") == runtime_id and
++            json.loads(raw_profile[0][0]).get("technical_hash") == technical,
++            "sealed profile original bytes or technical identity mismatch")
+     model_rows = [row for row in effects(db, project, run_id) if row.get("payload", {}).get("capability") == "MODEL"]
+     require(counts(effects(db, project, run_id)) == {"MODEL": 1, "TOOL": 0} and
+             len(model_rows) == 1 and model_rows[0].get("state") == "CONFIRMED",
+@@ -676,10 +845,11 @@
+         with readonly_db(db_path) as db:
+             count = db.execute("SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'").fetchone()[0]
+             require(count == 0, "bootstrap requires an empty isolated product DB")
+-        init, init_rows = command_once([cli, "init", doc["workspace"]], cwd, env, output, "cli-init", deadline)
++        init, init_rows = command_once(doc, [cli, "init", doc["workspace"]], cwd, env, output, "cli-init", deadline)
+         project_ids = [row.get("project_id") for row in init_rows if row.get("project_id")]
+         require(len(set(project_ids)) == 1, "CLI init project identity missing")
+-        goal, goal_rows = command_once([cli, "goal", doc["goal_objective"], "--project", project_ids[0]],
++        doc["_init_project_id"] = project_ids[0]
++        goal, goal_rows = command_once(doc, [cli, "goal", doc["goal_objective"], "--project", project_ids[0]],
+                                        cwd, env, output, "cli-goal", deadline)
+         with readonly_db(db_path) as db:
+             goals = [json.loads(row[0]) for row in db.execute(
+@@ -702,8 +872,8 @@
+     config_argv = [cli, "config", "set-model", "--model", PROVIDER + "/" + MODEL,
+                    "--base-url", BASE, "--config-revision", str(doc["config_revision"]),
+                    "--credential-ref", CREDENTIAL_REF, "--default"]
+-    command_once(config_argv, cwd, env, output, "cli-config", deadline)
+-    command_once([cli, "run", doc["prompt"], "--project", doc["project_id"], "--output", "jsonl"],
++    command_once(doc, config_argv, cwd, env, output, "cli-config", deadline)
++    command_once(doc, [cli, "run", doc["prompt"], "--project", doc["project_id"], "--output", "jsonl"],
+                  cwd, env, output, "cli-run", deadline)
+     guard_deadline(deadline, "ordinary Run DB read")
+     with readonly_db(db_path) as db:

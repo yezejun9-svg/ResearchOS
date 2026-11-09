@@ -1,0 +1,266 @@
+diff --git a/internal/domain/runtime_drain_windows_test.go b/internal/domain/runtime_drain_windows_test.go
+index db2a71d..6e4e701 100644
+--- a/internal/domain/runtime_drain_windows_test.go
++++ b/internal/domain/runtime_drain_windows_test.go
+@@ -5,9 +5,7 @@ package domain
+ import (
+ 	"context"
+ 	"database/sql"
+-	"os"
+ 	"path/filepath"
+-	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -110,251 +108,6 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
+ 	t.Log("single borrower; busy scan/startup drain refusal; recovery completes before quiesce; abort keeps Serve alive; coordinator close retains DB owner lock")
+ }
+ 
+-func TestDesktopExitStoppedNativePreparationKeepsConsumedHistory(t *testing.T) {
+-	f, c, fence, proof := harnessPreparationFixture(t)
+-	initial, _ := harnessPreparationLedger(t, f, fence)
+-	if len(initial) != 1 {
+-		t.Fatal("original local hold missing", initial)
+-	}
+-	originalHold := Bytes(initial[0])
+-	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
+-		t.Fatal(err)
+-	}
+-	harnessPreparationReleased(t, f, fence, originalHold)
+-	c.startupComplete = true // The disposable fixture has no Serve loop.
+-	ctx := context.Background()
+-	before, err := f.s.RuntimeDrainSnapshot(ctx)
+-	if err != nil || before.UnresolvedDispatches != 1 || before.ActiveRuns != 0 || before.Reservations != 0 {
+-		t.Fatalf("expected one terminal consumed dispatch: %+v %v", before, err)
+-	}
+-	if raw, err := c.QuiesceForRelease(ctx); err == nil || raw.UnresolvedDispatches != 1 {
+-		t.Fatalf("generic release accepted consumed STARTED: %+v %v", raw, err)
+-	}
+-	got, err := c.QuiesceForDesktopExit(ctx)
+-	if err != nil || got.UnresolvedDispatches != 1 || !c.quiesced || c.ClientIntakeOpen() {
+-		t.Fatalf("Desktop exit rejected stopped original: %+v %v", got, err)
+-	}
+-	var state, reason string
+-	if err = f.db.QueryRow("SELECT state,reason FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?", f.project, fence.runID, fence.epoch).Scan(&state, &reason); err != nil {
+-		t.Fatal(err)
+-	}
+-	if state != "STARTED" || reason == "" {
+-		t.Fatal("Desktop exit changed consumed dispatch", state, reason)
+-	}
+-	c.ResumeAfterReleaseAbort()
+-	if err = c.finishHarnessPreparationFailure(fence, proof); err != nil {
+-		t.Fatal("identical settlement lost idempotence", err)
+-	}
+-	var audits, failures int
+-	if err = f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'").Scan(&audits); err != nil {
+-		t.Fatal(err)
+-	}
+-	if err = f.db.QueryRow("SELECT coalesce(sum(count),0) FROM orchestration_failures WHERE project=? AND reason_hash=?", f.project, Digest([]byte("native preparation failed before model launch"))).Scan(&failures); err != nil {
+-		t.Fatal(err)
+-	}
+-	if audits != 1 || failures != 1 {
+-		t.Fatal("Desktop exit duplicated settlement", audits, failures)
+-	}
+-	harnessPreparationReleased(t, f, fence, originalHold)
+-}
+-
+-// A fixture can deliberately rewrite privileged database facts to exercise
+-// validator boundaries. Ordinary API callers cannot write the C5 reason.
+-func desktopPreparationRewriteAudit(t *testing.T, f *fixture, fence harnessPreparationFence, change func(Object)) {
+-	t.Helper()
+-	var raw []byte
+-	var principal string
+-	if err := f.db.QueryRow("SELECT bytes,principal FROM uploaded_content WHERE project=? AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", f.project).Scan(&raw, &principal); err != nil {
+-		t.Fatal(err)
+-	}
+-	audit, err := Decode(raw)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	change(audit)
+-	raw = Bytes(audit)
+-	sourceTx(t, f.db, func(tx *sql.Tx) error {
+-		if _, err := f.s.serverArtifactMode(tx, f.project, principal, "LOG", "LIVE", raw, Empty()); err != nil {
+-			return err
+-		}
+-		_, err := tx.Exec("UPDATE runtime_dispatches SET reason=? WHERE project=? AND run=? AND epoch=?", "native preparation failed before model launch: "+Str(audit, "reason")+"; proof="+Hash(audit), f.project, fence.runID, fence.epoch)
+-		return err
+-	})
+-}
+-
+-func TestDesktopExitStoppedNativePreparationRejectsCounterevidence(t *testing.T) {
+-	cases := []struct {
+-		name   string
+-		mutate func(*testing.T, *fixture, *RuntimeCoordinator, harnessPreparationFence)
+-	}{
+-		{"unsealed_audit", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, _ harnessPreparationFence) {
+-			var key string
+-			if err := f.db.QueryRow("SELECT storage_key FROM uploaded_content WHERE project=? AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", f.project).Scan(&key); err != nil {
+-				t.Fatal(err)
+-			}
+-			if _, err := f.db.Exec("UPDATE uploaded_content SET sealed=0 WHERE storage_key=?", key); err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"duplicate_audit", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, _ harnessPreparationFence) {
+-			_, err := f.db.Exec("INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) SELECT ?,project,principal,bytes,content_hash,expires_at,1 FROM uploaded_content WHERE project=? AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", ID(), f.project)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"wrong_audit_hash", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("UPDATE runtime_dispatches SET reason='native preparation failed before model launch: QUALIFICATION_POLICY_VIOLATION; proof=sha256:0000' WHERE project=? AND run=?", f.project, fence.runID)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"wrong_epoch", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["epoch"] = "2" })
+-		}},
+-		{"wrong_run", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["run_id"] = ID() })
+-		}},
+-		{"wrong_task", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["task_id"] = ID() })
+-		}},
+-		{"wrong_source", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["source_binding_hash"] = Digest([]byte("other")) })
+-		}},
+-		{"wrong_worker", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["worker"] = ID() })
+-		}},
+-		{"wrong_manifest", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["manifest_hash"] = Digest([]byte("other")) })
+-		}},
+-		{"wrong_project_in_audit", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["project_id"] = ID() })
+-		}},
+-		{"wrong_same_project_uploader", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, _ harnessPreparationFence) {
+-			var key, original, other string
+-			if err := f.db.QueryRow("SELECT storage_key,principal FROM uploaded_content WHERE project=? AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", f.project).Scan(&key, &original); err != nil {
+-				t.Fatal(err)
+-			}
+-			if err := f.db.QueryRow("SELECT principal FROM auth_grants WHERE project=? AND principal<>? LIMIT 1", f.project, original).Scan(&other); err != nil {
+-				t.Fatal(err)
+-			}
+-			if _, err := f.db.Exec("UPDATE uploaded_content SET principal=? WHERE storage_key=?", other, key); err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"delegate", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["model_start_delegated"] = true })
+-		}},
+-		{"unknown_child", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) { a["qualification_no_child"] = false })
+-		}},
+-		{"incomplete_child", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			desktopPreparationRewriteAudit(t, f, fence, func(a Object) {
+-				a["qualification_no_child"] = false
+-				a["qualification_pid"] = 234
+-				a["streams_drained"] = false
+-			})
+-		}},
+-		{"model_identity", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("UPDATE runtime_dispatches SET identity='{\"pid\":1}' WHERE project=? AND run=?", f.project, fence.runID)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"external_observation", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)", f.project, fence.runID, fence.epoch, Digest([]byte("inert observation")), `{}`, Now())
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"confirmed_effect", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)", f.project, fence.runID, ID(), `{"state":"CONFIRMED"}`)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"model_marker", func(t *testing.T, _ *fixture, c *RuntimeCoordinator, fence harnessPreparationFence) {
+-			path := filepath.Join(c.config.DataRoot, "runtime-dispatches", fence.locator)
+-			if err := os.MkdirAll(path, 0700); err != nil {
+-				t.Fatal(err)
+-			}
+-			if err := os.WriteFile(filepath.Join(path, "native-turn-authorization.json"), []byte("counterevidence"), 0600); err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"missing_marker_root", func(_ *testing.T, _ *fixture, c *RuntimeCoordinator, _ harnessPreparationFence) {
+-			c.config.DataRoot = filepath.Join(c.config.DataRoot, "missing-native-root")
+-		}},
+-		{"ordinary_started", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("UPDATE runtime_dispatches SET reason='' WHERE project=? AND run=?", f.project, fence.runID)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"unknown", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec("UPDATE runtime_dispatches SET state='UNKNOWN' WHERE project=? AND run=?", f.project, fence.runID)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"active_worker", func(_ *testing.T, _ *fixture, c *RuntimeCoordinator, _ harnessPreparationFence) {
+-			c.active[ID()] = true
+-		}},
+-		{"second_unresolved_dispatch", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			_, err := f.db.Exec(`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at)
+-				SELECT project,run,epoch+1,?,manifest,manifest_hash,'PREPARED',?,? FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, ID(), Now(), Now(), f.project, fence.runID, fence.epoch)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"reservation", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, fence harnessPreparationFence) {
+-			ledger := Object{"id": ID(), "run_id": fence.runID, "provider_request_id": ID(), "operation": "RESERVE"}
+-			_, err := f.db.Exec("INSERT INTO domain_objects(project,kind,id,revision,body) VALUES(?,'BudgetLedgerEntry',?,1,?)", f.project, ledger["id"], Bytes(ledger))
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-		{"unresolved_command", func(t *testing.T, f *fixture, _ *RuntimeCoordinator, _ harnessPreparationFence) {
+-			_, err := f.db.Exec("INSERT INTO client_control_requests(principal,project,command_id,session_id,control_request_id,request_hash,target_id,task_ids,state,created_at) VALUES(?,?,?,?,?,?,?,'[]','REQUESTED',?)", f.owner, f.project, ID(), ID(), ID(), Digest([]byte("inert command")), ID(), Now())
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-		}},
+-	}
+-	for _, tc := range cases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			f, c, fence, proof := harnessPreparationFixture(t)
+-			if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
+-				t.Fatal(err)
+-			}
+-			c.startupComplete = true
+-			clean, err := c.QuiesceForDesktopExit(context.Background())
+-			if err != nil || clean.Reservations != 0 || clean.UnresolvedDispatches != 1 {
+-				t.Fatal("counterevidence fixture has no clean exit control", clean, err)
+-			}
+-			c.ResumeAfterReleaseAbort()
+-			tc.mutate(t, f, c, fence)
+-			_, err = c.QuiesceForDesktopExit(context.Background())
+-			if err == nil || c.quiesced {
+-				t.Fatal("Desktop exit accepted conflicting preparation", tc.name)
+-			}
+-			want := "original stopped native preparation proof"
+-			switch tc.name {
+-			case "ordinary_started", "unknown", "active_worker", "second_unresolved_dispatch", "unresolved_command":
+-				want = "runtime busy or external effect unresolved"
+-			case "reservation":
+-				want = "unknown ledger RESERVE"
+-			case "model_marker":
+-				want = "native turn marker"
+-			case "missing_marker_root":
+-				want = "native dispatch directory uncertain"
+-			}
+-			if !strings.Contains(err.Error(), want) {
+-				t.Fatalf("%s rejected for unrelated reason: %v", tc.name, err)
+-			}
+-		})
+-	}
+-}
+-
+ // Disposable source fixture synthesizes durable record shapes; it makes no
+ // native acceptance claim. Actual Host/private-pipe coverage is separate.
+ func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, string) {

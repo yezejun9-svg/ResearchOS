@@ -1,0 +1,295 @@
+	}
+	if b["action"] == "REVALIDATE" {
+		return s.revalidateTask(tx, project, o)
+	}
+	if b["action"] == "PAUSE" || b["action"] == "CANCEL" {
+		return s.controlTask(tx, p, project, o, b, cid)
+	}
+	if b["action"] == "SUBMIT" || b["action"] == "RESUME" {
+		return s.orchestrateTask(tx, project, o, b)
+	}
+	if o["status"] != "DRAFT" {
+		return nil, Fail(409, "STATE_CONFLICT", "task transition requires W06")
+	}
+	switch b["action"] {
+	case "CANCEL":
+		o["status"] = "CANCELLED"
+	case "PAUSE":
+		o["status"] = "BLOCKED"
+	case "SUBMIT":
+		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "context and admission gate require W04/W06")
+	default:
+		return nil, Fail(409, "STATE_CONFLICT", "illegal task transition")
+	}
+	if e = bump(o); e != nil {
+		return nil, e
+	}
+	return o, s.put(tx, "Task", o)
+}
+func (s *Service) upload(tx *sql.Tx, p Principal, project string, b []byte) (Object, error) {
+	key := ID()
+	expiry := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	h := Digest(b)
+	_, e := tx.Exec("INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at) VALUES(?,?,?,?,?,?)", key, project, p.ID, b, h, expiry)
+	return Object{"storage_key": key, "content_hash": h, "byte_size": len(b), "expires_at": expiry}, e
+}
+func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
+	return s.sealArtifact(tx, p, project, b, false)
+}
+
+func (s *Service) sealArtifact(tx *sql.Tx, p Principal, project string, b Object, trustedSourceHealth bool) (Object, error) {
+	// Host capture authority is an internal capability, never a role, producer
+	// name or caller-authored field. Check before upload lookup or artifact reuse.
+	if b["media_type"] == "application/vnd.researchos.source-health.v1+json" && !trustedSourceHealth {
+		return nil, Fail(403, "FORBIDDEN", "source health reports require internal source capture")
+	}
+	if b["produced_by"] != p.ID {
+		return nil, Fail(403, "FORBIDDEN", "producer must be authenticated principal")
+	}
+	if b["access_class"] == "VERIFIER_ONLY" {
+		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "protected content store requires W17 qualification")
+	}
+	var contributionRun Object
+	if b["run_id"] != nil {
+		r, e := load(tx, project, "Run", Str(b, "run_id"))
+		if e != nil {
+			return nil, Fail(422, "GATE_FAILED", "run unavailable")
+		}
+		if !p.Allowed(project, Str(r, "task_id"), Str(r, "id"), false) {
+			return nil, Fail(403, "FORBIDDEN", "run scope denied")
+		}
+		if !p.HasRole("EXECUTOR") {
+			return nil, Fail(403, "FORBIDDEN", "current executor role required")
+		}
+		if e = validExecutorRun(tx, p, project, r); e != nil {
+			return nil, e
+		}
+		if runTerminal(r) {
+			return nil, Fail(409, "STATE_CONFLICT", "terminal run cannot seal new output")
+		}
+		contributionRun = r
+	}
+	if !s.visible(tx, Principal{ID: p.ID, Roles: []string{"READER"}, Grants: []Grant{{ProjectID: project}}}, project, b) {
+		return nil, Fail(403, "FORBIDDEN", "restricted lineage cannot be declassified")
+	}
+	for _, key := range []string{"input_refs", "source_refs"} {
+		for _, v := range Arr(b, key) {
+			r := v.(map[string]any)
+			if r["entity_type"] == "Artifact" {
+				a, e := load(tx, project, "Artifact", Str(r, "id"))
+				if e != nil {
+					return nil, Fail(422, "GATE_FAILED", "source unavailable")
+				}
+				if a["access_class"] == "VERIFIER_ONLY" {
+					return nil, Fail(403, "FORBIDDEN", "restricted derivation cannot be declassified")
+				}
+			}
+		}
+	}
+	var content []byte
+	var hash, owner, expires string
+	var wasSealed int
+	e := tx.QueryRow("SELECT bytes,content_hash,principal,expires_at,sealed FROM uploaded_content WHERE project=? AND storage_key=?", project, b["storage_key"]).Scan(&content, &hash, &owner, &expires, &wasSealed)
+	if e != nil {
+		return nil, Fail(422, "GATE_FAILED", "upload unavailable")
+	}
+	if contributionRun != nil && wasSealed != 0 {
+		var proven int
+		if e = tx.QueryRow("SELECT count(*) FROM artifact_uses WHERE project=? AND storage_key=? AND run=? AND epoch=? AND principal=?", project, b["storage_key"], contributionRun["id"], contributionRun["lease_epoch"], p.ID).Scan(&proven); e != nil {
+			return nil, e
+		}
+		if proven != 1 {
+			return nil, Fail(403, "FORBIDDEN", "new run contribution requires its own unsealed upload")
+		}
+	}
+	if owner != p.ID {
+		return nil, Fail(403, "FORBIDDEN", "upload belongs to another principal")
+	}
+	expiry, e := time.Parse(time.RFC3339Nano, expires)
+	if e != nil || time.Now().After(expiry) {
+		return nil, Fail(422, "GATE_FAILED", "upload expired")
+	}
+	size, e := Num(b, "byte_size")
+	if e != nil {
+		return nil, e
+	}
+	if hash != Digest(content) || b["content_hash"] != hash || size != int64(len(content)) {
+		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "content hash or size mismatch")
+	}
+	if b["kind"] == "TEST_RESULT" {
+		if report, e := Decode(content); e == nil && (report["schema_version"] == "2.0.0" || report["schema_version"] == "2.4.0") {
+			name := "EvaluationReport"
+			if report["report_artifact_ref"] != nil {
+				name = "EvaluationSummary"
+			}
+			if e = s.Contracts.Validate(name, report); e != nil {
+				return nil, Fail(422, "GATE_FAILED", "evaluation schema mismatch")
+			}
+			if report["project_id"] != project {
+				return nil, Fail(422, "GATE_FAILED", "evaluation project mismatch")
+			}
+			return nil, Fail(503, "RESOURCE_UNAVAILABLE", "evaluation execution and independent summary publication require W10/W17")
+		}
+	}
+	o := Merge(Base(project), b)
+	validity := "CURRENT"
+	for _, field := range []string{"input_refs", "source_refs"} {
+		for _, v := range Arr(b, field) {
+			r := v.(map[string]any)
+			if _, e = version(tx, project, r); e != nil {
+				return nil, e
+			}
+			if e = s.effective(tx, project, r); e != nil {
+				validity = "STALE"
+			}
+		}
+	}
+	Merge(o, Object{"validity": validity, "sealed_at": Now()})
+	var priorRaw string
+	lookupErr := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.content_hash')=? AND json_extract(body,'$.kind')=?", project, hash, b["kind"]).Scan(&priorRaw)
+	if lookupErr == nil {
+		prior, e := Decode([]byte(priorRaw))
+		if e != nil {
+			return nil, e
+		}
+		if e = s.reusableArtifact(tx, p, project, prior, b, contributionRun); e != nil {
+			return nil, e
+		}
+		if _, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"]); e != nil {
+			return nil, e
+		}
+		if e = s.recordArtifactUse(tx, p, project, contributionRun, prior, b); e != nil {
+			return nil, e
+		}
+		return prior, nil
+	}
+	if lookupErr != sql.ErrNoRows {
+		return nil, lookupErr
+	}
+
+	if e = s.put(tx, "Artifact", o); e != nil {
+		}
+		decisions = append(decisions, r)
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	historical := Empty()
+	for _, v := range decisions {
+		d, e := version(tx, project, v.(map[string]any))
+		if e != nil {
+			return nil, e
+		}
+		if prior := Str(d, "supersedes_id"); prior != "" {
+			old, e := load(tx, project, "DecisionReceipt", prior)
+			if e != nil {
+				return nil, e
+			}
+			historical = append(historical, Ref(old, "DecisionReceipt"))
+		}
+	}
+	continuation := Object{"goal_id": goal["id"], "goal_title": goal["title"], "goal_intent": goal["original_intent"], "goal_status_at_construction": goal["status"], "next_task_id": task["id"], "next_task_title": task["title"], "historical_decision_refs": historical, "current_decision_refs": decisions, "acceptance_contract": task["acceptance_contract"]}
+	summary += "\nContinuation: " + string(Bytes(continuation))
+	manifestHash := Hash(profile["source_document_refs"])
+	var importedHash string
+	if err := tx.QueryRow("SELECT manifest_hash FROM context_imports WHERE project=?", project).Scan(&importedHash); err == nil {
+		manifestHash = importedHash
+	} else if err != sql.ErrNoRows {
+		return nil, err
+	}
+	if len(snapshotIDs) > 0 {
+		manifestHash = Hash([]any{manifestHash, snapshotIDs})
+	}
+	bundle := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "task_id": task["id"], "project_state_revision": state["revision"], "version_vector": refs, "facts": profile["facts"], "unresolved_items": unresolved, "latest_decision_refs": decisions, "unfinished_commitments": commitments, "summary": summary, "summary_hash": Digest([]byte(summary)), "source_manifest_hash": manifestHash, "authorized_snapshot_ids": snapshotIDs, "policy_revision": state["policy_revision"]}
+	bundle["receipt_hash"] = Receipt(bundle)
+	if e = s.put(tx, "ContextBundle", bundle); e != nil {
+		return nil, e
+	}
+	task["context_bundle_id"] = bundle["id"]
+	if e = bump(task); e != nil {
+		return nil, e
+	}
+	if e = s.put(tx, "Task", task); e != nil {
+		return nil, e
+	}
+	if e = s.retireTaskDependencies(tx, project, Str(task, "id")); e != nil {
+		return nil, e
+	}
+	for _, r := range refs {
+		if _, e = s.impactLink(tx, project, Object{"from_ref": Ref(task, "Task"), "to_ref": r, "relation": "DEPENDS_ON", "basis": "DETERMINISTIC", "evidence_refs": []any{Ref(bundle, "ContextBundle")}}); e != nil {
+			return nil, e
+		}
+	}
+	if e = s.event(tx, project, "Task", task, p.ID, Str(bundle, "id"), "TASK_CHANGED"); e != nil {
+		return nil, e
+	}
+	return bundle, nil
+}
+func (s *Service) sendMessage(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
+	if b["run_id"] != nil {
+		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "Run messaging awaits runtime qualification")
+	}
+	if b["task_id"] != nil {
+		task, e := s.readObject(tx, p, project, "Task", Str(b, "task_id"))
+		if e != nil {
+			return nil, e
+		}
+		if e = s.taskContext(tx, project, task); e != nil {
+			return nil, e
+		}
+	}
+	var found int
+	if e := tx.QueryRow("SELECT count(*) FROM auth_principals WHERE id=? AND revoked=0", b["recipient_id"]).Scan(&found); e != nil {
+		return nil, e
+	}
+	if found != 1 {
+		return nil, Fail(422, "GATE_FAILED", "recipient unavailable")
+	}
+	var recipientRoles string
+	if e := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", b["recipient_id"]).Scan(&recipientRoles); e != nil {
+		return nil, e
+	}
+	recipient := Principal{ID: Str(b, "recipient_id")}
+	if e := json.Unmarshal([]byte(recipientRoles), &recipient.Roles); e != nil {
+		return nil, e
+	}
+	rows, e := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", recipient.ID)
+	if e != nil {
+		return nil, e
+	}
+	for rows.Next() {
+		var g Grant
+		if e = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		recipient.Grants = append(recipient.Grants, g)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return nil, e
+	}
+	if !recipient.Allowed(project, Str(b, "task_id"), Str(b, "run_id"), false) || !s.visible(tx, recipient, project, b) {
+		return nil, Fail(403, "FORBIDDEN", "recipient cannot read this message scope")
+	}
+	o := Merge(Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now()}, b)
+	o["sender_id"] = p.ID
+	o["dedup_key"] = Hash([]any{p.ID, project, b})
+	o["receipt_hash"] = Receipt(o)
+	return o, s.put(tx, "AgentMessage", o)
+}
+func (s *Service) impactLink(tx *sql.Tx, project string, b Object) (Object, error) {
+	for _, k := range []string{"from_ref", "to_ref"} {
+		if _, e := version(tx, project, b[k].(map[string]any)); e != nil {
+			return nil, e
+		}
+	}
+	o := Merge(Base(project), b)
+	o["status"] = "ACTIVE"
+	return o, s.put(tx, "ImpactLink", o)
+}
+func (s *Service) closure(tx *sql.Tx, project string, roots []Object) ([]any, []any, error) {
+	rows, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.status')='ACTIVE'", project)
+	if e != nil {

@@ -1,0 +1,1110 @@
+FILE ops/supervisor/owned_core_handle_windows.go SHA256 11e020cb648d780c8179e2300de8a788db0e1a743e336c7423b51f82a248bb60
+1: //go:build windows
+2: 
+3: package supervisor
+4: 
+5: import (
+6: 	"context"
+7: 	"crypto/sha256"
+8: 	"encoding/hex"
+9: 	"errors"
+10: 	"fmt"
+11: 	"io"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"strings"
+15: 	"time"
+16: 	"unsafe"
+17: 
+18: 	"golang.org/x/sys/windows"
+19: )
+20: 
+21: // OwnedCoreNativeIdentity is entirely observed from retained native handles.
+22: // ParentProcessID comes from one Toolhelp snapshot and is then bound to its
+23: // own retained process handle, creation time, SID and image file identity.
+24: type OwnedCoreNativeIdentity struct {
+25: 	PID               uint32 `json:"pid"`
+26: 	CreatedNS         int64  `json:"created_ns"`
+27: 	SID               string `json:"sid"`
+28: 	ImagePath         string `json:"image_path"`
+29: 	ImageSHA256       string `json:"image_sha256"`
+30: 	ImageVolume       uint32 `json:"image_volume"`
+31: 	ImageIndex        uint64 `json:"image_index"`
+32: 	ParentPID         uint32 `json:"parent_pid"`
+33: 	ParentCreatedNS   int64  `json:"parent_created_ns"`
+34: 	ParentSID         string `json:"parent_sid"`
+35: 	ParentImagePath   string `json:"parent_image_path"`
+36: 	ParentImageSHA256 string `json:"parent_image_sha256"`
+37: 	ParentImageVolume uint32 `json:"parent_image_volume"`
+38: 	ParentImageIndex  uint64 `json:"parent_image_index"`
+39: }
+40: 
+41: type ownedNativeProcess struct {
+42: 	handle  windows.Handle
+43: 	image   *ownedImageFile
+44: 	path    string
+45: 	created int64
+46: 	sid     string
+47: 	sha     string
+48: 	volume  uint32
+49: 	index   uint64
+50: }
+51: 
+52: type ownedImageAnchor struct {
+53: 	handle   windows.Handle
+54: 	volume   uint32
+55: 	index    uint64
+56: 	security string
+57: }
+58: 
+59: type ownedImageFile struct {
+60: 	file      *os.File
+61: 	ancestors []ownedImageAnchor
+62: 	final     ownedImageAnchor
+63: 	sha       string
+64: }
+65: 
+66: const trustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+67: 
+68: func trustedImageSID(sid string) (bool, error) {
+69: 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+70: 	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+71: 		return false, errors.New("current operator SID unavailable")
+72: 	}
+73: 	switch sid {
+74: 	case user.User.Sid.String(), "S-1-5-18", "S-1-5-32-544", trustedInstallerSID:
+75: 		return true, nil
+76: 	default:
+77: 		return false, nil
+78: 	}
+79: }
+80: 
+81: func imageSecurityAuthorized(sd *windows.SECURITY_DESCRIPTOR, directory bool) error {
+82: 	owner, _, err := sd.Owner()
+83: 	if err != nil || owner == nil || !owner.IsValid() {
+84: 		return errors.New("image owner unavailable")
+85: 	}
+86: 	trusted, err := trustedImageSID(owner.String())
+87: 	if err != nil || !trusted {
+88: 		return errors.New("image owner is outside trusted operator/OS/install boundary")
+89: 	}
+90: 	acl, _, err := sd.DACL()
+91: 	if err != nil || acl == nil || acl.AceCount == 0 {
+92: 		return errors.New("image DACL unavailable")
+93: 	}
+94: 	unsafeRights := uint32(windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE | windows.GENERIC_ALL | windows.MAXIMUM_ALLOWED | windows.ACCESS_SYSTEM_SECURITY)
+95: 	if directory {
+96: 		unsafeRights |= 0x40 // FILE_DELETE_CHILD on a directory.
+97: 	}
+98: 	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+99: 		var ace *windows.ACCESS_ALLOWED_ACE
+100: 		if err := windows.GetAce(acl, i, &ace); err != nil || ace == nil || ace.Header.AceSize < 16 {
+101: 			return errors.New("image ACE malformed")
+102: 		}
+103: 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE && ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE {
+104: 			return errors.New("image DACL contains unsupported ACE type")
+105: 		}
+106: 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+107: 		if !sid.IsValid() || 8+sid.Len() > int(ace.Header.AceSize) {
+108: 			return errors.New("image ACE SID malformed")
+109: 		}
+110: 		if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+111: 			continue
+112: 		}
+113: 		trusted, err := trustedImageSID(sid.String())
+114: 		if err != nil {
+115: 			return err
+116: 		}
+117: 		unsafeGranted := uint32(ace.Mask) & unsafeRights
+118: 		// FILE_ADD_SUBDIRECTORY alone can create a sibling at an ancestor.
+119: 		// It cannot replace the selected child while every selected component
+120: 		// is retained without FILE_SHARE_DELETE. C: grants this isolated right
+121: 		// to Authenticated Users on common Windows installations.
+122: 		if directory && unsafeGranted == windows.FILE_APPEND_DATA {
+123: 			unsafeGranted = 0
+124: 		}
+125: 		if !trusted && unsafeGranted != 0 {
+126: 			return errors.New("image DACL grants write or control to untrusted trustee")
+127: 		}
+128: 	}
+129: 	return nil
+130: }
+131: 
+132: func (im *ownedImageFile) Close() {
+133: 	if im == nil {
+134: 		return
+135: 	}
+136: 	if im.file != nil {
+137: 		_ = im.file.Close()
+138: 		im.file = nil
+139: 	}
+140: 	for i := len(im.ancestors) - 1; i >= 0; i-- {
+141: 		_ = windows.CloseHandle(im.ancestors[i].handle)
+142: 	}
+143: 	im.ancestors = nil
+144: }
+145: 
+146: func (p *ownedNativeProcess) close() {
+147: 	if p.image != nil {
+148: 		p.image.Close()
+149: 		p.image = nil
+150: 	}
+151: 	if p.handle != 0 {
+152: 		_ = windows.CloseHandle(p.handle)
+153: 		p.handle = 0
+154: 	}
+155: }
+156: 
+157: func ownedNativePath(h windows.Handle) (string, error) {
+158: 	buf := make([]uint16, 32768)
+159: 	size := uint32(len(buf))
+160: 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
+161: 		return "", err
+162: 	}
+163: 	path := windows.UTF16ToString(buf[:size])
+164: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") || !strings.EqualFold(filepath.Ext(path), ".exe") {
+165: 		return "", errors.New("canonical executable path required")
+166: 	}
+167: 	return path, nil
+168: }
+169: 
+170: func observeOwnedImageAnchor(h windows.Handle, directory bool) (ownedImageAnchor, windows.ByHandleFileInformation, error) {
+171: 	var info windows.ByHandleFileInformation
+172: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+173: 		return ownedImageAnchor{}, info, err
+174: 	}
+175: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory || info.VolumeSerialNumber == 0 || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) == 0 || (!directory && info.NumberOfLinks != 1) {
+176: 		return ownedImageAnchor{}, info, errors.New("image ancestor reparse/alias/native identity rejected")
+177: 	}
+178: 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+179: 	if err != nil || sd == nil || !sd.IsValid() {
+180: 		return ownedImageAnchor{}, info, errors.New("image native security descriptor unavailable")
+181: 	}
+182: 	if err := imageSecurityAuthorized(sd, directory); err != nil {
+183: 		return ownedImageAnchor{}, info, err
+184: 	}
+185: 	security := sd.String()
+186: 	if security == "" {
+187: 		return ownedImageAnchor{}, info, errors.New("image ancestor owner/DACL serialization unavailable")
+188: 	}
+189: 	return ownedImageAnchor{handle: h, volume: info.VolumeSerialNumber, index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), security: security}, info, nil
+190: }
+191: 
+192: func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
+193: 	image := &ownedImageFile{}
+194: 	defer func() {
+195: 		if err != nil {
+196: 			image.Close()
+197: 		}
+198: 	}()
+199: 	volume := filepath.VolumeName(path)
+200: 	current := volume + string(filepath.Separator)
+201: 	parts := strings.Split(strings.TrimPrefix(path[len(volume):], string(filepath.Separator)), string(filepath.Separator))
+202: 	paths := []string{current}
+203: 	for _, part := range parts {
+204: 		if part == "" || part == "." || part == ".." {
+205: 			return nil, errors.New("noncanonical image path component")
+206: 		}
+207: 		current = filepath.Join(current, part)
+208: 		paths = append(paths, current)
+209: 	}
+210: 	for i, name := range paths {
+211: 		last := i == len(paths)-1
+212: 		wide, e := windows.UTF16PtrFromString(name)
+213: 		if e != nil {
+214: 			return nil, e
+215: 		}
+216: 		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
+217: 		share := uint32(windows.FILE_SHARE_READ)
+218: 		if last {
+219: 			access = windows.GENERIC_READ | windows.READ_CONTROL
+220: 			share = windows.FILE_SHARE_READ
+221: 		}
+222: 		h, e := windows.CreateFile(wide, access, share, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+223: 		if e != nil {
+224: 			return nil, e
+225: 		}
+226: 		anchor, info, e := observeOwnedImageAnchor(h, !last)
+227: 		if e != nil {
+228: 			_ = windows.CloseHandle(h)
+229: 			return nil, fmt.Errorf("image component %q: %w", name, e)
+230: 		}
+231: 		if last {
+232: 			if info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > 256<<20 {
+233: 				_ = windows.CloseHandle(h)
+234: 				return nil, errors.New("bounded image size required")
+235: 			}
+236: 			image.final = anchor
+237: 			image.file = os.NewFile(uintptr(h), name)
+238: 			hash := sha256.New()
+239: 			var n int64
+240: 			n, err = io.Copy(hash, io.LimitReader(image.file, 256<<20+1))
+241: 			if err != nil {
+242: 				return nil, err
+243: 			}
+244: 			var after windows.ByHandleFileInformation
+245: 			if err = windows.GetFileInformationByHandle(h, &after); err != nil {
+246: 				return nil, err
+247: 			}
+248: 			if n != int64(info.FileSizeLow) || info.VolumeSerialNumber != after.VolumeSerialNumber || info.FileIndexHigh != after.FileIndexHigh || info.FileIndexLow != after.FileIndexLow || info.FileSizeLow != after.FileSizeLow || info.LastWriteTime != after.LastWriteTime {
+249: 				return nil, errors.New("image changed during retained read")
+250: 			}
+251: 			image.sha = hex.EncodeToString(hash.Sum(nil))
+252: 		} else {
+253: 			image.ancestors = append(image.ancestors, anchor)
+254: 		}
+255: 	}
+256: 	return image, nil
+257: }
+258: 
+259: func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err error) {
+260: 	p = ownedNativeProcess{handle: h}
+261: 	defer func() {
+262: 		if err != nil {
+263: 			p.close()
+264: 		}
+265: 	}()
+266: 	var created, exited, kernel, user windows.Filetime
+267: 	if err = windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+268: 		return p, err
+269: 	}
+270: 	p.created = created.Nanoseconds()
+271: 	var token windows.Token
+272: 	if err = windows.OpenProcessToken(h, windows.TOKEN_QUERY, &token); err != nil {
+273: 		return p, err
+274: 	}
+275: 	tu, e := token.GetTokenUser()
+276: 	_ = token.Close()
+277: 	if e != nil || tu.User.Sid == nil || !tu.User.Sid.IsValid() {
+278: 		return p, errors.New("process SID unavailable")
+279: 	}
+280: 	p.sid = tu.User.Sid.String()
+281: 	if p.path, err = ownedNativePath(h); err != nil {
+282: 		return p, err
+283: 	}
+284: 	p.image, err = ownedNativeImage(p.path)
+285: 	if err == nil {
+286: 		p.sha, p.volume, p.index = p.image.sha, p.image.final.volume, p.image.final.index
+287: 	}
+288: 	return p, err
+289: }
+290: 
+291: func ownedNativeParentPID(pid uint32) (uint32, error) {
+292: 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+293: 	if err != nil {
+294: 		return 0, err
+295: 	}
+296: 	defer windows.CloseHandle(snap)
+297: 	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
+298: 	if err = windows.Process32First(snap, &entry); err != nil {
+299: 		return 0, err
+300: 	}
+301: 	for {
+302: 		if entry.ProcessID == pid {
+303: 			if entry.ParentProcessID == 0 || entry.ParentProcessID == pid {
+304: 				return 0, errors.New("invalid parent identity")
+305: 			}
+306: 			return entry.ParentProcessID, nil
+307: 		}
+308: 		err = windows.Process32Next(snap, &entry)
+309: 		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+310: 			break
+311: 		}
+312: 		if err != nil {
+313: 			return 0, err
+314: 		}
+315: 	}
+316: 	return 0, errors.New("process absent from snapshot")
+317: }
+318: 
+319: // OwnedCoreRetainedHandle is the sole native termination capability. The
+320: // capability never exports its process handle. The caller must first verify
+321: // the reviewed plan and all external proofs before opening it.
+322: type OwnedCoreRetainedHandle struct {
+323: 	core           ownedNativeProcess
+324: 	parent         ownedNativeProcess
+325: 	identity       OwnedCoreNativeIdentity
+326: 	terminateCalls int
+327: 	closed         bool
+328: 	// Per-handle native call seams allow deterministic failure-path fixture cuts.
+329: 	// Nil always uses the Windows APIs; callers outside this package cannot set them.
+330: 	terminate func(windows.Handle, uint32) error
+331: 	wait      func(windows.Handle, uint32) (uint32, error)
+332: }
+333: 
+334: func (h *OwnedCoreRetainedHandle) nativeWait(ms uint32) (uint32, error) {
+335: 	if h.wait != nil {
+336: 		return h.wait(h.core.handle, ms)
+337: 	}
+338: 	return windows.WaitForSingleObject(h.core.handle, ms)
+339: }
+340: 
+341: func (h *OwnedCoreRetainedHandle) nativeTerminate(code uint32) error {
+342: 	if h.terminate != nil {
+343: 		return h.terminate(h.core.handle, code)
+344: 	}
+345: 	return windows.TerminateProcess(h.core.handle, code)
+346: }
+347: 
+348: func ownedCoreOpen(pid uint32, access uint32) (out *OwnedCoreRetainedHandle, err error) {
+349: 	if pid == 0 {
+350: 		return nil, errors.New("zero PID")
+351: 	}
+352: 	h, err := windows.OpenProcess(access|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+353: 	if err != nil {
+354: 		return nil, err
+355: 	}
+356: 	out = &OwnedCoreRetainedHandle{}
+357: 	defer func() {
+358: 		if err != nil {
+359: 			out.Close()
+360: 			out = nil
+361: 		}
+362: 	}()
+363: 	out.core, err = ownedNativeProcessFromHandle(h)
+364: 	if err != nil {
+365: 		return nil, err
+366: 	}
+367: 	actualPID, e := windows.GetProcessId(out.core.handle)
+368: 	if e != nil || actualPID != pid {
+369: 		return nil, errors.New("process handle PID mismatch")
+370: 	}
+371: 	parentPID, e := ownedNativeParentPID(pid)
+372: 	if e != nil {
+373: 		return nil, e
+374: 	}
+375: 	parentH, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, parentPID)
+376: 	if e != nil {
+377: 		return nil, e
+378: 	}
+379: 	out.parent, err = ownedNativeProcessFromHandle(parentH)
+380: 	if err != nil {
+381: 		return nil, err
+382: 	}
+383: 	actualParent, e := windows.GetProcessId(out.parent.handle)
+384: 	if e != nil || actualParent != parentPID {
+385: 		return nil, errors.New("parent handle PID mismatch")
+386: 	}
+387: 	out.identity = OwnedCoreNativeIdentity{PID: pid, CreatedNS: out.core.created, SID: out.core.sid, ImagePath: out.core.path, ImageSHA256: out.core.sha, ImageVolume: out.core.volume, ImageIndex: out.core.index, ParentPID: parentPID, ParentCreatedNS: out.parent.created, ParentSID: out.parent.sid, ParentImagePath: out.parent.path, ParentImageSHA256: out.parent.sha, ParentImageVolume: out.parent.volume, ParentImageIndex: out.parent.index}
+388: 	return out, nil
+389: }
+390: 
+391: // ObserveOwnedCoreReadOnly cannot terminate. It is suitable for preflight.
+392: func ObserveOwnedCoreReadOnly(pid uint32) (OwnedCoreNativeIdentity, error) {
+393: 	h, err := ownedCoreOpen(pid, 0)
+394: 	if err != nil {
+395: 		return OwnedCoreNativeIdentity{}, err
+396: 	}
+397: 	defer h.Close()
+398: 	return h.identity, nil
+399: }
+400: 
+401: // OpenOwnedCoreRetained binds the sole termination handle to a complete exact
+402: // native identity obtained during reviewed preflight. It cannot accept a
+403: // partial PID-only expectation.
+404: func OpenOwnedCoreRetained(expected OwnedCoreNativeIdentity) (*OwnedCoreRetainedHandle, error) {
+405: 	if expected.PID == 0 || expected.CreatedNS == 0 || expected.SID == "" || expected.ImageSHA256 == "" || expected.ImagePath == "" || expected.ImageIndex == 0 || expected.ParentPID == 0 || expected.ParentCreatedNS == 0 || expected.ParentSID == "" || expected.ParentImageSHA256 == "" || expected.ParentImageIndex == 0 {
+406: 		return nil, errors.New("complete reviewed native identity required")
+407: 	}
+408: 	h, err := ownedCoreOpen(expected.PID, windows.PROCESS_TERMINATE)
+409: 	if err != nil {
+410: 		return nil, err
+411: 	}
+412: 	if h.identity != expected {
+413: 		h.Close()
+414: 		return nil, errors.New("retained native identity differs from plan")
+415: 	}
+416: 	return h, nil
+417: }
+418: 
+419: func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
+420: 	if h == nil {
+421: 		return OwnedCoreNativeIdentity{}
+422: 	}
+423: 	return h.identity
+424: }
+425: 
+426: func verifyOwnedImageFile(image *ownedImageFile, volume uint32, index uint64) error {
+427: 	if image == nil || image.file == nil || image.final.volume != volume || image.final.index != index {
+428: 		return errors.New("retained image identity absent")
+429: 	}
+430: 	for _, original := range image.ancestors {
+431: 		current, _, err := observeOwnedImageAnchor(original.handle, true)
+432: 		if err != nil || current.volume != original.volume || current.index != original.index || current.security != original.security {
+433: 			return errors.New("retained image ancestor identity/ACL changed")
+434: 		}
+435: 	}
+436: 	current, _, err := observeOwnedImageAnchor(windows.Handle(image.file.Fd()), false)
+437: 	if err != nil || current.volume != image.final.volume || current.index != image.final.index || current.security != image.final.security {
+438: 		return errors.New("retained image file identity/ACL changed")
+439: 	}
+440: 	return nil
+441: }
+442: 
+443: func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+444: 	if h == nil || h.closed || h.core.handle == 0 {
+445: 		return errors.New("native handle closed")
+446: 	}
+447: 	pid, err := windows.GetProcessId(h.core.handle)
+448: 	if err != nil || pid != h.identity.PID {
+449: 		return errors.New("retained PID changed")
+450: 	}
+451: 	var created, exited, kernel, user windows.Filetime
+452: 	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
+453: 		return errors.New("retained process creation changed")
+454: 	}
+455: 	// Every path component remains open without delete sharing. The final image
+456: 	// also denies write sharing; identity and security are rechecked by handle.
+457: 	if err = verifyOwnedImageFile(h.core.image, h.identity.ImageVolume, h.identity.ImageIndex); err != nil {
+458: 		return err
+459: 	}
+460: 	parentPID, err := windows.GetProcessId(h.parent.handle)
+461: 	if err != nil || parentPID != h.identity.ParentPID {
+462: 		return errors.New("retained parent PID changed")
+463: 	}
+464: 	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+465: 		return errors.New("retained parent creation changed")
+466: 	}
+467: 	parentStatus, err := h.nativeParentWait()
+468: 	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+469: 		return errors.New("retained parent no longer live")
+470: 	}
+471: 	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
+472: 		return err
+473: 	}
+474: 	return nil
+475: }
+476: 
+477: func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {
+478: 	return windows.WaitForSingleObject(h.parent.handle, 0)
+479: }
+480: 
+481: // OwnedCoreNativeExit records whether the one call was made and the numeric
+482: // exit code from the same retained handle. Unknown wait is never retried.
+483: type OwnedCoreNativeExit struct {
+484: 	TerminateCalls int    `json:"terminate_calls"`
+485: 	ExitObserved   bool   `json:"exit_observed"`
+486: 	ExitCode       uint32 `json:"exit_code"`
+487: 	BeforeSignal   bool   `json:"before_signal"`
+488: }
+489: 
+490: const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
+491: 
+492: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
+493: 	return h.TerminateOnceAndWaitUntil(timeout, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+494: }
+495: 
+496: // TerminateOnceAndWaitUntil applies both the invocation monotonic deadline and
+497: // the grant's wall expiry at the last native boundary, after pre-signal waits.
+498: // A failed deadline check returns with zero TerminateProcess calls; the caller's
+499: // already-durable intent remains consumed.
+500: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+501: 	return h.TerminateOnceAndWaitUntilContext(context.Background(), timeout, invocationDeadline, wallExpiry)
+502: }
+503: 
+504: func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntilContext(ctx context.Context, timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+505: 	var out OwnedCoreNativeExit
+506: 	if ctx == nil {
+507: 		return out, errors.New("caller context required")
+508: 	}
+509: 	if timeout <= 0 || timeout > 30*time.Second {
+510: 		return out, errors.New("bounded native wait required")
+511: 	}
+512: 	if earlier, ok := ctx.Deadline(); ok && earlier.Before(invocationDeadline) {
+513: 		invocationDeadline = earlier
+514: 	}
+515: 	if err := ctx.Err(); err != nil {
+516: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+517: 	}
+518: 	if err := h.verifyRetained(); err != nil {
+519: 		return out, err
+520: 	}
+521: 	if h.terminateCalls != 0 {
+522: 		return out, errors.New("native termination already attempted")
+523: 	}
+524: 	status, err := h.nativeWait(0)
+525: 	if err != nil {
+526: 		return out, err
+527: 	}
+528: 	if status == windows.WAIT_OBJECT_0 {
+529: 		out.BeforeSignal = true
+530: 		out.ExitObserved = true
+531: 		if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+532: 			return out, err
+533: 		}
+534: 		return out, nil
+535: 	}
+536: 	if status != uint32(windows.WAIT_TIMEOUT) {
+537: 		return out, fmt.Errorf("unexpected native wait status %d", status)
+538: 	}
+539: 	if err := ctx.Err(); err != nil {
+540: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+541: 	}
+542: 	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+543: 		return out, errors.New("invocation or grant expired before native signal")
+544: 	}
+545: 	if err := ctx.Err(); err != nil {
+546: 		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+547: 	}
+548: 	h.terminateCalls = 1
+549: 	out.TerminateCalls = 1
+550: 	if err = h.nativeTerminate(OwnedCoreMaintenanceExitCode); err != nil {
+551: 		return out, fmt.Errorf("one TerminateProcess failed: %w", err)
+552: 	}
+553: 	status, err = h.nativeWait(uint32(timeout.Milliseconds()))
+554: 	if err != nil || status != windows.WAIT_OBJECT_0 {
+555: 		return out, fmt.Errorf("native wait unknown: status=%d err=%v", status, err)
+556: 	}
+557: 	out.ExitObserved = true
+558: 	if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+559: 		return out, err
+560: 	}
+561: 	return out, nil
+562: }
+563: 
+564: func (h *OwnedCoreRetainedHandle) Close() {
+565: 	if h == nil || h.closed {
+566: 		return
+567: 	}
+568: 	h.closed = true
+569: 	h.core.close()
+570: 	h.parent.close()
+571: }
+FILE ops/supervisor/owned_core_handle_windows_test.go SHA256 d96943defa4fd7aa5c6b7bc72094ff53572cbfb62b4b7beaeee9a0a4595bd2f0
+1: //go:build windows
+2: 
+3: package supervisor
+4: 
+5: import (
+6: 	"context"
+7: 	"errors"
+8: 	"io"
+9: 	"os"
+10: 	"os/exec"
+11: 	"path/filepath"
+12: 	"strconv"
+13: 	"strings"
+14: 	"testing"
+15: 	"time"
+16: 
+17: 	"golang.org/x/sys/windows"
+18: )
+19: 
+20: func testOperatorSID(t *testing.T) string {
+21: 	t.Helper()
+22: 	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+23: 	if err != nil || u == nil || u.User.Sid == nil {
+24: 		t.Fatalf("operator SID unavailable: %v", err)
+25: 	}
+26: 	return u.User.Sid.String()
+27: }
+28: 
+29: func testImageSecurityDescriptor(t *testing.T, sddl string) *windows.SECURITY_DESCRIPTOR {
+30: 	t.Helper()
+31: 	sd, err := windows.SecurityDescriptorFromString(sddl)
+32: 	if err != nil {
+33: 		t.Fatalf("fixture SDDL %q: %v", sddl, err)
+34: 	}
+35: 	return sd
+36: }
+37: 
+38: func setTestImageDACL(t *testing.T, path, sddl string) {
+39: 	t.Helper()
+40: 	sd := testImageSecurityDescriptor(t, sddl)
+41: 	acl, _, err := sd.DACL()
+42: 	if err != nil || acl == nil {
+43: 		t.Fatalf("fixture DACL absent: %v", err)
+44: 	}
+45: 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+46: 		t.Fatalf("setting task-owned fixture DACL: %v", err)
+47: 	}
+48: }
+49: 
+50: func TestOwnedImageOwnerAndACEAuthorization(t *testing.T) {
+51: 	operator := testOperatorSID(t)
+52: 	for _, tc := range []struct {
+53: 		name, sddl string
+54: 		directory  bool
+55: 		wantError  bool
+56: 	}{
+57: 		{"current operator", "O:" + operator + "D:P(A;;FA;;;" + operator + ")", false, false},
+58: 		{"SYSTEM install owner", "O:SYD:P(A;;FA;;;SY)", false, false},
+59: 		{"Administrators install owner", "O:BAD:P(A;;FA;;;BA)", true, false},
+60: 		{"TrustedInstaller install owner", "O:" + trustedInstallerSID + "D:P(A;;FA;;;SY)", false, false},
+61: 		{"foreign owner", "O:WDD:P(A;;FA;;;SY)", false, true},
+62: 		{"Everyone direct full control", "O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)", false, true},
+63: 		{"Users direct write", "O:SYD:P(A;;FA;;;SY)(A;;GW;;;BU)", false, true},
+64: 		{"Users direct control", "O:SYD:P(A;;FA;;;SY)(A;;WD;;;BU)", true, true},
+65: 		{"Everyone inherited write", "O:SYD:P(A;;FA;;;SY)(A;ID;GW;;;WD)", true, true},
+66: 		{"Users inherited delete child", "O:SYD:P(A;;FA;;;SY)(A;ID;DC;;;BU)", true, true},
+67: 		{"inherit only does not grant on directory", "O:SYD:P(A;;FA;;;SY)(A;OICIIO;FA;;;WD)", true, false},
+68: 		{"generic read remains safe", "O:SYD:P(A;;FA;;;SY)(A;;GR;;;WD)", false, false},
+69: 	} {
+70: 		t.Run(tc.name, func(t *testing.T) {
+71: 			err := imageSecurityAuthorized(testImageSecurityDescriptor(t, tc.sddl), tc.directory)
+72: 			if (err != nil) != tc.wantError {
+73: 				t.Fatalf("authorization mismatch: error=%v wantError=%t", err, tc.wantError)
+74: 			}
+75: 		})
+76: 	}
+77: 	t.Run("unsupported ACE type", func(t *testing.T) {
+78: 		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+79: 		acl, _, _ := sd.DACL()
+80: 		var ace *windows.ACCESS_ALLOWED_ACE
+81: 		if err := windows.GetAce(acl, 0, &ace); err != nil {
+82: 			t.Fatal(err)
+83: 		}
+84: 		ace.Header.AceType = 9 // callback allow: not safely interpreted by this policy
+85: 		if err := imageSecurityAuthorized(sd, false); err == nil {
+86: 			t.Fatal("unsupported ACE type accepted")
+87: 		}
+88: 	})
+89: 	t.Run("malformed ACE size", func(t *testing.T) {
+90: 		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+91: 		acl, _, _ := sd.DACL()
+92: 		var ace *windows.ACCESS_ALLOWED_ACE
+93: 		if err := windows.GetAce(acl, 0, &ace); err != nil {
+94: 			t.Fatal(err)
+95: 		}
+96: 		ace.Header.AceSize = 4
+97: 		if err := imageSecurityAuthorized(sd, false); err == nil {
+98: 			t.Fatal("malformed ACE accepted")
+99: 		}
+100: 	})
+101: }
+102: 
+103: func TestOwnedCoreFixtureChild(t *testing.T) {
+104: 	if os.Getenv("RESEARCHOS_OWNED_CORE_CHILD") != "yes" {
+105: 		return
+106: 	}
+107: 	time.Sleep(12 * time.Second)
+108: }
+109: 
+110: func TestOwnedCoreFixtureParent(t *testing.T) {
+111: 	if os.Getenv("RESEARCHOS_OWNED_PARENT_CHILD") != "yes" {
+112: 		return
+113: 	}
+114: 	cmd := exec.Command(os.Args[0], "-test.run=^TestOwnedCoreFixtureChild$")
+115: 	cmd.Env = append(os.Environ(), "RESEARCHOS_OWNED_CORE_CHILD=yes")
+116: 	if err := cmd.Start(); err != nil {
+117: 		t.Fatal(err)
+118: 	}
+119: 	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+120: 	if err := os.WriteFile(os.Getenv("RESEARCHOS_OWNED_CHILD_PID_FILE"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
+121: 		t.Fatal(err)
+122: 	}
+123: 	time.Sleep(12 * time.Second)
+124: }
+125: 
+126: func TestOwnedCoreAndParentImageAncestorsRetained(t *testing.T) {
+127: 	base := t.TempDir()
+128: 	imageDir := filepath.Join(base, "image", "nested")
+129: 	if err := os.MkdirAll(imageDir, 0700); err != nil {
+130: 		t.Fatal(err)
+131: 	}
+132: 	source, err := os.Executable()
+133: 	if err != nil {
+134: 		t.Fatal(err)
+135: 	}
+136: 	input, err := os.Open(source)
+137: 	if err != nil {
+138: 		t.Fatal(err)
+139: 	}
+140: 	defer input.Close()
+141: 	copyPath := filepath.Join(imageDir, "parent.exe")
+142: 	output, err := os.Create(copyPath)
+143: 	if err != nil {
+144: 		t.Fatal(err)
+145: 	}
+146: 	if _, err = io.Copy(output, input); err != nil {
+147: 		output.Close()
+148: 		t.Fatal(err)
+149: 	}
+150: 	if err = output.Close(); err != nil {
+151: 		t.Fatal(err)
+152: 	}
+153: 	alias := filepath.Join(imageDir, "alias.exe")
+154: 	if err = os.Link(copyPath, alias); err != nil {
+155: 		t.Fatalf("new fixture hardlink cut unavailable: %v", err)
+156: 	}
+157: 	if image, e := ownedNativeImage(copyPath); e == nil {
+158: 		image.Close()
+159: 		t.Fatal("hardlink image alias accepted")
+160: 	}
+161: 	if err = os.Remove(alias); err != nil {
+162: 		t.Fatal(err)
+163: 	}
+164: 	linkDir := filepath.Join(base, "image-link")
+165: 	if err = os.Symlink(imageDir, linkDir); err != nil {
+166: 		if output, e := exec.Command("cmd", "/c", "mklink", "/J", linkDir, imageDir).CombinedOutput(); e != nil {
+167: 			t.Logf("REPARSE_CUT_UNAVAILABLE symlink=%v junction=%v output=%q", err, e, output)
+168: 		} else {
+169: 			err = nil
+170: 		}
+171: 	}
+172: 	if err == nil {
+173: 		if image, e := ownedNativeImage(filepath.Join(linkDir, "parent.exe")); e == nil {
+174: 			image.Close()
+175: 			t.Fatal("reparse image ancestor accepted")
+176: 		}
+177: 	}
+178: 	pidFile := filepath.Join(base, "child.pid")
+179: 	parent := exec.Command(copyPath, "-test.run=^TestOwnedCoreFixtureParent$")
+180: 	parent.Env = append(os.Environ(), "RESEARCHOS_OWNED_PARENT_CHILD=yes", "RESEARCHOS_OWNED_CHILD_PID_FILE="+pidFile)
+181: 	if err = parent.Start(); err != nil {
+182: 		t.Fatal(err)
+183: 	}
+184: 	defer func() { _ = parent.Process.Kill(); _ = parent.Wait() }()
+185: 	var childPID uint64
+186: 	for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+187: 		if raw, e := os.ReadFile(pidFile); e == nil {
+188: 			childPID, err = strconv.ParseUint(string(raw), 10, 32)
+189: 			if err != nil {
+190: 				t.Fatal(err)
+191: 			}
+192: 			break
+193: 		}
+194: 	}
+195: 	if childPID == 0 {
+196: 		t.Fatal("owned fixture child PID unavailable")
+197: 	}
+198: 	childProcess, err := os.FindProcess(int(childPID))
+199: 	if err != nil {
+200: 		t.Fatal(err)
+201: 	}
+202: 	defer childProcess.Kill()
+203: 	id, err := ObserveOwnedCoreReadOnly(uint32(childPID))
+204: 	if err != nil {
+205: 		t.Fatal(err)
+206: 	}
+207: 	if id.ParentPID != uint32(parent.Process.Pid) || id.ImagePath != copyPath || id.ParentImagePath != copyPath {
+208: 		t.Fatalf("actual Core/parent fixture images differ: %+v", id)
+209: 	}
+210: 	h, err := OpenOwnedCoreRetained(id)
+211: 	if err != nil {
+212: 		t.Fatal(err)
+213: 	}
+214: 	defer h.Close()
+215: 	if len(h.core.image.ancestors) < 2 || len(h.parent.image.ancestors) < 2 || h.core.image.final.index != id.ImageIndex || h.parent.image.final.index != id.ParentImageIndex {
+216: 		t.Fatal("Core and parent image ancestors were not retained")
+217: 	}
+218: 	if err = os.Rename(imageDir, filepath.Join(base, "swapped")); err == nil {
+219: 		t.Fatal("retained image ancestor allowed directory swap")
+220: 	}
+221: 	wideDir, err := windows.UTF16PtrFromString(imageDir)
+222: 	if err != nil {
+223: 		t.Fatal(err)
+224: 	}
+225: 	if writable, e := windows.CreateFile(wideDir, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0); e == nil {
+226: 		defer windows.CloseHandle(writable)
+227: 		t.Log("writable directory handle opened; this alone does not replace the selected path")
+228: 		if err = os.Rename(imageDir, filepath.Join(base, "swapped-with-writer")); err == nil {
+229: 			t.Fatal("writable directory handle replaced retained selected ancestor")
+230: 		}
+231: 		t.Logf("selected ancestor rename with writer denied: %v", err)
+232: 	} else {
+233: 		t.Logf("writable directory handle denied: %v", e)
+234: 	}
+235: 	if file, e := os.OpenFile(copyPath, os.O_WRONLY, 0); e == nil {
+236: 		file.Close()
+237: 		t.Fatal("retained image allowed write-sharing")
+238: 	}
+239: 	if err = os.Remove(copyPath); err == nil {
+240: 		t.Fatal("retained image allowed removal")
+241: 	}
+242: 	if err = os.Rename(copyPath, filepath.Join(imageDir, "moved.exe")); err == nil {
+243: 		t.Fatal("retained image allowed final-name swap")
+244: 	}
+245: 	if err = os.WriteFile(copyPath, []byte("replacement"), 0600); err == nil {
+246: 		t.Fatal("retained image allowed overwrite")
+247: 	}
+248: 	attacker := filepath.Join(imageDir, "attacker.exe")
+249: 	if err = os.WriteFile(attacker, []byte("replacement"), 0600); err != nil {
+250: 		t.Fatal(err)
+251: 	}
+252: 	if err = os.Rename(attacker, copyPath); err == nil {
+253: 		t.Fatal("retained image allowed same-name replacement")
+254: 	}
+255: 	wrong := id
+256: 	wrong.ParentCreatedNS++
+257: 	if other, e := OpenOwnedCoreRetained(wrong); e == nil {
+258: 		other.Close()
+259: 		t.Fatal("wrong parent identity accepted")
+260: 	}
+261: 	if err = h.verifyRetained(); err != nil {
+262: 		t.Fatal(err)
+263: 	}
+264: 	operator := testOperatorSID(t)
+265: 	setTestImageDACL(t, copyPath, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+operator+")(A;;GW;;;WD)")
+266: 	if err = h.verifyRetained(); err == nil {
+267: 		t.Fatal("retained image allowed ACL grant drift")
+268: 	}
+269: }
+270: 
+271: func TestOwnedImageRejectsUnsafeInstallationAndCopiedProcessACL(t *testing.T) {
+272: 	if path := os.Getenv("RESEARCHOS_R4_UNTRUSTED_IMAGE"); path != "" {
+273: 		t.Run("D installation inherited untrusted modify", func(t *testing.T) {
+274: 			if image, err := ownedNativeImage(path); err == nil {
+275: 				image.Close()
+276: 				t.Fatal("D installation with untrusted ancestor modify ACL accepted")
+277: 			}
+278: 		})
+279: 	}
+280: 	operator := testOperatorSID(t)
+281: 	for _, tc := range []struct {
+282: 		name, target, rights, trustee string
+283: 	}{
+284: 		{"Everyone direct final full control", "final", "FA", "WD"},
+285: 		{"Users direct final write", "final", "GW", "BU"},
+286: 		{"Everyone inherited ancestor full control", "ancestor", "FA", "WD"},
+287: 		{"Users inherited ancestor write", "ancestor", "GW", "BU"},
+288: 		{"Users inherited ancestor control", "ancestor", "WD", "BU"},
+289: 	} {
+290: 		t.Run(tc.name, func(t *testing.T) {
+291: 			imageDir := filepath.Join(t.TempDir(), "image")
+292: 			if err := os.Mkdir(imageDir, 0700); err != nil {
+293: 				t.Fatal(err)
+294: 			}
+295: 			trusted := "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + operator + ")"
+296: 			if tc.target == "ancestor" {
+297: 				setTestImageDACL(t, imageDir, "D:P"+trusted+"(A;OICI;"+tc.rights+";;;"+tc.trustee+")")
+298: 			}
+299: 			original, err := os.Open(os.Args[0])
+300: 			if err != nil {
+301: 				t.Fatal(err)
+302: 			}
+303: 			defer original.Close()
+304: 			copyPath := filepath.Join(imageDir, "parent.exe")
+305: 			copyFile, err := os.Create(copyPath)
+306: 			if err != nil {
+307: 				t.Fatal(err)
+308: 			}
+309: 			if _, err = io.Copy(copyFile, original); err != nil {
+310: 				copyFile.Close()
+311: 				t.Fatal(err)
+312: 			}
+313: 			if err = copyFile.Close(); err != nil {
+314: 				t.Fatal(err)
+315: 			}
+316: 			if tc.target == "final" {
+317: 				setTestImageDACL(t, copyPath, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+operator+")(A;;"+tc.rights+";;;"+tc.trustee+")")
+318: 			}
+319: 			pidFile := filepath.Join(t.TempDir(), "child.pid")
+320: 			parent := exec.Command(copyPath, "-test.run=^TestOwnedCoreFixtureParent$")
+321: 			parent.Env = append(os.Environ(), "RESEARCHOS_OWNED_PARENT_CHILD=yes", "RESEARCHOS_OWNED_CHILD_PID_FILE="+pidFile)
+322: 			if err := parent.Start(); err != nil {
+323: 				t.Fatal(err)
+324: 			}
+325: 			t.Cleanup(func() { _ = parent.Process.Kill(); _ = parent.Wait() })
+326: 			var childPID uint64
+327: 			for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+328: 				if raw, e := os.ReadFile(pidFile); e == nil {
+329: 					childPID, err = strconv.ParseUint(string(raw), 10, 32)
+330: 					if err != nil {
+331: 						t.Fatal(err)
+332: 					}
+333: 					break
+334: 				}
+335: 			}
+336: 			if childPID == 0 {
+337: 				t.Fatal("copied child PID unavailable")
+338: 			}
+339: 			child, err := os.FindProcess(int(childPID))
+340: 			if err != nil {
+341: 				t.Fatal(err)
+342: 			}
+343: 			t.Cleanup(func() { _ = child.Kill() })
+344: 			if _, err = ObserveOwnedCoreReadOnly(uint32(childPID)); err == nil || !strings.Contains(err.Error(), "image DACL grants write or control") {
+345: 				t.Fatalf("unsafe copied parent/child ACL was not refused before signal: %v", err)
+346: 			}
+347: 		})
+348: 	}
+349: }
+350: 
+351: func TestOwnedCoreTerminateFailureIsSingleUnknownAttempt(t *testing.T) {
+352: 	core := ownedCoreChild(t)
+353: 	defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+354: 	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+355: 	if err != nil {
+356: 		t.Fatal(err)
+357: 	}
+358: 	h, err := OpenOwnedCoreRetained(id)
+359: 	if err != nil {
+360: 		t.Fatal(err)
+361: 	}
+362: 	defer h.Close()
+363: 	called := 0
+364: 	h.terminate = func(windows.Handle, uint32) error { called++; return errors.New("injected native failure") }
+365: 	exit, err := h.TerminateOnceAndWait(time.Second)
+366: 	if err == nil || exit.TerminateCalls != 1 || exit.ExitObserved || called != 1 {
+367: 		t.Fatalf("one-call failure was not UNKNOWN: %+v calls=%d err=%v", exit, called, err)
+368: 	}
+369: 	if again, err := h.TerminateOnceAndWait(time.Second); err == nil || again.TerminateCalls != 0 || called != 1 {
+370: 		t.Fatalf("native failure retried: %+v calls=%d err=%v", again, called, err)
+371: 	}
+372: 	if _, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
+373: 		t.Fatalf("injected failure affected target before cleanup: %v", err)
+374: 	}
+375: }
+376: 
+377: func TestOwnedCoreWaitDeadlineNeverRetriesSignal(t *testing.T) {
+378: 	core := ownedCoreChild(t)
+379: 	defer func() { _ = core.Wait() }()
+380: 	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+381: 	if err != nil {
+382: 		t.Fatal(err)
+383: 	}
+384: 	h, err := OpenOwnedCoreRetained(id)
+385: 	if err != nil {
+386: 		t.Fatal(err)
+387: 	}
+388: 	defer h.Close()
+389: 	waits := 0
+390: 	h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
+391: 		waits++
+392: 		if waits == 2 {
+393: 			return uint32(windows.WAIT_TIMEOUT), nil
+394: 		}
+395: 		return windows.WaitForSingleObject(handle, ms)
+396: 	}
+397: 	exit, err := h.TerminateOnceAndWait(time.Second)
+398: 	if err == nil || exit.TerminateCalls != 1 || exit.ExitObserved || waits != 2 {
+399: 		t.Fatalf("deadline not reported UNKNOWN: %+v waits=%d err=%v", exit, waits, err)
+400: 	}
+401: 	if again, err := h.TerminateOnceAndWait(time.Second); err == nil || again.TerminateCalls != 0 || waits != 2 {
+402: 		t.Fatalf("deadline retried signal/wait: %+v waits=%d err=%v", again, waits, err)
+403: 	}
+404: }
+405: 
+406: func TestOwnedCoreExpiredGrantBoundaryMakesZeroNativeCalls(t *testing.T) {
+407: 	core := ownedCoreChild(t)
+408: 	defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+409: 	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+410: 	if err != nil {
+411: 		t.Fatal(err)
+412: 	}
+413: 	h, err := OpenOwnedCoreRetained(id)
+414: 	if err != nil {
+415: 		t.Fatal(err)
+416: 	}
+417: 	defer h.Close()
+418: 	called := 0
+419: 	h.terminate = func(windows.Handle, uint32) error { called++; return nil }
+420: 	before := time.Now().Add(-time.Second)
+421: 	exit, err := h.TerminateOnceAndWaitUntil(time.Second, before, before)
+422: 	if err == nil || exit.TerminateCalls != 0 || called != 0 || h.terminateCalls != 0 {
+423: 		t.Fatalf("expired signal boundary allowed call: %+v calls=%d err=%v", exit, called, err)
+424: 	}
+425: 	if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
+426: 		t.Fatalf("zero-call target died: %v", err)
+427: 	}
+428: }
+429: 
+430: func TestOwnedCoreCallerCancellationAtFinalNativeBoundary(t *testing.T) {
+431: 	for _, mode := range []string{"already canceled", "earlier caller deadline", "canceled by prewait"} {
+432: 		t.Run(mode, func(t *testing.T) {
+433: 			core := ownedCoreChild(t)
+434: 			defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+435: 			id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+436: 			if err != nil {
+437: 				t.Fatal(err)
+438: 			}
+439: 			h, err := OpenOwnedCoreRetained(id)
+440: 			if err != nil {
+441: 				t.Fatal(err)
+442: 			}
+443: 			defer h.Close()
+444: 			ctx, cancel := context.WithCancel(context.Background())
+445: 			if mode == "earlier caller deadline" {
+446: 				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(10*time.Millisecond))
+447: 			}
+448: 			defer cancel()
+449: 			if mode == "already canceled" {
+450: 				cancel()
+451: 			}
+452: 			if mode == "canceled by prewait" {
+453: 				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
+454: 					if ms == 0 {
+455: 						cancel()
+456: 					}
+457: 					return windows.WaitForSingleObject(handle, ms)
+458: 				}
+459: 			}
+460: 			if mode == "earlier caller deadline" {
+461: 				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
+462: 					if ms == 0 {
+463: 						time.Sleep(20 * time.Millisecond)
+464: 					}
+465: 					return windows.WaitForSingleObject(handle, ms)
+466: 				}
+467: 			}
+468: 			calls := 0
+469: 			h.terminate = func(windows.Handle, uint32) error { calls++; return nil }
+470: 			exit, err := h.TerminateOnceAndWaitUntilContext(ctx, time.Second, time.Now().Add(time.Minute), time.Now().Add(time.Minute))
+471: 			if err == nil || exit.TerminateCalls != 0 || calls != 0 || h.terminateCalls != 0 {
+472: 				t.Fatalf("canceled/deadline native signal occurred: %+v calls=%d err=%v", exit, calls, err)
+473: 			}
+474: 			if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
+475: 				t.Fatalf("zero-call Core disappeared: %v", err)
+476: 			}
+477: 		})
+478: 	}
+479: }
+480: 
+481: func ownedCoreChild(t *testing.T) *exec.Cmd {
+482: 	t.Helper()
+483: 	exe, err := os.Executable()
+484: 	if err != nil {
+485: 		t.Fatal(err)
+486: 	}
+487: 	cmd := exec.Command(exe, "-test.run=^TestOwnedCoreFixtureChild$")
+488: 	cmd.Env = append(os.Environ(), "RESEARCHOS_OWNED_CORE_CHILD=yes")
+489: 	if err = cmd.Start(); err != nil {
+490: 		t.Fatal(err)
+491: 	}
+492: 	return cmd
+493: }
+494: 
+495: func TestOwnedCoreRetainedHandleSingleChildAndUnrelatedSurvives(t *testing.T) {
+496: 	core := ownedCoreChild(t)
+497: 	unrelated := ownedCoreChild(t)
+498: 	defer func() { _ = core.Wait(); _ = unrelated.Wait() }()
+499: 	observed, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+500: 	if err != nil {
+501: 		t.Fatal(err)
+502: 	}
+503: 	if observed.PID != uint32(core.Process.Pid) || observed.CreatedNS == 0 || observed.SID == "" || observed.ParentPID != uint32(os.Getpid()) || observed.ImageIndex == 0 || observed.ParentImageIndex == 0 {
+504: 		t.Fatalf("incomplete retained identity: %+v", observed)
+505: 	}
+506: 	wrong := observed
+507: 	wrong.CreatedNS++
+508: 	if h, e := OpenOwnedCoreRetained(wrong); e == nil {
+509: 		h.Close()
+510: 		t.Fatal("PID reuse identity accepted")
+511: 	}
+512: 	wrong = observed
+513: 	wrong.ImageSHA256 = strings.Repeat("0", 64)
+514: 	if h, e := OpenOwnedCoreRetained(wrong); e == nil {
+515: 		h.Close()
+516: 		t.Fatal("replacement image identity accepted")
+517: 	}
+518: 	h, err := OpenOwnedCoreRetained(observed)
+519: 	if err != nil {
+520: 		t.Fatal(err)
+521: 	}
+522: 	defer h.Close()
+523: 	if h.Identity() != observed {
+524: 		t.Fatal("retained identity changed")
+525: 	}
+526: 	exit, err := h.TerminateOnceAndWait(5 * time.Second)
+527: 	if err != nil || exit.TerminateCalls != 1 || !exit.ExitObserved || exit.ExitCode != OwnedCoreMaintenanceExitCode || exit.BeforeSignal {
+528: 		t.Fatalf("single exact termination failed: %+v %v", exit, err)
+529: 	}
+530: 	if second, e := h.TerminateOnceAndWait(time.Second); e == nil || second.TerminateCalls != 0 {
+531: 		t.Fatalf("second termination accepted: %+v %v", second, e)
+532: 	}
+533: 	other, e := ObserveOwnedCoreReadOnly(uint32(unrelated.Process.Pid))
+534: 	if e != nil || other.PID != uint32(unrelated.Process.Pid) {
+535: 		t.Fatalf("same-console unrelated child lost: %+v %v", other, e)
+536: 	}
+537: }

@@ -1,0 +1,241 @@
+R3 DELTA
+--- a/internal/qualificationmaintenancejournal/journal_windows.go
++++ b/internal/qualificationmaintenancejournal/journal_windows.go
+@@ -78,7 +78,7 @@
+ 	}
+ 	before := map[string]any{
+ 		"census": get("before_census"), "run": get("before_run"), "state": get("before_state"),
+-		"dispatch": get("before_dispatch"), "protected": get("before_protected_sha256"),
++		"dispatch": get("before_dispatch"), "dispatch_row": get("before_dispatch_row"), "protected": get("before_protected_sha256"),
+ 		"residual": get("before_residual_sha256"),
+ 	}
+ 	if value, err := hash(before); err != nil || value != plan.BeforeHash {
+--- a/internal/qualificationmaintenancejournal/journal_windows_test.go
++++ b/internal/qualificationmaintenancejournal/journal_windows_test.go
+@@ -26,7 +26,7 @@
+ 		"operation_id": plan.OperationID, "data_root": plan.DataRoot, "database": plan.Database,
+ 		"core": core, "subject": subject, "source": source, "proof": proof,
+ 		"before_census": map[string]any{"rows": 0}, "before_run": map[string]any{}, "before_state": map[string]any{},
+-		"before_dispatch": map[string]any{}, "before_protected_sha256": "p", "before_residual_sha256": "r",
++		"before_dispatch": map[string]any{}, "before_dispatch_row": map[string]any{}, "before_protected_sha256": "p", "before_residual_sha256": "r",
+ 		"artifact": map[string]any{}, "impact_link": map[string]any{}, "run": map[string]any{},
+ 		"project_state": map[string]any{}, "event": map[string]any{}, "observation": map[string]any{},
+ 		"dispatch_sequence": int64(1), "proof_bytes": []byte("fixture"), "outcome_hash": digest([]byte("outcome")),
+@@ -42,7 +42,7 @@
+ 	plan.SubjectHash = mustHash(subject)
+ 	plan.EvidenceHash = mustHash(map[string]any{"source": source, "native": proof["native"], "model": proof["model_binding"]})
+ 	plan.BeforeHash = mustHash(map[string]any{"census": full["before_census"], "run": full["before_run"], "state": full["before_state"],
+-		"dispatch": full["before_dispatch"], "protected": full["before_protected_sha256"], "residual": full["before_residual_sha256"]})
++		"dispatch": full["before_dispatch"], "dispatch_row": full["before_dispatch_row"], "protected": full["before_protected_sha256"], "residual": full["before_residual_sha256"]})
+ 	plan.AfterHash = mustHash(map[string]any{"artifact": full["artifact"], "impact_link": full["impact_link"], "run": full["run"],
+ 		"state": full["project_state"], "event": full["event"], "observation": full["observation"],
+ 		"dispatch_sequence": full["dispatch_sequence"], "upload_hash": digest([]byte("fixture")), "outcome_hash": full["outcome_hash"]})
+@@ -114,6 +114,7 @@
+ 		func(full map[string]any) { full["operation_id"] = "ffeeddccbbaa99887766554433221100" },
+ 		func(full map[string]any) { full["core"] = map[string]any{"schema": "changed"} },
+ 		func(full map[string]any) { full["before_protected_sha256"] = "changed" },
++		func(full map[string]any) { full["before_dispatch_row"] = map[string]any{"changed": true} },
+ 		func(full map[string]any) { full["proof_bytes"] = []byte("different") },
+ 		func(full map[string]any) { full["source"] = map[string]any{"source": "changed"} },
+ 	} {
+--- a/internal/host/qualification_failure_maintenance_windows_test.go
++++ b/internal/host/qualification_failure_maintenance_windows_test.go
+@@ -6,15 +6,95 @@
+ 	"context"
+ 	"crypto/sha256"
+ 	"database/sql"
++	"encoding/base64"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"unsafe"
+ 
+ 	"golang.org/x/sys/windows"
+ 	"researchos.local/research-os/internal/domain"
++	"researchos.local/research-os/internal/qualificationmaintenancejournal"
+ )
++
++func TestQualificationJournalFullPlanDispatchRowRoundTrip(t *testing.T) {
++	root := t.TempDir()
++	user, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	sid := user.User.Sid.String()
++	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")")
++	if err != nil {
++		t.Fatal(err)
++	}
++	hostPath, err := windows.UTF16PtrFromString(filepath.Join(root, "host"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
++	if err = windows.CreateDirectory(hostPath, &sa); err != nil {
++		t.Fatal(err)
++	}
++	plan := domain.HistoricalQualificationPlan{
++		Schema:      "researchos.qualification-failure-maintenance-full-plan.v1",
++		OperationID: "00112233445566778899aabbccddeeff", DataRoot: root,
++		Database: filepath.Join(root, "researchos.sqlite"),
++		Core:     domain.Object{"schema": "fixture"}, Proof: domain.Object{
++			"native": domain.Object{"kind": "fixture"}, "model_binding": domain.Object{"kind": "fixture"}},
++		ProofBytes: []byte("fixture"), OutcomeHash: domain.Digest([]byte("outcome")),
++		Subject:   domain.HistoricalQualificationSubject{ProjectID: "project", RunID: "run", Epoch: 1, DispatchKey: "dispatch"},
++		BeforeRun: domain.Object{}, BeforeState: domain.Object{}, BeforeDispatch: domain.Object{"state": "STARTED"},
++		BeforeProtectedSHA256: domain.Digest([]byte("protected")), BeforeResidualSHA256: domain.Digest([]byte("residual")),
++		Artifact: domain.Object{}, ImpactLink: domain.Object{}, Run: domain.Object{}, ProjectState: domain.Object{},
++		Event: domain.Object{}, Observation: domain.Object{}, DispatchSequence: 1,
++	}
++	// Populate the private typed dispatch row through its public JSON contract,
++	// as the Host does when reading a reviewed plan from disk.
++	initial, err := json.Marshal(plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var tree map[string]any
++	if err = json.Unmarshal(initial, &tree); err != nil {
++		t.Fatal(err)
++	}
++	row := tree["before_dispatch_row"].(map[string]any)
++	row["project"], row["run"], row["epoch"], row["dispatch_key"] = "project", "run", float64(1), "dispatch"
++	row["worker"] = "fixture-worker"
++	cells := row["cells"].([]any)
++	cells[7] = map[string]any{"type": "text", "data": base64.StdEncoding.EncodeToString([]byte("fixture-worker"))}
++	serialized, err := json.Marshal(tree)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = json.Unmarshal(serialized, &plan); err != nil {
++		t.Fatal(err)
++	}
++	fullPlanRaw, err := json.Marshal(plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var reviewed domain.HistoricalQualificationPlan
++	if err = json.Unmarshal(fullPlanRaw, &reviewed); err != nil {
++		t.Fatal(err)
++	}
++	journalRaw, err := qualificationJournalRaw(reviewed, fullPlanRaw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	digest, err := qualificationmaintenancejournal.StartQualification(root, journalRaw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, status, err := qualificationmaintenancejournal.OpenOwnInspection(root,
++		qualificationmaintenancejournal.QualificationNamespace, plan.OperationID, digest)
++	if err != nil || status.State != "BEGIN" {
++		t.Fatalf("typed full plan journal readback: %#v %v", status, err)
++	}
++}
+ 
+ func TestQualificationMaintenanceFrozenSubjectAndExternalPlan(t *testing.T) {
+ 	s := domain.HistoricalQualificationSubject{
+
+R4 DELTA
+--- a/internal/domain/backup_source_lease_windows_test.go
++++ b/internal/domain/backup_source_lease_windows_test.go
+@@ -125,7 +125,7 @@
+ 	defer guard.borrow.Release()
+ 	for _, branch := range []string{"prepared-local", "prepared-handoff"} {
+ 		t.Run(branch, func(t *testing.T) {
+-			inner, err := acquirePreparedUpgradeRootLease(root, source, guard)
++			inner, err := acquirePreparedUpgradeRootLease(guard.root, guard.source, guard)
+ 			if err != nil || inner.Check() != nil {
+ 				t.Fatalf("inherited prepared lease: %v", err)
+ 			}
+@@ -135,7 +135,7 @@
+ 			if inner.Check() == nil {
+ 				t.Fatal("closed inner prepared lease remained valid")
+ 			}
+-			if !lease.Held() || guard.Check(root, source) != nil {
++			if !lease.Held() || guard.Check(guard.root, guard.source) != nil {
+ 				t.Fatal("inner prepared Close released outer native source owner")
+ 			}
+ 			if err := os.Rename(source, source+".moved"); err == nil {
+
+COPIED ["internal/host/qualification_failure_maintenance_windows_test.go", "internal/qualificationmaintenancejournal/journal_windows.go", "internal/qualificationmaintenancejournal/journal_windows_test.go", "internal/domain/backup_source_lease_windows_test.go"]
+AUTHOR 061-r3-journal EXIT 0
+go test -count=1 ./internal/host ./internal/qualificationmaintenancejournal -run ^(TestQualificationJournal.*|TestQualificationMaintenanceFrozenSubjectAndExternalPlan)$
+
+ok  	researchos.local/research-os/internal/host	2.105s
+ok  	researchos.local/research-os/internal/qualificationmaintenancejournal	0.473s
+AUTHOR combined-065-domain EXIT 1
+cwd=D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-maintenance-c57-20261025
+go=D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe
+GOOS=windows
+GOARCH=amd64
+TEMP=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/tmp
+TMP=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/tmp
+GOTMPDIR=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/go-tmp
+GOMODCACHE=D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod
+GOCACHE=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/go-cache
+argv=D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe test -count=1 ./internal/domain -run ^(TestHistoricalQualification.*|TestBackupSourceLease.*|TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner|TestConfigurationUpgradeActiveQueueRecovery)$
+
+--- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner (0.01s)
+    --- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local (0.00s)
+        backup_source_lease_windows_test.go:130: inherited prepared lease: UPGRADE_SOURCE_LEASE_IDENTITY
+    --- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff (0.00s)
+        backup_source_lease_windows_test.go:130: inherited prepared lease: UPGRADE_SOURCE_LEASE_IDENTITY
+FAIL
+FAIL	researchos.local/research-os/internal/domain	5.128s
+FAIL
+AUTHOR 070-domain-lease-isolate EXIT 1
+go test -count=1 -v ./internal/domain -run ^TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner$
+
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local
+    backup_source_lease_windows_test.go:130: inherited prepared lease: UPGRADE_SOURCE_LEASE_IDENTITY
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff
+    backup_source_lease_windows_test.go:130: inherited prepared lease: UPGRADE_SOURCE_LEASE_IDENTITY
+--- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner (0.01s)
+    --- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local (0.00s)
+    --- FAIL: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff (0.00s)
+FAIL
+FAIL	researchos.local/research-os/internal/domain	2.470s
+FAIL
+AUTHOR 071-domain-lease-isolate EXIT 0
+go test -count=1 -v ./internal/domain -run ^TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner$
+
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff
+--- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner (0.01s)
+    --- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local (0.00s)
+    --- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff (0.00s)
+ok  	researchos.local/research-os/internal/domain	1.972s
+AUTHOR 073-domain-lease-d-env EXIT 0
+cwd=D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-maintenance-c57-20261025
+TEMP=D:/作品集/ResearchOS/research-os/.local/qualification-recovery-boundary-boot6-20261025-tmp/native-tmp-v6c
+TMP=D:/作品集/ResearchOS/research-os/.local/qualification-recovery-boundary-boot6-20261025-tmp/native-tmp-v6c
+GOTMPDIR=D:/作品集/ResearchOS/research-os/.local/qualification-recovery-boundary-boot6-20261025-tmp/go-tmp-v6
+GOCACHE=D:/作品集/ResearchOS/research-os/.local/qualification-recovery-boundary-boot6-20261025-tmp/go-cache-v6
+GOMODCACHE=D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod
+GOOS=windows
+GOARCH=amd64
+argv=go.exe test -count=1 -v ./internal/domain -run ^TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner$
+
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local
+=== RUN   TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff
+--- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner (0.01s)
+    --- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-local (0.00s)
+    --- PASS: TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner/prepared-handoff (0.00s)
+ok  	researchos.local/research-os/internal/domain	1.936s
+AUTHOR 074-domain-combined-r4 EXIT 0
+cwd=D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-maintenance-c57-20261025
+TEMP=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/tmp
+TMP=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/tmp
+GOTMPDIR=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/go-tmp
+GOCACHE=C:/Users/yqyyds/.codex/researchos-fixture-cache/qualification-maintenance-c57-20261025/go-cache
+GOMODCACHE=D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod
+GOOS=windows
+GOARCH=amd64
+argv=go.exe test -count=1 ./internal/domain -run ^(TestHistoricalQualification.*|TestBackupSourceLease.*|TestPreparedNestedSourceLeaseCloseKeepsOuterNativeOwner|TestConfigurationUpgradeActiveQueueRecovery)$
+
+ok  	researchos.local/research-os/internal/domain	5.338s

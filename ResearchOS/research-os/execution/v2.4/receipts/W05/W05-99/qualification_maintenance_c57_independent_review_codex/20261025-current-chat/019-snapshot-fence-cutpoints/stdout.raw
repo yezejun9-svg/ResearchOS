@@ -1,0 +1,129 @@
+526:func checkAncestorControl(p EntryFencePlan,holds []nativeHold) error {
+531:	for _,group:=range p.BusinessGroupSIDs { if _,e:=windows.StringToSid(group); e!=nil { return e }; groups[group]=true }
+658:	if e=checkAncestorControl(p,holds); e!=nil { return fail(e) }
+1023:func setTargetDescriptor(path, sddl string) error {
+1257:			if e = setTargetDescriptor(t.File.Path, t.InstalledSD); e != nil {
+1387:			if e = setTargetDescriptor(t.File.Path, t.File.SecurityDescriptor); e != nil {
+579:	// Protecting a DACL makes formerly inherited ACEs explicit on the object.
+580:	// Normalize the planned descriptor to the native readback representation.
+581:	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+582:		var item *windows.ACCESS_ALLOWED_ACE
+583:		if e = windows.GetAce(acl, i, &item); e != nil {
+584:			return "", e
+585:		}
+586:		item.Header.AceFlags &^= windows.INHERITED_ACE
+587:	}
+588:	abs, e := sd.ToAbsolute()
+589:	if e != nil {
+590:		return "", e
+591:	}
+592:	if managementSID!=sidText {
+593:		manager,e:=windows.StringToSid(managementSID); if e!=nil { return "",e }
+594:		if e=abs.SetOwner(manager,false); e!=nil { return "",e }
+595:	}
+596:	if e = abs.SetDACL(acl, true, false); e != nil {
+597:		return "", e
+598:	}
+599:	if e = abs.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); e != nil {
+600:		return "", e
+601:	}
+602:	installed, e := abs.ToSelfRelative()
+603:	if e != nil {
+604:		return "", e
+605:	}
+606:	return installed.String(), nil
+607:}
+608:
+609:// OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
+1023:func setTargetDescriptor(path, sddl string) error {
+1024:	sd, e := windows.SecurityDescriptorFromString(sddl)
+1025:	if e != nil {
+1026:		return e
+1027:	}
+1028:	owner,_,e:=sd.Owner(); if e!=nil || owner==nil { return errors.New("target owner descriptor missing") }
+1029:	dacl, _, e := sd.DACL()
+1030:	if e != nil {
+1031:		return e
+1032:	}
+1033:	control, _, e := sd.Control()
+1034:	if e != nil {
+1035:		return e
+1036:	}
+1037:	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
+1038:	if control&windows.SE_DACL_PROTECTED != 0 {
+1039:		flags = windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+1040:	}
+1041:	w, e := windows.UTF16PtrFromString(path)
+1042:	if e != nil {
+1043:		return e
+1044:	}
+1045:	h, e := windows.CreateFile(w, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER|windows.FILE_READ_ATTRIBUTES,
+1046:		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+1047:	if e != nil {
+1048:		return e
+1049:	}
+1050:	defer windows.CloseHandle(h)
+1051:	return windows.SetSecurityInfo(h, windows.SE_FILE_OBJECT, flags|windows.OWNER_SECURITY_INFORMATION, owner, nil, dacl, nil)
+1052:}
+1053:
+1054:func checkNoOfficialProcess(p EntryFencePlan) error {
+1055:	snapshot, e := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+1382:		for _, t := range p.Targets {
+1383:			x := byPath[strings.ToLower(t.File.Path)]
+1384:			if x.SecurityDescriptor == t.File.SecurityDescriptor {
+1385:				continue
+1386:			}
+1387:			if e = setTargetDescriptor(t.File.Path, t.File.SecurityDescriptor); e != nil {
+1388:				return "", e
+1389:			}
+1390:			h, e := openNative(t.File.Path, false, true)
+1391:			if e != nil {
+1392:				return "", e
+1393:			}
+1394:			ok := identityEqual(t.File, h.identity)
+1395:			closeErr := windows.CloseHandle(h.handle)
+1396:			if closeErr != nil {
+1397:				return "", closeErr
+1398:			}
+1399:			if !ok {
+1400:				return "", errors.New("disarm exact descriptor readback mismatch")
+1401:			}
+1402:		}
+1403:		r, e = readRecord(p)
+1404:		if e != nil {
+1405:			return "", e
+1406:		}
+1407:		if e = appendEvent(p, r.Events, "CLOSED"); e != nil {
+1408:			return "", e
+1409:		}
+1410:		return "CLOSED", nil
+1411:	}
+1412:	return "", errors.New("unreachable boundary phase")
+1413:}
+1414:
+1415:func checkExactCDurable(p EntryFencePlan) error {
+1416:	path := filepath.Join(p.DataRoot.Path, "host", qualificationmaintenancejournal.QualificationNamespace, p.OperationID, "plan.json")
+1417:	raw, e := os.ReadFile(path)
+1418:	if e != nil || len(raw) > 256<<10 {
+1419:		return errors.New("C journal plan unavailable")
+1420:	}
+1421:	var view struct {
+1422:		PlanHash string `json:"plan_hash"`
+1423:	}
+1424:	if e = json.Unmarshal(raw, &view); e != nil {
+1425:		return e
+876:func managedToken(p EntryFencePlan) error {
+877:	token := windows.GetCurrentProcessToken()
+878:	if !token.IsElevated() {
+879:		return errors.New("trusted management elevation required")
+880:	}
+881:	u, e := token.GetTokenUser()
+882:	if e != nil {
+883:		return e
+884:	}
+885:	if u.User.Sid.String() != p.ManagementSID || p.BusinessSID == p.ManagementSID {
+886:		return errors.New("management SID cannot be business owner")
+887:	}
+888:	return nil
+889:}
+890:

@@ -1,0 +1,277 @@
+1c17662c feat(desktop): integrate reviewed model configuration and host-origin barriers
+apps/web/src/workbench.jsx:1: trailing whitespace.
++import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+apps/web/src/workbench.jsx:9: trailing whitespace.
++const sameConfiguration = (value, request) => !!value?.model_config_ref &&
+apps/web/src/workbench.jsx:10: trailing whitespace.
++  ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
+apps/web/src/workbench.jsx:11: trailing whitespace.
++// The shell owns the command lifetime. This observable renderer snapshot holds
+apps/web/src/workbench.jsx:12: trailing whitespace.
++// only the public payload and terminal result across route unmounts.
+apps/web/src/workbench.jsx:13: trailing whitespace.
++const modelConfigurationPending = new Map()
+apps/web/src/workbench.jsx:14: trailing whitespace.
++const modelConfigurationListeners = new Map()
+apps/web/src/workbench.jsx:15: trailing whitespace.
++const modelPending = projectId => modelConfigurationPending.get(projectId) || null
+apps/web/src/workbench.jsx:16: trailing whitespace.
++function updateModelPending(projectId, value) {
+apps/web/src/workbench.jsx:17: trailing whitespace.
++  if (value) modelConfigurationPending.set(projectId, value)
+apps/web/src/workbench.jsx:18: trailing whitespace.
++  else modelConfigurationPending.delete(projectId)
+apps/web/src/workbench.jsx:19: trailing whitespace.
++  for (const listener of modelConfigurationListeners.get(projectId) || []) listener()
+apps/web/src/workbench.jsx:20: trailing whitespace.
++}
+apps/web/src/workbench.jsx:21: trailing whitespace.
++function subscribeModelPending(projectId, listener) {
+apps/web/src/workbench.jsx:22: trailing whitespace.
++  let listeners = modelConfigurationListeners.get(projectId)
+apps/web/src/workbench.jsx:23: trailing whitespace.
++  if (!listeners) { listeners = new Set(); modelConfigurationListeners.set(projectId, listeners) }
+apps/web/src/workbench.jsx:24: trailing whitespace.
++  listeners.add(listener)
+apps/web/src/workbench.jsx:25: trailing whitespace.
++  return () => { listeners.delete(listener); if (!listeners.size) modelConfigurationListeners.delete(projectId) }
+apps/web/src/workbench.jsx:26: trailing whitespace.
++}
+apps/web/src/workbench.jsx:29: trailing whitespace.
++    const code = reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求'
+apps/web/src/workbench.jsx:30: trailing whitespace.
++    const detail = typeof reply?.error === 'string' ? reply.error : reply?.error?.message
+apps/web/src/workbench.jsx:31: trailing whitespace.
++    const error = new Error(detail ? `${code}：${detail}` : code)
+apps/web/src/workbench.jsx:41: trailing whitespace.
++export function NativeModelConfiguration({ projectId, initialHost, onConfigured }) {
+apps/web/src/workbench.jsx:42: trailing whitespace.
++  const pending = useSyncExternalStore(listener => subscribeModelPending(projectId, listener), () => modelPending(projectId), () => null)
+apps/web/src/workbench.jsx:43: trailing whitespace.
++  const [host, setHost] = useState(initialHost || null)
+apps/web/src/workbench.jsx:44: trailing whitespace.
++  const [form, setForm] = useState(() => modelPending(projectId)?.form || { provider_id: '', base_url: '', model_id: '', credential_ref: '' })
+apps/web/src/workbench.jsx:45: trailing whitespace.
++  const [busy, setBusy] = useState(false), [error, setError] = useState(null), [notice, setNotice] = useState('')
+apps/web/src/workbench.jsx:46: trailing whitespace.
++  const live = useRef(true)
+apps/web/src/workbench.jsx:47: trailing whitespace.
++  useEffect(() => { live.current = true; return () => { live.current = false } }, [])
+apps/web/src/workbench.jsx:48: trailing whitespace.
++  useEffect(() => { if (initialHost) setHost(initialHost) }, [initialHost])
+apps/web/src/workbench.jsx:49: trailing whitespace.
++  async function readHost() {
+apps/web/src/workbench.jsx:50: trailing whitespace.
++    if (!live.current) throw new Error('页面已切换')
+apps/web/src/workbench.jsx:51: trailing whitespace.
++    const selected = await window.researchos.desktop.selectProject(projectId)
+apps/web/src/workbench.jsx:52: trailing whitespace.
++    if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
+apps/web/src/workbench.jsx:53: trailing whitespace.
++    if (!live.current) throw new Error('页面已切换')
+apps/web/src/workbench.jsx:54: trailing whitespace.
++    const reply = await window.researchos.v2['host.status']({})
+apps/web/src/workbench.jsx:55: trailing whitespace.
++    const value = { ...unwrap(reply), localHostOrigin: reply?.local_host_origin }
+apps/web/src/workbench.jsx:56: trailing whitespace.
++    if (!Number.isSafeInteger(value?.config_revision) || value.config_revision < 0) throw new Error('主机未返回有效的配置修订')
+apps/web/src/workbench.jsx:57: trailing whitespace.
++    if (!/^[a-f0-9]{64}$/.test(value.localHostOrigin || '')) throw new Error('主机未返回可信的本地身份')
+apps/web/src/workbench.jsx:58: trailing whitespace.
++    if (!live.current) throw new Error('页面已切换')
+apps/web/src/workbench.jsx:59: trailing whitespace.
++    setHost(value)
+apps/web/src/workbench.jsx:60: trailing whitespace.
++    return value
+apps/web/src/workbench.jsx:61: trailing whitespace.
++  }
+apps/web/src/workbench.jsx:62: trailing whitespace.
++  useEffect(() => { readHost().catch(setError) }, [projectId])
+apps/web/src/workbench.jsx:63: trailing whitespace.
++  async function reconcile(entry) {
+apps/web/src/workbench.jsx:64: trailing whitespace.
++    if (!entry?.outcome) return
+apps/web/src/workbench.jsx:65: trailing whitespace.
++    if (entry.reconciling) return entry.reconciling
+apps/web/src/workbench.jsx:66: trailing whitespace.
++    entry.reconciling = (async () => {
+apps/web/src/workbench.jsx:67: trailing whitespace.
++      if (!live.current || modelPending(projectId) !== entry) return
+apps/web/src/workbench.jsx:68: trailing whitespace.
++      const reply = entry.outcome
+apps/web/src/workbench.jsx:69: trailing whitespace.
++      if (reply?.dispatch_state === 'NOT_SENT') {
+apps/web/src/workbench.jsx:70: trailing whitespace.
++        // This attempt never reached HTTP. It has no original-host effect to
+apps/web/src/workbench.jsx:71: trailing whitespace.
++        // reconcile, even if another project's command owns the shell barrier.
+apps/web/src/workbench.jsx:72: trailing whitespace.
++        updateModelPending(projectId, null)
+apps/web/src/workbench.jsx:73: trailing whitespace.
++        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reply?.reason || '本地请求未发送'))
+apps/web/src/workbench.jsx:74: trailing whitespace.
++        return
+apps/web/src/workbench.jsx:75: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:76: trailing whitespace.
++      const refreshed = await readHost()
+apps/web/src/workbench.jsx:77: trailing whitespace.
++      if (!entry.origin || refreshed.localHostOrigin !== entry.origin || reply?.local_host_origin !== entry.origin) {
+apps/web/src/workbench.jsx:78: trailing whitespace.
++        throw new Error('主机已切换；原配置只能在原主机核对，当前主机不可证明保存结果')
+apps/web/src/workbench.jsx:79: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:80: trailing whitespace.
++      if ((reply?.ok && settled(reply)) || reply?.reason === 'STALE_RESPONSE') {
+apps/web/src/workbench.jsx:81: trailing whitespace.
++        const saved = reply?.reason === 'STALE_RESPONSE' ? reply.local_terminal_result : unwrap(reply)
+apps/web/src/workbench.jsx:82: trailing whitespace.
++        if (!sameConfiguration(saved, entry.payload)) throw new Error('原配置回执缺少完整的配置身份；请核对原主机状态')
+apps/web/src/workbench.jsx:83: trailing whitespace.
++        if (!refreshed.model_configurations?.some(item => sameConfiguration(item, entry.payload) && item.model_config_ref === saved.model_config_ref)) {
+apps/web/src/workbench.jsx:84: trailing whitespace.
++          throw new Error('原主机状态尚未列出同一配置；请刷新核对')
+apps/web/src/workbench.jsx:85: trailing whitespace.
++        }
+apps/web/src/workbench.jsx:86: trailing whitespace.
++        if (!live.current || modelPending(projectId) !== entry) return
+apps/web/src/workbench.jsx:87: trailing whitespace.
++        updateModelPending(projectId, null)
+apps/web/src/workbench.jsx:88: trailing whitespace.
++        onConfigured?.(refreshed, saved)
+apps/web/src/workbench.jsx:89: trailing whitespace.
++        setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+apps/web/src/workbench.jsx:90: trailing whitespace.
++      } else {
+apps/web/src/workbench.jsx:91: trailing whitespace.
++        const reason = reply?.reason || reply?.error_code
+apps/web/src/workbench.jsx:92: trailing whitespace.
++        if (!live.current || modelPending(projectId) !== entry) return
+apps/web/src/workbench.jsx:93: trailing whitespace.
++        updateModelPending(projectId, null)
+apps/web/src/workbench.jsx:94: trailing whitespace.
++        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reason || '主机拒绝配置'))
+apps/web/src/workbench.jsx:95: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:96: trailing whitespace.
++    })()
+apps/web/src/workbench.jsx:97: trailing whitespace.
++    try { await entry.reconciling }
+apps/web/src/workbench.jsx:98: trailing whitespace.
++    finally { entry.reconciling = null }
+apps/web/src/workbench.jsx:99: trailing whitespace.
++  }
+apps/web/src/workbench.jsx:100: trailing whitespace.
++  useEffect(() => { if (pending?.outcome) reconcile(pending).catch(setError) }, [pending, projectId])
+apps/web/src/workbench.jsx:101: trailing whitespace.
++  async function submit(event) {
+apps/web/src/workbench.jsx:102: trailing whitespace.
++    event.preventDefault(); if (busy) return
+apps/web/src/workbench.jsx:103: trailing whitespace.
++    setBusy(true); setError(null); setNotice('')
+apps/web/src/workbench.jsx:104: trailing whitespace.
++    try {
+apps/web/src/workbench.jsx:105: trailing whitespace.
++      const remembered = modelPending(projectId)
+apps/web/src/workbench.jsx:106: trailing whitespace.
++      if (remembered?.outcome) { await reconcile(remembered); return }
+apps/web/src/workbench.jsx:107: trailing whitespace.
++      if (!remembered && (!form.provider_id.trim() || !form.model_id.trim() || !form.base_url.trim())) {
+apps/web/src/workbench.jsx:108: trailing whitespace.
++        throw new Error('提供方 ID、模型 ID 和 API 基础地址不能为空')
+apps/web/src/workbench.jsx:109: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:110: trailing whitespace.
++      const current = remembered ? null : await readHost()
+apps/web/src/workbench.jsx:111: trailing whitespace.
++      const request = remembered?.payload || {
+apps/web/src/workbench.jsx:112: trailing whitespace.
++        config_revision: current.config_revision + 1,
+apps/web/src/workbench.jsx:113: trailing whitespace.
++        provider_id: form.provider_id.trim(), base_url: form.base_url.trim(), model_id: form.model_id.trim(),
+apps/web/src/workbench.jsx:114: trailing whitespace.
++        credential_ref: form.credential_ref.trim() || null,
+apps/web/src/workbench.jsx:115: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:116: trailing whitespace.
++      if (!live.current) return
+apps/web/src/workbench.jsx:117: trailing whitespace.
++      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, origin: current.localHostOrigin, outcome: null })
+apps/web/src/workbench.jsx:118: trailing whitespace.
++      const reply = await window.researchos.v2['host.configure'](request)
+apps/web/src/workbench.jsx:119: trailing whitespace.
++      const entry = modelPending(projectId)
+apps/web/src/workbench.jsx:120: trailing whitespace.
++      if (entry?.payload !== request) return
+apps/web/src/workbench.jsx:121: trailing whitespace.
++      if (reply?.ok && !settled(reply)) {
+apps/web/src/workbench.jsx:122: trailing whitespace.
++        if (reply.local_host_origin && reply.local_host_origin !== entry.origin) updateModelPending(projectId, { ...entry, origin: reply.local_host_origin })
+apps/web/src/workbench.jsx:123: trailing whitespace.
++        if (live.current) setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
+apps/web/src/workbench.jsx:124: trailing whitespace.
++        return
+apps/web/src/workbench.jsx:125: trailing whitespace.
++      }
+apps/web/src/workbench.jsx:126: trailing whitespace.
++      // Only a trusted shell terminal response or pre-HTTP fact ends this
+apps/web/src/workbench.jsx:127: trailing whitespace.
++      // intent. Every other failure remains an uncertain replay.
+apps/web/src/workbench.jsx:128: trailing whitespace.
++      if (settled(reply) || reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (!remembered && reply?.reason === 'COMMAND_PENDING')) {
+apps/web/src/workbench.jsx:129: trailing whitespace.
++        const terminal = { ...entry, origin: reply?.local_host_origin || null, outcome: reply }
+apps/web/src/workbench.jsx:130: trailing whitespace.
++        updateModelPending(projectId, terminal)
+apps/web/src/workbench.jsx:131: trailing whitespace.
++        if (live.current) await reconcile(terminal)
+apps/web/src/workbench.jsx:132: trailing whitespace.
++      } else if (live.current) unwrap(reply)
+apps/web/src/workbench.jsx:133: trailing whitespace.
++    } catch (cause) {
+apps/web/src/workbench.jsx:134: trailing whitespace.
++      if (live.current) { setError(cause); if (modelPending(projectId)?.outcome?.ok) setNotice('主机已返回配置成功；状态刷新尚未确认，请重新读取。') }
+apps/web/src/workbench.jsx:135: trailing whitespace.
++    } finally { if (live.current) setBusy(false) }
+apps/web/src/workbench.jsx:136: trailing whitespace.
++  }
+apps/web/src/workbench.jsx:137: trailing whitespace.
++  return <Panel title="模型配置" aside={<button type="button" disabled={busy} onClick={() => readHost().then(() => setError(null)).catch(setError)}>刷新主机状态</button>}>
+apps/web/src/workbench.jsx:138: trailing whitespace.
++    <p>配置保存到本地主机。空凭据引用适用于无凭据的本地模型；远程服务须使用主机已有的受保护凭据引用。</p>
+apps/web/src/workbench.jsx:139: trailing whitespace.
++    {host && <p className="small-muted">当前配置修订 {host.config_revision} · 已保存 {host.model_configurations?.length || 0} 条配置</p>}
+apps/web/src/workbench.jsx:140: trailing whitespace.
++    <Failure error={error}/>
+apps/web/src/workbench.jsx:141: trailing whitespace.
++    <form className="form-grid" onSubmit={submit}>
+apps/web/src/workbench.jsx:142: trailing whitespace.
++      <label>提供方 ID<input value={form.provider_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, provider_id: event.target.value })} placeholder="例如 ollama" required/></label>
+apps/web/src/workbench.jsx:143: trailing whitespace.
++      <label>模型 ID<input value={form.model_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, model_id: event.target.value })} placeholder="例如 qwen3:4b-instruct" required/></label>
+apps/web/src/workbench.jsx:144: trailing whitespace.
++      <label className="full-row">API 基础地址<input type="url" value={form.base_url} disabled={busy || !!pending} onChange={event => setForm({ ...form, base_url: event.target.value })} placeholder="http://127.0.0.1:11434/v1" required/></label>
+apps/web/src/workbench.jsx:145: trailing whitespace.
++      <label className="full-row">受保护凭据引用（本地模型留空）<input value={form.credential_ref} disabled={busy || !!pending} onChange={event => setForm({ ...form, credential_ref: event.target.value })} autoComplete="off" placeholder="留空时提交 null"/></label>
+apps/web/src/workbench.jsx:146: trailing whitespace.
++      <button className="primary" type="submit" disabled={busy}>{busy ? '正在核对主机修订…' : pending?.outcome ? '核对原配置结果' : pending ? '继续同一配置命令' : '保存模型配置'}</button>
+apps/web/src/workbench.jsx:147: trailing whitespace.
++    </form>
+apps/web/src/workbench.jsx:148: trailing whitespace.
++    {notice && <p role="status">{notice}</p>}
+apps/web/src/workbench.jsx:149: trailing whitespace.
++    {!!host?.model_configurations?.length && <div className="record-list">{host.model_configurations.map(item => <div className="record-row" key={item.model_config_ref}><strong>{item.provider_id} · {item.model_id}</strong><small>配置修订 {item.config_revision} · {item.verified_at ? '提供方已探测' : '提供方未探测'} · 运行时资格未由此确认</small></div>)}</div>}
+apps/web/src/workbench.jsx:150: trailing whitespace.
++  </Panel>
+apps/web/src/workbench.jsx:151: trailing whitespace.
++}
+apps/web/src/workbench.jsx:152: trailing whitespace.
++
+apps/web/src/workbench.jsx:179: trailing whitespace.
++    <Failure error={error}/>{result && <div role="status"><p>本地盘点已保存。接下来可在项目工作台配置模型；配置保存后仍须由服务端验证运行资格。</p><p className="break-all">{result.workspace.display_path}</p><button onClick={() => navigate(`/p/${result.project_id}`)}>配置模型并打开工作台</button></div>}
+apps/web/src/workbench.jsx:305: trailing whitespace.
++    {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
+apps/web/src/workbench.jsx:312: trailing whitespace.
++          <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择配置记录（资格未确认）</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
+apps/web/src/workbench.jsx:313: trailing whitespace.
++          {!state.host?.model_configurations?.length ? <p>还没有模型配置，请先使用上方表单或项目设置保存。</p> : <p className="small-muted">配置记录不代表运行时已具备资格；创建会话时由服务端检查。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>

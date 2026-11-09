@@ -1,0 +1,49 @@
+async function extraCases(){
+  for(const mode of ['true','false','missing','promise','throw','string','undefined']) await check('final-sync-guard/'+mode,async()=>{
+    const f=wireFixture();const fn=async()=>ref;
+    if(mode!=='missing')fn.verifyOrigin=()=>{if(mode==='throw')throw Error('changed');return mode==='true'?true:mode==='false'?false:mode==='promise'?Promise.resolve(true):mode==='string'?'true':undefined;};
+    const r=await f.transport('POST',d().url+'/v2/command',env(),{Authorization:'Bearer fake'},fn);
+    if(mode==='true'){assert.equal(r.ok,true);assert.equal(f.posts.length,1);}else{assert.equal(r.dispatch_state,'NOT_SENT');assert.equal(f.posts.length,0);}
+  });
+  for(const field of ['host_instance_id','url','data_dir'])await check('final-origin-late-field/'+field,async()=>{
+    const f=ipcFixture();f.deps.nativeCreateAttest=()=>{const p=Promise.resolve(ref);p.then(()=>queueMicrotask(()=>{f.current()[field]=field==='host_instance_id'?'host-ffffffffffff':field==='url'?'http://127.0.0.1:45679':'another-new-fixture-root';}));return p;};
+    const r=await ipc.callV2(f.deps,'session.create',payload());assert.equal(f.wire.posts.length,0);assert.equal(r.dispatch_state,'NOT_SENT');
+  });
+  await check('new-native-lane/oversize',async()=>{
+    const f=controlledNative();const p=f.api.dialNative('fake-only',{},20,true);const result=p.then(()=>({accepted:true}),error=>({error:error.message}));
+    f.socket.emit('connect');f.socket.emit('data',Buffer.alloc(8193,32));
+    assert.equal((await result).error,'NATIVE_FRAME_TOO_LARGE');assert.equal(f.socket.destroyed,true);assert.equal(f.timers[0].cleared,true);
+  });
+  await check('new-native-lane/absolute-timeout-with-partial-data',async()=>{
+    const f=controlledNative();const p=f.api.dialNative('fake-only',{},20,true);const result=p.then(()=>({accepted:true}),error=>({error:error.message}));
+    f.socket.emit('connect');for(let i=0;i<10;i++)f.socket.emit('data',Buffer.from(' '));
+    assert.equal(f.timers.length,1);assert.equal(f.timers[0].delay,20);assert.equal(f.socket.idleDelay,20);
+    f.timers[0].fn();assert.equal((await result).error,'NATIVE_TRANSPORT_TIMEOUT');assert.equal(f.socket.destroyed,true);assert.equal(f.timers[0].cleared,true);
+  });
+  await check('new-native-lane/close-without-end',async()=>{
+    const f=controlledNative();const p=f.api.dialNative('fake-only',{},20,true);const result=p.then(()=>({accepted:true}),error=>({error:error.message}));
+    f.socket.emit('connect');f.socket.emit('data',Buffer.from(JSON.stringify(proof())));f.socket.emit('close');
+    assert.equal((await result).error,'NATIVE_MALFORMED_REPLY');assert.equal(f.socket.destroyed,true);
+  });
+  await check('new-native-lane/end-then-close',async()=>{
+    const f=controlledNative();const p=f.api.dialNative('fake-only',{},20,true);const raw=Buffer.from(JSON.stringify(proof()));
+    f.socket.emit('connect');f.socket.emit('data',raw);f.socket.emit('end');assert.ok((await p).equals(raw));assert.equal(f.timers[0].cleared,true);
+  });
+  await check('legacy-native-lane/early-object-without-end-preserved',async()=>{
+    const f=controlledNative();const p=f.api.dialNative('fake-only',{kind:'NATIVE_USER_BOOTSTRAP_REQUEST'},20);
+    f.socket.emit('connect');f.socket.emit('data',Buffer.from(JSON.stringify(proof())));assert.equal((await p).kind,'NATIVE_CLIENT_ATTEST_RESULT');assert.equal(f.timers.length,0);assert.equal(f.socket.destroyed,true);
+  });
+  await check('native-canonical-escaped-key-valid-control',async()=>{
+    const attest=native.createClientAttestor({fsImpl:tokenFS,now:fixedNow,dial:async()=>JSON.stringify(proof()).replace('"kind":','"\\u006bind":')});
+    assert.equal(await attest(d(),Buffer.from(JSON.stringify(env())),{Authorization:'Bearer fake'}),ref);
+  });
+}
+function controlledNative(){
+  const timers=[];const socket=new EventEmitter();socket.destroyed=false;
+  socket.setTimeout=delay=>{socket.idleDelay=delay;};socket.write=()=>{};
+  socket.destroy=()=>{if(!socket.destroyed){socket.destroyed=true;socket.emit('close');}};
+  const context={require:name=>name==='node:net'?{connect:()=>socket}:name==='./http-wire.js'?require(path.join(lib,'http-wire.js')):require(name),
+    module:{exports:{}},exports:{},Buffer,TextDecoder,console,setTimeout:(fn,delay)=>{const t={fn,delay,cleared:false};timers.push(t);return t;},clearTimeout:t=>{t.cleared=true;}};
+  vm.runInNewContext(fs.readFileSync(path.join(lib,'native.js'),'utf8'),context);
+  return {api:context.module.exports,socket,timers};
+}

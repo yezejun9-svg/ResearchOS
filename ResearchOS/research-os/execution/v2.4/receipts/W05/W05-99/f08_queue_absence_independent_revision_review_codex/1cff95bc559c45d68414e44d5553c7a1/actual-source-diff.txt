@@ -1,0 +1,107 @@
+--- base-b50
++++ revision-9d7
+@@ -672,6 +672,7 @@
+ const f08Format="researchos.cancel-finalization/1"
+ const f08Unwired=f08Error("F08_CALLER_CONTRACT_UNBOUND")
+ const f08NativeProofGap=f08Error("F08_NATIVE_PROOF_IMPLEMENTATION_INCOMPLETE")
++const f08QualificationProfileGap=f08Error("F08_INITIAL_QUALIFICATION_PROFILE_PROOF_INCOMPLETE")
+ 
+ type f08Group struct {
+ 	phase string
+@@ -809,11 +810,75 @@
+ 	if r["private_header_digest"]!=req.headerDigest || binding["writer_client_id"]!=req.client{return zero,f08Binding}
+ 	return req,nil
+ }
++// Pure absence check over the complete typed source vector. It does not prove
++// SDK settlement and does not infer absence from a missing current Session.
++// A retained fence is the original Task/Session association; a Session's current
++// task_id may have advanced, so it is not used to reassign old queue history.
++func (v *f08ProofValidator) noSessionQueueHistory(s *f08Sources, project, task string) error {
++	if len(s.selectRows("sessions", []int{1, 6}, []any{project, task})) != 0 || len(s.selectRows("fences", []int{0, 1}, []any{project, task})) != 0 { return f08Binding }
++	for _, q := range s.rows["queue"] {
++		fs := s.selectRows("fences", []int{3}, []any{q[6]})
++		relevant := q[1] == project
++		for _, f := range fs { relevant = relevant || f[0] == project }
++		if !relevant { continue }
++		// Even DROPPED/CONSUMED history belongs to its original Task. SQL22's
++		// generation-only FK cannot justify the other denormalized columns.
++		if q[1] == project && q[4] == task { return f08Binding }
++		if len(fs) != 1 { return f08Binding }; f := fs[0]
++		if f[0] != q[1] || f[1] != q[4] || f[2] != q[3] { return f08Binding }
++		if _, e := s.one("sessions", []int{0, 1}, []any{q[3], q[1]}); e != nil { return e }
++		owner, e := v.head(s, project, "Task", q[4].(string)); if e != nil || owner.body["goal_id"] != q[5] { return f08Binding }
++		if _, e = v.head(s, project, "Goal", q[5].(string)); e != nil { return e }
++		n, e := f08Integer(q[7], 1); if e != nil { return e }
++		a, e := f08Integer(f[5], n); if e != nil || n > a { return f08Binding }
++		_, raw, e := f08RawObject(q[12]); if e != nil || f08RawHash(raw) != q[13] { return f08Binding }
++		if q[16] != nil {
++			if _, e = s.one("receipts", []int{0,1,2,3}, []any{q[16],q[1],q[6],q[2]}); e != nil { return e }
++		}
++	}
++	// Receipts have no FK. Every same-project receipt must be attributable to
++	// an original, different Task, rather than silently discarded as unrelated.
++	for _, r := range s.rows["receipts"] {
++		fs := s.selectRows("fences", []int{3}, []any{r[2]})
++		relevant := r[1] == project
++		for _, f := range fs { relevant = relevant || f[0] == project }
++		if !relevant { continue }
++		body, raw, e := f08RawObject(r[5]); if e != nil || f08RawHash(raw) != r[6] { return f08Binding }
++		if len(fs) != 1 || fs[0][0] != r[1] || fs[0][1] == task { return f08Binding }; f := fs[0]
++		if _, e = s.one("sessions", []int{0,1}, []any{f[2],r[1]}); e != nil { return e }
++		// Only the exact, known CANCEL_FENCE producer is classified here. Other
++		// receipt kinds need their own complete association proof; a kind label,
++		// NULL command, or unknown payload cannot confer an absence exemption.
++		if r[4] != "CANCEL_FENCE" { return f08NativeProofGap }
++		if _, e = f08Object(body, "task_id", "from", "to"); e != nil { return e }
++		if body["task_id"] != f[1] || body["task_id"] == task || r[3] == nil { return f08Binding }
++		q, e := s.one("queue", []int{1,2,6}, []any{r[1],r[3],r[2]}); if e != nil { return e }
++		if q[3] != f[2] || q[4] != f[1] { return f08Binding }
++		from, to := body["from"], body["to"]
++		if !(from == "ENQUEUED" && to == "DROPPED" || (from == "SENDING" || from == "SDK_ACCEPTED") && to == "DROP_REQUESTED") { return f08Binding }
++		if r[7] != nil {
++			// Resolve the entire retained chain, including nullable/duplicate IDs,
++			// cycle and cross-command/generation substitutions. This proves only
++			// association, never the SDK semantic meaning of a predecessor.
++			seen := map[string]bool{}
++			id, e := f08String(r[0]); if e != nil { return e }; seen[id] = true
++			previous := r[7]
++			for previous != nil {
++				id, e = f08String(previous); if e != nil || seen[id] { return f08Binding }; seen[id] = true
++				p, e := s.one("receipts", []int{0,1,2,3}, []any{id,r[1],r[2],r[3]}); if e != nil { return e }
++				_, bytes, e := f08RawObject(p[5]); if e != nil || f08RawHash(bytes) != p[6] { return f08Binding }
++				previous = p[7]
++			}
++		}
++	}
++	return nil
++}
++
+ func (v *f08ProofValidator) queueAdmission(s *f08Sources,project,task string)(map[string]any,error){
+ 	q:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+ 	sessions:=s.selectRows("sessions",[]int{1,6},[]any{project,task})
+ 	fences:=s.selectRows("fences",[]int{0,1},[]any{project,task})
+-	if len(sessions)==0{if len(fences)!=0{return nil,f08Binding};return q,nil}
++	if len(sessions)==0{if e:=v.noSessionQueueHistory(s,project,task);e!=nil{return nil,e};return q,nil}
+ 	if len(sessions)!=1{return nil,f08Binding};session:=sessions[0];q["session_id"]=session[0]
+ 	if len(fences)==0{q["variant"]="REAL_SESSION_NO_ORIGINAL_FENCE";return q,nil}
+ 	if len(fences)!=1 || fences[0][2]!=session[0]{return nil,f08Binding}
+@@ -1080,7 +1145,10 @@
+ 	created,e:=time.Parse(time.RFC3339Nano,run.body["created_at"].(string));if e!=nil{return nil,f08Binding}
+ 	seconds,e:=f08Integer(plan["max_validity_seconds"],1);if e!=nil || seconds>30*24*3600{return nil,f08Binding}
+ 	if a["expires_at"]!=created.Add(time.Duration(seconds)*time.Second).UTC().Format(time.RFC3339Nano){return nil,f08Binding}
+-	return []f08Version{runtime,profile,context},nil
++	// OPEN: sandbox/build/permission/timeout/output/model qualification predicates
++	// are not fully implemented. Retained labels and hashes cannot authorize
++	// an initial origin. Preserve the checked extraction above, then fail closed.
++	return nil,f08QualificationProfileGap
+ }
+ 
+ func (v *f08ProofValidator) deriveInitialOrigin(s *f08Sources,d []any)(map[string]any,error){
+@@ -1196,6 +1264,7 @@
+ 	before,e:=f08Object(original,"variant","session_id","generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced");if e!=nil{return nil,e}
+ 	q,e:=v.queueAdmission(s,project,task);if e!=nil{return nil,e}
+ 	if before["variant"]=="NO_SESSION"{
++		if e=v.noSessionQueueHistory(s,project,task);e!=nil{return nil,e}
+ 		if !f08Equal(q,before){return nil,f08Binding}
+ 	}else{
+ 		if q["session_id"]!=before["session_id"] || q["variant"]!="ORIGINAL_FENCE"{return nil,f08Binding}

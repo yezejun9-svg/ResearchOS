@@ -1,0 +1,81 @@
+--- prior/apps/cli/cli_model_configuration_windows_test.go
++++ current/apps/cli/cli_model_configuration_windows_test.go
+@@ -160,7 +160,7 @@
+ 	}
+ 	var sid, storedModel, task string
+ 	var revision, epoch int64
+-	if e = db.QueryRow(`SELECT id,model_ref,task_id,revision,writer_epoch FROM client_sessions WHERE project=?`, project).Scan(&sid, &storedModel, &task, &revision, &epoch); e != nil {
++	if e = db.QueryRow(`SELECT id,model_config_ref,task_id,revision,writer_epoch FROM client_sessions WHERE project_id=?`, project).Scan(&sid, &storedModel, &task, &revision, &epoch); e != nil {
+ 		t.Fatal(e)
+ 	}
+ 	if storedModel != model || task == "" {
+@@ -185,11 +185,15 @@
+ 		t.Fatal("default blocked by unrelated Session", out)
+ 	}
+ 	var old string
+-	if e = db.QueryRow(`SELECT model_ref FROM client_sessions WHERE id=?`, sid).Scan(&old); e != nil || old != model {
++	if e = db.QueryRow(`SELECT model_config_ref FROM client_sessions WHERE id=?`, sid).Scan(&old); e != nil || old != model {
+ 		t.Fatal("default rebound existing Session", e)
+ 	}
+ 	cancelKey := domain.ID()
+-	cancelPayload := domain.Object{"action": "CANCEL", "target_id": task, "reason": "owned noRun fixture settlement"}
++	var goal string
++	if e = db.QueryRow(`SELECT goal_id FROM client_sessions WHERE id=?`, sid).Scan(&goal); e != nil || goal == "" {
++		t.Fatal("original Session Goal unavailable", e)
++	}
++	cancelPayload := domain.Object{"action": "CANCEL", "target_id": goal, "reason": "owned noRun fixture settlement"}
+ 	reply, first := call("session.control", cancelKey, project, sid, revision, epoch, cancelPayload)
+ 	completed(reply)
+ 	_, replay := call("session.control", cancelKey, project, sid, revision, epoch, cancelPayload)
+@@ -209,7 +213,7 @@
+ 	if code != 0 {
+ 		t.Fatal("actual settled rebind", out)
+ 	}
+-	if e = db.QueryRow(`SELECT model_ref FROM client_sessions WHERE id=?`, sid).Scan(&old); e != nil || old != out["model"] {
++	if e = db.QueryRow(`SELECT model_config_ref FROM client_sessions WHERE id=?`, sid).Scan(&old); e != nil || old != out["model"] {
+ 		t.Fatal("scoped configuration not bound", e)
+ 	}
+ 	var runs, effects int
+@@ -269,5 +273,41 @@
+ 			t.Fatalf("changed original configure accepted: %d", response.StatusCode)
+ 		}
+ 	}
+-	t.Logf("CONFIGURE_ACTUAL_HOST instance=%s configuration_ref=%s task=%s runs=%d effects=%d sdk_calls=0 external_calls=0 paid_calls=0", h.InstanceID(), old, task, runs, effects)
++	// Boundary injection changes only current numeric counters on this real,
++	// settled and provenance-verified fixture Session. It does not claim that
++	// quadrillions of writer handoffs have been executed.
++	const maximum = int64(9007199254740991)
++	if _, e = db.Exec(`UPDATE client_sessions SET revision=?,writer_epoch=? WHERE id=?`, maximum, maximum, sid); e != nil {
++		t.Fatal(e)
++	}
++	raw, e = os.ReadFile(config)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = json.Unmarshal(raw, &cfg); e != nil {
++		t.Fatal(e)
++	}
++	cfg.Revision, cfg.WriterEpoch = maximum, maximum
++	if e = os.WriteFile(config, domain.Bytes(cfg), 0600); e != nil {
++		t.Fatal(e)
++	}
++	out, code = configurationCLIRun(t, exe, disc, config, owner.Session.Token, "config", "set-model", "--model", "fixture-provider/boundary", "--base-url", "https://fixture.invalid/v1", "--config-revision", "3", "--settled")
++	if code != 0 {
++		t.Fatal("actual Host max->max+1 refused", out)
++	}
++	raw, e = os.ReadFile(config)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = json.Unmarshal(raw, &cfg); e != nil {
++		t.Fatal(e)
++	}
++	if cfg.Revision != maximum+1 || cfg.WriterEpoch != maximum || cfg.ConfigRevision != 4 {
++		t.Fatal("exact Host boundary lost", cfg)
++	}
++	var durableRevision int64
++	if e = db.QueryRow(`SELECT revision FROM client_sessions WHERE id=?`, sid).Scan(&durableRevision); e != nil || durableRevision != maximum+1 {
++		t.Fatal("actual durable boundary", e, durableRevision)
++	}
++	t.Logf("CONFIGURE_ACTUAL_HOST instance=%s configuration_ref=%s task=%s runs=%d effects=%d sdk_calls=0 external_calls=0 paid_calls=0 numeric_counter_fixture=INJECTED exact_host_revision=%d", h.InstanceID(), old, task, runs, effects, durableRevision)
+ }

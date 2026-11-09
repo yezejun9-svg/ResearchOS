@@ -1,0 +1,143 @@
+--- b/main.go
++++ a/main.go
+@@ -47,9 +47,6 @@
+  CredentialRef string `json:"credential_ref"`
+  Provider string `json:"provider"`
+  QualificationPrompt string `json:"qualification_prompt"`
+- ProfileRaw []byte `json:"-"`
+- NodeRaw []byte `json:"-"`
+- BundleRaw []byte `json:"-"`
+ }
+ 
+ // State is the only holder of the Run lease token. It is stored under Host's
+@@ -118,15 +115,11 @@
+  h:=sha256.New(); n,err:=io.Copy(h,f); if err!=nil{return "",0,err}
+  return hex.EncodeToString(h.Sum(nil)),n,nil
+ }
+-func readPinnedSeedFile(path, expected string) ([]byte,error) {
+- if expected=="" {return nil,errors.New("missing pinned digest")}
+- info,err:=os.Lstat(path);if err!=nil{return nil,err}
+- if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink!=0{return nil,errors.New("pinned executable/profile/bundle must be regular files")}
+- canonical,err:=filepath.EvalSymlinks(path);if err!=nil{return nil,err}
+- if !strings.EqualFold(filepath.Clean(canonical),filepath.Clean(path)){return nil,errors.New("pinned file path must be canonical and non-reparse")}
+- raw,err:=os.ReadFile(path);if err!=nil{return nil,err}
+- if !strings.EqualFold(strings.TrimPrefix(expected,"sha256:"),hashBytes(raw)){return nil,errors.New("pinned file digest mismatch")}
+- return raw,nil
++func exactDigest(path, expected string) error {
++ if expected=="" {return errors.New("missing pinned digest")}
++ got,_,err:=fileHash(path); if err!=nil{return err}
++ if !strings.EqualFold(strings.TrimPrefix(expected,"sha256:"),got) {return errors.New("pinned file digest mismatch")}
++ return nil
+ }
+ func readSeed(path string) (seed,string,error) {
+  var s seed
+@@ -136,10 +129,12 @@
+  for _,p:=range []string{s.RepoRoot,s.DataRoot,s.DiscoveryFile,s.CLIConfigFile,s.WorkspaceDir,s.ProfileFile,s.NodeExecutable,s.BundleFile,s.ReadOnlyVaultDir} {
+   if !filepath.IsAbs(p) {return s,"",errors.New("all seed paths must be absolute")}
+  }
+- if !pathInside(filepath.Join(s.RepoRoot,".local"),s.DataRoot) || !strings.EqualFold(filepath.Clean(s.WorkspaceDir),filepath.Clean(filepath.Join(s.DataRoot,"workspace"))) || pathInside(s.ReadOnlyVaultDir,s.DataRoot) || pathInside(s.DataRoot,s.ReadOnlyVaultDir) {return s,"",errors.New("trial data root/workspace/vault layout differs from frozen isolation")}
+- if s.ProfileRaw,err=readPinnedSeedFile(s.ProfileFile,s.ProfileSHA256);err!=nil{return s,"",err}
+- if s.NodeRaw,err=readPinnedSeedFile(s.NodeExecutable,s.NodeSHA256);err!=nil{return s,"",err}
+- if s.BundleRaw,err=readPinnedSeedFile(s.BundleFile,s.BundleSHA256);err!=nil{return s,"",err}
++ for _,parent:=range []string{s.RepoRoot,s.DataRoot,s.ReadOnlyVaultDir}{if pathInside(parent,s.WorkspaceDir){return s,"",errors.New("witness workspace must be isolated from repo, data root and vault")}}
++ for _,v:=range []struct{p,h string}{{s.ProfileFile,s.ProfileSHA256},{s.NodeExecutable,s.NodeSHA256},{s.BundleFile,s.BundleSHA256}} {
++  info,e:=os.Lstat(v.p);if e!=nil{return s,"",e};if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink!=0{return s,"",errors.New("pinned executable/profile/bundle must be regular files")}
++  canonical,e:=filepath.EvalSymlinks(v.p);if e!=nil{return s,"",e};if !strings.EqualFold(filepath.Clean(canonical),filepath.Clean(v.p)){return s,"",errors.New("pinned file path must be canonical and non-reparse")}
++  if err=exactDigest(v.p,v.h); err!=nil{return s,"",err}
++ }
+  return s,hashBytes(raw),nil
+ }
+ func pathInside(parent,child string)bool{
+--- b/prepare.go
++++ a/prepare.go
+@@ -17,11 +17,9 @@
+ )
+ 
+ func prepare(ctx context.Context,s seed,digest string)(domain.Object,error){
++ if _,err:=os.Stat(statePath(s)); err==nil{return nil,errors.New("qualification preparation already claimed; inspect private state, no retry") }else if !errors.Is(err,os.ErrNotExist){return nil,err}
+  if err:=verifyEvidenceWorkspace(s);err!=nil{return nil,err}
+  e,err:=openEnvironment(ctx,s);if err!=nil{return nil,err};defer e.close()
+- // The data-root lease now serializes this check and the durable claim below.
+- // A concurrent prepare can no longer observe absent state before waiting.
+- if _,err=os.Stat(statePath(s));err==nil{return nil,errors.New("qualification preparation already claimed; inspect private state, no retry")}else if !errors.Is(err,os.ErrNotExist){return nil,err}
+  if err=e.startHTTP(e.handler(nil));err!=nil{return nil,err}
+  if err=verifyCLIProject(ctx,e,s);err!=nil{return nil,err}
+  v:=state{Schema:schema,SeedSHA256:digest,HostInstanceID:e.host.InstanceID(),OwnerID:e.ownerID,ProjectID:s.ProjectID,DraftGoalID:s.DraftGoalID,Phase:"PREPARE_CLAIMED"}
+@@ -78,9 +76,11 @@
+ }
+ 
+ func preparedProfile(s seed,registration domain.Object)(domain.Object,error){
+- var profile domain.Object;if err:=json.Unmarshal(s.ProfileRaw,&profile);err!=nil{return nil,err}
++ raw,err:=os.ReadFile(s.ProfileFile);if err!=nil{return nil,err}
++ var profile domain.Object;if err=json.Unmarshal(raw,&profile);err!=nil{return nil,err}
+  if containsSecretField(profile){return nil,errors.New("public profile includes secret-bearing field")}
+- node,bundle:=s.NodeRaw,s.BundleRaw
++ node,err:=os.ReadFile(s.NodeExecutable);if err!=nil{return nil,err}
++ bundle,err:=os.ReadFile(s.BundleFile);if err!=nil{return nil,err}
+  config,ok:=profile["model_config"].(map[string]any);if !ok{return nil,errors.New("profile has no model_config")}
+  if config["provider"]!=s.Provider || domain.Str(config,"route")=="" || domain.Str(config,"endpoint")=="" || config["api"]!="openai-completions"{return nil,errors.New("public model configuration differs from provider")}
+  // The total Root trial is one qualification MODEL effect and two ordinary
+@@ -104,7 +104,7 @@
+  profile["permissions"]=domain.Object{"network":"none","environment":"staging-only","capabilities":domain.Empty(),"process_limit":1,"memory_mib":256}
+  if profile["outputs"]==nil{profile["outputs"]=[]any{"result.json"}}
+  policy,ok:=profile["tool_policy"].(map[string]any);if !ok{return nil,errors.New("pinned profile lacks tool_policy")}
+- policy["read_paths"]=[]any{"evidence.txt"};policy["write_paths"]=domain.Empty();policy["checks"]=domain.Empty();policy["user_confirmation_tools"]=domain.Empty();policy["max_calls"]=1;policy["max_read_bytes"]=4096;policy["max_write_bytes"]=4096
++ policy["read_paths"]=[]any{"evidence.txt"};policy["write_paths"]=domain.Empty();policy["checks"]=domain.Empty();policy["user_confirmation_tools"]=domain.Empty();policy["max_calls"]=2;policy["max_read_bytes"]=65536;policy["max_write_bytes"]=65536
+  profile["tool_policy"]=policy
+  return profile,nil
+ }
+--- b/execute.go
++++ a/execute.go
+@@ -78,13 +78,12 @@
+ func (h *dynamicHandler) ServeHTTP(w http.ResponseWriter,r *http.Request){h.mu.RLock();next:=h.handler;h.mu.RUnlock();next.ServeHTTP(w,r)}
+ func (h *dynamicHandler) set(next http.Handler){h.mu.Lock();h.handler=next;h.mu.Unlock()}
+ 
+-func verifiedBytes(p pinnedFile) ([]byte,error) {
+- if !filepath.IsAbs(p.Path) || p.Bytes<=0 || p.SHA256=="" {return nil,errors.New("incomplete absolute authority pin")}
+- raw,err:=os.ReadFile(p.Path);if err!=nil{return nil,err}
+- if int64(len(raw))!=p.Bytes || !strings.EqualFold(strings.TrimPrefix(p.SHA256,"sha256:"),hashBytes(raw)){return nil,errors.New("Root authority pin differs from file")}
+- return raw,nil
+-}
+-func verifyPin(p pinnedFile) error {_,err:=verifiedBytes(p);return err}
++func verifyPin(p pinnedFile) error {
++ if !filepath.IsAbs(p.Path) || p.Bytes<=0 || p.SHA256=="" {return errors.New("incomplete absolute authority pin")}
++ h,n,err:=fileHash(p.Path);if err!=nil{return err}
++ if n!=p.Bytes || !strings.EqualFold(strings.TrimPrefix(p.SHA256,"sha256:"),h){return errors.New("Root authority pin differs from file")}
++ return nil
++}
+ func ownJobMembership() error {
+  // This proves only that this process is in some Job. Root must separately pin
+  // exact parent Job identity and descendants in its owned host-job probe.
+@@ -109,13 +108,13 @@
+  if a.Schema!="researchos.trusted-qualification-go.v1" || a.ProjectID!=v.ProjectID || a.DraftGoalID!=v.DraftGoalID || a.RuntimeID!=v.RuntimeID || a.QualificationTaskID!=v.TaskID || a.QualificationRunID!=v.RunID || a.QualificationEpoch!=v.RunEpoch || a.ProfileHash!=v.ProfileHash || a.StartedUTC!=v.StartedUTC || a.HostInstanceID!=v.HostInstanceID || a.HostPID!=os.Getpid() || a.HostURL!=e.apiURL {return a,errors.New("GO authority differs from admitted Run or actual Host")}
+  if a.MaximumProviderRequests!=3 || a.QualificationRequests!=1 || a.OrdinaryRequests!=2 {return a,errors.New("GO provider-call budget differs from Root cap")}
+  if a.ReadyReceipt.Path!=readyPath || a.Discovery.Path!=e.seed.DiscoveryFile || a.PrivateCoordinator.Path!=coordinatorPin.Path || a.PrivateCoordinator.SHA256!=coordinatorPin.SHA256 || a.PrivateCoordinator.Bytes!=coordinatorPin.Bytes {return a,errors.New("GO Host file paths differ from actual READY outputs")}
+- for _,p:=range []pinnedFile{a.ReadyReceipt,a.Discovery,a.PrivateCoordinator}{if err=verifyPin(p);err!=nil{return a,err}}
++ for _,p:=range []pinnedFile{a.ReadyReceipt,a.Discovery,a.PrivateCoordinator,a.RootGrant,a.OnceMarker,a.OuterJobContract,a.HostJobProbe}{if err=verifyPin(p);err!=nil{return a,err}}
+  if err=verifyGOEvidence(a,v);err!=nil{return a,err}
+  return a,nil
+ }
+ 
+ func readPinnedObject(p pinnedFile)(domain.Object,error){
+- raw,err:=verifiedBytes(p);if err!=nil{return nil,err}
++ raw,err:=os.ReadFile(p.Path);if err!=nil{return nil,err}
+  return domain.Decode(raw)
+ }
+ func verifyGOEvidence(a goAuthority,v state)error{
+--- b/profile.template.json
++++ a/profile.template.json
+@@ -11,11 +11,11 @@
+     "tools": []
+   },
+   "tool_policy": {
+-    "max_calls": 1,
++    "max_calls": 2,
+     "read_paths": ["evidence.txt"],
+     "write_paths": [],
+-    "max_read_bytes": 4096,
+-    "max_write_bytes": 4096,
++    "max_read_bytes": 65536,
++    "max_write_bytes": 65536,
+     "checks": []
+   },
+   "outputs": ["result.json"]

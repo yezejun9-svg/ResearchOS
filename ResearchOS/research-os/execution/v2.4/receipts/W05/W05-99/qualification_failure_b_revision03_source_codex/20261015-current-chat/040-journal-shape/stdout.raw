@@ -1,0 +1,93 @@
+60: 	Capability string          `json:"capability,omitempty"`
+61: 	Payload    json.RawMessage `json:"payload,omitempty"`
+62: 	Path       string          `json:"path,omitempty"`
+63: }
+64: 
+65: type BridgeRequest struct {
+66: 	WorkerID     string
+67: 	Manifest     json.RawMessage
+68: 	ManifestHash string
+69: 	Executable   string
+70: 	// Only explicit immutable inputs cross into the task sandbox. Credentials,
+71: 	// authority paths and the host manifest never enter this map.
+72: 	Inputs       map[string][]byte
+73: 	BeforeResume func(sandbox.Identity) error
+74: }
+75: 
+76: type BridgeJournal struct {
+77: 	PauseProtocol      string           `json:"pause_protocol,omitempty"`
+78: 	PauseRequested     bool             `json:"pause_requested,omitempty"`
+79: 	PauseID            string           `json:"pause_id,omitempty"`
+80: 	QueueBinding       json.RawMessage  `json:"queue_binding,omitempty"`
+81: 	Checkpoint         *PauseCheckpoint `json:"checkpoint,omitempty"`
+82: 	CheckpointSeal     *CheckpointSeal  `json:"checkpoint_seal,omitempty"`
+83: 	Version            int              `json:"version"`
+84: 	Manifest           json.RawMessage  `json:"manifest"`
+85: 	ManifestHash       string           `json:"manifest_hash"`
+86: 	DispatchKey        string           `json:"dispatch_key"`
+87: 	Worker             string           `json:"worker"`
+88: 	Revision           string           `json:"adapter_revision"`
+89: 	Identity           sandbox.Identity `json:"identity"`
+90: 	State              string           `json:"state"`
+91: 	Reason             string           `json:"reason"`
+92: 	Started            string           `json:"started"`
+93: 	Ended              string           `json:"ended"`
+94: 	Sequence           int64            `json:"observation_sequence"`
+95: 	Frames             int64            `json:"frames"`
+96: 	Acknowledged       int64            `json:"acknowledged"`
+97: 	ContextReady       bool             `json:"context_ready"`
+98: 	CheckpointSequence int64            `json:"checkpoint_sequence"`
+99: 	Paused             bool             `json:"paused"`
+100: 	InputHash          string           `json:"input_hash"`
+101: 	ProtocolComplete   bool             `json:"protocol_complete"`
+102: 	Cancelled          bool             `json:"cancelled"`
+103: 	Receipt            sandbox.Receipt  `json:"sandbox_receipt"`
+104: 	Artifacts          []Artifact       `json:"artifacts"`
+105: 	StdoutHash         string           `json:"stdout_hash"`
+782: func (j BridgeJournal) Observation() (map[string]any, error) {
+783: 	manifest, e := bridgeMap(j.Manifest)
+784: 	if e != nil {
+785: 		return nil, e
+786: 	}
+787: 	admission, _ := manifest["admission"].(map[string]any)
+788: 	profile, _ := admission["profile"].(map[string]any)
+789: 	spec := map[string]any{"run_id": manifest["run_id"], "task_id": manifest["task_id"], "epoch": manifest["epoch"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "capabilities": []any{"start"}}
+790: 	if j.ContextReady {
+791: 		spec["capabilities"] = []any{"start", "context_rebuild"}
+792: 	}
+793: 	for _, key := range []string{"build_hash", "backend", "model", "sandbox", "platform", "adapter", "adapter_revision", "credential_revision"} {
+794: 		spec[key] = profile[key]
+795: 	}
+796: 	state := j.State
+797: 	if state == "EXITED" {
+798: 		state = "UNKNOWN"
+799: 	}
+800: 	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
+801: 		state = "CANCELLED"
+802: 	}
+803: 	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+804: }
+805: 
+806: // ReadBridgeTerminal checks the trusted directory and raw hashes. It never
+807: // creates a process, renews a lease or turns missing PID into success.
+808: func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+809: 	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+810: 	if e != nil {
+811: 		return BridgeJournal{}, errors.New("worker still owns dispatch")
+812: 	}
+813: 	defer lock.Close()
+814: 	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+815: 	if e != nil {
+816: 		return BridgeJournal{}, e
+817: 	}
+818: 	var j BridgeJournal
+819: 	if e = json.Unmarshal(raw, &j); e != nil {
+820: 		return j, e
+821: 	}
+822: 	digest, e := canonicalHash(j.Manifest)
+823: 	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+824: 		return j, errors.New("recovery manifest mismatch")
+825: 	}
+826: 	if j.Identity.PID != 0 {
+827: 		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+828: 		if e != nil || alive {

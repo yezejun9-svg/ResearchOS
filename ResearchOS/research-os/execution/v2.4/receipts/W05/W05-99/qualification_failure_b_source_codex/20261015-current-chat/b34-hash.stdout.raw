@@ -1,0 +1,118 @@
+adapters/runtime\runtime_windows.go:96:func Hash(b []byte) string { h := sha256.Sum256(b); return "sha256:" + hex.EncodeToString(h[:]) }
+internal/domain\contracts.go:98:func Hash(v any) string {
+internal/domain\contracts.go:97:func Digest(b []byte) string { h := sha256.Sum256(b); return "sha256:" + hex.EncodeToString(h[:]) }
+package domain
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
+	"strconv"
+	"strings"
+	"time"
+	_ "time/tzdata"
+)
+
+type Service struct {
+	DB        *sql.DB
+	Contracts *Contracts
+	Protected protectedstore.Provider
+	// Fixed by a trusted constructor, never by a request or environment selector.
+	projectBindingRoute string
+	// Supplied only by a trusted local Root witness integration; nil fails closed.
+	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
+}
+type Fault struct {
+	Status        int
+	Code, Message string
+	Current       any
+}
+
+func (f *Fault) Error() string { return f.Code + ": " + f.Message }
+func Fail(status int, code, msg string) error {
+	return &Fault{Status: status, Code: code, Message: msg}
+}
+
+// NewCurrentMu is the installed current host's fixed construction policy. New
+// remains the legacy constructor so existing stored projects and fixtures keep
+// their historical binding semantics. Children inherit their stored parent.
+func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+		return nil, err
+	}
+	s, err := New(db, contractsDir, migrationFile)
+	if err != nil {
+		return nil, err
+	}
+	s.projectBindingRoute = "MU_FORK"
+	return s, nil
+}
+
+func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	c, e := LoadContracts(contractsDir)
+	if e != nil {
+		return nil, e
+	}
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
+	if e != nil {
+		return nil, e
+	}
+	if _, e = os.Stat(migrationFile); e != nil {
+		return nil, e
+	}
+	// Refuse future/gapped inventories before domain, additive or fence DDL.
+	// The lower storage layer has already opened the file and selected WAL.
+	if _, e = checkMigrationInventory(db, files); e != nil {
+		return nil, e
+	}
+	if e = CheckMigrationSafety(db, files); e != nil {
+		return nil, e
+	}
+	tx, e := db.Begin()
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	for _, file := range files {
+		version, err := strconv.Atoi(filepath.Base(file)[:4])
+		if err != nil {
+			return nil, err
+		}
+		if version < 2 {
+			continue
+		}
+		var applied int
+		if err := tx.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=?", version).Scan(&applied); err != nil {
+			return nil, err
+		}
+		if applied != 0 {
+			continue
+		}
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(string(b)); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", version); err != nil {
+			return nil, err
+		}
+	}
+	// W03's additive session schema has its own unnumbered, idempotent path.
+	// The production host must install it as well as the tests and import tools.
+	// Keep it in the same transaction so a missing or invalid schema cannot
+	// leave the business migrations committed with the typed client unusable.
+	sessionSchema, err := os.ReadFile(filepath.Join(filepath.Dir(migrationFile), "next_v24_sessions.sql"))
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(string(sessionSchema)); err != nil {
+		return nil, err
+	}

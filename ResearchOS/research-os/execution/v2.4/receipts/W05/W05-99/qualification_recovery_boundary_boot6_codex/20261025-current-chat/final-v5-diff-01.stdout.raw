@@ -1,0 +1,296 @@
+diff --git a/internal/recoveryboundary/contract.go b/internal/recoveryboundary/contract.go
+new file mode 100644
+index 00000000..b8d230b3
+--- /dev/null
++++ b/internal/recoveryboundary/contract.go
+@@ -0,0 +1,290 @@
++package recoveryboundary
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++const (
++	PlanSchema    = "researchos.recovery-boundary-plan.v1"
++	EventSchema   = "researchos.recovery-boundary-event.v1"
++	WitnessSchema = "researchos.post-restart-current-quiescence.v1"
++	// CurrentQuiescenceClass is scoped only to the C maintenance transaction.
++	// It is not a historical Wait, STOP closure, B drain ticket, or D proof.
++	CurrentQuiescenceClass = "POST_RESTART_CURRENT_QUIESCENCE_V1"
++	MaxElapsed             = 30 * time.Minute
++	MaxPostUptime          = 10 * time.Minute
++)
++
++// FileIdentity is evidence only. The native checker always reopens the object.
++type FileIdentity struct {
++	Path               string `json:"path"`
++	FinalUTF16         string `json:"final_utf16"`
++	Volume             uint64 `json:"volume"`
++	FileID             string `json:"file_id"`
++	SHA256             string `json:"sha256,omitempty"`
++	SecurityDescriptor string `json:"security_descriptor"`
++	Directory          bool   `json:"directory"`
++}
++
++type FenceTarget struct {
++	File              FileIdentity `json:"file"`
++	Mode              string       `json:"mode"` // executable or script; exact access is checked natively
++	InstalledSD       string       `json:"installed_sd,omitempty"`
++	RestartArgsSHA256 []string     `json:"restart_args_sha256,omitempty"`
++}
++
++// EntryFencePlan describes the complete, frozen official entry inventory.
++// Merely decoding one never grants an operation.
++type EntryFencePlan struct {
++	Schema                 string         `json:"schema"`
++	OperationID            string         `json:"operation_id"`
++	PlanSHA256             string         `json:"plan_sha256"`
++	DataRoot               FileIdentity   `json:"data_root"`
++	Database               FileIdentity   `json:"database"`
++	Helper                 FileIdentity   `json:"helper"`
++	BusinessSID            string         `json:"business_sid"`
++	BusinessGroupSIDs      []string       `json:"business_group_sids"` // native enabled groups excluding only per-logon SID and integrity label
++	ManagementSID          string         `json:"management_sid"`
++	HostIdentitySHA256     string         `json:"host_identity_sha256"`
++	SubjectSHA256          string         `json:"subject_sha256"`
++	EvidenceSHA256         string         `json:"evidence_sha256"`
++	BackupManifestSHA256   string         `json:"backup_manifest_sha256"`
++	SourceAcceptanceSHA256 string         `json:"source_acceptance_sha256"`
++	NativeAcceptanceSHA256 string         `json:"native_acceptance_sha256"`
++	RecoveryPackageSHA256  string         `json:"recovery_package_sha256"`
++	Targets                []FenceTarget  `json:"targets"`
++	Ancestors              []FileIdentity `json:"ancestors"`
++}
++
++type BootWitness struct {
++	Schema                     string    `json:"schema"`
++	OperationID                string    `json:"operation_id"`
++	PlanSHA256                 string    `json:"plan_sha256"`
++	HelperSHA256               string    `json:"helper_sha256"`
++	UTC                        time.Time `json:"utc"`
++	UptimeMilliseconds         uint64    `json:"uptime_milliseconds"`
++	LastBootUTC                time.Time `json:"last_boot_utc"`
++	RestartApps                uint32    `json:"restart_apps"`
++	FenceSHA256                string    `json:"fence_sha256"`
++	BusinessEnabledSIDsSHA256  string    `json:"business_enabled_sids_sha256,omitempty"`
++	BusinessSessionID          uint32    `json:"business_session_id,omitempty"`
++	BusinessElevationType      uint32    `json:"business_elevation_type,omitempty"`
++	BusinessIntegritySID       string    `json:"business_integrity_sid,omitempty"`
++	BusinessLogonSID           string    `json:"business_logon_sid,omitempty"`
++	BusinessPrivilegesSHA256   string    `json:"business_privileges_sha256,omitempty"`
++	BusinessProcessPID         uint32    `json:"business_process_pid,omitempty"`
++	BusinessProcessCreatedUTC  time.Time `json:"business_process_created_utc,omitempty"`
++	BusinessProcessImageSHA256 string    `json:"business_process_image_sha256,omitempty"`
++	FullRestartEvidenceSHA256  string    `json:"full_restart_evidence_sha256,omitempty"`
++}
++
++type BoundaryEvent struct {
++	Schema         string    `json:"schema"`
++	Sequence       uint64    `json:"sequence"`
++	PreviousSHA256 string    `json:"previous_sha256"`
++	SHA256         string    `json:"sha256"`
++	OperationID    string    `json:"operation_id"`
++	PlanSHA256     string    `json:"plan_sha256"`
++	State          string    `json:"state"`
++	UTC            time.Time `json:"utc"`
++}
++
++// BoundaryAttestation is a protected external reviewer or backup report.
++// A digest alone, a static copy, or a caller assertion cannot satisfy arm.
++type BoundaryAttestation struct {
++	Schema                string    `json:"schema"`
++	Kind                  string    `json:"kind"`
++	Status                string    `json:"status"`
++	OperationID           string    `json:"operation_id"`
++	PlanCoreSHA256        string    `json:"plan_core_sha256"`
++	Issuer                string    `json:"issuer"`
++	EvidenceSHA256        string    `json:"evidence_sha256"`
++	BackupID              string    `json:"backup_id,omitempty"`
++	RestoreTestSHA256     string    `json:"restore_test_sha256,omitempty"`
++	CredentialProbeSHA256 string    `json:"credential_probe_sha256,omitempty"`
++	RecordedUTC           time.Time `json:"recorded_utc"`
++}
++
++func digest(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToString(h[:]) }
++func validDigest(s string) bool {
++	if len(s) != 64 {
++		return false
++	}
++	_, e := hex.DecodeString(s)
++	return e == nil && s == strings.ToLower(s)
++}
++func validOperation(s string) bool {
++	if len(s) != 32 || s != strings.ToLower(s) {
++		return false
++	}
++	for _, c := range s {
++		if !(c >= 'a' && c <= 'f' || c >= '0' && c <= '9') {
++			return false
++		}
++	}
++	return true
++}
++
++func PlanCoreSHA256(p EntryFencePlan) (string, error) {
++	p.PlanSHA256 = ""
++	p.SourceAcceptanceSHA256 = ""
++	p.NativeAcceptanceSHA256 = ""
++	p.BackupManifestSHA256 = ""
++	p.RecoveryPackageSHA256 = ""
++	raw, e := json.Marshal(p)
++	if e != nil {
++		return "", e
++	}
++	return digest(raw), nil
++}
++
++func ComputePlanSHA256(p EntryFencePlan) (string, error) {
++	p.PlanSHA256 = ""
++	raw, e := json.Marshal(p)
++	if e != nil {
++		return "", e
++	}
++	return digest(raw), nil
++}
++
++func ValidatePlan(p EntryFencePlan) error {
++	expected, err := ComputePlanSHA256(p)
++	if err != nil || p.PlanSHA256 != expected {
++		return errors.New("boundary plan canonical digest mismatch")
++	}
++	if p.Schema != PlanSchema || !validOperation(p.OperationID) || !validDigest(p.PlanSHA256) ||
++		!validDigest(p.HostIdentitySHA256) || !validDigest(p.SubjectSHA256) ||
++		!validDigest(p.EvidenceSHA256) || !validDigest(p.BackupManifestSHA256) ||
++		!validDigest(p.SourceAcceptanceSHA256) || !validDigest(p.NativeAcceptanceSHA256) ||
++		!validDigest(p.RecoveryPackageSHA256) || p.BusinessSID == "" || p.ManagementSID == "" ||
++		strings.EqualFold(p.BusinessSID, p.ManagementSID) || len(p.Targets) == 0 || len(p.Targets) > 64 {
++		return errors.New("recovery boundary plan incomplete")
++	}
++	if p.DataRoot.Path == "" || p.Database.Path != filepath.Join(p.DataRoot.Path, "researchos.sqlite") || p.Helper.Path == "" {
++		return errors.New("recovery boundary root, database or helper mismatch")
++	}
++	if len(p.BusinessGroupSIDs) == 0 || len(p.BusinessGroupSIDs) > 64 {
++		return errors.New("business enabled group inventory missing")
++	}
++	seen := map[string]bool{}
++	if len(p.Ancestors) == 0 || len(p.Ancestors) > 256 {
++		return errors.New("boundary ancestor inventory missing")
++	}
++	for _, a := range p.Ancestors {
++		if !a.Directory || a.FileID == "" || a.FinalUTF16 == "" || a.SecurityDescriptor == "" || seen[strings.ToLower(a.Path)] {
++			return errors.New("boundary ancestor identity invalid")
++		}
++		seen[strings.ToLower(a.Path)] = true
++	}
++	for _, t := range p.Targets {
++		if t.Mode != "executable" && t.Mode != "script" {
++			return errors.New("unknown fence target mode")
++		}
++		if !filepath.IsAbs(t.File.Path) || filepath.Clean(t.File.Path) != t.File.Path || seen[strings.ToLower(t.File.Path)] || t.File.Directory {
++			return errors.New("fence inventory path invalid")
++		}
++		seen[strings.ToLower(t.File.Path)] = true
++		if len(t.RestartArgsSHA256) > 16 {
++			return errors.New("restart argv inventory unbounded")
++		}
++		for _, sha := range t.RestartArgsSHA256 {
++			if !validDigest(sha) {
++				return errors.New("restart argv digest invalid")
++			}
++		}
++	}
++	return nil
++}
++
++func ValidateRestart(pre, post BootWitness) error {
++	if pre.Schema != WitnessSchema || post.Schema != WitnessSchema || pre.OperationID != post.OperationID || pre.PlanSHA256 != post.PlanSHA256 || pre.HelperSHA256 != post.HelperSHA256 || pre.FenceSHA256 != post.FenceSHA256 || !validDigest(pre.PlanSHA256) || !validDigest(pre.FenceSHA256) || !validDigest(pre.HelperSHA256) {
++		return errors.New("witness binding changed")
++	}
++	if pre.UptimeMilliseconds < uint64(MaxPostUptime/time.Millisecond) || post.UptimeMilliseconds >= uint64(MaxPostUptime/time.Millisecond) || post.UptimeMilliseconds >= pre.UptimeMilliseconds {
++		return errors.New("uptime does not prove fresh restart")
++	}
++	if pre.LastBootUTC.IsZero() || post.LastBootUTC.IsZero() || !post.LastBootUTC.After(pre.LastBootUTC) {
++		return errors.New("boot time did not advance")
++	}
++	if pre.UTC.IsZero() || post.UTC.IsZero() || post.UTC.Before(pre.UTC) || post.UTC.Sub(pre.UTC) > MaxElapsed {
++		return errors.New("witness outside bounded UTC window")
++	}
++	if post.LastBootUTC.Before(pre.UTC.Add(-2*time.Minute)) || post.LastBootUTC.After(post.UTC) {
++		return errors.New("boot time contradicts witness UTC")
++	}
++	for _, w := range []BootWitness{pre, post} {
++		expected := w.UTC.Add(-time.Duration(w.UptimeMilliseconds) * time.Millisecond)
++		if w.LastBootUTC.Before(expected.Add(-2*time.Minute)) || w.LastBootUTC.After(expected.Add(2*time.Minute)) {
++			return errors.New("native uptime and boot time disagree")
++		}
++	}
++	if pre.RestartApps > 1 || post.RestartApps > 1 || pre.RestartApps != post.RestartApps {
++		return errors.New("RestartApps state unknown")
++	}
++	if pre.FullRestartEvidenceSHA256 != "" || !validDigest(post.FullRestartEvidenceSHA256) {
++		return errors.New("explicit FullRestart evidence missing")
++	}
++	if !validDigest(pre.BusinessEnabledSIDsSHA256) || pre.BusinessEnabledSIDsSHA256 != post.BusinessEnabledSIDsSHA256 ||
++		!validDigest(pre.BusinessPrivilegesSHA256) || pre.BusinessPrivilegesSHA256 != post.BusinessPrivilegesSHA256 ||
++		pre.BusinessElevationType < 1 || pre.BusinessElevationType > 3 || pre.BusinessElevationType != post.BusinessElevationType ||
++		pre.BusinessIntegritySID == "" || pre.BusinessIntegritySID != post.BusinessIntegritySID ||
++		pre.BusinessLogonSID == "" || post.BusinessLogonSID == "" {
++		return errors.New("business token permission semantics changed across restart")
++	}
++	for _, w := range []BootWitness{pre, post} {
++		if w.BusinessProcessPID == 0 || !validDigest(w.BusinessProcessImageSHA256) || w.BusinessProcessCreatedUTC.IsZero() ||
++			w.BusinessProcessCreatedUTC.Before(w.LastBootUTC.Add(-2*time.Second)) || w.BusinessProcessCreatedUTC.After(w.UTC.Add(2*time.Second)) {
++			return errors.New("business token source process identity invalid")
++		}
++	}
++	return nil
++}
++
++func transition(from, to string) bool {
++	switch from {
++	case "":
++		return to == "PREPARED"
++	case "PREPARED":
++		return to == "APPLYING" || to == "BOUNDARY_ABORTED"
++	case "APPLYING":
++		return to == "ARMED" || to == "BOUNDARY_ABORTED"
++	case "ARMED":
++		return to == "BOOT_OBSERVED" || to == "BOUNDARY_ABORTED"
++	case "BOOT_OBSERVED":
++		return to == "C_HELD" || to == "BOUNDARY_ABORTED"
++	case "C_HELD":
++		return to == "C_DURABLE" || to == "BOUNDARY_ABORTED"
++	case "C_DURABLE", "BOUNDARY_ABORTED":
++		return to == "DISARMING"
++	case "DISARMING":
++		return to == "CLOSED"
++	}
++	return false
++}
++
++func ValidateEvents(events []BoundaryEvent, operation, plan string) error {
++	if len(events) == 0 || len(events) > 16 {
++		return errors.New("boundary event inventory invalid")
++	}
++	prevState, prevHash := "", ""
++	for i, e := range events {
++		if e.Schema != EventSchema || e.Sequence != uint64(i+1) || e.PreviousSHA256 != prevHash || e.OperationID != operation || e.PlanSHA256 != plan || !transition(prevState, e.State) || e.UTC.IsZero() {
++			return fmt.Errorf("boundary event %d invalid", i+1)
++		}
++		copy := e
++		copy.SHA256 = ""
++		raw := []byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s", copy.Schema, copy.Sequence, copy.PreviousSHA256, copy.OperationID, copy.PlanSHA256, copy.State, copy.UTC.UTC().Format(time.RFC3339Nano)))
++		if e.SHA256 != digest(raw) {
++			return fmt.Errorf("boundary event %d hash drift", i+1)
++		}
++		prevState, prevHash = e.State, e.SHA256
++	}
++	return nil
++}

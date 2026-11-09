@@ -1,0 +1,107 @@
+--- integrate_exact38.py
++++ integrate_exact38.v2.py
+@@ -110,7 +110,7 @@
+     require(scope['status']=='ROOT_REGISTERED_EXACT38_INTEGRATION_ONCE' and scope['owner']=='codex:/root',
+             'Preparation scope cannot execute')
+     expected=scope['expected_registration']
+-    require(expected==[321,149,421],'Only explicitly proposed Root321/149/421; old319/320 refuses')
++    require(expected==[321,149,422],'Only explicitly proposed Root321/149/422; old319/320 refuses')
+     require(grant['schema']=='researchos.exact38-source-integration-grant.v1' and grant['actor']=='codex:/root' and
+             grant['status']=='ROOT_REGISTERED_EXECUTION_AUTHORIZED' and grant['actual_registration_completed'] is True and
+             grant['scope_ref']==scope_ref and grant['automatic_retry'] is False,'No actual new Root grant')
+@@ -181,7 +181,7 @@
+     require([done['checkpoint'],done['ownership'],done['failure_origins']]==expected and
+             done['intent_ref']==regs['intent'],'Registration verification tuple')
+     require(intent['Main_head']==CHAIN[0] and
+-            intent['transition']=={'checkpoint':[320,321],'ownership':[148,149],'failures':[417,421]} and
++            intent['transition']=={'checkpoint':[320,321],'ownership':[148,149],'failures':[417,422]} and
+             [x['path'] for x in intent['metadata']]==CANON[:2] and
+             [x['path'] for x in intent['unchanged']]==CANON[2:],'Registration intent boundary')
+     for i,item in enumerate(intent['metadata']):
+@@ -207,6 +207,18 @@
+     return rows
+ 
+ 
++def unique_git_row(raw,relative_path):
++    matches=[]
++    for line in raw.split(b'\0'):
++        if line:
++            header,name=line.split(b'\t',1)
++            if name.decode('utf-8',errors='strict')==relative_path:
++                mode,kind,blob=header.decode('ascii').split()
++                matches.append({'mode':mode,'kind':kind,'blob':blob})
++    require(len(matches)==1,'Missing or duplicate pinned Git row')
++    return matches[0]
++
++
+ def execute(args):
+     scope_raw=read(args.scope);require(hashlib.sha256(scope_raw).hexdigest()==args.scope_sha256,'Scope SHA')
+     scope=parse(scope_raw);scope_ref=ref(args.scope)
+@@ -225,12 +237,51 @@
+     independent=document(scope['root14_review_ref'])
+     require([x['path'] for x in exact]==independent['minimum_future_integration_scope']['exact_unique_paths'],
+             'Source roster differs from actual independent source scope')
+-    reviewed={x['relative_path']:x for x in document(independent['source38_final_hashes_ref'])}
++    map_ref=independent['source38_final_hashes_ref']
++    require(map_ref['sha256']=='b586bfe27bd9be3aaa02ae1b684dabc4d89a266a37fe35703595fac7cf37a295' and
++            scope['exact38_ref']['sha256']=='9953d625ed7b4c31fd9a2379e8df5cda8237ab822e21df15e1ac850d7e737495',
++            'Frozen source maps differ')
++    reviewed_rows=document(map_ref)
++    require(len(reviewed_rows)==38 and len({x['relative_path'] for x in reviewed_rows})==38,'Reviewed38 uniqueness')
++    reviewed={x['relative_path']:x for x in reviewed_rows}
++    supplement=document(scope['mode_supplement_ref'])
++    require(set(supplement)=={'schema','source_map_ref','exact38_ref','target_tree_ref','target_commit','relative_path','git_row'} and
++            supplement['schema']=='researchos.exact38-single-mode-supplement.v1' and
++            supplement['source_map_ref']==map_ref and supplement['exact38_ref']==scope['exact38_ref'] and
++            supplement['target_commit']==CHAIN[-1] and supplement['relative_path']=='apps/control/main.go',
++            'Only the exact independently reviewed single-row mode supplement is allowed')
++    actual_row=unique_git_row(verify(supplement['target_tree_ref']),'apps/control/main.go')
++    require(actual_row==supplement['git_row'] and actual_row['kind']=='blob','Supplement is not derived from raw Git tree')
+     for item in exact:
+         match=reviewed[item['path']]
++        if item['path']=='apps/control/main.go':
++            require(set(match)=={'relative_path','git_blob','path','sha256','bytes','API_replay_compiled_input'} and
++                    match['API_replay_compiled_input'] is False and actual_row==item['after_git'] and
++                    actual_row['blob']==match['git_blob'],'Unique supplemental row binding')
++            mode=actual_row['mode']
++        else:
++            require(set(match)=={'relative_path','git_blob','mode','path','sha256','bytes'},'Other37 require original exact mode fields')
++            mode=match['mode']
+         require(item['after_sha256']==match['sha256'] and item['after_bytes']==match['bytes'] and
+-                item['after_git']['blob']==match['git_blob'] and item['after_git']['mode']==match['mode'],
++                item['after_git']['blob']==match['git_blob'] and item['after_git']['mode']==mode,
+                 'Final map differs from independently verified source38')
++    attributes=document(scope['root_attributes_supplement_ref'])
++    require(set(attributes)=={'schema','root_path','raw_ref','base_tree_ref','target_tree_ref','base_commit','target_commit','git_row','original_protected_ref'} and
++            attributes['schema']=='researchos.exact38-root-attributes-supplement.v1' and
++            attributes['root_path']=='.gitattributes' and attributes['base_commit']==CHAIN[0] and
++            attributes['target_commit']==CHAIN[-1] and bounded(attributes['raw_ref']['path'])==ROOT/'.gitattributes',
++            'Only exact root attributes may be approved')
++    attribute_raw=verify(attributes['raw_ref'])
++    require(attribute_raw==b'* -text\n','Exact original root attribute bytes required')
++    attr_row=unique_git_row(verify(attributes['base_tree_ref']),'.gitattributes')
++    require(attr_row==unique_git_row(verify(attributes['target_tree_ref']),'.gitattributes')==attributes['git_row'] and
++            attr_row['kind']=='blob' and attr_row['blob']==hashlib.sha1(b'blob '+str(len(attribute_raw)).encode()+b'\0'+attribute_raw).hexdigest(),
++            'Root attributes must be the identical base/target Git blob')
++    require(attributes['original_protected_ref']['sha256']=='c1b5c28c810a9c50b9439a2e80687af489e2987cdf87676bbcd7af8b934c6277',
++            'Original protected vector pin')
++    original_protected=document(attributes['original_protected_ref'])
++    require(len(original_protected)==5172 and protected==original_protected+[attributes['raw_ref']],
++            'Protected vector must preserve original5172 prefix and append only root attributes')
+     for item in protected:
+         verify(item)
+     out=bounded(scope['new_output_root'],False)
+@@ -312,8 +363,11 @@
+                 attribute_paths.add(cursor/'.gitattributes');cursor=cursor.parent
+         for p in attribute_paths:
+             if p.exists():
+-                require(not any(x.strip() and not x.lstrip().startswith(b'#') for x in read(p).splitlines()),
+-                        'Nonempty checkout attributes need separate scope')
++                if p==ROOT/'.gitattributes':
++                    require(read(p)==verify(attributes['raw_ref'])==attribute_raw,'Exact root attribute bytes changed')
++                else:
++                    require(not any(x.strip() and not x.lstrip().startswith(b'#') for x in read(p).splitlines()),
++                            'Nonempty checkout attributes need separate scope')
+         for i,c in enumerate(CHAIN[1:],1):
+             require(run('parent-'+str(i),['rev-list','--parents','-n','1',c]).decode().split()==[c,CHAIN[i-1]],
+                     'Nonlinear or multi-parent source chain')

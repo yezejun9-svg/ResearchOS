@@ -1,0 +1,85 @@
+
+43:	PlanSHA256             string         `json:"plan_sha256"`
+60:type BootWitness struct {
+63:	PlanSHA256         string    `json:"plan_sha256"`
+67:	LastBootUTC        time.Time `json:"last_boot_utc"`
+72:type BoundaryEvent struct {
+78:	PlanSHA256     string    `json:"plan_sha256"`
+104:	if p.Schema != PlanSchema || !validOperation(p.OperationID) || !validDigest(p.PlanSHA256) ||
+137:func ValidateRestart(pre, post BootWitness) error {
+138:	if pre.Schema != WitnessSchema || post.Schema != WitnessSchema || pre.OperationID != post.OperationID || pre.PlanSHA256 != post.PlanSHA256 || pre.HelperSHA256 != post.HelperSHA256 || pre.FenceSHA256 != post.FenceSHA256 || !validDigest(pre.PlanSHA256) || !validDigest(pre.FenceSHA256) || !validDigest(pre.HelperSHA256) {
+144:	if pre.LastBootUTC.IsZero() || post.LastBootUTC.IsZero() || !post.LastBootUTC.After(pre.LastBootUTC) {
+150:	if post.LastBootUTC.Before(pre.UTC.Add(-2*time.Minute)) || post.LastBootUTC.After(post.UTC) {
+181:func ValidateEvents(events []BoundaryEvent, operation, plan string) error {
+187:		if e.Schema != EventSchema || e.Sequence != uint64(i+1) || e.PreviousSHA256 != prevHash || e.OperationID != operation || e.PlanSHA256 != plan || !transition(prevState, e.State) || e.UTC.IsZero() {
+192:		raw := []byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s", copy.Schema, copy.Sequence, copy.PreviousSHA256, copy.OperationID, copy.PlanSHA256, copy.State, copy.UTC.UTC().Format(time.RFC3339Nano)))
+35:	post   BootWitness
+39:// CurrentQuiescence has no public constructor or serializable authority.
+41:type CurrentQuiescence struct{ owner *quiescenceOwner }
+45:	Pre        BootWitness     `json:"pre"`
+46:	Post       BootWitness     `json:"post"`
+47:	Events     []BoundaryEvent `json:"events"`
+264:		BootTime          int64
+269:		BootTimeBias      uint64
+276:	if x.BootTime <= 0 {
+279:	return uint64(u), time.Unix(0, (x.BootTime-116444736000000000)*100).UTC(), nil
+282:func witness(p EntryFencePlan, fenceHash string) (BootWitness, error) {
+285:		return BootWitness{}, e
+289:		return BootWitness{}, e
+291:	return BootWitness{Schema: WitnessSchema, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, HelperSHA256: p.Helper.SHA256, UTC: time.Now().UTC(), UptimeMilliseconds: u, LastBootUTC: b, RestartApps: r, FenceSHA256: fenceHash}, nil
+303:	return filepath.Join(base, "ResearchOS", "RecoveryBoundary", h, p.OperationID), nil
+335:	if r.Plan.OperationID != p.OperationID || r.Plan.PlanSHA256 != p.PlanSHA256 {
+365:		var ev BoundaryEvent
+371:	if e = ValidateEvents(r.Events, p.OperationID, p.PlanSHA256); e != nil {
+429:func checkCurrentBoot(post BootWitness) error {
+434:	if b.Before(post.LastBootUTC.Add(-2*time.Second)) || b.After(post.LastBootUTC.Add(2*time.Second)) || u < post.UptimeMilliseconds {
+510:// OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
+512:func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+539:	fail := func(e error) (*CurrentQuiescence, error) { closeHolds(holds); return nil, e }
+550:	if e = checkCurrentBoot(r.Post); e != nil {
+565:	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
+575:	parent := filepath.Join(base, "ResearchOS", "RecoveryBoundary")
+600:		if candidate.OperationID == operation && candidate.PlanSHA256 == sha && candidate.DataRoot.Path == root {
+611:// ReadBoundaryPlan returns evidence for a C preflight. Its return value is
+613:func ReadBoundaryPlan(dataRoot, operationID, boundaryPlanSHA256 string) (EntryFencePlan, string, error) {
+615:	if !filepath.IsAbs(dataRoot) || !validOperation(operationID) || !validDigest(boundaryPlanSHA256) {
+618:	p, e := discoverPlan(dataRoot, operationID, boundaryPlanSHA256)
+640:		if e = checkCurrentBoot(r.Post); e != nil {
+647:func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
+657:	if o.closed || o.plan.DataRoot.Path != dataRoot || o.plan.Database.Path != database || o.plan.OperationID != operationID || o.plan.PlanSHA256 != planSHA256 {
+676:	if e = checkCurrentBoot(r.Post); e != nil {
+685:func (q *CurrentQuiescence) Close() error {
+771:func appendEvent(p EntryFencePlan, events []BoundaryEvent, state string) error {
+772:	if e := ValidateEvents(events, p.OperationID, p.PlanSHA256); e != nil && len(events) > 0 {
+783:	e := BoundaryEvent{Schema: EventSchema, Sequence: uint64(len(events) + 1), PreviousSHA256: previousHash, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, State: state, UTC: time.Now().UTC()}
+784:	e.SHA256 = digest([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s", e.Schema, e.Sequence, e.PreviousSHA256, e.OperationID, e.PlanSHA256, e.State, e.UTC.UTC().Format(time.RFC3339Nano))))
+path                                                       sha256
+----                                                       ------
+internal/recoveryboundary/contract.go                      19BA16A726B1FA0140B134BB51658AB6ABBC5FEF50C9DD80BFF9B858152…
+internal/recoveryboundary/boot_windows.go                  96A287F36A0BCF6B9AAE6B92B079CC4F8175349E8B720BB2D65472648E3…
+internal/host/qualification_failure_maintenance_windows.go BDC6A90E60B5DAEEB9710ADB0318C0B8AF6DFFFFAB292BCE3B3180589EC…
+11:	Action, DataRoot, Proposal, Out, Plan, PlanSHA256, OperationID string
+15:	Schema, Action, State, OperationID, PlanSHA256 string
+internal/domain/qualification_failure_maintenance_windows… D6DBAD2005E93248A865B448AFDCE5F0CA6593C07D9F7946814108726D2…
+230:		// held and checked against the complete three-frame census below.
+409:	BoundaryPlanSHA256 string                         `json:"boundary_plan_sha256"`
+414:	BeforeCensus      store.OwnedStopCensus          `json:"before_census"`
+438:	return Hash(Object{"census": p.BeforeCensus, "run": p.BeforeRun,
+457:	operationID, boundaryPlanSHA256, dataRoot, database, directory, sid string, before store.OwnedStopCensus,
+461:		dataRoot == "" || boundaryPlanSHA256 == "" || database != filepath.Join(dataRoot, "researchos.sqlite") {
+517:		"operation_id": operationID, "boundary_plan_sha256":boundaryPlanSHA256,
+521:		"before_census": before, "before_run_hash": Hash(verified.run),
+597:		"dispatch_sequence": dispatchSeq, "before_census": before})
+599:		OperationID: operationID, BoundaryPlanSHA256:boundaryPlanSHA256,
+603:		SID:               sid, BeforeCensus: before, Core: core, Proof: proof,
+617:	authorID, dataRoot, operationID, boundaryPlanSHA256, sid string) (plan HistoricalQualificationPlan, retErr error) {
+620:		return plan, qualificationDenialUnavailable("historical preflight input invalid")
+653:	before, err := store.QualificationMaintenanceCensus(ctx, tx)
+657:	plan, err = s.buildHistoricalQualificationPlan(tx, verified, operationID, boundaryPlanSHA256, dataRoot,
+831:	before, err := store.QualificationMaintenanceCensus(ctx, tx)
+835:	if Hash(before) != Hash(plan.BeforeCensus) {
+836:		return nil, qualificationDenialUnavailable("historical before census drift")
+843:	rebuilt, err := s.buildHistoricalQualificationPlan(tx, verified, plan.OperationID, plan.BoundaryPlanSHA256,
+966:		return deny("effect census differs from sole MODEL")
+989:		return deny("monetary ledger census differs")
+

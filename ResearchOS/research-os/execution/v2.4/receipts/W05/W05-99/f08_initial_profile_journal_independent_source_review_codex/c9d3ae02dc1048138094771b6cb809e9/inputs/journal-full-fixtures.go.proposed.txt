@@ -1,0 +1,114 @@
+// Pure evaluator fixture proposal, NOT_RUN. Source rows below are explicit
+// synthetic frozen tuples. No SQL, API, runtime or real cancellation occurs.
+// Expected R1 graphs are assembled from the explicit fixture edges, never by
+// calling the predicate under test to generate its expected proof.
+type f08JournalFixture struct {
+	t *testing.T
+	v *f08ProofValidator
+	f f08TestFixture
+	rows []any
+	versions map[string]f08Version
+	edges map[string][]any
+	admitted,final,control,journal []any
+	member,finalMember map[string]any
+	ack,completed []byte
+	trace []string
+}
+func f08FixtureKey(project,kind,id string,revision any) string { return project+"|"+kind+"|"+id+"|"+fmt.Sprint(revision) }
+func f08FixtureClone(t *testing.T,m map[string]any) map[string]any {t.Helper();x,_,e:=f08Strict(f08TestJSON(t,m));if e!=nil{t.Fatal(e)};return x.(map[string]any)}
+func(f *f08JournalFixture) add(category string,row []any){f.rows=append(f.rows,[]any{category,row})}
+func(f *f08JournalFixture) replace(category string,old,row []any){for i,x:=range f.rows{p:=x.([]any);if p[0]==category&&f08Equal(p[1],old){f.rows[i]=[]any{category,row};return}};f.t.Fatal("fixture missing actual OLD",category)}
+func(f *f08JournalFixture) put(project,kind string,body map[string]any,head bool) f08Version {
+	f.t.Helper();if e:=f.v.entities.ValidateDefInput(kind,body);e!=nil{f.t.Fatal("complete fixture schema",kind,e)}
+	raw:=f08TestJSON(f.t,body);revision,e:=f08Integer(body["revision"],1);if e!=nil{f.t.Fatal(e)}
+	var hash any;if kind=="EventEnvelope"{hash=body["receipt_hash"]}
+	x:=f08Version{project,kind,body["id"].(string),revision,hash,raw,body};key:=f08FixtureKey(project,kind,x.id,body["revision"]);f.versions[key]=x
+	r:=[]any{project,kind,x.id,f08Number(revision),strings.ToUpper(hex.EncodeToString(raw)),hash};f.add("domain_versions",r)
+	if head {for i,pair:=range f.rows{p:=pair.([]any);row:=p[1].([]any);if p[0]=="domain_objects"&&row[0]==project&&row[1]==kind&&row[2]==x.id{f.rows=append(f.rows[:i],f.rows[i+1:]...);break}};f.add("domain_objects",append(append([]any{},r...),f08Number(0)))}
+	return x
+}
+func(f *f08JournalFixture) edge(owner f08Version,field string,target f08Version){r:=[]any{owner.project,owner.kind,owner.id,f08Number(owner.revision),field,target.project,target.kind,target.id,f08Number(target.revision)};f.add("domain_refs",r);key:=f08FixtureKey(owner.project,owner.kind,owner.id,f08Number(owner.revision));f.edges[key]=append(f.edges[key],r)}
+func(f *f08JournalFixture) graph(roots ...f08Version)([]any,[]any){
+	pending:=append([]f08Version{},roots...);seen:=map[string]bool{};anchors:=map[string]any{};closures:=[]any{}
+	for len(pending)>0{o:=pending[0];pending=pending[1:];k:=f08FixtureKey(o.project,o.kind,o.id,f08Number(o.revision));if seen[k]{continue};seen[k]=true;ak,_:=f08Key([]any{o.project,o.ref()});anchors[ak]=o.anchor();targets:=map[string]any{};rows:=append([]any{},f.edges[k]...)
+		for _,r:=range rows{e:=r.([]any);target,ok:=f.versions[f08FixtureKey(e[5].(string),e[6].(string),e[7].(string),e[8])];if !ok{f.t.Fatal("explicit fixture edge missing target")};tk,_:=f08Key([]any{target.project,target.ref()});targets[tk]=target.anchor();pending=append(pending,target)}
+		f08SortTuples(rows);closures=append(closures,map[string]any{"owner_project":o.project,"owner_ref":o.ref(),"owner_body_digest":f08RawHash(o.raw),"rows":rows,"targets":f08SortedAnchors(targets)})
+	}
+	sort.Slice(closures,func(i,j int)bool{x:=closures[i].(map[string]any);y:=closures[j].(map[string]any);xr:=x["owner_ref"].(map[string]any);yr:=y["owner_ref"].(map[string]any);return f08TupleLess([]any{x["owner_project"],xr["entity_type"],xr["id"],xr["revision"],xr["content_hash"]},[]any{y["owner_project"],yr["entity_type"],yr["id"],yr["revision"],yr["content_hash"]})})
+	return closures,f08Pins(f08SortedAnchors(anchors))
+}
+func(f *f08JournalFixture) step(mode int64,action string,old,row []any,category string){
+	f.t.Helper();var oldValue any;if old!=nil{oldValue=old};raw:=f08TestJSON(f.t,map[string]any{"action":action,"row":row,"old":oldValue,"sources":f.rows})
+	result,e:=f.v.evaluate(mode,raw);if e!=nil||result!=int64(1){f.t.Fatalf("actual pure step %s mode%d: value=%v err=%v",action,mode,result,e)}
+	f.trace=append(f.trace,action);if old==nil{f.add(category,row)}else{f.replace(category,old,row)}
+}
+func(f *f08JournalFixture) materialize(row []any,member map[string]any,pins []any,phase string){
+	h,_:=f08Hash(member);child:=append(append([]any{},row[:4]...),"task-one",f08Number(0),row[6],h,f08ProofTestHex(f.t,member));action,category:="admitted_member.insert","admitted_members"
+	if phase=="FINALIZED"{prior,_:=f08Hash(f.member);child[6]=prior;action,category="final_member.insert","final_members"};f.step(7,action,nil,child,category)
+	for _,value:=range pins{p:=value.(map[string]any);pin:=append(append([]any{},row[:4]...),phase,p["project"],p["kind"],p["id"],p["revision"],p["content_hash"]);f.step(7,"pin.insert",nil,pin,"pins")}
+}
+func f08FullJournalFixture(t *testing.T,withACK bool,bodyType string)*f08JournalFixture {
+	t.Helper();f:=&f08JournalFixture{t:t,v:f08AbsenceValidator(t),f:f08TestSetup(t),rows:[]any{},versions:map[string]f08Version{},edges:map[string][]any{}}
+	when:="2026-01-01T00:00:00Z";q:=f.f.identityObject["request_hash"]
+	// Copy only the full entity shapes; overwrite their IDs and every actual
+	// relation explicitly. No unrelated B objects enter this source bundle.
+	shapes:=f08AbsenceFixture(t,false);var taskBody,goalBody map[string]any
+	for _,value:=range shapes{p:=value.([]any);r:=p[1].([]any);if p[0]!="domain_versions"||r[2]!="A"&&r[2]!="goal-A"{continue};b,_,e:=f08RawObject(r[4]);if e!=nil{t.Fatal(e)};if r[1]=="Task"{taskBody=b}else{goalBody=b}}
+	taskBody["id"]="task-one";taskBody["project_id"]="project-one";taskBody["goal_id"]="goal-one";taskBody["no_progress_record_id"]="progress-one"
+	goalBody["id"]="goal-one";goalBody["project_id"]="project-one";goalBody["task_ids"]=[]any{"task-one"};goalBody["problem_ids"]=[]any{"problem-one"};goalBody["budget_policy_id"]="budget-one"
+	reqBody:=map[string]any{"id":"requirement-one","project_id":"project-one","revision":f08Number(1),"created_at":when,"updated_at":when,"requirement_key":"fixture","text":"cancel finite task","basis":"USER_STATED","status":"ACCEPTED","source_refs":[]any{},"rationale":"fixture","supersedes_id":nil,"acceptance_check_ids":[]any{}}
+	req:=f.put("project-one","Requirement",reqBody,true);goalBody["requirement_refs"]=[]any{req.ref()}
+	np:=f.put("project-one","NoProgressRecord",map[string]any{"id":"progress-one","project_id":"project-one","revision":f08Number(1),"created_at":when,"updated_at":when,"origin_problem_id":"problem-one","candidate_id":"candidate-one","input_hash":"sha256:"+strings.Repeat("1",64),"key_hash":"sha256:"+strings.Repeat("2",64),"same_failure_count":f08Number(0),"no_progress_iterations":f08Number(0),"best_accepted_artifact_ref":nil,"last_effective_progress_at":nil,"resume_conditions":[]any{"fixture"},"status":"ACTIVE"},true)
+	policyBody:=map[string]any{"id":"budget-global","project_id":nil,"revision":f08Number(1),"created_at":when,"updated_at":when,"scope_type":"GLOBAL","scope_id":"global","parent_policy_id":nil,"mode":"UNLIMITED_AMOUNT","cap":nil,"enforcement":"ACCOUNTING_ONLY","period":"LIFETIME","timezone":"Asia/Shanghai","effective_from":when,"unknown_cost_action":"ALLOW_AND_RECORD"}
+	global:=f.put("","BudgetPolicy",policyBody,true);projectPolicy:=f08FixtureClone(t,policyBody);projectPolicy["id"]="budget-one";projectPolicy["project_id"]="project-one";projectPolicy["scope_type"]="PROJECT";projectPolicy["scope_id"]="project-one";projectPolicy["parent_policy_id"]="budget-global";budget:=f.put("project-one","BudgetPolicy",projectPolicy,true);f.edge(budget,"/parent_policy_id",global)
+	task:=f.put("project-one","Task",taskBody,true);goal:=f.put("project-one","Goal",goalBody,true)
+	f.edge(task,"/goal_id",goal);f.edge(task,"/no_progress_record_id",np);f.edge(goal,"/task_ids",task);f.edge(goal,"/requirement_refs/0",req);f.edge(goal,"/budget_policy_id",budget)
+	f.add("identities",[]any{"owner-one","cancel-one",ProtocolV2,"project-one","session.control","v2:session.control",q,when})
+	session:=[]any{"session-one","project-one",f08Number(7),when,when,"goal-one",nil,nil,f08Number(3),"client-one","2026-01-01T01:00:00Z",f08Number(12),"native-one",nil,nil,"workspace-one","fixture","configuration-one","build-one",nil,f08Number(0),nil,nil,ProtocolV2};f.add("sessions",session)
+	queue:=map[string]any{"variant":"NO_SESSION","session_id":nil,"generation":nil,"revision":nil,"state":nil,"accepted_through":nil,"sealed_through":nil,"run_id":nil,"runtime_epoch":nil,"dispatch_key":nil,"manifest_hash":nil,"process_identity":nil,"restore_fenced":nil}
+	root:=map[string]any{"format":f08Format,"phase":"ADMITTED","principal":"owner-one","project":"project-one","command_id":"cancel-one","method":"session.control","operation":"v2:session.control","key":"cancel-one","request_hash":q,"client_id":"client-one","session_binding":map[string]any{"session_id":"session-one","accepted_revision":f08Number(7),"writer_client_id":"client-one","writer_epoch":f08Number(3),"lease_expires_at":session[10],"event_watermark":f08Number(12)},"target_binding":map[string]any{"kind":"Goal","id":"goal-one","version_ref":goal.ref()},"private_header_digest":f08RawHash(f.f.header),"member_task_ids":[]any{"task-one"},"member_count":f08Number(1)}
+	rh,_:=f08Hash(root);closure,pins:=f.graph(task,goal);f.member=map[string]any{"format":f08Format,"phase":"ADMITTED","admitted_root_ref":f08RootReference("ADMITTED",rh),"task_ref":task.ref(),"goal_ref":goal.ref(),"run_ref":nil,"runtime_binding":nil,"dispatch_stage":"NO_RUN","dispatch_origin_ref":nil,"queue_admission":queue,"reference_closure":closure}
+	mh,_:=f08Hash(f.member);gh,_:=f08Hash([]any{map[string]any{"task_id":"task-one","member_hash":mh}});doc:=map[string]any{"root":root,"members":[]any{f.member},"pins":pins}
+	f.admitted=[]any{"owner-one","project-one","cancel-one",q,"v2:session.control",strings.ToUpper(hex.EncodeToString(f.f.header)),rh,gh,f08ProofTestHex(t,doc)}
+	f.step(0,"admitted.insert",nil,f.admitted,"admitted");f.materialize(f.admitted,f.member,pins,"ADMITTED")
+	f.control=[]any{"owner-one","project-one","cancel-one","session-one","ctrl-cancel-one",q,"goal-one",f08ProofTestHex(t,[]any{"task-one"}),"REQUESTED",nil,nil,when};f.step(6,"control.insert",nil,f.control,"controls")
+	f.ack=f08TestACK(t)
+	if withACK {next:=append([]any{},f.control...);next[9]=strings.ToUpper(hex.EncodeToString(f.ack));f.step(6,"control.update",f.control,next,"controls");f.control=next
+		f.journal=[]any{"owner-one","project-one","v2:session.control","cancel-one",q,f08Number(200),next[9],f.admitted[5],when,bodyType,"text"};f.step(5,"journal.insert",nil,f.journal,"idempotency")}
+	finalTaskBody:=f08FixtureClone(t,taskBody);finalTaskBody["revision"]=f08Number(2);finalTaskBody["status"]="CANCELLED";finalTaskBody["updated_at"]="2026-01-01T00:00:01Z";finalTask:=f.put("project-one","Task",finalTaskBody,true)
+	finalGoalBody:=f08FixtureClone(t,goalBody);finalGoalBody["revision"]=f08Number(2);finalGoalBody["status"]="CANCELLED";finalGoalBody["updated_at"]="2026-01-01T00:00:01Z";finalGoal:=f.put("project-one","Goal",finalGoalBody,true)
+	f.edge(finalTask,"/goal_id",finalGoal);f.edge(finalTask,"/no_progress_record_id",np);f.edge(finalGoal,"/task_ids",finalTask);f.edge(finalGoal,"/requirement_refs/0",req);f.edge(finalGoal,"/budget_policy_id",budget)
+	eb:=map[string]any{"id":"event-one","project_id":"project-one","revision":f08Number(1),"created_at":"2026-01-01T00:00:01Z","receipt_hash":"sha256:"+strings.Repeat("0",64),"sequence":f08Number(13),"event_type":"TASK_CHANGED","aggregate_ref":finalTask.ref(),"actor_id":"owner-one","correlation_id":"cancel-one","causation_id":nil,"event_data_artifact_ref":nil};eb["receipt_hash"]=Receipt(Object(eb));event:=f.put("project-one","EventEnvelope",eb,false);f.edge(event,"/aggregate_ref",finalTask);f.add("outbox",[]any{"project-one",f08Number(13),"event-one",strings.ToUpper(hex.EncodeToString(event.raw)),f08Number(0)})
+	_,snapshot:=f08TestCompleted(t);snapshot["pending_command_ids"]=[]any{};f.completed=f08TestResponse(t,"COMPLETED",8,map[string]any{"action":"CANCEL","target_id":"goal-one","control_request_id":"ctrl-cancel-one","settled":true,"children_stopped":true,"queue_empty":true,"snapshot":snapshot})
+	newSession:=append([]any{},session...);newSession[2]=f08Number(8);newSession[4]="2026-01-01T00:00:01Z";newSession[9]="";newSession[10]=nil;newSession[11]=f08Number(13);f.replace("sessions",session,newSession)
+	mode:="ORIGINAL_COMPLETED";original:=f08RawHash(f.completed);if withACK{mode="ACK_TO_COMPLETED";original=f08RawHash(f.ack)};pendingHash,_:=f08Hash([]any{})
+	fr:=map[string]any{"format":f08Format,"phase":"FINALIZED","admitted_root_ref":f08RootReference("ADMITTED",rh),"principal":"owner-one","project":"project-one","command_id":"cancel-one","request_hash":q,"control_request_id":"ctrl-cancel-one","completion_mode":mode,"original_response_digest":original,"final_response_digest":f08RawHash(f.completed),"final_snapshot_binding":map[string]any{"session_id":"session-one","project_id":"project-one","revision":f08Number(8),"event_sequence":f08Number(13),"pending_command_ids_digest":pendingHash},"member_count":f08Number(1)}
+	fq:=f08FixtureClone(t,queue);fq["entry_refs"]=[]any{};fq["receipt_refs"]=[]any{};closure,pins=f.graph(task,goal,finalTask,event)
+	f.finalMember=map[string]any{"format":f08Format,"phase":"FINALIZED","admitted_member_ref":f08MemberReference("ADMITTED","task-one",mh),"proof_kind":"NO_EXECUTION","task_admitted_ref":task.ref(),"run_admitted_ref":nil,"run_before_settlement_ref":nil,"run_final_ref":nil,"task_final_ref":finalTask.ref(),"dispatch_origin_ref":nil,"dispatch_final_binding":nil,"queue_final_binding":fq,"effect_closure":map[string]any{"run_id":nil,"epoch":nil,"histories":[]any{},"non_effect_reservations":[]any{}},"observation_ref":nil,"native_artifact_refs":[]any{},"sdk_receipt_refs":[]any{},"run_event_ref":nil,"task_event_ref":map[string]any{"version_ref":event.ref(),"outbox_id":"event-one","sequence":f08Number(13),"body_digest":f08RawHash(event.raw)},"reference_closure":closure,"prior_epoch_closure":[]any{},"prelaunch_checkpoint_carry":nil}
+	frh,_:=f08Hash(fr);fmh,_:=f08Hash(f.finalMember);fgh,_:=f08Hash([]any{map[string]any{"task_id":"task-one","member_hash":fmh}});f.final=[]any{"owner-one","project-one","cancel-one",q,rh,frh,fgh,f08ProofTestHex(t,map[string]any{"root":fr,"members":[]any{f.finalMember},"pins":pins})}
+	f.step(1,"final.insert",nil,f.final,"final");f.materialize(f.final,f.finalMember,pins,"FINALIZED")
+	next:=append([]any{},f.control...);next[10]=strings.ToUpper(hex.EncodeToString(f.completed));if !withACK{next[9]=next[10]};f.step(6,"control.update",f.control,next,"controls");f.control=next
+	next=append([]any{},f.control...);next[8]="CONFIRMED";f.step(6,"control.update",f.control,next,"controls");f.control=next
+	completedJournal:=[]any{"owner-one","project-one","v2:session.control","cancel-one",q,f08Number(200),next[10],f.admitted[5],when,bodyType,"text"}
+	if withACK{f.step(5,"journal.update",f.journal,completedJournal,"idempotency")}else{f.step(5,"journal.insert",nil,completedJournal,"idempotency")};f.journal=completedJournal
+	f.step(5,"commit.insert",nil,[]any{"owner-one","project-one","cancel-one",q,frh,original,f08RawHash(f.completed)},"commits")
+	return f
+}
+func TestF08FullNoRunJournalSequence(t *testing.T){
+	for _,ack:=range []bool{false,true}{for _,bodyType:=range []string{"text","blob"}{t.Run(fmt.Sprintf("ack_%v_%s",ack,bodyType),func(t *testing.T){f:=f08FullJournalFixture(t,ack,bodyType);if len(f.trace)<20||f.trace[0]!="admitted.insert"||f.trace[len(f.trace)-1]!="commit.insert"{t.Fatal("incomplete actual evaluator call sequence",f.trace)};s,e:=f08DecodeSources(f.rows);if e!=nil{t.Fatal(e)};if len(s.rows["commits"])!=1||len(s.rows["idempotency"])!=1||len(s.rows["admitted_members"])!=1||len(s.rows["final_members"])!=1{t.Fatal("materialization/journal count")};t.Log("PURE_PROPOSED_SEQUENCE",f.trace)})}}
+}
+func TestF08FullJournalSingleFactMutations(t *testing.T){
+	cases:=[]struct{name string;change func(*f08JournalFixture)}{
+		{"missing_admitted_pin",func(f *f08JournalFixture){for i,x:=range f.rows{p:=x.([]any);if p[0]=="pins"&&p[1].([]any)[4]=="ADMITTED"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"missing_final_member",func(f *f08JournalFixture){for i,x:=range f.rows{if x.([]any)[0]=="final_members"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"missing_outbox",func(f *f08JournalFixture){for i,x:=range f.rows{if x.([]any)[0]=="outbox"{f.rows=append(f.rows[:i],f.rows[i+1:]...);return}}}},
+		{"original_header_removed",func(f *f08JournalFixture){f.journal[7]=f08ProofTestHex(f.t,map[string]any{})}},
+		{"original_timestamp_changed",func(f *f08JournalFixture){f.journal[8]="2026-01-02T00:00:00Z"}},
+		{"control_not_confirmed",func(f *f08JournalFixture){f.control[8]="RECONCILING"}},
+		{"source_global_relocated",func(f *f08JournalFixture){for _,x:=range f.rows{p:=x.([]any);r:=p[1].([]any);if p[0]=="domain_versions"&&r[0]==""{r[0]="project-one";return}}}},
+	}
+	for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){f:=f08FullJournalFixture(t,true,"text");tc.change(f);s,e:=f08DecodeSources(f.rows);if e!=nil{t.Fatal("mutation must retain typed source shape",e)}
+		if tc.name=="original_timestamp_changed"{old:=append([]any{},f.journal...);old[6]=strings.ToUpper(hex.EncodeToString(f.ack));old[8]="2026-01-01T00:00:00Z";for i,x:=range f.rows{if x.([]any)[0]=="idempotency"{f.rows[i]=[]any{"idempotency",old}}};s,e=f08DecodeSources(f.rows);if e!=nil{t.Fatal(e)};if e=f.v.journal(s,"journal.update",old,f.journal);e==nil{t.Fatal("changed original timestamp authorized")};return}
+		final,e:=f08ParseGroup("final",f.final);if e!=nil{t.Fatal(e)};if e=f.v.completedJournal(s,f.journal,final);e==nil{t.Fatal("full source mutation authorized")}
+	})}
+}

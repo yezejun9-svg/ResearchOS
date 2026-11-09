@@ -1,0 +1,15 @@
+# Bounded actual parent image observation — Source repair
+
+Frozen candidate `040d297627e2cfc5de2d6b9e770acc7bdf4f9ab7`, parent `860a8935c8fffe4a1671eafa177e7fc5a053158a`. Exactly two registered files changed; clean worktree. The previous Core worktree, source package and receipts were not edited.
+
+The process identity observer previously reused the release/fixture 128 MiB executable gate. The locked actual Electron is 204,521,984 bytes, larger than that gate. With the original implementation, fresh direct observation of the still-live original PID 53188 returned `bounded regular executable required` in attempt02. This is a new direct API reproduction; the missing stderr of historical failed Core child 61168 is not reconstructed or claimed as captured.
+
+Process identity observation now uses a separate 256 MiB bound matching Desktop JavaScript. Its input still comes from the OS process image query. The helper requires an absolute regular executable without a reparse alias, hashes with at most 256 MiB plus one overflow byte, and refuses changed size/mtime or overflow. PID, creation time, image comparison and caller SID checks are untouched. The complete `exactImage` function body is unchanged; fixture/release launch retains the 128 MiB gate.
+
+Final observation matrix passed 6 parent tests and 6 subtests with zero skips: actual Electron PID 53188/CreatedNS/pinned SHA256 and Alive; incorrect timestamp/hash rejection; current test process; 128 MiB+1 and exact 256 MiB observation with independent full hash comparison; 256 MiB+1 refusal; fixture launch over128 refusal; native junction/noncanonical path rejection; existing Node/control/verifier image digests; and a real owned Node child that exits normally on stdin EOF. The original Electron was only observed, never signaled or closed.
+
+Both control and verifier were rebuilt from the clean candidate and embed the exact source commit with `vcs.modified=false`. Final process regression passed both opt-in tests, including two real control generations with the same Host/Owner and orderly exit, second-coordinator refusal, and actual independently spawned verifier/Mu qualification through private Host IPC using synthetic SSE. It used two synthetic provider calls and zero real models. This is not a retry of the user's actual Electron startup, nor live qualification or formal acceptance.
+
+All commands, times, exits and raw test events are retained. attempt01 is a sparse-checkout dependency failure before tests; expanding the existing tracked evaluation tree resolved it without source edits. attempt02 is the original real-Electron refusal; attempts03/05 are pre-freeze positives; attempts08/09 are final frozen evidence. Large boundary files and owned junctions were cleaned by the tests. No source or old failure history was rewritten.
+
+Independent review is pending. The packet does not authorize a release or claim Main24 completion. Root can perform the actual Desktop causal retry after independent review and integration.

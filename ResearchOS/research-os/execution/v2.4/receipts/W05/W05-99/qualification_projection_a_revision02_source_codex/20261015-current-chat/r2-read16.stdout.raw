@@ -1,0 +1,115 @@
+}
+
+func (s *Service) releaseQualificationReservation(tx *sql.Tx, project string, run Object) error {
+	requestID := "qualification-dispatch/" + Str(run, "id")
+	var raw string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.operation')='RESERVE'", project, requestID).Scan(&raw)
+	if e == sql.ErrNoRows {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	reserve, e := Decode([]byte(raw))
+	if e != nil {
+		return e
+	}
+	var settled int
+	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.operation') IN ('RELEASE','COMMIT','RECONCILE')", project, requestID).Scan(&settled); e != nil {
+		return e
+	}
+	if settled != 0 {
+		return nil
+	}
+	money := reserve["money"].(map[string]any)
+	_, e = s.appendBudget(tx, project, Object{"policy_id": reserve["policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": Object{"amount": "0", "currency": money["currency"]}, "provider_request_id": requestID, "provider_event_id": requestID + "/released", "reservation_id": reserve["id"], "cost_basis": "ACTUAL", "occurred_at": Now()})
+	return e
+}
+
+func (s *Service) beginRuntimeQualification(tx *sql.Tx, p Principal, project, taskID, runtimeID, executor string) (Object, string, error) {
+	t, e := load(tx, project, "Task", taskID)
+	if e != nil {
+		return nil, "", e
+	}
+	if t["status"] != "DRAFT" || t["task_type"] != "runtime_qualification" || len(Arr(t, "dependency_task_ids")) != 0 {
+		return nil, "", Fail(409, "STATE_CONFLICT", "only planned dependency-free draft qualifies")
+	}
+	plan, planHash, root, e := qualificationPlan(tx, project, taskID, runtimeID)
+	if e != nil {
+		return nil, "", e
+	}
+	if rootNow, err := authorityRoot(tx, p.ID); err != nil || rootNow != root {
+		return nil, "", Fail(403, "FORBIDDEN", "host plan owner root changed")
+	}
+	if !runtimeExecutorAllowed(tx, executor, project, taskID) {
+		return nil, "", Fail(403, "FORBIDDEN", "executor role or project grant revoked")
+	}
+	if qualificationTaskHash(t) != plan["task_hash"] {
+		return nil, "", Fail(412, "STALE_INPUT", "qualification task changed after host approval")
+	}
+	rt, e := load(tx, project, "RuntimeRegistration", runtimeID)
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	if len(history) < 3 || history[0]["state"] != "PREPARED" || history[1]["state"] != "STARTED" {
+		return bad("effect history stages")
+	}
+	for i, h := range history {
+		n, err := Num(h, "sequence")
+		if err != nil || n != int64(i+1) || h["request_hash"] != effect["request_hash"] || h["reservation_id"] != effect["reservation_id"] || Hash(h["payload"]) != Hash(request) || Hash(h["epoch"]) != Hash(effect["epoch"]) {
+			return bad("effect history binding")
+		}
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return e
+	}
+	policies, leaves, e := runBudgetScopes(tx, project, Str(run, "id"))
+	if e != nil {
+		return e
+	}
+	values := Empty()
+	for _, p := range policies {
+		values = append(values, p)
+	}
+	rows, e = tx.Query(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, project, run["id"])
+	if e != nil {
+		return e
+	}
+	ledgers := Empty()
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			rows.Close()
+			return e
+		}
+		o, err := Decode([]byte(raw))
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		ledgers = append(ledgers, o)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	mu := Object{"profile": profile, "ledger": ledgers, "unknown_budget": Object{"goal": goal, "policies": values, "leaves": leaves}}
+	if reason := verifyMuUnknownBudget(mu, task, run, request, effect, ledger); reason != "" {
+		return errors.New(reason)
+	}
+	return nil
+}
+
+// Desktop exit checks the same effective request as the live broker before it
+// can classify a fully completed local MODEL liability as safe to leave UNKNOWN.
+func validateCompletedLocalModelRequest(manifest map[string]any, task Object, payload Object) error {
+	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if err != nil {
+		return errors.New("desktop exit requires complete original local MODEL evidence: qualification projection; cost remains unknown")
+	}
+	_, err = validateRuntimeModelRequest(effective, payload)
+	return err
+}

@@ -1,0 +1,75 @@
+--- execution\v2.4\receipts\W09\W09-99\w09_evidence_implementation_source_proposal_codex\9bc40daa1dba4b628892ebb7188b70b4\retrieval.proposed.py
++++ ops/ci/retrieval.py
+@@ -39,10 +39,12 @@
+     "adapters/retrieval/identity_windows.go", "adapters/retrieval/identity_unix.go",
+     "internal/domain/retrieval.go", "internal/domain/retrieval_local.go",
+     "internal/domain/evidence_origin.go", "internal/domain/retrieval_test.go",
++    "internal/domain/w09_evidence_export_test.go", "internal/domain/domain_test.go",
+     "internal/domain/http.go", "internal/domain/context.go", "internal/domain/materialize.go",
+     "internal/domain/contracts.go", "migrations/sqlite/0007_retrieval.sql",
+     "migrations/sqlite/0009_retrieval_root_identity.sql",
+-    "ops/ci/retrieval.py", "go.mod", "go.sum",
++    "ops/ci/retrieval.py", "ops/ci/w09_formal_router.py", "ops/ci/w09_evidence_closure.py",
++    "go.mod", "go.sum",
+ ]
+ 
+ 
+@@ -56,6 +58,7 @@
+     owned = evidence / "owned"
+     owned.mkdir(mode=0o700)
+     options["env"]["RESEARCHOS_W09_EVIDENCE_DIR"] = str(owned.resolve())
++    options["env"]["RESEARCHOS_W09_RUN_ID"] = evidence.name.removeprefix("run-")
+     if os.name == "nt":
+         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+     else:
+@@ -109,11 +112,13 @@
+     if not pins or len(asserted) != len(records) or any(not isinstance(p, dict) for p in asserted):
+         return {"complete": False, "reason": "MISSING_ASSERTION_EXPORT", "members": pins}
+     member_by_abs = {(ROOT / p["path"]).resolve(): p for p in pins}
+-    for claim in asserted:
++    for record, claim in zip(records, asserted):
+         path = Path(claim["path"]).resolve(strict=True)
+         actual = member_by_abs.get(path)
+         if actual is None or actual["sha256"] != claim["sha256"] or actual["bytes"] != claim["bytes"]:
+             return {"complete": False, "reason": "ASSERTION_EXPORT_DRIFT", "members": pins}
++        if path.parent.name != record.get("test_name") or not path.name.endswith("-assertion-" + record["assertion_id"] + ".raw"):
++            return {"complete": False, "reason": "ASSERTION_EXPORT_ID_OR_OWNER", "members": pins}
+     tests = {p["path"].split("/owned/", 1)[1].split("/", 1)[0] for p in pins if "/owned/" in p["path"]}
+     domain_selected = {name for name in selected if TESTS[name][0] == "./internal/domain"}
+     return {"complete": tests == domain_selected, "selected_tests": selected,
+@@ -137,12 +142,13 @@
+                               text=True, encoding="utf-8", check=True).stdout.rstrip("\r\n")
+     report = {
+         "status": "FAIL", "task_id": task, "check_id": check or None, "case_id": case or None,
+-        "scope": "LIVE_WINDOWS_LOCAL" if check == "W09-G02" or case == "A06" and check != "W09-G01" else "FIXTURE_IMPLEMENTED_SERVICE",
++        "scope": "LIVE_WINDOWS_LOCAL" if check == "W09-G02" else "FIXTURE_IMPLEMENTED_SERVICE",
+         "retrieval_backend": "SQLite FTS5 with bounded scan on FTS failure",
+         "sirchmunk_status": "NOT_SELECTED",
+         "formal_construction_acceptance": "PENDING_INDEPENDENT_VERIFIER",
+         "assertions": 0, "assertion_ids": [],
+         "started_at": datetime.now(timezone.utc).isoformat(),
++        "run_id": evidence.name.removeprefix("run-"),
+         "version_manifest": {
+             "git_head": git("rev-parse", "HEAD"),
+             "git_status_porcelain": git("status", "--porcelain"),
+@@ -166,7 +172,7 @@
+         if (mode == "fixture" and check == "W09-G02"
+                 or mode == "live" and check == "W09-G01"
+                 or mode == "live" and case == "C19"
+-                or mode == "fixture" and case == "A06" and check != "W09-G01"):
++                or mode == "live" and case == "A06" and check != "W09-G02"):
+             raise ValueError("NOT_IMPLEMENTED: mode/check mismatch")
+         selected = GROUPS[check] if check else list(TESTS)
+         if case:
+@@ -175,6 +181,11 @@
+             raise ValueError("NOT_IMPLEMENTED: empty selector intersection")
+         locked = json.loads((ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8"))
+         go = os.getenv("RESEARCHOS_GO") or locked["tools"]["go"]["path"]
++        go_path = Path(go).resolve(strict=True)
++        go_raw = go_path.read_bytes()
++        report["go_executable"] = {"path": str(go_path), "sha256": hashlib.sha256(go_raw).hexdigest(), "bytes": len(go_raw)}
++        if report["go_executable"]["sha256"] != locked["tools"]["go"]["sha256"] or go_path != Path(locked["tools"]["go"]["path"]).resolve(strict=True):
++            raise ValueError("LOCKED_GO_ACTUAL_MISMATCH")
+         packages = sorted({TESTS[name][0] for name in selected})
+         command = [go, "test", "-count=1", "-json", "-run", "^(?:" + "|".join(selected) + ")$", *packages]
+         report["actual_invocation"] = command

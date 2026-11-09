@@ -1,0 +1,612 @@
+FILE .local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go SHA256 095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9 LINES 802-887
+802: func RegisterDeterministicScalarFunction(
+803: 	zFuncName string,
+804: 	nArg int32,
+805: 	xFunc func(ctx *FunctionContext, args []driver.Value) (driver.Value, error),
+806: ) (err error) {
+807: 	if dmesgs {
+808: 		defer func() {
+809: 			dmesg("zFuncName %q, nArg %v, xFunc %p: err %v", zFuncName, nArg, xFunc, err)
+810: 		}()
+811: 	}
+812: 	return d.registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: true})
+813: }
+814: 
+815: func (d *Driver) registerFunction(
+816: 	zFuncName string,
+817: 	impl *FunctionImpl,
+818: ) error {
+819: 	d.mu.Lock()
+820: 	defer d.mu.Unlock()
+821: 
+822: 	if d.udfs == nil {
+823: 		d.udfs = map[string]*userDefinedFunction{}
+824: 	}
+825: 	if _, ok := d.udfs[zFuncName]; ok {
+826: 		return fmt.Errorf("a function named %q is already registered", zFuncName)
+827: 	}
+828: 
+829: 	// dont free, functions registered on the driver live as long as the program
+830: 	name, err := libc.CString(zFuncName)
+831: 	if err != nil {
+832: 		return err
+833: 	}
+834: 
+835: 	var textrep int32 = sqlite3.SQLITE_UTF8
+836: 
+837: 	if impl.Deterministic {
+838: 		textrep |= sqlite3.SQLITE_DETERMINISTIC
+839: 	}
+840: 
+841: 	udf := &userDefinedFunction{
+842: 		zFuncName: name,
+843: 		nArg:      impl.NArgs,
+844: 		eTextRep:  textrep,
+845: 	}
+846: 
+847: 	if impl.Scalar != nil {
+848: 		xFuncs.mu.Lock()
+849: 		id := xFuncs.ids.next()
+850: 		xFuncs.m[id] = xFuncEntry{fn: impl.Scalar, volatile: impl.VolatileArgs}
+851: 		xFuncs.mu.Unlock()
+852: 
+853: 		udf.scalar = true
+854: 		udf.pApp = id
+855: 	} else {
+856: 		xAggregateFactories.mu.Lock()
+857: 		id := xAggregateFactories.ids.next()
+858: 		xAggregateFactories.m[id] = xAggregateFactoryEntry{factory: impl.MakeAggregate, volatile: impl.VolatileArgs}
+859: 		xAggregateFactories.mu.Unlock()
+860: 
+861: 		udf.pApp = id
+862: 	}
+863: 
+864: 	d.udfs[zFuncName] = udf
+865: 
+866: 	return nil
+867: }
+868: 
+869: // RegisterConnectionHook registers a function to be called after each
+870: // connection the driver registered as "sqlite" opens. This is called after all
+871: // the connection has been set up. Use [Driver.RegisterConnectionHook] to hook
+872: // the connections of a caller-constructed Driver instead.
+873: func RegisterConnectionHook(fn ConnectionHookFn) {
+874: 	d.RegisterConnectionHook(fn)
+875: }
+876: 
+877: func origin(skip int) string {
+878: 	pc, fn, fl, _ := runtime.Caller(skip)
+879: 	f := runtime.FuncForPC(pc)
+880: 	var fns string
+881: 	if f != nil {
+882: 		fns = f.Name()
+883: 		if x := strings.LastIndex(fns, "."); x > 0 {
+884: 			fns = fns[x+1:]
+885: 		}
+886: 	}
+887: 	return fmt.Sprintf("%s:%d:%s", fn, fl, fns)
+
+FILE .local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go SHA256 095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9 LINES 957-1023
+957: func functionArgs(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr, volatile bool) *udfCall {
+958: 	call := acquireUDFCall(tls, ctx, int(argc))
+959: 	args := call.args
+960: 	for i := int32(0); i < argc; i++ {
+961: 		valPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(i)*sqliteValPtrSize))
+962: 
+963: 		switch valType := sqlite3.Xsqlite3_value_type(tls, valPtr); valType {
+964: 		case sqlite3.SQLITE_TEXT:
+965: 			if volatile {
+966: 				p := sqlite3.Xsqlite3_value_text(tls, valPtr)
+967: 				n := sqlite3.Xsqlite3_value_bytes(tls, valPtr)
+968: 				if p == 0 || n == 0 {
+969: 					args[i] = ""
+970: 				} else {
+971: 					args[i] = unsafe.String((*byte)(unsafe.Pointer(p)), int(n))
+972: 				}
+973: 			} else {
+974: 				args[i] = libc.GoString(sqlite3.Xsqlite3_value_text(tls, valPtr))
+975: 			}
+976: 		case sqlite3.SQLITE_INTEGER:
+977: 			args[i] = sqlite3.Xsqlite3_value_int64(tls, valPtr)
+978: 		case sqlite3.SQLITE_FLOAT:
+979: 			args[i] = sqlite3.Xsqlite3_value_double(tls, valPtr)
+980: 		case sqlite3.SQLITE_NULL:
+981: 			args[i] = nil
+982: 		case sqlite3.SQLITE_BLOB:
+983: 			size := sqlite3.Xsqlite3_value_bytes(tls, valPtr)
+984: 			blobPtr := sqlite3.Xsqlite3_value_blob(tls, valPtr)
+985: 			if volatile {
+986: 				if blobPtr == 0 || size == 0 {
+987: 					args[i] = make([]byte, 0)
+988: 				} else {
+989: 					args[i] = unsafe.Slice((*byte)(unsafe.Pointer(blobPtr)), int(size))
+990: 				}
+991: 			} else {
+992: 				v := make([]byte, size)
+993: 				if size != 0 {
+994: 					copy(v, (*libc.RawMem)(unsafe.Pointer(blobPtr))[:size:size])
+995: 				}
+996: 				args[i] = v
+997: 			}
+998: 		default:
+999: 			panic(fmt.Sprintf("unexpected argument type %q passed by sqlite", valType))
+1000: 		}
+1001: 	}
+1002: 
+1003: 	return call
+1004: }
+1005: 
+1006: func functionReturnValue(tls *libc.TLS, ctx uintptr, res driver.Value) error {
+1007: 	switch resTyped := res.(type) {
+1008: 	case nil:
+1009: 		sqlite3.Xsqlite3_result_null(tls, ctx)
+1010: 	case int64:
+1011: 		sqlite3.Xsqlite3_result_int64(tls, ctx, resTyped)
+1012: 	case float64:
+1013: 		sqlite3.Xsqlite3_result_double(tls, ctx, resTyped)
+1014: 	case bool:
+1015: 		sqlite3.Xsqlite3_result_int(tls, ctx, libc.Bool32(resTyped))
+1016: 	case time.Time:
+1017: 		sqlite3.Xsqlite3_result_int64(tls, ctx, resTyped.Unix())
+1018: 	case string:
+1019: 		size := int32(len(resTyped))
+1020: 		cstr, err := libc.CString(resTyped)
+1021: 		if err != nil {
+1022: 			panic(err)
+1023: 		}
+
+FILE internal/domain/client_protocol_schema.go SHA256 834d22188e2103161a8913ec7e0443cbe06e06ce3adcd23ea6e12b152d1e4312 LINES 1-210
+1: package domain
+2: 
+3: // Contract validation for researchos-client/2 (W03-02).
+4: //
+5: // The published client.protocol.schema.json is the only shape truth. Validation uses the
+6: // repository's existing JSON Schema compiler (the same jsonschema/v6 path LoadContracts
+7: // uses), so there is no second validator and no hand-written keyword subset that can drift
+8: // from the contract. Cross-file references (domain.schema.json) must be pinned by the
+9: // caller; an unregistered resource fails closed at load time.
+10: //
+11: // Direction is the one thing JSON Schema annotations cannot enforce by themselves: a
+12: // property annotated writeOnly:true (credential material) is refused in every read path —
+13: // responses, events and snapshots — while command payloads and native import requests may
+14: // carry it. That policy is applied here and nowhere else.
+15: 
+16: import (
+17: 	"bytes"
+18: 	"encoding/json"
+19: 	"fmt"
+20: 	"net/url"
+21: 	"regexp"
+22: 	"sort"
+23: 	"strings"
+24: 
+25: 	"github.com/santhosh-tekuri/jsonschema/v6"
+26: )
+27: 
+28: type SchemaDoc struct {
+29: 	byName      map[string]*jsonschema.Schema
+30: 	Methods     map[string]MethodContract
+31: 	Events      map[string]string
+32: 	writeOnly   map[string]bool
+33: 	pathProps   map[string]bool
+34: 	Location    string
+35: 	defNames    []string
+36: 	// NeutralizedPatterns counts the pattern keywords the pinned contract publishes that
+37: 	// Go's RE2 engine cannot compile. Each one is replaced by a permissive pattern before
+38: 	// compilation and re-enforced with its exact published semantics afterwards, so the
+39: 	// count is asserted by qualification and can never silently grow.
+40: 	NeutralizedPatterns int
+41: 	// defChecks applies the documented semantics of a neutralised pattern when the value
+42: 	// being validated is that definition itself (for example the RelativePath string).
+43: 	defChecks map[string]func(string) bool
+44: }
+45: 
+46: type MethodContract struct {
+47: 	Payload string `json:"payload"`
+48: 	Result  string `json:"result"`
+49: }
+50: 
+51: func LoadSchema(raw []byte) (*SchemaDoc, error) { return LoadSchemaWithExternals(raw, nil) }
+52: 
+53: // LoadSchemaWithExternals compiles the protocol document together with the exact external
+54: // schemas it references (keyed by file name, e.g. "domain.schema.json").
+55: func LoadSchemaWithExternals(raw []byte, externals map[string][]byte) (*SchemaDoc, error) {
+56: 	doc, err := Decode(raw)
+57: 	if err != nil {
+58: 		return nil, fmt.Errorf("SCHEMA_PROTOCOL_DECODE:%v", err)
+59: 	}
+60: 	location, _ := doc["$id"].(string)
+61: 	if location == "" {
+62: 		return nil, fmt.Errorf("SCHEMA_MISSING_ID")
+63: 	}
+64: 	base, err := url.Parse(location)
+65: 	if err != nil {
+66: 		return nil, fmt.Errorf("SCHEMA_BAD_ID:%v", err)
+67: 	}
+68: 	compiler := jsonschema.NewCompiler()
+69: 	compiler.UseLoader(localOnly{})
+70: 	compiler.AssertFormat()
+71: 	compiler.DefaultDraft(jsonschema.Draft2020)
+72: 	// The Draft 2020-12 metaschema refuses a pattern that Go's regexp engine (which this
+73: 	// compiler uses, like the rest of the repo) cannot compile. Only the exact published
+74: 	// patterns whose semantics are implemented below may be neutralised; anything else makes
+75: 	// the loader fail closed instead of silently widening the contract.
+76: 	neutralized, defChecks, err := neutralizePatterns(doc)
+77: 	if err != nil {
+78: 		return nil, err
+79: 	}
+80: 	if err := compiler.AddResource(location, doc); err != nil {
+81: 		return nil, fmt.Errorf("SCHEMA_ADD_RESOURCE:%v", err)
+82: 	}
+83: 	defs, _ := doc["$defs"].(map[string]any)
+84: 	if len(defs) == 0 {
+85: 		return nil, fmt.Errorf("SCHEMA_NO_DEFS")
+86: 	}
+87: 	writeOnly := map[string]bool{}
+88: 	collectWriteOnly(doc, writeOnly)
+89: 	for name, body := range externals {
+90: 		edoc, err := Decode(body)
+91: 		if err != nil {
+92: 			return nil, fmt.Errorf("EXTERNAL_SCHEMA:%s:%v", name, err)
+93: 		}
+94: 		refURI := resolveURI(base, name)
+95: 		if id, ok := edoc["$id"].(string); ok && id != "" && id != refURI {
+96: 			if err := compiler.AddResource(id, edoc); err != nil {
+97: 				return nil, fmt.Errorf("EXTERNAL_ADD_RESOURCE_ID:%s:%v", name, err)
+98: 			}
+99: 		}
+100: 		if err := compiler.AddResource(refURI, edoc); err != nil {
+101: 			return nil, fmt.Errorf("EXTERNAL_ADD_RESOURCE:%s:%v", name, err)
+102: 		}
+103: 		n, extChecks, err := neutralizePatterns(edoc)
+104: 		if err != nil {
+105: 			return nil, fmt.Errorf("EXTERNAL_PATTERN:%s:%v", name, err)
+106: 		}
+107: 		neutralized += n
+108: 		for k, v := range extChecks {
+109: 			defChecks[k] = v
+110: 		}
+111: 		collectWriteOnly(edoc, writeOnly)
+112: 	}
+113: 	d := &SchemaDoc{byName: map[string]*jsonschema.Schema{}, Methods: map[string]MethodContract{},
+114: 		Events: map[string]string{}, writeOnly: writeOnly, Location: location,
+115: 		pathProps: map[string]bool{}, NeutralizedPatterns: neutralized, defChecks: defChecks}
+116: 	// Properties declared with the contract's RelativePath definition carry the semantics of
+117: 	// the neutralised pattern, so they are re-checked explicitly below.
+118: 	collectPathProps(doc, d.pathProps)
+119: 	for name := range defs {
+120: 		s, err := compiler.Compile(location + "#/$defs/" + name)
+121: 		if err != nil {
+122: 			return nil, fmt.Errorf("SCHEMA_COMPILE:%s:%v", name, err)
+123: 		}
+124: 		d.byName[name] = s
+125: 		d.defNames = append(d.defNames, name)
+126: 	}
+127: 	if mc, ok := doc["x-method-contracts"].(map[string]any); ok {
+128: 		for method, v := range mc {
+129: 			m, ok := v.(map[string]any)
+130: 			if !ok {
+131: 				return nil, fmt.Errorf("SCHEMA_METHOD_CONTRACT_NOT_OBJECT:%s", method)
+132: 			}
+133: 			p, _ := m["payload"].(string)
+134: 			r, _ := m["result"].(string)
+135: 			if p == "" || r == "" {
+136: 				return nil, fmt.Errorf("SCHEMA_METHOD_CONTRACT_INCOMPLETE:%s", method)
+137: 			}
+138: 			if _, ok := d.byName[p]; !ok {
+139: 				return nil, fmt.Errorf("SCHEMA_METHOD_PAYLOAD_DEF_MISSING:%s->%s", method, p)
+140: 			}
+141: 			if _, ok := d.byName[r]; !ok {
+142: 				return nil, fmt.Errorf("SCHEMA_METHOD_RESULT_DEF_MISSING:%s->%s", method, r)
+143: 			}
+144: 			d.Methods[method] = MethodContract{Payload: p, Result: r}
+145: 		}
+146: 	}
+147: 	if ec, ok := doc["x-event-contracts"].(map[string]any); ok {
+148: 		for kind, v := range ec {
+149: 			def, ok := v.(string)
+150: 			if !ok {
+151: 				return nil, fmt.Errorf("SCHEMA_EVENT_CONTRACT_NOT_STRING:%s", kind)
+152: 			}
+153: 			if _, has := d.byName[def]; !has {
+154: 				return nil, fmt.Errorf("SCHEMA_EVENT_PAYLOAD_DEF_MISSING:%s->%s", kind, def)
+155: 			}
+156: 			d.Events[kind] = def
+157: 		}
+158: 	}
+159: 	if len(d.Methods) == 0 || len(d.Events) == 0 {
+160: 		return nil, fmt.Errorf("SCHEMA_CONTRACT_MAPS_EMPTY")
+161: 	}
+162: 	return d, nil
+163: }
+164: 
+165: // resolveURI maps a bare file name to the absolute location a relative $ref in the
+166: // protocol document resolves to, and falls back to the document's own $id when present.
+167: func resolveURI(base *url.URL, file string) string {
+168: 	u := *base
+169: 	if idx := strings.LastIndex(u.Path, "/"); idx >= 0 {
+170: 		u.Path = u.Path[:idx+1] + file
+171: 	} else {
+172: 		u.Path = file
+173: 	}
+174: 	u.Fragment = ""
+175: 	return u.String()
+176: }
+177: 
+178: // ValidateDef checks a read-direction value: response, event, snapshot or native result.
+179: // writeOnly-annotated properties are refused, so credential material cannot travel back.
+180: func (d *SchemaDoc) ValidateDef(name string, value any) error {
+181: 	return d.validate(name, value, false)
+182: }
+183: 
+184: // ValidateDefInput checks a write-direction value: a command envelope or payload, where
+185: // writeOnly properties are legal.
+186: func (d *SchemaDoc) ValidateDefInput(name string, value any) error {
+187: 	return d.validate(name, value, true)
+188: }
+189: 
+190: func (d *SchemaDoc) validate(name string, value any, allowWriteOnly bool) error {
+191: 	s, ok := d.byName[name]
+192: 	if !ok {
+193: 		return fmt.Errorf("SCHEMA_DEF_UNKNOWN:%s", name)
+194: 	}
+195: 	var generic any
+196: 	dec := json.NewDecoder(bytes.NewReader(Bytes(value)))
+197: 	dec.UseNumber()
+198: 	if err := dec.Decode(&generic); err != nil {
+199: 		return fmt.Errorf("SCHEMA_VALUE_DECODE:%v", err)
+200: 	}
+201: 	if !allowWriteOnly {
+202: 		if key, bad := firstWriteOnly(generic, d.writeOnly); bad {
+203: 			return fmt.Errorf("WRITE_ONLY_IN_READ_PATH:%s", key)
+204: 		}
+205: 	}
+206: 	if key, bad := firstBadRelativePath(generic, d.pathProps); bad {
+207: 		return fmt.Errorf("RELATIVE_PATH_PATTERN:%s", key)
+208: 	}
+209: 	if check, ok := d.defChecks[name]; ok {
+210: 		if s, isString := generic.(string); isString && !check(s) {
+
+FILE internal/domain/client_protocol.go SHA256 3dc3fde08b8d5a50cf43c5dcd1c4fd839f11f7118c1da8854635f688da87fc5f LINES 1-200
+1: package domain
+2: 
+3: // Typed researchos-client/2 protocol core (W03-02).
+4: // One local service shared by CLI and Desktop: envelope handshake, per-method
+5: // typed payloads and results, command_id content-hash idempotency, writer/session/
+6: // revision CAS checks, and typed session events. Schema-shaped rejection of bare
+7: // objects, cross-method results, old protocol downgrade and untyped payloads lives
+8: // here, not in callers.
+9: 
+10: import (
+11: 	"context"
+12: 	"crypto/sha256"
+13: 	"database/sql"
+14: 	"encoding/hex"
+15: 	"encoding/json"
+16: 	"errors"
+17: 	"fmt"
+18: 	"sort"
+19: 	"strings"
+20: 	"time"
+21: )
+22: 
+23: const ProtocolV2 = "researchos-client/2"
+24: 
+25: var ErrProtocolVersion = errors.New("UNSUPPORTED_PROTOCOL")
+26: var ErrBareObject = errors.New("UNtyped_ENVELOPE")
+27: var ErrUnknownMethod = errors.New("UNKNOWN_METHOD")
+28: var ErrCrossMethod = errors.New("CROSS_METHOD_RESULT")
+29: var ErrIdemConflict = errors.New("IDEMPOTENCY_CONFLICT")
+30: var ErrSessionNotFound = errors.New("UNKNOWN_SESSION")
+31: 
+32: var methodsV2 = map[string]bool{
+33: 	"host.status": true, "host.configure": true, "project.bootstrap": true,
+34: 	"session.list": true, "session.create": true, "session.get": true, "session.attach": true,
+35: 	"session.send": true, "session.control": true, "session.events": true, "session.handoff": true,
+36: 	"goal.start": true, "provider.models": true, "provider.probe": true,
+37: 	"workspace.register": true, "workspace.list": true, "workspace.tree": true, "workspace.read": true,
+38: 	"workspace.diff": true, "workspace.write": true, "artifact.import": true, "session.update": true,
+39: 	"permission.respond": true,
+40: }
+41: 
+42: // durable command methods may never carry native-only or secret-bearing payloads
+43: // write-class methods require full identity/CAS fields in the envelope
+44: var writeMethods = map[string]bool{
+45: 	"session.create": true,
+46: 	"session.send":   true, "session.control": true, "session.update": true, "session.handoff": true,
+47: 	"workspace.write": true, "artifact.import": true, "permission.respond": true, "goal.start": true,
+48: 	"project.bootstrap": true,
+49: }
+50: 
+51: type Envelope struct {
+52: 	ProtocolVersion  *string         `json:"protocol_version"`
+53: 	CommandID        *string         `json:"command_id"`
+54: 	ClientID         *string         `json:"client_id"`
+55: 	ProjectID        *string         `json:"project_id"`
+56: 	SessionID        *string         `json:"session_id"`
+57: 	ExpectedRevision *int64          `json:"expected_revision"`
+58: 	WriterEpoch      *int64          `json:"writer_epoch"`
+59: 	Method           *string         `json:"method"`
+60: 	Payload          json.RawMessage `json:"payload"`
+61: 	extra            map[string]json.RawMessage
+62: }
+63: 
+64: func requiredString(name string, v *string) error {
+65: 	if v == nil || *v == "" {
+66: 		return fmt.Errorf("MISSING_FIELD:%s", name)
+67: 	}
+68: 	return nil
+69: }
+70: 
+71: // DecodeEnvelope enforces protocol_version first; a bare object (no protocol_version)
+72: // can never be mistaken for a valid command and there is no /1 downgrade path.
+73: func DecodeEnvelope(raw []byte) (*Envelope, error) {
+74: 	var probe map[string]json.RawMessage
+75: 	dec := json.NewDecoder(strings.NewReader(string(raw)))
+76: 	dec.DisallowUnknownFields()
+77: 	if err := dec.Decode(&probe); err != nil {
+78: 		return nil, fmt.Errorf("%w: %v", ErrBareObject, err)
+79: 	}
+80: 	if _, ok := probe["protocol_version"]; !ok {
+81: 		return nil, ErrBareObject
+82: 	}
+83: 	for k := range probe {
+84: 		switch k {
+85: 		case "protocol_version", "command_id", "client_id", "project_id", "session_id", "expected_revision", "writer_epoch", "method", "payload":
+86: 		default:
+87: 			return nil, fmt.Errorf("UNKNOWN_FIELD:%s", k)
+88: 		}
+89: 	}
+90: 	var e Envelope
+91: 	if err := json.Unmarshal(raw, &e); err != nil {
+92: 		return nil, err
+93: 	}
+94: 	e.extra = probe
+95: 	if err := requiredString("protocol_version", e.ProtocolVersion); err != nil {
+96: 		return nil, err
+97: 	}
+98: 	if *e.ProtocolVersion != ProtocolV2 {
+99: 		return nil, ErrProtocolVersion
+100: 	}
+101: 	if err := requiredString("command_id", e.CommandID); err != nil {
+102: 		return nil, err
+103: 	}
+104: 	if err := requiredString("client_id", e.ClientID); err != nil {
+105: 		return nil, err
+106: 	}
+107: 	if err := requiredString("method", e.Method); err != nil {
+108: 		return nil, err
+109: 	}
+110: 	if !methodsV2[*e.Method] {
+111: 		return nil, ErrUnknownMethod
+112: 	}
+113: 	// project_id/session_id are required keys but legal nulls (host-level commands carry
+114: 	// neither); an empty string is never a valid reference.
+115: 	if e.SessionID != nil && *e.SessionID == "" {
+116: 		return nil, fmt.Errorf("MISSING_FIELD:session_id")
+117: 	}
+118: 	if e.ProjectID != nil && *e.ProjectID == "" {
+119: 		return nil, fmt.Errorf("MISSING_FIELD:project_id")
+120: 	}
+121: 	if e.Payload == nil {
+122: 		return nil, fmt.Errorf("MISSING_FIELD:payload")
+123: 	}
+124: 	// takeover (session.attach with request_write_owner) must not claim a writer epoch;
+125: 	// read attach must carry the observed epoch.
+126: 	if *e.Method == "session.attach" {
+127: 		var ap struct {
+128: 			RequestWriteOwner *bool `json:"request_write_owner"`
+129: 		}
+130: 		json.Unmarshal(e.Payload, &ap)
+131: 		claim := ap.RequestWriteOwner != nil && *ap.RequestWriteOwner
+132: 		if claim && e.WriterEpoch != nil {
+133: 			return nil, fmt.Errorf("ATTACKER_CLAIMED_EPOCH")
+134: 		}
+135: 		if !claim && e.WriterEpoch == nil {
+136: 			return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
+137: 		}
+138: 	}
+139: 	if writeMethods[*e.Method] && *e.Method != "session.attach" && *e.Method != "session.create" && *e.Method != "project.bootstrap" && *e.Method != "workspace.register" {
+140: 		if err := requiredString("project_id", e.ProjectID); err != nil {
+141: 			return nil, err
+142: 		}
+143: 		// A project-level Goal creates its own real session. Only a Goal naming an
+144: 		// existing session may claim that session's revision and writer epoch.
+145: 		if *e.Method == "goal.start" && e.SessionID == nil {
+146: 			if e.ExpectedRevision != nil || e.WriterEpoch != nil {
+147: 				return nil, fmt.Errorf("INVALID_REQUEST:project goal must not claim a session writer")
+148: 			}
+149: 		} else {
+150: 			if e.ExpectedRevision == nil {
+151: 				return nil, fmt.Errorf("MISSING_FIELD:expected_revision")
+152: 			}
+153: 			if e.WriterEpoch == nil {
+154: 				return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
+155: 			}
+156: 		}
+157: 	}
+158: 	if *e.Method == "host.configure" {
+159: 		var cm map[string]json.RawMessage
+160: 		json.Unmarshal(e.Payload, &cm)
+161: 		if (hasKeyRaw(cm, "model_id") || hasKeyRaw(cm, "provider_id")) && e.WriterEpoch == nil {
+162: 			return nil, fmt.Errorf("MODEL_CHANGE_WITHOUT_EPOCH")
+163: 		}
+164: 	}
+165: 	if err := e.validatePayload(); err != nil {
+166: 		return nil, err
+167: 	}
+168: 	return &e, nil
+169: }
+170: 
+171: func decodePayloadObject(e *Envelope) (map[string]json.RawMessage, error) {
+172: 	var m map[string]json.RawMessage
+173: 	if err := json.Unmarshal(e.Payload, &m); err != nil {
+174: 		return nil, fmt.Errorf("PAYLOAD_NOT_OBJECT:%v", err)
+175: 	}
+176: 	return m, nil
+177: }
+178: 
+179: func hasKey(m map[string]json.RawMessage, k string) bool {
+180: 	_, ok := m[k]
+181: 	return ok
+182: }
+183: 
+184: func hasKeyRaw(m map[string]json.RawMessage, k string) bool {
+185: 	_, ok := m[k]
+186: 	return ok
+187: }
+188: 
+189: func isTrue(m map[string]json.RawMessage, k string) bool {
+190: 	raw, ok := m[k]
+191: 	if !ok {
+192: 		return false
+193: 	}
+194: 	var b bool
+195: 	return json.Unmarshal(raw, &b) == nil && b
+196: }
+197: 
+198: func isSHA256(s string, allowNull bool, raw json.RawMessage) bool {
+199: 	if allowNull && string(raw) == "null" {
+200: 		return true
+
+FILE internal/domain/budget_scopes.go SHA256 3972a8833a26cb2c610f826a30648b093939340b59d2324810a4588cfc6ae619 LINES 180-219
+180: 	}
+181: 	// Exposure groups by (project, run, provider_request_id) and a hold that is never
+182: 	// settled keeps counting. Each lease epoch therefore takes its own reservation, and
+183: 	// taking over a lease must first release the hold the dead epoch left open - as an
+184: 	// explicit ledger entry, never a deletion - or the same run is charged again next to
+185: 	// its own earlier hold while the original stays unresolved. A restart neither
+186: 	// recounts the charge nor clears the accounting trail.
+187: 	prefix := "runtime-local-launch/" + Str(run, "id") + "/"
+188: 	stale, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id') LIKE ? AND json_extract(body,'$.operation')='RESERVE'", project, run["id"], prefix+"%")
+189: 	if e != nil {
+190: 		return e
+191: 	}
+192: 	holds := []Object{}
+193: 	for stale.Next() {
+194: 		var raw string
+195: 		if e = stale.Scan(&raw); e != nil {
+196: 			stale.Close()
+197: 			return e
+198: 		}
+199: 		o, e := Decode([]byte(raw))
+200: 		if e != nil {
+201: 			stale.Close()
+202: 			return e
+203: 		}
+204: 		if Str(o, "provider_request_id") != request {
+205: 			holds = append(holds, o)
+206: 		}
+207: 	}
+208: 	e = stale.Err()
+209: 	stale.Close()
+210: 	if e != nil {
+211: 		return e
+212: 	}
+213: 	for _, hold := range holds {
+214: 		release := Str(hold, "provider_request_id") + "/released"
+215: 		if _, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": Str(hold, "provider_request_id"), "provider_event_id": release, "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()}); e != nil {
+216: 			return e
+217: 		}
+218: 	}
+219: 	_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": request, "provider_event_id": request, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})

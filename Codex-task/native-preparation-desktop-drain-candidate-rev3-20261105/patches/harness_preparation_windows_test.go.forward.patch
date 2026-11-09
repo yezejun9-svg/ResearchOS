@@ -1,0 +1,303 @@
+diff --git a/internal/domain/harness_preparation_windows_test.go b/internal/domain/harness_preparation_windows_test.go
+index 12304b4..8ca1349 100644
+--- a/internal/domain/harness_preparation_windows_test.go
++++ b/internal/domain/harness_preparation_windows_test.go
+@@ -3,6 +3,7 @@
+ package domain
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"database/sql"
+ 	"os"
+@@ -89,14 +90,61 @@ func harnessPreparationFixture(t *testing.T) (*fixture, *RuntimeCoordinator, har
+ 	return f, c, fence, proof
+ }
+ 
++func harnessPreparationLedger(t *testing.T, f *fixture, fence harnessPreparationFence) ([]Object, string) {
++	t.Helper()
++	request := "runtime-local-launch/" + fence.runID + "/" + strconv.FormatInt(fence.epoch, 10)
++	rows, err := f.db.Query("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? ORDER BY rowid", f.project, request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer rows.Close()
++	entries := []Object{}
++	for rows.Next() {
++		var raw string
++		if err := rows.Scan(&raw); err != nil {
++			t.Fatal(err)
++		}
++		entry, err := Decode([]byte(raw))
++		if err != nil {
++			t.Fatal(err)
++		}
++		entries = append(entries, entry)
++	}
++	if err := rows.Err(); err != nil {
++		t.Fatal(err)
++	}
++	return entries, request
++}
++
++func harnessPreparationReleased(t *testing.T, f *fixture, fence harnessPreparationFence, original []byte) {
++	t.Helper()
++	entries, request := harnessPreparationLedger(t, f, fence)
++	if len(entries) != 2 || entries[0]["operation"] != "RESERVE" || entries[1]["operation"] != "RELEASE" ||
++		entries[1]["reservation_id"] != entries[0]["id"] || entries[1]["provider_event_id"] != request+"/released" ||
++		entries[1]["money"] == nil || entries[1]["receipt_hash"] != Receipt(entries[1]) || !bytes.Equal(Bytes(entries[0]), original) {
++		t.Fatal("C5 did not retain exact zero hold and append one linked release", entries)
++	}
++	money := entries[1]["money"].(map[string]any)
++	amount, err := moneyAmount(money)
++	if err != nil || amount.Sign() != 0 {
++		t.Fatal("nonzero local release", entries[1], err)
++	}
++}
++
+ func TestHarnessPreparationFailureAtomicTerminalAndRestart(t *testing.T) {
+ 	f, c, fence, proof := harnessPreparationFixture(t)
++	initial, _ := harnessPreparationLedger(t, f, fence)
++	if len(initial) != 1 || initial[0]["operation"] != "RESERVE" {
++		t.Fatal("real claim did not reserve local launch", initial)
++	}
++	originalHold := Bytes(initial[0])
+ 	if _, err := os.Stat(filepath.Join(c.config.DataRoot, "runtime-dispatches", fence.locator)); !os.IsNotExist(err) {
+ 		t.Fatal("fixture unexpectedly precreated model directory", err)
+ 	}
+ 	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
+ 		t.Fatal(err)
+ 	}
++	harnessPreparationReleased(t, f, fence, originalHold)
+ 	view := harnessViewFixture(t, f, c, fence.taskID)
+ 	if view["status"] != "FAILED" || view["result"] != nil || view["terminal"] != true || view["failure"].(map[string]any)["code"] != "HARNESS_UNAVAILABLE" {
+ 		t.Fatal("failed preparation projected as model result", view)
+@@ -129,6 +177,7 @@ func TestHarnessPreparationFailureAtomicTerminalAndRestart(t *testing.T) {
+ 	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
+ 		t.Fatal("identical durable failure was not idempotent", err)
+ 	}
++	harnessPreparationReleased(t, f, fence, originalHold)
+ 	var progressRuns, failureCount int
+ 	if err := f.db.QueryRow("SELECT count(*) FROM resource_progress_runs WHERE project=? AND run=?", f.project, fence.runID).Scan(&progressRuns); err != nil {
+ 		t.Fatal(err)
+@@ -173,6 +222,7 @@ func TestHarnessPreparationFailureAtomicTerminalAndRestart(t *testing.T) {
+ 	if runs != 1 || logsAfter != 1 {
+ 		t.Fatal("terminal preparation relaunched or duplicated", runs, logsAfter)
+ 	}
++	harnessPreparationReleased(t, f, fence, originalHold)
+ }
+ 
+ func TestHarnessPreparationFailureRejectsConflictsAndRollsBack(t *testing.T) {
+@@ -257,6 +307,190 @@ func TestHarnessPreparationProofRejectsUnknownAndIncompleteFacts(t *testing.T) {
+ 	}
+ }
+ 
++func TestHarnessStoppedChildPreparationReleasesOnlyLocalZeroHold(t *testing.T) {
++	f, c, fence, proof := harnessPreparationFixture(t)
++	initial, _ := harnessPreparationLedger(t, f, fence)
++	if len(initial) != 1 {
++		t.Fatal("missing original hold", initial)
++	}
++	proof.NoQualificationChild = false
++	proof.QualificationPID = 123
++	proof.QualificationJobZero = true
++	proof.StreamsDrained = true
++	proof.CleanupComplete = true
++	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
++		t.Fatal(err)
++	}
++	harnessPreparationReleased(t, f, fence, Bytes(initial[0]))
++	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
++		t.Fatal("stopped child settlement not idempotent", err)
++	}
++	harnessPreparationReleased(t, f, fence, Bytes(initial[0]))
++}
++
++func TestHarnessPreparationLocalHoldConflictsRollBackSettlement(t *testing.T) {
++	cases := []string{"missing", "duplicate", "wrong_run", "wrong_project", "wrong_policy", "wrong_request", "wrong_epoch", "wrong_event", "nonzero", "wrong_currency", "parent", "bad_receipt", "unknown", "conflicting_release", "reused_event"}
++	for _, name := range cases {
++		t.Run(name, func(t *testing.T) {
++			f, c, fence, proof := harnessPreparationFixture(t)
++			initial, request := harnessPreparationLedger(t, f, fence)
++			if len(initial) != 1 {
++				t.Fatal("missing claim hold", initial)
++			}
++			hold := initial[0]
++			if name == "missing" {
++				if _, err := f.db.Exec("DELETE FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?", f.project, hold["id"]); err != nil {
++					t.Fatal(err)
++				}
++			} else if name == "duplicate" || name == "unknown" || name == "conflicting_release" || name == "reused_event" {
++				other := Object{}
++				for k, v := range hold {
++					other[k] = v
++				}
++				other["id"] = ID()
++				other["provider_event_id"] = request + "/extra"
++				if name == "unknown" {
++					other["operation"] = "UNKNOWN"
++					other["money"] = nil
++					other["cost_basis"] = "UNKNOWN"
++					other["reservation_id"] = hold["id"]
++				}
++				if name == "conflicting_release" {
++					other["operation"] = "RELEASE"
++					other["cost_basis"] = "ACTUAL"
++					other["reservation_id"] = hold["id"]
++				}
++				if name == "reused_event" {
++					other["provider_request_id"] = request + "/other"
++					other["provider_event_id"] = request + "/released"
++				}
++				other["receipt_hash"] = Receipt(other)
++				if _, err := f.db.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,'BudgetLedgerEntry',?,1,?,?,1)", f.project, other["id"], Bytes(other), other["receipt_hash"]); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				// Disposable DB corruption tests exercise the Host validator. The
++				// production immutable-receipt trigger remains untouched elsewhere.
++				if _, err := f.db.Exec("DROP TRIGGER objects_immutable"); err != nil {
++					t.Fatal(err)
++				}
++				switch name {
++				case "wrong_run":
++					hold["run_id"] = ID()
++				case "wrong_project":
++					hold["project_id"] = ID()
++				case "wrong_policy":
++					hold["policy_id"] = ID()
++				case "wrong_request":
++					hold["provider_request_id"] = request + "/other"
++				case "wrong_epoch":
++					hold["provider_request_id"] = "runtime-local-launch/" + fence.runID + "/" + strconv.FormatInt(fence.epoch+1, 10)
++				case "wrong_event":
++					hold["provider_event_id"] = request + "/other"
++				case "nonzero":
++					hold["money"].(map[string]any)["amount"] = "1"
++				case "wrong_currency":
++					hold["money"].(map[string]any)["currency"] = "EUR"
++				case "parent":
++					hold["reservation_id"] = ID()
++				}
++				if name != "bad_receipt" {
++					hold["receipt_hash"] = Receipt(hold)
++				} else {
++					hold["receipt_hash"] = Digest([]byte("wrong receipt"))
++				}
++				if _, err := f.db.Exec("UPDATE domain_objects SET body=?,content_hash=? WHERE project=? AND kind='BudgetLedgerEntry' AND id=?", Bytes(hold), hold["receipt_hash"], f.project, hold["id"]); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if err := c.finishHarnessPreparationFailure(fence, proof); err == nil {
++				t.Fatal("conflicted local hold committed C5")
++			}
++			var state, status string
++			if err := f.db.QueryRow("SELECT state FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?", f.project, fence.runID, fence.epoch).Scan(&state); err != nil {
++				t.Fatal(err)
++			}
++			if err := f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='Run' AND id=?", f.project, fence.runID).Scan(&status); err != nil {
++				t.Fatal(err)
++			}
++			var audits, releases int
++			if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE project=? AND sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", f.project).Scan(&audits); err != nil {
++				t.Fatal(err)
++			}
++			if err := f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.provider_event_id')=?", f.project, request, request+"/released").Scan(&releases); err != nil {
++				t.Fatal(err)
++			}
++			if state != "STARTED" || status != "QUEUED" || audits != 0 || releases != 0 {
++				t.Fatal("C5 conflict partially committed", state, status, audits, releases)
++			}
++		})
++	}
++}
++
++func TestHarnessPreparationExistingReleaseConflictRefusesRepeat(t *testing.T) {
++	f, c, fence, proof := harnessPreparationFixture(t)
++	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
++		t.Fatal(err)
++	}
++	entries, request := harnessPreparationLedger(t, f, fence)
++	if len(entries) != 2 {
++		t.Fatal("missing settled history", entries)
++	}
++	if _, err := f.db.Exec("DROP TRIGGER objects_immutable"); err != nil {
++		t.Fatal(err)
++	}
++	release := entries[1]
++	release["reservation_id"] = ID()
++	release["receipt_hash"] = Receipt(release)
++	if _, err := f.db.Exec("UPDATE domain_objects SET body=?,content_hash=? WHERE project=? AND kind='BudgetLedgerEntry' AND id=?", Bytes(release), release["receipt_hash"], f.project, release["id"]); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.finishHarnessPreparationFailure(fence, proof); err == nil {
++		t.Fatal("conflicting release accepted idempotently")
++	}
++	var count int
++	if err := f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=?", f.project, request).Scan(&count); err != nil {
++		t.Fatal(err)
++	}
++	if count != 2 {
++		t.Fatal("repeat appended a new release", count)
++	}
++}
++
++func TestHarnessPreparationReleaseAppendFailureRollsBackC5(t *testing.T) {
++	f, c, fence, proof := harnessPreparationFixture(t)
++	if _, err := f.db.Exec(`CREATE TRIGGER fail_c5_release BEFORE INSERT ON domain_objects
++		WHEN NEW.kind='BudgetLedgerEntry' AND json_extract(NEW.body,'$.operation')='RELEASE'
++		BEGIN SELECT RAISE(ABORT,'inert release fault'); END`); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.finishHarnessPreparationFailure(fence, proof); err == nil {
++		t.Fatal("release failure committed C5")
++	}
++	if _, err := f.db.Exec("DROP TRIGGER fail_c5_release"); err != nil {
++		t.Fatal(err)
++	}
++	entries, _ := harnessPreparationLedger(t, f, fence)
++	var status, reason string
++	if err := f.db.QueryRow("SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='Run' AND id=?", f.project, fence.runID).Scan(&status); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.db.QueryRow("SELECT reason FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?", f.project, fence.runID, fence.epoch).Scan(&reason); err != nil {
++		t.Fatal(err)
++	}
++	var audits int
++	if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE project=? AND sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-preparation-outcome.v1%'", f.project).Scan(&audits); err != nil {
++		t.Fatal(err)
++	}
++	if len(entries) != 1 || status != "QUEUED" || reason != "" || audits != 0 {
++		t.Fatal("append failure leaked partial C5 settlement", entries, status, reason, audits)
++	}
++	if err := c.finishHarnessPreparationFailure(fence, proof); err != nil {
++		t.Fatal("original consumed attempt could not settle after rollback", err)
++	}
++	harnessPreparationReleased(t, f, fence, Bytes(entries[0]))
++}
++
+ func TestHarnessQualifiedSyntheticSourceRejectsOtherWorkspaceBeforeTask(t *testing.T) {
+ 	f, c, binding, _ := harnessRPCTurnFixture(t)
+ 	oldID, _ := harnessSubmitFixture(t, f, c, binding, "historical inert fixture")
+@@ -377,4 +611,21 @@ func TestHarnessConcreteQualifiedHandleNoChildPreflight(t *testing.T) {
+ 	if pidErr != nil || audit["qualification_no_child"] != true || pid != 0 || audit["model_start_delegated"] != false || audit["qualification_receipt_path_sha256"] != nil {
+ 		t.Fatal("concrete preflight did not prove zero child", audit, pidErr)
+ 	}
++	entries, _ := harnessPreparationLedger(t, f, harnessPreparationFence{runID: runID, epoch: epoch})
++	if len(entries) != 2 || entries[0]["operation"] != "RESERVE" || entries[1]["operation"] != "RELEASE" || entries[1]["reservation_id"] != entries[0]["id"] {
++		t.Fatal("concrete stopped handle did not settle only its local hold", entries)
++	}
++	snapshot, err := f.s.RuntimeDrainSnapshot(context.Background())
++	if err != nil || snapshot.Reservations != 0 || snapshot.UnresolvedDispatches != 1 {
++		t.Fatal("concrete C5 raw counters changed", snapshot, err)
++	}
++	// This handle really reached C5 through runHarness; Desktop may now close
++	// after the worker is done while generic release retains the STARTED fact.
++	c.startupComplete = true
++	if raw, err := c.QuiesceForRelease(context.Background()); err == nil || raw.UnresolvedDispatches != 1 {
++		t.Fatal("generic release accepted concrete consumed attempt", raw, err)
++	}
++	if raw, err := c.QuiesceForDesktopExit(context.Background()); err != nil || raw.UnresolvedDispatches != 1 {
++		t.Fatal("Desktop exit rejected concrete stopped preflight", raw, err)
++	}
+ }

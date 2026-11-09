@@ -1,0 +1,11 @@
+import hashlib,json
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=Path('D:/作品集/ResearchOS/research-os');CONTROL=HERE/'product-v1-owned-verification-20261104';ID='product-v1-qualification-build-tests-01';OUT=HERE/(ID+'-registration')
+def read(p):return json.loads(p.read_bytes())
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+scopefile=ROOT/'execution/product-v1/receipts/single-harness-20261104/qualification-build-binding/scope.json';assert sha(scopefile)=='43700c29f92112a21e608cfb9ca097f182f03bff2b138697b88c93b4923ec566';lease=read(scopefile);WT=Path(lease['worktree']);manifest=HERE/'product-v1-qualification-build-binding-author-20261105/MANIFEST.json';assert sha(manifest)=='35f048d916950fbcaba1c9e6a25940f9b8255434baab8978342ed54ab2fa1338'
+assert not OUT.exists() and not (CONTROL/'runs'/ID).exists();py=Path('C:/Users/yqyyds/AppData/Local/Python/pythoncore-3.14-64/python.exe');assert sha(py)=='cce21c0e8710e304273e98ac4b2b0f5aceb639acbcd2343cbaa5c4e81619c45b'
+files=[WT/p for p in lease['production_paths']+lease['test_paths']]+[ROOT/p for p in lease['contract_pins']]+[manifest,scopefile,Path(__file__),CONTROL/'owned_run.py']
+for ref,digest in lease['contract_pins'].items():assert sha(ROOT/ref)==digest
+s=dict(schema='researchos.owned-windows-run/1',scope_id=ID,purpose='build',authorization='ROOT_REVIEWED_EXACT_COMMAND',controller_sha256=sha(CONTROL/'owned_run.py'),executable=str(py),executable_sha256=sha(py),argv=['-B','-X','utf8','-m','unittest','discover','-s','tests/desktop','-p','test_qualification_build.py','-v'],cwd=str(WT),timeout_seconds=180,graceful='none',grace_seconds=0,cleanup_seconds=5,process_limit=8,memory_mib=1536,max_raw_bytes=8388608,inputs=[dict(path=str(p),sha256=sha(p)) for p in files])
+OUT.mkdir();sp=CONTROL/'scopes'/(ID+'.json');assert not sp.exists();sp.write_bytes((json.dumps(s,indent=2)+'\n').encode('utf8'));r=dict(status='REGISTERED_NOT_EXECUTED',scope_id=ID,scope_path=str(sp),scope_sha256=sha(sp),source_manifest_sha256=sha(manifest),pure_python_inert_fixtures_only=True,go_build_helper_native_model_execution=0,formal_increment=0,product_increment=0);(OUT/'REGISTRATION.json').write_bytes((json.dumps(r,indent=2)+'\n').encode('utf8'));print(json.dumps(r))

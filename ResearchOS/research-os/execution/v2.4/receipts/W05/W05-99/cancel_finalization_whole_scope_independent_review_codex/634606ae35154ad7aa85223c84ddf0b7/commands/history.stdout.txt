@@ -1,0 +1,259 @@
+ARGV ["rg", "-n", "runtime_dispatches|resource_effects|client|func", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain\\backup_recovery.go"]
+17:func (s *Service) backupRelocateSources(stage, destination string) error {
+98:func backupWriteSource(target string, raw []byte, hash string, written map[string]backupSourceFile) error {
+153:func (s *Service) backupPublishSourcePaths(stage, destination string) error {
+189:func (s *Service) backupRecomputeAcceptance() (Object, error) {
+216:func (s *Service) backupFence(ctx context.Context) (Object, error) {
+221:	effects, e := backupObjects(s.DB, `SELECT body FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`)
+
+
+FILE internal/domain/backup_upgrade.go SHA256 9cadb11a119648707cf5f36c5b60e9682abaa2536d546949fe12cf9823a88b68 LINES 194-232
+194: func upgradeOpenExclusive(ctx context.Context, path string) (*sql.DB, error) {
+195: 	db, e := store.Open(path)
+196: 	if e != nil {
+197: 		return nil, e
+198: 	}
+199: 	// locking_mode=EXCLUSIVE keeps the native SQLite lock after ROLLBACK,
+200: 	// permitting VACUUM INTO on this same connection outside a transaction.
+201: 	// A second process with an open WAL reader or writer causes a bounded failure.
+202: 	_, e = db.ExecContext(ctx, "PRAGMA busy_timeout=250; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;")
+203: 	if e != nil {
+204: 		db.Close()
+205: 		return nil, fmt.Errorf("UPGRADE_SOURCE_NOT_OFFLINE: %w", e)
+206: 	}
+207: 	return db, nil
+208: }
+209: 
+210: func upgradeTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+211: 	stage, e := os.MkdirTemp("", ".researchos-backup-stage-")
+212: 	if e != nil {
+213: 		return "", "", e
+214: 	}
+215: 	defer backupDiscard(stage)
+216: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+217: 	if e != nil {
+218: 		return "", "", e
+219: 	}
+220: 	defer db.Close()
+221: 	for i, raw := range sqls[:13] {
+222: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+223: 			return "", "", e
+224: 		}
+225: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+226: 			return "", "", e
+227: 		}
+228: 	}
+229: 	before, e := backupSchema(db)
+230: 	if e != nil {
+231: 		return "", "", e
+232: 	}
+
+FILE internal/domain/backup_command_queue.go SHA256 bd44154330600f4e743ab93bbd82f633c948c41e76000e99bbee0e4a17afa93a LINES 1-150
+1: package domain
+2: 
+3: import (
+4: 	"database/sql"
+5: 	"encoding/json"
+6: 	"fmt"
+7: 	"sort"
+8: )
+9: 
+10: var clientQueueTables = []string{"client_queue_fences", "client_command_queue", "client_control_requests", "client_control_receipts"}
+11: 
+12: func backupQueueState(db *sql.DB) (Object, error) {
+13: 	var version int
+14: 	if err := db.QueryRow(`SELECT coalesce(max(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+15: 		return nil, err
+16: 	}
+17: 	if version < 22 {
+18: 		return nil, nil
+19: 	}
+20: 	state := Object{"format": "RESEARCHOS_COMMAND_QUEUE_V1"}
+21: 	for _, table := range clientQueueTables {
+22: 		rows, err := db.Query(`SELECT * FROM ` + table)
+23: 		if err != nil {
+24: 			return nil, err
+25: 		}
+26: 		cols, err := rows.Columns()
+27: 		if err != nil {
+28: 			rows.Close()
+29: 			return nil, err
+30: 		}
+31: 		entries := []Object{}
+32: 		for rows.Next() {
+33: 			values := make([]any, len(cols))
+34: 			ptrs := make([]any, len(cols))
+35: 			for i := range values {
+36: 				ptrs[i] = &values[i]
+37: 			}
+38: 			if err = rows.Scan(ptrs...); err != nil {
+39: 				rows.Close()
+40: 				return nil, err
+41: 			}
+42: 			entry := Object{}
+43: 			for i, col := range cols {
+44: 				entry[col] = values[i]
+45: 			}
+46: 			entries = append(entries, entry)
+47: 		}
+48: 		err = rows.Err()
+49: 		rows.Close()
+50: 		if err != nil {
+51: 			return nil, err
+52: 		}
+53: 		sort.Slice(entries, func(i, j int) bool { return Hash(entries[i]) < Hash(entries[j]) })
+54: 		state[table] = entries
+55: 	}
+56: 	return state, nil
+57: }
+58: 
+59: func validateBackupQueue(db *sql.DB) error {
+60: 	state, err := backupQueueState(db)
+61: 	if err != nil || state == nil {
+62: 		return err
+63: 	}
+64: 	for _, query := range []string{
+65: 		`SELECT count(*) FROM client_queue_fences f LEFT JOIN client_sessions s ON s.project_id=f.project AND s.id=f.session_id LEFT JOIN domain_objects t ON t.project=f.project AND t.kind='Task' AND t.id=f.task_id WHERE s.id IS NULL OR t.id IS NULL OR f.accepted_through<0 OR f.sealed_through<0 OR f.sealed_through>f.accepted_through OR (f.state='SEALED' AND f.sealed_through<>f.accepted_through)`,
+66: 		`SELECT count(*) FROM client_queue_fences f WHERE f.run_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=f.project AND r.kind='Run' AND r.id=f.run_id AND json_extract(r.body,'$.task_id')=f.task_id AND json_extract(r.body,'$.lease_epoch')=f.runtime_epoch)`,
+67: 		`SELECT count(*) FROM client_command_queue q LEFT JOIN client_queue_fences f ON f.generation=q.generation LEFT JOIN domain_objects t ON t.project=q.project AND t.kind='Task' AND t.id=q.task_id WHERE f.generation IS NULL OR f.project<>q.project OR f.task_id<>q.task_id OR f.session_id<>q.session_id OR json_extract(t.body,'$.goal_id') IS NOT q.goal_id OR t.id IS NULL OR q.queue_sequence<1 OR q.queue_sequence>f.accepted_through OR q.accepted_writer_epoch<1`,
+68: 		`SELECT count(*) FROM client_queue_fences f WHERE f.accepted_through<>(SELECT count(*) FROM client_command_queue q WHERE q.generation=f.generation)`,
+69: 		`SELECT count(*) FROM client_command_queue q WHERE (q.state<>'ENQUEUED' AND q.last_receipt_id IS NULL) OR (q.last_receipt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM client_control_receipts r WHERE r.receipt_id=q.last_receipt_id AND r.project=q.project AND r.generation=q.generation AND r.command_id=q.command_id))`,
+70: 		`SELECT count(*) FROM client_control_receipts r WHERE NOT EXISTS(SELECT 1 FROM client_queue_fences f WHERE f.project=r.project AND f.generation=r.generation) OR (r.previous_receipt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM client_control_receipts p WHERE p.receipt_id=r.previous_receipt_id AND p.project=r.project AND p.generation=r.generation AND p.command_id=r.command_id AND p.receipt_id<>r.receipt_id))`,
+71: 		`SELECT count(*) FROM client_control_requests c WHERE NOT EXISTS(SELECT 1 FROM client_sessions s WHERE s.id=c.session_id AND s.project_id=c.project) OR NOT json_valid(c.task_ids) OR json_array_length(c.task_ids)=0 OR (c.state='CONFIRMED' AND c.final_response IS NULL)`,
+72: 	} {
+73: 		var n int
+74: 		if err = db.QueryRow(query).Scan(&n); err != nil {
+75: 			return err
+76: 		}
+77: 		if n != 0 {
+78: 			return fmt.Errorf("BACKUP_QUEUE_BINDING: %d invalid rows", n)
+79: 		}
+80: 	}
+81: 	for _, query := range []string{
+82: 		`SELECT count(*) FROM client_command_queue q WHERE NOT EXISTS(SELECT 1 FROM idempotency i WHERE i.principal=q.principal AND i.project=q.project AND i.operation='v2:session.send' AND i.key=q.command_id AND i.request_hash=q.request_hash)`,
+83: 		`SELECT count(*) FROM client_control_requests c WHERE NOT EXISTS(SELECT 1 FROM idempotency i WHERE i.principal=c.principal AND i.project=c.project AND i.operation='v2:session.control' AND i.key=c.command_id AND i.request_hash=c.request_hash) OR c.original_response IS NULL`,
+84: 		`SELECT count(*) FROM client_queue_fences f WHERE f.process_identity IS NOT NULL AND NOT EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=f.project AND d.run=f.run_id AND d.epoch=f.runtime_epoch AND d.dispatch_key=f.dispatch_key AND d.manifest_hash=f.manifest_hash AND d.identity=f.process_identity)`} {
+85: 		var n int
+86: 		if err = db.QueryRow(query).Scan(&n); err != nil {
+87: 			return err
+88: 		}
+89: 		if n != 0 {
+90: 			return fmt.Errorf("BACKUP_QUEUE_REQUEST_OR_PROCESS_BINDING")
+91: 		}
+92: 	}
+93: 	for _, row := range state["client_command_queue"].([]Object) {
+94: 		if Digest([]byte(Str(row, "content"))) != row["content_hash"] {
+95: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT_HASH")
+96: 		}
+97: 		var content Object
+98: 		if json.Unmarshal([]byte(Str(row, "content")), &content) != nil || len(content) != 2 {
+99: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT")
+100: 		}
+101: 
+102: 		text, ok := content["text"].(string)
+103: 		attachments, valid := content["attachments"].([]any)
+104: 		if !ok || !valid || text == "" || len(Str(row, "content")) > 32*1024 {
+105: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT_SHAPE")
+106: 		}
+107: 		for _, value := range attachments {
+108: 			a, ok := value.(map[string]any)
+109: 			if !ok || len(a) != 3 {
+110: 				return fmt.Errorf("BACKUP_QUEUE_ATTACHMENT")
+111: 			}
+112: 			ref, ok := a["ref"].(map[string]any)
+113: 			body, valid := a["text"].(string)
+114: 			if !ok || !valid || ref["entity_type"] != "Artifact" || ref["content_hash"] != Digest([]byte(body)) {
+115: 				return fmt.Errorf("BACKUP_QUEUE_ATTACHMENT_BINDING")
+116: 			}
+117: 		}
+118: 	}
+119: 	receipts := map[string]Object{}
+120: 	for _, row := range state["client_control_receipts"].([]Object) {
+121: 		if Digest([]byte(Str(row, "body"))) != row["body_hash"] {
+122: 			return fmt.Errorf("BACKUP_QUEUE_RECEIPT_HASH")
+123: 		}
+124: 		receipts[Str(row, "receipt_id")] = row
+125: 	}
+126: 	for id := range receipts {
+127: 		seen := map[string]bool{}
+128: 		for id != "" {
+129: 			if seen[id] {
+130: 				return fmt.Errorf("BACKUP_QUEUE_RECEIPT_CYCLE")
+131: 			}
+132: 			seen[id] = true
+133: 			id = Str(receipts[id], "previous_receipt_id")
+134: 		}
+135: 	}
+136: 	for _, row := range state["client_control_requests"].([]Object) {
+137: 		var ids []string
+138: 		if json.Unmarshal([]byte(Str(row, "task_ids")), &ids) != nil {
+139: 			return fmt.Errorf("BACKUP_CONTROL_MEMBERSHIP")
+140: 		}
+141: 		for _, id := range ids {
+142: 			var count int
+143: 			if err = db.QueryRow(`SELECT count(*) FROM domain_objects t WHERE t.project=? AND t.kind='Task' AND t.id=? AND (json_extract(t.body,'$.goal_id')=? OR json_extract(t.body,'$.active_run_id')=?)`, row["project"], id, row["target_id"], row["target_id"]).Scan(&count); err != nil {
+144: 				return err
+145: 			}
+146: 			if count != 1 {
+147: 				return fmt.Errorf("BACKUP_CONTROL_MEMBERSHIP")
+148: 			}
+149: 		}
+150: 	}
+
+FILE internal/domain/runtime.go SHA256 a565c36b98c7267aaab100c6c20b240ddc2a9a8d705b871e04c72764db0842ca LINES 295-350
+295: 	case "acknowledgeRunCancellation":
+296: 		if e = clientQueueSettled(tx, project, id); e != nil {
+297: 			return nil, "", 0, e
+298: 		}
+299: 		o, err := runtimeObservation(tx, project, r)
+300: 		if err != nil {
+301: 			return nil, "", 0, err
+302: 		}
+303: 		if r["status"] != "CANCEL_REQUESTED" || o["state"] != "CANCELLED" || o["children_stopped"] != true || o["queue_empty"] != true {
+304: 			return nil, "", 0, Fail(422, "GATE_FAILED", "cancellation is not confirmed")
+305: 		}
+306: 		if e = s.runtimeReceipt(tx, project, r, b["receipt_artifact_ref"], o); e != nil {
+307: 			return nil, "", 0, e
+308: 		}
+309: 		Merge(r, Object{"status": "CANCELLED", "children_stopped": true, "queue_empty": true, "cancel_confirmed_at": Now(), "ended_at": Now()})
+310: 		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
+311: 			return nil, "", 0, e
+312: 		}
+313: 	case "reconcileRun":
+314: 		o, err := runtimeObservation(tx, project, r)
+315: 		if err != nil {
+316: 			return nil, "", 0, err
+317: 		}
+318: 		if e = s.runtimeReceipt(tx, project, r, b["receipt_artifact_ref"], o); e != nil {
+319: 			return nil, "", 0, e
+320: 		}
+321: 		// UNKNOWN or missing process is never evidence of a settled side effect.
+322: 		r["status"] = "RECONCILING"
+323: 		r["children_stopped"] = o["children_stopped"]
+324: 		r["queue_empty"] = o["queue_empty"]
+325: 	default:
+326: 		return nil, "", 0, Fail(503, "RESOURCE_UNAVAILABLE", "runtime operation unavailable")
+327: 	}
+328: 	if e = bump(r); e != nil {
+329: 		return nil, "", 0, e
+330: 	}
+331: 	if e = s.runtimeTaskTerminal(tx, p, project, r, cid); e != nil {
+332: 		return nil, "", 0, e
+333: 	}
+334: 	return r, "Run", 200, s.put(tx, "Run", r)
+335: }
+336: func (s *Service) runtimeReceipt(tx *sql.Tx, project string, r Object, value any, o Object) error {
+337: 	ref, ok := value.(map[string]any)
+338: 	if !ok {
+339: 		return Fail(422, "GATE_FAILED", "receipt reference required")
+340: 	}
+341: 	a, e := version(tx, project, ref)
+342: 	if e != nil || ref["entity_type"] != "Artifact" {
+343: 		return Fail(422, "GATE_FAILED", "receipt run mismatch")
+344: 	}
+345: 	_, use, e := s.artifactUse(tx, project, r, Str(a, "id"), false)
+346: 	if e != nil {
+347: 		return e
+348: 	}
+349: 	var b []byte
+350: 	if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&b); e != nil {

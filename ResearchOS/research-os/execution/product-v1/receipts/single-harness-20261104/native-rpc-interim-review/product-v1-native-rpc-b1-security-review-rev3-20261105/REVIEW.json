@@ -1,0 +1,138 @@
+{
+  "schema": "researchos.independent_security_review.v1",
+  "decision": "BLOCKED",
+  "reviewed_freeze": "product-v1-native-rpc-runtime-author-20261105/rev3-test02-ready",
+  "source_sha256": {
+    "codex.go": "8f3ce1889bc23ee4ab6875d73b3c3234afad5bec27cb0275b79aae1bafb2aba2",
+    "codex_policy.go": "67be546c7f1dee308f05bd2a96b839cc7e1ed7a26a7a98b7eb7349f16507647f",
+    "codex_driver_windows.go": "6b80481ba30b63713fcd5bf8605fef5bbf017a61bdf9a9a93f8d6de91194a4de",
+    "codex_rpc_protocol.go": "09af86dfafd55ee215d7800ab4b462b4a7d9818870956da5c1531bb66960f912",
+    "codex_rpc_windows.go": "b6553811324fbec142ae7073b0eb6b4a1a0576e145ae305e3719f527e24d3b7b",
+    "codex_policy_test.go": "c0c9dcf207db7a859c501c61ce8fab21fb797f35b9c5a3c25608563d771f1243",
+    "codex_rpc_protocol_test.go": "1a1709da8666a01e57b0e887d57d253b2ecd020c99e3ebff5c1327cb9146d5cb",
+    "codex_rpc_windows_test.go": "d7c34e9116c972bee3c90c8a4b36efea72913af62c96d32e66f86a4b1b3322e4"
+  },
+  "lease_sha256": "0226a367b8d0eec25a04c0f22e8f2eba6db9efdd4849ad51c5a98b74d387f2be",
+  "contract_sha256": "03de6480cef5c81504addf6366d03652bff3c5b311ca713279c96a4372336d62",
+  "formal_increment": 0,
+  "product_increment": 0,
+  "native_invocations": 0,
+  "model_invocations": 0,
+  "tests_executed_by_reviewer": 0,
+  "source_modifications_by_reviewer": 0,
+  "pending_blockers": [
+    {
+      "id": "B1-F1",
+      "severity": "high",
+      "origin_key": "native-rpc-b1:pre-turn-live-stream-fence-gap",
+      "location": "codex_rpc_windows.go:381-429",
+      "detail": "After the startup loop, reading stops throughout Ensure and BeforeModelTurn. Buffered()==0 checks only prefetched bytes. Delayed diagnostics, duplicate responses, server requests or a partial frame can already be queued before prompt admission without invalidating the run. The cancel/intent check is also followed by unlocked file creation/fsync before the actual write.",
+      "counterexample": "Fake child sends valid id2+thread/started, then a delayed warning or server request while BeforeModelTurn is blocked; callback succeeds and turn/start can be written before the next read observes the error. Cancel after line413 during intent IO also has no final admission recheck.",
+      "minimal_fix": "Maintain sticky capture/protocol state during callbacks; synchronize actual-pipe pending-byte/read handoff with a final admission check after durable intent. Serialize cancellation/error/one-use write admission, while cancellation can still close stdin/stop Job if a write blocks. Original arg0 warning ordering is strong but does not replace live protocol fencing.",
+      "required_check": "Registered fake OS-child delayed-warning/request/partial-frame and cancel-during-intent cases must prove no prompt bytes; do not infer zero bytes from missing intent file alone."
+    },
+    {
+      "id": "B1-F2",
+      "severity": "high",
+      "origin_key": "native-rpc-b1:non-durable-partial-capture",
+      "location": "codex_rpc_windows.go:235,262-289,307-316",
+      "detail": "Capture exists only in bytes.Buffer and is returned at defer; no bounded durable partial capture or terminal receipt is written. Hard stop loses diagnostics already read. A ReadSlice that crosses the 8MiB limit is consumed but discarded before raw.Write, losing that observed line; the ceiling is checked after ingestion.",
+      "counterexample": "Host stops while a callback waits after Native warning bytes were received, or the next line crosses captureLimit; no durable record of those already-observed bytes is guaranteed.",
+      "minimal_fix": "Use the established restricted run directory for bounded incremental raw capture and phase/partial metadata; sync before barrier/callback and preserve a bounded offending prefix on limit. Enforce ingestion budget at the reader boundary, distinguish partial/complete, fail closed on IO errors. Persist terminal receipt before Wait returns.",
+      "required_check": "Pure/fake capture pressure, write/sync failure, frame overflow and externally stopped fake-host evidence retention; no Native invocation."
+    },
+    {
+      "id": "B1-F3",
+      "severity": "medium",
+      "origin_key": "native-rpc-b1:rpc-envelope-utf8-not-strict",
+      "location": "codex_rpc_protocol.go:90-160,177-221; codex_rpc_windows.go:336,354-375,449-479",
+      "detail": "json.Valid/encoding/json do not require valid UTF-8 in strings; no utf8.Valid check exists. Frames are not classified as mutually exclusive response/request/notification. A nonnumeric id is treated as absent, and mixed method/result/id envelopes can be accepted by a matching branch.",
+      "counterexample": "Valid id2 policy response with invalid UTF-8 in ignored metadata passes after replacement; a string-id frame using method thread/started can be treated as a notification, although it is a request envelope.",
+      "minimal_fix": "Reject invalid UTF-8 before JSON decoding; strict envelope classifier must distinguish key absence from wrong id type and reject mixed method/result/error forms, malformed errors and unexpected root keys according to pinned schema.",
+      "required_check": "Invalid UTF-8, noninteger/string/null IDs on notifications, mixed request/response and duplicate keys at all levels are zero-turn failures."
+    },
+    {
+      "id": "B1-F4",
+      "severity": "high",
+      "origin_key": "native-rpc-b1:empty-environments-not-local-default",
+      "location": "codex_rpc_protocol.go:39-44",
+      "detail": "thread/start explicitly sends environments:[], selecting an empty list rather than the reviewed normal local FromThread default. Official thread_processor unwrap_or_else and thread_manager Option resolution retain Some(empty); core collects no environment selections.",
+      "counterexample": "The fake server ignores environments and returns a successful response, hiding that the actual Native route has no selected local executor. This does not implement the contract's local execution route.",
+      "minimal_fix": "Omit environments for the reviewed normal default-local route, or freeze and review an exact single local FromThread schema. Assert the chosen creation schema in tests and update template hash/seal binding; do not add environment overrides to first turn.",
+      "required_check": "Pinned public DTO/source conformance plus fake child assertion must distinguish absent from explicit empty; real Native validation remains separately authorized."
+    },
+    {
+      "id": "B1-F5",
+      "severity": "high",
+      "origin_key": "native-rpc-b1:terminal-tail-and-items-not-validated",
+      "location": "codex_rpc_windows.go:262-281,509-551",
+      "detail": "After the first turn/completed, the deferred drain appends bytes without parsing them. A later error, duplicate completion, wrong-thread event or incomplete frame can remain in a COMPLETED result. Item IDs/lifecycle are not tracked: an uncompleted commandExecution start, empty/missing agent text, duplicate item completion or changed item identity need not prevent success.",
+      "counterexample": "Valid turn acknowledgement/start/completed followed by a protocol error or partial JSON retains COMPLETED if raw drain fits; commandExecution started without completed plus turn/completed also passes.",
+      "minimal_fix": "Keep terminal success provisional until bounded shutdown/drain validation; retain sticky errors and validate allowed terminal frames. Track exact item IDs/type/lifecycle and validate final assistant payload and tool outcomes; do not allow later turn/completed to erase a prior incomplete/failed tool.",
+      "required_check": "Terminal-tail error/truncation/duplicate cases, missing tool completion, duplicate/mismatched item IDs and malformed assistant text must not return successful completion."
+    },
+    {
+      "id": "B1-F6",
+      "severity": "medium",
+      "origin_key": "native-rpc-b1:public-event-dto-conformance-gap",
+      "location": "codex_rpc_windows.go:497-548,528; codex_rpc_protocol_test.go; codex_rpc_windows_test.go",
+      "detail": "The RPC path emits CodexEvent.Kind ASSISTANT instead of the shared existing ASSISTANT_MESSAGE and omits NativeID/tool lifecycle projection. Its allowlist rejects normal v2 streaming agent/reasoning delta notifications; official bespoke_event_handling forwards those. The fake stream is authored to the implementation and does not cover pinned Native protocol behavior.",
+      "counterexample": "A normal Native agent-message delta fails after prompt consumption. An accepted completed agent message is passed to domain under a different event kind, so the existing assistant-message contract is not preserved.",
+      "minimal_fix": "Implement the bounded pinned-v2 notification subset needed by one normal readonly turn, with exact thread/turn/item binding; public summaries only and no private reasoning exposure. Map final assistant/tool events to existing CodexEvent contract. Keep unknown/permission requests failclosed.",
+      "required_check": "Source-derived transcript fixtures including normal deltas, supported user/item lifecycle, command completion, existing event kinds/NativeID; tests must assert DTO semantics, not only callback counts."
+    }
+  ],
+  "diagnostic_events": [
+    {
+      "origin_key": "native-rpc-b1:pre-turn-live-stream-fence-gap",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "After the startup loop, reading stops throughout Ensure and BeforeModelTurn. Buffered()==0 checks only prefetched bytes. Delayed diagnostics, duplicate responses, server requests or a partial frame can already be queued before prompt admission without invalidating the run. The cancel/intent check is also followed by unlocked file creation/fsync before the actual write."
+    },
+    {
+      "origin_key": "native-rpc-b1:non-durable-partial-capture",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "Capture exists only in bytes.Buffer and is returned at defer; no bounded durable partial capture or terminal receipt is written. Hard stop loses diagnostics already read. A ReadSlice that crosses the 8MiB limit is consumed but discarded before raw.Write, losing that observed line; the ceiling is checked after ingestion."
+    },
+    {
+      "origin_key": "native-rpc-b1:rpc-envelope-utf8-not-strict",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "json.Valid/encoding/json do not require valid UTF-8 in strings; no utf8.Valid check exists. Frames are not classified as mutually exclusive response/request/notification. A nonnumeric id is treated as absent, and mixed method/result/id envelopes can be accepted by a matching branch."
+    },
+    {
+      "origin_key": "native-rpc-b1:empty-environments-not-local-default",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "thread/start explicitly sends environments:[], selecting an empty list rather than the reviewed normal local FromThread default. Official thread_processor unwrap_or_else and thread_manager Option resolution retain Some(empty); core collects no environment selections."
+    },
+    {
+      "origin_key": "native-rpc-b1:terminal-tail-and-items-not-validated",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "After the first turn/completed, the deferred drain appends bytes without parsing them. A later error, duplicate completion, wrong-thread event or incomplete frame can remain in a COMPLETED result. Item IDs/lifecycle are not tracked: an uncompleted commandExecution start, empty/missing agent text, duplicate item completion or changed item identity need not prevent success."
+    },
+    {
+      "origin_key": "native-rpc-b1:public-event-dto-conformance-gap",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "The RPC path emits CodexEvent.Kind ASSISTANT instead of the shared existing ASSISTANT_MESSAGE and omits NativeID/tool lifecycle projection. Its allowlist rejects normal v2 streaming agent/reasoning delta notifications; official bespoke_event_handling forwards those. The fake stream is authored to the implementation and does not cover pinned Native protocol behavior."
+    }
+  ],
+  "positive_findings": [
+    "One actual os.Pipe plus DuplicateHandle for stderr; one capture reader.",
+    "Fresh crypto/rand 16-byte nonce, fixed MXC/read-only/network=false/memory scalars, no first-turn overrides.",
+    "Actual response checks nonce/no extends/cwd/roots/coarse sandbox/approval; both thread response and thread/started IDs matched.",
+    "Production constructor qualifier remains nil; before prompt returns QUALIFICATION_REQUIRED. Trusted fake provider is Go composition only.",
+    "One in-memory turnIntent and O_EXCL/fsync write-intent; no automatic relaunch/retransmit path found.",
+    "Existing suspended original Job assignment and BeforeResume reused; legacy exec change is only forcing its constructor transport identity."
+  ],
+  "review_limits": [
+    "Static source review only; did not execute any Go test, fake process, Native, model or RPC.",
+    "Root-owned test02 was running at task receipt; no test02 result is claimed or used as source approval.",
+    "B2 domain second-fence implementation is reviewed separately; B3 production qualifier is absent and not a new B1 source blocker.",
+    "Existing baseline Main three source hashes match the lease. Git diff attempt returned filesystem Permission denied; no retry/escalation; direct read/hash/line comparison supplied baseline verification.",
+    "No universal OS isolation or installed-binary reproducible-source proof."
+  ],
+  "known_failure": {
+    "origin_key": "native-rpc-b1:same-pipe-stderr-warning-order",
+    "test01": "Retained CHILD_NONZERO_STOPPED, exit1, stop proved, no input drift; original assertion contradicted child id1-warning-id2 order.",
+    "counter_increment": 0,
+    "rev3_assertion": "Corrected order assertion inspected; does not resolve new source blockers."
+  }
+}

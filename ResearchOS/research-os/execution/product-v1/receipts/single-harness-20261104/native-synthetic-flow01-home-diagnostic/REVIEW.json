@@ -1,0 +1,93 @@
+{
+  "schema": "researchos.independent-native-failure-diagnostic.v1",
+  "decision": "CONFIRMED_SOURCE_DEFECT_REQUIRES_SCOPED_FIX",
+  "source_head": "998fc6330ba735056cd31f8ebf68dd50a8251c1b",
+  "source_sha256": {
+    "adapters/runtime/codex_qualification_windows_test.go": "05a6c3d789fe1522877108407b8545eee0f2c514a432b846ae805876437752e1",
+    "adapters/runtime/codex_rpc_windows.go": "8767b832238dea36896baa302482cbc3c0568b3e56f23de14708bcee9b6d9e20",
+    "adapters/runtime/codex_qualification_windows.go": "7af3347a194a66455f962d38fc1918b0752a30ca4138ef46734ebd2fdc20bd24",
+    "internal/host/harness_windows.go": "81db466e62f6bbdc8cb60cc6575cf96f6cd4c1a988b79f5de47783d3c8cde0e6",
+    "adapters/runtime/codex_qualification_capture_windows_test.go": "1accac663ea2fb583b807253c7bf16b8190a28bafb3c4902aaa8cd9864995fc5",
+    "apps/desktop/main/lib/desktop-management.js": "e6f67be511decec49f65c88846d69fce2165f96ae3f4872ecb8054b7f1bb7d85",
+    "adapters/runtime/codex_qualification_capture_windows.go": "a664f9c24feaf752ba784bb370d3a650d81232f8e449ccb45ca6138a16f9eb59"
+  },
+  "formal_increment": 0,
+  "product_increment": 0,
+  "pending_blockers": [
+    "Canonical Host normal-home versus raw USERPROFILE comparison rejects valid forward-slash spelling in ensureLaunch and prelaunch intent validation"
+  ],
+  "diagnostic_events": [
+    {
+      "origin_key": "native-synthetic-flow01:normal-home-separator-mismatch",
+      "classification": "CONFIRMED_SOURCE_DEFECT_FROM_ACTUAL_INPUT_AND_BOUND_SOURCE",
+      "detail": "Actual launch-input and inner scope specify USERPROFILE C:/Users/yqyyds. Runner passes this unchanged; Desktop passes USERPROFILE unchanged to Core. Host obtains OS-account HomeDir then filepath.Clean. B1 constructor compares Clean on both sides and accepts the same location. B3 ensureLaunch compares raw strings with EqualFold and therefore rejects slash versus backslash before root PrivateDirectory or receipt creation. The capture intent validator repeats the same defective comparison. This is a sufficient deterministic rejection in the bound source; public Task evidence does not expose which individual disjunct ran first."
+    }
+  ],
+  "actual_observations": {
+    "task_message": "Native preparation failed before model launch; no automatic replay",
+    "outer_stop_proved": true,
+    "outer_job_cumulative_processes": 58,
+    "outer_scope_sha256": "181da91b8024cc2d222092950d16705945ed77b667259ba8f04297cd9da3045c",
+    "qualification_receipts_parent_exists": false,
+    "task_id": "c9fc3e4dc1ea5d34a0ca003a983b43c6",
+    "outer_elapsed_seconds": 690.0539851000067,
+    "task_status": "FAILED",
+    "run_id": "a46af22fb058915f9f7119b2d7d73f8f",
+    "assistant_events": 0,
+    "dom_submit_attempts": 1,
+    "qualification_receipt_fixed_leaf": "4e089878d4c37a124d93a1dd73434f29128f75366fa1a58ddaa6b75999493fff.json",
+    "outer_status": "TIMED_OUT_STOPPED",
+    "outer_input_drift": false,
+    "outer_job_zero": true,
+    "outer_force_job_attempts": 1,
+    "event_kinds": [
+      "TASK_QUEUED",
+      "RUN_STARTED",
+      "TASK_TERMINAL"
+    ],
+    "qualification_receipt_exists": false,
+    "epoch": "1",
+    "task_failure": "HARNESS_UNAVAILABLE"
+  },
+  "evidence_chain": [
+    "Actual launch-input explicit_environment.USERPROFILE and scope.windows.normal_user_profile both equal C:/Users/yqyyds. Runner makeEnvironment:72-85 preserves the raw spelling and _electron.launch:485-486 uses that same env object.",
+    "Pinned Desktop desktop-management.js managedControlEnvironment:793-799 copies nonempty USERPROFILE verbatim; start:430-439 uses its returned env to spawn the managed Core. No intervening home normalization exists there.",
+    "Pinned Host harness_windows.go:201-217 obtains user.Current().HomeDir, calls codexNormalHome, then passes that home to the native-qualified RPC constructor. codexNormalHome:224-228 returns filepath.Clean(home). No EvalSymlinks is used by this Host helper; that part of the initial hypothesis is unnecessary.",
+    "Pinned NewCodexRPC:52-57 already checks EqualFold(filepath.Clean(NormalHome), filepath.Clean(USERPROFILE)). It preserves NormalHome and does not rewrite USERPROFILE. Successful private driver construction does not imply the later raw-string predicate will match.",
+    "Pinned B3 ensureLaunch:569-578 creates only in-memory observation/context, then evaluates raw NormalHome versus USERPROFILE at line571. False equality returns QUALIFICATION_SCOPE_MISMATCH before exactReal(root/source/helper), PrivateDirectory(root), os.Mkdir(receipts), collector or Native launch.",
+    "Pinned capture_windows.go:246-247 repeats raw EqualFold(context.NormalHome, USERPROFILE), so fixing only ensureLaunch would leave a later prelaunch intent rejection. Both sites need the same comparison semantics.",
+    "Actual final Task is a known preparation failure and events contain no ASSISTANT. The exact receipt path is derived from SHA256(run_id + / + epoch), checked directly after original Job stop, and its parent does not exist. This supports the early failure stage; absence alone cannot identify a unique failed guard."
+  ],
+  "minimal_source_contract": {
+    "pure_counterexamples": [
+      "Canonical backslash Host home versus forward-slash USERPROFILE for the identical drive/path accepts.",
+      "Same path with case variation and ordinary separator normalization accepts under Windows semantics; identity remains the same canonical absolute directory.",
+      "Different user or different drive/root rejects; prefix sibling such as user versus user2 rejects.",
+      "Empty USERPROFILE, empty trusted home, relative/drive-relative path, embedded NUL/CR/LF/semicolon reject.",
+      "Both production call sites use the same predicate; final immutable intent context/EnvironmentHash tampering still rejects independently."
+    ],
+    "production_change": "Introduce one package-private pure same-normal-home predicate in qualification_windows.go and reuse it at both raw USERPROFILE comparisons. Reject empty/nonabsolute/invalid input, normalize Windows separator spelling with filepath.Clean and compare case-insensitively against the already Host-supplied OS-account NormalHome. Do not obtain authority from USERPROFILE or mutate either value.",
+    "preserve": [
+      "Host OS-account home remains authoritative; no request/JSON/env field may select an alternative trusted home.",
+      "Do not resolve a different alias/reparse target into an authorized profile. Do not add credential reads, normal HOME content reads, fallback accounts, environment overrides, new public API or readiness grants.",
+      "Retain original exactReal ancestor/reparse checks, private directories, source binding, nonce/plan/argv/env hashes, durable intent ordering, once-only qualification and no-delegation failure facts.",
+      "Do not change runner, Desktop, Host factory, B1, shared DTO or parallel drain-owner files to hide the symptom.",
+      "Original flow01 Task/run/epoch and consumed scope remain terminal and nonreplayable. A future live attempt requires separate Root authorization and a new identity after source review/tests/build."
+    ],
+    "reparse_fixture_limit": "A pure string predicate cannot detect filesystem reparse metadata. Preserve production exactReal checks and use existing trusted fake metadata/boundary fixtures or a separately supervised synthetic-temp fixture to assert reparse rejection with zero launch. Do not claim pure spelling tests establish actual normal HOME alias safety, and do not inspect or mutate real HOME/ACL for this review.",
+    "exact_paths": [
+      "adapters/runtime/codex_qualification_windows.go",
+      "adapters/runtime/codex_qualification_windows_test.go",
+      "adapters/runtime/codex_qualification_capture_windows.go",
+      "adapters/runtime/codex_qualification_capture_windows_test.go"
+    ],
+    "validation_plan": "Root may register bounded Go-only fixtures after a new exact4 source lease. Reviewer executes none. Include regression for the constructor-compatible forward-slash spelling at the early qualification gate and intent validator, plus changed-home/empty-profile zero-launch negatives and unchanged final-link rejection."
+  },
+  "review_limits": [
+    "No new App, helper, CLI, Native, model, Task, probe, test or registrar execution occurred. Only source/receipt/hash reads and fixed receipt existence checks; no credential/DB/private HOME traversal or ACL reads/writes were needed.",
+    "No precise per-guard runtime diagnostic was captured, so this report distinguishes the deterministic source defect from a uniquely observed branch trace. No assurance is made that repairing it alone makes Native qualification pass.",
+    "Outer timeout/forced Job cleanup is independently observed but belongs to the separate drain investigation; this report does not duplicate or diagnose that event.",
+    "One guessed source filename lookup returned not found and one read-only PowerShell formatting command failed to parse before execution; both were corrected by exact file discovery/read-only retry. Neither changed source, receipts or runtime state."
+  ],
+  "root_archive_selection": "archive-file-list.json"
+}

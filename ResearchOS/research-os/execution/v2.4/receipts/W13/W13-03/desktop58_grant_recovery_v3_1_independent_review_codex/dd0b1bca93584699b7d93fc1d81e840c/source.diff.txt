@@ -1,0 +1,88 @@
+--- 
++++ 
+@@ -233,6 +233,22 @@
+     return (int(values[0].high) << 32) | int(values[0].low)
+ 
+ 
++def cim_birth_microsecond(row: dict) -> int:
++    """Validate CIM's microsecond timestamp; do not claim 100ns precision."""
++    need(type(row) is dict and type(row.get('CreationTime100nsFromCIM')) is int and
++         type(row.get('CreationDateCimUtc')) is str,
++         'CIM creation timestamp absent')
++    parsed = stamp(row['CreationDateCimUtc']).astimezone(datetime.timezone.utc)
++    epoch = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
++    elapsed = parsed - epoch
++    calculated = ((elapsed.days * 86400 + elapsed.seconds) * 10_000_000 +
++                  elapsed.microseconds * 10)
++    derived = row['CreationTime100nsFromCIM']
++    need(derived == calculated and derived > 0 and derived % 10 == 0,
++         'CIM creation ISO and converted microsecond mismatch')
++    return derived // 10
++
++
+ def observe(attempt: Path, phase: str) -> dict:
+     """Use the pinned owned Job runner and capture an actual CIM snapshot."""
+     need(phase in ('pre-gate', 'post-gate'), 'invalid observation phase')
+@@ -248,9 +264,12 @@
+         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+         "$OutputEncoding=[Console]::OutputEncoding;"
+         "$rows=@(Get-CimInstance Win32_Process | ForEach-Object {"
+-        "$birth=$null;if($null -ne $_.CreationDate){$birth=[int64]$_.CreationDate.ToUniversalTime().ToFileTimeUtc()};"
++        "$birth=$null;$birthIso=$null;if($null -ne $_.CreationDate){"
++        "$birth=[int64]$_.CreationDate.ToUniversalTime().ToFileTimeUtc();"
++        "$birthIso=$_.CreationDate.ToUniversalTime().ToString('o')};"
+         "[pscustomobject]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;"
+-        "CreationTime100ns=$birth;CommandLine=[string]$_.CommandLine}});"
++        "CreationDateCimUtc=$birthIso;CreationTime100nsFromCIM=$birth;"
++        "CommandLine=[string]$_.CommandLine}});"
+         "$selfRow=@($rows | Where-Object {$_.ProcessId -eq $PID})[0];"
+         "if($null -eq $selfRow){throw 'CIM observer absent'};"
+         "$parentRow=@($rows | Where-Object {$_.ProcessId -eq $selfRow.ParentProcessId})[0];"
+@@ -325,37 +344,37 @@
+                             value.get('root_wrapper'))
+     need(all(type(row) is dict for row in (own, parent, wrapper)) and
+          own.get('ProcessId') == result['owned_child_pid'] and
+-         own.get('CreationTime100ns') == result['creation_time_100ns'] and
++         cim_birth_microsecond(own) == result['creation_time_100ns'] // 10 and
+          own.get('ParentProcessId') == python_pid and
+          parent.get('ProcessId') == python_pid and
+-         parent.get('CreationTime100ns') == python_birth and
++         cim_birth_microsecond(parent) == python_birth // 10 and
+          parent.get('ParentProcessId') == wrapper_pid and
+          wrapper.get('ProcessId') == wrapper_pid and
+-         type(wrapper.get('CreationTime100ns')) is int and
+-         0 < wrapper['CreationTime100ns'] <= python_birth <
++         0 < cim_birth_microsecond(wrapper) <= python_birth // 10 and
++         python_birth <
+          result['creation_time_100ns'] and
+          SOURCE.name in str(parent.get('CommandLine')) and
+          SOURCE.name in str(wrapper.get('CommandLine')) and
+          'Get-CimInstance Win32_Process' in str(own.get('CommandLine')),
+          phase + ' owned CIM PID/creation/parent chain mismatch')
+     excluded = [own, parent, wrapper]
+-    excluded_identities = {(row['ProcessId'], row['CreationTime100ns'])
++    excluded_identities = {(row['ProcessId'], cim_birth_microsecond(row))
+                            for row in excluded}
+     uid_rows = value['all_uid_processes']
+     need(all(type(row) is dict and type(row.get('ProcessId')) is int and
+-             type(row.get('CreationTime100ns')) is int and
++             cim_birth_microsecond(row) > 0 and
+              UID in str(row.get('CommandLine')) for row in uid_rows) and
+-         len({(row['ProcessId'], row['CreationTime100ns'])
++         len({(row['ProcessId'], cim_birth_microsecond(row))
+               for row in uid_rows}) == len(uid_rows),
+          phase + ' UID process row malformed or duplicated')
+     matching = [row for row in uid_rows if
+-                (row['ProcessId'], row['CreationTime100ns']) not in excluded_identities]
++                (row['ProcessId'], cim_birth_microsecond(row)) not in excluded_identities]
+     classification = exclusive(attempt / (phase + '.classification.json'), {
+         'schema': 'researchos.scope7-win32-process-classification.v3',
+         'raw_stdout_ref': stdout_ref, 'invocation_ref': invocation,
+-        'exclusion_rule': 'exact PID plus 100ns creation; owned child, current Python, verified Root wrapper',
++        'exclusion_rule': 'exact PID plus CIM microsecond-normalized birth against retained helper/Python 100ns creation; owned child, current Python, verified Root wrapper',
+         'excluded_processes': [row for row in uid_rows if
+-                               (row['ProcessId'], row['CreationTime100ns']) in excluded_identities],
++                               (row['ProcessId'], cim_birth_microsecond(row)) in excluded_identities],
+         'matching_processes': matching})
+     observed = stamp(value['observed_at'])
+     age = datetime.datetime.now(datetime.timezone.utc) - observed

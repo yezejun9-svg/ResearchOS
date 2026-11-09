@@ -1,0 +1,45 @@
+--- v3/prepare_runtime.go
++++ v4/prepare_runtime.go
+@@ -94,23 +94,31 @@
+ }
+ 
+ func verifyCLIGoalCreation(ctx context.Context,e *environment,s seed,v state,goalID string)error{
+- rows,err:=e.db.QueryContext(ctx,"SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='v2:goal.start'",e.ownerID,s.ProjectID);if err!=nil{return err};defer rows.Close()
++ rows,err:=e.db.QueryContext(ctx,"SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='v2:goal.start'",e.ownerID,s.ProjectID);if err!=nil{return err}
++ var matchedSnapshot map[string]any
+  matches:=0
+  for rows.Next(){
+-  var raw string;if err=rows.Scan(&raw);err!=nil{return err}
+-  var response domain.Object;if err=json.Unmarshal([]byte(raw),&response);err!=nil{return err}
++  var body string
++  if err=rows.Scan(&body);err!=nil{rows.Close();return err}
++  var response domain.Object
++  if err=json.Unmarshal([]byte(body),&response);err!=nil{rows.Close();return err}
+   result,_:=response["result"].(map[string]any)
+-  if result["goal_id"]!=goalID {continue}
++  if result["goal_id"]!=goalID{continue}
+   snapshot,_:=result["snapshot"].(map[string]any)
+-  if response["status"]!="COMPLETED" || response["method"]!="goal.start" || response["session_id"]!=nil || snapshot["workspace_ref"]!=s.WorkspaceRef || snapshot["model_config_ref"]!=v.ModelRef{return errors.New("CLI goal.start identity or workspace/model snapshot differs")}
+-  sid:=domain.Str(snapshot,"session_id");if sid==""{return errors.New("CLI draft did not create a session")}
+-  var workspace,model,storedGoal,task,run string
+-  if err=e.db.QueryRowContext(ctx,"SELECT workspace_ref,model_config_ref,coalesce(goal_id,''),coalesce(task_id,''),coalesce(run_id,'') FROM client_sessions WHERE project_id=? AND id=?",s.ProjectID,sid).Scan(&workspace,&model,&storedGoal,&task,&run);err!=nil{return err}
+-  if workspace!=s.WorkspaceRef || model!=v.ModelRef || storedGoal!=goalID || task!="" || run!=""{return errors.New("CLI draft session has wrong Goal/workspace/model or started Task/Run")}
+-  matches++
++  if response["status"]!="COMPLETED" || response["method"]!="goal.start" || response["session_id"]!=nil || snapshot["workspace_ref"]!=s.WorkspaceRef || snapshot["model_config_ref"]!=v.ModelRef{rows.Close();return errors.New("CLI goal.start identity or workspace/model snapshot differs")}
++  matchedSnapshot=snapshot;matches++
+  }
+- if err=rows.Err();err!=nil{return err}
++ iterationErr:=rows.Err()
++ closeErr:=rows.Close()
++ if iterationErr!=nil{return iterationErr}
++ if closeErr!=nil{return closeErr}
+  if matches!=1{return errors.New("expected one actual completed CLI goal.start")}
++ sid:=domain.Str(matchedSnapshot,"session_id");if sid==""{return errors.New("CLI draft did not create a session")}
++ // SQLite's production pool has one connection. No query runs until the
++ // idempotency cursor releases that connection, including every error path.
++ var workspace,model,storedGoal,task,run string
++ if err=e.db.QueryRowContext(ctx,"SELECT workspace_ref,model_config_ref,coalesce(goal_id,''),coalesce(task_id,''),coalesce(run_id,'') FROM client_sessions WHERE project_id=? AND id=?",s.ProjectID,sid).Scan(&workspace,&model,&storedGoal,&task,&run);err!=nil{return err}
++ if workspace!=s.WorkspaceRef || model!=v.ModelRef || storedGoal!=goalID || task!="" || run!=""{return errors.New("CLI draft session has wrong Goal/workspace/model or started Task/Run")}
+  var ordinaryTasks int
+  if err=e.db.QueryRowContext(ctx,"SELECT count(*) FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.goal_id')=?",s.ProjectID,goalID).Scan(&ordinaryTasks);err!=nil{return err}
+  if ordinaryTasks!=0{return errors.New("ordinary CLI draft unexpectedly has a Task")}

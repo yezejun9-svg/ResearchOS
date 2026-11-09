@@ -1,0 +1,270 @@
+def manifest_members(item):
+    data = doc(item)
+    rows = data['entries']
+    need(type(data['count']) is int and data['count'] == len(rows) and rows, 'sealed manifest cardinality')
+    parent = path(item['path']).parent
+    result = {}
+    for row in rows:
+        q = path(row['path'])
+        need(q.is_relative_to(parent) and q != path(item['path']) and q not in result, 'manifest boundary/duplicate')
+        verify(row)
+        result[q] = row
+    return result
+
+
+def member(members, parent, name):
+    q = parent / name
+    need(q in members, 'required sealed member: ' + name)
+    return members[q]
+
+
+def refs_in(value):
+    if isinstance(value, dict):
+        if {'path', 'sha256', 'bytes'} <= set(value):
+            yield {k: value[k] for k in ['path', 'sha256', 'bytes']}
+        else:
+            for child in value.values():
+                yield from refs_in(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from refs_in(child)
+
+
+def closure(q):
+    r = doc(q['source_closure_review_ref'])
+    need(r['schema'] == 'researchos.desktop58-source-execution-independent-review.v1' and r['reviewer'] == 'codex:/root/w05_merge_review', 'source closure reviewer')
+    need(r['decision'] == 'SOURCE_COMMIT_EVIDENCE_CLOSED' and r['requested_changes'] == [] and r['actual_source_integration_evidence_closed'] is True, 'source closure decision')
+    need(r['source_acceptance'] is False and r['fresh58_qualified'] is False and r['formal_increment'] == 0 and r['product_native_compile_SQL_HTTP_model_calls'] == 0, 'bounded closure only')
+    need(r['actual_parent'] == q['head_before'] and r['actual_new_head'] == q['head_after'] and r['canonical_tuple'] == q['before_tuple'], 'actual closed head/tuple')
+    need(r['source_path_count'] == 15 and len(r['source_paths']) == len(set(r['source_paths'])) == 15 and r['unique_combined_paths'] == 58, 'exact15/58')
+    need([r[k] for k in ['apply_attempts', 'commit_attempts', 'actual_git_invocations', 'actual_git_native_nonzero', 'controller_owned_native_exit', 'outer_tool_exit', 'outer_explicit_python_exit']] == [1, 1, 43, 0, 0, 0, 0], 'actual finite source evidence')
+    review_members = manifest_members(q['source_closure_manifest_ref'])
+    need(path(q['source_closure_review_ref']['path']) in review_members and same(review_members[path(q['source_closure_review_ref']['path'])], q['source_closure_review_ref']), 'source review sealed')
+    inner = manifest_members(r['manifest_ref'])
+    outer = manifest_members(r['outer_manifest_ref'])
+    ip, op = path(r['manifest_ref']['path']).parent, path(r['outer_manifest_ref']['path']).parent
+    for name in ['completed_ref', 'source_intent_ref']:
+        need(path(r[name]['path']) in inner and same(inner[path(r[name]['path'])], r[name]), 'inner relation')
+    need(path(r['outer_invocation_ref']['path']) in outer and same(outer[path(r['outer_invocation_ref']['path'])], r['outer_invocation_ref']), 'outer relation')
+    c, intent, invocation = doc(r['completed_ref']), doc(r['source_intent_ref']), doc(r['outer_invocation_ref'])
+    scope, grant = doc(r['scope_ref']), doc(r['grant_ref'])
+    need(c['actor'] == 'codex:/root' and c['status'] == 'DESKTOP_EXACT15_SOURCE_COMMIT_CLOSED_PENDING_FRESH58_VALIDATION', 'actual completion')
+    need(c['parent'] == r['actual_parent'] and c['actual_new_commit'] == r['actual_new_head'] and c['source_candidate'] == r['source_candidate'], 'completion heads')
+    need(c['source_paths'] == r['source_paths'] and c['unique_combined_paths'] == 58, 'completion exact source paths')
+    need([c[k] for k in ['apply_attempts', 'commit_attempts', 'Git_steps', 'canonical_writes', 'compile_SQL_HTTP_models', 'formal_increment']] == [1, 1, 43, 0, 0, 0] and c['source_acceptance'] is False, 'completion bounds')
+    for d in [c, intent, grant]:
+        need(same(d['scope_ref'], r['scope_ref']), 'actual scope cross-binding')
+    for d in [c, intent]:
+        need(same(d['grant_ref'], r['grant_ref']), 'actual grant cross-binding')
+    need(scope['schema'] == 'researchos.desktop15-source-integration-scope.v1' and scope['authorized'] is True and scope['owner'] == 'codex:/root', 'historical actual source scope')
+    need(scope['expected_registration'] == q['before_tuple'] and scope['expected_cli43_head'] == q['head_before'] and scope['candidate'] == r['source_candidate'], 'source scope origin')
+    need(same(scope['status_ref'], q['status_ref']) and scope['old_deleted_paths'] == q['old_deleted_paths'], 'same source status/deletions')
+    need(same(scope['toolchain_lock_ref'], q['toolchain_lock_ref']) and same(scope['owned_process_helper_ref'], q['helper_ref']), 'same source toolchain/helper')
+    need([scope[k] for k in ['exact_paths', 'union_paths', 'apply_cap', 'commit_cap']] == [15, 58, 1, 1], 'source scope caps')
+    need(grant['schema'] == 'researchos.desktop15-source-integration-grant.v1' and grant['authorized'] is True and grant['actual_registration_completed'] is True and grant['status'] == 'ROOT_REGISTERED_EXECUTION_AUTHORIZED', 'real historical grant')
+    need(grant['operation_uuid'] == scope['operation_uuid'] and grant['automatic_retry'] is False, 'grant operation')
+    need(intent['base'] == q['head_before'] and intent['candidate'] == r['source_candidate'] and intent['canonical_copies'] == grant['canonical_copies'], 'source intent authority')
+    need(len(grant['canonical_copies']) == 4, 'source grant four originals')
+    for canonical, copied, original in zip(CANON, grant['canonical_copies'], q['original_copy_refs']):
+        need(ROOT / copied['canonical_path'] == canonical and verify(copied['ref']) == verify(original), 'source grant same original four')
+    registration = grant['registration_refs']
+    rm = manifest_members(registration['manifest'])
+    for name in ['audit', 'invocation', 'intent', 'verified']:
+        need(path(registration[name]['path']) in rm and same(registration[name], rm[path(registration[name]['path'])]), 'source registration sealed relation')
+    ra, ri = doc(registration['audit']), doc(registration['invocation'])
+    need(ra['after'] == q['before_tuple'] and ra['actual_registration_exit'] == 0 and ri['actual_exit'] == 0 and ri['wrapper_error'] is None, 'actual prior Root registration')
+    job_ok(ri['owned_result'])
+    need(invocation['first_error'] is None and invocation['secondary_errors'] == [] and invocation['actual_native_controller_exit'] == 0 and invocation['automatic_retry'] is False and invocation['counter_reset'] is False, 'outer actual source completion')
+    job_ok(invocation['owned_result'])
+    started = doc(member(outer, op, 'inner.started.json'))
+    need(invocation['argv'] == started['argv'], 'actual source argv pairing')
+    argv = invocation['argv']
+    need(argv[1:5] == ['-I', '-S', '-X', 'utf8'] and path(argv[5]) == path(scope['controller_ref']['path']), 'source controller argv')
+    need(argv[6:] == ['--scope', str(path(r['scope_ref']['path'])), '--scope-sha256', r['scope_ref']['sha256'], '--grant', str(path(r['grant_ref']['path'])), '--grant-sha256', r['grant_ref']['sha256']], 'source exact argv refs')
+    verify(scope['controller_ref']); verify(scope['launcher_ref'])
+    observations = doc(r['root_tool_observations_ref'])
+    need(observations['schema'] == 'researchos.root-owned-source-launch-tool-observations.v1' and observations['actor'] == 'codex:/root' and observations['closed'] is True, 'Root tool observation schema')
+    need(observations['actual_outer_tool_exit'] == 0 and observations['actual_python_exit'] == 0 and observations['counter_reset'] is False, 'original tool exits')
+    need(same(observations['actual_scope_ref'], r['scope_ref']) and same(observations['actual_grant_ref'], r['grant_ref']), 'Root launch refs')
+    initial = observations['initial_result']
+    polls = observations['polls']
+    need(type(initial['session_id']) is int and polls and observations['terminal_result'] == polls[-1]['result'], 'original terminal pairing')
+    for index, poll in enumerate(polls):
+        need(poll['input']['session_id'] == initial['session_id'] and poll['input']['chars'] == '', 'original poll session/read-only')
+        if index != len(polls) - 1:
+            need('exit_code' not in poll['result'], 'no continued polling after terminal')
+    terminal = polls[-1]['result']
+    need(terminal['exit_code'] == 0 and 'ACTUAL_PYTHON_EXIT=0' in terminal['output'], 'original explicit Python exit observation')
+    need(path(observations['initial_input']['workdir']) == ROOT, 'Root launch cwd')
+    need(r['root_tool_observations_are_original_native_streams'] is False, 'tool bridge not native stream claim')
+    need(verify(member(inner, ip, 'head-after.stdout.raw')).decode().strip() == q['head_after'], 'sealed source head')
+    need(verify(member(inner, ip, 'commit-parent.stdout.raw')).decode().split() == [q['head_after'], q['head_before']], 'sealed direct parent')
+    need(verify(member(inner, ip, 'delta-after.stdout.raw')).decode().splitlines() == r['source_paths'], 'sealed exact15 delta')
+    need(verify(member(inner, ip, 'index-after.stdout.raw')) == b'' and verify(member(inner, ip, 'status-after.stdout.raw')) == verify(q['status_ref']), 'sealed status/index')
+    calls = [x for v, x in inner.items() if v.name.endswith('.invocation.json')]
+    need(len(calls) == 43, '43 actual source Git calls')
+    for item in calls:
+        d = doc(item)
+        need(d['actual_native_exit'] == 0 and d['wrapper_error'] is None and d['automatic_retry'] is False and path(d['cwd']) == ROOT, 'source Git actual0')
+        job_ok(d['process_observation'])
+    return r
+
+
+def initialize_request():
+    global OUT, REQUEST_REF
+    need(len(sys.argv) in [3, 5], 'request path+SHA then optional review path+SHA')
+    REQUEST_REF = ref(sys.argv[1])
+    need(REQUEST_REF['sha256'] == sys.argv[2], 'explicit immutable Root request SHA')
+    q = doc(REQUEST_REF)
+    need(q['schema'] == 'researchos.desktop58-forward-head-request.v1' and q['actor'] == 'codex:/root', 'Root request schema')
+    need(q['authorized'] is False and q['source_acceptance'] is False and q['formal_increment'] == 0 and q['new_execution_grant'] is None, 'metadata only request')
+    ns = path(q['registration_namespace'], False)
+    base = ROOT / 'execution/v2.4/receipts/W05/W05-99/integration_codex'
+    need(ns.parent == base and ns.name.startswith('desktop58-post-integration-') and len(q['run_uuid']) == 32 and all(x in '0123456789abcdef' for x in q['run_uuid']) and q['run_uuid'] in ns.name, 'new metadata namespace')
+    need(not path(REQUEST_REF['path']).is_relative_to(ns), 'request is immutable external input')
+    if MODE == 'prepare':
+        OUT = ns
+        need(ns.parent.is_dir() and not ns.exists(), 'fresh draft namespace')
+    else:
+        need(ns == OUT, 'request matches actual script namespace')
+    need(q['before_tuple'] == [332, 160, 516], 'fixed current source closure baseline')
+    need(q['head_before'] == 'a510dbef4a7e08fb5c428df44c39b133f3ffa856' and q['head_after'] == 'e2ee22a0e4d697bf98b46f10ebb58ae7e23159a7', 'actual source pair')
+    need(type(q['after_tuple']) is list and len(q['after_tuple']) == 3 and all(type(x) is int for x in q['after_tuple']), 'explicit Root after tuple')
+    need(q['after_tuple'][:2] == [q['before_tuple'][0] + 1, q['before_tuple'][1] + 1], 'one forward revision')
+    need(datetime.datetime.fromisoformat(q['timestamp']).tzinfo is not None, 'explicit timestamp')
+    runtime = doc(q['runtime_resources_ref'])
+    need(len(runtime['files']) == 1212, 'existing runtime1212 no widening')
+    for r in runtime['files']:
+        v = Path(r['path'])
+        if not v.is_relative_to(ROOT):
+            need(v.is_absolute() and (v not in EXTERNAL or EXTERNAL[v] == r), 'external catalog duplicate')
+            EXTERNAL[v] = r
+    need(len(q['original_copy_refs']) == len(q['canonical_before']) == 4, 'original four layout')
+    for canonical, copied, original in zip(CANON, q['original_copy_refs'], q['canonical_before']):
+        need(path(original['path']) == canonical and path(copied['path']) not in CANON, 'canonical refs separate from immutable copies')
+        b = verify(copied)
+        need(hashlib.sha256(b).hexdigest() == original['sha256'] and len(b) == original['bytes'], 'original copy exactbytes')
+    for r in q['immutable_inputs']:
+        verify(r)
+    for r in q['code_refs'].values():
+        verify(r)
+    need(set(q['code_refs']) == {'engine', 'builder'}, 'exact preparation code2')
+    if MODE == 'prepare':
+        need(verify(q['code_refs']['engine']) == raw(Path(__file__)) and path(q['code_refs']['builder']['path']) == Path(sys.argv[0]).resolve(), 'actual builder/engine pairing')
+    need(q['old_deleted_paths'] and len(q['old_deleted_paths']) == len(set(q['old_deleted_paths'])) == 11, 'old11D')
+    rows = verify(q['status_ref']).decode('utf-8').splitlines()
+    need(len(rows) == 13 and sorted(x[3:] for x in rows if x.startswith(' D ')) == sorted(q['old_deleted_paths']), 'status old11D')
+    need(sorted(x for x in rows if not x.startswith(' D ')) == [' M execution/v2.4/checkpoint.json', ' M execution/v2.4/path_ownership.json'], 'status exact CP/OW only')
+    need(all(path(r['path']) not in CANON for r in q['immutable_inputs']), 'live canonical is not immutable input')
+    r = closure(q)
+    cut = doc(q['origin_cut_ref'])
+    need(cut['schema'] == 'researchos.desktop58-forward-origin-cut.v1' and cut['before_tuple'] == q['before_tuple'] and cut['after_tuple'] == q['after_tuple'], 'explicit immutable failure cut')
+    need(cut['counter_reset'] is False and q['after_tuple'][2] == q['before_tuple'][2] + len(cut['origins']), 'append count')
+    old = parse(verify(q['original_copy_refs'][0]))['failure_counters']
+    seen = {x['sha256'] for x in refs_in(old)}
+    keys = set()
+    for row in cut['origins']:
+        item = row['evidence_ref']
+        need(row['original_payload'] == doc(item) and row['count_once'] is True and row['counter_reset'] is False, 'original failure payload preserved')
+        need(item['sha256'] not in seen and item['sha256'] not in keys, 'origin already registered/duplicate')
+        keys.add(item['sha256'])
+    return q, runtime['files'], r, cut['origins']
+
+
+def prepare_request(q, runtime, r, origins):
+    global OWN_OUT
+    need(MODE == 'prepare' and len(sys.argv) == 3, 'prepare only request args')
+    lock = doc(q['toolchain_lock_ref'])['tools']
+    need(Path(sys.executable).resolve() == Path(lock['python']['path']).resolve(), 'builder actual Python')
+    for key in ['python', 'git']:
+        need(ref(lock[key]['path'])['sha256'] == lock[key]['sha256'], 'fixed tool bytes')
+    need(q['helper_ref']['sha256'] == '6a4fa13d7a69bd6dc33b10a667253906193bf105f8370db9f6665cd76837b3ad', 'unchanged owned helper')
+    verify(q['helper_ref'])
+    before = [verify(x) for x in q['original_copy_refs']]
+    need(all(raw(v) == b for v, b in zip(CANON, before)), 'prepare current four')
+    p = {'authorized': False, 'future_root_grant': None, 'registration_namespace': str(OUT), 'request_ref': REQUEST_REF,
+         'head': q['head_after'], 'head_before': q['head_before'], 'before_tuple': q['before_tuple'], 'after_tuple': q['after_tuple'],
+         'timestamp': q['timestamp'], 'original_refs': q['original_copy_refs'], 'origins': origins, 'source_paths': r['source_paths'],
+         'source_closure_review_ref': q['source_closure_review_ref'], 'source_closure_manifest_ref': q['source_closure_manifest_ref'],
+         'completed_ref': r['completed_ref'], 'source_manifest_ref': r['manifest_ref'], 'outer_manifest_ref': r['outer_manifest_ref'],
+         'source_grant_ref': r['grant_ref'], 'source_scope_ref': r['scope_ref'], 'origin_cut_ref': q['origin_cut_ref'],
+         'status_ref': q['status_ref'], 'old_deleted_paths': q['old_deleted_paths'], 'runtime_files': runtime,
+         'toolchain_lock_ref': q['toolchain_lock_ref'], 'helper_ref': q['helper_ref'], 'source_acceptance': False, 'formal_increment': 0,
+         'script_refs': q['code_refs']}
+    # Pure IO preparation: inspect already-loaded Python only; no helper/DLL/Git invocation.
+    observed = loaded(p)
+    source = verify(q['code_refs']['engine'])
+    need(source.count(b"MODE = 'register'") == 1, 'engine mode anchor')
+    before_again = [raw(v) for v in CANON]
+    need(before_again == before and not OUT.exists(), 'preallocation fresh/current four')
+    OUT.mkdir()
+    OWN_OUT = True
+    save('request.original.json', verify(REQUEST_REF), True)
+    p['original_refs'] = [save(v.stem + '.original.json', b, True) for v, b in zip(CANON, before)]
+    p['script_refs'] = dict(q['code_refs'])
+    for mode in ['register', 'run', 'seal']:
+        p['script_refs'][mode] = save(mode + '.py', source.replace(b"MODE = 'register'", ("MODE = '" + mode + "'").encode(), 1), True)
+    _, targets = desired(p)
+    p['desired_refs'] = [save(v.stem + '.desired.json', b, True) for v, b in zip(CANON, targets)]
+    p['immutable_inputs'] = list(READS.values())
+    for item in [*p['original_refs'], *p['script_refs'].values()]:
+        if all(not same(item, old) for old in p['immutable_inputs']):
+            p['immutable_inputs'].append(item)
+    need(all(path(x['path']) not in CANON for x in p['immutable_inputs']), 'no live canon in immutable set')
+    save('prepared_refs.json', p)
+    save('audit.json', {'schema': 'researchos.desktop58-forward-head-draft-audit.v1', 'request_ref': REQUEST_REF,
+         'before': p['before_tuple'], 'after': p['after_tuple'], 'head_before': p['head_before'], 'head_after': p['head'],
+         'pure_IO_prepare': True, 'Git_helper_DLL_product_calls': 0, 'canonical_writes': 0, 'source_acceptance': False,
+         'formal_increment': 0, 'source_closure_review_ref': p['source_closure_review_ref'], 'observed_runtime': observed,
+         'immutable_count': len(p['immutable_inputs']), 'canonical_before': q['canonical_before']})
+    need(all(raw(v) == b for v, b in zip(CANON, before)), 'prepare finish canonical unchanged')
+    save('preparation.manifest.json', {'entries': [ref(x) for x in sorted(OUT.iterdir()) if x.is_file()], 'self_excluded': True})
+
+
+def desired(p):
+    before = [verify(x) for x in p['original_refs']]
+    cp, ow = [parse(x) for x in before[:2]]
+    original_cp, original_ow = copy.deepcopy(cp), copy.deepcopy(ow)
+    a, b = p['before_tuple'], p['after_tuple']
+    need([cp['revision'], ow['revision'], len(cp['failure_counters'])] == a and cp['head'] == p['head_before'], 'before tuple/head')
+    need(b[:2] == [a[0] + 1, a[1] + 1] and b[2] == a[2] + len(p['origins']), 'explicit tuple increments')
+    cp['failure_counters'].extend(copy.deepcopy(p['origins']))
+    cp.update(head=p['head'], revision=b[0], expected_previous_revision=a[0], updated_at=p['timestamp'], updated_by='codex:/root')
+    additions = {'desktop_exact15_source_integration_state': 'CLOSED_PENDING_FRESH58_VALIDATION',
+        'desktop_exact15_source_integration_completed_ref': p['completed_ref'],
+        'desktop_exact15_source_integration_manifest_ref': p['source_manifest_ref'],
+        'desktop_exact15_source_integration_outer_manifest_ref': p['outer_manifest_ref'],
+        'desktop_exact15_source_integration_grant_ref': p['source_grant_ref'],
+        'desktop_exact15_source_integration_execution_review_ref': p['source_closure_review_ref'],
+        'desktop_exact15_actual58_head': p['head'], 'desktop_exact15_actual_combined_source_paths': 58,
+        'desktop_fresh58_validation_authorized': False, 'desktop_GUI_install_NVDA_authorized': False}
+    need(same(cp['work_in_progress']['desktop_exact15_source_integration_scope_ref'], p['source_scope_ref']), 'current registered source scope')
+    cp['work_in_progress'].update(additions)
+    cp['next_command'] = 'Desktop source15/combined58 source commit closed; prepare separately reviewed fresh58 validation. No fresh compiler, runtime, GUI, SQL24 or formal acceptance is authorized by this head-forward registration.'
+    cp['integrity_events'].append({'event': 'ROOT_DESKTOP58_FORWARD_HEAD_REGISTRATION', 'actor': 'codex:/root', 'at': p['timestamp'],
+        'before': a, 'after': b, 'head_before': p['head_before'], 'head_after': p['head'],
+        'completed_ref': p['completed_ref'], 'execution_review_ref': p['source_closure_review_ref'],
+        'origin_refs': [x['evidence_ref'] for x in p['origins']], 'counter_reset': False, 'formal_increment': 0})
+    for item in [p['request_ref'], p['completed_ref'], p['source_manifest_ref'], p['outer_manifest_ref'], p['source_grant_ref'], p['source_closure_review_ref'], p['source_closure_manifest_ref'], p['origin_cut_ref']]:
+        if item['path'] not in cp['evidence_index']:
+            cp['evidence_index'].append(item['path'])
+    sub = ow['card_path_bindings']['W13-03']['subtasks']['desktop_exact15_source_integration']
+    need(sub['owner'] == sub['current_source_writer'] == 'codex:/root' and sub['state'] == 'ROOT_REGISTERED_WAIT_SEAL_AND_EXCLUSIVE_GRANT', 'specific existing Root source lease')
+    need(sub['source_paths'] == p['source_paths'] and same(sub['scope_ref'], p['source_scope_ref']), 'existing exact15 lease')
+    sub.update(current_source_writer=None, state='CLOSED_PENDING_FRESH58_VALIDATION', actual_head=p['head'],
+        actual_unique_source_paths=58, actual_source_paths=15, completed_ref=p['completed_ref'], manifest_ref=p['source_manifest_ref'],
+        outer_manifest_ref=p['outer_manifest_ref'], grant_ref=p['source_grant_ref'], execution_review_ref=p['source_closure_review_ref'],
+        source_acceptance=False, formal_increment=0, compile_test_SQL_HTTP_model_authorized=False, GUI_authorized=False)
+    ow.update(revision=b[1], amended_at=p['timestamp'], amended_by='codex:/root')
+    compare = copy.deepcopy(ow)
+    compare['card_path_bindings']['W13-03']['subtasks']['desktop_exact15_source_integration'] = original_ow['card_path_bindings']['W13-03']['subtasks']['desktop_exact15_source_integration']
+    for k in ['revision', 'amended_at', 'amended_by']:
+        if k in original_ow: compare[k] = original_ow[k]
+        else: compare.pop(k, None)
+    need(compare == original_ow, 'other ownership changed')
+    allowed = {'head', 'revision', 'expected_previous_revision', 'updated_at', 'updated_by', 'failure_counters', 'work_in_progress', 'next_command', 'integrity_events', 'evidence_index'}
+    need({k: v for k, v in cp.items() if k not in allowed} == {k: v for k, v in original_cp.items() if k not in allowed}, 'other CP changed')
+    need({k: v for k, v in cp['work_in_progress'].items() if k not in additions} == {k: v for k, v in original_cp['work_in_progress'].items() if k not in additions}, 'other WIP changed')
+    need(cp['current_effective_formal_status'] == original_cp['current_effective_formal_status'], 'formal state changed')
+    need(cp['failure_counters'][:a[2]] == original_cp['failure_counters'], 'failure prefix')
+    return before, [encode(cp), encode(ow), before[2], before[3]]

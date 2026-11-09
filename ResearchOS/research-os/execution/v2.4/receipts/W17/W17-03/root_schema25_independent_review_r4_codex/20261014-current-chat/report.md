@@ -1,0 +1,11 @@
+# Root schema25 R4 incremental independent review
+
+Verdict: **SOURCE_FIXTURE_ACCEPTED**, carrying forward R3's bounded schema25 storage/new pause-backup-validator acceptance. Formal increment remains **0**.
+
+The scope amendment is verified against CP464 scope SHA256 `29f3d15481c589f67261ca103177d831493edec7821dd1d67f5af8c35cea04f9`. The only source delta after R3 is `internal/domain/backup_prepared_abandonment_upgrade_test.go`: the future-version case is renamed Future26; it first inserts version25 without its schema and requires the exact `BACKUP_PAUSE_SCHEMA` refusal, then inserts26 and requires `BACKUP_CONFIGURATION_VERSION`. This correctly distinguishes malformed current schema from unsupported future schema. No production validator or R3 source byte changed. `source-before.json` and `source-after.json` freeze ten scoped existing files, including the unchanged command-queue dependency; nine source files differ from base.
+
+Independent incremental execution passed five top-level cases, exit0: Future26/malformed25 boundary, exact24 schema recognition/refusal, normal public backup/restore round trip, supported22-25 pause schema/legacy backup behavior, and the independent complete six-revision history with later cancellation. `git diff --check` passed. This is targeted follow-up testing; the R3 17-top/21-subtest independent capture remains the evidence for unchanged storage behavior.
+
+The separately authored full backup regression capture was also inspected and copied unchanged into `author-backup-regression-06`: all 18 top-level `TestBackupHostConfiguration.*|TestPreparedUpgrade.*` cases passed, exit0, no fail or skip. This is author evidence independently inspected, not a claim that the reviewer reran that complete suite. The prior regression-05 outdated-version assertion failure remains preserved by Root and is not rewritten.
+
+The normal public round-trip case exercises the existing backup/restore flow on synthetic host-configuration fixtures. It does not establish a complete production backup of a real populated schema25 pause database. All R3 limitations remain: no original-root upgrade entrypoint, Core expected-revision/state CAS, native pause/resume, provider/GUI/phone flow, parent/formal acceptance or formal-case increment. Candidate production source stayed frozen throughout this incremental review.

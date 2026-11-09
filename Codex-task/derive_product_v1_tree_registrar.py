@@ -1,0 +1,18 @@
+from pathlib import Path
+s=Path('register_product_v1_real_flow02.py').read_text(encoding='utf8')
+s=s.replace('import hashlib,json,secrets,subprocess','import argparse,hashlib,json,secrets,subprocess')
+s=s.replace('product-v1-real-electron-harness-prepare-revision-04','product-v1-real-electron-tree-diagnostic-01')
+s=s.replace('product-v1-real-electron-run-02-registration','product-v1-tree-diagnostic-03-registration')
+s=s.replace('product-v1-real-electron-run-02','product-v1-tree-diagnostic-run-03')
+s=s.replace('product-v1-real-electron-flow-02','product-v1-tree-diagnostic-03')
+start=s.index("review=HERE/'product-v1-real-electron-independent-review-20261104/revision04/report.json'")
+end=s.index('rv=read(review)',start)
+s=s[:start]+"ap=argparse.ArgumentParser();ap.add_argument('--review',required=True);ap.add_argument('--review-sha',required=True);a=ap.parse_args();review=Path(a.review);assert sha(review)==a.review_sha\n"+s[end:]
+s=s.replace('68458e0ff59d091d2481356f19bec7d557a3dc9924ee3f91cc8c47e77b1d450b','a7e38ceecd654e63b6689556c18ec57346b8ae4390068bcd3e80d28a4ede692d')
+s=s.replace('8fa1b220c6e8624bc969bc149616d3838e521b999d7e9d13d703eabd576f1f82','d3e37e333fa85fe57b6951292a458f73b08a2f801a2e9b997089599ec044ade4')
+s=s.replace('APPROVED_ONE_FRESH_REAL_READONLY_GUI_TASK','APPROVED_OWNED_DIALOG_TREE_METADATA_ONLY_CANCEL').replace('task_budget=1','task_budget=0')
+s=s.replace('Actual capabilities must report LOGGED_IN+chatgpt immediately before sole DOM submit. No API paid/login fallback.','Dedicated diagnostic has no capabilities/task/submit/model path; budget0.')
+s=s.replace('Real owned Shell UIAutomation only; reliable absolute path proof or normal owned cancel, never fake selection.','Only owned dialog Tree metadata, then mandatory owned IDCANCEL. No TreeItem navigation, OK, workspace authorization or task.')
+s=s.replace('single-harness-20261104/real-electron-flow-02','single-harness-20261104/tree-diagnostic-03')
+q=Path('register_product_v1_tree_diagnostic.py');assert not q.exists();q.write_bytes(s.encode('utf8'))
+print('Prepared new diagnostic03 registrar, not executed')

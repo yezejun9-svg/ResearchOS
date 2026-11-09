@@ -1,0 +1,40 @@
+--- innocuous_test.go.before
++++ innocuous_test.go.after
+@@ -258,7 +258,12 @@
+ 	// binary/native exit/Job/raw invocation. This JSON alone is not that proof.
+ }
+ 
+-type driver18F08Vector struct { Valid []driver.Value; Corrupt []driver.Value }
++type driver18F08Vector struct {
++ Valid []driver.Value; Corrupt []driver.Value
++ CorruptKind string
++ FixedCallbackError string
++ ExpectedSQLitePrimaryCode int // source inference; verify in future controlled run
++}
+ type driver18F08Binding struct { Name string; Impl *FunctionImpl; Vectors []driver18F08Vector }
+ // A separately reviewed future adapter must assign BOTH variables using the
+ // actual approved F08 names, pure implementations and independent raw vectors.
+@@ -283,12 +288,20 @@
+ 		table:=fmt.Sprintf("f08_%d",i)
+ 		f.exec(t,"CREATE TABLE "+table+"("+strings.Join(cols,",")+",CHECK("+b.Name+"("+strings.Join(args,",")+")=1))")
+ 		for _,v:=range b.Vectors{
+-			if len(v.Valid)!=n||len(v.Corrupt)!=n||reflect.DeepEqual(v.Valid,v.Corrupt){t.Fatal("I17 vector arity or missing corruption")}
++			if len(v.Valid)!=n||len(v.Corrupt)!=n||reflect.DeepEqual(v.Valid,v.Corrupt)||v.CorruptKind!="CALLBACK_ERROR"||v.FixedCallbackError==""||v.ExpectedSQLitePrimaryCode!=1{t.Fatal("I17 vector arity, callback error contract or corruption incomplete")}
++            direct,directErr:=b.Impl.Scalar(nil,v.Corrupt)
++            if direct!=nil||directErr==nil||directErr.Error()!=v.FixedCallbackError{t.Fatalf("I17 direct callback result=%T error=%v",direct,directErr)}
+ 			valid,bad:=make([]any,n),make([]any,n);for j:=0;j<n;j++{valid[j]=v.Valid[j];bad[j]=v.Corrupt[j]}
+ 			query:="SELECT "+b.Name+"("+strings.Join(marks,",")+")"
+-			f.integer(t,query,1,valid...);f.integer(t,query,0,bad...)
++			f.integer(t,query,1,valid...)
++            var rejected any
++            err:=f.conn.QueryRowContext(f.ctx,query,bad...).Scan(&rejected)
++            driver18Error(t,err,v.ExpectedSQLitePrimaryCode,v.FixedCallbackError)
+ 			f.exec(t,"INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")",valid...)
+-			_,err:=f.conn.ExecContext(f.ctx,"INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")",bad...);driver18Error(t,err,275,"CHECK constraint failed")
++			var before int64; if err:=f.conn.QueryRowContext(f.ctx,"SELECT count(*) FROM "+table).Scan(&before);err!=nil{t.Fatal(err)}
++            _,err=f.conn.ExecContext(f.ctx,"INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")",bad...)
++            driver18Error(t,err,v.ExpectedSQLitePrimaryCode,v.FixedCallbackError)
++            f.integer(t,"SELECT count(*) FROM "+table,before)
+ 		}
+ 		f.integer(t,"SELECT count(*) FROM "+table,int64(len(b.Vectors)))
+ 	}

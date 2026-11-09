@@ -1,0 +1,211 @@
+--- v2/contract.json
++++ v3/contract.json
+@@ -1,11 +1,15 @@
+ {
+-  "schema": "researchos.restored21-v2-root-actual-caller-source-contract.v2",
++  "schema": "researchos.restored21-v2-root-actual-caller-source-contract.v3",
+   "status": "SOURCE_ONLY_PENDING_INDEPENDENT_CALLER_REVIEW_AND_ROOT_ACTUAL",
+   "repository": "D:/作品集/ResearchOS/research-os",
+-  "worktree": "D:/作品集/ResearchOS/research-os/.local/worktrees/r21v2caller-20261009-02",
+-  "environment": "D:/作品集/ResearchOS/research-os/.local/restored21-v2-caller-env-20261009-02",
+-  "isolation_output": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/integration_codex/restored21-v2-isolation-root-20261009-02",
+-  "validation_output": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/integration_codex/restored21-v2-target-root-20261009-02",
++  "worktree": "D:/作品集/ResearchOS/research-os/.local/worktrees/r21v3caller-20261009-01",
++  "environment": "D:/作品集/ResearchOS/research-os/.local/restored21-v3-caller-env-20261009-01",
++  "isolation_output": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/integration_codex/restored21-v3-isolation-root-20261009-01",
++  "validation_output": "D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/integration_codex/restored21-v3-target-root-20261009-01",
++  "v2_source_handoff": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_session_runtime_caller_source_codex/r21v2caller-20261009-02/HDF.json","sha256":"2d172df967d25c2a0d502be1b44fb37a205224fa49b6fb7a7eafe44b4e246850","bytes":4432},
++  "v2_source_manifest": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_session_runtime_caller_source_codex/r21v2caller-20261009-02/MF.json","sha256":"a5b2cb8fab4da322d15df9a37e7daf9344459cdbe995215186122004c574b90d","bytes":4422},
++  "v2_review_handoff": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_runtime_v2_caller_independent_review_codex/review-1a11fa1/HDF.json","sha256":"7a4dadcb3a38fed8947b8fb14a0a742ae4d2851e486b63b1c1f6d45376d86cef","bytes":2927},
++  "v2_review_manifest": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_runtime_v2_caller_independent_review_codex/review-1a11fa1/MF.json","sha256":"b5f21d70950ccfff37e053f17a04e9221ec2c6e13e98008ed8dd2075856c1aee","bytes":3154},
+   "superseded_caller_handoff": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_session_runtime_caller_source_codex/r21v2caller-20261009-01/HDF.json","sha256":"b19c49a10fccdeb115ca1dad956bfa9d550df89b9dd28d7716599907e203a2a1","bytes":2659},
+   "superseded_caller_manifest": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_session_runtime_caller_source_codex/r21v2caller-20261009-01/MF.json","sha256":"d04e059361e1f16764d93d29208c8614f0dfe16db0eeb701f68ba05ebfc014a2","bytes":2861},
+   "request_changes_handoff": {"path":"D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/restored21_session_runtime_caller_independent_review_codex/r21callr-01a11f6b/HDF.json","sha256":"223a0edbe263afd0aeca7aab2ecf5955b6886f44f1ea268b95116148ca16d161","bytes":4694},
+--- v2/prepare_root_actual.py
++++ v3/prepare_root_actual.py
+@@ -86,7 +86,9 @@
+     runtime_guard = None
+     ready_payload = None
+     cleanup_refs = []
++    cleanup_errors = []
+     cleanup_ok = True
++    attempts_ref = None
+     jobs = []
+     try:
+         guard.acquire(list({x['path'].casefold(): x for x in frozen}.values()))
+@@ -173,12 +175,27 @@
+                     cleanup = g.close()
+                 except BaseException as error:
+                     cleanup = {'closed': False, 'errors': [repr(error)], 'retained_handles_count': None}
+-                cleanup_refs.append(save(name + '-source-guard.cleanup.actual.json', cleanup))
+-                cleanup_ok = cleanup_ok and cleanup['closed'] is True and not cleanup['errors'] and cleanup['retained_handles_count'] == 0
+-    assert len(cleanup_refs) == 2 and cleanup_ok
++                    cleanup_errors.append({'guard': name, 'operation': 'close', 'error': repr(error)})
++                close_ok = (cleanup.get('closed') is True and not cleanup.get('errors') and
++                            cleanup.get('retained_handles_count') == 0)
++                try:
++                    cleanup_refs.append(save(name + '-source-guard.cleanup.actual.json', cleanup))
++                except BaseException as error:
++                    cleanup_errors.append({'guard': name, 'operation': 'persist', 'error': repr(error)})
++                    close_ok = False
++                cleanup_ok = cleanup_ok and close_ok
++        try:
++            attempts_ref = save('isolation.cleanup.attempts.json', {'guard_refs': cleanup_refs,
++                'errors': cleanup_errors, 'jobs': jobs, 'all_guards_closed': cleanup_ok})
++        except BaseException as error:
++            cleanup_errors.append({'guard': 'all', 'operation': 'persist_attempts', 'error': repr(error)})
++            print(json.dumps({'guard_cleanup_receipt_error': cleanup_errors[-1]}), flush=True)
++            cleanup_ok = False
++    assert len(cleanup_refs) == 2 and cleanup_ok and not cleanup_errors and attempts_ref is not None
+     assert len(jobs) == len(invocations) == 6 and all(item['closed'] is True for item in jobs)
+     cleanup_ref = save('isolation.cleanup.closed.json', {'guard_refs': cleanup_refs, 'jobs': jobs,
+-        'all_guards_closed': cleanup_ok, 'all_owned_jobs_closed': True, 'canonical_refs': expected})
++        'attempts_ref': attempts_ref, 'all_guards_closed': cleanup_ok,
++        'all_owned_jobs_closed': True, 'canonical_refs': expected})
+     assert ready_payload is not None and all(p.read_bytes() == raw for p, raw in before.items())
+     ready_payload['all_owned_jobs_closed'] = True
+     ready_payload['cleanup_closed_ref'] = cleanup_ref
+--- v2/validate_root_actual.py
++++ v3/validate_root_actual.py
+@@ -128,6 +128,10 @@
+     assert len(preparation_cleanup['guard_refs']) == 2 and len(preparation_cleanup['jobs']) == 6
+     assert all(exact(ref) == ref for ref in preparation_cleanup['guard_refs'])
+     assert all(item['closed'] is True for item in preparation_cleanup['jobs'])
++    preparation_attempts_ref = exact(preparation_cleanup['attempts_ref'])
++    preparation_attempts = json.loads(Path(preparation_attempts_ref['path']).read_bytes())
++    assert preparation_attempts['guard_refs'] == preparation_cleanup['guard_refs']
++    assert preparation_attempts['all_guards_closed'] is True and not preparation_attempts['errors']
+     assert not O.exists()
+     assert O.resolve().is_relative_to((R / 'execution/v2.4/receipts/W05/W05-99/integration_codex').resolve())
+     O.mkdir(parents=True)
+@@ -140,6 +144,7 @@
+     gp, hp, go, node, mu, test2json = [exact(C[k]) for k in ('source_guard', 'owned_job', 'go', 'node', 'mu_bundle', 'test2json')]
+     fmt = pin(Path(go['path']).with_name('gofmt.exe'))
+     inputs = unique(source_refs + [exact(C['python']), isolation_ref, preparation_cleanup_ref,
++        preparation_attempts_ref,
+         *[exact(ref) for ref in preparation_cleanup['guard_refs']],
+         roster_ref, pin(__file__), pin(N / 'contract.json'), pin(N / 'HDF.json'), pin(N / 'MF.json'),
+         pin(roster_path), gp, hp, go, fmt, node, mu, test2json, *sources.values(),
+@@ -152,9 +157,40 @@
+     formatted_ref = inventory_ref = overlay_ref = binary = typed_evidence_ref = None
+     phase_error = None
+     guard_cleanup_refs = []
++    guard_cleanup_errors = []
++    cleanup_attempts_ref = None
+     all_guards_closed = True
+     actual_test_jsonl_primary_ref = None
+     development_tests_observed = False
++    def closed(status, error=None):
++        canonical_unchanged = all(p.read_bytes() == raw for p, raw in before.items())
++        main_unchanged = all(p.read_bytes() == raw for p, raw in main_before.items())
++        jobs_closed = bool(jobs) and all(item['closed'] is True for item in jobs)
++        ref = save('validation.closed.json', {'status': status, 'error': error, 'source_count': len(sources),
++            'source_overlay_ref': overlay_ref, 'formatted_source_ref': formatted_ref,
++            'compiler_inventory_ref': inventory_ref, 'compiled_test_ref': pin(binary) if binary and binary.is_file() else None,
++            'exact_parent_names': parents, 'expected_terminal_names': sorted(terminals),
++            'started_names': sorted(started), 'actions': actions,
++            'pass_count': sum(a == 'pass' for a in actions.values()),
++            'fail_count': sum(a == 'fail' for a in actions.values()),
++            'skip_count': sum(a == 'skip' for a in actions.values()),
++            'invocation_refs': invocations, 'jobs': jobs, 'all_owned_jobs_closed': jobs_closed,
++            'guard_cleanup_refs': guard_cleanup_refs, 'guard_cleanup_errors': guard_cleanup_errors,
++            'cleanup_attempts_ref': cleanup_attempts_ref, 'all_guards_closed': all_guards_closed,
++            'preparation_cleanup_ref': preparation_cleanup_ref,
++            'actual_test_jsonl_primary_ref': actual_test_jsonl_primary_ref,
++            'typed_fixture_evidence_inventory_ref': typed_evidence_ref,
++            'canonical_refs': expected, 'canonical_unchanged': canonical_unchanged,
++            'Main_8_guarded_files_unchanged': main_unchanged, 'Main_adopted': False,
++            'component_scope': C['component_scope'], 'genuine21_22_release_program_provenance': 'OPEN',
++            'public_late_failure_no_publication': 'OPEN', 'overall20to24': 'OPEN', 'formal_acceptance': False,
++            'original_trial_DB_touched': False, 'external_model_requests': 0,
++            'original_trial_provider_requests': None, 'descendant_test_binary_exit': None,
++            'individual_descendant_PID_FILETIME_and_raw_streams': None,
++            'native_qualification_accepted': False, 'component_validation_accepted': False})
++        print(json.dumps({'closed_ref': ref, 'status': status}), flush=True)
++        return ref
++
+     try:
+         input_guard.acquire(inputs)
+         helper = module(hp['path'], input_guard.get_buffer(hp['path']))
+@@ -213,34 +249,6 @@
+             assert result['actual_exit'] == 0, label + ' actual exit nonzero'
+             return result
+ 
+-        def closed(status, error=None):
+-            canonical_unchanged = all(p.read_bytes() == raw for p, raw in before.items())
+-            main_unchanged = all(p.read_bytes() == raw for p, raw in main_before.items())
+-            jobs_closed = bool(jobs) and all(item['closed'] is True for item in jobs)
+-            ref = save('validation.closed.json', {'status': status, 'error': error, 'source_count': len(sources),
+-                'source_overlay_ref': overlay_ref, 'formatted_source_ref': formatted_ref,
+-                'compiler_inventory_ref': inventory_ref, 'compiled_test_ref': pin(binary) if binary and binary.is_file() else None,
+-                'exact_parent_names': parents, 'expected_terminal_names': sorted(terminals),
+-                'started_names': sorted(started), 'actions': actions,
+-                'pass_count': sum(a == 'pass' for a in actions.values()),
+-                'fail_count': sum(a == 'fail' for a in actions.values()),
+-                'skip_count': sum(a == 'skip' for a in actions.values()),
+-                'invocation_refs': invocations, 'jobs': jobs, 'all_owned_jobs_closed': jobs_closed,
+-                'guard_cleanup_refs': guard_cleanup_refs, 'all_guards_closed': all_guards_closed,
+-                'preparation_cleanup_ref': preparation_cleanup_ref,
+-                'actual_test_jsonl_primary_ref': actual_test_jsonl_primary_ref,
+-                'typed_fixture_evidence_inventory_ref': typed_evidence_ref,
+-                'canonical_refs': expected, 'canonical_unchanged': canonical_unchanged,
+-                'Main_8_guarded_files_unchanged': main_unchanged, 'Main_adopted': False,
+-                'component_scope': C['component_scope'], 'genuine21_22_release_program_provenance': 'OPEN',
+-                'public_late_failure_no_publication': 'OPEN', 'overall20to24': 'OPEN', 'formal_acceptance': False,
+-                'original_trial_DB_touched': False, 'external_model_requests': 0,
+-                'original_trial_provider_requests': None, 'descendant_test_binary_exit': None,
+-                'individual_descendant_PID_FILETIME_and_raw_streams': None,
+-                'native_qualification_accepted': False, 'component_validation_accepted': False})
+-            print(json.dumps({'closed_ref': ref, 'status': status}), flush=True)
+-            return ref
+-
+         for name, ref in sources.items():
+             target = T / name
+             assert target.resolve().is_relative_to(T.resolve()) and not target.is_symlink()
+@@ -271,9 +279,9 @@
+             if pkg.get('Export'):
+                 ref = pin(pkg['Export'])
+                 exports[ref['path']] = ref
+-            module = pkg.get('Module')
+-            if isinstance(module, dict) and module.get('GoMod'):
+-                ref = pin(module['GoMod'])
++            go_module_info = pkg.get('Module')
++            if isinstance(go_module_info, dict) and go_module_info.get('GoMod'):
++                ref = pin(go_module_info['GoMod'])
+                 module_manifests[ref['path']] = ref
+             if not pkg.get('Dir'):
+                 continue
+@@ -380,14 +388,29 @@
+                     cleanup = guard.close()
+                 except BaseException as error:
+                     cleanup = {'closed': False, 'errors': [repr(error)], 'retained_handles_count': None}
+-                guard_cleanup_refs.append(save(name + '-source-guard.cleanup.actual.json', cleanup))
+-                all_guards_closed = (all_guards_closed and cleanup['closed'] is True and
+-                                     not cleanup['errors'] and cleanup['retained_handles_count'] == 0)
++                    guard_cleanup_errors.append({'guard': name, 'operation': 'close', 'error': repr(error)})
++                close_ok = (cleanup.get('closed') is True and not cleanup.get('errors') and
++                            cleanup.get('retained_handles_count') == 0)
++                try:
++                    guard_cleanup_refs.append(save(name + '-source-guard.cleanup.actual.json', cleanup))
++                except BaseException as error:
++                    guard_cleanup_errors.append({'guard': name, 'operation': 'persist', 'error': repr(error)})
++                    close_ok = False
++                all_guards_closed = all_guards_closed and close_ok
++        try:
++            cleanup_attempts_ref = save('validation.cleanup.attempts.json', {
++                'guard_refs': guard_cleanup_refs, 'errors': guard_cleanup_errors,
++                'all_guards_closed': all_guards_closed, 'jobs': jobs})
++        except BaseException as error:
++            guard_cleanup_errors.append({'guard': 'all', 'operation': 'persist_attempts', 'error': repr(error)})
++            print(json.dumps({'guard_cleanup_receipt_error': guard_cleanup_errors[-1]}), flush=True)
++            all_guards_closed = False
+     jobs_closed = bool(jobs) and len(jobs) == len(invocations) and all(item['closed'] is True for item in jobs)
+     canonical_unchanged = all(p.read_bytes() == raw for p, raw in before.items())
+     main_unchanged = all(p.read_bytes() == raw for p, raw in main_before.items())
+     required_guard_count = 5 + (1 if evidence_guard is not None else 0)
+-    clean = all_guards_closed and len(guard_cleanup_refs) == required_guard_count and jobs_closed and canonical_unchanged and main_unchanged
++    clean = (all_guards_closed and not guard_cleanup_errors and cleanup_attempts_ref is not None and
++             len(guard_cleanup_refs) == required_guard_count and jobs_closed and canonical_unchanged and main_unchanged)
+     if not clean and phase_error is None:
+         phase_error = 'Required guard, Job, canonical, or Main closure was not observed'
+     if phase_error is None and development_tests_observed:

@@ -1,0 +1,402 @@
+FILE internal/store/owned_stop_backup.go SHA256 11a26d70cb3e4de34c84ba62bd66ebaeab6cf22793505befa9c0e16bc97a9edc
+1: package store
+2: 
+3: import (
+4: 	"context"
+5: 	"crypto/sha256"
+6: 	"database/sql"
+7: 	"encoding/binary"
+8: 	"encoding/hex"
+9: 	"errors"
+10: 	"fmt"
+11: 	"hash"
+12: 	"io"
+13: 	"math"
+14: 	"net/url"
+15: 	"os"
+16: 	"path/filepath"
+17: 	"regexp"
+18: 	"sort"
+19: 	"strings"
+20: 	"time"
+21: 
+22: 	"modernc.org/sqlite"
+23: )
+24: 
+25: // OwnedStopCensus is a hash of the exact sqlite_master rows and every user or
+26: // SQLite-owned table row. Each cell has a type and length delimiter; BLOBs are
+27: // hashed as bytes. A row count is included for review, not as a substitute.
+28: type OwnedStopCensus struct {
+29: 	SHA256       string `json:"sha256"`
+30: 	SchemaSHA256 string `json:"schema_sha256"`
+31: 	Tables       int    `json:"tables"`
+32: 	Rows         int64  `json:"rows"`
+33: 	QuickCheck   string `json:"quick_check"`
+34: }
+35: 
+36: type ownedStopQueryer interface {
+37: 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+38: 	QueryRowContext(context.Context, string, ...any) *sql.Row
+39: }
+40: 
+41: var ownedStopIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+42: 
+43: func ownedStopURI(path, mode string) string {
+44: 	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
+45: 	q := u.Query()
+46: 	q.Set("mode", mode)
+47: 	q.Set("_busy_timeout", "1500")
+48: 	u.RawQuery = q.Encode()
+49: 	return u.String()
+50: }
+51: 
+52: func ownedStopFrame(h hash.Hash, kind byte, raw []byte) {
+53: 	_, _ = h.Write([]byte{kind})
+54: 	var n [8]byte
+55: 	binary.BigEndian.PutUint64(n[:], uint64(len(raw)))
+56: 	_, _ = h.Write(n[:])
+57: 	_, _ = h.Write(raw)
+58: }
+59: func ownedStopCell(h hash.Hash, v any) error {
+60: 	switch x := v.(type) {
+61: 	case nil:
+62: 		ownedStopFrame(h, 'N', nil)
+63: 	case []byte:
+64: 		ownedStopFrame(h, 'B', x)
+65: 	case string:
+66: 		ownedStopFrame(h, 'S', []byte(x))
+67: 	case int64:
+68: 		ownedStopFrame(h, 'I', []byte(fmt.Sprintf("%d", x)))
+69: 	case float64:
+70: 		ownedStopFrame(h, 'F', []byte(fmt.Sprintf("%016x", math.Float64bits(x))))
+71: 	case bool:
+72: 		if x {
+73: 			ownedStopFrame(h, 'T', nil)
+74: 		} else {
+75: 			ownedStopFrame(h, 'f', nil)
+76: 		}
+77: 	case time.Time:
+78: 		ownedStopFrame(h, 'D', []byte(x.UTC().Format(time.RFC3339Nano)))
+79: 	default:
+80: 		return fmt.Errorf("unsupported SQLite cell type %T", v)
+81: 	}
+82: 	return nil
+83: }
+84: 
+85: // Fixed statement forms are constructed only from identifiers returned by
+86: // sqlite_master and PRAGMA table_info. The connection is never returned.
+87: func ownedStopCensus(ctx context.Context, q ownedStopQueryer) (OwnedStopCensus, error) {
+88: 	var out OwnedStopCensus
+89: 	if err := q.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&out.QuickCheck); err != nil || out.QuickCheck != "ok" {
+90: 		return out, fmt.Errorf("quick_check: %s: %w", out.QuickCheck, err)
+91: 	}
+92: 	schema := sha256.New()
+93: 	all := sha256.New()
+94: 	rows, err := q.QueryContext(ctx, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql")
+95: 	if err != nil {
+96: 		return out, err
+97: 	}
+98: 	tables := []string{}
+99: 	for rows.Next() {
+100: 		var typ, name, tbl string
+101: 		var sqlText sql.NullString
+102: 		if err = rows.Scan(&typ, &name, &tbl, &sqlText); err != nil {
+103: 			break
+104: 		}
+105: 		for _, s := range []string{typ, name, tbl} {
+106: 			ownedStopFrame(schema, 'S', []byte(s))
+107: 		}
+108: 		if sqlText.Valid {
+109: 			ownedStopFrame(schema, 'S', []byte(sqlText.String))
+110: 		} else {
+111: 			ownedStopFrame(schema, 'N', nil)
+112: 		}
+113: 		if typ == "table" {
+114: 			tables = append(tables, name)
+115: 		}
+116: 	}
+117: 	if err == nil {
+118: 		err = rows.Err()
+119: 	}
+120: 	rows.Close()
+121: 	if err != nil {
+122: 		return out, err
+123: 	}
+124: 	out.SchemaSHA256 = hex.EncodeToString(schema.Sum(nil))
+125: 	ownedStopFrame(all, 'H', schema.Sum(nil))
+126: 	for _, table := range tables {
+127: 		if !ownedStopIdentifier.MatchString(table) {
+128: 			return out, errors.New("noncanonical SQLite table identifier")
+129: 		}
+130: 		colRows, e := q.QueryContext(ctx, "PRAGMA table_info(\""+table+"\")")
+131: 		if e != nil {
+132: 			return out, e
+133: 		}
+134: 		type key struct {
+135: 			name  string
+136: 			order int
+137: 		}
+138: 		var keys []key
+139: 		for colRows.Next() {
+140: 			var cid, notnull, pk int
+141: 			var name, typ string
+142: 			var defaultValue sql.NullString
+143: 			if e = colRows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); e != nil {
+144: 				break
+145: 			}
+146: 			if !ownedStopIdentifier.MatchString(name) {
+147: 				e = errors.New("noncanonical SQLite column identifier")
+148: 				break
+149: 			}
+150: 			if pk > 0 {
+151: 				keys = append(keys, key{name, pk})
+152: 			}
+153: 		}
+154: 		if e == nil {
+155: 			e = colRows.Err()
+156: 		}
+157: 		colRows.Close()
+158: 		if e != nil {
+159: 			return out, e
+160: 		}
+161: 		order := "rowid"
+162: 		if len(keys) > 0 {
+163: 			sort.Slice(keys, func(i, j int) bool { return keys[i].order < keys[j].order })
+164: 			parts := make([]string, len(keys))
+165: 			for i, k := range keys {
+166: 				parts[i] = "\"" + k.name + "\""
+167: 			}
+168: 			order = strings.Join(parts, ",")
+169: 		}
+170: 		ownedStopFrame(all, 'T', []byte(table))
+171: 		data, e := q.QueryContext(ctx, "SELECT * FROM \""+table+"\" ORDER BY "+order)
+172: 		if e != nil {
+173: 			return out, e
+174: 		}
+175: 		columns, e := data.Columns()
+176: 		if e != nil {
+177: 			data.Close()
+178: 			return out, e
+179: 		}
+180: 		for data.Next() {
+181: 			values := make([]any, len(columns))
+182: 			ptrs := make([]any, len(columns))
+183: 			for i := range values {
+184: 				ptrs[i] = &values[i]
+185: 			}
+186: 			if e = data.Scan(ptrs...); e != nil {
+187: 				break
+188: 			}
+189: 			ownedStopFrame(all, 'R', nil)
+190: 			for _, v := range values {
+191: 				if e = ownedStopCell(all, v); e != nil {
+192: 					break
+193: 				}
+194: 			}
+195: 			if e != nil {
+196: 				break
+197: 			}
+198: 			out.Rows++
+199: 		}
+200: 		if e == nil {
+201: 			e = data.Err()
+202: 		}
+203: 		data.Close()
+204: 		if e != nil {
+205: 			return out, e
+206: 		}
+207: 		out.Tables++
+208: 	}
+209: 	out.SHA256 = hex.EncodeToString(all.Sum(nil))
+210: 	return out, nil
+211: }
+212: 
+213: // OnlineOwnedStopBackup creates a new destination outside the source root and
+214: // uses the pinned native online-backup API. It returns only hashes and counts.
+215: func OnlineOwnedStopBackup(ctx context.Context, source, destination string) (OwnedStopCensus, string, error) {
+216: 	if !filepath.IsAbs(source) || !filepath.IsAbs(destination) || filepath.Clean(destination) != destination {
+217: 		return OwnedStopCensus{}, "", errors.New("canonical backup paths required")
+218: 	}
+219: 	rel, e := filepath.Rel(filepath.Dir(source), destination)
+220: 	if e != nil || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
+221: 		return OwnedStopCensus{}, "", errors.New("backup destination must be outside data root")
+222: 	}
+223: 	if _, err := os.Stat(source); err != nil {
+224: 		return OwnedStopCensus{}, "", err
+225: 	}
+226: 	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+227: 	if err != nil {
+228: 		return OwnedStopCensus{}, "", err
+229: 	}
+230: 	if err = f.Close(); err != nil {
+231: 		return OwnedStopCensus{}, "", err
+232: 	}
+233: 	src, err := sql.Open("sqlite", ownedStopURI(source, "rw"))
+234: 	if err != nil {
+235: 		return OwnedStopCensus{}, "", err
+236: 	}
+237: 	defer src.Close()
+238: 	src.SetMaxOpenConns(1)
+239: 	conn, err := src.Conn(ctx)
+240: 	if err != nil {
+241: 		return OwnedStopCensus{}, "", err
+242: 	}
+243: 	defer conn.Close()
+244: 	destURI := ownedStopURI(destination, "rw")
+245: 	err = conn.Raw(func(driverConn any) error {
+246: 		maker, ok := driverConn.(interface {
+247: 			NewBackup(string) (*sqlite.Backup, error)
+248: 		})
+249: 		if !ok {
+250: 			return errors.New("pinned native backup unavailable")
+251: 		}
+252: 		backup, e := maker.NewBackup(destURI)
+253: 		if e != nil {
+254: 			return e
+255: 		}
+256: 		var stepErr error
+257: 		complete := false
+258: 		for steps := 0; steps < 100000; steps++ {
+259: 			if e = ctx.Err(); e != nil {
+260: 				stepErr = e
+261: 				break
+262: 			}
+263: 			var more bool
+264: 			more, e = backup.Step(128)
+265: 			if e != nil {
+266: 				stepErr = e
+267: 				break
+268: 			}
+269: 			if !more {
+270: 				complete = true
+271: 				break
+272: 			}
+273: 		}
+274: 		if !complete && stepErr == nil {
+275: 			stepErr = errors.New("online backup step limit")
+276: 		}
+277: 		return errors.Join(stepErr, backup.Finish())
+278: 	})
+279: 	if err != nil {
+280: 		return OwnedStopCensus{}, "", err
+281: 	}
+282: 	closed, err := os.OpenFile(destination, os.O_RDWR, 0)
+283: 	if err != nil {
+284: 		return OwnedStopCensus{}, "", err
+285: 	}
+286: 	if err = closed.Sync(); err != nil {
+287: 		closed.Close()
+288: 		return OwnedStopCensus{}, "", err
+289: 	}
+290: 	h := sha256.New()
+291: 	_, err = io.Copy(h, closed)
+292: 	closeErr := closed.Close()
+293: 	if err != nil {
+294: 		return OwnedStopCensus{}, "", err
+295: 	}
+296: 	if closeErr != nil {
+297: 		return OwnedStopCensus{}, "", closeErr
+298: 	}
+299: 	ro, err := sql.Open("sqlite", ownedStopURI(destination, "ro"))
+300: 	if err != nil {
+301: 		return OwnedStopCensus{}, "", err
+302: 	}
+303: 	defer ro.Close()
+304: 	ro.SetMaxOpenConns(1)
+305: 	census, err := ownedStopCensus(ctx, ro)
+306: 	return census, hex.EncodeToString(h.Sum(nil)), err
+307: }
+308: 
+309: // ReadOwnedStopBackup rereads a closed backup as a read-only database. It is
+310: // used when committing a reviewed plan; it never refreshes the backup.
+311: func ReadOwnedStopBackup(ctx context.Context, path string) (OwnedStopCensus, string, error) {
+312: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+313: 		return OwnedStopCensus{}, "", errors.New("canonical backup path required")
+314: 	}
+315: 	f, err := os.Open(path)
+316: 	if err != nil {
+317: 		return OwnedStopCensus{}, "", err
+318: 	}
+319: 	h := sha256.New()
+320: 	_, err = io.Copy(h, f)
+321: 	closeErr := f.Close()
+322: 	if err != nil {
+323: 		return OwnedStopCensus{}, "", err
+324: 	}
+325: 	if closeErr != nil {
+326: 		return OwnedStopCensus{}, "", closeErr
+327: 	}
+328: 	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
+329: 	if err != nil {
+330: 		return OwnedStopCensus{}, "", err
+331: 	}
+332: 	defer db.Close()
+333: 	db.SetMaxOpenConns(1)
+334: 	census, err := ownedStopCensus(ctx, db)
+335: 	return census, hex.EncodeToString(h.Sum(nil)), err
+336: }
+337: 
+338: func ReadOwnedStopCensus(ctx context.Context, path string) (OwnedStopCensus, error) {
+339: 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+340: 		return OwnedStopCensus{}, errors.New("canonical existing SQLite path required")
+341: 	}
+342: 	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
+343: 	if err != nil {
+344: 		return OwnedStopCensus{}, err
+345: 	}
+346: 	defer db.Close()
+347: 	db.SetMaxOpenConns(1)
+348: 	return ownedStopCensus(ctx, db)
+349: }
+FILE internal/store/owned_stop_backup_test.go SHA256 b705521ae752409f50791b44a80d80ae558d0d25023d153250881934928bfb17
+1: package store
+2: 
+3: import (
+4: 	"context"
+5: 	"database/sql"
+6: 	"os"
+7: 	"path/filepath"
+8: 	"testing"
+9: )
+10: 
+11: func TestOwnedStopOnlineBackupWALAndLogicalCAS(t *testing.T) {
+12: 	root := t.TempDir()
+13: 	source := filepath.Join(root, "source", "owned.sqlite")
+14: 	if err := os.Mkdir(filepath.Dir(source), 0700); err != nil {
+15: 		t.Fatal(err)
+16: 	}
+17: 	db, err := sql.Open("sqlite", ownedStopURI(source, "rwc"))
+18: 	if err != nil {
+19: 		t.Fatal(err)
+20: 	}
+21: 	defer db.Close()
+22: 	if _, err = db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE records(k TEXT PRIMARY KEY,b BLOB); INSERT INTO records VALUES('a',x'00ff')`); err != nil {
+23: 		t.Fatal(err)
+24: 	}
+25: 	backup := filepath.Join(root, "private-backup.sqlite")
+26: 	base, digest, err := OnlineOwnedStopBackup(context.Background(), source, backup)
+27: 	if err != nil {
+28: 		t.Fatal(err)
+29: 	}
+30: 	if digest == "" || base.QuickCheck != "ok" || base.Rows != 1 {
+31: 		t.Fatalf("incomplete backup: %+v %q", base, digest)
+32: 	}
+33: 	if _, _, err = OnlineOwnedStopBackup(context.Background(), source, backup); err == nil {
+34: 		t.Fatal("backup overwritten")
+35: 	}
+36: 	if _, err = db.Exec(`INSERT INTO records VALUES('b',x'0100')`); err != nil {
+37: 		t.Fatal(err)
+38: 	}
+39: 	b, err := AcquireOwnedStopBarrier(context.Background(), source)
+40: 	if err != nil {
+41: 		t.Fatal(err)
+42: 	}
+43: 	defer b.Close()
+44: 	now, err := b.Census(context.Background())
+45: 	if err != nil {
+46: 		t.Fatal(err)
+47: 	}
+48: 	if now.SHA256 == base.SHA256 || now.Rows != 2 {
+49: 		t.Fatal("committed WAL drift not seen by barrier")
+50: 	}
+51: }

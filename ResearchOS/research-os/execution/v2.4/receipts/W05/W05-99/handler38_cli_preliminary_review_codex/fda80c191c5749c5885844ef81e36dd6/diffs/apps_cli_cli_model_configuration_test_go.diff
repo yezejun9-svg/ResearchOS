@@ -1,0 +1,111 @@
+--- prior/apps/cli/cli_model_configuration_test.go
++++ current/apps/cli/cli_model_configuration_test.go
+@@ -163,6 +163,11 @@
+ 			w.Write(append([]byte(`{"status":"COMPLETED",`), b[1:]...))
+ 			return
+ 		}
++		if p.mode == "status-near-integer" {
++			b, _ := json.Marshal(reply)
++			w.Write(bytes.Replace(b, []byte(`"config_revision":1`), []byte(`"config_revision":1.0000000000000001`), 1))
++			return
++		}
+ 	} else {
+ 		pl := env["payload"].(map[string]any)
+ 		result := map[string]any{"model_config_ref": "mc-opaque-from-original-host", "config_revision": pl["config_revision"], "provider_id": pl["provider_id"], "model_id": pl["model_id"], "base_url": pl["base_url"], "credential_ref": pl["credential_ref"], "verified_at": nil}
+@@ -218,6 +223,7 @@
+ 			delete(reply, "error")
+ 		case "ack":
+ 			reply["status"] = "ACKNOWLEDGED"
++			reply["result"] = map[string]any{"accepted_at": "2026-10-01T00:00:00Z", "operation_id": "pending-configure", "after_sequence": 0, "related_resource_ref": nil}
+ 		case "in-progress":
+ 			reply["status"] = "IN_PROGRESS"
+ 		case "wrong-command":
+@@ -248,6 +254,14 @@
+ 			result["verified_at"] = "2026-10-01T00:00:00Z"
+ 		case "cross-result":
+ 			reply["result"] = doctorReply(env)["result"]
++		case "config-near-integer":
++			b, _ := json.Marshal(reply)
++			w.Write(bytes.Replace(b, []byte(`"config_revision":1`), []byte(`"config_revision":1.0000000000000001`), 1))
++			return
++		case "session-near-integer":
++			b, _ := json.Marshal(reply)
++			w.Write(bytes.Replace(b, []byte(`"revision":8`), []byte(`"revision":8.0000000000000001`), 1))
++			return
+ 		case "rejected":
+ 			reply["status"] = "REJECTED"
+ 			reply["result"] = nil
+@@ -291,6 +305,11 @@
+ 		{name: "C19-future-session-consumes-ref", requests: 2},
+ 		{name: "C23-material-argument", args: []string{"--api-key", configurationCLISecret}, code: 2, reason: "CREDENTIAL_MATERIAL_NOT_ALLOWED"},
+ 		{name: "C23-secret-ref", mode: "secret-ref", code: 1, requests: 2},
++		{name: "C15-status-near-integer", mode: "status-near-integer", code: 1, requests: 1},
++		{name: "C15-config-near-integer", mode: "config-near-integer", code: 1, requests: 2},
++		{name: "C15-session-near-integer", mode: "session-near-integer", scope: true, args: []string{"--settled"}, code: 1, requests: 2},
++		{name: "C13-config-exact-upper-bound", mode: "config-upper-bound", requests: 2},
++		{name: "C16-session-exact-max-plus-one", mode: "session-upper-bound", scope: true, args: []string{"--settled"}, requests: 2},
+ 		{name: "C24-malformed-existing", malformed: true, code: 1, reason: "CONFIG_UNREADABLE"},
+ 	}
+ 	for _, mode := range []string{"ack", "in-progress"} {
+@@ -325,6 +344,12 @@
+ 			p := &configurationCLIProbe{mode: tc.mode}
+ 			if tc.mode == "stale-host" {
+ 				p.revision = 1
++			}
++			if tc.mode == "status-near-integer" {
++				p.revision = 1
++			}
++			if tc.mode == "config-upper-bound" {
++				p.revision = 9007199254740990
+ 			}
+ 			server := httptest.NewServer(http.HandlerFunc(p.handler))
+ 			defer server.Close()
+@@ -344,6 +369,16 @@
+ 			}
+ 			if tc.mode == "stale-local" {
+ 				cfg.ConfigRevision = 1
++			}
++			if tc.mode == "status-near-integer" {
++				cfg.ConfigRevision = 1
++			}
++			if tc.mode == "config-upper-bound" {
++				cfg.ConfigRevision = 9007199254740990
++			}
++			if tc.mode == "session-upper-bound" {
++				cfg.Revision = 9007199254740991
++				cfg.WriterEpoch = 9007199254740991
+ 			}
+ 			if !tc.missing {
+ 				raw, _ := json.Marshal(cfg)
+@@ -367,6 +402,10 @@
+ 				args[3] = "bare"
+ 			case "no-endpoint":
+ 				args = append(args[:4], args[6:]...)
++			case "status-near-integer":
++				args[len(args)-1] = "1"
++			case "config-upper-bound":
++				args[len(args)-1] = "9007199254740990"
+ 			}
+ 			args = append(args, tc.args...)
+ 			out, code := configurationCLIRun(t, exe, disc, config, configurationCLISecret, args...)
+@@ -398,17 +437,17 @@
+ 				return
+ 			}
+ 			var saved cliConfig
+-			if json.Unmarshal(after, &saved) != nil || saved.Model != "mc-opaque-from-original-host" || saved.ConfigRevision != 1 {
++			if json.Unmarshal(after, &saved) != nil || saved.Model != "mc-opaque-from-original-host" || saved.ConfigRevision != cfg.ConfigRevision+1 {
+ 				t.Fatal("opaque config not saved")
+ 			}
+ 			configure := requests[1]
+ 			pl := configure["payload"].(map[string]any)
+-			if configure["command_id"] == requests[0]["command_id"] || pl["model_id"] != "org/name" || pl["provider_id"] != "vendor" || pl["config_revision"] != float64(1) || pl["credential_ref"] != nil {
++			if configure["command_id"] == requests[0]["command_id"] || pl["model_id"] != "org/name" || pl["provider_id"] != "vendor" || pl["config_revision"] != float64(cfg.ConfigRevision+1) || pl["credential_ref"] != nil {
+ 				t.Fatal("wrong typed request", configure)
+ 			}
+ 			scoped := tc.scope && !flagBool(tc.args, "default")
+ 			if scoped {
+-				if configure["session_id"] != cfg.SessionID || configure["project_id"] != cfg.ProjectID || configure["expected_revision"] != float64(7) || configure["writer_epoch"] != float64(2) || saved.Revision != 8 {
++				if configure["session_id"] != cfg.SessionID || configure["project_id"] != cfg.ProjectID || configure["expected_revision"] != float64(cfg.Revision) || configure["writer_epoch"] != float64(cfg.WriterEpoch) || saved.Revision != cfg.Revision+1 {
+ 					t.Fatal("scoped CAS changed")
+ 				}
+ 			} else {

@@ -1,0 +1,427 @@
+726:func verifiedBusinessGroups(p EntryFencePlan) (map[string]bool, error) {
+742:		shape, captureErr := inspectExistingBusinessProcess(p, expected, pre)
+758:		shape, captureErr := captureOfficialBusinessToken(p, expected)
+839:func tokenSecurityShape(token windows.Token, pid uint32, businessSID string) (businessTokenShape, error) {
+860:	if err = rejectFenceBypassPrivileges(privBytes); err != nil {
+876:func rejectFenceBypassPrivileges(raw []byte) error {
+909:func inspectExistingBusinessProcess(p EntryFencePlan, expected string, pre BootWitness) (businessTokenShape, error) {
+911:	if pre.BusinessLogonSID == "" || !validDigest(pre.BusinessPrivilegesSHA256) || pre.BusinessIntegritySID == "" {
+973:			shape, shapeErr := tokenSecurityShape(token, entry.ProcessID, p.BusinessSID)
+1017:	if current.LogonSID == "" || current.IntegritySID == "" || current.GroupsSHA256 != expected || current.ElevationType != pre.BusinessElevationType || current.IntegritySID != pre.BusinessIntegritySID || current.PrivilegesSHA256 != pre.BusinessPrivilegesSHA256 {
+1081:	_, err := captureOfficialBusinessToken(p, expected)
+1085:func captureOfficialBusinessToken(p EntryFencePlan, expected string) (businessTokenShape, error) {
+1128:			shape, shapeErr := tokenSecurityShape(token, entry.ProcessID, p.BusinessSID)
+1151:func checkAncestorControl(p EntryFencePlan, holds []nativeHold) error {
+1152:	enabled, err := verifiedBusinessGroups(p)
+1210:func preflightManagementRestore(p EntryFencePlan) error {
+1237:			if e = ensureOwnerRestorable(p.ManagementSID, owner); e != nil {
+1268:func ensureOwnerRestorable(managementSID string, originalOwner *windows.SID) error {
+1311:		if err = windows.AdjustTokenPrivileges(token, false, &state, 0, nil, nil); err != nil {
+1325:func preflightInstalledRestore(p EntryFencePlan, byPath map[string]FileIdentity) error {
+1353:			if err = ensureOwnerRestorable(p.ManagementSID, owner); err != nil {
+1485:	if e = checkAncestorControl(p, holds); e != nil {
+1634:	return checkAncestorControl(o.plan, o.holds)
+1693:		if err = checkAncestorControl(q.owner.plan, q.owner.holds); err != nil {
+2158:		if e = checkAncestorControl(p, holds); e != nil {
+2179:		shape, e := captureOfficialBusinessToken(p, pre.BusinessEnabledSIDsSHA256)
+2187:		pre.BusinessPrivilegesSHA256 = shape.PrivilegesSHA256
+2229:		if e = checkAncestorControl(p, holds); e != nil {
+2232:		if e = preflightManagementRestore(p); e != nil {
+2275:		if e = checkAncestorControl(p, holds); e != nil {
+2285:		currentBusiness, e := inspectExistingBusinessProcess(p, r.Pre.BusinessEnabledSIDsSHA256, r.Pre)
+2294:		post.BusinessPrivilegesSHA256 = currentBusiness.PrivilegesSHA256
+2365:		if e = checkAncestorControl(p, holds); e != nil {
+2378:		if e = preflightInstalledRestore(p, byPath); e != nil {
+NATIVE_EXIT=0
+820: 
+821: func tokenInfoBytes(token windows.Token, class uint32) ([]byte, error) {
+822: 	buf := make([]byte, 128)
+823: 	for {
+824: 		var size uint32
+825: 		err := windows.GetTokenInformation(token, class, &buf[0], uint32(len(buf)), &size)
+826: 		if err == nil {
+827: 			if size > uint32(len(buf)) {
+828: 				return nil, errors.New("token information size invalid")
+829: 			}
+830: 			return buf[:size], nil
+831: 		}
+832: 		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || size > 64<<10 || size <= uint32(len(buf)) {
+833: 			return nil, err
+834: 		}
+835: 		buf = make([]byte, size)
+836: 	}
+837: }
+838: 
+839: func tokenSecurityShape(token windows.Token, pid uint32, businessSID string) (businessTokenShape, error) {
+840: 	var shape businessTokenShape
+841: 	var session, elevation, size uint32
+842: 	if err := windows.ProcessIdToSessionId(pid, &session); err != nil {
+843: 		return shape, err
+844: 	}
+845: 	if err := windows.GetTokenInformation(token, windows.TokenElevationType, (*byte)(unsafe.Pointer(&elevation)), 4, &size); err != nil || size != 4 {
+846: 		return shape, errors.Join(err, errors.New("token elevation type unavailable"))
+847: 	}
+848: 	labelBytes, err := tokenInfoBytes(token, windows.TokenIntegrityLevel)
+849: 	if err != nil || len(labelBytes) < int(unsafe.Sizeof(windows.Tokenmandatorylabel{})) {
+850: 		return shape, errors.Join(err, errors.New("token integrity label unavailable"))
+851: 	}
+852: 	groupSHA, effective, logonSID, err := tokenGroupState(token, businessSID)
+853: 	if err != nil {
+854: 		return shape, err
+855: 	}
+856: 	privBytes, err := tokenInfoBytes(token, windows.TokenPrivileges)
+857: 	if err != nil || len(privBytes) < int(unsafe.Sizeof(windows.Tokenprivileges{})) {
+858: 		return shape, errors.Join(err, errors.New("token privileges unavailable"))
+859: 	}
+860: 	if err = rejectFenceBypassPrivileges(privBytes); err != nil {
+861: 		return shape, err
+862: 	}
+863: 	var privilegeLines []string
+864: 	for _, priv := range (*windows.Tokenprivileges)(unsafe.Pointer(&privBytes[0])).AllPrivileges() {
+865: 		privilegeLines = append(privilegeLines, fmt.Sprintf("%08x:%08x:%08x", uint32(priv.Luid.HighPart), priv.Luid.LowPart, priv.Attributes))
+866: 	}
+867: 	sort.Strings(privilegeLines)
+868: 	privJSON, _ := json.Marshal(privilegeLines)
+869: 	shape = businessTokenShape{SessionID: session, ElevationType: elevation, IntegritySID: (*windows.Tokenmandatorylabel)(unsafe.Pointer(&labelBytes[0])).Label.Sid.String(), LogonSID: logonSID, PrivilegesSHA256: digest(privJSON), GroupsSHA256: groupSHA, EffectiveSIDs: effective}
+870: 	return shape, nil
+871: }
+872: 
+873: // This is admission for the native business token only. A privilege present
+874: // but disabled can be enabled later, so its Attributes cannot make it safe.
+875: // The management token's separate owner-restoration path is unaffected.
+876: func rejectFenceBypassPrivileges(raw []byte) error {
+877: 	const countBytes = 4
+878: 	if len(raw) < countBytes {
+879: 		return errors.New("business token privilege inventory truncated")
+880: 	}
+881: 	count := binary.LittleEndian.Uint32(raw[:countBytes])
+882: 	start := uint64(unsafe.Offsetof(windows.Tokenprivileges{}.Privileges))
+883: 	stride := uint64(unsafe.Sizeof(windows.LUIDAndAttributes{}))
+884: 	if start+uint64(count)*stride > uint64(len(raw)) {
+885: 		return errors.New("business token privilege inventory length invalid")
+886: 	}
+887: 	privileges := (*windows.Tokenprivileges)(unsafe.Pointer(&raw[0])).AllPrivileges()
+888: 	for _, name := range [...]string{"SeTakeOwnershipPrivilege", "SeRestorePrivilege", "SeBackupPrivilege"} {
+889: 		namePtr, err := windows.UTF16PtrFromString(name)
+890: 		if err != nil {
+891: 			return err
+892: 		}
+893: 		var luid windows.LUID
+894: 		if err := windows.LookupPrivilegeValue(nil, namePtr, &luid); err != nil {
+895: 			return fmt.Errorf("business token privilege lookup %s: %w", name, err)
+896: 		}
+897: 		for _, privilege := range privileges {
+898: 			if privilege.Luid == luid {
+899: 				return fmt.Errorf("business token assigned fence-bypass privilege %s", name)
+900: 			}
+901: 		}
+902: 	}
+903: 	return nil
+904: }
+905: 
+906: // Existing Explorer supplies a fresh business process token after restart.
+907: // Its current PID, session and logon SID are evidence, never compared to the
+908: // pre-restart values. Elevated-admin cross-account TOKEN_QUERY is probed.
+1250: 	if user.User.Sid.Equals(owner) {
+1251: 		return true, nil
+1252: 	}
+1253: 	groups, err := token.GetTokenGroups()
+1254: 	if err != nil {
+1255: 		return false, err
+1256: 	}
+1257: 	for _, group := range groups.AllGroups() {
+1258: 		if group.Sid.Equals(owner) && group.Attributes&windows.SE_GROUP_OWNER != 0 && group.Attributes&windows.SE_GROUP_ENABLED != 0 && group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+1259: 			return true, nil
+1260: 		}
+1261: 	}
+1262: 	return false, nil
+1263: }
+1264: 
+1265: // NtSetSecurityObject can restore a foreign original owner only while the actual
+1266: // mutation process token has SeRestorePrivilege enabled. A WRITE_OWNER handle
+1267: // alone proves only that it can assign an eligible owner.
+1268: func ensureOwnerRestorable(managementSID string, originalOwner *windows.SID) error {
+1269: 	var token windows.Token
+1270: 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &token); err != nil {
+1271: 		return err
+1272: 	}
+1273: 	defer token.Close()
+1274: 	user, err := token.GetTokenUser()
+1275: 	if err != nil || user.User.Sid.String() != managementSID {
+1276: 		return errors.New("owner restore token is not frozen management SID")
+1277: 	}
+1278: 	eligible, err := ownerAssignableWithoutRestore(token, originalOwner)
+1279: 	if err != nil || eligible {
+1280: 		return err
+1281: 	}
+1282: 	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
+1283: 	if err != nil {
+1284: 		return err
+1285: 	}
+1286: 	var luid windows.LUID
+1287: 	if err = windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+1288: 		return err
+1289: 	}
+1290: 	privilegePresent := func() (bool, bool, error) {
+1291: 		raw, err := tokenInfoBytes(token, windows.TokenPrivileges)
+1292: 		if err != nil || len(raw) < 4 {
+1293: 			return false, false, errors.Join(err, errors.New("restore privilege inventory unavailable"))
+1294: 		}
+1295: 		for _, privilege := range (*windows.Tokenprivileges)(unsafe.Pointer(&raw[0])).AllPrivileges() {
+1296: 			if privilege.Luid == luid {
+1297: 				return true, privilege.Attributes&windows.SE_PRIVILEGE_ENABLED != 0, nil
+1298: 			}
+1299: 		}
+1300: 		return false, false, nil
+1301: 	}
+1302: 	present, enabled, err := privilegePresent()
+1303: 	if err != nil {
+1304: 		return err
+1305: 	}
+1306: 	if !present {
+1307: 		return errors.New("SeRestorePrivilege not assigned to management token")
+1308: 	}
+1309: 	if !enabled {
+1310: 		state := windows.Tokenprivileges{PrivilegeCount: 1, Privileges: [1]windows.LUIDAndAttributes{{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}}}
+1311: 		if err = windows.AdjustTokenPrivileges(token, false, &state, 0, nil, nil); err != nil {
+1312: 			return fmt.Errorf("enable SeRestorePrivilege: %w", err)
+1313: 		}
+1314: 		_, enabled, err = privilegePresent()
+1315: 		if err != nil {
+1316: 			return err
+1317: 		}
+1318: 	}
+1319: 	if !enabled {
+1320: 		return errors.New("SeRestorePrivilege absent after enable readback")
+1321: 	}
+1322: 	return nil
+1323: }
+1324: 
+1325: func preflightInstalledRestore(p EntryFencePlan, byPath map[string]FileIdentity) error {
+1326: 	for _, target := range p.Targets {
+1327: 		observed := byPath[strings.ToLower(target.File.Path)]
+1328: 		if observed.SecurityDescriptor == target.File.SecurityDescriptor && observed.NativeSecuritySHA256 == target.File.NativeSecuritySHA256 {
+1410: 	}
+1411: 	if managementSID != sidText {
+1412: 		manager, e := windows.StringToSid(managementSID)
+1413: 		if e != nil {
+1414: 			return "", e
+1415: 		}
+1416: 		if e = abs.SetOwner(manager, false); e != nil {
+1417: 			return "", e
+1418: 		}
+1419: 	}
+1420: 	if e = abs.SetDACL(acl, true, false); e != nil {
+1421: 		return "", e
+1422: 	}
+1423: 	if e = abs.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); e != nil {
+1424: 		return "", e
+1425: 	}
+1426: 	installed, e := abs.ToSelfRelative()
+1427: 	if e != nil {
+1428: 		return "", e
+1429: 	}
+1430: 	return installed.String(), nil
+1431: }
+1432: 
+1433: // OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
+1434: // retains native no-delete holds through the caller's actual outer transaction.
+1435: func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+1436: 	if e := ctx.Err(); e != nil {
+1437: 		return nil, e
+1438: 	}
+1439: 	if held == nil || !held.Held() || held.Root() != dataRoot || database != filepath.Join(dataRoot, "researchos.sqlite") || !validOperation(operationID) || !validDigest(planSHA256) {
+1440: 		return nil, errors.New("current quiescence held lease or binding invalid")
+1441: 	}
+1442: 	lease, e := held.MaintenanceIdentity()
+1443: 	if e != nil {
+1444: 		return nil, e
+1445: 	}
+1446: 	// Discovery is by fixed ProgramData inventory. We never accept a path from
+1447: 	// a caller or a JSON supplied capability.
+1448: 	p, e := discoverPlan(dataRoot, operationID, planSHA256)
+1449: 	if e != nil {
+1450: 		return nil, e
+1451: 	}
+1452: 	if e = ValidatePlan(p); e != nil {
+1453: 		return nil, e
+1454: 	}
+1455: 	if e = managedToken(p); e != nil {
+1456: 		return nil, e
+1457: 	}
+1458: 	if p.DataRoot.Path != dataRoot || p.Database.Path != database {
+1459: 		return nil, errors.New("current quiescence source mismatch")
+1460: 	}
+1461: 	holds, e := openPlanHolds(p)
+1462: 	if e != nil {
+1463: 		return nil, e
+1464: 	}
+1465: 	fail := func(e error) (*CurrentQuiescence, error) { return nil, errors.Join(e, closeHolds(holds)) }
+1466: 	r, e := readRecord(p)
+1467: 	if e != nil {
+1468: 		return fail(e)
+1469: 	}
+1470: 	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
+1471: 		return fail(errors.New("boundary not boot observed"))
+1472: 	}
+1473: 	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1474: 		return fail(e)
+1475: 	}
+1476: 	if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
+1477: 		return fail(e)
+1478: 	}
+1479: 	if e = checkNoOfficialProcess(p); e != nil {
+1480: 		return fail(e)
+1481: 	}
+1482: 	if e = checkFence(p, holds); e != nil {
+1483: 		return fail(e)
+1484: 	}
+1485: 	if e = checkAncestorControl(p, holds); e != nil {
+1486: 		return fail(e)
+1487: 	}
+1488: 	if e = checkHolds(holds); e != nil {
+1489: 		return fail(e)
+1490: 	}
+1491: 	if e = lease.Matches(held); e != nil {
+1492: 		return fail(e)
+1493: 	}
+1494: 	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
+1495: 	return q, nil
+1570: 	}
+1571: 	if e = checkManagedChain(p); e != nil {
+1572: 		return zero, "", e
+1573: 	}
+1574: 	if e = checkAcceptanceFiles(p); e != nil {
+1575: 		return zero, "", e
+1576: 	}
+1577: 	r, e := readRecord(p)
+1578: 	if e != nil {
+1579: 		return zero, "", e
+1580: 	}
+1581: 	state := r.Events[len(r.Events)-1].State
+1582: 	if state == "BOOT_OBSERVED" {
+1583: 		if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1584: 			return zero, "", e
+1585: 		}
+1586: 		if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
+1587: 			return zero, "", e
+1588: 		}
+1589: 	}
+1590: 	return p, state, nil
+1591: }
+1592: 
+1593: func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
+1594: 	if e := ctx.Err(); e != nil {
+1595: 		return e
+1596: 	}
+1597: 	if q == nil || q.owner == nil {
+1598: 		return errors.New("current quiescence absent")
+1599: 	}
+1600: 	o := q.owner
+1601: 	o.mu.Lock()
+1602: 	defer o.mu.Unlock()
+1603: 	if o.closed || o.plan.DataRoot.Path != dataRoot || o.plan.Database.Path != database || o.plan.OperationID != operationID || o.plan.PlanSHA256 != planSHA256 {
+1604: 		return errors.New("current quiescence binding stale")
+1605: 	}
+1606: 	if e := managedToken(o.plan); e != nil {
+1607: 		return e
+1608: 	}
+1609: 	if e := o.lease.Matches(held); e != nil {
+1610: 		return e
+1611: 	}
+1612: 	if e := checkHolds(o.holds); e != nil {
+1613: 		return e
+1614: 	}
+1615: 	r, e := readRecord(o.plan)
+1616: 	if e != nil {
+1617: 		return e
+1618: 	}
+1619: 	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" || r.Post != o.post {
+1620: 		return errors.New("current quiescence state changed")
+1621: 	}
+1622: 	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+1623: 		return e
+1624: 	}
+1625: 	if e = checkCurrentBoot(r.Post, o.plan.BusinessSID); e != nil {
+1626: 		return e
+1627: 	}
+1628: 	if e = checkNoOfficialProcess(o.plan); e != nil {
+1629: 		return e
+1630: 	}
+1631: 	if e = checkFence(o.plan, o.holds); e != nil {
+1632: 		return e
+1633: 	}
+1634: 	return checkAncestorControl(o.plan, o.holds)
+1635: }
+2245: 			}
+2246: 			ok := identityCoreEqual(t.File, h.identity) && h.identity.SecurityDescriptor == t.InstalledSD && h.identity.NativeSecuritySHA256 == t.InstalledNativeSecuritySHA256
+2247: 			closeErr := windows.CloseHandle(h.handle)
+2248: 			if closeErr != nil {
+2249: 				return "", closeErr
+2250: 			}
+2251: 			if !ok {
+2252: 				return "", errors.New("arm native readback mismatch")
+2253: 			}
+2254: 		}
+2255: 		r, e = readRecord(p)
+2256: 		if e != nil {
+2257: 			return "", e
+2258: 		}
+2259: 		if e = appendEvent(p, r.Events, "ARMED"); e != nil {
+2260: 			return "", e
+2261: 		}
+2262: 		return "ARMED", nil
+2263: 	case "observe":
+2264: 		if state != "ARMED" {
+2265: 			return "", errors.New("observe requires ARMED")
+2266: 		}
+2267: 		holds, e := openPlanHolds(p)
+2268: 		if e != nil {
+2269: 			return "", e
+2270: 		}
+2271: 		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
+2272: 		if e = checkFence(p, holds); e != nil {
+2273: 			return "", e
+2274: 		}
+2275: 		if e = checkAncestorControl(p, holds); e != nil {
+2276: 			return "", e
+2277: 		}
+2278: 		if e = checkNoOfficialProcess(p); e != nil {
+2279: 			return "", e
+2280: 		}
+2281: 		post, e := witness(p, fenceDigest(p))
+2282: 		if e != nil {
+2283: 			return "", e
+2284: 		}
+2285: 		currentBusiness, e := inspectExistingBusinessProcess(p, r.Pre.BusinessEnabledSIDsSHA256, r.Pre)
+2286: 		if e != nil {
+2287: 			return "", e
+2288: 		}
+2289: 		post.BusinessEnabledSIDsSHA256 = currentBusiness.GroupsSHA256
+2290: 		post.BusinessSessionID = currentBusiness.SessionID
+2291: 		post.BusinessElevationType = currentBusiness.ElevationType
+2292: 		post.BusinessIntegritySID = currentBusiness.IntegritySID
+2293: 		post.BusinessLogonSID = currentBusiness.LogonSID
+2294: 		post.BusinessPrivilegesSHA256 = currentBusiness.PrivilegesSHA256
+2295: 		post.BusinessProcessPID = currentBusiness.ProcessID
+2296: 		post.BusinessProcessCreatedUTC = currentBusiness.ProcessCreated
+2297: 		post.BusinessProcessImageSHA256 = currentBusiness.ProcessImageSHA
+2298: 		post.FullRestartEvidenceSHA256, e = readFullRestartEvidence(p, r.Pre, post.UTC)
+2299: 		if e != nil {
+2300: 			return "", e
+2301: 		}
+2302: 		if e = ValidateRestart(r.Pre, post); e != nil {
+2303: 			return "", e
+2304: 		}
+2305: 		if e = writeExclusiveJSON(filepath.Join(dir, "post.json"), p.ManagementSID, post); e != nil {
+2306: 			return "", e
+2307: 		}
+2308: 		if e = appendEvent(p, r.Events, "BOOT_OBSERVED"); e != nil {
+2309: 			return "", e
+2310: 		}
+2311: 		return "BOOT_OBSERVED", nil
+2312: 	case "disarm-request":
+2313: 		if state == "PREPARED" || state == "APPLYING" || state == "ARMED" || state == "BOOT_OBSERVED" {
+2314: 			// The only abort path is a proven pre-BEGIN path under the same
+2315: 			// exclusive root lock used by C. Any journal, even malformed or
+NATIVE_EXIT=2

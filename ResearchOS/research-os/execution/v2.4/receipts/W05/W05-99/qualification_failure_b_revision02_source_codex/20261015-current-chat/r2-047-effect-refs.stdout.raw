@@ -1,0 +1,246 @@
+internal/domain/durability.go:9:func latestEffect(tx *sql.Tx, project, run, key string) (Object, error) {
+internal/domain/durability.go-10-	var raw string
+internal/domain/durability.go-11-	e := tx.QueryRow("SELECT body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence DESC LIMIT 1", project, run, key).Scan(&raw)
+internal/domain/durability.go-12-	if e != nil {
+internal/domain/durability.go-13-		return nil, e
+internal/domain/durability.go-14-	}
+internal/domain/durability.go-15-	return Decode([]byte(raw))
+internal/domain/durability.go-16-}
+internal/domain/durability.go-17-func effectAppend(tx *sql.Tx, project, run, key string, o Object) error {
+internal/domain/durability.go-18-	var seq int64
+internal/domain/durability.go-19-	if e := tx.QueryRow("SELECT coalesce(max(sequence),0)+1 FROM resource_effects WHERE project=? AND run=? AND effect_key=?", project, run, key).Scan(&seq); e != nil {
+internal/domain/durability.go-20-		return e
+internal/domain/durability.go-21-	}
+internal/domain/durability.go-22-	o["sequence"] = seq
+internal/domain/durability.go-23-	o["observed_at"] = Now()
+internal/domain/durability.go-24-	_, e := tx.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)", project, run, key, seq, string(Bytes(o)))
+internal/domain/durability.go-25-	return e
+internal/domain/durability.go-26-}
+internal/domain/durability.go-27-func effectsReconciled(tx *sql.Tx, project, run string) error {
+internal/domain/durability.go-28-	var unresolved int
+internal/domain/durability.go-29-	e := tx.QueryRow(`SELECT count(*) FROM resource_effects x WHERE project=? AND run=? AND sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('STARTED','UNKNOWN')`, project, run).Scan(&unresolved)
+internal/domain/durability.go-30-	if e != nil {
+internal/domain/durability.go-31-		return e
+internal/domain/durability.go-32-	}
+internal/domain/durability.go-33-	if unresolved != 0 {
+internal/domain/durability.go-34-		return Fail(409, "STATE_CONFLICT", "unknown effects require reconciliation; blind retry prohibited")
+internal/domain/durability.go-35-	}
+internal/domain/durability.go-36-	return nil
+internal/domain/durability.go-37-}
+internal/domain/durability.go-38-
+internal/domain/durability.go-39-// PrepareEffect persists intent and cost admission in one transaction before
+internal/domain/durability.go-40-// any provider request. The sole scheduler owns this; a worker cannot enqueue.
+internal/domain/durability.go-41-func (s *Service) PrepareEffect(ctx context.Context, token, project, runID, key string, payload, cost Object) (Object, error) {
+internal/domain/durability.go-42-	tx, e := s.DB.BeginTx(ctx, nil)
+internal/domain/durability.go-43-	if e != nil {
+internal/domain/durability.go-44-		return nil, e
+internal/domain/durability.go-45-	}
+internal/domain/durability.go-46-	defer tx.Rollback()
+internal/domain/durability.go-47-	result, e := s.prepareEffectTx(tx, token, project, runID, key, payload, cost)
+internal/domain/durability.go-48-	if e != nil {
+internal/domain/durability.go-49-		return nil, e
+internal/domain/durability.go-50-	}
+internal/domain/durability.go-51-	return result, tx.Commit()
+internal/domain/durability.go-52-}
+internal/domain/durability.go-53-func (s *Service) prepareEffectTx(tx *sql.Tx, token, project, runID, key string, payload, cost Object) (Object, error) {
+internal/domain/durability.go-54-	if e := resourceWriteLock(tx); e != nil {
+internal/domain/durability.go-55-		return nil, e
+internal/domain/durability.go-56-	}
+internal/domain/durability.go-57-	p, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+internal/domain/durability.go-58-	if e != nil {
+internal/domain/durability.go-59-		return nil, e
+internal/domain/durability.go-60-	}
+internal/domain/durability.go-61-	if s.Contracts.Validate("Idempotency-Key", key) != nil {
+internal/domain/durability.go-62-		return nil, Fail(400, "INVALID_REQUEST", "stable effect key required")
+internal/domain/durability.go-63-	}
+internal/domain/durability.go-64-	digest := Hash([]any{payload, cost})
+--
+internal/domain/durability.go:67:		if prior["request_hash"] != digest {
+internal/domain/durability.go-68-			return nil, Fail(409, "IDEMPOTENCY_CONFLICT", "effect key payload changed")
+internal/domain/durability.go-69-		}
+internal/domain/durability.go-70-		return prior, nil
+internal/domain/durability.go-71-	}
+internal/domain/durability.go-72-	if e != sql.ErrNoRows {
+internal/domain/durability.go-73-		return nil, e
+internal/domain/durability.go-74-	}
+internal/domain/durability.go-75-	run, e := load(tx, project, "Run", runID)
+internal/domain/durability.go-76-	if e != nil {
+internal/domain/durability.go-77-		return nil, e
+internal/domain/durability.go-78-	}
+internal/domain/durability.go-79-	task, e := load(tx, project, "Task", Str(run, "task_id"))
+internal/domain/durability.go-80-	if e != nil {
+internal/domain/durability.go-81-		return nil, e
+internal/domain/durability.go-82-	}
+internal/domain/durability.go-83-	if e = qualificationEffectBlocked(tx, project, task); e != nil {
+internal/domain/durability.go-84-		if e = qualificationModelEffectAllowed(tx, project, task, payload); e != nil {
+internal/domain/durability.go-85-			return nil, e
+internal/domain/durability.go-86-		}
+internal/domain/durability.go-87-	}
+internal/domain/durability.go-88-	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+internal/domain/durability.go-89-	if e != nil {
+internal/domain/durability.go-90-		return nil, e
+internal/domain/durability.go-91-	}
+internal/domain/durability.go-92-	if task["active_run_id"] != runID || goal["status"] != "ACTIVE" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
+internal/domain/durability.go-93-		return nil, Fail(409, "STATE_CONFLICT", "run is not permitted new effects")
+internal/domain/durability.go-94-	}
+internal/domain/durability.go-95-	if e = s.taskContextForRun(tx, project, run); e != nil {
+internal/domain/durability.go-96-		return nil, e
+internal/domain/durability.go-97-	}
+internal/domain/durability.go-98-	if e = effectsReconciled(tx, project, runID); e != nil {
+internal/domain/durability.go-99-		return nil, e
+internal/domain/durability.go-100-	}
+internal/domain/durability.go-101-	if cost["run_id"] != runID || cost["provider_request_id"] != key || cost["reservation_id"] != nil || (cost["operation"] != "RESERVE" && cost["operation"] != "UNKNOWN") {
+internal/domain/durability.go-102-		return nil, Fail(422, "GATE_FAILED", "effect must bind a new reservation")
+internal/domain/durability.go-103-	}
+internal/domain/durability.go-104-	if e = s.Contracts.Validate("CostEntryRequest", cost); e != nil {
+internal/domain/durability.go-105-		return nil, Fail(400, "INVALID_REQUEST", "invalid cost request")
+internal/domain/durability.go-106-	}
+internal/domain/durability.go-107-	ledger, e := s.appendBudget(tx, project, cost)
+internal/domain/durability.go-108-	if e != nil {
+internal/domain/durability.go-109-		return nil, e
+internal/domain/durability.go-110-	}
+internal/domain/durability.go:111:	o := Object{"project_id": project, "goal_id": goal["id"], "task_id": task["id"], "run_id": runID, "key": key, "request_hash": digest, "payload": payload, "reservation_id": ledger["id"], "state": "PREPARED", "epoch": run["lease_epoch"], "context_bundle_id": task["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "receipt": nil}
+internal/domain/durability.go-112-	if e = effectAppend(tx, project, runID, key, o); e != nil {
+internal/domain/durability.go-113-		return nil, e
+internal/domain/durability.go-114-	}
+internal/domain/durability.go-115-	if e = s.event(tx, project, "Run", run, p.ID, ID(), "RUN_CHANGED"); e != nil {
+internal/domain/durability.go-116-		return nil, e
+internal/domain/durability.go-117-	}
+internal/domain/durability.go-118-	return o, nil
+internal/domain/durability.go-119-}
+internal/domain/durability.go-120-
+internal/domain/durability.go-121-// BeginEffect is an atomic one-time dispatch fence. A lost acknowledgement is
+internal/domain/durability.go-122-// STARTED/UNKNOWN until trusted reconciliation, even when retries remain.
+internal/domain/durability.go-123-func (s *Service) BeginEffect(ctx context.Context, token, project, runID, key string) (Object, error) {
+internal/domain/durability.go-124-	tx, e := s.DB.BeginTx(ctx, nil)
+internal/domain/durability.go-125-	if e != nil {
+internal/domain/durability.go-126-		return nil, e
+internal/domain/durability.go-127-	}
+internal/domain/durability.go-128-	defer tx.Rollback()
+internal/domain/durability.go-129-	result, e := s.beginEffectTx(tx, token, project, runID, key)
+internal/domain/durability.go-130-	if e != nil {
+internal/domain/durability.go-131-		return nil, e
+internal/domain/durability.go-132-	}
+internal/domain/durability.go-133-	return result, tx.Commit()
+internal/domain/durability.go-134-}
+internal/domain/durability.go-135-func (s *Service) beginEffectTx(tx *sql.Tx, token, project, runID, key string) (Object, error) {
+internal/domain/durability.go-136-	if e := resourceWriteLock(tx); e != nil {
+internal/domain/durability.go-137-		return nil, e
+internal/domain/durability.go-138-	}
+internal/domain/durability.go-139-	_, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+internal/domain/durability.go-140-	if e != nil {
+internal/domain/durability.go-141-		return nil, e
+internal/domain/durability.go-142-	}
+internal/domain/durability.go-143-	o, e := latestEffect(tx, project, runID, key)
+internal/domain/durability.go-144-	if e != nil {
+internal/domain/durability.go-145-		return nil, e
+internal/domain/durability.go-146-	}
+internal/domain/durability.go-147-	if o["state"] != "PREPARED" {
+internal/domain/durability.go-148-		return nil, Fail(409, "STATE_CONFLICT", "already dispatched; query provider before recovery")
+internal/domain/durability.go-149-	}
+internal/domain/durability.go-150-	run, e := load(tx, project, "Run", runID)
+internal/domain/durability.go-151-	if e != nil {
+internal/domain/durability.go-152-		return nil, e
+internal/domain/durability.go-153-	}
+internal/domain/durability.go-154-	task, e := load(tx, project, "Task", Str(run, "task_id"))
+internal/domain/durability.go-155-	if e != nil {
+internal/domain/durability.go-156-		return nil, e
+internal/domain/durability.go-157-	}
+internal/domain/durability.go-158-	if e = qualificationEffectBlocked(tx, project, task); e != nil {
+internal/domain/durability.go-159-		payload, _ := o["payload"].(map[string]any)
+internal/domain/durability.go-160-		if e = qualificationModelEffectAllowed(tx, project, task, payload); e != nil {
+internal/domain/durability.go-161-			return nil, e
+internal/domain/durability.go-162-		}
+internal/domain/durability.go-163-	}
+internal/domain/durability.go-164-	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+internal/domain/durability.go-165-	if e != nil {
+internal/domain/durability.go-166-		return nil, e
+--
+internal/domain/durability.go:278:	e = tx.QueryRow("SELECT request_hash,body FROM idempotency WHERE principal=? AND project=? AND operation='resumeCheckpoint' AND key=?", p.ID, project, key).Scan(&oldHash, &raw)
+internal/domain/durability.go-279-	if e == nil {
+internal/domain/durability.go-280-		if hash != oldHash {
+internal/domain/durability.go-281-			return nil, Fail(409, "IDEMPOTENCY_CONFLICT", "resume key changed")
+internal/domain/durability.go-282-		}
+internal/domain/durability.go-283-		return Decode(raw)
+internal/domain/durability.go-284-	}
+internal/domain/durability.go-285-	if e != sql.ErrNoRows {
+internal/domain/durability.go-286-		return nil, e
+internal/domain/durability.go-287-	}
+internal/domain/durability.go-288-	run, e := load(tx, project, "Run", runID)
+internal/domain/durability.go-289-	if e != nil {
+internal/domain/durability.go-290-		return nil, e
+internal/domain/durability.go-291-	}
+internal/domain/durability.go-292-	revision, _ := Num(run, "revision")
+internal/domain/durability.go-293-	if revision != expectedRevision {
+internal/domain/durability.go-294-		return nil, Fail(412, "STALE_REVISION", "run changed")
+internal/domain/durability.go-295-	}
+internal/domain/durability.go-296-	task, e := load(tx, project, "Task", Str(run, "task_id"))
+internal/domain/durability.go-297-	if e != nil {
+internal/domain/durability.go-298-		return nil, e
+internal/domain/durability.go-299-	}
+internal/domain/durability.go-300-	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+internal/domain/durability.go-301-	if e != nil {
+internal/domain/durability.go-302-		return nil, e
+internal/domain/durability.go-303-	}
+internal/domain/durability.go-304-	if task["active_run_id"] != runID || task["status"] != "RUNNING" || goal["status"] != "ACTIVE" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
+internal/domain/durability.go-305-		return nil, Fail(409, "STATE_CONFLICT", "stop state retains ownership without resume")
+internal/domain/durability.go-306-	}
+internal/domain/durability.go-307-	if Str(run, "checkpoint_artifact_id") == "" {
+internal/domain/durability.go-308-		return nil, Fail(422, "GATE_FAILED", "durable checkpoint required")
+internal/domain/durability.go-309-	}
+internal/domain/durability.go-310-	checkpoint, oldUse, e := s.artifactUse(tx, project, run, Str(run, "checkpoint_artifact_id"), false)
+internal/domain/durability.go-311-	if e != nil {
+internal/domain/durability.go-312-		return nil, e
+internal/domain/durability.go-313-	}
+internal/domain/durability.go-314-	observation, e := runtimeObservation(tx, project, run)
+internal/domain/durability.go-315-	if e != nil {
+internal/domain/durability.go-316-		return nil, e
+internal/domain/durability.go-317-	}
+internal/domain/durability.go-318-	if observation["children_stopped"] != true || observation["queue_empty"] != true {
+internal/domain/durability.go-319-		return nil, Fail(422, "GATE_FAILED", "old process tree not confirmed stopped")
+internal/domain/durability.go-320-	}
+internal/domain/durability.go-321-	if e = effectsReconciled(tx, project, runID); e != nil {
+internal/domain/durability.go-322-		return nil, e
+internal/domain/durability.go-323-	}
+internal/domain/durability.go-324-	priorDispatch, dispatchErr := runtimeDispatch(tx, project, runID, run["lease_epoch"])
+internal/domain/durability.go-325-	if dispatchErr != nil && dispatchErr != sql.ErrNoRows {
+internal/domain/durability.go-326-		return nil, dispatchErr
+internal/domain/durability.go-327-	}
+internal/domain/durability.go-328-	native := dispatchErr == nil
+internal/domain/durability.go-329-	if native {
+internal/domain/durability.go-330-		if priorDispatch["manifest"].(map[string]any)["admission"].(map[string]any)["qualification_bootstrap"] == true {
+internal/domain/durability.go-331-			return nil, Fail(403, "FORBIDDEN", "qualification bootstrap cannot resume")
+internal/domain/durability.go-332-		}
+internal/domain/durability.go-333-		if _, e = nativeDispatchProof(tx, project, run, observation); e != nil {
+--
+internal/domain/durability.go:398:	if _, e = tx.Exec("INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'resumeCheckpoint',?,?,200,?,'{}',?)", p.ID, project, key, hash, Bytes(out), Now()); e != nil {
+internal/domain/durability.go-399-		return nil, e
+internal/domain/durability.go-400-	}
+internal/domain/durability.go-401-	return out, tx.Commit()
+internal/domain/durability.go-402-}
+--
+internal/domain/runtime_model_windows.go:176:	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+internal/domain/runtime_model_windows.go-177-	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+internal/domain/runtime_model_windows.go-178-		return unknown("model response persistence failed")
+internal/domain/runtime_model_windows.go-179-	}
+internal/domain/runtime_model_windows.go:180:	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+internal/domain/runtime_model_windows.go-181-		return nil, e
+internal/domain/runtime_model_windows.go-182-	}
+internal/domain/runtime_model_windows.go-183-	// Late responses may update billing/effect facts, but never regain execution authority.
+internal/domain/runtime_model_windows.go-184-	tx, _, _, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+internal/domain/runtime_model_windows.go-185-	if e != nil {
+internal/domain/runtime_model_windows.go-186-		return nil, e
+internal/domain/runtime_model_windows.go-187-	}
+internal/domain/runtime_model_windows.go-188-	tx.Rollback()
+internal/domain/runtime_model_windows.go-189-	if stream != nil {
+internal/domain/runtime_model_windows.go-190-		if e = stream.Send(ctx, withheld, true); e != nil {
+internal/domain/runtime_model_windows.go-191-			return nil, e
+internal/domain/runtime_model_windows.go-192-		}
+internal/domain/runtime_model_windows.go-193-		summary, err := stream.Terminal(ctx, Digest(raw))
+internal/domain/runtime_model_windows.go-194-		if err != nil {
+internal/domain/runtime_model_windows.go-195-			return nil, err
+internal/domain/runtime_model_windows.go-196-		}
+internal/domain/runtime_model_windows.go-197-		reply = Object{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": summary}
+internal/domain/runtime_model_windows.go-198-	}
+internal/domain/runtime_model_windows.go-199-	return reply, nil
+internal/domain/runtime_model_windows.go-200-}

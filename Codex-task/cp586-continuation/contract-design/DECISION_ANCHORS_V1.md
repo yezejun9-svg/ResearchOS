@@ -1,0 +1,11 @@
+# Binding prototype decisions
+
+These decisions supersede the earlier draft where Owner authority root was part of the stable intent key. They do not change any product API, database or LIVE gate.
+
+- Keep permission identity separate from causal identity. Store Owner/root as required authorization snapshots, but exclude project, Owner/root, new Goal/approval IDs and timestamps from the stable business anchor.
+- Qualify the business anchor with a trusted lineage issuer. Enforce `UNIQUE(lineage_issuer_ref, business_anchor)` across projects and principals within this database. A future Host must derive both from the original authoritative origin; a missing original lineage is unsupported, not permission to start a new one. SQL cannot prevent creating an unrelated database.
+- Qualify approval IDs by their actual issuer, and enforce `UNIQUE(approval_issuer_ref, approval_ref)` across this database. A missing binding or transaction rollback does not prove that an external native approval was unconsumed. Its original journal/UNKNOWN state remains authoritative.
+- Retain `PRIMARY KEY(project, task)` and `UNIQUE(project, goal)`. Do not put principal into their uniqueness scope. A first version permits one lifetime binding per qualified anchor; controlled successors/retries require a later explicit lineage design.
+- Binding bodies remain a clearly named prototype DTO. Never equate Python JSON formatting with the product hash. The existing Go `Hash` chain is `Digest(canonical.JSON(json.Marshal(value)))`; reuse and fingerprint the exact existing `internal/canonical/jcs.go` in a C-only interoperability helper. Preserve full int64 references by explicit canonical decimal strings where needed; no invented Run epoch and no arbitrary JavaScript-safe cap.
+- Enforce JSON field presence explicitly: SQLite CHECK(NULL) is not rejection. Reject duplicate/unknown fields in the consumer, compare body identity columns and actual digest, and guard INSERT conflicts so REPLACE cannot bypass immutability when recursive triggers are off.
+- This is a fresh-fixture schema/consumer candidate. Actual Owner/root authentication, approved Host plan, canonical domain lineage, backups/migrations, Task/Goal contracts and LIVE acceptance remain separate integration work.

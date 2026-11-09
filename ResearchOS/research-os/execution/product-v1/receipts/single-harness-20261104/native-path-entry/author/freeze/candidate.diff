@@ -1,0 +1,202 @@
+diff --git a/internal/host/native_folder_windows.go b/internal/host/native_folder_windows.go
+index d78d8872..e741e413 100644
+--- a/internal/host/native_folder_windows.go
++++ b/internal/host/native_folder_windows.go
+@@ -26,7 +26,10 @@ type browseInfoW struct {
+ 
+ const (
+ 	bifReturnOnlyFileSystemDirs = 0x0001
++	bifEditBox                  = 0x0010
++	bifValidate                 = 0x0020
+ 	bffmInitialized             = 1
++	bffmValidateFailedW         = 4
+ 	bffmSetSelectionW           = 0x0467
+ )
+ 
+@@ -40,26 +43,68 @@ var (
+ 	user32ShowFolder       = windows.NewLazySystemDLL("user32.dll").NewProc("ShowWindow")
+ 	user32FolderVisible    = windows.NewLazySystemDLL("user32.dll").NewProc("IsWindowVisible")
+ 	user32ForegroundFolder = windows.NewLazySystemDLL("user32.dll").NewProc("SetForegroundWindow")
+-	nativeFolderCallback   = syscall.NewCallback(func(hwnd uintptr, message uint32, _ uintptr, suggested uintptr) uintptr {
+-		if message != bffmInitialized {
+-			return 0
+-		}
+-		if suggested != 0 {
++	user32FolderMessage    = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
++	nativeFolderEffects    = nativeFolderUIEffects{
++		setSelection: func(hwnd, suggested uintptr) {
+ 			user32Send.Call(hwnd, bffmSetSelectionW, 1, suggested)
++		},
++		show: func(hwnd uintptr) { user32ShowFolder.Call(hwnd, 1) }, // SW_SHOWNORMAL.
++		visible: func(hwnd uintptr) bool {
++			visible, _, _ := user32FolderVisible.Call(hwnd)
++			return visible != 0
++		},
++		foreground:  func(hwnd uintptr) { user32ForegroundFolder.Call(hwnd) },
++		warnInvalid: warnNativeFolderInvalidPath,
++	}
++	nativeFolderCallback = syscall.NewCallback(func(hwnd uintptr, message uint32, parameter, suggested uintptr) uintptr {
++		return handleNativeFolderBrowseMessage(hwnd, message, parameter, suggested, nativeFolderEffects)
++	})
++)
++
++// nativeFolderUIEffects keeps the synchronous, owning-thread UI calls together.
++// Tests can observe these effects without opening a dialog or changing the wire API.
++type nativeFolderUIEffects struct {
++	setSelection func(hwnd, suggested uintptr)
++	show         func(hwnd uintptr)
++	visible      func(hwnd uintptr) bool
++	foreground   func(hwnd uintptr)
++	warnInvalid  func(hwnd uintptr)
++}
++
++func handleNativeFolderBrowseMessage(hwnd uintptr, message uint32, _ uintptr, suggested uintptr, ui nativeFolderUIEffects) uintptr {
++	switch message {
++	case bffmValidateFailedW:
++		// SHBrowseForFolderW supplies an unbounded UTF-16 path pointer here.
++		// Do not read or retain it: a fixed warning is enough, and only a
++		// subsequently confirmed Shell PIDL may become a selected path.
++		ui.warnInvalid(hwnd)
++		return 1 // Keep the chooser open after invalid input.
++	case bffmInitialized:
++		if suggested != 0 {
++			ui.setSelection(hwnd, suggested)
+ 		}
+ 		// A background Core starts with STARTF_USESHOWWINDOW/SW_HIDE. Windows
+ 		// may apply that startup state to the first ShowWindow call. Show only
+ 		// this Shell-owned chooser, then repeat if the startup state hid it.
+ 		// All calls finish on its owning thread; no deferred HWND survives it.
+-		user32ShowFolder.Call(hwnd, 1) // SW_SHOWNORMAL, never SW_SHOWDEFAULT.
+-		if visible, _, _ := user32FolderVisible.Call(hwnd); visible == 0 {
+-			user32ShowFolder.Call(hwnd, 1)
++		ui.show(hwnd)
++		if !ui.visible(hwnd) {
++			ui.show(hwnd)
+ 		}
+ 		// Foreground activation is best-effort under Windows focus rules.
+-		user32ForegroundFolder.Call(hwnd)
+-		return 0
+-	})
+-)
++		ui.foreground(hwnd)
++	}
++	return 0
++}
++
++func warnNativeFolderInvalidPath(hwnd uintptr) {
++	// These fixed strings cannot contain embedded NULs. Never echo invalid input.
++	text, _ := windows.UTF16PtrFromString("文件夹路径无效或不存在。请输入已有的文件夹路径后重试。")
++	title, _ := windows.UTF16PtrFromString("ResearchOS")
++	user32FolderMessage.Call(hwnd, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x30) // MB_OK | MB_ICONWARNING.
++	runtime.KeepAlive(text)
++	runtime.KeepAlive(title)
++}
+ 
+ // chooseNativeFolderWindows is called only after the pipe ACL and peer SID
+ // checks. A client-supplied path merely preselects the dialog; the returned
+@@ -87,7 +132,7 @@ func chooseNativeFolderWindows(initial string) (string, error) {
+ 	}
+ 	var display [260]uint16
+ 	info := browseInfoW{displayName: &display[0], title: title,
+-		flags: bifReturnOnlyFileSystemDirs, callback: nativeFolderCallback,
++		flags: bifReturnOnlyFileSystemDirs | bifEditBox | bifValidate, callback: nativeFolderCallback,
+ 		callbackArg: uintptr(unsafe.Pointer(initialPath))}
+ 	selected, _, _ := shell32Browse.Call(uintptr(unsafe.Pointer(&info)))
+ 	runtime.KeepAlive(initialPath)
+diff --git a/internal/host/native_folder_windows_test.go b/internal/host/native_folder_windows_test.go
+index 8d7cbb64..f2aa0c92 100644
+--- a/internal/host/native_folder_windows_test.go
++++ b/internal/host/native_folder_windows_test.go
+@@ -265,3 +265,92 @@ func TestNativeFolderHiddenHelper(t *testing.T) {
+ 	ole32Uninitialize.Call()
+ 	emit(nativeFolderObservation{Event: "com-balanced-and-fail-closed"})
+ }
++
++func recordingNativeFolderUI(events *[]string, visible bool) nativeFolderUIEffects {
++	return nativeFolderUIEffects{
++		setSelection: func(hwnd, suggested uintptr) {
++			*events = append(*events, fmt.Sprintf("select:%x:%x", hwnd, suggested))
++		},
++		show: func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("show:%x", hwnd)) },
++		visible: func(hwnd uintptr) bool {
++			*events = append(*events, fmt.Sprintf("visible:%x", hwnd))
++			return visible
++		},
++		foreground:  func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("foreground:%x", hwnd)) },
++		warnInvalid: func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("warning:%x", hwnd)) },
++	}
++}
++
++func TestNativeFolderValidationCallbackRetainsOwnedDialog(t *testing.T) {
++	for _, parameter := range []uintptr{0, 1, ^uintptr(0)} {
++		var events []string
++		// 4 is BFFM_VALIDATEFAILEDW; neither Shell's invalid-text parameter nor
++		// the suggested-path pointer is valid memory in this test.
++		result := handleNativeFolderBrowseMessage(0x25, 4, parameter, ^uintptr(0), recordingNativeFolderUI(&events, false))
++		if result != 1 || strings.Join(events, ",") != "warning:25" {
++			t.Fatalf("invalid Unicode input must warn its owner once and retain chooser: result=%d events=%v", result, events)
++		}
++	}
++}
++
++func TestNativeFolderValidationIgnoresOtherMessages(t *testing.T) {
++	// ANSI validation is 3, not the W chooser's message 4. Selection-change
++	// and unknown notifications must not read either pointer or perform UI.
++	for _, message := range []uint32{0, 2, 3, 5, 0xffffffff} {
++		var events []string
++		result := handleNativeFolderBrowseMessage(0x25, message, 1, ^uintptr(0), recordingNativeFolderUI(&events, false))
++		if result != 0 || len(events) != 0 {
++			t.Fatalf("message %d: result=%d events=%v", message, result, events)
++		}
++	}
++}
++
++func TestNativeFolderInitializationEffectsPreserved(t *testing.T) {
++	for _, visible := range []bool{false, true} {
++		for _, suggested := range []uintptr{0, 0x1234} {
++			t.Run(fmt.Sprintf("visible=%v/suggested=%x", visible, suggested), func(t *testing.T) {
++				var events, want []string
++				if suggested != 0 {
++					want = append(want, "select:25:1234")
++				}
++				want = append(want, "show:25", "visible:25")
++				if !visible {
++					want = append(want, "show:25")
++				}
++				want = append(want, "foreground:25")
++				result := handleNativeFolderBrowseMessage(0x25, 1, ^uintptr(0), suggested, recordingNativeFolderUI(&events, visible))
++				if result != 0 || strings.Join(events, ",") != strings.Join(want, ",") {
++					t.Fatalf("initialization changed: result=%d events=%v want=%v", result, events, want)
++				}
++			})
++		}
++	}
++}
++
++func TestNativeFolderCancelledChoiceDoesNotGrant(t *testing.T) {
++	for _, withPath := range []bool{false, true} {
++		t.Run(fmt.Sprintf("error-with-path=%v", withPath), func(t *testing.T) {
++			h := firstUseHost(t)
++			frame := nativeFirstUseFrame(t, KindWorkspaceChooseRequest,
++				map[string]any{"requested_path": nil, "requested_access": AccessReadWrite})
++			picked := ""
++			if withPath {
++				picked = t.TempDir()
++			}
++			calls := 0
++			reply, err := h.HandleNative(frame, true, func(initial string) (string, error) {
++				calls++
++				if initial != "" {
++					t.Fatalf("unexpected initial path %q", initial)
++				}
++				return picked, fmt.Errorf("%w: folder selection cancelled", ErrFrameShape)
++			})
++			if calls != 1 || reply != nil || !errors.Is(err, ErrFrameShape) {
++				t.Fatalf("cancel result: calls=%d reply=%s err=%v", calls, reply, err)
++			}
++			if len(h.Roots()) != 0 || h.selections.Outstanding() != 0 {
++				t.Fatalf("cancel granted authority: roots=%d selections=%d", len(h.Roots()), h.selections.Outstanding())
++			}
++		})
++	}
++}

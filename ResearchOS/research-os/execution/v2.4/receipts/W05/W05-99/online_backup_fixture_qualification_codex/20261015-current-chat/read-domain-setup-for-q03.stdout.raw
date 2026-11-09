@@ -1,0 +1,187 @@
+internal/domain\domain_test.go:24:type fixture struct {
+internal/domain\domain_test.go-25-	s                     *Service
+internal/domain\domain_test.go-26-	h                     http.Handler
+internal/domain\domain_test.go-27-	token, owner, project string
+internal/domain\domain_test.go-28-	db                    *sql.DB
+internal/domain\domain_test.go-29-	t                     *testing.T
+internal/domain\domain_test.go-30-}
+internal/domain\domain_test.go-31-
+internal/domain\domain_test.go-32-// Connect before sending any fixture business request. Windows loopback can
+internal/domain\domain_test.go-33-// transiently reject a newly opened listener; never replay a submitted request.
+internal/domain\domain_test.go-34-func fixtureConnect(t *testing.T, server *httptest.Server) net.Conn {
+internal/domain\domain_test.go-35-	t.Helper()
+internal/domain\domain_test.go-36-	var last error
+internal/domain\domain_test.go-37-	for attempt := 1; attempt <= 3; attempt++ {
+internal/domain\domain_test.go-38-		conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), 2*time.Second)
+internal/domain\domain_test.go-39-		if err == nil {
+internal/domain\domain_test.go-40-			return conn
+internal/domain\domain_test.go-41-		}
+internal/domain\domain_test.go-42-		last = err
+internal/domain\domain_test.go-43-		t.Logf("fixture connection attempt %d failed: %v", attempt, err)
+internal/domain\domain_test.go-44-	}
+internal/domain\domain_test.go-45-	t.Fatalf("fixture listener unavailable after three connection attempts: %v", last)
+internal/domain\domain_test.go-46-	return nil
+internal/domain\domain_test.go-47-}
+internal/domain\domain_test.go-48-
+internal/domain\domain_test.go-49-func fixtureHTTPProbe(client *http.Client, url string) (Object, error) {
+internal/domain\domain_test.go-50-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+internal/domain\domain_test.go-51-	defer cancel()
+internal/domain\domain_test.go-52-	probe, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+internal/domain\domain_test.go-53-	response, err := client.Do(probe)
+internal/domain\domain_test.go-54-	entry := Object{"url": url, "status": nil, "error": nil}
+internal/domain\domain_test.go-55-	if err == nil {
+internal/domain\domain_test.go-56-		entry["status"] = response.StatusCode
+internal/domain\domain_test.go-57-		_, err = io.Copy(io.Discard, response.Body)
+internal/domain\domain_test.go-58-		response.Body.Close()
+internal/domain\domain_test.go-59-	}
+internal/domain\domain_test.go-60-	if err != nil {
+internal/domain\domain_test.go-61-		entry["error"] = err.Error()
+internal/domain\domain_test.go-62-	}
+internal/domain\domain_test.go-63-	return entry, err
+internal/domain\domain_test.go-64-}
+internal/domain\domain_test.go-65-
+internal/domain\domain_test.go-66-// A child process cannot replace its parent's provider URL. Only its read-only
+internal/domain\domain_test.go-67-// probe may retry; the subsequent effect request remains single-shot.
+internal/domain\domain_test.go-68-func fixtureHTTPReady(t *testing.T, client *http.Client, url string) {
+internal/domain\domain_test.go-69-	t.Helper()
+internal/domain\domain_test.go-70-	for attempt := 1; attempt <= 3; attempt++ {
+internal/domain\domain_test.go-71-		entry, err := fixtureHTTPProbe(client, url)
+internal/domain\domain_test.go-72-		if err == nil {
+internal/domain\domain_test.go-73-			if entry["status"] != 404 {
+internal/domain\domain_test.go-74-				t.Fatalf("unexpected fixture readiness response: %v", entry)
+internal/domain\domain_test.go-75-			}
+internal/domain\domain_test.go-76-			return
+internal/domain\domain_test.go-77-		}
+internal/domain\domain_test.go-78-		t.Logf("fixture read-only probe %d: %v", attempt, err)
+internal/domain\domain_test.go-79-	}
+internal/domain\domain_test.go-80-	t.Fatal("fixture provider unavailable after three read-only probes")
+internal/domain\domain_test.go-81-}
+internal/domain\domain_test.go-82-
+internal/domain\domain_test.go-83-// Windows can bind a loopback port that remains unreachable. Retry startup on
+internal/domain\domain_test.go-84-// fresh listeners before handing the URL to a caller; never replay business IO.
+internal/domain\domain_test.go-85-func fixtureHTTPServer(t *testing.T, handler http.Handler) (*httptest.Server, []any) {
+internal/domain\domain_test.go-86-	t.Helper()
+internal/domain\domain_test.go-87-	readiness := Empty()
+internal/domain\domain_test.go-88-	for attempt := 0; attempt < 3; attempt++ {
+internal/domain\domain_test.go-89-		server := httptest.NewServer(handler)
+internal/domain\domain_test.go-90-		url := server.URL + "/__researchos_fixture_readiness__"
+internal/domain\domain_test.go-91-		entry, err := fixtureHTTPProbe(server.Client(), url)
+internal/domain\domain_test.go-92-		entry["attempt"] = attempt + 1
+internal/domain\domain_test.go-93-		readiness = append(readiness, entry)
+internal/domain\domain_test.go-94-		if err == nil {
+internal/domain\domain_test.go-95-			if entry["status"] != 404 {
+internal/domain\domain_test.go-96-				server.Close()
+internal/domain\domain_test.go-97-				t.Fatalf("unexpected fixture readiness response: %v", entry)
+internal/domain\domain_test.go-98-			}
+internal/domain\domain_test.go-99-			return server, readiness
+internal/domain\domain_test.go-100-		}
+internal/domain\domain_test.go-101-		server.Close()
+internal/domain\domain_test.go-102-		t.Logf("fixture startup attempt %d failed before business IO: %v", attempt+1, err)
+internal/domain\domain_test.go-103-		if attempt == 2 {
+internal/domain\domain_test.go-104-			t.Fatalf("fixture unavailable after three fresh listeners: %v", err)
+internal/domain\domain_test.go-105-		}
+internal/domain\domain_test.go-106-	}
+internal/domain\domain_test.go-107-	return nil, readiness
+internal/domain\domain_test.go-108-}
+internal/domain\domain_test.go-109-
+internal/domain\domain_test.go-110-func TestFixtureHTTPStartupRecovery(t *testing.T) {
+internal/domain\domain_test.go-111-	var probes, business atomic.Int32
+internal/domain\domain_test.go-112-	server, attempts := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+internal/domain\domain_test.go-113-		if r.URL.Path == "/__researchos_fixture_readiness__" {
+internal/domain\domain_test.go-114-			if probes.Add(1) == 1 {
+internal/domain\domain_test.go-115-				conn, _, err := w.(http.Hijacker).Hijack()
+internal/domain\domain_test.go-116-				if err == nil {
+--
+internal/domain\domain_test.go:141:func setup(t *testing.T) *fixture {
+internal/domain\domain_test.go-142-	return setupWithConstructor(t, New)
+internal/domain\domain_test.go-143-}
+internal/domain\domain_test.go-144-
+internal/domain\domain_test.go-145-func setupWithConstructor(t *testing.T, construct func(*sql.DB, string, string) (*Service, error)) *fixture {
+internal/domain\domain_test.go-146-	t.Helper()
+internal/domain\domain_test.go-147-	db, e := store.Open(filepath.Join(t.TempDir(), "domain.sqlite"))
+internal/domain\domain_test.go-148-	if e != nil {
+internal/domain\domain_test.go-149-		t.Fatal(e)
+internal/domain\domain_test.go-150-	}
+internal/domain\domain_test.go-151-	t.Cleanup(func() { db.Close() })
+internal/domain\domain_test.go-152-	if e = store.Bootstrap(context.Background(), db, "../../migrations/sqlite/0001_bootstrap.sql"); e != nil {
+internal/domain\domain_test.go-153-		t.Fatal(e)
+internal/domain\domain_test.go-154-	}
+internal/domain\domain_test.go-155-	s, e := construct(db, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql")
+internal/domain\domain_test.go-156-	if e != nil {
+internal/domain\domain_test.go-157-		t.Fatal(e)
+internal/domain\domain_test.go-158-	}
+internal/domain\domain_test.go-159-	p := Principal{ID: "fixture-owner", Roles: []string{"OWNER"}, CanCreateProject: true}
+internal/domain\domain_test.go-160-	if e = s.ProvisionPrincipal(context.Background(), p); e != nil {
+internal/domain\domain_test.go-161-		t.Fatal(e)
+internal/domain\domain_test.go-162-	}
+internal/domain\domain_test.go-163-	token, e := s.IssueCredential(context.Background(), p.ID, time.Minute)
+internal/domain\domain_test.go-164-	if e != nil {
+internal/domain\domain_test.go-165-		t.Fatal(e)
+internal/domain\domain_test.go-166-	}
+internal/domain\domain_test.go-167-	return &fixture{s: s, h: s.Handler(), token: token, owner: p.ID, db: db, t: t}
+internal/domain\domain_test.go-168-}
+internal/domain\domain_test.go-169-func (f *fixture) request(method, path, key, etag string, body any) (int, Object, http.Header) {
+internal/domain\domain_test.go-170-	f.t.Helper()
+internal/domain\domain_test.go-171-	var raw []byte
+internal/domain\domain_test.go-172-	if body != nil {
+internal/domain\domain_test.go-173-		switch v := body.(type) {
+internal/domain\domain_test.go-174-		case []byte:
+internal/domain\domain_test.go-175-			raw = v
+internal/domain\domain_test.go-176-		default:
+internal/domain\domain_test.go-177-			raw = Bytes(v)
+internal/domain\domain_test.go-178-		}
+internal/domain\domain_test.go-179-	}
+internal/domain\domain_test.go-180-	r := httptest.NewRequest(method, path, bytes.NewReader(raw))
+internal/domain\domain_test.go-181-	r.Header.Set("Authorization", "Bearer "+f.token)
+internal/domain\domain_test.go-182-	if key != "" {
+internal/domain\domain_test.go-183-		r.Header.Set("Idempotency-Key", key)
+internal/domain\domain_test.go-184-	}
+internal/domain\domain_test.go-185-	if etag != "" {
+internal/domain\domain_test.go-186-		r.Header.Set("If-Match", etag)
+internal/domain\domain_test.go-187-	}
+internal/domain\domain_test.go-188-	w := httptest.NewRecorder()
+internal/domain\domain_test.go-189-	f.h.ServeHTTP(w, r)
+internal/domain\domain_test.go-190-	var o Object
+internal/domain\domain_test.go-191-	json.Unmarshal(w.Body.Bytes(), &o)
+internal/domain\domain_test.go-192-	return w.Code, o, w.Header()
+internal/domain\domain_test.go-193-}
+internal/domain\domain_test.go-194-func (f *fixture) expect(status int, method, path, key, etag string, b any) Object {
+internal/domain\domain_test.go-195-	f.t.Helper()
+internal/domain\domain_test.go-196-	got, o, _ := f.request(method, path, key, etag, b)
+internal/domain\domain_test.go-197-	if got != status {
+internal/domain\domain_test.go-198-		f.t.Fatalf("%s %s: status %d want %d body %s", method, path, got, status, Bytes(o))
+internal/domain\domain_test.go-199-	}
+internal/domain\domain_test.go-200-	return o
+internal/domain\domain_test.go-201-}
+internal/domain\domain_test.go-202-func projectBody() Object {
+internal/domain\domain_test.go-203-	return Object{"name": "ResearchOS fixture", "intent": "verify foundation", "facts": Empty(), "accepted_scope": []any{"fixture"}, "constraints": Empty(), "source_configs": Empty(), "source_document_refs": Empty(), "read_snapshot_ids": Empty()}
+internal/domain\domain_test.go-204-}
+internal/domain\domain_test.go-205-func (f *fixture) createProject() Object {
+internal/domain\domain_test.go-206-	o := f.expect(201, "POST", "/v1/projects", ID(), "", projectBody())
+internal/domain\domain_test.go-207-	f.project = Str(o, "project_id")
+internal/domain\domain_test.go-208-	return o
+internal/domain\domain_test.go-209-}
+internal/domain\domain_test.go-210-func (f *fixture) path(s string) string { return "/v1/projects/" + f.project + s }
+internal/domain\domain_test.go-211-func (f *fixture) stateTag() string {
+internal/domain\domain_test.go-212-	return testTag(f.expect(200, "GET", f.path("/state"), "", "", nil))
+internal/domain\domain_test.go-213-}
+internal/domain\domain_test.go-214-func requirementBody() Object {
+internal/domain\domain_test.go-215-	return Object{"requirement_key": "REQ-1", "text": "persist fixture evidence", "basis": "USER_STATED", "source_refs": Empty(), "rationale": "explicit synthetic fixture", "supersedes_id": nil, "acceptance_check_ids": Empty()}
+internal/domain\domain_test.go-216-}
+internal/domain\domain_test.go-217-func (f *fixture) requirement() Object {
+internal/domain\domain_test.go-218-	o := f.expect(201, "POST", f.path("/requirements"), ID(), f.stateTag(), requirementBody())
+internal/domain\domain_test.go-219-	return f.expect(200, "POST", f.path("/requirements/"+Str(o, "id")+"/actions"), ID(), testTag(o), Object{"action": "ACCEPT", "reason": "explicit fixture requirement", "source_validation_refs": Empty()})
+internal/domain\domain_test.go-220-}
+internal/domain\domain_test.go-221-func TestW03SchemaMigrationDefaults(t *testing.T) {
+internal/domain\domain_test.go-222-	f := setup(t)
+internal/domain\domain_test.go-223-	p := f.createProject()
+internal/domain\domain_test.go-224-	if p["project_id"] != p["id"] {
+internal/domain\domain_test.go-225-		t.Fatal("project identity mismatch")
+internal/domain\domain_test.go-226-	}
+internal/domain\domain_test.go-227-	for _, url := range []string{"/v1/policies/budget", f.path("/budget-policy")} {
+internal/domain\domain_test.go-228-		o := f.expect(200, "GET", url, "", "", nil)
+internal/domain\domain_test.go-229-		if o["cap"] != nil || o["mode"] != "UNLIMITED_AMOUNT" {
+internal/domain\domain_test.go-230-			t.Fatal(o)
+internal/domain\domain_test.go-231-		}
+internal/domain\domain_test.go-232-	}
+internal/domain\domain_test.go-233-	o := f.expect(200, "GET", f.path("/run-policy"), "", "", nil)

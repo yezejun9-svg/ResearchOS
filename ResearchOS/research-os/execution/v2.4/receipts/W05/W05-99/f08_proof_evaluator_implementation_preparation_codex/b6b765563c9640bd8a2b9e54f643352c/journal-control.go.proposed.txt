@@ -1,0 +1,106 @@
+// Sole-journal closure. All raw digests below consume the hex-decoded original
+// SQL column bytes; re-encoding a response never substitutes for those bytes.
+func (v *f08ProofValidator) journalEnvelope(s *f08Sources,row []any)(map[string]any,map[string]any,error){
+	if e:=f08ValidateTuple("idempotency",row);e!=nil{return nil,nil,e}
+	if row[2]!="v2:session.control" || row[10]!="text" || row[9]!="text" && row[9]!="blob"{return nil,nil,f08Binding}
+	hraw,e:=f08Hex(row[7]);if e!=nil || len(hraw)>f08HeaderMaximum{return nil,nil,f08Header}
+	h,_,e:=f08Strict(hraw);if e!=nil{return nil,nil,e};hm,e:=f08Object(h,"schema","encoding","raw_envelope_base64");if e!=nil{return nil,nil,e}
+	encoded,ok:=hm["raw_envelope_base64"].(string);if !ok || len(encoded)>f08Base64Maximum || hm["schema"]!=f08HeaderSchema || hm["encoding"]!="base64"{return nil,nil,f08Header}
+	canonicalHeader,e:=json.Marshal(struct{Schema string `json:"schema"`;Encoding string `json:"encoding"`;Raw string `json:"raw_envelope_base64"`}{f08HeaderSchema,"base64",encoded});if e!=nil || !bytes.Equal(canonicalHeader,hraw){return nil,nil,f08Header}
+	raw,e:=base64.StdEncoding.Strict().DecodeString(encoded);if e!=nil || len(raw)==0 || len(raw)>f08EnvelopeMaximum || base64.StdEncoding.EncodeToString(raw)!=encoded{return nil,nil,f08Header}
+	parsed,_,e:=f08Strict(raw);if e!=nil{return nil,nil,e};env,e:=f08Object(parsed,"protocol_version","command_id","client_id","project_id","session_id","expected_revision","writer_epoch","method","payload");if e!=nil{return nil,nil,e}
+	if env["method"]!="session.control" || env["project_id"]!=row[1] || env["command_id"]!=row[3] || env["protocol_version"]!=ProtocolV2{return nil,nil,f08Binding}
+	if e=v.protocol.ValidateDefInput("CommandEnvelope",env);e!=nil{return nil,nil,f08Schema}
+	decoded,e:=DecodeEnvelope(raw);if e!=nil{return nil,nil,f08Schema};q,e:=decoded.ContentHash();if e!=nil || q!=row[4]{return nil,nil,f08Binding}
+	id,e:=s.one("identities",[]int{0,1},[]any{row[0],row[3]});if e!=nil{return nil,nil,e}
+	if id[2]!=ProtocolV2 || id[3]!=row[1] || id[4]!=env["method"] || id[5]!=row[2] || id[6]!=row[4]{return nil,nil,f08Binding}
+	body,rawBody,e:=f08RawObject(row[6]);if e!=nil{return nil,nil,e}
+	if e=v.protocol.ValidateDef("CommandResponse",body);e!=nil{return nil,nil,f08Schema}
+	response,e:=DecodeResponse(rawBody);if e!=nil{return nil,nil,f08Schema};if e=ValidateResultAgainstMethod("session.control",response,v.protocol);e!=nil{return nil,nil,f08Schema}
+	for _,key:=range []string{"protocol_version","command_id","method","session_id"}{if !f08Equal(body[key],env[key]){return nil,nil,f08Binding}}
+	return env,body,nil
+}
+func f08ControlLocator(row []any)[]any{return []any{row[0],row[1],row[2],row[5]}}
+func f08JournalLocator(row []any)[]any{return []any{row[0],row[1],row[3],row[4]}}
+
+func (v *f08ProofValidator) finalResponse(s *f08Sources,g *f08Group,currentRaw []byte,oldRaw []byte)error{
+	a,e:=f08FindGroup(s,"admitted",g.row[:4]);if e!=nil{return e};req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	header,e:=f08Hex(a.row[5]);if e!=nil{return e}
+	mode:=int64(1);if g.root["completion_mode"]=="ACK_TO_COMPLETED"{mode=2}else if g.root["completion_mode"]!="ORIGINAL_COMPLETED"{return f08Shape}
+	proof:=map[string]any{"admitted_root_hash":a.rootHash,"original_response_digest":g.root["original_response_digest"],"final_root_hash":g.rootHash,"final_response_digest":g.root["final_response_digest"],"final_snapshot_binding":g.root["final_snapshot_binding"]}
+	binding,e:=f08Encode(map[string]any{"identity":req.identity,"response_proof":proof});if e!=nil{return e}
+	return f08Response(v.protocol,header,binding,oldRaw,currentRaw,mode)
+}
+
+func (v *f08ProofValidator) control(s *f08Sources,action string,old,row []any)error{
+	if e:=f08ValidateTuple("controls",row);e!=nil{return e}
+	if action=="control.update"{
+		if e:=f08ValidateTuple("controls",old);e!=nil{return e};actual,e:=s.one("controls",[]int{0,1,2},old[:3]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+		if !f08RetainedColumns(old,row,8,9,10){return f08Binding}
+		if f08Equal(row,old){return nil}
+		// Existing genuine recovery can move only its pending state. It does
+		// not create original membership, change bytes or finalize legacy ACK.
+		if old[8]=="REQUESTED" && row[8]=="RECONCILING" && f08RetainedColumns(old,row,8){return nil}
+		if old[8]=="CONFIRMED" || old[9]!=nil && old[9]!=row[9] || old[10]!=nil && old[10]!=row[10]{return f08Binding}
+	}else if action!="control.insert"{return f08Mode}
+	a,e:=f08FindGroup(s,"admitted",f08ControlLocator(row));if e!=nil{return e}
+	if _,e=v.admitted(s,a.row,false);e!=nil{return e};if e=v.completeMaterializations(s,a);e!=nil{return e}
+	req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	tasks,_,e:=f08JSONHex(row[7]);if e!=nil || !f08Equal(tasks,a.root["member_task_ids"]) || row[3]!=req.session || row[4]!="ctrl-"+req.command || row[6]!=req.target{return f08Binding}
+	if action=="control.insert"{if row[8]!="REQUESTED" || row[9]!=nil || row[10]!=nil || len(s.selectRows("controls",[]int{0,1,2},row[:3]))!=0{return f08Binding};return nil}
+	if row[8]!="REQUESTED" && row[8]!="RECONCILING" && row[8]!="CONFIRMED"{return f08Shape}
+	if row[10]==nil{
+		if row[8]=="CONFIRMED" || row[8]!=old[8] || old[9]!=nil || row[9]==nil || len(s.selectRows("final",[]int{0,1,2,3},a.row[:4]))!=0{return f08Binding}
+		raw,e:=f08Hex(row[9]);if e!=nil{return e};_,e=v.responseBody(req,raw,"ACKNOWLEDGED");return e
+	}
+	f,e:=f08FindGroup(s,"final",a.row[:4]);if e!=nil{return e};if _,e=v.finalGroup(s,f.row,true);e!=nil{return e}
+	if e=v.completeMaterializations(s,f);e!=nil{return e}
+	raw,e:=f08Hex(row[10]);if e!=nil{return e};var prior []byte
+	if f.root["completion_mode"]=="ACK_TO_COMPLETED"{prior,e=f08Hex(row[9]);if e!=nil{return e}}else if row[9]!=row[10]{return f08Binding}
+	if e=v.finalResponse(s,f,raw,prior);e!=nil{return e}
+	// Both staged final bytes (same pending state) and the subsequent genuine
+	// CONFIRMED transition bind this already-complete group. SQL deferred
+	// commit obligation still requires the sole journal completed write.
+	if row[8]!=old[8] && row[8]!="CONFIRMED"{return f08Binding};return nil
+}
+
+func (v *f08ProofValidator) journal(s *f08Sources,action string,old,row []any)error{
+	if action=="commit.insert"{
+		if e:=f08ValidateTuple("commits",row);e!=nil{return e};f,e:=f08FindGroup(s,"final",row[:4]);if e!=nil{return e}
+		if row[4]!=f.rootHash || row[5]!=f.root["original_response_digest"] || row[6]!=f.root["final_response_digest"]{return f08Binding}
+		j,e:=s.one("idempotency",[]int{0,1,2,3},[]any{row[0],row[1],"v2:session.control",row[2]});if e!=nil{return e}
+		return v.completedJournal(s,j,f)
+	}
+	if action!="journal.insert" && action!="journal.update"{return f08Mode}
+	env,response,e:=v.journalEnvelope(s,row);if e!=nil{return e}
+	if action=="journal.update"{
+		if e=f08ValidateTuple("idempotency",old);e!=nil{return e};actual,e:=s.one("idempotency",[]int{0,1,2,3},old[:4]);if e!=nil || !f08Equal(actual,old){return f08Binding}
+		if !f08RetainedColumns(old,row,6) || old[6]==row[6]{return f08Binding}
+	}else if len(s.selectRows("idempotency",[]int{0,1,2,3},row[:4]))!=0{return f08Binding}
+	payload,ok:=env["payload"].(map[string]any);if !ok{return f08Shape};locator:=f08JournalLocator(row)
+	if payload["action"]!="CANCEL" || response["status"]=="REJECTED"{
+		// F08 does not confer PAUSE/RESUME authority or alter typed rejection
+		// business semantics. No witness/control may survive this branch.
+		if action!="journal.insert" || len(s.selectRows("admitted",[]int{0,1,2,3},locator))!=0 || len(s.selectRows("final",[]int{0,1,2,3},locator))!=0 || len(s.selectRows("controls",[]int{0,1,2,5},locator))!=0{return f08Binding};return nil
+	}
+	a,e:=f08FindGroup(s,"admitted",locator);if e!=nil{return e};if _,e=v.admitted(s,a.row,false);e!=nil{return e};if e=v.completeMaterializations(s,a);e!=nil{return e}
+	if row[7]!=a.row[5]{return f08Binding};req,e:=v.groupRequest(s,a);if e!=nil{return e}
+	c,e:=s.one("controls",[]int{0,1,2,5},locator);if e!=nil{return e}
+	if response["status"]=="ACKNOWLEDGED"{
+		if action!="journal.insert" || c[8]=="CONFIRMED" || c[9]!=row[6] || c[10]!=nil || len(s.selectRows("final",[]int{0,1,2,3},locator))!=0{return f08Binding}
+		raw,e:=f08Hex(row[6]);if e!=nil{return e};_,e=v.responseBody(req,raw,"ACKNOWLEDGED");return e
+	}
+	if response["status"]!="COMPLETED"{return f08Binding}
+	f,e:=f08FindGroup(s,"final",locator);if e!=nil{return e}
+	if action=="journal.update"{if f.root["completion_mode"]!="ACK_TO_COMPLETED" || old[6]!=c[9]{return f08Binding}}else if f.root["completion_mode"]!="ORIGINAL_COMPLETED"{return f08Binding}
+	return v.completedJournal(s,row,f)
+}
+func (v *f08ProofValidator) completedJournal(s *f08Sources,row []any,f *f08Group)error{
+	_,response,e:=v.journalEnvelope(s,row);if e!=nil || response["status"]!="COMPLETED"{return f08Binding}
+	if _,e=v.finalGroup(s,f.row,true);e!=nil{return e};if e=v.completeMaterializations(s,f);e!=nil{return e}
+	c,e:=s.one("controls",[]int{0,1,2,5},f.row[:4]);if e!=nil || c[8]!="CONFIRMED" || c[10]!=row[6] || c[9]==nil{return f08Binding}
+	a,e:=f08FindGroup(s,"admitted",f.row[:4]);if e!=nil || row[7]!=a.row[5]{return f08Binding}
+	raw,e:=f08Hex(row[6]);if e!=nil{return e};var prior []byte
+	if f.root["completion_mode"]=="ACK_TO_COMPLETED"{prior,e=f08Hex(c[9]);if e!=nil{return e}}else if c[9]!=row[6]{return f08Binding}
+	return v.finalResponse(s,f,raw,prior)
+}

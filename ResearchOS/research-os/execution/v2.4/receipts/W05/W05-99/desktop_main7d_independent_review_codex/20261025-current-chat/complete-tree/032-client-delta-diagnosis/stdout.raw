@@ -1,0 +1,25 @@
+# only after exact new before/after manifests match the independently checked r2 set.
+client=A/'client-wire-builder';inputs=read(client/'inputs.before.json');after=read(client/'inputs.after.json')
+oldclient=A.parent/'build-01/client-wire-builder';oldinputs=read(oldclient/'inputs.before.json')
+assert len(inputs)==len(oldinputs)==6451
+by={r['path']:r for r in inputs};oldby={r['path']:r for r in oldinputs}
+changed_inputs=[p for p in by.keys()&oldby.keys() if by[p]!=oldby[p]]
+assert changed_inputs==[str(W/'tests/ui/desktop/development-launcher.test.mjs')],changed_inputs
+new_paths=by.keys()-oldby.keys();old_paths=oldby.keys()-by.keys()
+assert len(new_paths)==len(old_paths)==1
+new_fixture=next(iter(new_paths));old_fixture=next(iter(old_paths))
+assert pathlib.Path(new_fixture).is_relative_to(W/'.local') and pathlib.Path(new_fixture).as_posix().endswith('/fixtures/negative-child.go')
+assert (by[new_fixture]['sha256'],by[new_fixture]['bytes'])==(oldby[old_fixture]['sha256'],oldby[old_fixture]['bytes'])
+for p in changed_inputs+list(new_paths):check(by[p])
+assert len(after)==len(inputs) and all(r['sha256']==r['current_sha256'] for r in after)
+assert [{k:v for k,v in r.items() if k!='current_sha256'} for r in after]==inputs
+bound=hashlib.sha256(json.dumps(inputs,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+assert bound==manifest['client_wire']['build_input_digest']
+desc=read(B/'apps/desktop/resources/client-wire/descriptor.json')
+assert desc['build_input_digest']==bound and desc['binary_sha256']==sha(B/'apps/desktop/resources/client-wire/researchos-client-wire-validator.exe')
+for r in desc['exact_module_source_inventory']:assert sha(B/'apps/desktop'/r['path'])==r['sha256']
+for r in desc['compiled_React_asset_inventory']:assert sha(B/'apps/web/dist'/r['path'])==r['sha256']
+commands={}
+for p in (A/'commands').iterdir():
+    value=read(p/'result.json');assert value['native_exit']==0
+    assert value['stdout_sha256']==sha(p/'stdout.raw') and value['stderr_sha256']==sha(p/'stderr.raw')

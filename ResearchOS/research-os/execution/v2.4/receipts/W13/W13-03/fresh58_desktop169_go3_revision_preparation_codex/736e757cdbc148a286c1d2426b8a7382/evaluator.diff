@@ -1,0 +1,94 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\fresh58_desktop169_go3_controller_preparation_codex\52998fc9c4d64166b10aa02e6eca11e4\fixture_evaluator.proposed.py
++++ fixture_evaluator.v2.proposed.py
+@@ -9,6 +9,53 @@
+     b=p.read_bytes();return {'path':str(p),'sha256':hashlib.sha256(b).hexdigest(),'bytes':len(b)}
+ def verify(p,row):
+     r=rawref(p);need(r['sha256']==row['sha256'] and r['bytes']==row['bytes'],'Fixture raw digest mismatch');return r
++def observer_lifecycle(rows,parent,seen_pids):
++    need(rows and rows[0]['kind']=='observer-start' and rows[-1]['kind']=='observer-exit','Observer lifetime missing')
++    pid=rows[0]['pid']
++    need(type(pid) is int and pid>0 and parent.name==str(pid) and pid not in seen_pids,'Duplicate/foreign observer PID')
++    seen_pids.add(pid)
++    need(all(type(r['pid']) is int and r['pid']==pid and type(r['sequence']) is int for r in rows),'Observer PID/sequence type')
++    need([r['sequence'] for r in rows]==list(range(1,len(rows)+1)),'Observer sequence gap/duplicate')
++    requests={}
++    for event in rows[1:-1]:
++        kind=event['kind'];rid=event.get('id')
++        need(kind in ['request-received','request-body-complete','response-call-returned','response-finish','response-close'],
++             'Unknown/error/incomplete observer event')
++        need(type(rid) is int and rid>0,'Request id type')
++        if kind=='request-received':
++            need(rid not in requests and rid==len(requests)+1,'Duplicate/out-of-order request admission')
++            requests[rid]={'received':event,'body':None,'finish':None,'close':None,'writes':{}}
++            continue
++        need(rid in requests,'Orphan request event')
++        item=requests[rid]
++        if kind=='response-call-returned':
++            ordinal=event['ordinal']
++            need(type(ordinal) is int and ordinal>0 and ordinal not in item['writes'] and event['method'] in ['write','end'],
++                 'Duplicate/invalid response method ordinal')
++            need('accepted_argument' in event and event['actual_socket_bytes'] is None,'Response raw boundary missing')
++            item['writes'][ordinal]=event
++            continue
++        key={'request-body-complete':'body','response-finish':'finish','response-close':'close'}[kind]
++        need(item[key] is None,'Duplicate request lifecycle event')
++        if key=='body':
++            need('raw' in event and item['close'] is None,'Missing body raw or body completes after close: OPEN')
++        elif key=='finish':
++            need(item['close'] is None and type(event['reader_complete']) is bool and
++                 event['reader_complete']==(item['body'] is not None),'Finish/reader order mismatch')
++        else:
++            need(item['finish'] is not None and item['body'] is not None and event['finished'] is True and
++                 event['reader_complete'] is True,'Premature/incomplete response close: OPEN')
++        item[key]=event
++    for item in requests.values():
++        need(all(item[k] is not None for k in ['body','finish','close']),'Missing body/finish/close')
++        need(sorted(item['writes'])==list(range(1,len(item['writes'])+1)),'Response method ordinal gap')
++    final=rows[-1]
++    need(type(final['code']) is int and final['code']==0 and final['errors']==0 and final['active']==0,'Observer exit/outstanding failure')
++    need(type(final['requests_received']) is int and type(final['response_finished']) is int and
++         final['requests_received']==final['response_finished']==len(requests),'Exact lifecycle counters disagree')
++    return {'pid':pid,'requests':len(requests),'complete':True,'request_ids':sorted(requests),
++            'body_end_vs_finish_order':'EITHER; both must precede close','socket_bytes':None}
++
+ def validate_case(state,leaf,case,export,job,scope):
+     case=Path(case);evidence=case/'evidence';files=[]
+     need(state['native_exit']==0 and job['actual_exit']==0,'Observed primary native exit required')
+@@ -20,20 +67,21 @@
+         if p.is_file():files.append(rawref(p))
+     observers=list((evidence/'legacy-observer').glob('*/events.jsonl'))
+     need(observers,'Actual observer child/parent records absent')
+-    received=0;finished=0;observer_pids=[]
++    received=0;finished=0;observer_pids=[];seen_pids=set();lifecycles=[]
+     for p in observers:
+         rows=[json.loads(x) for x in p.read_bytes().splitlines()]
+-        need(rows and rows[0]['kind']=='observer-start' and rows[-1]['kind']=='observer-exit','Observer lifetime end missing')
+-        need([x['sequence'] for x in rows]==list(range(1,len(rows)+1)),'Observer sequence gap')
+-        final=rows[-1];need(final['code']==0 and final['errors']==0 and final['active']==0,'Observer failure/outstanding response')
+-        need(not any('overflow' in x['kind'] or 'error' in x['kind'] for x in rows),'Observer incomplete evidence')
+-        incoming=[x for x in rows if x['kind']=='request-received'];ends=[x for x in rows if x['kind']=='response-finish']
+-        need(final['requests_received']==len(incoming) and final['response_finished']==len(ends),'Counter mismatch')
+         for item in rows:
+             for key in ['raw','accepted_argument','attempted']:
+                 if key in item:
+                     rp=Path(item[key]['path']);need(rp.parent==p.parent,'Observer raw foreign path');verify(rp,item[key])
+-        received+=len(incoming);finished+=len(ends);observer_pids.append(final['pid'])
++        try:report=observer_lifecycle(rows,p.parent,seen_pids)
++        except (RuntimeError,KeyError,TypeError,ValueError) as exc:
++            return {'qualified':False,'source_assertions_preserved':True,'source_assertions_passed':True,
++                    'transport_complete':False,'transport_qualification':'OPEN','lifecycle_error':str(exc),
++                    'observer_path':str(p),'completed_observer_lifecycles':lifecycles,'files':files,
++                    'socket_transmitted_byte_count':None,'auto_Date_ContentLength':None,
++                    'expected_abort_exception_authorized':False}
++        lifecycles.append(report);received+=report['requests'];finished+=report['requests'];observer_pids.append(report['pid'])
+     harness_http=0;harness_children=0;harness_refs=[]
+     for p in evidence.rglob('observations.json'):
+         doc=read(p);need(doc['external']==0 and doc['model']==0,'Unexpected fixture network/model metadata')
+@@ -72,6 +120,7 @@
+         alias_usage={'allocation_roots':1,'root':str(root),'exact_image_path':str(image),'actual_CREATE_count':len(admissions),'expected_CREATE_count':row['expected_image_creates'],'unused_launch_path':len(admissions)==0,'PID_count_is_not_clone_count':True}
+     else:need(not admissions,'Unexpected future-image use by unrelated case')
+     return {'qualified':True,'source_assertions_preserved':True,'evidence_boundary':boundary,'HTTP':http,'HTTP_cap':cap,
++        'transport_complete':True,'observer_lifecycles':lifecycles,
+         'server_received':received,'server_finished':finished,'original_harness_HTTP':harness_http,'original_harness_children':harness_children,
+         'observer_PIDs':observer_pids,'harness_refs':harness_refs,'files':files,'alias_usage':alias_usage,'socket_transmitted_byte_count':None,
+         'auto_Date_ContentLength':None,'unobserved_client_outbound_calls':None,'Python_lifecycle_proof':False,

@@ -1,0 +1,146 @@
+apps/desktop/main/main.js
+390:       message: '当前主机无法安全退出', detail: String(error.code || error.message || error) }));
+391:   });
+392:   await win.loadURL(process.env.ROS_DESKTOP_LEGACY_WORKBENCH === '1'
+393:     ? 'file://' + path.join(__dirname, 'workbench.html').replaceAll('\\', '/') : APP_ORIGIN + '/');
+394:   const renderer = await win.webContents.executeJavaScript(`({
+395:     bridge: !!window.researchos?.desktop && !!window.researchos?.v2,
+396:     review: !!document.getElementById('root') || (!!document.getElementById('review') && !!document.getElementById('review-open')),
+397:     react_root: !!document.getElementById('root'),
+398:     mounted_title: document.querySelector('#root h1')?.textContent || null,
+399:     navigation: document.querySelectorAll('[aria-label="主导航"] a').length,
+400:     status: document.getElementById('review-report')?.textContent || '',
+401:     health: document.getElementById('host-health')?.textContent || ''
+402:   })`);
+403:   const nativeProbe = SMOKE && process.env.ROS_DESKTOP_NATIVE_SMOKE === '1'
+404:     ? await win.webContents.executeJavaScript(`window.researchos.v2['host.status']({}).then(r => ({
+405:         ok: r.ok === true, protocol_status: r.protocol_status || null, reason: r.reason || null
+406:       }))`)
+407:     : null;
+408:   const report = {
+409:     event: 'ready_to_show', host_health: started.health, host_launched_by_shell: started.launched,
+410:     spawns: started.spawns, host_url: started.discovery ? started.discovery.url : null,
+411:     channels: ipc.BRIDGE.length, electron: process.versions.electron, protocol: 'researchos-client/2',
+412:     renderer, native_probe: nativeProbe, pid: process.pid,
+413:     management_state: management.state, management_reason: management.reason || null,
+414:     management_diagnostic_bytes: managementDiagnostic.bytes,
+415:     management_diagnostic_sha256: managementDiagnostic.bytes ? crypto.createHash('sha256').update(Buffer.concat(managementDiagnostic.chunks)).digest('hex') : null,
+416:     management_diagnostic_truncated: managementDiagnostic.truncated,
+417:   };
+418:   if (SMOKE && process.env.ROS_DESKTOP_CAPTURE_PATH) {
+419:     const capturePath = path.resolve(process.env.ROS_DESKTOP_CAPTURE_PATH);
+420:     await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+421:     await new Promise(resolve => setTimeout(resolve, 400));
+422:     await fs.promises.writeFile(capturePath, (await win.webContents.capturePage()).toPNG());
+423:     report.capture_path = capturePath;
+424:   }
+425:   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify(report));
+426:   if (SMOKE) {
+427:     let code = renderer.bridge && (renderer.mounted_title || renderer.review && !renderer.react_root) && (!nativeProbe || nativeProbe.ok) ? 0 : 2;
+428:     if (desktopManagement.state === 'READY') {
+429:       try { await desktopManagement.shutdown(); }
+430:       catch (error) {
+431:         code = 2;
+432:         console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: error.code || error.message }));
+433:       }
+434:     }
+435:     if (desktopManagement.hasUnconfirmedChild()) {
+436:       console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: desktopManagement.failure || 'CONTROL_EXIT_UNCONFIRMED' }));
+437:       return;
+438:     }
+439:     app.exit(code);
+440:   }
+441: }
+442: 
+443: app.whenReady().then(boot).catch(async (e) => {
+444:   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'boot_failed', error: String(e && e.message || e) }));
+445:   if (desktopManagement.state === 'READY') {
+446:     try { await desktopManagement.shutdown(); }
+447:     catch (error) { console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: error.code || error.message })); }
+448:   }
+449:   if (desktopManagement.hasUnconfirmedChild()) {
+450:     console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: desktopManagement.failure || 'CONTROL_EXIT_UNCONFIRMED' }));
+451:     return;
+452:   }
+453:   app.exit(2);
+454: });
+apps/desktop/main/lib/desktop-management.js
+455:       const result = await readyPromise;
+456:       if (this.ready) { clearTimeout(this.ready.timer); this.ready = null; }
+457:       if (installed.controlHash !== this.identity.ImageSHA256) throw failure('CONTROL_IMAGE_CHANGED');
+458:       this.currentHost();
+459:       return result;
+460:     } catch (error) {
+461:       this.broken(error.code || 'MANAGEMENT_START_FAILED');
+462:       return this.summary();
+463:     }
+464:   }
+465:   async exchange(operation, scope, timeoutMs, postflight = true, hooks = {}) {
+466:     this.currentHost();
+467:     if (hooks.beforeWrite) {
+468:       if (operation !== 'CONFIRM_CODING' || this.pending || !this.consentPending)
+469:         throw failure('PRIVILEGED_CONFIRM_PENDING');
+470:     } else this.commandIdle();
+471:     const messageId = crypto.randomUUID();
+472:     const request = { protocol: PROTOCOL, message_id: messageId, operation, host_id: this.hostId, ...scope };
+473:     const bytes = Buffer.from(JSON.stringify(request) + '\n');
+474:     if (bytes.length - 1 > FRAME_LIMIT) throw failure('PRIVATE_FRAME_SIZE');
+475:     return new Promise((resolve, reject) => {
+476:       // This hook runs in the same JS turn as the write, after all prior awaits.
+477:       hooks.beforeWrite?.();
+478:       const pending = { messageId, operation, resolve, reject, timer: null,
+479:         onTerminal: hooks.onTerminal || null };
+480:       this.pending = pending;
+481:       pending.timer = setTimeout(() => {
+482:         // A timed-out write may already be executing. Keep the barrier until a
+483:         // late terminal reply or process exit; never issue a second CONFIRM.
+484:         pending.timedOut = true; reject(failure('MANAGEMENT_REPLY_UNCERTAIN'));
+485:       }, timeoutMs);
+apps/desktop/main/lib/desktop-management.js
+750:         retireReason: 'CODING_COMMITTED' })); this.intent = null;
+751:     }
+752:   }
+753:   async statusCoding() {
+754:     this.commandIdle();
+755:     const intent = this.codingIntent;
+756:     if (!intent) throw failure('CODING_ORIGINAL_REQUEST_REQUIRED');
+757:     if (!intent.requestId) throw failure('CODING_PREPARE_ORIGINAL_UNRESOLVED');
+758:     if (!this.sameSelection(intent.projectId, intent.sessionId)) throw failure('CONTEXT_CHANGED');
+759:     const reply = await this.exchange('STATUS_CODING', { project_id: intent.projectId,
+760:       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
+761:     if (reply.kind !== 'RESULT') throw failure('CODING_STATUS_REJECTED');
+762:     const value = reply.result;
+763:     if (value?.state === 'CODING_CONFIGURED') {
+764:       this.acceptCodingResult(intent, value); this.retireQualificationAfterCodingCommit();
+765:     }
+766:     else if (!object(value) || !['AWAITING_CODING_CONFIRMATION', 'EXPIRED'].includes(value.state) ||
+767:         value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
+768:         value.project_id !== intent.projectId || value.session_id !== intent.sessionId)
+769:       throw failure('CODING_STATUS_RESULT_INVALID');
+770:     else { intent.state = value.state; intent.statusCheckedAt = Date.now(); }
+771:     return this.codingSummary();
+772:   }
+773:   async shutdown() {
+774:     if (this.state === 'STOPPED') return { state: 'STOPPED', process_exit_confirmed: true };
+775:     if (this.state !== 'READY') throw failure('SAFE_SHUTDOWN_UNAVAILABLE');
+776:     const reply = await this.exchange('SHUTDOWN', {}, 30000);
+777:     if (reply.kind !== 'RESULT' || reply.result?.state !== 'SHUTDOWN_ACCEPTED')
+778:       throw failure('SHUTDOWN_REFUSED');
+779:     this.shutdownAccepted = true;
+780:     let timer;
+781:     let outcome;
+782:     try {
+783:       outcome = await Promise.race([
+784:         this.exitPromise,
+785:         new Promise((_, reject) => { timer = setTimeout(() => reject(failure('SHUTDOWN_EXIT_UNCONFIRMED')), 15000); }),
+786:       ]);
+787:     } finally { clearTimeout(timer); }
+788:     if (outcome.code !== 0 || outcome.signal || this.state !== 'STOPPED')
+789:       throw failure('SHUTDOWN_EXIT_UNCONFIRMED');
+790:     return { state: 'STOPPED', process_exit_confirmed: true };
+791:   }
+792: }
+793: 
+794: function createDesktopManagement(options) { return new DesktopManagement(options); }
+795: module.exports = { PROTOCOL, FRAME_LIMIT, strictJSON, installedResources, observeWindowsProcess,
+796:   createDesktopManagement, DesktopManagement };

@@ -1,0 +1,44 @@
+import datetime,hashlib,json,os,subprocess
+from pathlib import Path
+R=Path('D:/作品集/ResearchOS/research-os');B=Path(__file__).parent;O=B/'continuation-cp472'
+def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
+def ref(p):return {'path':p.relative_to(R).as_posix() if p.is_relative_to(R) else p.as_posix(),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size}
+def new(p,v):
+ with p.open('x',encoding='utf8') as f:json.dump(v,f,ensure_ascii=False,indent=2);f.write('\n')
+def replace(p,b,v):
+ assert p.read_bytes()==b
+ t=p.with_name(p.name+'.cp472.pending')
+ with t.open('xb') as f:f.write(v)
+ assert p.read_bytes()==b;os.replace(t,p)
+cp_p=R/'execution/v2.4/checkpoint.json';ow_p=R/'execution/v2.4/path_ownership.json';hp=R/'execution/v2.4/HANDOFF_RESUME_PACK.md';sp=R/'execution/v2.4/step_state.json';raw={p:p.read_bytes() for p in [cp_p,ow_p,hp,sp]};cp=read(cp_p);ow=read(ow_p)
+assert cp['revision']==471 and ow['revision']==257 and len(cp['failure_counters'])==1414
+assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=R,text=True).strip()==cp['head']=='a7ec7ebf2d53848ea163b6115667b3e3761a6bd2'
+O.mkdir(exist_ok=False);now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+review=R/'execution/v2.4/receipts/W17/W17-03/mu_m1_02_activation_admission_review_codex/20261014-current-chat';rp=review/'FINAL-report.json';assert ref(rp)['sha256']=='86e4bcb16cd7ddfe29b11104eafae21d4189cb58e1b0791081e2600ec546171d'
+old_scope=B/'continuation-cp469/mu-m1-02-source-scope-v2.json';scope=read(old_scope);assert len(scope['paths'])==16
+scope.update(schema='researchos.mu-m1-02-source-scope/3',at=now,supersedes=ref(old_scope),activation_admission_architecture_ref=ref(rp),architecture_policy_ref=ref(review/'report.md'))
+scope['requirements'].extend(['Explicit Root policy extension: candidate narrow sealed-pause activation proof class; not general native resume qualification and not a string-only bypass of supports_resume. Implement all mandatory gates in referenced independent report.md','First prepare oldepoch requires installedschema25, nonlegacy/nonbootstrap full common admission, exact current PAUSED_CONFIRMED/CAS/RESUMEkey/hash/currentOwner/device/grants/Goal/Task/Run/context/input/dependencies, validated exact old HOST_PAUSE_CAPABILITY receipt/protocol/ACK/process/generation/input, exact sealed bytes/use/principal/journal and true STOPPED/drain/cleanup/effect/queue proof; cancel/restore fence wins','Successor epoch launch/recovery requires immutable activation and every old/new binding. Missing schema/activation/intent/receipt never falls through optional gate or ordinary claim. No repeated carry/epoch increment. PREPARED unstarted-only recovery; STARTED/UNKNOWN never blind rerun','Preserve ordinary resume refusal when supports_resume=false/resume_evidence_ref=null and every common admission. No fabricated qualification or historical receipt mutation. Host ACK alone is not independent native resume proof; independent implementation and actual Host/AppContainer E2E acceptance still required'])
+new(O/'mu-m1-02-source-scope-v3.json',scope)
+live=R/'execution/v2.4/receipts/W05/W05-99/normal_desktop_attach_retry09_codex/20261014-current-chat';diag=R/'execution/v2.4/receipts/W05/W05-99/normal_shutdown_refusal_diagnosis_codex/20261014-current-chat'
+assert ref(diag/'FINAL-with-close-result-report.json')['sha256']=='3f577e392f0344ffc33b30748694b7adcfcdc78ad9efdcaf3bd5fc66f298e8b3'
+assert read(R/'execution/v2.4/receipts/W05/W05-99/normal_desktop_attach_retry08_codex/20261014-current-chat/electron-process-wait.observed.json')['actual_numeric_wait_status']==0
+assert read(live/'launch.json')['pid']==27440
+origins=[
+ ('root-prior-wait-path','Optional read guessed prior wait receipt under original observer dir absent; actual retry07 wait receipt found and read; no evidence rewritten.'),
+ ('shutdown-readonly-schema-setup','Independent readonly observer initially queried absent idempotency.namespace; corrected to operation; raw failure retained, original DB ro/query_only unchanged.'),
+ ('native-config-first-expired','First prepared native coding scope expired during Root review; verifier refused native click and original dialog Cancel clicked. Product status EXPIRED, no confirm.'),
+ ('coding-reprepare-write-lease','After expired scope, reprepare refused WRITE_OWNER_REQUIRED. UI wait60s timed out; dependent native capture found no dialog and exited1. No confirm. Refreshed session then acquired current writer.'),
+ ('coding-reprepare-toolchain-generation','After writer reacquisition, picker authority cleared; reprepare refused GO_TOOLCHAIN_SELECTION_REQUIRED. UI wait60s timed out; no dependent click. Corrected through fresh native Go/vendor selections.'),
+ ('mu-m1-native-resume-proof','Author attempt-004-native.log refused current resume supports_resume=false after real PAUSED_CONFIRMED. Historical failure preserved; independently reviewed explicit narrower proof-class extension, not accepted implementation.'),
+ ('mu-m1-effect-fixture-manifest','Author new boundary test fixture used placeholder manifest hash rejected by real runtimeDispatch; corrected valid manifest, failure preserved.'),
+ ('native25-owner-planner-fixture','Author test07 fixture Owner lacked PLANNER; corrected through existing authorized contextFixtureFrom; test08 passed; count preserved.'),
+ ('native25-local-variable-compile','Author local refactoring test-variable compile error; corrected and rerun, failure preserved.'),
+ ('normal-coding-confirm-result-invalid','Fresh exact326/read2write scope native confirmed once at2026-10-13T18:35:11.740174Z before18:35:59.7266606Z. Desktop UNRESOLVED/CODING_RESULT_INVALID; original codingStatus requested once, no repeat confirm. Commit outcome under readonly diagnosis.')]
+for key,detail in origins:cp['failure_counters'].append({'origin_key':'20261014|'+key,'attempts':1,'status':'OPEN_DIAGNOSIS' if key=='normal-coding-confirm-result-invalid' else 'DIAGNOSTIC_PRESERVED','detail':detail,'counter_reset':False})
+new(O/'failure-additions.json',cp['failure_counters'][-len(origins):])
+resume=read(B/'continuation-cp471/RESUME.current.json');resume.update(schema='researchos.current-chat-resume.v50',at=now,checkpoint_revision=472,ownership_revision=258,failure_records_preserved=len(cp['failure_counters']),live_desktop_pid=27440,live_core_pid=60564,live_launcher_session=42390,normal_package_activation='ACTIVATED_NORMAL_PRESERVED_DATA_SCHEMA24',normal_shutdown_diagnosis_ref=ref(diag/'FINAL-with-close-result-report.json'),mu_m1_02_extended_scope_ref=ref(O/'mu-m1-02-source-scope-v3.json'),coding_confirmation_ref=ref(live/'25-native-confirmation-checked.json'),coding_current_ui_ref=ref(live/'27-config-result.ui.txt'),coding_confirmation='ONCE_SENT_RESULT_INVALID_UNRESOLVED_NO_REPEAT',active_source_cards=['CP472 CoreM1-02 exact16 with required sealed-pause activation proof class','CP467 schema24to25 native exact22'],next_command='Readonly exact original coding confirmation/status diagnosis: determine whether config committed despite CODING_RESULT_INVALID; never repeat confirm. Continue exact16 Core/new required activation gates and exact22 nativeupgrade; independently review frozen source candidates. No new model dispatch yet.')
+new(O/'RESUME.current.json',resume);rr=ref(O/'RESUME.current.json');cp.update(revision=472,expected_previous_revision=471,updated_at=now,updated_by='codex:/root',next_command=resume['next_command']);cp['work_in_progress'].update(current_chat_continuation_cp472=rr,mu_m1_02_required_activation_scope_ref=ref(O/'mu-m1-02-source-scope-v3.json'));cp['evidence_index'].append({'kind':'REAL_CODING_ONCE_CONFIRM_UNRESOLVED_AND_PAUSE_POLICY_EXTENSION','ref':rr,'formal_increment':0});ow.update(revision=258,expected_previous_revision=257,updated_at=now,updated_by='codex:/root');ow['special_paths']['mu_m1_02_extended_source']={'owner':scope['owner'],'ref':ref(O/'mu-m1-02-source-scope-v3.json'),'paths':scope['paths'],'worktree':scope['worktree']}
+for p,n in [(cp_p,'checkpoint.before.raw.json'),(ow_p,'ownership.before.raw.json'),(hp,'handoff.before.raw.md')]:(O/n).write_bytes(raw[p])
+for p,b in raw.items():assert p.read_bytes()==b
+replace(ow_p,raw[ow_p],(json.dumps(ow,ensure_ascii=False,indent=2)+'\n').encode());replace(cp_p,raw[cp_p],(json.dumps(cp,ensure_ascii=False,indent=2)+'\n').encode());replace(hp,raw[hp],('# Current verified continuation CP472\n\nRead `'+rr['path']+'` first. FreshDesktop27440/Core60564/ownedwait42390 active; one real coding confirm has CODING_RESULT_INVALID, do not confirm again. Core16 new narrow required activation policy and native22 continue. Formal0/42 all22open.\n\n').encode()+raw[hp]);assert sp.read_bytes()==raw[sp]
+print(json.dumps({'checkpoint':472,'ownership':258,'failures':len(cp['failure_counters']),'scope':ref(O/'mu-m1-02-source-scope-v3.json'),'resume':rr}))

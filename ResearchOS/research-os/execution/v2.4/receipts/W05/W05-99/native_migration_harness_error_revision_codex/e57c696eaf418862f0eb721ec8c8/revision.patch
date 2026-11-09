@@ -1,0 +1,124 @@
+--- 7050/candidate-root/internal/domain/native_migration_authority_harness_windows_test.go
++++ revision/candidate-root/internal/domain/native_migration_authority_harness_windows_test.go
+@@ -186,6 +186,24 @@
+     // Signature and capability verification remain solely in the actual Root.
+     return raw
+ }
++// nativeHarnessExpectedError compares the first nonempty native stderr line.
++// Only the actual standard log.Fatal timestamp is stripped. A later expected
++// message cannot hide an earlier different error, and a separate Root
++// "exit status N" line after the Control error does not change that error.
++func nativeHarnessExpectedError(stderr []byte, expected string) bool {
++    for _, line := range strings.Split(string(stderr), "\n") {
++        line = strings.TrimSuffix(line, "\r")
++        if line == "" { continue }
++        if len(line) >= 20 && line[19] == ' ' {
++            if _, err := time.Parse("2006/01/02 15:04:05", line[:19]); err == nil {
++                line = line[20:]
++            }
++        }
++        return expected != "" && line == expected
++    }
++    return false
++}
++
+ func nativeHarnessReadDB(t *testing.T, path string, expectedVersion int) (preparedUpgradeRows, string) {
+     t.Helper()
+     u := url.URL{Scheme:"file", Opaque:filepath.ToSlash(path)}
+@@ -261,7 +279,7 @@
+         "positive-replay":"", "missing-native-channel":"AUTHORITY_PRIVATE_INHERITANCE_REQUIRED",
+         "wrong-purpose":"AUTHORITY_ISSUER_SIGNATURE", "mismatched-database":"AUTHORITY_MIGRATION_GRANT_NATIVE_ID",
+         "release-pin-mismatch":"AUTHORITY_RAW_PIN_MISMATCH", "expired-grant":"AUTHORITY_MIGRATION_GRANT",
+-        "missing-dynamic-pin":"AUTHORITY_MIGRATION_REQUIRED_RAW_PIN_ABSENT", "wrong-owner":"current project Owner required",
++        "missing-dynamic-pin":"AUTHORITY_MIGRATION_REQUIRED_RAW_PIN_ABSENT", "wrong-owner":"FORBIDDEN: current project Owner required",
+         "lease-occupied":"MEASURE_ACTUAL_WIN32_SHARING_VIOLATION",
+     }
+     expectedError, ok := cases[cfg.Case]
+@@ -426,10 +444,10 @@
+         if afterSchema!=receipt.TargetSchema || len(after[preparedUpgradeProofTable].Rows)!=0 {t.Fatal("native migration schema/proof table differs")}
+         replay,_,replayErr:=nativeHarnessBroker(t,ctx,cfg,"04-replay",cfg.RootProgram,[]string{"schema23-to24"},owner)
+         replayRows,replaySchema:=nativeHarnessReadDB(t,opt.Source,24)
+-        if *replay.Result.ActualExit==0 || !bytes.Contains(replayErr,[]byte("AUTHORITY_MIGRATION_GRANT_ALREADY_USED")) ||
++        if *replay.Result.ActualExit==0 || !nativeHarnessExpectedError(replayErr,"AUTHORITY_MIGRATION_GRANT_ALREADY_USED") ||
+             Hash(replayRows)!=Hash(after) || replaySchema!=afterSchema{t.Fatal("actual nonce replay rejection/state mismatch")}
+     }else{
+-        if *native.Result.ActualExit==0 || !bytes.Contains(stderr,[]byte(expectedError)){t.Fatal("native negative did not reach its designated rejection layer")}
++        if *native.Result.ActualExit==0 || !nativeHarnessExpectedError(stderr,expectedError){t.Fatal("native negative did not reach its designated rejection layer")}
+         if Hash(after)!=Hash(before) || afterSchema!=beforeSchema{t.Fatal("native rejection changed whole fixture rows/schema")}
+     }
+     nativeHarnessWrite(t,filepath.Join(cfg.OutputDirectory,"05-case.result.json"),Object{
+--- /dev/null
++++ revision/candidate-root/internal/domain/native_migration_error_match_windows_test.go
+@@ -0,0 +1,48 @@
++//go:build windows && researchos_native_recovery_harness
++
++package domain
++
++import "testing"
++
++// Pure matching checks only. Root executes this test independently; it does
++// not create fixtures, sign grants, invoke native programs or touch a DB.
++func TestNativeHarnessExpectedError(t *testing.T) {
++    cases := []struct {
++        name string
++        stderr string
++        expected string
++        want bool
++    }{
++        {"bare-exact", "AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", true},
++        {"standard-time-prefix", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", true},
++        {"native-id-collision", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT_NATIVE_ID", "AUTHORITY_MIGRATION_GRANT", false},
++        {"already-used-collision", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT_ALREADY_USED", "AUTHORITY_MIGRATION_GRANT", false},
++        {"size-collision", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT_SIZE", "AUTHORITY_MIGRATION_GRANT", false},
++        {"authority-no-expected", "2026/10/09 05:01:02 AUTHORITY_PRIVATE_INHERITANCE_REQUIRED", "AUTHORITY_MIGRATION_GRANT", false},
++        {"expected-prefix-text", "2026/10/09 05:01:02 failure: AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", false},
++        {"expected-suffix-text", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT additional detail", "AUTHORITY_MIGRATION_GRANT", false},
++        {"unknown-log-prefix", "WARN 2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", false},
++        {"invalid-date-prefix", "2026/99/09 05:01:02 AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", false},
++        {"fractional-prefix-not-current-format", "2026/10/09 05:01:02.123456 AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", false},
++        {"extra-space-after-time", "2026/10/09 05:01:02  AUTHORITY_MIGRATION_GRANT", "AUTHORITY_MIGRATION_GRANT", false},
++        {"control-error-then-root-exit-status", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT\n2026/10/09 05:01:02 exit status 1\n", "AUTHORITY_MIGRATION_GRANT", true},
++        {"first-other-error-not-hidden", "2026/10/09 05:01:02 AUTHORITY_RAW_PIN_MISMATCH\n2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT\n", "AUTHORITY_MIGRATION_GRANT", false},
++        {"crlf", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT\r\n2026/10/09 05:01:02 exit status 1\r\n", "AUTHORITY_MIGRATION_GRANT", true},
++        {"blank-before-exact", "\n2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT\n", "AUTHORITY_MIGRATION_GRANT", true},
++        {"no-error", "", "AUTHORITY_MIGRATION_GRANT", false},
++        {"empty-expected", "", "", false},
++        {"replay-exact", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT_ALREADY_USED", "AUTHORITY_MIGRATION_GRANT_ALREADY_USED", true},
++        {"replay-longer-collision", "2026/10/09 05:01:02 AUTHORITY_MIGRATION_GRANT_ALREADY_USED_EXTRA", "AUTHORITY_MIGRATION_GRANT_ALREADY_USED", false},
++        {"wrong-owner-complete", "2026/10/09 05:01:02 FORBIDDEN: current project Owner required", "FORBIDDEN: current project Owner required", true},
++        {"wrong-owner-missing-fault-code", "2026/10/09 05:01:02 current project Owner required", "FORBIDDEN: current project Owner required", false},
++        {"lease-full-localized-message", "2026/10/09 05:01:02 示例租约错误（仅匹配测试）", "示例租约错误（仅匹配测试）", true},
++        {"lease-extra-prefix", "2026/10/09 05:01:02 detail: 示例租约错误（仅匹配测试）", "示例租约错误（仅匹配测试）", false},
++    }
++    for _, tc := range cases {
++        t.Run(tc.name,func(t *testing.T){
++            if got:=nativeHarnessExpectedError([]byte(tc.stderr),tc.expected);got!=tc.want{
++                t.Fatalf("match=%v want=%v stderr=%q expected=%q",got,tc.want,tc.stderr,tc.expected)
++            }
++        })
++    }
++}
+--- 7050/CONTRACT.md
++++ revision/CONTRACT.md
+@@ -63,7 +63,7 @@
+ | release-pin-mismatch | Independently reviewed negative release deliberately contains one wrong source hash; accepted source bytes are not edited. Rejects AUTHORITY_RAW_PIN_MISMATCH. |
+ | expired-grant | Deliberately old valid four-minute issue/expiry interval; rejects AUTHORITY_MIGRATION_GRANT. |
+ | missing-dynamic-pin | Remove exactly one source-inventory role, preserving five mandatory raw roles, valid Owner and native channel. Must reach AUTHORITY_MIGRATION_REQUIRED_RAW_PIN_ABSENT from the real MigrationToken.RequirePin gate, not an earlier channel/credential failure. |
+-| wrong-owner | Send the real local Executor credential issued before the baseline. Valid native channel/token/pins must reach current project Owner required; original state unchanged. |
++| wrong-owner | Send the real local Executor credential issued before the baseline. Valid native channel/token/pins must reach FORBIDDEN: current project Owner required; original state unchanged. |
+ | lease-occupied | Test actually acquires DataRootLease after signed grant review and holds it throughout the native call. A second acquisition must produce errors.Is(ERROR_SHARING_VIOLATION); its measured localized error becomes the exact expected native rejection. Record actual holder PID/birth and lease closure; original exact23 state unchanged. |
+ 
+ All eight negative cases compare whole original table/typed-row hash inventories and exact schema fingerprint; the positive replay compares the exact post-migration state. Root must independently read the retained fixture and raw outputs, verify actual Job/guard closure and negative rejection layers, then decide acceptance.
+@@ -76,3 +76,12 @@
+ 
+ Failure-origin.798.json preserves the one new nonexistent-path read error. The earlier rg no-match is preserved as NO_MATCH with no new failure ordinal. All source-author operations remain read/static/own-namespace writes.
+ 
++
++
++## Exact native error matching revision
++
++The first nonempty stderr line is the actual error under the observed production log.Fatal path. Remove only a valid standard YYYY/MM/DD HH:MM:SS timestamp followed by exactly one space, then require complete equality with the expected message. CRLF line ending is normalized by dropping only its trailing CR. Arbitrary prefixes, suffixes, unknown timestamp formats and a later expected error after a different first error are rejected. A later separate Root exit status N line does not replace the Control error.
++
++This applies uniformly to every Authority rejection, replay, the complete Fault.Error message FORBIDDEN: current project Owner required, and the actual measured localized lease error. It prevents AUTHORITY_MIGRATION_GRANT_NATIVE_ID, AUTHORITY_MIGRATION_GRANT_ALREADY_USED and AUTHORITY_MIGRATION_GRANT_SIZE from satisfying the expired-grant expectation AUTHORITY_MIGRATION_GRANT.
++
++Root first runs the guarded pure unit test with -tags researchos_native_recovery_harness -run ^TestNativeHarnessExpectedError$ -count=1 ./internal/domain. Its 24 cases are Source only and unexecuted by the author. The nine-case signed/native workflow, complete state assertions and credential pipe remain unchanged. The copied 93-entry base-pins.json and program-provenance.json retain original verified provenance; this minimal revision did not re-run that full inventory.

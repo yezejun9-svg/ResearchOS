@@ -1,0 +1,117 @@
+	inputs["worker.json"] = Bytes(effective)
+	return nil
+}
+
+func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+	manifest := dispatch["manifest"].(map[string]any)
+	effective, e := runtimepolicy.Effective(manifest, provider.Purpose)
+	if e != nil {
+		return nil, e
+	}
+	body, e := validateRuntimeModelRequest(effective, payload)
+	if e != nil {
+		return nil, e
+	}
+	var stream *rt.ModelStream
+	unknown := func(reason string) (Object, error) {
+		if stream != nil {
+			stop, cancel := context.WithTimeout(context.Background(), time.Second)
+			stream.Fail(stop)
+			cancel()
+		}
+		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {
+			return nil, e
+		}
+		return nil, Fail(409, "STATE_CONFLICT", "model outcome UNKNOWN; automatic retry prohibited")
+	}
+	notDispatched := func() (Object, error) {
+		// Credential resolution failed before HTTP request construction. This is a
+		// known absent provider operation, unlike a transport failure after send.
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
+	}
+	if provider.MeasurementMode == "LIVE" && clientConfigurationLoopbackModelEndpoint(provider.Endpoint) && (provider.CredentialRef != "" || provider.CredentialRevision != "none" || provider.BearerToken != "") {
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "local model route contains credential material; no provider request was sent")
+	}
+	if provider.CredentialRef != "" {
+		if c.config.ModelCredential == nil {
+			return notDispatched()
+		}
+		material, err := c.config.ModelCredential(ctx, provider)
+		if err != nil || len(material) == 0 {
+			return notDispatched()
+		}
+		provider.BearerToken = string(material)
+		for i := range material {
+			material[i] = 0
+		}
+	}
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint, bytes.NewReader(Bytes(body)))
+	if e != nil {
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "model request construction failed before dispatch")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if provider.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+	}
+	client := &http.Client{Timeout: 90 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("model redirect prohibited") }}
+	defer client.CloseIdleConnections()
+	response, e := client.Do(req)
+	if e != nil {
+		return unknown("model transport ended without complete response")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+		return unknown("model returned invalid SSE headers")
+	}
+	var raw, withheld []byte
+	if bridge.Read().QueueRequired {
+		binding, err := c.modelStreamBinding(ctx, route, runID, lease, epoch, bridge, frame, intent)
+		if err != nil {
+			return unknown("model stream initialization authority unavailable")
+		}
+		stream, err = bridge.OpenModelStream(ctx, binding)
+		if err != nil {
+			return unknown("model stream could not open")
+		}
+		quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken)
+		if err != nil {
+			return unknown("model quarantine unavailable")
+		}
+		chunk := make([]byte, 8192)
+		for {
+			n, readErr := response.Body.Read(chunk)
+			if n > 0 {
+				released, gateErr := quarantine.Feed(chunk[:n])
+				if gateErr != nil {
+					return unknown("model response rejected by quarantine")
+				}
+				if len(released) > 0 {
+					if err = stream.Send(ctx, released, false); err != nil {
+						return unknown("model stream transport failed")
+					}
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return unknown("model transport interrupted")
+			}
+		}
+		raw, withheld, err = quarantine.Finish()
+		if err != nil {
+			return unknown("model returned no complete bounded SSE response")
+		}
+	} else {
+		raw, e = io.ReadAll(io.LimitReader(response.Body, runtimeModelMaxSSEBytes+1))
+		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+			return unknown("model returned no complete bounded SSE response")
+		}
+		for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+			if secret != "" && bytes.Contains(raw, []byte(secret)) {
+				return unknown("model response contained host credential material")
+			}
+		}
+internal/domain\backup_prepared_abandonment_upgrade.go:571:        _, err = expected.Exec("CREATE TABLE runtime_dispatches(project TEXT,run TEXT,epoch INTEGER,state TEXT,worker TEXT,journal_locator TEXT,identity TEXT,observation_sequence INTEGER,observation_hash TEXT,PRIMARY KEY(project,run,epoch)); CREATE TABLE domain_objects(project TEXT,kind TEXT,id TEXT,body TEXT);")
+internal/domain\runtime_model.go:172:func runtimeModelCallGate(tx *sql.Tx, project, run, key string, config Object) error {

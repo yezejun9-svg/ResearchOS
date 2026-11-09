@@ -1,0 +1,143 @@
+--- v4/w09_formal_router.v4.proposed.py
++++ v5/w09_formal_router.v5.proposed.py
+@@ -12,7 +12,7 @@
+ from pathlib import Path
+ import subprocess
+ import sys
+-from w09_evidence_closure import verify_native, verify_owned, verify_c19, verify_a06, verify_mode
++from w09_evidence_closure import verify_native, verify_owned, verify_c19, verify_a06, verify_mode, safe_repo_rel
+ 
+ ROOT = Path.cwd().resolve()
+ NATIVE = {
+@@ -76,12 +76,7 @@
+ 
+ 
+ def _inside_repo(relative):
+-    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+-        raise ValueError("BAD_RELATIVE_REF")
+-    path = (ROOT / relative).resolve(strict=True)
+-    if path != ROOT and ROOT not in path.parents:
+-        raise ValueError("FOREIGN_REF")
+-    return path
++    return safe_repo_rel(ROOT, relative)
+ 
+ 
+ def _pin(relative):
+@@ -162,7 +157,7 @@
+     events = {}
+     for path in member_map:
+         label = path.name.split("-", 1)[-1].removesuffix(".raw")
+-        if label.startswith(("http-request", "http-response", "file-body-", "simulated-opinion-", "g02-junction-stdout")):
++        if label.startswith(("http-request", "http-response", "file-body-", "g02-junction-stdout")) or __import__("re").fullmatch(r"simulated-opinion-(?:0[0-9]|1[0-9])", label):
+             continue
+         if label.startswith(("assertion-", "c19-", "chain-", "a06-", "g02-", "http-", "origins-", "state-", "file-")):
+             try:
+@@ -238,7 +233,8 @@
+             raise ValueError("C19_GRAPH_RELATIONS_MISMATCH")
+         if len([label for label in events if label.startswith("file-c19-before-")]) != 7:
+             raise ValueError("C19_INPUT_SNAPSHOTS_MISSING")
+-        if len([label for label in member_map if "simulated-opinion-" in label.name]) != 20:
++        if len([path for path in member_map if __import__("re").fullmatch(
++                r"[0-9]{8}-simulated-opinion-(?:0[0-9]|1[0-9])\.raw", path.name)]) != 20:
+             raise ValueError("C19_SIMULATED_INPUTS_MISSING")
+         rejection = events.get("c19-unsupported-relation-rejection", [])
+         if len(rejection) != 1 or not rejection[0].get("actual_error"):
+@@ -281,6 +277,40 @@
+                        os.getenv("RESEARCHOS_W09_MODE_DECISION_SHA256", ""))
+ 
+ 
++def _pinned_native_report():
++    relative = os.getenv("RESEARCHOS_W09_NATIVE_REPORT_REF", "")
++    expected = os.getenv("RESEARCHOS_W09_NATIVE_REPORT_SHA256", "")
++    if not relative or len(expected) != 64:
++        raise ValueError("SEALED_NATIVE_REPORT_NOT_GIVEN")
++    path = _inside_repo(relative)
++    raw = path.read_bytes()
++    if hashlib.sha256(raw).hexdigest() != expected:
++        raise ValueError("SEALED_NATIVE_REPORT_DRIFT")
++    report = json.loads(raw)
++    if report.get("formal_construction_acceptance") != "NOT_RUN_POSTRUN_REVIEW_PENDING":
++        raise ValueError("NATIVE_PRODUCER_PRETENDS_FORMAL")
++    tool_ref = os.getenv("RESEARCHOS_W09_TOOL_RUN_REF", "")
++    tool_sha = os.getenv("RESEARCHOS_W09_TOOL_RUN_SHA256", "")
++    tool_path = _inside_repo(tool_ref)
++    tool_raw = tool_path.read_bytes()
++    if hashlib.sha256(tool_raw).hexdigest() != tool_sha:
++        raise ValueError("NATIVE_TOOL_RUN_PIN_DRIFT")
++    tool = json.loads(tool_raw)
++    if (tool.get("schema") != "researchos.w09-native-producer-tool-run.v1"
++            or tool.get("report_ref") != relative or tool.get("report_sha256") != expected
++            or tool.get("run_id") != report.get("run_id")
++            or tool.get("actual_invocation") != report.get("actual_invocation")
++            or tool.get("native_exit_code") != report.get("exit_code")
++            or tool.get("stdout_ref") != report.get("raw_evidence_references", [None])[0]
++            or tool.get("stderr_ref") != report.get("raw_evidence_references", [None, None])[1]
++            or tool.get("stdout_sha256") != _pin(tool["stdout_ref"])["sha256"]
++            or tool.get("stderr_sha256") != _pin(tool["stderr_ref"])["sha256"]):
++        raise ValueError("NATIVE_TOOL_RUN_NOT_SAME_RUN")
++    source = dict(report)
++    source["report_reference"] = relative
++    return source, report, tool
++
++
+ def main():
+     if len(sys.argv) != 2 or sys.argv[1] not in {"test.retrieval", "test.research.fixture", "test.security"}:
+         return _failure("INVALID_COMMAND_KEY")
+@@ -290,38 +320,37 @@
+         return _failure("UNBOUND_SELECTOR_TUPLE")
+     if not (ROOT / "execution/toolchains/locked.json").is_file():
+         return _failure("WRONG_REPOSITORY_CWD")
+-    go = os.getenv("RESEARCHOS_GO", "")
+-    if route[1] == "W09" and route[2] == "W09-01":
+-        argv = [sys.executable, "-X", "utf8", str(ROOT / "tests/evidence/check/main.py")]
+-    elif route[1] == "W08":
+-        if not go:
+-            return _failure("MISSING_LOCKED_GO")
+-        argv = [go, "run", "./tests/research/check"]
+-    elif route[1] == "W17":
+-        if not go:
+-            return _failure("MISSING_LOCKED_GO")
+-        argv = [go, "run", "./tests/security/check"]
+-    else:
+-        argv = [sys.executable, "-X", "utf8", str(ROOT / "ops/ci/retrieval.py")]
+-    child = subprocess.run(argv, cwd=ROOT, env=os.environ.copy(),
+-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, shell=False)
+-    sys.stderr.buffer.write(child.stderr)
+-    if route in PRESERVED or child.returncode != 0:
++    if route in PRESERVED:
++        go = os.getenv("RESEARCHOS_GO", "")
++        if route[1] == "W09":
++            argv = [sys.executable, "-X", "utf8", str(ROOT / "tests/evidence/check/main.py")]
++        elif route[1] == "W08":
++            if not go: return _failure("MISSING_LOCKED_GO")
++            argv = [go, "run", "./tests/research/check"]
++        else:
++            if not go: return _failure("MISSING_LOCKED_GO")
++            argv = [go, "run", "./tests/security/check"]
++        child = subprocess.run(argv, cwd=ROOT, env=os.environ.copy(),
++                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                               check=False, shell=False)
++        sys.stderr.buffer.write(child.stderr)
+         sys.stdout.buffer.write(child.stdout)
+         return child.returncode
+     try:
+-        source = json.loads(child.stdout.decode("utf-8").strip().splitlines()[-1])
++        source, report, tool = _pinned_native_report()
+         pins, report, native = _native_exact(source, route)
+         owned = _owned_exact(source, report, route)
+         mode = _mode_review(source, report, route, owned, native)
++        if mode.get("formal_authority") is not False:
++            raise ValueError("MODE_REVIEW_MUST_NOT_SELF_ACCEPT")
+     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+-        sys.stdout.buffer.write(child.stdout)
+-        return _failure("SOURCE_REPORT_NOT_EXACT_OR_INCOMPLETE", type(exc).__name__)
++        return _failure("SEALED_NATIVE_OR_POSTRUN_MODE_OPEN", type(exc).__name__)
+     print(json.dumps({"status": "PASS", "assertion_ids": list(FORMAL[route]),
+                       "assertions": len(FORMAL[route]), "task_id": "W09",
+                       "check_id": route[2] or None, "case_id": route[3] or None,
+                       "native_assertion_ids": list(NATIVE[route]),
+                       "source_pins": pins, "owned_export_member_count": len(owned["members"]),
++                      "native_tool_run_ref": os.getenv("RESEARCHOS_W09_TOOL_RUN_REF"),
+                       "mode_evidence": mode,
+                       "formal_acceptance": "PENDING_INDEPENDENT_VERIFIER"}, ensure_ascii=False))
+     return 0

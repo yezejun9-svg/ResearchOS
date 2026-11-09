@@ -1,0 +1,42 @@
+--- apps/cli/cli_stream.go
++++ cli_stream.context_receipt.v5.proposed.go
+@@ -110,6 +110,7 @@
+ 	readInterrupt        *cliReadInterrupt
+ 	responseExit         int
+ 	transportUnreachable bool
++	lastVerifiedSessionSnapshot map[string]any
+ }
+ 
+ func (f *cliFlow) interrupt() {
+@@ -274,6 +275,7 @@
+ 	if snap["project_id"] != f.c.projectID || snap["session_id"] != f.c.sessionID || snap["protocol_version"] != clientProtocol {
+ 		return nil, "SNAPSHOT_SCOPE_MISMATCH", exitNotImplemented
+ 	}
++	f.lastVerifiedSessionSnapshot = snap
+ 	return snap, "", 0
+ }
+ 
+@@ -753,6 +755,9 @@
+ 	out["operations"], out["requests_sent"] = f.operations, c.requestLog
+ 	out["admission_command_id"] = f.admissionCommand
+ 	out["session_id"], out["reason"], out["detail"] = c.sessionID, reason, detail
++	if f.lastVerifiedSessionSnapshot != nil && !readOnly {
++		out["last_verified_session_snapshot"] = f.lastVerifiedSessionSnapshot
++	}
+ 	return out, code
+ }
+ 
+@@ -833,6 +838,13 @@
+ 			code = exitFailed
+ 			out["status"], out["exit_code"] = "REJECTED", code
+ 		}
++	} else if c.sessionID != "" && c.projectID != "" && c.revision >= 1 {
++		// Original JSONL reports the exact persisted context after a successful save.
++		out["saved_context"] = map[string]any{
++			"project_id": cfg.ProjectID, "session_id": cfg.SessionID,
++			"session_revision": cfg.Revision, "writer_epoch": cfg.WriterEpoch,
++			"updated_by": cfg.UpdatedBy,
++		}
+ 	}
+ 	outJSON(out)
+ 	return code

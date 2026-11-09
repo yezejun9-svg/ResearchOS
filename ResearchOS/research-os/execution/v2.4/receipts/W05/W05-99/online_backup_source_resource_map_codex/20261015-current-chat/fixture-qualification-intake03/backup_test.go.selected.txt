@@ -1,0 +1,65 @@
+1: package domain
+2: 
+3: import (
+4: 	"context"
+5: 	"crypto/rand"
+6: 	"database/sql"
+7: 	"encoding/json"
+8: 	"fmt"
+9: 	"os"
+10: 	"path/filepath"
+11: 	"researchos.local/research-os/adapters/sources"
+12: 	"researchos.local/research-os/internal/store"
+13: 	"runtime"
+14: 	"strings"
+15: 	"sync"
+16: 	"testing"
+17: 	"time"
+18: )
+19: 
+20: func backupAssert(t *testing.T, id string, want, got, evidence any) {
+21: 	t.Helper()
+22: 	status := "PASS"
+23: 	if Hash(want) != Hash(got) {
+24: 		status = "FAIL"
+25: 	}
+26: 	fmt.Println("W18_ASSERTION " + string(Bytes(Object{"assertion_id": id, "expected": want, "actual": got, "status": status, "evidence": evidence})))
+27: 	if status != "PASS" {
+28: 		t.Fatal(id)
+29: 	}
+30: }
+31: func backupTestKey(t *testing.T) []byte {
+32: 	t.Helper()
+33: 	b := make([]byte, 32)
+34: 	if _, e := rand.Read(b); e != nil {
+35: 		t.Fatal(e)
+36: 	}
+37: 	return b
+38: }
+39: func backupOpt(t *testing.T, s *Service, key []byte) RestoreOptions {
+40: 	t.Helper()
+41: 	v, e := backupMigrations(s.DB)
+42: 	if e != nil {
+43: 		t.Fatal(e)
+44: 	}
+45: 	return RestoreOptions{Key: key, SupportedMigrations: v, Contracts: s.Contracts}
+46: }
+47: func backupTestCreate(t *testing.T, s *Service, key []byte) (string, BackupManifest) {
+48: 	t.Helper()
+49: 	p := filepath.Join(t.TempDir(), "backup")
+50: 	m, e := s.CreateBackup(context.Background(), p, key)
+51: 	if e != nil {
+52: 		t.Fatal(e)
+53: 	}
+54: 	return p, m
+55: }
+56: func backupEvidence(t *testing.T, name string, v any) {
+57: 	t.Helper()
+58: 	if dir := os.Getenv("W18_EVIDENCE_DIR"); dir != "" {
+59: 		if e := os.WriteFile(filepath.Join(dir, name), Bytes(v), 0600); e != nil {
+60: 			t.Fatal(e)
+61: 		}
+62: 	}
+63: }
+64: 
+65: func TestW18RestoreNative(t *testing.T) {

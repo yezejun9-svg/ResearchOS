@@ -1,0 +1,305 @@
+--- immutable-v1
++++ candidate-final
+@@ -21,7 +21,9 @@
+ CANON = [V / (x + ".json") for x in ("checkpoint", "path_ownership", "step_state", "commands")]
+ ROOT = "codex:/root"
+ ROOT_THREAD = "01a11007-5233-7ca1-b71f-9e9e5ce84c98"
+-AUTHOR = "codex:/root/native_temp_independent_review"
++CALLER_AUTHOR = "codex:/root/backup_regression_resources"
++BUILDER_AUTHOR = "codex:/root/native_temp_independent_review"
++AUTHOR = CALLER_AUTHOR
+ SLICE = "FRESH_CURRENT_MAIN23_PROGRAMME_BUILD"
+ KEY = "fresh_main23_programme_build"
+ STATE = "ROOT_REGISTERED_PENDING_FRESH_MAIN23_BUILD"
+@@ -148,14 +150,14 @@
+ def validate_builder_chain(review, review_mf, decision, source, source_mf, contract):
+     need(review.get("status") == "SOURCE_ACCEPTED_FOR_ROOT_REGISTRATION" and decision.get("verdict") == "SOURCE_ACCEPTED_FOR_ROOT_REGISTRATION", "BUILDER_SOURCE_NOT_ACCEPTED")
+     reviewer = decision.get("review_author")
+-    need(type(reviewer) is str and reviewer not in ("", ROOT, AUTHOR) and reviewer == review.get("review_author") and decision.get("source_author") == review.get("source_author") == AUTHOR and decision.get("independent_non_author") is True, "BUILDER_NONAUTHOR_REQUIRED")
++    need(type(reviewer) is str and reviewer not in ("", ROOT, BUILDER_AUTHOR) and reviewer == review.get("review_author") and decision.get("source_author") == review.get("source_author") == BUILDER_AUTHOR and decision.get("independent_non_author") is True, "BUILDER_NONAUTHOR_REQUIRED")
+     need(same_ref(review["decision_ref"], BUILDER_REVIEW_REFS["decision"]) and same_ref(review["manifest_ref"], BUILDER_REVIEW_REFS["mf"]), "BUILDER_REVIEW_CHAIN")
+     for field in ("author_hdf_ref", "author_mf_ref"):
+         need(same_ref(decision[field], review[field]), "BUILDER_AUTHOR_REF_MISMATCH")
+     need(same_ref(source["manifest_ref"], decision["author_mf_ref"]) and same_ref(source["builder_ref"], decision["author_builder_ref"]) and same_ref(source["contract_ref"], decision["author_contract_ref"]) and same_ref(source["input_manifest_ref"], decision["author_input_manifest_ref"]), "BUILDER_SOURCE_HDF_CHAIN")
+     for field in ("builder_ref", "contract_ref", "input_manifest_ref"):
+         need(any(same_ref(source[field], member) for member in source_mf["members"]), "BUILDER_SOURCE_MEMBER_MISSING")
+-    need(same_ref(contract["builder_ref"], source["builder_ref"]) and same_ref(contract["input_manifest_ref"], source["input_manifest_ref"]) and contract.get("schema_version") == 23 and contract.get("source_author") == AUTHOR, "BUILDER_CONTRACT_CHAIN")
++    need(same_ref(contract["builder_ref"], source["builder_ref"]) and same_ref(contract["input_manifest_ref"], source["input_manifest_ref"]) and contract.get("schema_version") == 23 and contract.get("source_author") == BUILDER_AUTHOR, "BUILDER_CONTRACT_CHAIN")
+     need(decision.get("formal_programme_qualification") is False and decision.get("candidate_program_ref") is None and decision.get("qualification_ref") is None and decision.get("formal_acceptance") is False, "SOURCE_REVIEW_NOT_PROGRAMME_QUALIFICATION")
+     return True
+ 
+@@ -173,23 +175,200 @@
+     return {"review": review, "decision": decision, "source": source, "contract": contract, "refs": refs}
+ 
+ 
+-def validate_root_capture(binding, raw, expected_refs):
+-    """Verify an existing external Root pair; never manufacture capture evidence."""
+-    need(binding.get("schema") == "researchos.root-actual-tool-capture-binding.v1" and binding.get("issued_by") == ROOT and binding.get("root_thread_id") == ROOT_THREAD, "EXTERNAL_ROOT_CAPTURE_IDENTITY")
++ROOT_AUDIT_LOG = "C:/Users/yqyyds/.codex/sessions/2026/10/06/rollout-2026-10-06T15-04-37-01a11007-5233-7ca1-b71f-9e9e5ce84c98.jsonl"
++CAPTURE_RESULT_SCHEMA = "researchos.root-main23-capture-result.v2"
++CAPTURE_OPERATIONS = {"SOURCE_REVIEW_WITNESS", "POSTREVIEW_CURRENT_FOUR", "ACTIVATION_FACTS_CURRENT_FOUR", "RUNTIME_QUALIFICATION_ISSUANCE"}
++
++
++def structured_documents(value):
++    """Decode complete JSON values/lines, never digest-containing substrings."""
++    values = []
++    def visit(item, depth):
++        need(depth <= 24, "CAPTURE_STRUCTURE_DEPTH")
++        if type(item) is dict:
++            values.append(item)
++            for child in item.values(): visit(child, depth + 1)
++        elif type(item) is list:
++            for child in item: visit(child, depth + 1)
++        elif type(item) is str:
++            texts = [item] + item.splitlines() if "\n" in item else [item]
++            seen = set()
++            for text in texts:
++                text = text.strip()
++                if text in seen or not text.startswith(("{", "[")): continue
++                seen.add(text)
++                try: parsed = strict(text)
++                except (ValueError, TypeError): continue
++                if type(parsed) in (dict, list): visit(parsed, depth + 1)
++    visit(value, 0)
++    return values
++
++
++def exact_ref_set(refs):
++    need(type(refs) is list and refs, "CAPTURE_COMPLETE_REFS_REQUIRED")
++    result = []
++    for ref in refs:
++        shape(ref)
++        result.append((canonical(ref["path"]), ref["sha256"], ref["bytes"]))
++    need(len(set(result)) == len(result), "CAPTURE_DUPLICATE_REFS")
++    return set(result)
++
++
++def original_capture_rows(binding, raw, peer=False):
++    need(type(binding) is dict and binding.get("schema") == ("researchos.root-actual-peer-capture-binding.v2" if peer else "researchos.root-actual-tool-capture-binding.v1")
++         and binding.get("issued_by") == ROOT and binding.get("root_thread_id") == ROOT_THREAD, "EXTERNAL_ROOT_CAPTURE_IDENTITY")
+     lines = raw.splitlines(keepends=True)
+-    need(2 < len(lines) <= 16 and len(raw) <= 32 * 1024 * 1024, "EXTERNAL_CAPTURE_BOUNDS")
+-    need([hashlib.sha256(line).hexdigest() for line in lines] == binding.get("original_line_sha256") and [len(line) for line in lines] == binding.get("source_line_bytes"), "EXTERNAL_CAPTURE_LINE_PINS")
+-    rows = [strict(line) for line in lines]
+-    need(any(x.get("type") == "session_meta" and x.get("payload", {}).get("id") == ROOT_THREAD for x in rows), "EXTERNAL_ROOT_SESSION_REQUIRED")
++    need(len(lines) == 3 and len(raw) <= 32 * 1024 * 1024 and all(x.endswith(b"\n") for x in lines), "EXTERNAL_CAPTURE_BOUNDS")
++    need([hashlib.sha256(x).hexdigest() for x in lines] == binding.get("original_line_sha256")
++         and [len(x) for x in lines] == binding.get("source_line_bytes"), "EXTERNAL_CAPTURE_LINE_PINS")
++    need(same_ref(binding.get("original_capture_ref"), dict(binding["original_capture_ref"], sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))), "EXTERNAL_CAPTURE_RAW_PIN")
++    rows = [strict(x) for x in lines]
++    need(all(type(x) is dict for x in rows) and rows[0].get("type") == "session_meta"
++         and type(rows[0].get("ordinal")) is int and rows[0]["ordinal"] == 0
++         and type(rows[0].get("payload")) is dict and rows[0]["payload"].get("id") == ROOT_THREAD, "EXTERNAL_ROOT_SESSION_REQUIRED")
++    offsets = binding.get("source_line_offsets")
++    prefix = binding.get("source_prefix_size_observed")
++    need(binding.get("source_audit_path") == ROOT_AUDIT_LOG
++         and type(offsets) is list and len(offsets) == 3 and offsets[0] == 0
++         and all(type(x) is int and x >= 0 for x in offsets) and offsets == sorted(set(offsets))
++         and type(prefix) is int and prefix > 0, "EXTERNAL_ORIGINAL_SOURCE_REQUIRED")
++    with Path(ROOT_AUDIT_LOG).open("rb") as stream:
++        for offset, line in zip(offsets, lines):
++            need(offset + len(line) <= prefix, "EXTERNAL_ORIGINAL_SOURCE_REQUIRED")
++            stream.seek(offset)
++            need(stream.readline() == line, "EXTERNAL_ORIGINAL_SOURCE_BYTES")
++    first, last = rows[1:]
++    need(type(first.get("ordinal")) is int and first["ordinal"] > 0
++         and type(last.get("ordinal")) is int and last["ordinal"] > first["ordinal"]
++         and type(first.get("payload")) is dict and type(last.get("payload")) is dict, "COMPLETE_EXTERNAL_ROOT_PAIR_REQUIRED")
++    need(when(last.get("timestamp")) >= when(first.get("timestamp")), "EXTERNAL_PAIR_TIME_ORDER")
++    return first, last
++
++
++def validate_peer_delivery(binding_ref, expected_refs, peer_actor, operation):
++    need(type(peer_actor) is str and re.fullmatch(r"codex:/root/[a-z0-9_]+", peer_actor)
++         and peer_actor not in (ROOT, CALLER_AUTHOR, BUILDER_AUTHOR), "ACTUAL_NONAUTHOR_PEER_REQUIRED")
++    binding = doc(binding_ref)
++    first, last = original_capture_rows(binding, checked(binding["original_capture_ref"]), peer=True)
++    payload = last["payload"]
++    need(first.get("type") == "inter_agent_communication_metadata" and type(first["payload"].get("trigger_turn")) is bool
++         and last.get("type") == "response_item" and last["ordinal"] == first["ordinal"] + 1
++         and first.get("timestamp") == last.get("timestamp") and payload.get("type") == "agent_message"
++         and payload.get("author") == peer_actor and payload.get("recipient") == "/root"
++         and type(last.get("metadata")) is dict and last["metadata"].get("client_authored") is False
++         and type(payload.get("content")) is list and len(payload["content"]) == 1
++         and type(payload["content"][0]) is dict and set(payload["content"][0]) == {"type", "text"}
++         and payload["content"][0]["type"] == "input_text" and type(payload["content"][0]["text"]) is str,
++         "ACTUAL_PEER_DELIVERY_REQUIRED")
++    text = payload["content"][0]["text"]
++    deliveries = [x for x in structured_documents(text) if x.get("schema") == "researchos.main23-peer-review-delivery.v2"]
++    need(len(deliveries) == 1, "PEER_TYPED_DELIVERY_REQUIRED")
++    delivered = deliveries[0]
++    need(delivered.get("review_author") == peer_actor and delivered.get("root_thread_id") == ROOT_THREAD
++         and delivered.get("operation") == operation and delivered.get("verdict") == "ACCEPTED_SOURCE_ONLY"
++         and delivered.get("formal_acceptance") is False and delivered.get("execution_grant") is False
++         and exact_ref_set(delivered.get("review_refs")) == exact_ref_set(expected_refs), "PEER_REVIEW_REF_BINDING")
++    need(binding.get("peer_actor") == peer_actor and binding.get("message_id") == payload.get("id")
++         and type(payload.get("id")) is str and payload["id"]
++         and binding.get("received_at") == last["timestamp"], "PEER_ORIGINAL_IDENTITY")
++    return binding, when(last["timestamp"])
++
++
++def validate_root_capture(binding, raw, expected_refs, operation=None, peer_actor=None):
++    """Three actual Root records, typed return provenance and complete exact refs."""
++    first, last = original_capture_rows(binding, raw)
++    need(operation in CAPTURE_OPERATIONS and binding.get("operation") == operation, "EXTERNAL_CAPTURE_OPERATION")
++    call, output = first["payload"], last["payload"]
+     call_id = binding.get("original_call_id")
+     need(type(call_id) is str and call_id, "EXTERNAL_CALL_ID_REQUIRED")
+-    calls = [(i, x["payload"]) for i, x in enumerate(rows) if x.get("type") == "response_item" and x.get("payload", {}).get("type") in ("custom_tool_call", "function_call") and x["payload"].get("call_id") == call_id]
+-    returns = [(i, x["payload"]) for i, x in enumerate(rows) if x.get("type") == "response_item" and x.get("payload", {}).get("type") in ("custom_tool_call_output", "function_call_output") and x["payload"].get("call_id") == call_id]
+-    need(len(calls) == len(returns) == 1 and calls[0][0] < returns[0][0] and calls[0][1].get("name") and (calls[0][1].get("input") or calls[0][1].get("arguments")) and returns[0][1].get("output"), "COMPLETE_EXTERNAL_ROOT_PAIR_REQUIRED")
+-    returned = json.dumps(returns[0][1]["output"], ensure_ascii=False)
+-    need(all(shape(ref)["sha256"] in returned for ref in expected_refs), "EXTERNAL_PAIR_DOES_NOT_BIND_REVIEW_REFS")
+-    need(when(binding["tool_result_timestamp"]) >= when(binding["tool_call_timestamp"]), "EXTERNAL_PAIR_TIME_ORDER")
++    need(first.get("type") == last.get("type") == "response_item"
++         and call.get("type") in ("custom_tool_call", "function_call")
++         and output.get("type") in ("custom_tool_call_output", "function_call_output")
++         and call.get("call_id") == output.get("call_id") == call_id
++         and call.get("name") in {"exec", "functions.exec", "exec_command", "functions.exec_command"}
++         and (call.get("name") in {"exec_command", "functions.exec_command"} or (type(call.get("input", call.get("arguments"))) is str and "tools.exec_command" in call.get("input", call.get("arguments"))))
++         and type(call.get("input", call.get("arguments"))) is str
++         and "MAIN23_CAPTURE_OPERATION:" + operation in call.get("input", call.get("arguments"))
++         and output.get("output"), "COMPLETE_EXTERNAL_ROOT_PAIR_REQUIRED")
++    need(binding.get("tool_call_timestamp") == first["timestamp"]
++         and binding.get("tool_result_timestamp") == last["timestamp"], "EXTERNAL_PAIR_ORIGINAL_TIMESTAMPS")
++    hosts = [x for x in structured_documents(output["output"]) if type(x.get("chunk_id")) is str and x.get("chunk_id")
++             and type(x.get("exit_code")) is int and x.get("exit_code") == 0 and type(x.get("output")) is str]
++    need(len(hosts) == 1, "EXPECTED_ACTUAL_EXEC_HOST_RESULT")
++    result_docs = [x for x in structured_documents(hosts[0]["output"]) if x.get("schema") == CAPTURE_RESULT_SCHEMA]
++    need(len(result_docs) == 1, "EXPECTED_TYPED_ROOT_CAPTURE_RESULT")
++    observed = result_docs[0]
++    need(observed.get("issued_by") == observed.get("observer_actor") == ROOT
++         and observed.get("root_thread_id") == ROOT_THREAD and observed.get("operation") == operation
++         and observed.get("source") == "tools.exec_command" and observed.get("formal_acceptance") is False
++         and exact_ref_set(observed.get("observed_refs")) == exact_ref_set(expected_refs), "EXTERNAL_PAIR_DOES_NOT_BIND_REVIEW_REFS")
++    if peer_actor is not None:
++        need(observed.get("peer_actor") == peer_actor and binding.get("peer_delivery_binding_ref") is not None,
++             "ACTUAL_NONAUTHOR_PEER_REQUIRED")
++        _, received = validate_peer_delivery(binding["peer_delivery_binding_ref"], expected_refs, peer_actor, operation)
++        need(received <= when(first["timestamp"]), "ROOT_WITNESS_PRECEDES_PEER_DELIVERY")
++    else:
++        need(observed.get("peer_actor") is None, "EXTERNAL_CAPTURE_ACTOR_CONTEXT")
+     return True
++
++
++def runtime_review_chain(qualification_ref, qualification, contract):
++    need(qualification.get("schema") == "researchos.root-main23-qualified-runtime.v2"
++         and qualification.get("root_thread_id") == ROOT_THREAD and qualification.get("issued_by") == ROOT,
++         "QUALIFIED_RUNTIME_ACTUAL_REVIEW_CHAIN_REQUIRED")
++    payload = doc(qualification["payload_ref"])
++    projected = {k: v for k, v in qualification.items() if k not in {"payload_ref", "root_issuance_binding_ref", "schema"}}
++    need(payload.get("schema") == "researchos.root-main23-runtime-qualification-payload.v2"
++         and {k: v for k, v in payload.items() if k != "schema"} == projected, "QUALIFICATION_PAYLOAD_EXACT_BINDING")
++    author = qualification.get("review_author")
++    need(type(author) is str and re.fullmatch(r"codex:/root/[a-z0-9_]+", author)
++         and author not in (ROOT, CALLER_AUTHOR, BUILDER_AUTHOR), "QUALIFIED_RUNTIME_REVIEW_REQUIRED")
++    source_ref, source_mf_ref = qualification["source_hdf_ref"], qualification["source_mf_ref"]
++    source, source_mf = doc(source_ref), manifest(source_mf_ref)
++    need(same_ref(source_ref, pin(N / "HDF.json")) and same_ref(source_mf_ref, pin(N / "MF.json"))
++         and source.get("source_author") == CALLER_AUTHOR and same_ref(source["manifest_ref"], source_mf_ref)
++         and same_ref(source["caller_ref"], qualification["caller_ref"]) and same_ref(qualification["caller_ref"], pin(__file__))
++         and doc(qualification["builder_contract_ref"]) == contract, "RUNTIME_REVIEW_SOURCE_PINS")
++    scope_ref = qualification["qualification_scope_ref"]; scope = doc(scope_ref)
++    need(scope.get("schema") == "researchos.root-main23-runtime-qualification-scope.v2"
++         and scope.get("issued_by") == ROOT and scope.get("root_thread_id") == ROOT_THREAD
++         and scope.get("slice_id") == "MAIN23_RUNTIME_RESOURCE_QUALIFICATION"
++         and scope.get("formal_acceptance") is False and scope.get("execution_grant") is False
++         and same_ref(scope["source_hdf_ref"], source_ref) and same_ref(scope["source_mf_ref"], source_mf_ref)
++         and same_ref(scope["caller_ref"], qualification["caller_ref"])
++         and same_ref(scope["builder_contract_ref"], qualification["builder_contract_ref"])
++         and when(scope["lease_expires_at"]) > datetime.now(timezone.utc), "RUNTIME_ROOT_QUALIFICATION_SCOPE")
++    review_refs = [qualification[k] for k in ("review_hdf_ref", "review_mf_ref", "review_decision_ref")]
++    review, review_mf, decision = doc(review_refs[0]), manifest(review_refs[1]), doc(review_refs[2])
++    need(review.get("schema") == "researchos.main23-runtime-independent-review-hdf.v2"
++         and review.get("review_author") == decision.get("review_author") == author
++         and review.get("source_author") == decision.get("source_author") == CALLER_AUTHOR
++         and review.get("builder_source_author") == decision.get("builder_source_author") == BUILDER_AUTHOR
++         and review.get("root_thread_id") == decision.get("root_thread_id") == ROOT_THREAD
++         and same_ref(review["manifest_ref"], review_refs[1]) and same_ref(review["decision_ref"], review_refs[2])
++         and any(same_ref(review_refs[2], ref) for ref in review_mf["members"]), "RUNTIME_REVIEW_HDF_MF_BINDING")
++    need(decision.get("schema") == "researchos.main23-runtime-independent-review-decision.v2"
++         and decision.get("independent_non_author") is True and decision.get("verdict") == "RUNTIME_CLOSURE_ACCEPTED"
++         and decision.get("formal_acceptance") is False and decision.get("execution_grant") is False
++         and decision.get("resource_refs") == qualification["resource_refs"]
++         and exact_ref_set(decision["resource_refs"]) == exact_ref_set(qualification["resource_refs"]), "RUNTIME_DECISION_BINDING")
++    for name, ref in (("source_hdf_ref", source_ref), ("source_mf_ref", source_mf_ref),
++                      ("caller_ref", qualification["caller_ref"]), ("builder_contract_ref", qualification["builder_contract_ref"]),
++                      ("qualification_scope_ref", scope_ref), ("python_ref", qualification["python_ref"]), ("go_ref", qualification["go_ref"])):
++        need(same_ref(review[name], ref) and same_ref(decision[name], ref), "RUNTIME_REVIEW_SOURCE_SCOPE_REFS")
++    peer_binding, received = validate_peer_delivery(qualification["review_hostpair_binding_ref"], review_refs, author,
++                                                     "RUNTIME_QUALIFICATION_ISSUANCE")
++    root_binding = doc(qualification["root_issuance_binding_ref"])
++    expected = [qualification["payload_ref"], scope_ref] + review_refs + [qualification["review_hostpair_binding_ref"]]
++    validate_root_capture(root_binding, checked(root_binding["original_capture_ref"]), expected,
++                          "RUNTIME_QUALIFICATION_ISSUANCE")
++    need(when(scope["created_utc"]) <= when(review["reviewed_utc"]) <= received
++         <= when(root_binding["tool_call_timestamp"]) <= when(root_binding["tool_result_timestamp"])
++         <= when(qualification["created_utc"]), "RUNTIME_ORIGINAL_REVIEW_ISSUANCE_TIME_ORDER")
++    refs = [qualification["payload_ref"], qualification["root_issuance_binding_ref"], root_binding["original_capture_ref"],
++            qualification["review_hostpair_binding_ref"], peer_binding["original_capture_ref"], scope_ref,
++            source_ref, source_mf_ref, qualification["caller_ref"], qualification["builder_contract_ref"]] + review_refs
++    return refs + review_mf["members"] + source_mf["members"]
+ 
+ 
+ def own_review(request):
+@@ -209,10 +388,12 @@
+     for field in ("review_hdf_ref", "review_mf_ref", "review_decision_ref"):
+         need(same_ref(witness[field], request[field]), "ROOT_REVIEW_WITNESS_BINDING")
+     capture = doc(witness["capture_binding_ref"]); raw = checked(capture["original_capture_ref"])
+-    validate_root_capture(capture, raw, [request[x] for x in ("review_hdf_ref", "review_mf_ref", "review_decision_ref")])
++    validate_root_capture(capture, raw, [request[x] for x in ("review_hdf_ref", "review_mf_ref", "review_decision_ref")], "SOURCE_REVIEW_WITNESS", reviewer)
+     need(when(capture["tool_result_timestamp"]) >= when(review["reviewed_utc"]) and when(witness["created_utc"]) >= when(capture["tool_result_timestamp"]), "ROOT_REVIEW_WITNESS_NOT_AFTER_REVIEW")
+     refs = [request[x] for x in ("source_hdf_ref", "source_mf_ref", "review_hdf_ref", "review_mf_ref", "review_decision_ref", "review_hostpair_witness_ref")]
+     refs += source_mf["members"] + review_mf["members"] + [source["source_inputs_ref"], witness["capture_binding_ref"], capture["original_capture_ref"]]
++    peer_ref = capture["peer_delivery_binding_ref"]
++    refs += [peer_ref, doc(peer_ref)["original_capture_ref"]]
+     refs += doc(source["source_inputs_ref"])["references"]
+     return {"source": source, "review": review, "reviewer": reviewer, "witness": witness, "refs": refs}
+ 
+@@ -271,7 +452,7 @@
+     paths = [parent / (prefix + case["case_id"]) for prefix in ("fresh-main23-", "fresh-main23-caller-", "fresh-main23-registration-")]
+     need(all(not p.exists() for p in paths[:2]) and case["output_root"] == str(paths[0]) and q["caller_receipt_root"] == str(paths[1]) and q["registration_root"] == str(paths[2]), "FRESH_SEPARATE_OUTPUT_ROOTS")
+     live_capture = doc(live["capture_binding_ref"])
+-    validate_root_capture(live_capture, checked(live_capture["original_capture_ref"]), q["before_canonical_refs"])
++    validate_root_capture(live_capture, checked(live_capture["original_capture_ref"]), q["before_canonical_refs"], "POSTREVIEW_CURRENT_FOUR")
+     need(when(live_capture["tool_result_timestamp"]) > when(source["review"]["reviewed_utc"]), "LIVE_ROOT_CAPTURE_PRECEDES_REVIEW")
+     refs = [request_ref, q["root_resume_ref"], q["postreview_live_ref"], q["case_request_ref"], live["capture_binding_ref"], live_capture["original_capture_ref"]] + source["refs"] + builder["refs"] + public["refs"]
+     return q, current, source, builder, refs
+@@ -347,8 +528,9 @@
+ 
+ def runtime_closure(qualification_ref, contract):
+     qualification = doc(qualification_ref)
+-    need(qualification.get("schema") == "researchos.root-main23-qualified-runtime.v1" and qualification.get("issued_by") == ROOT and qualification.get("independent_non_author") is True and qualification.get("review_author") not in (None, "", ROOT, AUTHOR), "QUALIFIED_RUNTIME_REVIEW_REQUIRED")
++    need(qualification.get("schema") == "researchos.root-main23-qualified-runtime.v2" and qualification.get("issued_by") == ROOT and qualification.get("independent_non_author") is True and qualification.get("review_author") not in (None, "", ROOT, CALLER_AUTHOR, BUILDER_AUTHOR), "QUALIFIED_RUNTIME_REVIEW_REQUIRED")
+     need(qualification.get("status") == "QUALIFIED_FOR_MAIN23_BUILD" and qualification.get("formal_programme_qualification") is False, "RUNTIME_QUALIFICATION_STATUS")
++    review_refs = runtime_review_chain(qualification_ref, qualification, contract)
+     locked = doc(contract["toolchain_lock_ref"]); python = pin(sys.executable)
+     need(canonical(contract["go_ref"]["path"]) == canonical(locked["tools"]["go"]["path"]) and contract["go_ref"]["sha256"] == locked["tools"]["go"]["sha256"], "LOCKED_GO_DRIFT")
+     need(canonical(python["path"]) == canonical(locked["tools"]["python"]["path"]) and python["sha256"] == locked["tools"]["python"]["sha256"] and same_ref(qualification["python_ref"], python) and same_ref(qualification["go_ref"], contract["go_ref"]), "QUALIFIED_PYTHON_GO_BINDING")
+@@ -362,7 +544,7 @@
+             if path and Path(path).is_file(): required.append(pin(path))
+     qualified = {canonical(x["path"]): x for x in qualification["resource_refs"]}
+     need(all(canonical(x["path"]) in qualified and same_ref(x, qualified[canonical(x["path"])]) for x in required), "UNQUALIFIED_LOADED_RUNTIME_RESOURCE")
+-    return [qualification_ref, qualification["review_decision_ref"], contract["toolchain_lock_ref"]] + qualification["resource_refs"]
++    return [qualification_ref, contract["toolchain_lock_ref"]] + review_refs + qualification["resource_refs"]
+ 
+ 
+ def register(mode, facts_ref, activation_ref=None):
+@@ -381,7 +563,7 @@
+         activation = doc(activation_ref)
+         need(activation.get("issued_by") == ROOT and same_ref(activation["facts_ref"], facts_ref) and activation.get("before_canonical_refs") == current["requested_refs"] and when(activation["created_utc"]) > when(q["created_utc"]), "FRESH_ROOT_ACTIVATION_REQUIRED")
+         capture = doc(activation["capture_binding_ref"])
+-        validate_root_capture(capture, checked(capture["original_capture_ref"]), [facts_ref] + current["requested_refs"])
++        validate_root_capture(capture, checked(capture["original_capture_ref"]), [facts_ref] + current["requested_refs"], "ACTIVATION_FACTS_CURRENT_FOUR")
+         need(when(capture["tool_result_timestamp"]) > when(q["created_utc"]), "ACTIVATION_CAPTURE_NOT_FRESH")
+         refs += [activation_ref, activation["capture_binding_ref"], capture["original_capture_ref"]]
+     refs += pending_refs + [facts_ref, facts["scope_ref"], facts["owner_ref"], facts["worker_ref"], GUARD_REF, TP_REF] + facts["before_archive_refs"] + current["physical_refs"][2:]
+@@ -436,7 +618,7 @@
+     def require_registered(self, contract_ref, request_ref, source_author):
+         need(self.held is not None, "ROOT_RESOURCE_CLOSURE_RELEASED")
+         scope, _, _, _ = live_lease(self.actual)
+-        need(source_author == AUTHOR and same_ref(contract_ref, scope["builder_contract_ref"]) and same_ref(request_ref, self.actual["case_request_ref"]), "REGISTERED_BUILDER_MISMATCH")
++        need(source_author == BUILDER_AUTHOR and same_ref(contract_ref, scope["builder_contract_ref"]) and same_ref(request_ref, self.actual["case_request_ref"]), "REGISTERED_BUILDER_MISMATCH")
+ 
+     def require_phase(self, phase, request_ref, output_root):
+         need(self.held is not None, "ROOT_RESOURCE_CLOSURE_RELEASED")

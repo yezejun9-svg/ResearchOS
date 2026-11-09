@@ -1,0 +1,51 @@
+--- coordinator-before
++++ coordinator-after
+@@ -233,6 +233,12 @@
+         self._guard([self.bootstrap['workspace_witness_ref'], pin(seed['profile_file'])])
+         require(pin(seed['profile_file'])['sha256'] == seed['profile_sha256'], 'profile seed changed')
+         self.host_seed_ref = self.input['host_seed_ref']
++        # Prepare only the directory; v9 exclusively consumes the absent file.
++        once_dir = Path(self.bootstrap['data_root']) / 'trial-once'
++        once_dir.mkdir(exist_ok=True)
++        require(once_dir.is_dir() and not once_dir.is_symlink() and not once_dir.is_junction() and once_dir.resolve() == once_dir, 'canonical isolated once directory required')
++        once_path = once_dir / (self.run_uuid + '.json')
++        require(once_path.parent == once_dir and not once_path.exists() and not once_path.is_symlink(), 'Root once file already consumed or foreign')
+         self.state = 'PREPARE_ATTEMPTED'
+         receipt = self.output / 'host.prepare.json'
+         self._host_phase('prepare', receipt, time.monotonic()+90)
+@@ -301,8 +307,26 @@
+         self.ready_ref = pin(ready_path)
+         self.state = 'READY_ADMISSION_PENDING'
+ 
++    def _verify_admitted_profile_binding(self):
++        # Host profile_hash remains the Artifact content digest; C7 expects Hash(ArtifactRef).
++        project = self.bootstrap['project_id']
++        runtime_id = self.admitted['runtime_id']
++        profile_digest = self.engine.go_hash(self.profile_entity_ref)
++        require(self.profile_entity_ref['content_hash'] == self.prepared['profile_hash'] == self.admitted['profile_hash'], 'actual profile content digest changed')
++        with self._read_db() as db:
++            actual_ref = self.engine.exact_artifact_ref(db, project, self.prepared['profile_artifact_id'])
++            runtime = self.engine.object_by_id(db, 'RuntimeRegistration', runtime_id, project)
++            bindings = db.execute('SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?', (project, runtime_id)).fetchall()
++            markers = db.execute('SELECT task,run,runtime,epoch,profile_hash FROM runtime_qualification_runs WHERE project=? AND run=?', (project, self.admitted['qualification_run_id'])).fetchall()
++        require(actual_ref == self.profile_entity_ref and runtime['id'] == runtime_id and runtime['project_id'] == project, 'current ArtifactRef or runtime registration differs')
++        technical_hash = self.engine.go_hash([runtime[k] for k in ('adapter', 'adapter_revision', 'capabilities', 'platform', 'measurement_mode', 'credential_ref')])
++        require(len(bindings) == 1 and json.loads(bindings[0][0]) == actual_ref and bindings[0][1] == profile_digest and bindings[0][2] == technical_hash, 'actual runtime profile binding differs')
++        expected_marker = (self.admitted['qualification_task_id'], self.admitted['qualification_run_id'], runtime_id, self.admitted['qualification_epoch'], profile_digest)
++        require(type(self.admitted['qualification_epoch']) is int and len(markers) == 1 and markers[0] == expected_marker, 'actual qualification profile marker differs')
++
+     def issue_go(self):
+         require(self.state == 'READY_ADMISSION_PENDING' and not self.go_sent, 'GO already attempted')
++        self._verify_admitted_profile_binding()
+         self.state = 'GO_ATTEMPTED'
+         discovery_ref = pin(self.bootstrap['discovery_file'])
+         discovery = read_json(discovery_ref)
+@@ -331,7 +355,7 @@
+         with self._read_db() as db:
+             marker = db.execute('SELECT owner_root FROM runtime_qualification_runs WHERE project=? AND run=?', (self.bootstrap['project_id'], self.admitted['qualification_run_id'])).fetchall()
+             require(len(marker) == 1 and marker[0][0], 'qualification owner marker unavailable')
+-        doc = {'schema': 'researchos.mu-sdk-trial.executable-input.v1', 'source_commit': SOURCE_COMMIT, 'phase': 'execute', 'run_uuid': self.run_uuid, 'maximum_provider_requests': 3, 'qualification_requests': 1, 'ordinary_requests': 2, 'requested_output_tokens_total': 8192, 'total_wall_seconds': 300, 'cli_binary': self.fixed['cli_binary'], 'intake_review': self.input['intake_review_ref'], 'public_route_manifest': self.input['public_route_manifest_ref'], 'runtime_profile': self.profile_ref, 'cancel_fixture_receipt': self.fixed['cancel_receipt'], 'bootstrap_receipt': self.input['bootstrap_result_ref'], 'credential_revision': self.engine.CREDENTIAL_REF, 'repository_root': str(ROOT), 'outcome_dir': str(self.output / 'c7-outcomes'), 'once_path': str(self.output / 'c7-execute.once.json'), 'root_registration_started_at_utc': self.started_utc, 'runtime_id': self.admitted['runtime_id'], 'qualification_task_id': self.admitted['qualification_task_id'], 'qualification_run_id': self.admitted['qualification_run_id'], 'qualification_epoch': self.admitted['qualification_epoch'], 'qualification_owner_root': marker[0][0], 'qualification_profile_hash': self.admitted['profile_hash'], 'profile_entity_ref': self.profile_entity_ref, 'prompt': self.input['ordinary_prompt']}
++        doc = {'schema': 'researchos.mu-sdk-trial.executable-input.v1', 'source_commit': SOURCE_COMMIT, 'phase': 'execute', 'run_uuid': self.run_uuid, 'maximum_provider_requests': 3, 'qualification_requests': 1, 'ordinary_requests': 2, 'requested_output_tokens_total': 8192, 'total_wall_seconds': 300, 'cli_binary': self.fixed['cli_binary'], 'intake_review': self.input['intake_review_ref'], 'public_route_manifest': self.input['public_route_manifest_ref'], 'runtime_profile': self.profile_ref, 'cancel_fixture_receipt': self.fixed['cancel_receipt'], 'bootstrap_receipt': self.input['bootstrap_result_ref'], 'credential_revision': self.engine.CREDENTIAL_REF, 'repository_root': str(ROOT), 'outcome_dir': str(self.output / 'c7-outcomes'), 'once_path': str(Path(self.bootstrap['data_root']) / 'trial-once' / (self.run_uuid + '.json')), 'root_registration_started_at_utc': self.started_utc, 'runtime_id': self.admitted['runtime_id'], 'qualification_task_id': self.admitted['qualification_task_id'], 'qualification_run_id': self.admitted['qualification_run_id'], 'qualification_epoch': self.admitted['qualification_epoch'], 'qualification_owner_root': marker[0][0], 'qualification_profile_hash': self.engine.go_hash(self.profile_entity_ref), 'profile_entity_ref': self.profile_entity_ref, 'prompt': self.input['ordinary_prompt']}
+         for key in ('data_root', 'workspace', 'discovery_file', 'cli_config_file', 'project_id', 'goal_id', 'config_revision', 'workspace_witness'):
+             doc[key] = self.bootstrap[key]
+         discovery, config = self.engine.current_consumed_states(doc)

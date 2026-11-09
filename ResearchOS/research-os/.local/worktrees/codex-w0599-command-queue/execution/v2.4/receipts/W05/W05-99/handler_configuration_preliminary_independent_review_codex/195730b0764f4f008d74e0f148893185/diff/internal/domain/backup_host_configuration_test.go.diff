@@ -1,0 +1,246 @@
+--- baseline/internal/domain/backup_host_configuration_test.go
++++ snapshot/internal/domain/backup_host_configuration_test.go
+@@ -3,10 +3,12 @@
+ import (
+ 	"context"
+ 	"database/sql"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"researchos.local/research-os/internal/store"
+ )
+@@ -247,3 +249,230 @@
+ 		})
+ 	}
+ }
++
++// Explicit bounded workspace fixture; no user filesystem authority is inferred
++// from a database path. Only this test's originally chosen empty root is read.
++type handlerBackupWorkspace struct{ path, principal string }
++
++func (w handlerBackupWorkspace) ConsumeSelection(_ context.Context, selection, client, principal string) (WorkspaceSelection, error) {
++	if selection != "handler-selection" || client != "config-client" || principal != w.principal {
++		return WorkspaceSelection{}, fmt.Errorf("foreign synthetic selection")
++	}
++	return WorkspaceSelection{RealPath: w.path, DisplayPath: w.path, Access: "READ_ONLY", HostPrincipalRef: "SYNTHETIC-METADATA", ClientID: client}, nil
++}
++func (w handlerBackupWorkspace) ConfirmPath(_ context.Context, path, access string) error {
++	if path != w.path || access != "READ_ONLY" {
++		return fmt.Errorf("foreign synthetic root")
++	}
++	_, e := os.Stat(path)
++	return e
++}
++func (w handlerBackupWorkspace) Scan(_ context.Context, path string) (LocalInventoryScan, error) {
++	if path != w.path {
++		return LocalInventoryScan{}, fmt.Errorf("foreign synthetic scan")
++	}
++	return LocalInventoryScan{Environment: "handler-public-backup-fixture", Entries: []LocalInventoryEntry{}, Failures: []LocalInventoryFileFailure{}}, nil
++}
++
++func (w handlerBackupWorkspace) SnapshotWorkspace(_ context.Context, b WorkspaceBinding, _ string, _ BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error) {
++	if b.RealPath != w.path || b.PrincipalID != w.principal {
++		return BackupWorkspaceSnapshot{}, fmt.Errorf("foreign fixture workspace")
++	}
++	entries, e := os.ReadDir(w.path)
++	if e != nil {
++		return BackupWorkspaceSnapshot{}, e
++	}
++	if len(entries) != 0 {
++		return BackupWorkspaceSnapshot{}, fmt.Errorf("fixture root not empty")
++	}
++	return BackupWorkspaceSnapshot{Directories: []string{}, Files: []BackupWorkspaceFile{}}, nil
++}
++
++func TestHandlerRejectedSessionPublicBackupReplay(t *testing.T) {
++	f := setup(t)
++	doc := configurationSchema(t)
++	port := handlerBackupWorkspace{t.TempDir(), f.owner}
++	owner := Principal{ID: f.owner, Roles: []string{"OWNER"}, CanCreateProject: true}
++	b, e := f.s.RegisterWorkspace(context.Background(), owner, port, doc, RegisterWorkspaceInput{SelectionRef: "handler-selection", DisplayName: "Public backup fixture", RequestedAccess: "READ_ONLY", CommandID: ID(), ClientID: "config-client"})
++	if e != nil {
++		t.Fatal(e)
++	}
++	project, e := f.s.BootstrapProject(context.Background(), owner, port, doc, port, BootstrapProjectInput{AuthorizedWorkspaceRef: Str(b, "authorized_workspace_ref"), DisplayName: "Public backup fixture", ClientID: "config-client", CommandID: ID(), MeasurementMode: "FIXTURE"})
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.project = Str(project, "project_id")
++	s := &ClientService{Doc: doc, Domain: f.s, ConfigurationAuthority: handlerMetadataFixture{f.owner}, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: "fixture", LeaseTTL: time.Hour}}
++	configured, _ := handlerCommand(t, f, s, handlerDefaultEnvelope(1))
++	if deref(configured.Status) != "COMPLETED" {
++		t.Fatal(string(Bytes(configured)))
++	}
++	created, _ := handlerCommand(t, f, s, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("config-client"), ProjectID: &f.project, Method: strptr("session.create"), Payload: Bytes(Object{"workspace_ref": Str(b, "authorized_workspace_ref"), "model_config_ref": Str(configured.Result, "model_config_ref"), "title": "offline backup"})})
++	if deref(created.Status) != "COMPLETED" {
++		t.Fatal(string(Bytes(created)))
++	}
++	sid := deref(created.SessionID)
++	unknown := "absent-session-" + ID()
++	env := handlerDefaultEnvelope(2)
++	env.ProjectID, env.SessionID, env.ExpectedRevision, env.WriterEpoch = &f.project, &unknown, revPtr(1), revPtr(1)
++	r, _ := handlerCommand(t, f, s, env)
++	if deref(r.Status) != "REJECTED" || deref(r.SessionID) != unknown || deref(r.ErrorCode) != "NOT_FOUND" {
++		t.Fatalf("original refusal: %s", Bytes(r))
++	}
++	original := string(Bytes(r))
++	// A different project with a real Session is also a legal original refusal;
++	// its original request scope must survive backup and exact replay.
++	foreign := *env
++	foreign.CommandID, foreign.SessionID, foreign.ProjectID = strptr(ID()), &sid, strptr("foreign-project")
++	r, _ = handlerCommand(t, f, s, &foreign)
++	if deref(r.Status) != "REJECTED" || deref(r.SessionID) != sid {
++		t.Fatal(string(Bytes(r)))
++	}
++	scoped := handlerDefaultEnvelope(2)
++	scoped.ProjectID = &f.project
++	scoped.SessionID = &sid
++	scoped.ExpectedRevision = revPtr(1)
++	scoped.WriterEpoch = revPtr(1)
++	scopedReply, _ := handlerCommand(t, f, s, scoped)
++	if deref(scopedReply.Status) != "COMPLETED" {
++		t.Fatal(string(Bytes(scopedReply)))
++	}
++	for revision := int64(3); revision <= 201; revision++ {
++		saved, _ := handlerCommand(t, f, s, handlerDefaultEnvelope(revision))
++		if deref(saved.Status) != "COMPLETED" {
++			t.Fatal(string(Bytes(saved)))
++		}
++	}
++	status, _ := handlerCommand(t, f, s, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("config-client"), Method: strptr("host.status"), Payload: Bytes(Object{})})
++	if deref(status.Status) != "COMPLETED" || len(Arr(status.Result, "model_configurations")) != 100 {
++		t.Fatal("public backup did not cover full history outside bounded status")
++	}
++	var historicalConfigs int
++	f.db.QueryRow(`SELECT count(*) FROM host_model_configurations`).Scan(&historicalConfigs)
++	if historicalConfigs != 201 {
++		t.Fatal("history was pruned")
++	}
++	if e := validateBackupHostConfiguration(f.db); e != nil {
++		t.Fatal(e)
++	}
++	key := backupTestKey(t)
++	dir := filepath.Join(t.TempDir(), "backup")
++	var root string
++	if e := f.db.QueryRow(`SELECT json_extract(body,'$.real_path') FROM domain_objects WHERE kind='WorkspaceBinding'`).Scan(&root); e != nil {
++		t.Fatal(e)
++	}
++	if _, e := f.s.CreateBackupWithWorkspaces(context.Background(), dir, key, handlerBackupWorkspace{root, f.owner}); e != nil {
++		t.Fatal(e)
++	}
++	dst := filepath.Join(t.TempDir(), "restore")
++	var rebound string
++	pin := func(_ context.Context, _ string, requests []WorkspaceRestoreRequest) ([]WorkspaceRestorePin, error) {
++		pins := []WorkspaceRestorePin{}
++		for _, request := range requests {
++			if request.PrincipalID != f.owner {
++				return nil, fmt.Errorf("foreign restored principal")
++			}
++			rebound = request.RealPath
++			pins = append(pins, WorkspaceRestorePin{AuthorizedRef: request.AuthorizedRef, RealPath: request.RealPath, HostPrincipalRef: "SYNTHETIC-RESTORED-METADATA"})
++		}
++		return pins, nil
++	}
++	if _, e := RestoreBackup(context.Background(), dir, dst, RestoreOptions{Key: key, SupportedMigrations: upgradeVersions(23), Contracts: f.s.Contracts, DatabaseName: "researchos.sqlite", WorkspaceTarget: pin}); e != nil {
++		t.Fatal(e)
++	}
++	db, e := store.Open(filepath.Join(dst, "researchos.sqlite"))
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer db.Close()
++	configurationEvidenceSnapshot(t, f.db, "handler-legal-refusals-source")
++	configurationEvidenceSnapshot(t, db, "handler-legal-refusals-restored")
++	for _, request := range []*Envelope{env, &foreign} {
++		tx, e := db.Begin()
++		if e != nil {
++			t.Fatal(e)
++		}
++		response, replay, e := s.Execute(context.Background(), tx, handlerDecode(t, request), f.owner)
++		if e != nil {
++			tx.Rollback()
++			t.Fatal(e)
++		}
++		if !replay || deref(response.SessionID) != deref(request.SessionID) || (request == env && string(Bytes(response)) != original) {
++			tx.Rollback()
++			t.Fatal("restored original replay differs")
++		}
++		if e = tx.Commit(); e != nil {
++			t.Fatal(e)
++		}
++	}
++	if rebound == "" || rebound == root {
++		t.Fatal("restored workspace not isolated")
++	}
++	if _, e = (&Service{DB: db, Contracts: f.s.Contracts}).CreateBackupWithWorkspaces(context.Background(), filepath.Join(t.TempDir(), "rebackup"), key, handlerBackupWorkspace{rebound, f.owner}); e != nil {
++		t.Fatal(e)
++	}
++}
++
++func TestHandlerRejectedOriginalProofBackupTampering(t *testing.T) {
++	for _, mutation := range []string{"response-SID", "request-SID", "request-payload", "journal-hash", "identity-project", "success-without-session", "remove-original", "noncanonical-base64"} {
++		t.Run(mutation, func(t *testing.T) {
++			f := contextFixture(t)
++			s, _, _ := handlerTypedSession(t, f, "config-client")
++			env := handlerDefaultEnvelope(2)
++			env.ProjectID = &f.project
++			env.SessionID = strptr("missing-session")
++			env.ExpectedRevision = revPtr(1)
++			env.WriterEpoch = revPtr(1)
++			r, _ := handlerCommand(t, f, s, env)
++			if deref(r.Status) != "REJECTED" {
++				t.Fatal(string(Bytes(r)))
++			}
++			if e := validateBackupHostConfiguration(f.db); e != nil {
++				t.Fatal(e)
++			}
++			switch mutation {
++			case "response-SID":
++				configurationBackupMutation(t, f.db, `UPDATE idempotency SET body=json_set(body,'$.session_id','other') WHERE key=?`, *env.CommandID)
++			case "journal-hash":
++				configurationBackupMutation(t, f.db, `UPDATE idempotency SET request_hash=? WHERE key=?`, Digest([]byte("different")), *env.CommandID)
++			case "identity-project":
++				configurationBackupMutation(t, f.db, `UPDATE client_command_identities SET project='other' WHERE command_id=?`, *env.CommandID)
++			case "success-without-session":
++				configurationBackupMutation(t, f.db, `UPDATE idempotency SET body=json_set(body,'$.status','COMPLETED','$.error',NULL,'$.error_code',NULL) WHERE key=?`, *env.CommandID)
++			case "remove-original":
++				configurationBackupMutation(t, f.db, `UPDATE idempotency SET headers='{}' WHERE key=?`, *env.CommandID)
++			default:
++				var h string
++				f.db.QueryRow(`SELECT headers FROM idempotency WHERE key=?`, *env.CommandID).Scan(&h)
++				request, _, e := readClientCommandEnvelope(s.Doc, h)
++				if e != nil {
++					t.Fatal(e)
++				}
++				if mutation == "request-SID" {
++					request.env.SessionID = strptr("other")
++				} else if mutation == "request-payload" {
++					request.env.Payload = Bytes(Object{"config_revision": 2, "provider_id": "fixture-provider", "base_url": "https://fixture.invalid/v1", "model_id": "different", "credential_ref": nil})
++				}
++				altered := handlerDecode(t, request.env)
++				h, e = writeClientCommandEnvelope(s.Doc, altered)
++				if e != nil {
++					t.Fatal(e)
++				}
++				if mutation == "noncanonical-base64" {
++					h = " " + h
++				}
++				configurationBackupMutation(t, f.db, `UPDATE idempotency SET headers=? WHERE key=?`, h, *env.CommandID)
++			}
++			if e := validateBackupHostConfiguration(f.db); e == nil {
++				t.Fatal("modified original proof accepted")
++			}
++			destination := filepath.Join(t.TempDir(), "refused")
++			if _, e := f.s.CreateBackup(context.Background(), destination, backupTestKey(t)); e == nil {
++				t.Fatal("corrupt backup published")
++			}
++			if _, e := os.Stat(destination); !os.IsNotExist(e) {
++				t.Fatal("failed backup left published directory", e)
++			}
++		})
++	}
++}

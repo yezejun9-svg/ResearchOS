@@ -1,0 +1,103 @@
+{
+  "template_version": "2.4.0",
+  "artifact": "independent_review",
+  "step_id": "W02-02",
+  "parent_task": "W02",
+  "reviewer_id": "qoder-desktop:/root/independent_verifier_w0202",
+  "reviewer_identity_source": "self-declared verifier identity; every conclusion below is from first-hand execution against the repository at commit 2213c7fc, not from the executor's receipts",
+  "verdict": "ACCEPT",
+  "subject": {
+    "commit": "2213c7fcfc08ca11d56237623c9f53c08401f370",
+    "parent": "9e6809b9",
+    "repository_head_at_review": "2213c7fc",
+    "card": "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tasks/steps/W02-02.md",
+    "allowed_scope": [
+      "execution/command_dispatcher/dispatch.py",
+      "execution/v2.4/commands.json",
+      "execution/v2.4/client_mapping.json",
+      "tests/bootstrap/test_dispatcher.py",
+      "execution/v2.4/receipts/W02/W02-02/**"
+    ]
+  },
+  "checked_at": "2026-10-01T16:02:38Z",
+  "methods": [
+    "Ran the self-running dispatcher check: `python tests/bootstrap/test_dispatcher.py` -> exit 0, exactly 30 assertion_ids (21 legacy `W02-DISPATCH-*` + 9 `W02-V24-*`); read the test source in full to confirm the assertions are real, not decorative.",
+    "Independently drove the dispatcher CLI 6 times against the real registry and read the resulting on-disk invocation receipts to inspect registry_spec/status/exit_code/registered_command_revision.",
+    "Line-ending-normalized `diff` of dispatch.py and test_dispatcher.py between parent 9e6809b9 and HEAD to isolate the true semantic delta from the CRLF re-write noise in `git show`.",
+    "Grep of the legacy execution/commands.json selectors for '*'; empirical reproduction of the pre-fix dispatcher (wildcard line reverted) and a strict v2.0 selector with a wrong task-id.",
+    "Extracted the SPEC schema method/event enums from ResearchOS_Implementation_Package_v2.4/contracts/client.protocol.schema.json and set-diffed them against client_mapping.json; verified the pinned schema_sha256.",
+    "Re-checked the session.send rpc_binding against docs 22 (line 17/75) and 19 (line 56/184); read doc 18 §2 (items 1 and 5) for the current-spec binding rule.",
+    "sha256 of the 4 touched files + legacy registry vs receipt claims; git status --porcelain tracked-modification count; gitlink scan of the commit and of HEAD; step_state.json diff and evidence-hash verification."
+  ],
+  "required_findings": {
+    "1_test": "PASS. exit 0; 30 assertion_ids = 21 legacy fail-closed + 9 v2.4. V24 group is genuine: UNKNOWN_KEY_NONZERO/UNBOUND_NONZERO/BOUND_REAL_VALIDATE/VERSION_ISOLATION/AUTO_POINTER_V24/SELECTOR_MISMATCH_FAILS all call dispatch.execute(root=real repo) and assert on receipt['status'], receipt['exit_code'] and receipt['registry_spec']; BOUND_REAL_VALIDATE actually executes the real v2.4 validator and asserts PASS with >10 assertion ids; REGISTRY_INVARIANTS and MAPPING_23_14_OWNED read the registries; OLD_REGISTRY_PROTECTED hash-pins the legacy file.",
+    "2_cli_rerun": "PASS. dispatcher.selftest --spec v2.4 -> PASS 30 exit 0 (my invocation a781db64). fork.worker_launch_rpc --spec v2.4 -> NOT_IMPLEMENTED exit 3 (80178733). package.validate --spec v2.4 -> NOT_IMPLEMENTED exit 3 (3ed4675b). package.validate_v24 --spec v2.0 -> NOT_IMPLEMENTED exit 3 (ac09f4f1). package.validate --spec v2.0 -> PASS 8 exit 0 (b15c88c2). Every receipt carries the correct registry_spec (v2.4 for the first three, v2.0 for the last two) and the right registered_command_revision (bf8de03b = v2.4 registry, 4239a0e6 = legacy).",
+    "3_wildcard_honesty": "PASS, disclosure is truthful. dispatch.py diff proves resolve_registry + spec param + registry_spec recording + wildcard selector branch + --spec CLI are all added in this commit. I reconstructed the code WITHOUT only the wildcard branch and ran dispatcher.selftest --spec v2.4: it returned NOT_IMPLEMENTED exit 3 (invocation c0daf0e2), reproducing exactly the mid_card_failure_disclosed failure; with the fix the same inputs PASS. Wildcard semantics are additive-safe for legacy: the old execution/commands.json contains 0 selectors with '*' (grep confirmed), so the added condition is always true for legacy entries and the effective test reduces to the original exact match. Empirically, package.validate --spec v2.0 --task-id WRONGTASK still returns NOT_IMPLEMENTED exit 3 (7dec1b81), proving legacy exact selectors are not silently loosened. The fix only matters for the new v2.4 registry, which is where '*' selectors are actually used.",
+    "4_commands_json": "PASS. 2 BOUND + 8 UNBOUND (>=7 met). All UNBOUND carry real planned argv (npm ci / npm run build / rpc-entry.js --mode rpc --model deepseek/deepseek-flash / --stop / apps/cli/main.go / apps/desktop / dist:win / tests/bootstrap/test_protocol.py), timeout_seconds>0 and owner_card (W02-03, W16, W03+); none is an echo-PASS stub. BOUND package.validate_v24 argv runs the real external v2.4 validator (D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tools/validate_package.py) via `python -c subprocess` and I observed PASS/12 checks (invocation 4272717a) — this is a legitimate 'bind to current-spec validation' per doc 18 §2 item 5 (extend dispatcher to select new registry by current_spec; do not fake history), because the main root has no spec/v2.4 directory (only spec/v2.0) and the only in-repo validators are v2.0 (wrong spec). See limitations for the portability risk.",
+    "5_client_mapping": "PASS. method_map has exactly 23 methods and event_map exactly 14 events; both sets are equal to the SPEC schema enums (/$defs/CommandEnvelope.properties.method + CommandResponse.properties.method = 23; /$defs/SessionEvent.properties.kind = 14) with no missing/extra/duplicate. source.schema_sha256 8943fe36... equals the live schema file hash. Every method and event has a non-empty owner_card. session.send rpc_binding 'prompt/steer/follow_up per streamingBehavior' matches doc 22 line 17/75 and doc 19 line 56/184 exactly. Statuses are PLANNED / PLANNED_IN_W02_03_THEN_W03 for methods and MAPPED / PLANNED for events; no entry claims IMPLEMENTED/DONE, so the mapping document is not overstating product readiness.",
+    "6_legacy_retention": "PASS. test_dispatcher.py grew 117 -> 148 lines; the entire original 21-check fail-closed body (REAL_CHILD through PATH_BOUNDARY) is byte-for-byte preserved; only the final print(...) was replaced by the appended V24 block + new print. Legacy execution/commands.json hash is still 4239a0e6551c24915c12fb1e707738467d9d62d148c2e48560d5cdfa127b7961 (unmodified by this commit, matching the OLD_REGISTRY_PROTECTED assertion and my own re-hash).",
+    "7_no_overclaim": "PASS. Neither receipt.json nor the W02-02 step_state entry claims A03/A15 final verification; the receipt notice is 'Executor reports only' and check_results are EXECUTION_REPORTED/PASS for the incremental checks only. step_state.json W02-02 = EXECUTION_REPORTED with executor_id only and NO verifier_id / accepted_at (no self-acceptance). The receipt evidence hash 30e8b39... matches the actual committed receipt.json.",
+    "8_repo_integrity": "PASS. git status --porcelain shows 0 tracked modifications (only untracked runtime/verifier dirs). Commit 2213c7fc introduced no mode-160000 gitlink and none exists at HEAD. The 4 changed source/registry files' sha256 all match the receipt's input.code_hashes."
+  },
+  "problems": [
+    {
+      "id": "P1",
+      "severity": "minor",
+      "where": "execution/v2.4/receipts/W02/W02-02/receipt.json (check_results W02-02-OUTPUT detail)",
+      "detail": "Receipt summary states '2 BOUND real + 7 UNBOUND planned argv' but the registry actually holds 8 UNBOUND entries (fork.install_deps, fork.build_worker, fork.worker_launch_rpc, fork.worker_stop, cli.entry_run, desktop.shell_launch, desktop.installer_build, protocol.v2_roundtrip). Understatement, not inflation; all 8 are genuine UNBOUND and the REGISTRY_INVARIANTS test threshold (>=7) is met by the true count of 8. No behavioral impact."
+    },
+    {
+      "id": "P2",
+      "severity": "minor",
+      "where": "commit 2213c7fc file list",
+      "detail": "execution/v2.4/step_state.json is modified by this commit although it is not one of the 5 enumerated allowed-scope paths. The change is append-only (adds only the W02-02 EXECUTION_REPORTED entry, no other step altered) and does not self-accept, so it is consistent with the harness contract and with the card's own expectation that step_state stays EXECUTION_REPORTED until independent review; recorded here as a scope-adjacency observation."
+    }
+  ],
+  "limitations": [
+    {
+      "id": "L1",
+      "where": "execution/v2.4/commands.json package.validate_v24.argv",
+      "detail": "The BOUND validator hard-codes an absolute, machine-specific path to the external delivery package (D:/作品集/.../ResearchOS_Implementation_Package_v2.4/tools/validate_package.py), outside the repository and outside the pinned .local/worktrees/v24-continuation/spec/v2.4 snapshot that current_spec.json references. It validates the current v2.4 spec today (real PASS/12), but it is non-portable and is not self-contained in the delivered snapshot. Once 18 §2 item 1 copies the read-only v2.4 snapshot into the repo (spec/v2.4), this argv should be re-pointed to the in-repo validator copy so the check is reproducible independent of the working machine."
+    },
+    {
+      "id": "L2",
+      "where": "execution/command_dispatcher/dispatch.py resolve_registry (auto branch)",
+      "detail": "The auto route only checks that execution/v2.4/current_spec.json exists (Path.is_file) plus that the key is present in the v2.4 registry, whereas commands.json's selection_rule wording says auto prefers v2.4 'only when current_spec.json is valid'. Existence is weaker than content-validity. Functionally correct given the current pointer is present and correct (AUTO_POINTER_V24 passed and explicit --spec routes deterministically); low severity, worth tightening when the snapshot lands in-repo."
+    }
+  ],
+  "measured": {
+    "test_exit_code": 0,
+    "test_assertions": 30,
+    "legacy_assertions": 21,
+    "v24_assertions": 9,
+    "commands_total": 10,
+    "commands_bound": 2,
+    "commands_unbound": 8,
+    "client_mapping_methods": 23,
+    "client_mapping_events": 14,
+    "schema_enum_methods": 23,
+    "schema_enum_events": 14,
+    "tracked_modifications": 0,
+    "gitlinks_in_commit": 0,
+    "gitlinks_at_head": 0,
+    "legacy_commands_sha256": "4239a0e6551c24915c12fb1e707738467d9d62d148c2e48560d5cdfa127b7961",
+    "v24_commands_sha256": "bf8de03b50eeafe05d1447b145c74024c0f8d77c6ff563c6391d457225641f8a",
+    "client_mapping_sha256": "f1f5c59563085deb20d9873fbee706344d6ee9e76c9d394f5975a7199887c44e",
+    "dispatch_sha256": "97287797227f7ed9b2a3a4a8ab5332798fb9683a0eda6d6e1f6f97f0b5dbb173",
+    "test_sha256": "91ae07d822bd372ec594f8a1795b8d3b9ef77eb9b27f93b5a40d43d58604311a",
+    "client_protocol_schema_sha256": "8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+    "receipt_json_sha256": "30e8b39afa71dafe7861305abd91f4eb396e60fd6352def21101e65007bf7edc"
+  },
+  "verifier_invocations": {
+    "dispatcher.selftest --spec v2.4 PASS30": "a781db64-face-4a63-a109-538db2b428ac",
+    "fork.worker_launch_rpc --spec v2.4 NOT_IMPLEMENTED": "80178733-c6b6-42de-883d-6f04d1103f63",
+    "package.validate --spec v2.4 NOT_IMPLEMENTED": "3ed4675b-513d-40e4-a239-02429e1317cf",
+    "package.validate_v24 --spec v2.0 NOT_IMPLEMENTED": "ac09f4f1-1d80-4177-a1a8-335ef2b39d05",
+    "package.validate --spec v2.0 PASS8": "b15c88c2-a56e-4b33-9d0b-1efe5d267344",
+    "package.validate_v24 --spec v2.4 PASS12": "4272717a-d944-4c1d-aabe-09ed9cc83388",
+    "package.validate --spec v2.0 wrong-selector NOT_IMPLEMENTED": "7dec1b81-4413-4e95-a124-ed66199b1a34",
+    "no-wildcard reproduction selftest --spec v2.4 NOT_IMPLEMENTED": "c0daf0e2-163c-4968-b4ec-2567bc4d7b34"
+  },
+  "scope_note": "Independent review of the W02-02 increment only. It does not accept the parent task W02, does not run formal cases A03/A15 final verification, and does not change step_state; acceptance of W02-02 remains a separate registration by the orchestrator.",
+  "summary": "ACCEPT. All eight mandatory checks pass on first-hand execution: the self-running dispatcher test is real (30 assertions with the 9 v2.4 checks genuinely calling dispatch.execute and asserting status/exit_code/registry_spec), all five CLI routes and their registry_spec fields reproduce exactly, the wildcard fix and its disclosure are truthful (reproduced the pre-fix failure and confirmed legacy strictness is unaffected), commands.json meets the BOUND/UNBOUND and no-echo-PASS bar, client_mapping.json matches the SPEC schema 23/14 with full owner-card coverage and no readiness overclaim, the legacy test body and old registry are preserved, there is no A03/A15/self-acceptance overclaim, and the repo has 0 tracked modifications and no gitlink. Remaining items are two minor inaccuracies (P1 undercount of UNBOUND, P2 step_state scope-adjacency) and two carried limitations (L1 non-portable external validator binding, L2 auto-route existence-vs-validity), none of which block acceptance; they should be remediated when the v2.4 snapshot is vendored in-repo."
+}

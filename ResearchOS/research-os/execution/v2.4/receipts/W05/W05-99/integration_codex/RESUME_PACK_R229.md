@@ -1,0 +1,15 @@
+# ResearchOS v2.4 resume: checkpoint 229
+
+Read execution/v2.4/checkpoint.json and step_state.json again before acting. This pack is a reading aid, not authority or an acceptance receipt.
+
+Current permanent identity: aede0678-7308-43dc-b9f2-cfe3d90cfdfb. Main source integration: 9a751cb34998345a84d37e0aef165c37671018c2; subsequent fbf661c1 stores unchanged-source construction evidence. Card selector chooses W05-99, IN_PROGRESS. 39/71 cards and 5/22 parents are ACCEPTED. Current formal cases: 0/42; W04 C03/C04/A01 remain NEEDS_REVALIDATION after S2/S3 domain changes. Preserve all 101 recorded failure origins, old UNKNOWN model effect, 12 resource blocks, historical results and fees/reservations.
+
+S1 CLI follow/cancel, S2 explicit Goal service, S3 durable tool/usage events and S4 typed CLI Goal follower are integrated. Current source-bound CLI67 and domain174 inclusive tests passed with actual raw subprocess output, no skips, no input changes and no external provider calls. Their immutable evidence is in current_runs/20261006T071638Z-aa51d0d5be and current_runs/20261006T071638Z-68a5ef7734. This is local fixture evidence and does not accept W05 or A04. A fresh development binary is .local/bin/researchos-w05-20261006.exe; build/version/help receipts are in build-20261006T072528Z-dfec36. This binary is not an installer.
+
+Next live work: goal_composition_test owns only apps/cli/cli_stream_test.go in .local/worktrees/codex-w0599-goal-composition at 9a751cb3; scope is goal_composition_test_scope_codex.json and independently reviewed merge_preflight.json.reviewed_next_scope. Require real CLI to actual API/domain/SQLite draft and blocked Goal proof, immutable raw/source output, then independent source/evidence review before integration.
+
+The independent architecture reviewer is investigating complete persistent STEER/FOLLOW_UP, actual worker control and pending Goal/Task cancellation. Do not implement an in-memory-only or database-only queue. Candidate needs actual SDK steer/followUp/abort consumption, downstream acknowledgements, canonical queue states, seal/late-queue race handling, cancellation settlement, UNKNOWN-effect preservation and backup/restore/release-drain compatibility. Do not use putOpaque without demonstrating portable restore and upgrade protection: it omits domain_versions and may fail those gates. No production DB cutover is authorized here.
+
+W04 current proof should be revalidated after applicable domain source stabilizes, using new append-only evidence and distinct independent issuance. Do not overwrite former proof pointers/readers just to pass. Do not sign self-acceptance, change frozen thresholds, push, deploy, buy/charge, restart old unknown effects, repeat unchanged401 or launch Qoder CLI. Current credential references and environment key presence are not proof of service availability.
+
+Run the authoritative task selector from the external frozen package and require state_source=VALIDATED_FILE. The old execution/v2.4/HANDOFF_RESUME_PACK.md records revision156 and is historical. Source snapshots, test driver success, reference UI and metadata count cannot replace complete22/42 final gates.

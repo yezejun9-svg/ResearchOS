@@ -1,0 +1,382 @@
+=== internal/host/roots.go ===
+1: package host
+2: 
+3: // Workspace root binding (22 §workspace binding, 04 §鉴权). A root is registered once from a
+4: // user-chosen directory, pinned by volume serial plus file index so a later junction or symlink
+5: // swap of the same path is detectable, and revoked rather than "appearing empty" when access is
+6: // withdrawn - an inaccessible directory must never be presented as an empty one.
+7: 
+8: import (
+9: 	"errors"
+10: 	"fmt"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"sort"
+14: 	"strings"
+15: 	"sync"
+16: 	"time"
+17: )
+18: 
+19: const (
+20: 	AccessReadOnly  = "READ_ONLY"
+21: 	AccessReadWrite = "READ_WRITE"
+22: )
+23: 
+24: type RootBinding struct {
+25: 	Ref          string `json:"ref"`
+26: 	DisplayPath  string `json:"display_path"`
+27: 	RealPath     string `json:"real_path"`
+28: 	Access       string `json:"access"`
+29: 	VolumeID     string `json:"volume_id"`
+30: 	FileID       uint64 `json:"file_id"`
+31: 	FinalPath    string `json:"final_path"`
+32: 	RegisteredAt string `json:"registered_at"`
+33: 	Revoked      bool   `json:"revoked"`
+34: }
+35: 
+36: type rootIndex struct {
+37: 	Version int            `json:"version"`
+38: 	Roots   []*RootBinding `json:"roots"`
+39: }
+40: 
+41: type RootRegistry struct {
+42: 	dir   string
+43: 	mu    sync.RWMutex
+44: 	roots map[string]*RootBinding
+45: }
+46: 
+47: func openRootRegistry(dir string) (*RootRegistry, error) {
+48: 	d := filepath.Join(dir, "workspaces")
+49: 	if err := os.MkdirAll(d, 0o700); err != nil {
+50: 		return nil, err
+51: 	}
+52: 	if err := privateDir(d); err != nil {
+53: 		return nil, err
+54: 	}
+55: 	r := &RootRegistry{dir: d, roots: map[string]*RootBinding{}}
+56: 	var idx rootIndex
+57: 	if err := readPrivate(d, "roots.json", &idx); err != nil {
+58: 		return nil, err
+59: 	}
+60: 	for _, b := range idx.Roots {
+61: 		if b != nil && b.Ref != "" {
+62: 			r.roots[b.Ref] = b
+63: 		}
+64: 	}
+65: 	return r, nil
+66: }
+67: 
+68: func (r *RootRegistry) save() error {
+69: 	idx := rootIndex{Version: 1}
+70: 	for _, ref := range sortedRefs(r.roots) {
+71: 		idx.Roots = append(idx.Roots, r.roots[ref])
+72: 	}
+73: 	if idx.Roots == nil {
+74: 		idx.Roots = []*RootBinding{}
+75: 	}
+76: 	return writePrivate(r.dir, "roots.json", &idx)
+77: }
+78: 
+79: func sortedRefs(m map[string]*RootBinding) []string {
+80: 	out := make([]string, 0, len(m))
+81: 	for k := range m {
+82: 		out = append(out, k)
+83: 	}
+84: 	sort.Strings(out)
+85: 	return out
+86: }
+87: 
+88: // Register pins the chosen directory. A path that is itself a reparse point, or whose parent
+89: // chain contains one, is refused: the binding must describe the real directory the user picked.
+90: func (r *RootRegistry) Register(ref, displayPath, access string, now time.Time) (*RootBinding, error) {
+91: 	if ref == "" || displayPath == "" {
+92: 		return nil, fmt.Errorf("%w: root ref and path are required", ErrBadState)
+93: 	}
+94: 	if access != AccessReadOnly && access != AccessReadWrite {
+95: 		return nil, fmt.Errorf("%w: unknown workspace access", ErrRootDenied)
+96: 	}
+97: 	abs, err := filepath.Abs(displayPath)
+98: 	if err != nil {
+99: 		return nil, err
+100: 	}
+101: 	real, err := filepath.EvalSymlinks(abs)
+102: 	if err != nil {
+103: 		return nil, err
+104: 	}
+105: 	if cleanReal := filepath.Clean(real); cleanReal != filepath.Clean(abs) {
+106: 		return nil, fmt.Errorf("%w: chosen path resolves through a link", ErrPathReparsePoint)
+107: 	}
+108: 	if reparse, err := chainHasReparsePoint(clean(real)); err != nil {
+109: 		return nil, err
+110: 	} else if reparse {
+111: 		return nil, ErrPathReparsePoint
+112: 	}
+113: 	vol, id, final, err := fileIdentity(clean(real))
+114: 	if err != nil {
+115: 		return nil, err
+116: 	}
+117: 	r.mu.Lock()
+118: 	defer r.mu.Unlock()
+119: 	if existing, ok := r.roots[ref]; ok && !existing.Revoked {
+120: 		return nil, fmt.Errorf("%w: root ref already registered", ErrBadState)
+121: 	}
+122: 	b := &RootBinding{Ref: ref, DisplayPath: displayPath, RealPath: clean(real), Access: access,
+123: 		VolumeID: vol, FileID: id, FinalPath: final, RegisteredAt: now.UTC().Format(time.RFC3339Nano)}
+124: 	r.roots[ref] = b
+125: 	if err := r.save(); err != nil {
+126: 		delete(r.roots, ref)
+127: 		return nil, err
+128: 	}
+129: 	return b, nil
+130: }
+131: 
+132: // Resolve validates one published relative path against a bound root and returns the absolute
+133: // path to use. Every check is re-done per access: registration time correctness does not grant
+134: // later immunity, because links and permissions can change underneath.
+135: func (r *RootRegistry) Resolve(ref, rel, wantAccess string) (string, error) {
+136: 	r.mu.RLock()
+137: 	b, ok := r.roots[ref]
+138: 	r.mu.RUnlock()
+139: 	if !ok || b == nil {
+140: 		return "", ErrRootUnknown
+141: 	}
+142: 	if b.Revoked {
+143: 		return "", ErrRootRevoked
+144: 	}
+145: 	if wantAccess == AccessReadWrite && b.Access == AccessReadOnly {
+=== internal/host/backup_integration_windows_test.go ===
+1: //go:build windows
+2: 
+3: package host_test
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"encoding/json"
+9: 	"fmt"
+10: 	"net/http"
+11: 	"net/http/httptest"
+12: 	"os"
+13: 	"os/exec"
+14: 	"path/filepath"
+15: 	"runtime"
+16: 	"strings"
+17: 	"testing"
+18: 	"time"
+19: 
+20: 	"researchos.local/research-os/adapters/local_workspace"
+21: 	"researchos.local/research-os/internal/api"
+22: 	"researchos.local/research-os/internal/domain"
+23: 	"researchos.local/research-os/internal/host"
+24: 	"researchos.local/research-os/internal/store"
+25: )
+26: 
+27: func backupCLI(t *testing.T, binary, repo string, args ...string) ([]byte, error) {
+28: 	t.Helper()
+29: 	cmd := exec.Command(binary, args...)
+30: 	cmd.Dir = repo
+31: 	return cmd.CombinedOutput()
+32: }
+33: 
+34: func backupTestRepo(t *testing.T) string {
+35: 	t.Helper()
+36: 	root, err := filepath.Abs(filepath.Join("..", ".."))
+37: 	if err != nil {
+38: 		t.Fatal(err)
+39: 	}
+40: 	return root
+41: }
+42: 
+43: func backupTestHost(t *testing.T, db *sql.DB, dataRoot, repo string) *host.Host {
+44: 	t.Helper()
+45: 	h, err := host.New(host.Config{DB: db, Dir: filepath.Join(dataRoot, "host"),
+46: 		ContractsDir:  filepath.Join(repo, "spec", "v2.0", "contracts"),
+47: 		MigrationFile: filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"),
+48: 		SchemaDir:     filepath.Join(repo, "internal", "api", "contracts")})
+49: 	if err != nil {
+50: 		t.Fatal(err)
+51: 	}
+52: 	return h
+53: }
+54: 
+55: func backupHTTP(t *testing.T, svc *domain.Service, token, method, path string, body any, etag string, want int) (domain.Object, string) {
+56: 	t.Helper()
+57: 	var raw []byte
+58: 	if body != nil {
+59: 		raw = domain.Bytes(body)
+60: 	}
+61: 	request := httptest.NewRequest(method, path, strings.NewReader(string(raw)))
+62: 	request.Header.Set("Authorization", "Bearer "+token)
+63: 	if body != nil {
+64: 		request.Header.Set("Content-Type", "application/json")
+65: 	}
+66: 	if method != http.MethodGet {
+67: 		request.Header.Set("Idempotency-Key", domain.ID())
+68: 	}
+69: 	if etag != "" {
+70: 		request.Header.Set("If-Match", etag)
+71: 	}
+72: 	response := httptest.NewRecorder()
+73: 	svc.Handler().ServeHTTP(response, request)
+74: 	if response.Code != want {
+75: 		t.Fatalf("%s %s expected %d, got %d: %s", method, path, want, response.Code, response.Body.String())
+76: 	}
+77: 	var value domain.Object
+78: 	if err := json.Unmarshal(response.Body.Bytes(), &value); err != nil {
+79: 		t.Fatal(err)
+80: 	}
+81: 	return value, response.Header().Get("ETag")
+82: }
+83: 
+84: // This smoke uses production Host registration, domain workspace/project/session
+85: // creation, and the compiled ops/backup CLI. The chooser callback supplies a
+86: // temporary test path; it is not evidence that a human clicked the Windows UI.
+87: func TestW1802ProductionBackupCLIWorkspaceContinuation(t *testing.T) {
+88: 	ctx := context.Background()
+89: 	repo := backupTestRepo(t)
+90: 	root := t.TempDir()
+91: 	sourceData := filepath.Join(root, "source-data")
+92: 	workspace := filepath.Join(root, "chosen-workspace")
+93: 	if err := os.MkdirAll(filepath.Join(workspace, "src"), 0700); err != nil {
+94: 		t.Fatal(err)
+95: 	}
+96: 	if err := os.Mkdir(filepath.Join(workspace, "empty"), 0700); err != nil {
+97: 		t.Fatal(err)
+98: 	}
+99: 	if err := os.WriteFile(filepath.Join(workspace, "src", "main.go"), []byte("package continued\n"), 0600); err != nil {
+100: 		t.Fatal(err)
+101: 	}
+102: 	if err := os.MkdirAll(sourceData, 0700); err != nil {
+103: 		t.Fatal(err)
+104: 	}
+105: 	db, err := store.Open(filepath.Join(sourceData, "researchos.sqlite"))
+106: 	if err != nil {
+107: 		t.Fatal(err)
+108: 	}
+109: 	if err := store.Bootstrap(ctx, db, filepath.Join(repo, "migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
+110: 		t.Fatal(err)
+111: 	}
+112: 	svc, err := domain.New(db, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+113: 	if err != nil {
+114: 		t.Fatal(err)
+115: 	}
+116: 	h := backupTestHost(t, db, sourceData, repo)
+117: 	owner, err := h.BootstrapOwner(ctx)
+118: 	if err != nil {
+119: 		t.Fatal(err)
+120: 	}
+121: 	credentialRef, err := h.ImportCredential("fixture-provider", "API_KEY", "synthetic-private-value", "")
+122: 	if err != nil || h.CredentialStatus(credentialRef) != host.StatusAvailable {
+123: 		t.Fatalf("source host credential fixture unavailable: %v", err)
+124: 	}
+125: 	frame, err := json.Marshal(map[string]any{"kind": host.KindWorkspaceChooseRequest,
+126: 		"client_id": "backup-smoke-cli", "payload": map[string]any{"requested_path": workspace, "requested_access": host.AccessReadWrite}})
+127: 	if err != nil {
+128: 		t.Fatal(err)
+129: 	}
+130: 	reply, err := h.HandleNative(frame, true, func(string) (string, error) { return workspace, nil })
+131: 	if err != nil {
+132: 		t.Fatal(err)
+133: 	}
+134: 	var chosen struct {
+135: 		Payload struct {
+136: 			Ref string `json:"selection_ref"`
+137: 		} `json:"payload"`
+138: 	}
+139: 	if err := json.Unmarshal(reply, &chosen); err != nil || chosen.Payload.Ref == "" {
+140: 		t.Fatalf("native selection failed: %v", err)
+141: 	}
+142: 	doc, err := api.ClientProtocolDocument()
+143: 	if err != nil {
+144: 		t.Fatal(err)
+145: 	}
+146: 	principal := domain.Principal{ID: owner.PrincipalID, Roles: []string{"OWNER"}, CanCreateProject: true}
+147: 	authority := localworkspace.NewAuthority(h)
+148: 	registered, err := svc.RegisterWorkspace(ctx, principal, authority, doc, domain.RegisterWorkspaceInput{
+149: 		SelectionRef: chosen.Payload.Ref, DisplayName: "continued workspace", RequestedAccess: host.AccessReadWrite,
+150: 		ClientID: "backup-smoke-cli", CommandID: "backup-smoke-register"})
+151: 	if err != nil {
+152: 		t.Fatal(err)
+153: 	}
+154: 	ref := domain.Str(registered, "authorized_workspace_ref")
+155: 	project, err := svc.BootstrapProject(ctx, principal, authority, doc, localworkspace.NewScanner(), domain.BootstrapProjectInput{
+156: 		AuthorizedWorkspaceRef: ref, DisplayName: "continued project", ClientID: "backup-smoke-cli",
+157: 		CommandID: "backup-smoke-project", MeasurementMode: "FIXTURE"})
+158: 	if err != nil {
+159: 		t.Fatal(err)
+160: 	}
+161: 	projectID := domain.Str(project, "project_id")
+162: 	if projectID == "" || ref == "" {
+163: 		t.Fatal("production project or authorized workspace identity missing")
+164: 	}
+165: 	projectPath := "/v1/projects/" + projectID
+166: 	_, stateTag := backupHTTP(t, svc, owner.Session.Token, "GET", projectPath+"/state", nil, "", 200)
+167: 	requirement, requirementTag := backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/requirements",
+168: 		domain.Object{"requirement_key": "W18-BACKUP", "text": "continue the same work after restore", "basis": "USER_STATED",
+169: 			"source_refs": domain.Empty(), "rationale": "fixture continuation", "supersedes_id": nil, "acceptance_check_ids": domain.Empty()}, stateTag, 201)
+170: 	requirement, _ = backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/requirements/"+domain.Str(requirement, "id")+"/actions",
+171: 		domain.Object{"action": "ACCEPT", "reason": "fixture continuation", "source_validation_refs": domain.Empty()}, requirementTag, 200)
+172: 	_, stateTag = backupHTTP(t, svc, owner.Session.Token, "GET", projectPath+"/state", nil, "", 200)
+173: 	contract := domain.Object{"contract_hash": domain.Digest([]byte("backup-smoke-contract")), "contract_revision": 1,
+174: 		"checks": []any{domain.Object{"check_id": "backup-continue", "kind": "DETERMINISTIC", "required": true,
+175: 			"expected": "same pending task", "command_key": "test.backup", "rubric_ref": nil, "qualification_id": nil, "not_applicable_reason": nil}},
+176: 		"require_independent_verifier": true, "version_policy": "EXACT", "frozen_at": domain.Now()}
+177: 	goal, goalTag := backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/goals",
+178: 		domain.Object{"title": "continue backup task", "original_intent": "preserve next step", "scope": "PROJECT",
+179: 			"requirement_refs": []any{domain.Ref(requirement, "Requirement")}, "problem_ids": []any{"backup-source"},
+180: 			"deliverables": []any{"same pending task"}, "acceptance_contract": contract}, stateTag, 201)
+=== internal/host/host.go ===
+185: 
+186: // Identity exposes the verified OS principal reference (never the raw SID).
+187: func (h *Host) Identity() auth.Identity { return h.identity }
+188: 
+189: // InstanceID is a stable local host identifier for handshake responses; it is derived from
+190: // the private directory path plus the principal reference, so it changes if either does.
+191: func (h *Host) InstanceID() string {
+192: 	sum := sha256.Sum256([]byte(h.dir + "|" + h.identity.Ref))
+193: 	return "host-" + hex.EncodeToString(sum[:6])
+194: }
+195: 
+196: // writePrivate stores a file with 0600 plus the current-user-only DACL and a durable rename,
+197: // so a crash cannot leave a half-written credential or root registry.
+198: func writePrivate(dir, name string, payload any) error {
+199: 	raw, err := json.MarshalIndent(payload, "", "  ")
+200: 	if err != nil {
+201: 		return err
+202: 	}
+203: 	tmp, err := os.CreateTemp(dir, name+".tmp-")
+204: 	if err != nil {
+205: 		return err
+206: 	}
+207: 	defer os.Remove(tmp.Name())
+208: 	if err := tmp.Chmod(0o600); err != nil {
+209: 		tmp.Close()
+210: 		return err
+211: 	}
+212: 	if _, err := tmp.Write(raw); err != nil {
+213: 		tmp.Close()
+214: 		return err
+215: 	}
+216: 	if err := tmp.Sync(); err != nil {
+217: 		tmp.Close()
+218: 		return err
+219: 	}
+220: 	if err := tmp.Close(); err != nil {
+221: 		return err
+222: 	}
+223: 	if err := privateFile(tmp.Name()); err != nil {
+224: 		return err
+225: 	}
+226: 	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+227: }
+228: 
+229: func readPrivate(dir, name string, into any) error {
+230: 	raw, err := os.ReadFile(filepath.Join(dir, name))
+231: 	if err != nil {
+232: 		if errors.Is(err, os.ErrNotExist) {
+233: 			return nil
+234: 		}
+235: 		return err
+236: 	}
+237: 	return json.Unmarshal(raw, into)
+238: }

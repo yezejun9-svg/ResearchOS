@@ -1,0 +1,17 @@
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { realpathSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join, relative, isAbsolute } from 'node:path';
+const sdk=realpathSync(process.argv[1]);
+const parentURL=pathToFileURL(join(sdk,'package.json')).href;
+const pins=[["@earendil-works/pi-ai","packages/ai/dist/index.js","0dc26761a16303c8c38b9953d257b211f003def6eec9920d66af0953e2cea3c4"],["@earendil-works/pi-agent-core","packages/agent/dist/index.js","4a551a8b128525e90f3da827f5c459a6f6ba39796c63b2ba73d0f0bfb7be9e72"],["@earendil-works/pi-coding-agent","packages/coding-agent/dist/index.js","4115b15a968a442ec44d565ceb7c9b84bd84245ebba366334fc3ea1fd0aa2244"],["esbuild","node_modules/esbuild/lib/main.js","61ec0ba144ff93f4bf0e96ad6fab6f430ede0aa13e27ace8063ed63ba416b3cd"]];
+for(const [specifier,entry,sha256] of pins){
+  const url=import.meta.resolve(specifier,parentURL);
+  if(!url.startsWith('file:')) throw new Error('non-file resolution '+specifier);
+  const resolved=fileURLToPath(url), actual=realpathSync(resolved);
+  const expected=realpathSync(join(sdk,entry)), rel=relative(sdk,actual);
+  if(!rel||rel==='..'||rel.startsWith('..\\')||rel.startsWith('../')||isAbsolute(rel)||actual!==expected) throw new Error('wrong SDK entry '+specifier);
+  const actualSHA=createHash('sha256').update(readFileSync(actual)).digest('hex');
+  if(actualSHA!==sha256) throw new Error('entry byte drift '+specifier);
+  console.log(JSON.stringify({specifier,parentURL,url,resolved,realpath:actual,expected_realpath:expected,sha256:actualSHA,condition:'actual_ESM_default_import',SDK_module_imported:false}));
+}

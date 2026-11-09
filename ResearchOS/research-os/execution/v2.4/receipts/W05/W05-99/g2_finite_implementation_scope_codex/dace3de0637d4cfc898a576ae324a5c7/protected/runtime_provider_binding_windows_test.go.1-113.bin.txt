@@ -1,0 +1,113 @@
+//go:build windows
+
+package domain
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"researchos.local/research-os/internal/store"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func providerEvidence(t *testing.T, name string, v any) {
+	t.Helper()
+	root := os.Getenv("RESEARCHOS_PROVIDER_EVIDENCE_DIR")
+	if root == "" {
+		t.Fatal("explicit fixture evidence directory required")
+	}
+	dir := filepath.Join(root, strings.ReplaceAll(t.Name(), "/", "_"))
+	if e := os.MkdirAll(dir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(dir, name), Bytes(v), 0600); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func providerSnapshotDB(t *testing.T, db *sql.DB, name string) string {
+	t.Helper()
+	root := os.Getenv("RESEARCHOS_PROVIDER_EVIDENCE_DIR")
+	if root == "" {
+		t.Fatal("explicit fixture DB evidence directory required")
+	}
+	dir := filepath.Join(root, strings.ReplaceAll(t.Name(), "/", "_"))
+	if e := os.MkdirAll(dir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(dir, name+".sqlite")
+	if _, e := db.Exec("VACUUM INTO ?", path); e != nil {
+		t.Fatal(e)
+	}
+	return path
+}
+
+func providerQualify(t *testing.T, c *RuntimeCoordinator, route RuntimeCoordinatorRoute, r *runtimeFixture) {
+	t.Helper()
+	f := r.f
+	if err := c.RunAdmitted(context.Background(), route, r.run, r.lease); err != nil {
+		t.Fatal(err)
+	}
+	r.run = f.read("runs", Str(r.run, "id"))
+	r.task = f.read("tasks", Str(r.task, "id"))
+	if len(Arr(r.run, "result_artifact_ids")) != 1 {
+		t.Fatalf("provider bootstrap no original output: %s", Bytes(r.run))
+	}
+	a := f.read("artifacts", Arr(r.run, "result_artifact_ids")[0].(string))
+	body := (&orchestrationFixture{f: f, owner: r.ownerToken}).acceptance(r, a)
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		p, e := authenticate(tx, f.token)
+		if e != nil {
+			return e
+		}
+		snapshot, e := f.s.acceptanceSnapshot(tx, p, f.project, body)
+		if e != nil {
+			return e
+		}
+		status, why := verifyMuTurn(snapshot)
+		if status != "PASS" {
+			mu := snapshot["mu_turn"].(map[string]any)
+			for _, v := range Arr(mu, "effects") {
+				e := v.(map[string]any)
+				if e["state"] == "PREPARED" {
+					p := e["payload"].(map[string]any)
+					if p["capability"] == "MODEL" {
+						body := p["payload"].(map[string]any)["body"].(map[string]any)
+						h, err := providerRequestHistory(Arr(body, "messages"))
+						t.Logf("FIXTURE original wire history=%s error=%v messages=%s", Bytes(h), err, Bytes(body["messages"]))
+					}
+				}
+			}
+			t.Fatalf("provider qualification proof: %s %s", status, why)
+		}
+		return nil
+	})
+	receipt := f.expect(201, "POST", f.path("/acceptances"), ID(), testTag(r.task), body)
+	var raw string
+	if e := f.db.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.kind')='LOG'", f.project, r.run["id"]).Scan(&raw); e != nil {
+		t.Fatal(e)
+	}
+	log, e := Decode([]byte(raw))
+	if e != nil {
+		t.Fatal(e)
+	}
+	r.registration = f.expect(200, "POST", f.path("/runtimes/"+Str(r.registration, "id")+"/qualify"), ID(), testTag(r.registration), Object{"qualification_ids": []any{receipt["id"]}, "supports_resume": false, "resume_evidence_ref": nil, "receipt_artifact_ref": Ref(log, "Artifact")})
+	if r.registration["status"] != "AVAILABLE" {
+		t.Fatal("fixture runtime unavailable")
+	}
+}
+

@@ -1,0 +1,146 @@
+// EXPORT-ONLY INSTRUMENTATION. Not a Main source file or unmodified Main test.
+package main
+
+import (
+ "bytes"
+ "crypto/sha256"
+ "database/sql"
+ "encoding/base64"
+ "encoding/json"
+ "fmt"
+ "io"
+ "net/http"
+ "net/url"
+ "os"
+ "path/filepath"
+ "reflect"
+ "sort"
+ "strconv"
+ "strings"
+ "sync"
+ "testing"
+
+ "researchos.local/research-os/internal/api"
+ "researchos.local/research-os/internal/canonical"
+)
+
+func cli43Save(dir,name string,value any) error {
+ b,e:=json.MarshalIndent(value,"","  ");if e!=nil{return e}
+ f,e:=os.OpenFile(filepath.Join(dir,name),os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if e!=nil{return e}
+ _,w:=f.Write(append(b,'\n'));c:=f.Close();if w!=nil{return w};return c
+}
+func cli43Bytes(b []byte) map[string]any{return map[string]any{"raw_base64":b,"bytes":len(b),"sha256":fmt.Sprintf("%x",sha256.Sum256(b))}}
+
+var cli43WireMu sync.Mutex
+var cli43WireCounts=map[string]int{}
+func cli43Wire(t *testing.T,dir,layer,method,path string,request []byte,status int,headers http.Header,response []byte) {
+ t.Helper();cli43WireMu.Lock();defer cli43WireMu.Unlock()
+ key:=dir+"/"+layer;cli43WireCounts[key]++;seq:=cli43WireCounts[key]
+ if seq>32 { t.Errorf("export instrumentation HTTP layer cap exceeded: %s",layer);return }
+ e:=cli43Save(dir,fmt.Sprintf("wire-%s-%03d.json",layer,seq),map[string]any{
+  "measurement":"EXPORT_ONLY_SYNTHETIC_METADATA_AND_ADMISSION_REAL_HTTP_SQLITE",
+  "layer":layer,"sequence":seq,"http_method":method,"request_uri":path,
+  "request":cli43Bytes(request),"request_authorization_header":"OMITTED_SYNTHETIC_EPHEMERAL_CREDENTIAL",
+  "status":status,"response_headers":headers,"response":cli43Bytes(response),
+ })
+ if e!=nil {t.Errorf("wire evidence: %v",e)}
+}
+type cli43HTTPWriter struct {http.ResponseWriter;status int;body bytes.Buffer;headers http.Header}
+func (w *cli43HTTPWriter) WriteHeader(code int) {if w.status!=0{return};w.status=code;w.headers=w.Header().Clone();w.ResponseWriter.WriteHeader(code)}
+func (w *cli43HTTPWriter) Write(b []byte)(int,error){if w.status==0{w.WriteHeader(200)};n,e:=w.ResponseWriter.Write(b);w.body.Write(b[:n]);return n,e}
+func cli43RecordingHandler(t *testing.T,dir string,next http.Handler) http.Handler {
+ var mu sync.Mutex;calls:=0
+ return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  mu.Lock();calls++;n:=calls;mu.Unlock()
+  if n>32 {t.Error("export instrumentation upstream HTTP32 cap");http.Error(w,"fixture cap",503);return}
+  b,e:=io.ReadAll(io.LimitReader(r.Body,1048577));if e!=nil||len(b)>1048576{t.Errorf("request capture: %v size=%d",e,len(b));http.Error(w,"fixture capture",500);return}
+  r.Body.Close();r.Body=io.NopCloser(bytes.NewReader(b))
+  observed:=&cli43HTTPWriter{ResponseWriter:w};next.ServeHTTP(observed,r)
+  if observed.status==0{observed.WriteHeader(200)}
+  cli43Wire(t,dir,"upstream",r.Method,r.URL.RequestURI(),b,observed.status,observed.headers,observed.body.Bytes())
+ })
+}
+func cli43SessionBoundary(t *testing.T,db *sql.DB,dir,label string,cfg cliConfig) {
+ t.Helper();var sid,project,writer string;var epoch,revision int64
+ if e:=db.QueryRow("SELECT id,project_id,writer_client_id,writer_epoch,revision FROM client_sessions WHERE id=?",cfg.SessionID).Scan(&sid,&project,&writer,&epoch,&revision);e!=nil{t.Fatal(e)}
+ if sid!=cfg.SessionID||project!=cfg.ProjectID||writer!="cli-client"||epoch!=1 {t.Fatal("export instrumentation original Session binding",sid,project,writer,epoch)}
+ if e:=cli43Save(dir,"session-"+label+".json",map[string]any{"session_id":sid,"project_id":project,"writer_client_id":writer,"writer_epoch":epoch,"revision":revision});e!=nil{t.Fatal(e)}
+}
+func cli43AssertBinding(t *testing.T,db *sql.DB,dir,name string,cfg cliConfig,requests []json.RawMessage,responses [][]byte,before,after []byte) {
+ t.Helper();var a,b cliConfig
+ if json.Unmarshal(before,&a)!=nil||json.Unmarshal(after,&b)!=nil||a.SessionID!=cfg.SessionID||b.SessionID!=cfg.SessionID||b.WriterEpoch!=1{t.Fatal("original SID/epoch changed")}
+ if len(requests)!=len(responses){t.Fatal("request/response pairing")}
+ doc,e:=api.ClientProtocolDocument();if e!=nil{t.Fatal(e)}
+ for i,raw:=range requests{
+  canonicalRequest,e:=canonical.JSON(raw);if e!=nil{t.Fatal(e)}
+  var env map[string]any;if e=json.Unmarshal(canonicalRequest,&env);e!=nil{t.Fatal(e)}
+  body,e:=canonical.JSON(responses[i]);if e!=nil{t.Fatal(e)}
+  var reply map[string]any;if e=json.Unmarshal(body,&reply);e!=nil{t.Fatal(e)}
+  if e=doc.ValidateDef("CommandResponse",reply);e!=nil{t.Fatal(e)}
+  method,_:=env["method"].(string)
+  if method=="session.create"{t.Fatal("existing Session fixture unexpectedly created a Session")}
+  if env["session_id"]!=cfg.SessionID||reply["session_id"]!=cfg.SessionID||reply["command_id"]!=env["command_id"]||reply["method"]!=method{t.Fatal("request/reply original Session identity mismatch",method)}
+  if snapshot,ok:=reply["result"].(map[string]any);ok{
+   if sid,exists:=snapshot["session_id"];exists&&sid!=cfg.SessionID{t.Fatal("snapshot SID mismatch")}
+  }
+ }
+ cli43SessionBoundary(t,db,dir,"after",cfg)
+ if e=cli43Save(dir,"identity-proof.json",map[string]any{"fixture":name,"before_sid":a.SessionID,"after_sid":b.SessionID,"db_sid":cfg.SessionID,"epoch":b.WriterEpoch,"all_request_response_sid_equal":true,"SDK_MODEL_external_paid":0});e!=nil{t.Fatal(e)}
+}
+
+type cli43Rows struct {Schema []string `json:"schema"`;Columns map[string][]string `json:"columns"`;Tables map[string][]string `json:"tables"`}
+func cli43Quote(s string)string{return `"`+strings.ReplaceAll(s,`"`,`""`)+`"`}
+func cli43Query(db *sql.DB,q string)(out []string,err error){
+ rows,e:=db.Query(q);if e!=nil{return nil,e};defer func(){if e:=rows.Close();err==nil{err=e}}()
+ cols,e:=rows.Columns();if e!=nil{return nil,e};out=[]string{}
+ for rows.Next(){v:=make([]any,len(cols));p:=make([]any,len(v));for i:=range v{p[i]=&v[i]};if e=rows.Scan(p...);e!=nil{return nil,e};b,e:=json.Marshal(v);if e!=nil{return nil,e};out=append(out,string(b))}
+ if e=rows.Err();e!=nil{return nil,e};sort.Strings(out);return out,nil
+}
+func cli43Capture(db *sql.DB)(v cli43Rows,err error){
+ v.Columns=map[string][]string{};v.Tables=map[string][]string{}
+ v.Schema,err=cli43Query(db,"SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");if err!=nil{return v,err}
+ rs,e:=db.Query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name");if e!=nil{return v,e};names:=[]string{}
+ for rs.Next(){var n string;if e=rs.Scan(&n);e!=nil{rs.Close();return v,e};names=append(names,n)}
+ e=rs.Err();ce:=rs.Close();if e!=nil{return v,e};if ce!=nil{return v,ce}
+ for _,n:=range names{
+  v.Columns[n],e=cli43Query(db,"PRAGMA table_xinfo("+cli43Quote(n)+")");if e!=nil{return v,e}
+  expr:=[]string{}
+  for _,r:=range v.Columns[n]{var row []any;if e=json.Unmarshal([]byte(r),&row);e!=nil{return v,e};name,ok:=row[1].(string);if !ok{return v,fmt.Errorf("column shape")};q:=cli43Quote(name);expr=append(expr,"typeof("+q+")",q)}
+  rows,e:=db.Query("SELECT "+strings.Join(expr,",")+" FROM "+cli43Quote(n));if e!=nil{return v,e};values:=[]string{}
+  for rows.Next(){a:=make([]any,len(expr));p:=make([]any,len(a));for i:=range a{p[i]=&a[i]};if e=rows.Scan(p...);e!=nil{rows.Close();return v,e};cells:=[][2]string{}
+   for i:=0;i<len(a);i+=2{typ:=fmt.Sprint(a[i]);s:="";switch x:=a[i+1].(type){case nil:case string:s=base64.StdEncoding.EncodeToString([]byte(x));case []byte:s=base64.StdEncoding.EncodeToString(x);case int64:s=strconv.FormatInt(x,10);case float64:s=strconv.FormatFloat(x,'g',-1,64);default:rows.Close();return v,fmt.Errorf("unhandled driver value %T",x)};cells=append(cells,[2]string{typ,s})}
+   b,e:=json.Marshal(cells);if e!=nil{rows.Close();return v,e};values=append(values,string(b))
+  };e=rows.Err();ce=rows.Close();if e!=nil{return v,e};if ce!=nil{return v,ce};sort.Strings(values);v.Tables[n]=values
+ };return v,nil
+}
+func cli43Files(path string)(map[string]any,error){
+ out:=map[string]any{}
+ for _,s:=range []string{"","-wal","-shm"}{b,e:=os.ReadFile(path+s);if os.IsNotExist(e){out[s]=nil}else if e!=nil{return out,e}else{out[s]=map[string]any{"bytes":len(b),"sha256":fmt.Sprintf("%x",sha256.Sum256(b))}}};return out,nil
+}
+func cli43NoSidecars(path string)error{for _,s:=range []string{"-wal","-shm"}{_,e:=os.Lstat(path+s);if !os.IsNotExist(e){return fmt.Errorf("sidecar observation %s: %v",path+s,e)}};return nil}
+func cli43CloseEvidence(t *testing.T,db *sql.DB,dir string)error {
+ path:=filepath.Join(dir,"session.sqlite")
+ opened,first:=cli43Capture(db)
+ before,e:=cli43Files(path);if first==nil{first=e}
+ if e=cli43Save(dir,"db-before-close.files.json",before);first==nil{first=e}
+ closeErr:=db.Close() // Always close original, including failed snapshots.
+ if first==nil{first=closeErr}
+ if e=cli43Save(dir,"db-close-result.json",map[string]any{"original_close_error":fmt.Sprint(closeErr),"snapshot_error":fmt.Sprint(first)});first==nil{first=e}
+ if first!=nil{return first}
+ if e=cli43Save(dir,"db-post-open.rows.json",opened);e!=nil{return e}
+ closed,e:=cli43Files(path);if e!=nil{return e};if e=cli43Save(dir,"db-closed-original.files.json",closed);e!=nil{return e}
+ if e=cli43NoSidecars(path);e!=nil{return e}
+ original,e:=os.ReadFile(path);if e!=nil{return e}
+ copyPath:=filepath.Join(dir,"closed-copy.sqlite");f,e:=os.OpenFile(copyPath,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if e!=nil{return e};_,we:=f.Write(original);ce:=f.Close();if we!=nil{return we};if ce!=nil{return ce}
+ if e=cli43NoSidecars(copyPath);e!=nil{return e};absolute,e:=filepath.Abs(copyPath);if e!=nil{return e};up:=filepath.ToSlash(absolute);if !strings.HasPrefix(up,"/"){up="/"+up}
+ u:=url.URL{Scheme:"file",Path:up};u.RawQuery=url.Values{"mode":{"ro"},"immutable":{"1"}}.Encode()
+ copyDB,e:=sql.Open("sqlite",u.String());if e!=nil{return e};copyDB.SetMaxOpenConns(1)
+ copied,readErr:=cli43Capture(copyDB);copyCloseErr:=copyDB.Close()
+ if e=cli43Save(dir,"db-copy-read-result.json",map[string]any{"read_error":fmt.Sprint(readErr),"close_error":fmt.Sprint(copyCloseErr),"uri":u.String(),"original_reopened":false});e!=nil{return e}
+ if readErr!=nil{return readErr};if copyCloseErr!=nil{return copyCloseErr}
+ if e=cli43NoSidecars(copyPath);e!=nil{return e};after,e:=os.ReadFile(copyPath);if e!=nil{return e};originalAfter,e:=os.ReadFile(path);if e!=nil{return e}
+ if e=cli43Save(dir,"db-closed-copy.rows.json",copied);e!=nil{return e}
+ equal:=reflect.DeepEqual(opened,copied);byteEqual:=bytes.Equal(original,after)&&bytes.Equal(original,originalAfter)
+ if e=cli43Save(dir,"closed-proof.json",map[string]any{"all_schema_column_typed_row_multisets_equal":equal,"original_after_close_sha256":fmt.Sprintf("%x",sha256.Sum256(original)),"copy_before_sha256":fmt.Sprintf("%x",sha256.Sum256(original)),"copy_after_sha256":fmt.Sprintf("%x",sha256.Sum256(after)),"original_after_read_sha256":fmt.Sprintf("%x",sha256.Sum256(originalAfter)),"closed_bytes_equal":byteEqual,"original_and_copy_WAL_SHM_absent":true,"original_reopened":false,"case_failed":t.Failed(),"measurement":"EXPORT_ONLY_INSTRUMENTATION"});e!=nil{return e}
+ if !equal||!byteEqual{return fmt.Errorf("closed-copy proof mismatch")};return nil
+}

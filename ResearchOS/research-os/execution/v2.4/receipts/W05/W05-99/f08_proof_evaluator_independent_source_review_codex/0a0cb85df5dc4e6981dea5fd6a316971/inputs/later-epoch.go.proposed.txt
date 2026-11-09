@@ -1,0 +1,58 @@
+// R2 later-epoch component. It proves immediate immutable Run versions and
+// the real rebuild/switch/carry rows. It does NOT authorize a later origin:
+// qualified admission, every prior native proof and accounting remain OPEN.
+type f08LaterParts struct{run,previous,task f08Version;rebuild,route,carry map[string]any;anchors []any}
+func f08RowAnchor(category string,key []any,raw []byte)map[string]any{return map[string]any{"category":category,"key":key,"body_digest":f08RawHash(raw)}}
+func (v *f08ProofValidator) laterParts(s *f08Sources,d []any)(f08LaterParts,error){
+	var out f08LaterParts
+	run,e:=v.head(s,d[0].(string),"Run",d[1].(string));if e!=nil || run.revision<2{return out,f08Binding}
+	priorRow,e:=s.one("domain_versions",[]int{0,1,2,3},[]any{run.project,"Run",run.id,f08Number(run.revision-1)});if e!=nil{return out,e}
+	previous,e:=v.version(s,run.project,map[string]any{"entity_type":"Run","id":run.id,"revision":priorRow[3],"content_hash":priorRow[5]});if e!=nil{return out,e}
+	previousEpoch,e:=f08Integer(previous.body["lease_epoch"],1);if e!=nil || previousEpoch==1<<63-1{return out,f08Binding}
+	if !f08Equal(run.body["lease_epoch"],f08Number(previousEpoch+1)) || !f08Equal(d[2],run.body["lease_epoch"]) || run.body["status"]!="QUEUED" || run.body["lease_token_hash"]==previous.body["lease_token_hash"]{return out,f08Binding}
+	for _,b:=range []map[string]any{previous.body,run.body}{if !f08NullFields(b,"cancel_requested_at","cancel_confirmed_at","ended_at"){return out,f08Binding};if b["status"]=="CANCELLED" || b["status"]=="SUCCEEDED" || b["status"]=="FAILED"{return out,f08Binding}}
+	for _,key:=range []string{"task_id","executor_principal_id","input_refs","checkpoint_artifact_id"}{if !f08Equal(run.body[key],previous.body[key]){return out,f08Binding}}
+	if run.body["external_run_id"]!=nil || run.body["checkpoint_artifact_id"]==nil{return out,f08Binding}
+	task,e:=v.head(s,run.project,"Task",run.body["task_id"].(string));if e!=nil || task.body["active_run_id"]!=run.id{return out,f08Binding}
+	goal,e:=v.head(s,run.project,"Goal",task.body["goal_id"].(string));if e!=nil || goal.body["status"]!="ACTIVE"{return out,f08Binding}
+	manifest,e:=v.dispatchManifest(s,d,run,task);if e!=nil{return out,e};admission:=manifest["admission"].(map[string]any)
+	var rebuild map[string]any;var rebuildAnchor map[string]any;count:=0
+	for _,row:=range s.selectRows("routes",[]int{1,2},[]any{run.project,run.id}){
+		body,raw,e:=f08RawObject(row[3]);if e!=nil{return out,e}
+		if body["kind"]!="SESSION_REBUILT" || !f08Equal(body["next_lease_epoch"],run.body["lease_epoch"]){continue}
+		// native_resume=false is present in the ACTUAL producer, although the
+		// prose's abbreviated field list omits it; it cannot be discarded.
+		if _,e=f08Object(body,"kind","reason","native_resume","run_id","runtime_id","previous_external_run_id","previous_lease_epoch","next_lease_epoch","checkpoint_artifact_id","actor","at");e!=nil{return out,e}
+		if row[0]==nil || body["native_resume"]!=false || body["run_id"]!=run.id || body["runtime_id"]!=run.body["runtime_id"] || !f08Equal(body["previous_lease_epoch"],previous.body["lease_epoch"]) || !f08Equal(body["previous_external_run_id"],previous.body["external_run_id"]) || body["checkpoint_artifact_id"]!=run.body["checkpoint_artifact_id"]{return out,f08Binding}
+		rebuild=body;rebuildAnchor=f08RowAnchor("routes",[]any{row[0]},raw);count++
+	};if count!=1{return out,f08Binding}
+	var route map[string]any;anchors:=[]any{rebuildAnchor}
+	switch rebuild["reason"]{
+	case "CHECKPOINT_AND_CURRENT_CONTEXT":
+		if run.body["runtime_id"]!=previous.body["runtime_id"]{return out,f08Binding}
+		if admission["operation"]==nil{return out,f08LaterOperationUnbound};if admission["operation"]!="checkpoint_resume"{return out,f08Binding}
+	case "RESOURCE_SWITCH":
+		if admission["operation"]==nil{return out,f08LaterOperationUnbound};if admission["operation"]!="replacement"{return out,f08Binding}
+		count=0
+		for _,row:=range s.selectRows("routes",[]int{1,2},[]any{run.project,run.id}){
+			b,raw,e:=f08RawObject(row[3]);if e!=nil{return out,e};if b["kind"]=="SESSION_REBUILT"{continue}
+			to,ok:=b["to_runtime_ref"].(map[string]any);if !ok || to["id"]!=run.body["runtime_id"] || b["checkpoint_artifact_id"]!=run.body["checkpoint_artifact_id"] || b["actor"]!=rebuild["actor"]{continue}
+			if _,e=f08Object(b,"from_runtime_ref","to_runtime_ref","grant","run_id","task_id","acceptance_contract_hash","context_bundle_id","checkpoint_artifact_id","at","actor");e!=nil{return out,e}
+			fromRuntime,e:=v.version(s,run.project,b["from_runtime_ref"]);if e!=nil || fromRuntime.kind!="RuntimeRegistration" || fromRuntime.id!=previous.body["runtime_id"]{return out,f08Binding}
+			toRuntime,e:=v.version(s,run.project,to);if e!=nil || toRuntime.kind!="RuntimeRegistration" || !f08Equal(to,admission["runtime_ref"]){return out,f08Binding}
+			grant,ok:=b["grant"].(map[string]any);if !ok || !f08Equal(grant["admission"],admission) || b["run_id"]!=run.id || b["task_id"]!=task.id || b["context_bundle_id"]!=task.body["context_bundle_id"] || b["acceptance_contract_hash"]!=task.body["acceptance_contract"].(map[string]any)["contract_hash"] || row[0]==nil{return out,f08Binding}
+			route=b;anchors=append(anchors,f08RowAnchor("routes",[]any{row[0]},raw));count++
+		};if count!=1{return out,f08Binding}
+	default:return out,f08Binding
+	}
+	carryRow,e:=s.one("checkpoint_carries",[]int{0,1,2},d[:3]);if e!=nil{return out,e};carry,carryRaw,e:=f08RawObject(carryRow[3]);if e!=nil{return out,e}
+	if _,e=f08Object(carry,"actor","artifact_ref","from_use_receipt_hash","from_epoch","to_epoch","new_upload_key","reason","at");e!=nil{return out,e}
+	if carry["actor"]!=rebuild["actor"] || carry["reason"]!="CHECKPOINT_CARRY_NOT_NEW_RESULT" || !f08Equal(carry["to_epoch"],d[2]){return out,f08Binding}
+	fromEpoch,e:=f08Integer(carry["from_epoch"],1);if e!=nil || fromEpoch>previousEpoch{return out,f08Binding}
+	artifact,e:=v.version(s,run.project,carry["artifact_ref"]);if e!=nil || artifact.kind!="Artifact" || artifact.id!=run.body["checkpoint_artifact_id"]{return out,f08Binding}
+	oldUse,e:=s.one("artifact_uses",[]int{0,1,2,3,6},[]any{run.project,artifact.id,run.id,carry["from_epoch"],carry["from_use_receipt_hash"]});if e!=nil{return out,e}
+	newUse,e:=s.one("artifact_uses",[]int{0,1,2,3,5},[]any{run.project,artifact.id,run.id,d[2],carry["new_upload_key"]});if e!=nil{return out,e}
+	for _,use:=range [][]any{oldUse,newUse}{body,_,e:=f08RawObject(use[7]);if e!=nil || Receipt(body)!=use[6]{return out,f08Binding};content,e:=s.one("content",[]int{0,1},[]any{use[5],run.project});if e!=nil{return out,e};raw,e:=f08Hex(content[3]);if e!=nil || f08RawHash(raw)!=artifact.body["content_hash"] || content[4]!=artifact.body["content_hash"] || !f08Equal(content[6],f08Number(1)){return out,f08Binding}}
+	anchors=append(anchors,f08RowAnchor("checkpoint_carries",d[:3],carryRaw))
+	return f08LaterParts{run,previous,task,rebuild,route,carry,anchors},nil
+}

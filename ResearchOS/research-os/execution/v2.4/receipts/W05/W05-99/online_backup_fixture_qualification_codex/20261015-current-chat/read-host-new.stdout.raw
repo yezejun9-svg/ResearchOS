@@ -1,0 +1,408 @@
+internal/host/bootstrap.go:1:package host
+internal/host/bootstrap.go:3:import (
+internal/host/bootstrap.go:4:	"context"
+internal/host/bootstrap.go:5:	"encoding/json"
+internal/host/bootstrap.go:6:	"errors"
+internal/host/bootstrap.go:7:	"fmt"
+internal/host/bootstrap.go:8:	"time"
+internal/host/bootstrap.go:10:	"researchos.local/research-os/internal/auth"
+internal/host/bootstrap.go:11:	"researchos.local/research-os/internal/domain"
+internal/host/bootstrap.go:12:)
+internal/host/bootstrap.go:14:// Session is a short-lived host credential. It is handed to the trusted local client in
+internal/host/bootstrap.go:15:// process (or over the OS-protected native bridge) and is never written into a log, an event,
+internal/host/bootstrap.go:16:// a CommandEnvelope, or a renderer-visible structure.
+internal/host/bootstrap.go:17:type Session struct {
+internal/host/bootstrap.go:18:	PrincipalID  string    `json:"-"`
+internal/host/bootstrap.go:19:	PrincipalRef string    `json:"principal_ref"`
+internal/host/bootstrap.go:20:	Token        string    `json:"-"`
+internal/host/bootstrap.go:21:	IssuedAt     time.Time `json:"issued_at"`
+internal/host/bootstrap.go:22:	ExpiresAt    time.Time `json:"expires_at"`
+internal/host/bootstrap.go:23:	TTLSec       int64     `json:"expires_in_seconds"`
+internal/host/bootstrap.go:24:}
+internal/host/bootstrap.go:26:// BootstrapResult distinguishes the two legitimate outcomes, because the contract requires
+internal/host/bootstrap.go:27:// different behaviour for each: a first local user establishes exactly one OWNER, while every
+internal/host/bootstrap.go:28:// later start binds the existing OWNER without touching permissions or data.
+internal/host/bootstrap.go:29:type BootstrapResult struct {
+internal/host/bootstrap.go:30:	PrincipalID   string
+internal/host/bootstrap.go:31:	PrincipalRef  string
+internal/host/bootstrap.go:32:	CreatedOwner  bool
+internal/host/bootstrap.go:33:	BoundExisting bool
+internal/host/bootstrap.go:34:	Iterations    int
+internal/host/bootstrap.go:35:	Session       Session
+internal/host/bootstrap.go:36:}
+internal/host/bootstrap.go:38:// BootstrapOwner implements 22 §OS bootstrap: verify the OS principal, then bind an existing
+internal/host/bootstrap.go:39:// OWNER or, only when the database has no principal at all, initialise one exactly once.
+internal/host/bootstrap.go:40:// There is no route by which an untrusted caller (renderer, ordinary HTTP request, phone
+internal/host/bootstrap.go:41:// pairing) reaches this function, and it never resets permissions or data.
+internal/host/bootstrap.go:42:func (h *Host) BootstrapOwner(ctx context.Context) (*BootstrapResult, error) {
+internal/host/bootstrap.go:43:	fresh, err := h.reverify()
+internal/host/bootstrap.go:44:	if err != nil {
+internal/host/bootstrap.go:45:		return nil, err
+internal/host/bootstrap.go:46:	}
+internal/host/bootstrap.go:47:	owners, total, ownerID := h.scanPrincipals(ctx)
+internal/host/bootstrap.go:48:	switch {
+internal/host/bootstrap.go:49:	case owners > 1:
+internal/host/bootstrap.go:50:		// A database with more than one OWNER is a corrupted or tampered state; refusing is
+internal/host/bootstrap.go:51:		// safer than picking one, because either choice could hand another user's project set
+internal/host/bootstrap.go:52:		// to the current caller.
+internal/host/bootstrap.go:53:		return nil, ErrMultipleOwners
+internal/host/bootstrap.go:54:	case owners == 1:
+internal/host/bootstrap.go:55:		if bound := h.boundPrincipal(); bound != "" && bound != ownerID {
+internal/host/bootstrap.go:56:			return nil, fmt.Errorf("%w: this host directory belongs to a different local principal", ErrHostIdentity)
+internal/host/bootstrap.go:57:		}
+internal/host/bootstrap.go:58:		sess, err := h.issue(ctx, ownerID)
+internal/host/bootstrap.go:59:		if err != nil {
+internal/host/bootstrap.go:60:			return nil, err
+internal/host/bootstrap.go:61:		}
+internal/host/bootstrap.go:62:		h.state.PrincipalID = ownerID
+internal/host/bootstrap.go:63:		h.state.PrincipalRef = fresh.Ref
+internal/host/bootstrap.go:64:		if h.state.HostInstanceID == "" {
+internal/host/bootstrap.go:65:			h.state.HostInstanceID = h.InstanceID()
+internal/host/bootstrap.go:66:			h.state.BootstrapAt = h.nowUTC().Format(time.RFC3339Nano)
+internal/host/bootstrap.go:67:		}
+internal/host/bootstrap.go:68:		h.state.BootstrapIterations++
+internal/host/bootstrap.go:69:		h.state.CreatedOwner = h.state.CreatedOwner || false
+internal/host/bootstrap.go:70:		if err := h.saveState(h.state); err != nil {
+internal/host/bootstrap.go:71:			return nil, err
+internal/host/bootstrap.go:72:		}
+internal/host/bootstrap.go:73:		return &BootstrapResult{PrincipalID: ownerID, PrincipalRef: fresh.Ref, BoundExisting: true,
+internal/host/bootstrap.go:74:			CreatedOwner: false, Iterations: h.state.BootstrapIterations, Session: sess}, nil
+internal/host/bootstrap.go:75:	case owners == 0 && total > 0:
+internal/host/bootstrap.go:76:		// Principals exist but none is an OWNER: the local admin path created them, and this
+internal/host/bootstrap.go:77:		// bootstrap must not silently promote one of them.
+internal/host/bootstrap.go:78:		return nil, ErrNoOwner
+internal/host/bootstrap.go:79:	case owners == 0 && total == 0:
+internal/host/bootstrap.go:80:		id := "owner-" + domain.ID()
+internal/host/bootstrap.go:81:		if err := h.domain.ProvisionPrincipal(ctx, domain.Principal{
+internal/host/bootstrap.go:82:			ID: id, Roles: []string{"OWNER"}, CanCreateProject: true,
+internal/host/bootstrap.go:83:		}); err != nil {
+internal/host/bootstrap.go:84:			return nil, fmt.Errorf("owner initialisation failed: %w", err)
+internal/host/bootstrap.go:85:		}
+internal/host/bootstrap.go:86:		sess, err := h.issue(ctx, id)
+internal/host/bootstrap.go:87:		if err != nil {
+internal/host/bootstrap.go:88:			return nil, fmt.Errorf("owner session failed: %w", err)
+internal/host/bootstrap.go:89:		}
+internal/host/bootstrap.go:90:		h.state = &hostState{Version: 1, PrincipalID: id, PrincipalRef: fresh.Ref,
+internal/host/bootstrap.go:91:			HostInstanceID: h.InstanceID(), BootstrapAt: h.nowUTC().Format(time.RFC3339Nano),
+internal/host/bootstrap.go:92:			CreatedOwner: true, BootstrapIterations: 1}
+internal/host/bootstrap.go:93:		h.state.ActiveCredentialHash = domain.Digest([]byte(sess.Token))
+internal/host/bootstrap.go:94:		if err := h.saveState(h.state); err != nil {
+internal/host/bootstrap.go:95:			return nil, err
+internal/host/bootstrap.go:96:		}
+internal/host/bootstrap.go:97:		return &BootstrapResult{PrincipalID: id, PrincipalRef: fresh.Ref, CreatedOwner: true,
+internal/host/bootstrap.go:98:			Iterations: 1, Session: sess}, nil
+internal/host/bootstrap.go:99:	}
+internal/host/bootstrap.go:100:	return nil, errors.New("unreachable bootstrap state")
+internal/host/bootstrap.go:101:}
+internal/host/bootstrap.go:103:// issue creates the short credential and hands it to the local user through the host's private
+internal/host/bootstrap.go:104:// 0600 file. The bridge reply deliberately does not carry it, so the renderer never sees a token
+internal/host/bootstrap.go:105:// and the user never copies one out of a log or console. A renewal supersedes the credential it
+internal/host/bootstrap.go:106:// replaces: the old one is revoked immediately rather than left live for the rest of its TTL,
+internal/host/bootstrap.go:107:// because "the token in the file" must be the only token that works.
+internal/host/bootstrap.go:108:func (h *Host) issue(ctx context.Context, principalID string) (Session, error) {
+internal/host/bootstrap.go:109:	previous := ""
+internal/host/bootstrap.go:110:	if h.state != nil {
+internal/host/bootstrap.go:111:		previous = h.state.ActiveCredentialHash
+internal/host/bootstrap.go:112:	}
+internal/host/bootstrap.go:113:	token, err := h.domain.IssueCredential(ctx, principalID, h.ttl)
+internal/host/bootstrap.go:114:	if err != nil {
+internal/host/bootstrap.go:115:		return Session{}, err
+internal/host/bootstrap.go:116:	}
+internal/host/bootstrap.go:117:	hash := domain.Digest([]byte(token))
+internal/host/bootstrap.go:118:	if previous != "" && previous != hash {
+internal/host/bootstrap.go:119:		if err := h.revokeCredentialByHash(ctx, principalID, previous); err != nil {
+internal/host/bootstrap.go:120:			return Session{}, err
+internal/host/bootstrap.go:121:		}
+internal/host/bootstrap.go:122:	}
+internal/host/bootstrap.go:123:	now := h.nowUTC()
+internal/host/bootstrap.go:124:	sess := Session{PrincipalID: principalID, PrincipalRef: h.identity.Ref, Token: token,
+internal/host/bootstrap.go:125:		IssuedAt: now, ExpiresAt: now.Add(h.ttl), TTLSec: int64(h.ttl / time.Second)}
+internal/host/bootstrap.go:126:	if err := h.writeSessionFile(sess); err != nil {
+internal/host/bootstrap.go:127:		return Session{}, err
+internal/host/bootstrap.go:128:	}
+internal/host/bootstrap.go:129:	if h.state != nil {
+internal/host/bootstrap.go:130:		h.state.ActiveCredentialHash = hash
+internal/host/bootstrap.go:131:	}
+internal/host/bootstrap.go:132:	return sess, nil
+internal/host/bootstrap.go:133:}
+internal/host/bootstrap.go:135:// revokeCredentialByHash marks exactly one credential row revoked, identified by the hash the
+internal/host/bootstrap.go:136:// host itself issued. The host never searches or decrypts a token and never touches another
+internal/host/bootstrap.go:137:// principal's rows: an already-absent row is not an error.
+internal/host/bootstrap.go:138:func (h *Host) revokeCredentialByHash(ctx context.Context, principalID, tokenHash string) error {
+internal/host/bootstrap.go:139:	if principalID == "" || tokenHash == "" {
+internal/host/bootstrap.go:140:		return nil
+internal/host/bootstrap.go:141:	}
+internal/host/bootstrap.go:142:	_, err := h.db.ExecContext(ctx, `UPDATE auth_credentials SET revoked=1 WHERE principal=? AND token_hash=?`,
+internal/host/bootstrap.go:143:		principalID, tokenHash)
+internal/host/bootstrap.go:144:	return err
+internal/host/bootstrap.go:145:}
+internal/host/bootstrap.go:147:// scanPrincipals counts OWNER principals and all principals. Roles are stored as a JSON array
+internal/host/bootstrap.go:148:// by the domain layer; an unparsable row counts as "not an OWNER" rather than being trusted.
+internal/host/bootstrap.go:149:func (h *Host) scanPrincipals(ctx context.Context) (owners, total int, ownerID string) {
+internal/host/bootstrap.go:150:	rows, err := h.db.QueryContext(ctx, `SELECT id, roles, revoked FROM auth_principals ORDER BY id`)
+internal/host/bootstrap.go:151:	if err != nil {
+internal/host/bootstrap.go:152:		return -1, -1, ""
+internal/host/bootstrap.go:153:	}
+internal/host/bootstrap.go:154:	defer rows.Close()
+internal/host/bootstrap.go:155:	for rows.Next() {
+internal/host/bootstrap.go:156:		var id, roles string
+internal/host/bootstrap.go:157:		var revoked int
+internal/host/bootstrap.go:158:		if err := rows.Scan(&id, &roles, &revoked); err != nil {
+internal/host/bootstrap.go:159:			return -1, -1, ""
+internal/host/bootstrap.go:160:		}
+internal/host/bootstrap.go:161:		total++
+internal/host/bootstrap.go:162:		if revoked != 0 {
+internal/host/bootstrap.go:163:			continue
+internal/host/bootstrap.go:164:		}
+internal/host/bootstrap.go:165:		var list []string
+internal/host/bootstrap.go:166:		if err := json.Unmarshal([]byte(roles), &list); err != nil {
+internal/host/bootstrap.go:167:			continue
+internal/host/bootstrap.go:168:		}
+internal/host/bootstrap.go:169:		for _, r := range list {
+internal/host/bootstrap.go:170:			if r == "OWNER" {
+internal/host/bootstrap.go:171:				owners++
+internal/host/bootstrap.go:172:				ownerID = id
+internal/host/bootstrap.go:173:			}
+internal/host/bootstrap.go:174:		}
+internal/host/bootstrap.go:175:	}
+internal/host/bootstrap.go:176:	if err := rows.Err(); err != nil {
+internal/host/bootstrap.go:177:		return -1, -1, ""
+internal/host/bootstrap.go:178:	}
+internal/host/bootstrap.go:179:	return owners, total, ownerID
+internal/host/bootstrap.go:180:}
+internal/host/bootstrap.go:182:// reverify is the identity check every privileged host operation performs first: the OS
+internal/host/bootstrap.go:183:// principal asking now must be the same principal this host was started for.
+internal/host/bootstrap.go:184:func (h *Host) reverify() (identitySnapshot, error) {
+internal/host/bootstrap.go:185:	fresh, err := auth.Current()
+internal/host/bootstrap.go:186:	if err != nil {
+internal/host/bootstrap.go:187:		return identitySnapshot{}, err
+internal/host/bootstrap.go:188:	}
+internal/host/bootstrap.go:189:	if !h.identity.SameUser(fresh) {
+internal/host/bootstrap.go:190:		return identitySnapshot{}, ErrHostIdentity
+internal/host/bootstrap.go:191:	}
+internal/host/bootstrap.go:192:	return identitySnapshot{Ref: fresh.Ref}, nil
+internal/host/bootstrap.go:193:}
+internal/host/bootstrap.go:195:type identitySnapshot struct{ Ref string }
+internal/host/host.go:1:// Package host is the trusted local host boundary (W17-01). It owns three things the plain
+internal/host/host.go:2:// command protocol must never own: the one-time OWNER bootstrap bound to the OS user, the
+internal/host/host.go:3:// short-lived session credential that can be renewed without the user ever copying a token,
+internal/host/host.go:4:// and the protected storage for provider credentials and workspace-root bindings.
+internal/host/host.go:5://
+internal/host/host.go:6:// Business truth stays in the existing domain layer: this package calls domain.ProvisionPrincipal
+internal/host/host.go:7:// and domain.IssueCredential instead of writing auth_* tables itself, and its own local state
+internal/host/host.go:8:// (credential vault, root registry, single-use selection references) lives in a private
+internal/host/host.go:9:// current-user directory as files, never as a second set of business tables.
+internal/host/host.go:10:package host
+internal/host/host.go:12:import (
+internal/host/host.go:13:	"crypto/sha256"
+internal/host/host.go:14:	"database/sql"
+internal/host/host.go:15:	"encoding/hex"
+internal/host/host.go:16:	"encoding/json"
+internal/host/host.go:17:	"errors"
+internal/host/host.go:18:	"fmt"
+internal/host/host.go:19:	"os"
+internal/host/host.go:20:	"path/filepath"
+internal/host/host.go:21:	"time"
+internal/host/host.go:23:	"researchos.local/research-os/internal/auth"
+internal/host/host.go:24:	"researchos.local/research-os/internal/domain"
+internal/host/host.go:25:)
+internal/host/host.go:27:const (
+internal/host/host.go:28:	// MaxSessionTTL mirrors the existing host credential ceiling (22: short sessions only).
+internal/host/host.go:29:	MaxSessionTTL = 15 * time.Minute
+internal/host/host.go:30:	// DefaultSessionTTL is what the host issues unless configured lower.
+internal/host/host.go:31:	DefaultSessionTTL = MaxSessionTTL
+internal/host/host.go:32:	// SelectionTTL is the published single-use window for a workspace selection reference.
+internal/host/host.go:33:	SelectionTTL = 5 * time.Minute
+internal/host/host.go:34:	// MaxSelectionRecords bounds the local reference table so a hostile loop cannot grow it.
+internal/host/host.go:35:	MaxSelectionRecords = 256
+internal/host/host.go:36:)
+internal/host/host.go:38:var (
+internal/host/host.go:39:	ErrNoOwner            = errors.New("OWNER_NOT_INITIALIZED")
+internal/host/host.go:40:	ErrMultipleOwners     = errors.New("MULTIPLE_OWNER_STATE")
+internal/host/host.go:41:	ErrOwnerTaken         = errors.New("OWNER_ALREADY_INITIALIZED")
+internal/host/host.go:42:	ErrPrincipalRevoked   = errors.New("PRINCIPAL_REVOKED")
+internal/host/host.go:43:	ErrHostIdentity       = errors.New("OS_IDENTITY_MISMATCH")
+internal/host/host.go:44:	ErrUntrustedTransport = errors.New("UNTRUSTED_TRANSPORT")
+internal/host/host.go:45:	// ErrUntrustedPathChoice refuses a directory a client named by itself when no user chooser
+internal/host/host.go:46:	// confirmed it: binding a caller-typed path is how a "user-chosen workspace" becomes a
+internal/host/host.go:47:	// drive-by path.
+internal/host/host.go:48:	ErrUntrustedPathChoice = errors.New("FORBIDDEN")
+internal/host/host.go:49:	ErrBadState            = errors.New("HOST_STATE_INVALID")
+internal/host/host.go:50:)
+internal/host/host.go:52:// Config wires the host onto an already-migrated database. ContractsDir and MigrationFile are
+internal/host/host.go:53:// the existing host inputs (same values apps/control uses) so domain validation stays one
+internal/host/host.go:54:// implementation rather than a second one tuned for tests.
+internal/host/host.go:55:type Config struct {
+internal/host/host.go:56:	DB            *sql.DB
+internal/host/host.go:57:	Dir           string
+internal/host/host.go:58:	// Trial-only read access to one existing DPAPI record; the new DB stays isolated.
+internal/host/host.go:59:	ReadOnlyModelVaultDir string
+internal/host/host.go:60:	ReadOnlyModelCredentialRef string
+internal/host/host.go:61:	ReadOnlyModelProvider string
+internal/host/host.go:62:	ContractsDir  string
+internal/host/host.go:63:	MigrationFile string
+internal/host/host.go:64:	SessionTTL    time.Duration
+internal/host/host.go:65:	// SchemaDir holds the pinned client.protocol.schema.json plus domain.schema.json the bridge
+internal/host/host.go:66:	// grades its frames against. Without it the host refuses to start rather than accepting
+internal/host/host.go:67:	// frames nobody has graded.
+internal/host/host.go:68:	SchemaDir string
+internal/host/host.go:69:	Now       func() time.Time
+internal/host/host.go:70:	// AllowNonWindows is only used to keep the package buildable; the bootstrap path refuses
+internal/host/host.go:71:	// to run anywhere the OS identity cannot be verified as the local principal.
+internal/host/host.go:72:	AllowNonWindows bool
+internal/host/host.go:73:	// PeerIdentityResolver decides who is on the other end of a native connection. The default
+internal/host/host.go:74:	// is the real OS lookup (auth.ProcessIdentity). Qualification may substitute it to prove the
+internal/host/host.go:75:	// serve path refuses a peer whose resolved principal is not the host owner: the seam only
+internal/host/host.go:76:	// replaces the OS answer, it cannot replace the comparison, so a host that stopped comparing
+internal/host/host.go:77:	// would accept a peer the resolver called foreign.
+internal/host/host.go:78:	PeerIdentityResolver func(pid uint32) (auth.Identity, error)
+internal/host/host.go:79:	// ProtocolVersion is the version this host stamps into bridge replies. It defaults to the
+internal/host/host.go:80:	// pinned researchos-client/2; a host built for any other version has its replies refused by
+internal/host/host.go:81:	// contract grading, which is what keeps the bridge from growing a private dialect.
+internal/host/host.go:82:	ProtocolVersion string
+internal/host/host.go:83:}
+internal/host/host.go:85:// Host is one trusted local host instance.
+internal/host/host.go:86:type Host struct {
+internal/host/host.go:87:	db       *sql.DB
+internal/host/host.go:88:	domain   *domain.Service
+internal/host/host.go:89:	dir      string
+internal/host/host.go:90:	ttl      time.Duration
+internal/host/host.go:91:	identity auth.Identity
+internal/host/host.go:92:	now      func() time.Time
+internal/host/host.go:94:	doc schemaDocument
+internal/host/host.go:96:	peerLookup      func(pid uint32) (auth.Identity, error)
+internal/host/host.go:97:	protocolVersion string
+internal/host/host.go:99:	vault      *Vault
+internal/host/host.go:100:	roots      *RootRegistry
+internal/host/host.go:101:	selections *SelectionStore
+internal/host/host.go:102:	state      *hostState
+internal/host/host.go:103:}
+internal/host/host.go:105:// New verifies the OS identity first: a host that cannot name the local principal is not
+internal/host/host.go:106:// allowed to bootstrap, renew, or accept native calls at all.
+internal/host/host.go:107:func New(cfg Config) (*Host, error) {
+internal/host/host.go:108:	if cfg.DB == nil || cfg.Dir == "" || cfg.ContractsDir == "" || cfg.MigrationFile == "" || cfg.SchemaDir == "" {
+internal/host/host.go:109:		return nil, fmt.Errorf("%w: db, dir, contracts, migration and schema are required", ErrBadState)
+internal/host/host.go:110:	}
+internal/host/host.go:111:	if cfg.ReadOnlyModelVaultDir != "" {
+internal/host/host.go:112:		if cfg.ReadOnlyModelCredentialRef == "" || cfg.ReadOnlyModelProvider == "" ||
+internal/host/host.go:113:			filepath.Base(cfg.Dir) != "host" ||
+internal/host/host.go:114:            ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+internal/host/host.go:115:			return nil, ErrUnknownCredential
+internal/host/host.go:116:		}
+internal/host/host.go:117:	} else if cfg.ReadOnlyModelCredentialRef != "" || cfg.ReadOnlyModelProvider != "" {
+internal/host/host.go:118:		return nil, ErrUnknownCredential
+internal/host/host.go:119:	}
+internal/host/host.go:120:	ttl := cfg.SessionTTL
+internal/host/host.go:121:	if ttl <= 0 || ttl > MaxSessionTTL {
+internal/host/host.go:122:		ttl = DefaultSessionTTL
+internal/host/host.go:123:	}
+internal/host/host.go:124:	now := cfg.Now
+internal/host/host.go:125:	if now == nil {
+internal/host/host.go:126:		now = func() time.Time { return time.Now().UTC() }
+internal/host/host.go:127:	}
+internal/host/host.go:128:	id, err := auth.Current()
+internal/host/host.go:129:	if err != nil {
+internal/host/host.go:130:		return nil, err
+internal/host/host.go:131:	}
+internal/host/host.go:132:	if !verifiableKind(id.Kind) {
+internal/host/host.go:133:		return nil, fmt.Errorf("%w: host identity kind %s is not a verifiable local principal", ErrHostIdentity, id.Kind)
+internal/host/host.go:134:	}
+internal/host/host.go:135:	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+internal/host/host.go:136:		return nil, err
+internal/host/host.go:137:	}
+internal/host/host.go:138:	if cfg.ReadOnlyModelVaultDir != "" &&
+internal/host/host.go:139:		ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+internal/host/host.go:140:		return nil, ErrUnknownCredential
+internal/host/host.go:141:	}
+internal/host/host.go:142:	if err := privateDir(cfg.Dir); err != nil {
+internal/host/host.go:143:		return nil, fmt.Errorf("private host directory refused: %w", err)
+internal/host/host.go:144:	}
+internal/host/host.go:145:	doc, err := loadSchema(cfg.SchemaDir)
+internal/host/host.go:146:	if err != nil {
+internal/host/host.go:147:		return nil, err
+internal/host/host.go:148:	}
+internal/host/host.go:149:	svc, err := domain.NewCurrentMu(cfg.DB, cfg.ContractsDir, cfg.MigrationFile)
+internal/host/host.go:150:	if err != nil {
+internal/host/host.go:151:		return nil, err
+internal/host/host.go:152:	}
+internal/host/host.go:153:	h := &Host{db: cfg.DB, domain: svc, dir: cfg.Dir, ttl: ttl, identity: id, now: now, doc: doc}
+internal/host/host.go:154:	h.peerLookup = cfg.PeerIdentityResolver
+internal/host/host.go:155:	if h.peerLookup == nil {
+internal/host/host.go:156:		h.peerLookup = auth.ProcessIdentity
+internal/host/host.go:157:	}
+internal/host/host.go:158:	h.protocolVersion = cfg.ProtocolVersion
+internal/host/host.go:159:	if h.protocolVersion == "" {
+internal/host/host.go:160:		h.protocolVersion = nativeProtocolVersion
+internal/host/host.go:161:	}
+internal/host/host.go:162:	if cfg.ReadOnlyModelVaultDir != "" {
+internal/host/host.go:163:		if h.vault, err = openVaultReadOnly(cfg.ReadOnlyModelVaultDir,
+internal/host/host.go:164:			cfg.ReadOnlyModelCredentialRef, cfg.ReadOnlyModelProvider); err != nil {
+internal/host/host.go:165:			return nil, err
+internal/host/host.go:166:		}
+internal/host/host.go:167:	} else if h.vault, err = openVault(cfg.Dir); err != nil {
+internal/host/host.go:168:		return nil, err
+internal/host/host.go:169:	}
+internal/host/host.go:170:	if h.roots, err = openRootRegistry(cfg.Dir); err != nil {
+internal/host/host.go:171:		return nil, err
+internal/host/host.go:172:	}
+internal/host/host.go:173:	if h.selections, err = openSelectionStore(cfg.Dir); err != nil {
+internal/host/host.go:174:		return nil, err
+internal/host/host.go:175:	}
+internal/host/host.go:176:	if h.state, err = loadHostState(cfg.Dir); err != nil {
+internal/host/host.go:177:		return nil, err
+internal/host/host.go:178:	}
+internal/host/host.go:179:	return h, nil
+internal/host/host.go:180:}
+internal/host/host.go:182:// verifiableKind accepts WINDOWS_SID today; the POSIX path must be re-qualified before it is
+internal/host/host.go:183:// trusted as a local principal, so anything else fails closed.
+internal/host/host.go:184:func verifiableKind(kind string) bool { return kind == "WINDOWS_SID" }
+internal/host/host.go:186:// Identity exposes the verified OS principal reference (never the raw SID).
+internal/host/host.go:187:func (h *Host) Identity() auth.Identity { return h.identity }
+internal/host/host.go:189:// InstanceID is a stable local host identifier for handshake responses; it is derived from
+internal/host/host.go:190:// the private directory path plus the principal reference, so it changes if either does.
+internal/host/host.go:191:func (h *Host) InstanceID() string {
+internal/host/host.go:192:	sum := sha256.Sum256([]byte(h.dir + "|" + h.identity.Ref))
+internal/host/host.go:193:	return "host-" + hex.EncodeToString(sum[:6])
+internal/host/host.go:194:}
+internal/host/host.go:196:// writePrivate stores a file with 0600 plus the current-user-only DACL and a durable rename,
+internal/host/host.go:197:// so a crash cannot leave a half-written credential or root registry.
+internal/host/host.go:198:func writePrivate(dir, name string, payload any) error {
+internal/host/host.go:199:	raw, err := json.MarshalIndent(payload, "", "  ")
+internal/host/host.go:200:	if err != nil {
+internal/host/host.go:201:		return err
+internal/host/host.go:202:	}
+internal/host/host.go:203:	tmp, err := os.CreateTemp(dir, name+".tmp-")
+internal/host/host.go:204:	if err != nil {
+internal/host/host.go:205:		return err
+internal/host/host.go:206:	}
+internal/host/host.go:207:	defer os.Remove(tmp.Name())
+internal/host/host.go:208:	if err := tmp.Chmod(0o600); err != nil {
+internal/host/host.go:209:		tmp.Close()
+internal/host/host.go:210:		return err
+internal/host/host.go:211:	}
+internal/host/host.go:212:	if _, err := tmp.Write(raw); err != nil {
+internal/host/host.go:213:		tmp.Close()
+internal/host/host.go:214:		return err
+internal/host/host.go:215:	}
+internal/host/host.go:216:	if err := tmp.Sync(); err != nil {
+internal/host/host.go:217:		tmp.Close()
+internal/host/host.go:218:		return err
+internal/host/host.go:219:	}
+internal/host/host.go:220:	if err := tmp.Close(); err != nil {
+internal/host/host.go:221:		return err
+internal/host/host.go:222:	}
+internal/host/host.go:223:	if err := privateFile(tmp.Name()); err != nil {
+internal/host/host.go:224:		return err
+internal/host/host.go:225:	}
+internal/host/host.go:226:	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+internal/host/host.go:227:}
+internal/host/host.go:229:func readPrivate(dir, name string, into any) error {
+internal/host/host.go:230:	raw, err := os.ReadFile(filepath.Join(dir, name))
+internal/host/host.go:231:	if err != nil {
+internal/host/host.go:232:		if errors.Is(err, os.ErrNotExist) {
+internal/host/host.go:233:			return nil
+internal/host/host.go:234:		}
+internal/host/host.go:235:		return err
+internal/host/host.go:236:	}
+internal/host/host.go:237:	return json.Unmarshal(raw, into)
+internal/host/host.go:238:}

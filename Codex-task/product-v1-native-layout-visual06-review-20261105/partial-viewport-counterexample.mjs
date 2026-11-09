@@ -1,0 +1,13 @@
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+const source=fs.readFileSync(new URL('../product-v1-native-layout-visual-prepare-06/real-electron-flow.mjs',import.meta.url),'utf8');
+const start=source.indexOf('visual.findings=visual.scenarios.flatMap(row => {');
+const end=source.indexOf('\n    visual.status=',start);
+assert(start>=0 && end>start);
+const rect=(x,y,width,height)=>({x,y,width,height,right:x+width,bottom:y+height});
+const row={phase:'INITIAL_VIEWPORT',viewport:{requested_width:390,requested_height:844,inner_width:390,inner_height:844},requested_theme:'dark',actual_theme:'dark',rects:{canvas:rect(0,0,390,1200),transcript:rect(0,0,390,1100),composer:rect(0,1100,390,100),heading:rect(10,840,100,40),actions:[rect(10,900,100,40),rect(10,950,100,40),rect(10,1000,100,40)]},horizontal_overflow:false,composer_overlaps_content:[],composer_visible:false,composer_center_hit:false,heading_visible:true,heading_center_hit:false,actions_visible:[false,false,false],actions_center_hit:[false,false,false],action_index:null};
+const context={visual:{scenarios:[row]}};
+vm.runInNewContext(source.slice(start,end),context);
+assert(context.visual.findings.some(x=>x.endsWith(':HEADING_COVERED_INITIAL')));
+console.log(JSON.stringify({finding:'CONFIRMED_FALSE_COVERED_CLASSIFICATION',heading_bottom:880,viewport_bottom:844,heading_center_y:860,partially_visible:true,center_outside_viewport:true,occluding_element_present:false,actual_findings:context.visual.findings,scope:'EXTRACTED_PURE_CLASSIFIER_ONLY',runner_import:0,app:0,gui:0,model:0}));

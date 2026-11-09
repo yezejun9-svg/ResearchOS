@@ -1,0 +1,34 @@
+--- baseline/internal/domain/runtime_goal_bindings_windows.go
++++ snapshot/internal/domain/runtime_goal_bindings_windows.go
+@@ -47,6 +47,31 @@
+ 	}
+ 
+ 	model := ""
++	if c.config.ConfigurationAuthority != nil {
++		s := &ClientService{Domain: c.service, Doc: c.config.ClientSchema, ConfigurationAuthority: c.config.ConfigurationAuthority}
++		owner, e := s.configurationOwner(ctx, tx, principal)
++		if e != nil {
++			return "", "", e
++		}
++		head, e := readClientConfigurationHead(ctx, tx, c.config.ClientSchema, owner, principal)
++		if e != nil {
++			return "", "", Fail(503, "MODEL_UNAVAILABLE", "current configuration head is invalid")
++		}
++		if head.Ref != "" {
++			if e = c.ValidateBinding(ctx, tx, principal, project, workspace, head.Ref); e != nil {
++				return "", "", e
++			}
++			return workspace, head.Ref, nil
++		}
++	} else {
++		var heads int
++		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM host_model_config_heads WHERE principal=?`, principal).Scan(&heads); err != nil {
++			return "", "", err
++		}
++		if heads > 0 {
++			return "", "", Fail(503, "MODEL_UNAVAILABLE", "configuration head requires trusted host authority")
++		}
++	}
+ 	seen := map[string]bool{}
+ 	for _, route := range c.config.Routes {
+ 		if route.ProjectID != project {

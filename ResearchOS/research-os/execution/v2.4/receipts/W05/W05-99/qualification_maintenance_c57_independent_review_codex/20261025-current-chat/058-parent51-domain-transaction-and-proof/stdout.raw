@@ -1,0 +1,716 @@
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+477: type verifiedHistoricalQualification struct {
+478: 	subject      HistoricalQualificationSubject
+479: 	author       Principal
+480: 	ownerRoot    string
+481: 	profileRef   Object
+482: 	run          Object
+483: 	task         Object
+484: 	state        Object
+485: 	dispatch     Object
+486: 	observation  Object
+487: 	modelBinding Object
+488: 	native       historicalQualificationNative
+489: 	source       HistoricalQualificationSource
+490: }
+491: 
+492: type HistoricalQualificationPlan struct {
+493: 	Schema                string                         `json:"schema"`
+494: 	OperationID           string                         `json:"operation_id"`
+495: 	DataRoot              string                         `json:"data_root"`
+496: 	Database              string                         `json:"database"`
+497: 	Subject               HistoricalQualificationSubject `json:"subject"`
+498: 	Source                HistoricalQualificationSource  `json:"source"`
+499: 	BoundaryPlanSHA256    string                         `json:"boundary_plan_sha256"`
+500: 	AuthorID              string                         `json:"author_id"`
+501: 	OwnerRoot             string                         `json:"owner_root"`
+502: 	DispatchDirectory     string                         `json:"dispatch_directory"`
+503: 	SID                   string                         `json:"sid"`
+504: 	BeforeCensus          store.OwnedStopCensus          `json:"before_census"`
+505: 	BeforeProtectedSHA256 string                         `json:"before_protected_sha256"`
+506: 	BeforeResidualSHA256  string                         `json:"before_residual_sha256"`
+507: 	Core                  Object                         `json:"core"`
+508: 	Proof                 Object                         `json:"proof"`
+509: 	ProofBytes            []byte                         `json:"proof_bytes"`
+510: 	Artifact              Object                         `json:"artifact"`
+511: 	ImpactLink            Object                         `json:"impact_link"`
+512: 	Run                   Object                         `json:"run"`
+513: 	ProjectState          Object                         `json:"project_state"`
+514: 	Event                 Object                         `json:"event"`
+515: 	Observation           Object                         `json:"observation"`
+516: 	BeforeRun             Object                         `json:"before_run"`
+517: 	BeforeState           Object                         `json:"before_state"`
+518: 	BeforeDispatch        Object                         `json:"before_dispatch"`
+519: 	UploadKey             string                         `json:"upload_key"`
+520: 	ExpiresAt             string                         `json:"expires_at"`
+521: 	ObservedAt            string                         `json:"observed_at"`
+522: 	EventSequence         int64                          `json:"event_sequence"`
+523: 	DispatchSequence      int64                          `json:"dispatch_sequence"`
+524: 	OutcomeHash           string                         `json:"outcome_hash"`
+525: }
+526: 
+527: func (p HistoricalQualificationPlan) coreHash() string { return Hash(p.Core) }
+528: 
+529: func (p HistoricalQualificationPlan) beforeHash() string {
+530: 	return Hash(Object{"census": p.BeforeCensus, "run": p.BeforeRun,
+531: 		"state": p.BeforeState, "dispatch": p.BeforeDispatch,
+532: 		"protected": p.BeforeProtectedSHA256, "residual": p.BeforeResidualSHA256})
+533: }
+534: 
+535: func (p HistoricalQualificationPlan) residualSelectors() (store.QualificationResidualSelectors, error) {
+536: 	runRev, e := Num(p.Run, "revision")
+537: 	if e != nil {
+538: 		return store.QualificationResidualSelectors{}, e
+539: 	}
+540: 	stateRev, e := Num(p.ProjectState, "revision")
+541: 	if e != nil {
+542: 		return store.QualificationResidualSelectors{}, e
+543: 	}
+544: 	return store.QualificationResidualSelectors{
+545: 		Project: p.Subject.ProjectID, Run: p.Subject.RunID, Operation: p.OperationID,
+546: 		Principal: p.AuthorID, UploadKey: p.UploadKey, EventID: Str(p.Event, "id"),
+547: 		Epoch: p.Subject.Epoch, EventSequence: p.EventSequence, ArtifactID: Str(p.Artifact, "id"),
+548: 		ImpactLinkID: Str(p.ImpactLink, "id"), StateID: Str(p.ProjectState, "id"),
+549: 		RunRevision: runRev, StateRevision: stateRev, ObservationHash: Hash(p.Observation),
+550: 	}, nil
+551: }
+552: 
+553: func (p HistoricalQualificationPlan) afterHash() string {
+554: 	return Hash(Object{"artifact": p.Artifact, "impact_link": p.ImpactLink,
+555: 		"run": p.Run, "state": p.ProjectState, "event": p.Event,
+556: 		"observation": p.Observation, "dispatch_sequence": p.DispatchSequence,
+557: 		"upload_hash": Digest(p.ProofBytes), "outcome_hash": p.OutcomeHash})
+558: }
+559: 
+560: // JournalHashes allow a lower-dependency journal to bind every immutable
+561: // planned payload without importing domain or exposing SQL authority.
+562: func (p HistoricalQualificationPlan) JournalHashes() (plan, before, after, subject, evidence string) {
+563: 	return p.coreHash(), p.beforeHash(), p.afterHash(), Hash(p.Subject),
+564: 		Hash(Object{"source": p.Source, "native": p.Proof["native"], "model": p.Proof["model_binding"]})
+565: }
+566: 
+567: func (s *Service) buildHistoricalQualificationPlan(ctx context.Context, tx *sql.Tx, verified verifiedHistoricalQualification,
+568: 	operationID, boundaryPlanSHA256, dataRoot, database, directory, sid string, before store.OwnedStopCensus,
+569: 	frozen *HistoricalQualificationPlan) (HistoricalQualificationPlan, error) {
+570: 	var plan HistoricalQualificationPlan
+571: 	if len(operationID) != 32 || before.Tables < 87 || before.SHA256 == "" ||
+572: 		dataRoot == "" || boundaryPlanSHA256 == "" || database != filepath.Join(dataRoot, "researchos.sqlite") {
+573: 		return plan, qualificationDenialUnavailable("historical plan inputs invalid")
+574: 	}
+575: 	currentRun, err := cloneQualificationObject(verified.run)
+576: 	if err != nil {
+577: 		return plan, err
+578: 	}
+579: 	currentState, err := cloneQualificationObject(verified.state)
+580: 	if err != nil {
+581: 		return plan, err
+582: 	}
+583: 	observation, err := cloneQualificationObject(verified.observation)
+584: 	if err != nil {
+585: 		return plan, err
+586: 	}
+587: 	seq, err := Num(verified.state, "event_sequence")
+588: 	if err != nil || seq == 1<<63-1 {
+589: 		return plan, qualificationDenialUnavailable("event sequence exhausted")
+590: 	}
+591: 	var maxOutbox int64
+592: 	if err = tx.QueryRow(`SELECT coalesce(max(sequence),0) FROM outbox WHERE project=?`, verified.subject.ProjectID).Scan(&maxOutbox); err != nil {
+593: 		return plan, err
+594: 	}
+595: 	if maxOutbox > seq {
+596: 		seq = maxOutbox
+597: 	}
+598: 	if seq == 1<<63-1 {
+599: 		return plan, qualificationDenialUnavailable("event sequence exhausted")
+600: 	}
+601: 	seq++
+602: 	dispatchSeq, err := Num(verified.dispatch, "observation_sequence")
+603: 	if err != nil {
+604: 		return plan, err
+605: 	}
+606: 	if verified.native.journal.Sequence > dispatchSeq {
+607: 		dispatchSeq = verified.native.journal.Sequence
+608: 	}
+609: 	if dispatchSeq == 1<<63-1 {
+610: 		return plan, qualificationDenialUnavailable("dispatch sequence exhausted")
+611: 	}
+612: 	dispatchSeq++
+613: 	observedAt := Now()
+614: 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+615: 	uploadKey, artifactID, linkID, eventID := ID(), ID(), ID(), ID()
+616: 	if frozen != nil {
+617: 		observedAt, expiresAt = frozen.ObservedAt, frozen.ExpiresAt
+618: 		uploadKey, artifactID, linkID, eventID = frozen.UploadKey,
+619: 			Str(frozen.Core, "artifact_id"), Str(frozen.Core, "impact_link_id"), Str(frozen.Core, "event_id")
+620: 		if len(uploadKey) != 32 || len(artifactID) != 32 || len(linkID) != 32 || len(eventID) != 32 ||
+621: 			observedAt == "" || expiresAt == "" {
+622: 			return plan, qualificationDenialUnavailable("frozen historical identifiers invalid")
+623: 		}
+624: 	}
+625: 	qf := observation["qualification_failure"].(map[string]any)
+626: 	qf["closure_observed_at"] = observedAt
+627: 	core := Object{"schema": "researchos.qualification-failure-maintenance-core.v1",
+628: 		"operation_id": operationID, "boundary_plan_sha256": boundaryPlanSHA256,
+629: 		"subject": verified.subject, "source": verified.source,
+630: 		"data_root": dataRoot, "database": database, "author": verified.author.ID,
+631: 		"owner_root": verified.ownerRoot, "business_sid": sid,
+632: 		"before_census": before, "before_run_hash": Hash(verified.run),
+633: 		"before_state_hash": Hash(verified.state), "before_dispatch_hash": Hash(verified.dispatch),
+634: 		"profile_ref": verified.profileRef, "upload_key": uploadKey,
+635: 		"artifact_id": artifactID, "impact_link_id": linkID, "event_id": eventID,
+636: 		"observed_at": observedAt, "expires_at": expiresAt,
+637: 		"event_sequence": seq, "dispatch_observation_sequence": dispatchSeq,
+638: 		"observation_hash": Hash(observation)}
+639: 	proof := Object{"schema": "researchos.qualification-failure-maintenance-proof.v1",
+640: 		"kind":         historicalMaintenanceProofKind,
+641: 		"claim":        "HOST_TOOL_EFFECT_NOT_DISPATCHED",
+642: 		"rule":         historicalMaintenanceRule,
+643: 		"native_class": historicalMaintenanceNativeClass,
+644: 		"plan_hash":    Hash(core), "plan_core": core, "subject": verified.subject,
+645: 		"author": verified.author.ID, "owner_root": verified.ownerRoot,
+646: 		"observed_at": observedAt,
+647: 		"native": Object{"bridge_sha256": verified.native.bridgeHash,
+648: 			"stdout_sha256": verified.native.stdoutHash, "stderr_sha256": verified.native.stderrHash,
+649: 			"model_fact_sha256": verified.native.modelHash,
+650: 			"pid":               verified.native.journal.Identity.PID,
+651: 			"created":           verified.native.journal.Identity.Created,
+652: 			"job":               verified.native.journal.Identity.Job,
+653: 			"frames":            int64(3), "acknowledged": int64(2), "raw_queue_empty": false,
+654: 			"stopped":             verified.native.journal.Receipt.Stopped,
+655: 			"streams_drained":     verified.native.journal.Receipt.StreamsDrained,
+656: 			"job_total_processes": verified.native.journal.Receipt.JobProcesses,
+657: 			"exit_code":           verified.native.journal.Receipt.ExitCode,
+658: 			"raw_wait_result":     nil},
+659: 		"source_binding": verified.source, "model_binding": verified.modelBinding,
+660: 		"derived_observation": observation,
+661: 		"limits":              "Host first-gate TOOL only; no universal OS NO_EFFECT, raw WAIT or broker join"}
+662: 	proofBytes := Bytes(proof)
+663: 	if len(proofBytes) == 0 || len(proofBytes) > 64<<10 {
+664: 		return plan, qualificationDenialUnavailable("historical proof bound exceeded")
+665: 	}
+666: 	artifact := Object{"id": artifactID, "project_id": verified.subject.ProjectID,
+667: 		"revision": 1, "created_at": observedAt, "updated_at": observedAt,
+668: 		"run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED",
+669: 		"measurement_mode": "LIVE", "media_type": "application/json",
+670: 		"content_hash": Digest(proofBytes), "storage_key": uploadKey, "byte_size": len(proofBytes),
+671: 		"input_refs": []any{verified.profileRef}, "source_refs": Empty(),
+672: 		"produced_by": verified.author.ID, "access_class": "PROJECT",
+673: 		"validity": "CURRENT", "sealed_at": observedAt}
+674: 	link := Object{"id": linkID, "project_id": verified.subject.ProjectID,
+675: 		"revision": 1, "created_at": observedAt, "updated_at": observedAt,
+676: 		"from_ref": Ref(artifact, "Artifact"), "to_ref": verified.profileRef,
+677: 		"relation": "DERIVED_FROM", "basis": "DETERMINISTIC",
+678: 		"evidence_refs": Empty(), "status": "ACTIVE"}
+679: 	runRev, err := Num(currentRun, "revision")
+680: 	if err != nil || runRev == 1<<63-1 {
+681: 		return plan, qualificationDenialUnavailable("Run revision unavailable")
+682: 	}
+683: 	currentRun["revision"] = runRev + 1
+684: 	currentRun["updated_at"] = observedAt
+685: 	currentRun["status"] = "FAILED"
+686: 	currentRun["execution_report"] = "Historical Host first-gate TOOL classification; operation " + operationID +
+687: 		"; proof " + Digest(proofBytes) + "; native ended " + verified.native.journal.Ended
+688: 	currentRun["exit_code"] = verified.native.journal.Receipt.ExitCode
+689: 	currentRun["runtime_settled_at"] = observedAt
+690: 	currentRun["children_stopped"] = true
+691: 	currentRun["queue_empty"] = true
+692: 	currentRun["ended_at"] = observedAt
+693: 	stateRev, err := Num(currentState, "revision")
+694: 	if err != nil || stateRev == 1<<63-1 {
+695: 		return plan, qualificationDenialUnavailable("ProjectState revision unavailable")
+696: 	}
+697: 	currentState["revision"] = stateRev + 1
+698: 	currentState["updated_at"] = observedAt
+699: 	currentState["event_sequence"] = seq
+700: 	event := Object{"id": eventID, "project_id": verified.subject.ProjectID,
+701: 		"revision": 1, "created_at": observedAt, "sequence": seq,
+702: 		"event_type": "RUN_CHANGED", "aggregate_ref": Ref(currentRun, "Run"),
+703: 		"actor_id": verified.author.ID, "correlation_id": operationID,
+704: 		"causation_id": nil, "event_data_artifact_ref": nil}
+705: 	event["receipt_hash"] = Receipt(event)
+706: 	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": currentRun,
+707: 		"state": currentState, "event": event, "observation": observation,
+708: 		"dispatch_sequence": dispatchSeq, "before_census": before})
+709: 	plan = HistoricalQualificationPlan{Schema: "researchos.qualification-failure-maintenance-full-plan.v1",
+710: 		OperationID: operationID, BoundaryPlanSHA256: boundaryPlanSHA256,
+711: 		DataRoot: dataRoot, Database: database, Subject: verified.subject,
+712: 		Source: verified.source, AuthorID: verified.author.ID, OwnerRoot: verified.ownerRoot,
+713: 		DispatchDirectory: directory,
+714: 		SID:               sid, BeforeCensus: before, Core: core, Proof: proof,
+715: 		ProofBytes: proofBytes, Artifact: artifact, ImpactLink: link, Run: currentRun,
+716: 		ProjectState: currentState, Event: event, Observation: observation,
+717: 		BeforeRun: verified.run, BeforeState: verified.state, BeforeDispatch: verified.dispatch,
+718: 		UploadKey: uploadKey, ExpiresAt: expiresAt, ObservedAt: observedAt,
+719: 		EventSequence: seq, DispatchSequence: dispatchSeq, OutcomeHash: outcomeHash}
+720: 	plan.BeforeProtectedSHA256, err = store.QualificationMaintenanceProtectedCensus(ctx, tx)
+721: 	if err != nil {
+722: 		return HistoricalQualificationPlan{}, err
+723: 	}
+724: 	selectors, err := plan.residualSelectors()
+725: 	if err != nil {
+726: 		return HistoricalQualificationPlan{}, err
+727: 	}
+728: 	plan.BeforeResidualSHA256, err = store.QualificationMaintenanceResidualCensus(ctx, tx, selectors)
+729: 	if err != nil {
+730: 		return HistoricalQualificationPlan{}, err
+731: 	}
+732: 	return plan, nil
+733: }
+734: 
+735: // PlanHistoricalQualification performs only reads of the existing database.
+736: // The returned plan is informational until a separate boot-bound opaque
+737: // current-quiescence witness, native root lock and journal BEGIN are present.
+738: func PlanHistoricalQualification(ctx context.Context, db *sql.DB, contractsDir string,
+739: 	subject HistoricalQualificationSubject, source HistoricalQualificationSource,
+740: 	authorID, dataRoot, operationID, boundaryPlanSHA256, sid string) (plan HistoricalQualificationPlan, retErr error) {
+741: 	if db == nil || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot ||
+742: 		!filepath.IsAbs(contractsDir) || sid == "" {
+743: 		return plan, qualificationDenialUnavailable("historical preflight input invalid")
+744: 	}
+745: 	if err := ctx.Err(); err != nil {
+746: 		return plan, err
+747: 	}
+748: 	contracts, err := LoadContracts(contractsDir)
+749: 	if err != nil {
+750: 		return plan, err
+751: 	}
+752: 	s := &Service{DB: db, Contracts: contracts}
+753: 	// SQL statements still use ctx, but the transaction itself must be rolled
+754: 	// back synchronously before the native evidence hold is released. A Tx
+755: 	// bound to ctx can auto-rollback in a background goroutine after cancellation.
+756: 	tx, err := db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true})
+757: 	if err != nil {
+758: 		return plan, err
+759: 	}
+760: 	var hold *historicalQualificationHold
+761: 	defer func() {
+762: 		retErr = errors.Join(retErr, finishHistoricalQualificationTx(tx, false, hold))
+763: 	}()
+764: 	var manifestHash string
+765: 	if err := tx.QueryRowContext(ctx, `SELECT manifest_hash FROM runtime_dispatches WHERE project=? AND run=? AND epoch=? AND dispatch_key=?`,
+766: 		subject.ProjectID, subject.RunID, subject.Epoch, subject.DispatchKey).Scan(&manifestHash); err != nil || manifestHash == "" {
+767: 		return plan, qualificationDenialUnavailable("exact historical dispatch unavailable")
+768: 	}
+769: 	directory := filepath.Join(dataRoot, "runtime-dispatches", subject.DispatchKey)
+770: 	native, nativeHold, err := holdHistoricalQualificationNative(directory, manifestHash, "", sid, source)
+771: 	if err != nil {
+772: 		return plan, err
+773: 	}
+774: 	hold = nativeHold
+775: 	verified, err := s.verifyHistoricalQualificationTx(ctx, tx, subject, source, authorID, directory, sid, native)
+776: 	if err != nil {
+777: 		return plan, err
+778: 	}
+779: 	before, err := store.QualificationMaintenanceCensus(ctx, tx)
+780: 	if err != nil {
+781: 		return plan, err
+782: 	}
+783: 	plan, err = s.buildHistoricalQualificationPlan(ctx, tx, verified, operationID, boundaryPlanSHA256, dataRoot,
+784: 		filepath.Join(dataRoot, "researchos.sqlite"), directory, sid, before, nil)
+785: 	if err != nil {
+786: 		return plan, err
+787: 	}
+788: 	if err = hold.Check(); err != nil {
+789: 		return plan, err
+790: 	}
+791: 	if err = ctx.Err(); err != nil {
+792: 		return plan, err
+793: 	}
+794: 	return plan, nil
+795: }
+796: 
+797: func historicalMaintenanceMarker(plan HistoricalQualificationPlan, planFileSHA256 string) Object {
+798: 	return Object{"schema": "researchos.qualification-failure-maintenance-marker.v1",
+799: 		"kind": historicalMaintenanceProofKind, "operation_id": plan.OperationID,
+800: 		"plan_hash": plan.coreHash(), "plan_file_sha256": planFileSHA256,
+801: 		"subject": plan.Subject, "author": plan.AuthorID, "owner_root": plan.OwnerRoot,
+802: 		"proof_ref":        Ref(plan.Artifact, "Artifact"),
+803: 		"observation_hash": Hash(plan.Observation),
+804: 		"terminal_run_ref": Ref(plan.Run, "Run"), "outcome_hash": plan.OutcomeHash}
+805: }
+806: 
+807: func (s *Service) applyHistoricalQualificationTx(ctx context.Context, tx *sql.Tx,
+808: 	plan HistoricalQualificationPlan, planFileSHA256 string) error {
+809: 	if plan.Schema != "researchos.qualification-failure-maintenance-full-plan.v1" ||
+810: 		plan.Proof["kind"] != historicalMaintenanceProofKind ||
+811: 		plan.Proof["claim"] != "HOST_TOOL_EFFECT_NOT_DISPATCHED" ||
+812: 		plan.Proof["rule"] != historicalMaintenanceRule ||
+813: 		plan.Proof["native_class"] != historicalMaintenanceNativeClass ||
+814: 		plan.Proof["plan_hash"] != plan.coreHash() ||
+815: 		!bytes.Equal(plan.ProofBytes, Bytes(plan.Proof)) ||
+816: 		plan.Artifact["run_id"] != nil || len(Arr(plan.Artifact, "input_refs")) != 1 ||
+817: 		len(Arr(plan.Artifact, "source_refs")) != 0 ||
+818: 		plan.Artifact["content_hash"] != Digest(plan.ProofBytes) ||
+819: 		plan.Artifact["produced_by"] != plan.AuthorID ||
+820: 		plan.ImpactLink["relation"] != "DERIVED_FROM" ||
+821: 		plan.Event["event_type"] != "RUN_CHANGED" ||
+822: 		plan.Event["correlation_id"] != plan.OperationID ||
+823: 		plan.OutcomeHash == "" || len(plan.ProofBytes) > 64<<10 {
+824: 		return qualificationDenialUnavailable("historical planned write set invalid")
+825: 	}
+826: 	expiresAt, err := time.Parse(time.RFC3339Nano, plan.ExpiresAt)
+827: 	if err != nil || !expiresAt.After(time.Now()) {
+828: 		return qualificationDenialUnavailable("historical planned upload expired")
+829: 	}
+830: 	var used int
+831: 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.content_hash')=?`,
+832: 		plan.Subject.ProjectID, plan.Artifact["content_hash"]).Scan(&used); err != nil || used != 0 {
+833: 		return qualificationDenialUnavailable("historical proof content reused")
+834: 	}
+835: 	if _, err := tx.ExecContext(ctx, `INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,?,?,?,?,?,0)`,
+836: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID, plan.ProofBytes, Digest(plan.ProofBytes), plan.ExpiresAt); err != nil {
+837: 		return err
+838: 	}
+839: 	if err := s.put(tx, "Artifact", plan.Artifact); err != nil {
+840: 		return err
+841: 	}
+842: 	result, err := tx.ExecContext(ctx, `UPDATE uploaded_content SET sealed=1 WHERE storage_key=? AND project=? AND principal=? AND sealed=0`,
+843: 		plan.UploadKey, plan.Subject.ProjectID, plan.AuthorID)
+844: 	if err != nil {
+845: 		return err
+846: 	}
+847: 	if n, err := result.RowsAffected(); err != nil || n != 1 {
+848: 		return qualificationDenialUnavailable("historical upload seal CAS failed")
+849: 	}
+850: 	if err := s.put(tx, "ImpactLink", plan.ImpactLink); err != nil {
+851: 		return err
+852: 	}
+853: 	if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)`,
+854: 		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch,
+855: 		Hash(plan.Observation), string(Bytes(plan.Observation)), plan.ObservedAt); err != nil {
+856: 		return err
+857: 	}
+858: 	result, err = tx.ExecContext(ctx, `UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,reason=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state=? AND observation_sequence=? AND dispatch_key=? AND manifest_hash=?`,
+859: 		plan.DispatchSequence, Hash(plan.Observation), "historical qualification first-gate TOOL reconstruction "+plan.OperationID,
+860: 		plan.ObservedAt, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch,
+861: 		plan.BeforeDispatch["state"], plan.BeforeDispatch["observation_sequence"],
+862: 		plan.BeforeDispatch["dispatch_key"], plan.BeforeDispatch["manifest_hash"])
+863: 	if err != nil {
+864: 		return err
+865: 	}
+866: 	if n, err := result.RowsAffected(); err != nil || n != 1 {
+867: 		return qualificationDenialUnavailable("historical dispatch CAS failed")
+868: 	}
+869: 	if err := s.put(tx, "Run", plan.Run); err != nil {
+870: 		return err
+871: 	}
+872: 	if err := s.put(tx, "ProjectState", plan.ProjectState); err != nil {
+873: 		return err
+874: 	}
+875: 	if err := s.put(tx, "EventEnvelope", plan.Event); err != nil {
+876: 		return err
+877: 	}
+878: 	if _, err := tx.ExecContext(ctx, `INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)`,
+879: 		plan.Subject.ProjectID, plan.EventSequence, plan.Event["id"], string(Bytes(plan.Event))); err != nil {
+880: 		return err
+881: 	}
+882: 	if _, err := tx.ExecContext(ctx, `INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)`,
+883: 		plan.Subject.ProjectID, plan.Event["id"], plan.ProjectState["revision"], string(Bytes(plan.ProjectState))); err != nil {
+884: 		return err
+885: 	}
+886: 	marker := historicalMaintenanceMarker(plan, planFileSHA256)
+887: 	if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-failure-maintenance',?,?,200,?,'{}',?)`,
+888: 		plan.AuthorID, plan.Subject.ProjectID, plan.OperationID, planFileSHA256,
+889: 		string(Bytes(marker)), plan.ObservedAt); err != nil {
+890: 		return err
+891: 	}
+892: 	return nil
+893: }
+894: 
+895: func (s *Service) validatedHistoricalQualificationFailureTx(tx *sql.Tx,
+896: 	plan HistoricalQualificationPlan, verified verifiedHistoricalQualification,
+897: 	hold *historicalQualificationHold) (historicalQualificationClosure, error) {
+898: 	var zero historicalQualificationClosure
+899: 	if tx == nil || hold == nil || verified.subject != plan.Subject ||
+900: 		verified.author.ID != plan.AuthorID || verified.ownerRoot != plan.OwnerRoot ||
+901: 		Hash(verified.run) != Hash(plan.BeforeRun) || Hash(verified.state) != Hash(plan.BeforeState) ||
+902: 		Hash(verified.dispatch) != Hash(plan.BeforeDispatch) ||
+903: 		verified.native.bridgeHash != plan.Source.BridgeSHA256 ||
+904: 		plan.Proof["kind"] != historicalMaintenanceProofKind ||
+905: 		plan.Proof["claim"] != "HOST_TOOL_EFFECT_NOT_DISPATCHED" ||
+906: 		plan.Proof["native_class"] != historicalMaintenanceNativeClass ||
+907: 		plan.Proof["plan_hash"] != plan.coreHash() ||
+908: 		plan.Proof["owner_root"] != plan.OwnerRoot ||
+909: 		plan.Proof["author"] != plan.AuthorID ||
+910: 		plan.Proof["model_binding"] == nil ||
+911: 		Hash(plan.Proof["model_binding"]) != Hash(verified.modelBinding) {
+912: 		return zero, qualificationDenialUnavailable("historical private consumer mismatch")
+913: 	}
+914: 	closure := historicalQualificationClosure{proof: plan.Proof, hold: hold}
+915: 	if err := closure.Check(); err != nil {
+916: 		return zero, err
+917: 	}
+918: 	return closure, nil
+919: }
+920: 
+921: // ApplyHistoricalQualification consumes only a validated full plan and its
+922: // exact external file digest. Native evidence stays held through the actual
+923: // Commit/Rollback return, including a failed Commit and every early error.
+924: func ApplyHistoricalQualification(ctx context.Context, db *sql.DB, contractsDir string,
+925: 	plan HistoricalQualificationPlan, planFileSHA256 string,
+926: 	boundary *recoveryboundary.CurrentQuiescence, lease *rt.DataRootLease) (marker Object, retErr error) {
+927: 	if db == nil || !filepath.IsAbs(contractsDir) || planFileSHA256 == "" ||
+928: 		plan.Schema != "researchos.qualification-failure-maintenance-full-plan.v1" ||
+929: 		plan.Database != filepath.Join(plan.DataRoot, "researchos.sqlite") ||
+930: 		boundary == nil || lease == nil {
+931: 		return nil, qualificationDenialUnavailable("historical commit input invalid")
+932: 	}
+933: 	if err := boundary.Check(ctx, lease, plan.DataRoot, plan.Database, plan.OperationID, plan.BoundaryPlanSHA256); err != nil {
+934: 		return nil, err
+935: 	}
+936: 	contracts, err := LoadContracts(contractsDir)
+937: 	if err != nil {
+938: 		return nil, err
+939: 	}
+940: 	s := &Service{DB: db, Contracts: contracts}
+941: 	native, hold, err := holdHistoricalQualificationNative(plan.DispatchDirectory,
+942: 		Str(plan.BeforeDispatch, "manifest_hash"), "", plan.SID, plan.Source)
+943: 	if err != nil {
+944: 		return nil, err
+945: 	}
+946: 	// Keep cancellation from starting database/sql's asynchronous Tx rollback;
+947: 	// the deferred synchronous Rollback must return before Close releases the
+948: 	// original native evidence. All statements and the final gate use ctx.
+949: 	tx, err := db.BeginTx(context.WithoutCancel(ctx), nil)
+950: 	if err != nil {
+951: 		return nil, errors.Join(err, hold.Close())
+952: 	}
+953: 	txFinished := false
+954: 	var closure historicalQualificationClosure
+955: 	defer func() {
+956: 		retErr = errors.Join(retErr, finishHistoricalQualificationTx(tx, txFinished, hold))
+957: 	}()
+958: 	if err := resourceWriteLock(tx); err != nil {
+959: 		return nil, err
+960: 	}
+961: 	before, err := store.QualificationMaintenanceCensus(ctx, tx)
+962: 	if err != nil {
+963: 		return nil, err
+964: 	}
+965: 	if Hash(before) != Hash(plan.BeforeCensus) {
+966: 		return nil, qualificationDenialUnavailable("historical before census drift")
+967: 	}
+968: 	verified, err := s.verifyHistoricalQualificationTx(ctx, tx, plan.Subject, plan.Source,
+969: 		plan.AuthorID, plan.DispatchDirectory, plan.SID, native)
+970: 	if err != nil {
+971: 		return nil, err
+972: 	}
+973: 	rebuilt, err := s.buildHistoricalQualificationPlan(ctx, tx, verified, plan.OperationID, plan.BoundaryPlanSHA256,
+974: 		plan.DataRoot, plan.Database, plan.DispatchDirectory, plan.SID, before, &plan)
+975: 	if err != nil || Hash(rebuilt) != Hash(plan) {
+976: 		return nil, qualificationDenialUnavailable("historical full plan drift")
+977: 	}
+978: 	closure, err = s.validatedHistoricalQualificationFailureTx(tx, plan, verified, hold)
+979: 	if err != nil {
+980: 		return nil, err
+981: 	}
+982: 	if err := s.applyHistoricalQualificationTx(ctx, tx, plan, planFileSHA256); err != nil {
+983: 		return nil, err
+984: 	}
+985: 	if err := closure.Check(); err != nil {
+986: 		return nil, err
+987: 	}
+988: 	if err := boundary.Check(ctx, lease, plan.DataRoot, plan.Database, plan.OperationID, plan.BoundaryPlanSHA256); err != nil {
+989: 		return nil, err
+990: 	}
+991: 	if err := ctx.Err(); err != nil {
+992: 		return nil, err
+993: 	}
+994: 	if err := tx.Commit(); err != nil {
+995: 		return nil, err
+996: 	}
+997: 	txFinished = true
+998: 	return historicalMaintenanceMarker(plan, planFileSHA256), nil
+999: }
+1000: 
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1328: func ClassifyHistoricalQualification(ctx context.Context, db *sql.DB, plan HistoricalQualificationPlan, planFileSHA256 string) (_ string, retErr error) {
+1329: 	if db == nil || plan.Schema != "researchos.qualification-failure-maintenance-full-plan.v1" || planFileSHA256 == "" {
+1330: 		return "", errors.New("qualification classifier plan invalid")
+1331: 	}
+1332: 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+1333: 	if err != nil {
+1334: 		return "", err
+1335: 	}
+1336: 	defer func() { retErr = errors.Join(retErr, tx.Rollback()) }()
+1337: 	full, err := store.QualificationMaintenanceCensus(ctx, tx)
+1338: 	if err != nil {
+1339: 		return "", err
+1340: 	}
+1341: 	var count int
+1342: 	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-failure-maintenance' AND key=?`,
+1343: 		plan.AuthorID, plan.Subject.ProjectID, plan.OperationID).Scan(&count)
+1344: 	if err != nil {
+1345: 		return "", err
+1346: 	}
+1347: 	if Hash(full) == Hash(plan.BeforeCensus) && count == 0 {
+1348: 		return "NOT_APPLIED", nil
+1349: 	}
+1350: 	if count != 1 || full.SchemaSHA256 != plan.BeforeCensus.SchemaSHA256 {
+1351: 		return "UNKNOWN", nil
+1352: 	}
+1353: 	protected, err := store.QualificationMaintenanceProtectedCensus(ctx, tx)
+1354: 	if err != nil {
+1355: 		return "", err
+1356: 	}
+1357: 	selectors, err := plan.residualSelectors()
+1358: 	if err != nil {
+1359: 		return "", err
+1360: 	}
+1361: 	residual, err := store.QualificationMaintenanceResidualCensus(ctx, tx, selectors)
+1362: 	if err != nil {
+1363: 		return "", err
+1364: 	}
+1365: 	if protected != plan.BeforeProtectedSHA256 || residual != plan.BeforeResidualSHA256 {
+1366: 		return "UNKNOWN", nil
+1367: 	}
+1368: 	exact, err := historicalQualificationExactRows(ctx, tx, plan, planFileSHA256)
+1369: 	if err != nil {
+1370: 		return "", err
+1371: 	}
+1372: 	if !exact {
+1373: 		return "UNKNOWN", nil
+1374: 	}
+1375: 	return "APPLIED", nil
+1376: }
+1377: 
+1378: func (s *Service) verifyHistoricalQualificationTx(ctx context.Context, tx *sql.Tx,
+1379: 	subject HistoricalQualificationSubject, source HistoricalQualificationSource,
+1380: 	authorID, directory, sid string, native historicalQualificationNative) (verifiedHistoricalQualification, error) {
+1381: 	var out verifiedHistoricalQualification
+1382: 	deny := func(reason string) (verifiedHistoricalQualification, error) {
+1383: 		return out, qualificationDenialUnavailable("historical " + reason)
+1384: 	}
+1385: 	if tx == nil || subject.ProjectID == "" || subject.TaskID == "" || subject.RunID == "" ||
+1386: 		subject.RuntimeID == "" || subject.DispatchKey == "" || subject.Epoch != 1 ||
+1387: 		source.BridgeSHA256 == "" || source.SourceCommit == "" || source.CoreSHA256 == "" ||
+1388: 		source.WorkerSHA256 == "" || source.BuildSHA256 == "" || source.PID == 0 ||
+1389: 		source.Created <= 0 || source.Job == "" || authorID == "" || sid == "" {
+1390: 		return deny("exact subject/source binding missing")
+1391: 	}
+1392: 	j := native.journal
+1393: 	f1, f2, f3 := native.frames[0], native.frames[1], native.frames[2]
+1394: 	if native.bridgeHash != source.BridgeSHA256 || native.stdoutHash != j.StdoutHash || native.stderrHash != j.StderrHash ||
+1395: 		j.DispatchKey != subject.DispatchKey || j.Identity.PID != source.PID || j.Identity.Created != source.Created ||
+1396: 		j.Identity.Job != source.Job || j.Receipt.PID != source.PID || j.Receipt.Created != source.Created ||
+1397: 		j.Receipt.Job != source.Job || j.Receipt.SID != j.Identity.SID || j.Receipt.Profile != j.Identity.Profile ||
+1398: 		j.Identity.SID == "" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete ||
+1399: 		!j.Receipt.OutputCopied || j.Receipt.ExitCode != 124 || !j.Receipt.TimedOut ||
+1400: 		j.Receipt.JobProcesses != 2 || j.Frames != 3 || j.Acknowledged != 2 ||
+1401: 		j.QueueRequired || j.QueueInitSequence != 0 || len(j.CommandReceipts) != 0 ||
+1402: 		j.Checkpoint != nil || j.CheckpointSequence != 0 || j.Paused || j.ProtocolComplete ||
+1403: 		(j.State != "FAILED" && j.State != "UNKNOWN") || j.Reason != "qualification first dispatch gate denied TOOL" ||
+1404: 		f1.Sequence != 1 || f1.Type != "context.ready" || f2.Sequence != 2 || f2.Capability != "MODEL" ||
+1405: 		f3.Sequence != 3 || f3.Capability != "TOOL" || f2.Key == "" || f3.Key == "" ||
+1406: 		f2.Key == f3.Key || f2.Route == "" || f3.Route != f2.Route {
+1407: 		return deny("raw native Job accounting/three-frame source differs")
+1408: 	}
+1409: 	if filepath.Clean(directory) != directory || filepath.Base(directory) != subject.DispatchKey ||
+1410: 		filepath.Base(filepath.Dir(directory)) != "runtime-dispatches" {
+1411: 		return deny("dispatch directory identity differs")
+1412: 	}
+1413: 	run, err := load(tx, subject.ProjectID, "Run", subject.RunID)
+1414: 	if err != nil {
+1415: 		return out, err
+1416: 	}
+1417: 	task, err := load(tx, subject.ProjectID, "Task", subject.TaskID)
+1418: 	if err != nil {
+1419: 		return out, err
+1420: 	}
+1421: 	state, err := singleton(tx, subject.ProjectID, "ProjectState")
+1422: 	if err != nil {
+1423: 		return out, err
+1424: 	}
+1425: 	dispatch, err := runtimeDispatch(tx, subject.ProjectID, subject.RunID, subject.Epoch)
+1426: 	if err != nil {
+1427: 		return out, err
+1428: 	}
+1429: 	manifest, manifestOK := dispatch["manifest"].(map[string]any)
+1430: 	admission, admissionOK := manifest["admission"].(map[string]any)
+1431: 	profile, profileOK := admission["profile"].(map[string]any)
+1432: 	modelConfig, configOK := profile["model_config"].(map[string]any)
+1433: 	if !manifestOK || !admissionOK || !profileOK || !configOK || run["status"] != "RUNNING" ||
+1434: 		run["task_id"] != subject.TaskID || run["runtime_id"] != subject.RuntimeID ||
+1435: 		Hash(run["lease_epoch"]) != Hash(subject.Epoch) || run["checkpoint_artifact_id"] != nil ||
+1436: 		task["task_type"] != "runtime_qualification" || task["active_run_id"] != subject.RunID ||
+1437: 		dispatch["state"] != "STARTED" && dispatch["state"] != "UNKNOWN" ||
+1438: 		dispatch["dispatch_key"] != subject.DispatchKey || dispatch["journal_locator"] != subject.DispatchKey ||
+1439: 		dispatch["manifest_hash"] != j.ManifestHash || dispatch["worker"] != j.Worker ||
+1440: 		Hash(dispatch["identity"]) != Hash(runtimeNativeIdentity(j.Identity)) ||
+1441: 		admission["qualification_bootstrap"] != true || admission["mode"] != "LIVE" ||
+1442: 		profile["build_hash"] != source.WorkerSHA256 || profile["bundle_hash"] != source.BundleSHA256 ||
+1443: 		Hash(admission["profile_ref"]) != admission["profile_hash"] ||
+1444: 		f2.Route != Str(modelConfig, "route") || len(Arr(run, "result_artifact_ids")) != 0 || len(j.Artifacts) != 0 {
+1445: 		return deny("current Run/Task/dispatch/profile differs")
+1446: 	}
+1447: 	plan, planHash, ownerRoot, err := qualificationPlan(tx, subject.ProjectID, subject.TaskID, subject.RuntimeID)
+1448: 	if err != nil || plan["task_hash"] != qualificationTaskHash(task) ||
+1449: 		Hash(plan["profile_ref"]) != admission["profile_hash"] ||
+1450: 		Hash(plan["model_qualification"]) != Hash(profile["model_qualification"]) ||
+1451: 		runtimeTechnicalHashMust(tx, subject.ProjectID, subject.RuntimeID) != admission["technical_hash"] {
+1452: 		return deny("original qualification plan differs")
+1453: 	}
+1454: 	var markerCount int
+1455: 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND profile_hash=? AND owner_root=?`,
+1456: 		subject.ProjectID, subject.TaskID, subject.RunID, subject.RuntimeID, subject.Epoch, planHash, admission["profile_hash"], ownerRoot).Scan(&markerCount); err != nil || markerCount != 1 {
+1457: 		return deny("original qualification marker differs")
+1458: 	}
+1459: 	author, err := clientAuthenticatedPrincipal(ctx, tx, authorID)
+1460: 	if err != nil || !author.HasRole("OWNER") || !author.Allowed(subject.ProjectID, "", "", false) ||
+1461: 		author.ID != ownerRoot {
+1462: 		return deny("current Owner authority differs")
+1463: 	}
+1464: 	currentRoot, err := currentAuthorityRoot(tx, author.ID)
+1465: 	if err != nil || currentRoot != ownerRoot {
+1466: 		return deny("current Owner root differs")
+1467: 	}
+1468: 	profileRef, refOK := admission["profile_ref"].(map[string]any)
+1469: 	if !refOK {
+1470: 		return deny("profile reference missing")
+1471: 	}
+1472: 	ref, err := version(tx, subject.ProjectID, Object(profileRef))
+1473: 	if err != nil || ref["access_class"] != "PROJECT" || ref["validity"] != "CURRENT" ||
+1474: 		ref["sealed_at"] == nil || s.effective(tx, subject.ProjectID, Object(profileRef)) != nil {
+1475: 		return deny("profile not effective")
+1476: 	}
+1477: 	var effects, rejected, unknown int
+1478: 	if err := tx.QueryRowContext(ctx, `SELECT count(DISTINCT effect_key),coalesce(sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN json_extract(body,'$.state') IN ('UNKNOWN','NOT_APPLIED') THEN 1 ELSE 0 END),0) FROM resource_effects WHERE project=? AND run=?`,
+1479: 		f3.Key, subject.ProjectID, subject.RunID).Scan(&effects, &rejected, &unknown); err != nil || effects != 1 || rejected != 0 || unknown != 0 {
+1480: 		return deny("effect census differs from sole MODEL")
+1481: 	}
+1482: 	effect, err := latestEffect(tx, subject.ProjectID, subject.RunID, f2.Key)
+1483: 	if err != nil {
+1484: 		return out, err
+1485: 	}
+1486: 	request, _ := effect["payload"].(map[string]any)
+1487: 	modelPayload, payloadErr := Decode(f2.Payload)
+1488: 	if payloadErr != nil || effect["state"] != "CONFIRMED" || request["capability"] != "MODEL" ||
+1489: 		request["route"] != f2.Route || Hash(request["payload"]) != Hash(modelPayload) ||
+1490: 		effect["receipt"] == nil || effect["key"] != f2.Key ||
+1491: 		(effect["epoch"] != nil && Hash(effect["epoch"]) != Hash(subject.Epoch)) {
+1492: 		return deny("MODEL request/receipt differs")
+1493: 	}
+1494: 	modelBinding, err := qualificationModelBindingTx(tx, subject.ProjectID, subject.RunID, subject.Epoch,
+1495: 		dispatch, directory, f2.Key, f2.Route, Hash(modelPayload))
+1496: 	if err != nil || modelBinding["fact_hash"] != native.modelHash {
+1497: 		return deny("MODEL fact source differs")
+1498: 	}
+1499: 	var ledgerRows int
+1500: 	var ledgerRaw string
+1501: 	if err := tx.QueryRowContext(ctx, `SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`,
+1502: 		subject.ProjectID, subject.RunID).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+1503: 		return deny("monetary ledger census differs")
+1504: 	}
+1505: 	ledger, err := Decode([]byte(ledgerRaw))
+1506: 	if err != nil || ledger["provider_request_id"] != f2.Key || ledger["id"] != modelBinding["reservation_id"] ||
+1507: 		ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["cost_basis"] != "UNKNOWN" {
+1508: 		return deny("UNKNOWN money must remain UNKNOWN")
+1509: 	}
+1510: 	var queueFenceCount int
+1511: 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=?`,
+1512: 		subject.ProjectID, subject.RunID).Scan(&queueFenceCount); err != nil || queueFenceCount != 0 {
+1513: 		return deny("client queue fence remains")
+1514: 	}
+1515: 	for _, query := range []string{

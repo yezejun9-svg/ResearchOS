@@ -1,0 +1,323 @@
+D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_model_windows.go:53:func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_model_windows.go:156:		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_model_windows.go:176:	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-failure-b-r2-20261015/internal/domain/runtime_model_windows.go:177:	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+SEARCH_NATIVE_EXIT 2
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"bytes"
+7: 	"context"
+8: 	"errors"
+9: 	"io"
+10: 	"net/http"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"strings"
+14: 	"time"
+15: 
+16: 	rt "researchos.local/research-os/adapters/runtime"
+17: 	"researchos.local/research-os/internal/runtimepolicy"
+18: )
+19: 
+20: func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs map[string][]byte) error {
+21: 	manifest := dispatch["manifest"].(map[string]any)
+22: 	profile := manifest["admission"].(map[string]any)["profile"].(map[string]any)
+23: 	if profile["backend"] != runtimeMuBackend {
+24: 		return nil
+25: 	}
+26: 	if e := validateRuntimeModelConfig(profile); e != nil {
+27: 		return e
+28: 	}
+29: 	effective, e := runtimepolicy.Effective(manifest, "")
+30: 	if e != nil {
+31: 		return e
+32: 	}
+33: 	if !filepath.IsAbs(route.BundleFile) {
+34: 		return errors.New("host Mu bundle binding required")
+35: 	}
+36: 	actual, e := filepath.EvalSymlinks(route.BundleFile)
+37: 	if e != nil || !strings.EqualFold(actual, filepath.Clean(route.BundleFile)) {
+38: 		return errors.New("Mu bundle reparse rejected")
+39: 	}
+40: 	info, e := os.Stat(actual)
+41: 	if e != nil || !info.Mode().IsRegular() || info.Size() > 32*1024*1024 {
+42: 		return errors.New("bounded Mu bundle required")
+43: 	}
+44: 	raw, e := os.ReadFile(actual)
+45: 	if e != nil || Digest(raw) != profile["bundle_hash"] {
+46: 		return errors.New("Mu bundle differs from frozen profile")
+47: 	}
+48: 	inputs["mu-worker.mjs"] = raw
+49: 	inputs["worker.json"] = Bytes(effective)
+50: 	return nil
+51: }
+52: 
+53: func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+54: 	manifest := dispatch["manifest"].(map[string]any)
+55: 	effective, e := runtimepolicy.Effective(manifest, provider.Purpose)
+56: 	if e != nil {
+57: 		return nil, e
+58: 	}
+59: 	body, e := validateRuntimeModelRequest(effective, payload)
+60: 	if e != nil {
+61: 		return nil, e
+62: 	}
+63: 	var stream *rt.ModelStream
+64: 	unknown := func(reason string) (Object, error) {
+65: 		if stream != nil {
+66: 			stop, cancel := context.WithTimeout(context.Background(), time.Second)
+67: 			stream.Fail(stop)
+68: 			cancel()
+69: 		}
+70: 		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {
+71: 			return nil, e
+72: 		}
+73: 		return nil, Fail(409, "STATE_CONFLICT", "model outcome UNKNOWN; automatic retry prohibited")
+74: 	}
+75: 	notDispatched := func() (Object, error) {
+76: 		// Credential resolution failed before HTTP request construction. This is a
+77: 		// known absent provider operation, unlike a transport failure after send.
+78: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
+79: 	}
+80: 	if provider.MeasurementMode == "LIVE" && clientConfigurationLoopbackModelEndpoint(provider.Endpoint) && (provider.CredentialRef != "" || provider.CredentialRevision != "none" || provider.BearerToken != "") {
+81: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "local model route contains credential material; no provider request was sent")
+82: 	}
+83: 	if provider.CredentialRef != "" {
+84: 		if c.config.ModelCredential == nil {
+85: 			return notDispatched()
+86: 		}
+87: 		material, err := c.config.ModelCredential(ctx, provider)
+88: 		if err != nil || len(material) == 0 {
+89: 			return notDispatched()
+90: 		}
+91: 		provider.BearerToken = string(material)
+92: 		for i := range material {
+93: 			material[i] = 0
+94: 		}
+95: 	}
+96: 	req, e := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint, bytes.NewReader(Bytes(body)))
+97: 	if e != nil {
+98: 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "model request construction failed before dispatch")
+99: 	}
+100: 	req.Header.Set("Content-Type", "application/json")
+101: 	req.Header.Set("Accept", "text/event-stream")
+102: 	if provider.BearerToken != "" {
+103: 		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+104: 	}
+105: 	client := &http.Client{Timeout: 90 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("model redirect prohibited") }}
+106: 	defer client.CloseIdleConnections()
+107: 	response, e := client.Do(req)
+108: 	if e != nil {
+109: 		return unknown("model transport ended without complete response")
+110: 	}
+111: 	defer response.Body.Close()
+112: 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+113: 		return unknown("model returned invalid SSE headers")
+114: 	}
+115: 	var raw, withheld []byte
+116: 	if bridge.Read().QueueRequired {
+117: 		binding, err := c.modelStreamBinding(ctx, route, runID, lease, epoch, bridge, frame, intent)
+118: 		if err != nil {
+119: 			return unknown("model stream initialization authority unavailable")
+120: 		}
+121: 		stream, err = bridge.OpenModelStream(ctx, binding)
+122: 		if err != nil {
+123: 			return unknown("model stream could not open")
+124: 		}
+125: 		quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken)
+126: 		if err != nil {
+127: 			return unknown("model quarantine unavailable")
+128: 		}
+129: 		chunk := make([]byte, 8192)
+130: 		for {
+131: 			n, readErr := response.Body.Read(chunk)
+132: 			if n > 0 {
+133: 				released, gateErr := quarantine.Feed(chunk[:n])
+134: 				if gateErr != nil {
+135: 					return unknown("model response rejected by quarantine")
+136: 				}
+137: 				if len(released) > 0 {
+138: 					if err = stream.Send(ctx, released, false); err != nil {
+139: 						return unknown("model stream transport failed")
+140: 					}
+141: 				}
+142: 			}
+143: 			if readErr == io.EOF {
+144: 				break
+145: 			}
+146: 			if readErr != nil {
+147: 				return unknown("model transport interrupted")
+148: 			}
+149: 		}
+150: 		raw, withheld, err = quarantine.Finish()
+151: 		if err != nil {
+152: 			return unknown("model returned no complete bounded SSE response")
+153: 		}
+154: 	} else {
+155: 		raw, e = io.ReadAll(io.LimitReader(response.Body, runtimeModelMaxSSEBytes+1))
+156: 		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+157: 			return unknown("model returned no complete bounded SSE response")
+158: 		}
+159: 		for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+160: 			if secret != "" && bytes.Contains(raw, []byte(secret)) {
+161: 				return unknown("model response contained host credential material")
+162: 			}
+163: 		}
+164: 	}
+165: 	result := Object{"status": response.StatusCode, "content_type": "text/event-stream", "body": string(raw)}
+166: 	// A received response proves the operation completed, not what it cost.
+167: 	// Retain the original upper-bound reservation until a real billing fact arrives.
+168: 	receipt := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": result}
+169: 	var reply Object
+170: 	if stream == nil {
+171: 		reply, e = runtimeEffectWireReply(frame, receipt)
+172: 	}
+173: 	if e != nil {
+174: 		return unknown("encoded model response exceeds bridge frame limit")
+175: 	}
+176: 	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+177: 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+178: 		return unknown("model response persistence failed")
+179: 	}
+180: 	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+181: 		return nil, e
+182: 	}
+183: 	// Late responses may update billing/effect facts, but never regain execution authority.
+184: 	tx, _, _, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+185: 	if e != nil {
+186: 		return nil, e
+187: 	}
+188: 	tx.Rollback()
+189: 	if stream != nil {
+190: 		if e = stream.Send(ctx, withheld, true); e != nil {
+191: 			return nil, e
+192: 		}
+193: 		summary, err := stream.Terminal(ctx, Digest(raw))
+194: 		if err != nil {
+195: 			return nil, err
+196: 		}
+197: 		reply = Object{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": summary}
+198: 	}
+199: 	return reply, nil
+200: }
+adapters/runtime/qualification_failure_proof_windows.go
+adapters/runtime/qualification_failure_proof_windows_test.go
+internal/domain/runtime_command_queue_windows_test.go
+internal/domain/runtime_qualification_failure_windows.go
+internal/domain/runtime_qualification_failure_windows_test.go
+adapters/runtime/bridge_windows.go
+adapters/runtime/qualification_failure_proof_windows.go
+adapters/runtime/qualification_failure_proof_windows_test.go
+internal/domain/runtime_broker_windows.go
+internal/domain/runtime_command_queue_windows.go
+internal/domain/runtime_command_queue_windows_test.go
+internal/domain/runtime_coordinator_windows.go
+internal/domain/runtime_qualification_failure_windows.go
+internal/domain/runtime_qualification_failure_windows_test.go
+[
+  {
+    "Algorithm": "SHA256",
+    "Hash": "D3CCDB604EAFA6031133AEFE1A3DB24F0BB7362B857BC2125AC4E4C178B4B490",
+    "Path": "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\bin\\go.exe"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "2A8E70132A914AFFC6122C1F1DB29CFA315B655C93D4200145852EBBC853D441",
+    "Path": "D:\\作品集\\ResearchOS\\research-os\\.local\\w0599-main-stream-integration-r268\\mu-worker.mjs"
+  }
+]
+[
+  {
+    "id": "B-r2-review-006",
+    "nativeExit": 0,
+    "testPass": 45,
+    "testFail": 0,
+    "testSkip": 0,
+    "failedTests": [],
+    "packageResults": [
+      {
+        "Package": "researchos.local/research-os/adapters/runtime",
+        "Action": "pass",
+        "Elapsed": 1.316
+      }
+    ]
+  },
+  {
+    "id": "B-r2-review-008",
+    "nativeExit": 0,
+    "testPass": 90,
+    "testFail": 0,
+    "testSkip": 0,
+    "failedTests": [],
+    "packageResults": [
+      {
+        "Package": "researchos.local/research-os/internal/domain",
+        "Action": "pass",
+        "Elapsed": 118.099
+      }
+    ]
+  },
+  {
+    "id": "B-r2-review-009",
+    "nativeExit": 0,
+    "testPass": 5,
+    "testFail": 0,
+    "testSkip": 0,
+    "failedTests": [],
+    "packageResults": [
+      {
+        "Package": "researchos.local/research-os/internal/domain",
+        "Action": "pass",
+        "Elapsed": 23.267
+      }
+    ]
+  },
+  {
+    "id": "B-r2-review-014",
+    "nativeExit": 1,
+    "testPass": 14,
+    "testFail": 7,
+    "testSkip": 0,
+    "failedTests": [
+      "TestIndependentB2NativeACLAndIdentityContinuity/native_locks_across_read_write_flush",
+      "TestIndependentB2NativeACLAndIdentityContinuity",
+      "TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation/raw_stdout.raw",
+      "TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation/raw_stderr.raw",
+      "TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation/raw_bridge.json",
+      "TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation/raw_qualification-rejection-00000000000000000003.json",
+      "TestIndependentB2ClosureFullCensusReplayAndNativeRevalidation"
+    ],
+    "packageResults": [
+      {
+        "Package": "researchos.local/research-os/adapters/runtime",
+        "Action": "fail",
+        "Elapsed": 0.665
+      },
+      {
+        "Package": "researchos.local/research-os/internal/domain",
+        "Action": "fail",
+        "Elapsed": 5.006
+      }
+    ]
+  },
+  {
+    "id": "B-r2-review-016",
+    "nativeExit": 1,
+    "testPass": 1,
+    "testFail": 1,
+    "testSkip": 0,
+    "failedTests": [
+      "TestIndependentB2GuardNamespaceSwap"
+    ],
+    "packageResults": [
+      {
+        "Package": "researchos.local/research-os/adapters/runtime",
+        "Action": "fail",
+        "Elapsed": 0.758
+      }
+    ]
+  }
+]

@@ -1,0 +1,258 @@
+FILE adapters/runtime/bridge_windows.go EXIT 0
+210: 	if e != nil || !info.Mode().IsRegular() || info.Size() > 128*1024*1024 {
+211: 		return nil, errors.New("bounded regular executable required")
+212: 	}
+213: 	binary, e := os.ReadFile(actual)
+214: 	if e != nil {
+215: 		return nil, e
+216: 	}
+217: 	if Hash(binary) != profile["build_hash"] {
+218: 		return nil, errors.New("executable differs from frozen build")
+219: 	}
+220: 	if e = os.Mkdir(directory, 0700); e != nil {
+221: 		return nil, e
+222: 	} // Never reuses a dispatch directory.
+223: 	if _, e = PrivateDirectory(directory); e != nil {
+224: 		return nil, e
+225: 	}
+226: 	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+227: 	if e != nil {
+228: 		return nil, e
+229: 	}
+230: 	child, cancel := context.WithCancel(ctx)
+231: 	w := &Bridge{directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}, modelObservations: make(chan ModelStreamObservation, ModelStreamWindow), modelChanged: make(chan struct{})}
+232: 	w.journal = BridgeJournal{Version: 1, Manifest: append(json.RawMessage(nil), request.Manifest...), ManifestHash: digest, DispatchKey: bridgeString(manifest, "dispatch_key"), Worker: request.WorkerID, Revision: BridgeRevision, State: "PREPARED", Started: now(), Artifacts: []Artifact{}, InputHash: Hash(request.Inputs["request.json"])}
+233: 	inputRequest, _ := bridgeMap(request.Inputs["request.json"])
+234: 	w.journal.QueueRequired = inputRequest["queue_control"] == true
+235: 	w.journal.QueueBinding, _ = json.Marshal(inputRequest["queue_binding"])
+236: 	if inputRequest["pause_protocol"] == PauseProtocol {
+237: 		w.journal.PauseProtocol = PauseProtocol
+238: 	}
+239: 	failed := true
+240: 	defer func() {
+241: 		if failed {
+242: 			cancel()
+243: 			lock.Close()
+244: 			if w.stdout != nil {
+245: 				w.stdout.Close()
+246: 			}
+247: 			if w.stderr != nil {
+248: 				w.stderr.Close()
+249: 			}
+250: 		}
+370: 		}
+371: 		var frame BridgeFrame
+372: 		if _, e := canonical.JSON(line); e != nil {
+373: 			return errors.New("invalid canonical JSON protocol line")
+374: 		}
+375: 		shape, shapeErr := bridgeMap(line)
+376: 		if shapeErr != nil {
+377: 			return shapeErr
+378: 		}
+379: 		if _, auxiliary := shape["version"]; auxiliary {
+380: 			if err := w.consumeModelFrame(line); err != nil {
+381: 				return err
+382: 			}
+383: 			continue
+384: 		}
+385: 		decoder := json.NewDecoder(bytes.NewReader(line))
+386: 		decoder.DisallowUnknownFields()
+387: 		if e := decoder.Decode(&frame); e != nil {
+388: 			return errors.New("invalid typed protocol")
+389: 		}
+390: 		if e := decoder.Decode(new(any)); e != io.EOF {
+391: 			return errors.New("one complete JSON object per protocol line required")
+392: 		}
+393: 		if frame.Sequence != w.journal.Frames+1 || w.journal.ProtocolComplete {
+394: 			return errors.New("protocol sequence or terminal ordering invalid")
+395: 		}
+396: 		switch frame.Type {
+397: 		case "context.ready":
+398: 			payload, err := bridgeMap(frame.Payload)
+399: 			if err != nil || w.journal.ContextReady || payload["input_hash"] != w.journal.InputHash {
+400: 				return errors.New("context acknowledgement mismatch")
+401: 			}
+402: 			if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
+403: 				return errors.New("pause capability unsupported")
+404: 			}
+405: 			w.journal.ContextReady = true
+406: 		case "effect.request", "checkpoint":
+407: 			if !w.journal.ContextReady || w.journal.QueueRequired && (w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence) {
+408: 				return errors.New("context and queue initialization acknowledgement required before work")
+409: 			}
+410: 			if frame.Type == "checkpoint" {
+411: 				if err := w.capturePauseCheckpoint(frame); err != nil {
+412: 					return err
+413: 				}
+414: 				w.journal.CheckpointSequence = frame.Sequence
+415: 			}
+416: 		case "turn.paused":
+417: 			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence || w.journal.CheckpointSeal == nil {
+418: 				return errors.New("durably acknowledged checkpoint required before pause")
+419: 			}
+420: 			var paused CheckpointSeal
+421: 			if json.Unmarshal(frame.Payload, &paused) != nil || paused.Version != PauseProtocol || !samePauseBinding(paused.Binding, w.journal.Checkpoint.Binding) || paused.Sequence != w.journal.CheckpointSequence || paused.ContentHash != w.journal.Checkpoint.ContentHash || paused.PauseID != w.journal.PauseID || paused.CheckpointUsePrincipal != w.journal.CheckpointSeal.CheckpointUsePrincipal || paused.CheckpointArtifactID != w.journal.CheckpointSeal.CheckpointArtifactID || paused.CheckpointUseReceiptHash != w.journal.CheckpointSeal.CheckpointUseReceiptHash || paused.JournalCheckpointHash != w.journal.CheckpointSeal.JournalCheckpointHash {
+422: 				return errors.New("paused seal correlation mismatch")
+423: 			}
+424: 			w.journal.Paused, w.journal.ProtocolComplete = true, true
+425: 		case "turn.completed":
+426: 			if !w.journal.ContextReady || w.journal.QueueRequired && !w.journal.QueueSealed {
+427: 				return errors.New("context acknowledgement required before completion")
+428: 			}
+429: 			w.journal.ProtocolComplete = true
+430: 		case "command.accepted", "command.consumed", "command.cleared", "command.abort_observed", "command.idle", "command.sealed":
+431: 			if !w.journal.ContextReady || !w.journal.QueueRequired || len(w.journal.CommandReceipts) >= 256 {
+432: 				return errors.New("unexpected or excessive command receipt")
+433: 			}
+434: 			payload, err := bridgeMap(frame.Payload)
+435: 			if err != nil || w.validateControlBinding(payload) != nil {
+436: 				return errors.New("unbound command receipt")
+437: 			}
+438: 			if frame.Type == "command.accepted" && payload["initialized"] == true {
+439: 				if w.journal.QueueInitSequence != 0 {
+440: 					return errors.New("duplicate initialization receipt")
+441: 				}
+442: 				if w.journal.PauseProtocol != "" && payload["pause_protocol"] != PauseProtocol {
+443: 					return errors.New("pause initialization negotiation failed")
+444: 				}
+445: 				w.journal.QueueInitSequence = frame.Sequence
+446: 			} else if w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence {
+447: 				return errors.New("command receipt before initialization")
+448: 			}
+449: 			if frame.Type == "command.abort_observed" {
+450: 				w.journal.QueueAbortObserved = payload["sdk_idle"] == true && payload["sdk_queue_empty"] == true
+451: 			}
+452: 			if frame.Type == "command.idle" || frame.Type == "command.sealed" {
+453: 				if !w.journal.Cancelled && payload["cancelled"] != true {
+454: 					for _, stream := range w.modelStreams {
+455: 						if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+456: 							return errors.New("SDK idle before MODEL stream observations reconciled")
+457: 						}
+458: 					}
+459: 				}
+460: 				if payload["sdk_idle"] != true || payload["sdk_queue_empty"] != true {
+461: 					return errors.New("false SDK settlement witness")
+462: 				}
+463: 				w.journal.QueueIdle = true
+464: 				if payload["cancelled"] == true && w.journal.QueueAbortObserved {
+465: 					w.journal.QueueCancelIdle = true
+466: 				}
+467: 			}
+468: 			if frame.Type == "command.sealed" {
+469: 				w.journal.QueueSealed = true
+470: 			}
+471: 			w.journal.CommandReceipts = append(w.journal.CommandReceipts, frame)
+472: 		default:
+473: 			return errors.New("unknown protocol frame")
+474: 		}
+475: 		w.journal.Frames = frame.Sequence
+760: 	if !w.journal.Cancelled {
+761: 		for _, stream := range w.modelStreams {
+762: 			if !stream.closed || stream.failed || stream.creditedObservation != stream.observationSequence {
+763: 				return w.journal, errors.New("MODEL stream closure not reconciled")
+764: 			}
+765: 		}
+766: 	}
+767: 	if w.journal.State == "EXITED" {
+768: 		w.journal.State = "SETTLED"
+769: 	}
+770: 	if e := w.persist(); e != nil {
+771: 		return w.journal, e
+772: 	}
+773: 	return w.journal, nil
+774: }
+775: 
+776: // Observation is host-created. PID creation time is represented as decimal
+777: // text to retain all 64 bits through canonical JSON, unlike a float64 number.
+778: func (j BridgeJournal) Observation() (map[string]any, error) {
+779: 	manifest, e := bridgeMap(j.Manifest)
+780: 	if e != nil {
+781: 		return nil, e
+782: 	}
+783: 	admission, _ := manifest["admission"].(map[string]any)
+784: 	profile, _ := admission["profile"].(map[string]any)
+785: 	spec := map[string]any{"run_id": manifest["run_id"], "task_id": manifest["task_id"], "epoch": manifest["epoch"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "capabilities": []any{"start"}}
+786: 	if j.ContextReady {
+787: 		spec["capabilities"] = []any{"start", "context_rebuild"}
+788: 	}
+789: 	for _, key := range []string{"build_hash", "backend", "model", "sandbox", "platform", "adapter", "adapter_revision", "credential_revision"} {
+790: 		spec[key] = profile[key]
+791: 	}
+792: 	state := j.State
+793: 	if state == "EXITED" {
+794: 		state = "UNKNOWN"
+795: 	}
+796: 	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
+797: 		state = "CANCELLED"
+798: 	}
+799: 	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+800: }
+801: 
+802: // ReadBridgeTerminal checks the trusted directory and raw hashes. It never
+803: // creates a process, renews a lease or turns missing PID into success.
+804: func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+805: 	lock, e := lockFile(filepath.Join(directory, "owner.lock"))
+806: 	if e != nil {
+807: 		return BridgeJournal{}, errors.New("worker still owns dispatch")
+808: 	}
+809: 	defer lock.Close()
+810: 	raw, e := os.ReadFile(filepath.Join(directory, "bridge.json"))
+811: 	if e != nil {
+812: 		return BridgeJournal{}, e
+813: 	}
+814: 	var j BridgeJournal
+815: 	if e = json.Unmarshal(raw, &j); e != nil {
+816: 		return j, e
+817: 	}
+818: 	digest, e := canonicalHash(j.Manifest)
+819: 	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+820: 		return j, errors.New("recovery manifest mismatch")
+821: 	}
+822: 	if j.Identity.PID != 0 {
+823: 		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+824: 		if e != nil || alive {
+825: 			return j, errors.New("old process identity not confirmed stopped")
+826: 		}
+827: 	}
+828: 	if j.Ended == "" || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete {
+829: 		return j, errors.New("dispatch outcome UNKNOWN")
+830: 	}
+831: 	if j.State == "SETTLED" && (!j.ProtocolComplete || j.Acknowledged != j.Frames || j.Receipt.ExitCode != 0 || !j.Receipt.OutputCopied || j.Cancelled) {
+832: 		return j, errors.New("terminal protocol is not settled")
+833: 	}
+834: 	for file, digest := range map[string]string{"stdout.raw": j.StdoutHash, "stderr.raw": j.StderrHash} {
+835: 		f, e := os.Open(filepath.Join(directory, file))
+836: 		if e != nil {
+837: 			return j, e
+838: 		}
+839: 		raw, e := io.ReadAll(io.LimitReader(f, sandbox.MaxStreamBytes+1))
+840: 		f.Close()
+FILE internal/domain/resource_effects.go EXIT 128
+fatal: path 'internal/domain/resource_effects.go' does not exist in '4f4023c956f84d65743f39ce77d6c8899a21ada1'
+
+VECTOR TYPE list
+[{"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\bin\\go.exe", "bytes": 17508352, "sha256": "d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490"}, {"path": "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\src\\bufio\\bufio.go", "bytes": 22506, "sha256": "01cda8edce0b23c41fc64bb20a28c8a13cbd0a44f8535fe10555e6ba65711676"}]
+ARGV ['rg', '-n', 'func effectsReconciled|NO_EFFECT', 'internal/domain/resource_effect.go', 'internal/domain/resources.go', 'internal/domain/runtime_effect.go'] EXIT 2
+
+rg: internal/domain/resource_effect.go: 系统找不到指定的文件。 (os error 2)
+rg: internal/domain/runtime_effect.go: 系统找不到指定的文件。 (os error 2)
+
+ARGV ['rg', '-n', 'lock.Close|lock:|close\\(.*done|func .*wait|sandboxReceipt', 'adapters/runtime/bridge_windows.go'] EXIT 0
+231:	w := &Bridge{directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}, modelObservations: make(chan ModelStreamObservation, ModelStreamWindow), modelChanged: make(chan struct{})}
+243:			lock.Close()
+493:func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+494:	defer close(w.done)
+496:	defer w.lock.Close()
+809:	defer lock.Close()
+899:		lock.Close()
+904:		lock.Close()
+909:		lock.Close()
+915:			lock.Close()
+921:				lock.Close()
+941:				lock.Close()
+948:				lock.Close()
+954:				lock.Close()
+963:				lock.Close()
+968:	lock.Close()
+
+

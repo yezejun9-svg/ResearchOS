@@ -1,0 +1,865 @@
+diff --git a/internal/api/v2.go b/internal/api/v2.go
+index adf619c2..7b7ed70a 100644
+--- a/internal/api/v2.go
++++ b/internal/api/v2.go
+@@ -113,12 +113,12 @@ func coreBuildID() (string, string) {
+ 
+ func operatingMode() string { return "LOCAL_USER_HOST" }
+ 
+-// leaseTTL is host configuration, not a client parameter; unset means the writer-lease policy
+-// is unavailable and v2 stays closed rather than publishing an invented lease.
++// leaseTTL is host configuration, not a client parameter; unset uses the local
++// host's 90-second writer lease.
+ func leaseTTL() (time.Duration, error) {
+ 	raw := os.Getenv("RESEARCHOS_WRITER_LEASE_TTL")
+ 	if raw == "" {
+-		return 15 * time.Minute, nil
++		return 90 * time.Second, nil
+ 	}
+ 	d, err := time.ParseDuration(raw)
+ 	if err != nil || d <= 0 || d > 15*time.Minute {
+diff --git a/internal/api/v2_sessions_test.go b/internal/api/v2_sessions_test.go
+index f5b12f28..c67a28df 100644
+--- a/internal/api/v2_sessions_test.go
++++ b/internal/api/v2_sessions_test.go
+@@ -316,7 +316,7 @@ func TestW14SessionWriterLeaseHandoff(t *testing.T) {
+ 	take["session_id"] = snapshot["session_id"]
+ 	take["client_id"] = "client-two"
+ 	take["expected_revision"] = 1
+-	if r := f.call(t, f.token, take); r["status"] != "ACKNOWLEDGED" {
++	if r := f.call(t, f.token, take); r["status"] != "COMPLETED" || sessionResult(t, r)["write_owner_acquired"] != true || r["revision"] != float64(3) {
+ 		t.Fatal(r)
+ 	}
+ 	get := f.envelope("session.get", "lease-get", domain.Object{})
+@@ -339,6 +339,60 @@ func TestW14SessionWriterLeaseHandoff(t *testing.T) {
+ 	}
+ }
+ 
++func TestAttachHTTPRawReplayAndDefaultLease(t *testing.T) {
++	t.Setenv("RESEARCHOS_WRITER_LEASE_TTL", "")
++	f := newSessionHTTPFixture(t)
++	snapshot := f.create(t, "default-lease-create")
++	sid := snapshot["session_id"].(string)
++	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++		t.Fatal(err)
++	}
++	take := f.envelope("session.attach", "default-lease-attach", domain.Object{"after_sequence": 0, "request_write_owner": true})
++	take["session_id"], take["client_id"], take["expected_revision"] = sid, "client-two", 1
++	callRaw := func() []byte {
++		req, err := http.NewRequest("POST", f.server.URL+"/v2/command", bytes.NewReader(domain.Bytes(take)))
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Authorization", "Bearer "+f.token)
++		req.Header.Set("Content-Type", "application/json")
++		resp, err := f.server.Client().Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		raw, err := io.ReadAll(resp.Body)
++		if err != nil || resp.StatusCode != 200 {
++			t.Fatalf("HTTP attach status=%d body=%s err=%v", resp.StatusCode, raw, err)
++		}
++		return raw
++	}
++	before := time.Now().UTC()
++	first := callRaw()
++	second := callRaw()
++	if !bytes.Equal(first, second) {
++		t.Fatalf("HTTP replay bytes changed: first=%s second=%s", first, second)
++	}
++	var result domain.Object
++	if err := json.Unmarshal(first, &result); err != nil {
++		t.Fatal(err)
++	}
++	attach := sessionResult(t, result)
++	if attach["write_owner_acquired"] != true || result["revision"] != float64(3) {
++		t.Fatalf("attach result: %s", first)
++	}
++	final := attach["snapshot"].(map[string]any)
++	writer := final["writer"].(map[string]any)
++	expires, err := time.Parse(time.RFC3339Nano, writer["expires_at"].(string))
++	if err != nil || writer["client_id"] != "client-two" || writer["epoch"] != float64(2) || final["revision"] != float64(3) || final["event_sequence"] != float64(1) || expires.Before(before.Add(85*time.Second)) || expires.After(time.Now().UTC().Add(95*time.Second)) {
++		t.Fatalf("default lease or snapshot differs: %s err=%v", first, err)
++	}
++	var events int
++	if err := f.db.QueryRow(`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'`, f.project, sid).Scan(&events); err != nil || events != 1 {
++		t.Fatalf("replay duplicated handoff events=%d err=%v", events, err)
++	}
++}
++
+ // Session-list identity controls use the production API, transaction and SQLite.
+ // Only the two existing metadata/runtime ports are SYNTHETIC; no runtime starts.
+ type sessionListFixture struct {
+diff --git a/internal/api/v2_workspace_files_windows_test.go b/internal/api/v2_workspace_files_windows_test.go
+index dc7b429e..b3aa498c 100644
+--- a/internal/api/v2_workspace_files_windows_test.go
++++ b/internal/api/v2_workspace_files_windows_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	localworkspace "researchos.local/research-os/adapters/local_workspace"
+ 	"researchos.local/research-os/internal/api"
+@@ -253,15 +254,21 @@ func TestW13WorkspaceFilesRealHostHTTPReadDiffImport(t *testing.T) {
+ 	if err := f.db.QueryRow(`SELECT count(*) FROM outbox WHERE json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='ARTIFACT'`, f.session).Scan(&events); err != nil || events != 1 {
+ 		t.Fatalf("import event count=%d err=%v", events, err)
+ 	}
++	if _, err := f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), f.session); err != nil {
++		t.Fatal(err)
++	}
++	previousClient := f.client
++	f.client = "client-two"
+ 	takeover := f.command("session.attach", "renew-writer", &f.project, &f.session, revision, nil,
+ 		domain.Object{"after_sequence": 0, "request_write_owner": true})
+-	if takeover["status"] != "ACKNOWLEDGED" {
++	if takeover["status"] != "COMPLETED" {
+ 		t.Fatalf("writer epoch did not advance: %s", domain.Bytes(takeover))
+ 	}
+ 	var advancedRevision, advancedEpoch int64
+ 	if err := f.db.QueryRow("SELECT revision,writer_epoch FROM client_sessions WHERE id=?", f.session).Scan(&advancedRevision, &advancedEpoch); err != nil || advancedEpoch != 2 {
+ 		t.Fatalf("current writer epoch=%d revision=%d err=%v", advancedEpoch, advancedRevision, err)
+ 	}
++	f.client = previousClient
+ 	oldEpoch := f.command("artifact.import", "actual-old-epoch", &f.project, &f.session, advancedRevision, 1, importPayload)
+ 	if oldEpoch["error_code"] != "STALE_WRITER_EPOCH" {
+ 		t.Fatalf("old writer epoch imported file: %s", domain.Bytes(oldEpoch))
+diff --git a/internal/domain/client_protocol.go b/internal/domain/client_protocol.go
+index b88bf9cc..6737ba39 100644
+--- a/internal/domain/client_protocol.go
++++ b/internal/domain/client_protocol.go
+@@ -15,6 +15,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"math"
+ 	"sort"
+ 	"strings"
+ 	"time"
+@@ -904,6 +905,12 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
+ 		}
+ 	}
+ 	if deref(env.SessionID) != "" {
++		if *env.Method == "session.attach" && isTruePayloadAttach(env.Payload) {
++			owner, err := clientPrincipal(ctx, tx, principal, deref(env.ProjectID), true)
++			if err != nil || owner.DeviceID != "" {
++				return reject(0, nil, "FORBIDDEN", "local project Owner required for writer attach"), nil
++			}
++		}
+ 		if err := clientSessionOwner(ctx, tx, deref(env.ProjectID), deref(env.SessionID), principal); err != nil {
+ 			return reject(0, nil, "FORBIDDEN", "session belongs to another principal"), nil
+ 		}
+@@ -971,6 +978,13 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
+ 	return s.handleWrite(ctx, tx, env, principal, sess, reject)
+ }
+ 
++func isTruePayloadAttach(raw json.RawMessage) bool {
++	var p struct {
++		RequestWriteOwner bool `json:"request_write_owner"`
++	}
++	return json.Unmarshal(raw, &p) == nil && p.RequestWriteOwner
++}
++
+ func loadClientSession(ctx context.Context, tx *sql.Tx, sessionID, project string) (*clientSessionRow, error) {
+ 	row := &clientSessionRow{}
+ 	if sessionID == "" {
+@@ -1107,13 +1121,6 @@ func (s *ClientService) handleRead(ctx context.Context, tx *sql.Tx, env *Envelop
+ }
+ 
+ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow, reject func(int64, any, string, string) *Response) (*Response, error) {
+-	// ack reports the session revision *after* every write this command performed, so a
+-	// client that journals one event and a client that transfers ownership both learn the
+-	// exact revision to refresh against.
+-	ack := func(revision int64, result map[string]any) *Response {
+-		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
+-			Status: strptr("ACKNOWLEDGED"), SessionID: env.SessionID, Revision: revPtr(revision), Result: result}
+-	}
+ 	complete := func(rev int64, result map[string]any) *Response {
+ 		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
+ 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
+@@ -1135,22 +1142,69 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
+ 		return s.respondClientPermission(ctx, tx, env, principal, sess)
+ 	case "session.attach":
+ 		var p struct {
+-			RequestWriteOwner bool `json:"request_write_owner"`
++			RequestWriteOwner bool  `json:"request_write_owner"`
++			AfterSequence     int64 `json:"after_sequence"`
++		}
++		if err := json.Unmarshal(env.Payload, &p); err != nil {
++			return nil, err
+ 		}
+-		json.Unmarshal(env.Payload, &p)
+ 		if !p.RequestWriteOwner {
+ 			return reject(sess.revision, sess.epoch, "INVALID_REQUEST", "attach without write ownership is a read path"), nil
+ 		}
+-		// Reacquisition by the current client renews the writer lease through the
+-		// same CAS and epoch rotation as a handoff. Any queued old claim expires.
+-		if sess.runID != "" {
+-			status, settled, err := runState(ctx, tx, sess.project, sess.runID)
++		if p.AfterSequence < 0 || p.AfterSequence > sess.watermark {
++			return reject(sess.revision, sess.epoch, "CURSOR_INVALID", "after_sequence exceeds the session watermark; recover from snapshot"), nil
++		}
++		if s.Host.LeaseTTL <= 0 || s.Host.LeaseTTL > 15*time.Minute {
++			return nil, fmt.Errorf("HOST_LEASE_POLICY_INVALID")
++		}
++		creator, err := s.attachCreationAuthority(ctx, tx, principal, sess)
++		if err != nil {
++			return clientFault(env, err)
++		}
++		if creator != principal {
++			return reject(sess.revision, sess.epoch, "FORBIDDEN", "session belongs to another principal"), nil
++		}
++		var oldLease sql.NullString
++		if err := tx.QueryRowContext(ctx, `SELECT lease_expires_at FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, sess.project).Scan(&oldLease); err != nil {
++			return nil, err
++		}
++		nowT := time.Now().UTC()
++		var until time.Time
++		if oldLease.Valid {
++			until, err = time.Parse(time.RFC3339Nano, oldLease.String)
++			if err != nil {
++				return reject(sess.revision, sess.epoch, "WRITER_BUSY", "writer lease state is invalid"), nil
++			}
++		}
++		if oldLease.Valid && sess.writerClientID == deref(env.ClientID) {
++			// An ordinary renewal does not invalidate the current writer's claims.
++			if err := s.attachRenewalSafe(ctx, tx, principal, sess); err != nil {
++				return clientFault(env, err)
++			}
++			res, err := tx.ExecContext(ctx, `UPDATE client_sessions SET lease_expires_at=?,updated_at=? WHERE id=? AND project_id=? AND writer_client_id=? AND revision=? AND writer_epoch=? AND lease_expires_at=? AND sealed_at IS NULL AND archived_at IS NULL`, nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), nowT.Format(time.RFC3339Nano), sess.sessionID, sess.project, sess.writerClientID, sess.revision, sess.epoch, oldLease.String)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			if liveRunStatuses[status] && !settled {
+-				return reject(sess.revision, sess.epoch, "SESSION_BUSY", "previous runtime must settle before writer takeover"), nil
++			if n, err := res.RowsAffected(); err != nil || n != 1 {
++				return nil, fmt.Errorf("ATTACH_RENEWAL_CAS: %v", err)
++			}
++			snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
++			if err != nil {
++				return nil, err
+ 			}
++			return complete(sess.revision, map[string]any{"snapshot": snap, "write_owner_acquired": true}), nil
++		}
++		if oldLease.Valid && until.After(nowT) {
++			return reject(sess.revision, sess.epoch, "WRITER_BUSY", "another client holds the writer lease"), nil
++		}
++		if err := s.attachRenewalSafe(ctx, tx, principal, sess); err != nil {
++			return clientFault(env, err)
++		}
++		if err := s.attachSettlement(ctx, tx, principal, sess); err != nil {
++			return clientFault(env, err)
++		}
++		if sess.epoch == math.MaxInt64 || sess.revision > math.MaxInt64-2 || sess.watermark == math.MaxInt64 {
++			return nil, fmt.Errorf("ATTACH_SEQUENCE_OVERFLOW")
+ 		}
+ 		prevEpoch, prevClient := sess.epoch, sess.writerClientID
+ 		newEpoch, err := HandoffEpoch(ctx, tx, sess.sessionID, sess.epoch, sess.revision)
+@@ -1161,18 +1215,16 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
+ 			}
+ 			return reject(sess.revision, sess.epoch, code, err.Error()), nil
+ 		}
+-		nowT := time.Now().UTC()
+-		if s.Host.LeaseTTL <= 0 {
+-			// A handoff must publish a real writer lease; the TTL comes from host config,
+-			// and the service refuses to invent one.
+-			return nil, fmt.Errorf("HOST_LEASE_POLICY_MISSING")
+-		}
+ 		// Writer attribution moves with the epoch inside this same transaction, so the old
+ 		// client cannot slip a command in between the transfer and the journal row.
+-		if _, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=? WHERE id=? AND writer_epoch=?`,
+-			deref(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), sess.sessionID, newEpoch); err != nil {
++		res, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=?,updated_at=? WHERE id=? AND project_id=? AND writer_epoch=? AND revision=? AND writer_client_id=? AND lease_expires_at IS ? AND sealed_at IS NULL AND archived_at IS NULL`,
++			deref(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), nowT.Format(time.RFC3339Nano), sess.sessionID, sess.project, newEpoch, sess.revision+1, prevClient, oldLease)
++		if err != nil {
+ 			return nil, err
+ 		}
++		if n, err := res.RowsAffected(); err != nil || n != 1 {
++			return nil, fmt.Errorf("ATTACH_GRANT_CAS: %v", err)
++		}
+ 		sess.writerClientID = deref(env.ClientID)
+ 		now := nowT.Format(time.RFC3339Nano)
+ 		// the transfer already advanced epoch and revision; the journal row is written under
+@@ -1192,8 +1244,11 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
+ 		}); err != nil {
+ 			return nil, err
+ 		}
+-		return ack(sess.revision+1, map[string]any{"accepted_at": now, "operation_id": "op-" + deref(env.CommandID),
+-			"after_sequence": sess.watermark + 1, "related_resource_ref": nil}), nil
++		snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
++		if err != nil {
++			return nil, err
++		}
++		return complete(sess.revision+1, map[string]any{"snapshot": snap, "write_owner_acquired": true}), nil
+ 	case "session.control":
+ 		var p struct {
+ 			Action   *string `json:"action"`
+@@ -1243,6 +1298,201 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
+ 	}
+ }
+ 
++// attachCreationAuthority requires one original, immutable creation receipt and its
++// command identity. A mapped session with no such proof remains readable only.
++func (s *ClientService) attachCreationAuthority(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) (string, error) {
++	creator, err := clientSessionCreationPrincipal(ctx, tx, sess.project, sess.sessionID)
++	if err != nil || creator != principal {
++		return "", Fail(403, "FORBIDDEN", "original session creation attribution unavailable")
++	}
++	var key, operation, hash, headers, body string
++	err = tx.QueryRowContext(ctx, `SELECT key,operation,request_hash,headers,body FROM idempotency WHERE principal=? AND project=? AND ((operation='v2:session.create' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.result.session_id')=?) OR (operation='v2:goal.start' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.session_id') IS NULL AND json_extract(body,'$.result.snapshot.session_id')=?))`, principal, sess.project, sess.sessionID, sess.sessionID).Scan(&key, &operation, &hash, &headers, &body)
++	if err != nil {
++		return "", Fail(403, "FORBIDDEN", "original session creation receipt unavailable")
++	}
++	req, known, err := readClientCommandEnvelope(s.Doc, headers)
++	if err != nil {
++		return "", err
++	}
++	if err := requireClientOriginalHeader(ctx, tx, principal, key, known); err != nil {
++		return "", err
++	}
++	if !known || req.hash != hash || deref(req.env.CommandID) != key || deref(req.env.ProjectID) != sess.project || "v2:"+deref(req.env.Method) != operation {
++		return "", Fail(403, "FORBIDDEN", "original session request identity unavailable")
++	}
++	var n int
++	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=? AND request_hash=? AND project=? AND method=?`, principal, key, hash, sess.project, deref(req.env.Method)).Scan(&n); err != nil {
++		return "", err
++	}
++	if n != 1 {
++		return "", Fail(403, "FORBIDDEN", "original session command identity unavailable")
++	}
++	if _, err := decodeClientIdentityResponse(s.Doc, req, []byte(body)); err != nil {
++		return "", err
++	}
++	return creator, nil
++}
++
++func (s *ClientService) attachRenewalSafe(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) error {
++	var restore, fences int
++	var workspace string
++	err := tx.QueryRowContext(ctx, `SELECT resume_requires_explicit_user,COALESCE(workspace_ref,'') FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, sess.project).Scan(&restore, &workspace)
++	if err != nil {
++		return err
++	}
++	if restore != 0 {
++		return Fail(409, "SESSION_BUSY", "session restore requires explicit recovery")
++	}
++	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING')`, sess.project, sess.sessionID).Scan(&fences)
++	if err != nil {
++		return err
++	}
++	if fences != 0 {
++		return Fail(409, "SESSION_BUSY", "session recovery fence is active")
++	}
++	if sess.runID != "" {
++		status, _, err := runState(ctx, tx, sess.project, sess.runID)
++		if err != nil {
++			return err
++		}
++		if status == "RECONCILING" || status == "LOST" {
++			return Fail(409, "SESSION_BUSY", "session run requires recovery")
++		}
++	}
++	if s.Domain == nil {
++		return Fail(503, "HOST_UNAVAILABLE", "workspace authority unavailable")
++	}
++	b, err := s.Domain.binding(ctx, tx, workspace)
++	if err != nil || b.ProjectID == nil || *b.ProjectID != sess.project || b.PrincipalID != principal || b.Status != WorkspaceActive {
++		return Fail(403, "WORKSPACE_REVOKED", "session workspace is unavailable")
++	}
++	return nil
++}
++
++// attachSettlement is the lease-independent, read-only settlement predicate used
++// only for a new writer grant. The configuration predicate remains unchanged.
++func (s *ClientService) attachSettlement(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) error {
++	if sess.runID != "" {
++		run, err := load(tx, sess.project, "Run", sess.runID)
++		if err != nil || !runTerminal(run) || run["children_stopped"] != true || run["queue_empty"] != true || effectsReconciled(tx, sess.project, sess.runID) != nil {
++			return Fail(409, "SESSION_BUSY", "current session run is not settled")
++		}
++	}
++	originalTasks, e := s.originalSessionTasks(ctx, tx, principal, sess.project, sess.sessionID)
++	if e != nil {
++		return e
++	}
++	rows, e := tx.QueryContext(ctx, `SELECT DISTINCT t.body FROM domain_objects t WHERE t.project=? AND t.kind='Task' AND (t.id=(SELECT task_id FROM client_sessions WHERE id=?) OR json_extract(t.body,'$.goal_id') IN(SELECT COALESCE(json_extract(body,'$.result.goal_id'),json_extract(body,'$.result.snapshot.goal_id')) FROM idempotency WHERE project=? AND operation IN('v2:goal.start','v2:session.send') AND json_extract(body,'$.status')='COMPLETED' AND (json_extract(body,'$.session_id')=? OR json_extract(body,'$.result.snapshot.session_id')=?)) OR t.id IN(SELECT task_id FROM client_queue_fences WHERE project=? AND session_id=?))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.sessionID, sess.project, sess.sessionID)
++	if e != nil {
++		return e
++	}
++	tasks := originalTasks
++	for rows.Next() {
++		var raw string
++		if e = rows.Scan(&raw); e != nil {
++			rows.Close()
++			return e
++		}
++		task, e := Decode([]byte(raw))
++		if e != nil {
++			rows.Close()
++			return e
++		}
++		tasks = append(tasks, task)
++	}
++	e = rows.Err()
++	rows.Close()
++	if e != nil {
++		return e
++	}
++	for _, task := range tasks {
++		if !clientTurnSettled(tx, sess.project, sess.sessionID, task) {
++			return Fail(409, "SESSION_BUSY", "session task is not settled")
++		}
++		// A later active_run_id cannot hide an older generation's unresolved
++		// effects or child process. Reuse the actual settlement predicate for
++		// each canonical Run belonging to the original Task, without writes.
++		runs, err := tx.QueryContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=?`, sess.project, Str(task, "id"))
++		if err != nil {
++			return err
++		}
++		ids := []string{}
++		for runs.Next() {
++			var id string
++			if err = runs.Scan(&id); err != nil {
++				runs.Close()
++				return err
++			}
++			ids = append(ids, id)
++		}
++		err = runs.Err()
++		runs.Close()
++		if err != nil {
++			return err
++		}
++		for _, id := range ids {
++			historical := Object{}
++			for k, v := range task {
++				historical[k] = v
++			}
++			historical["active_run_id"] = id
++			if !clientTurnSettled(tx, sess.project, sess.sessionID, historical) {
++				return Fail(409, "SESSION_BUSY", "earlier session run is not settled")
++			}
++		}
++	}
++	var pending int
++	e = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM client_command_queue WHERE project=? AND session_id=? AND state NOT IN('CONSUMED','DROPPED'))+(SELECT count(*) FROM client_control_requests WHERE project=? AND session_id=? AND state<>'CONFIRMED')+(SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING'))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.project, sess.sessionID).Scan(&pending)
++	if e != nil {
++		return e
++	}
++	if pending != 0 {
++		return Fail(409, "SESSION_BUSY", "session controls remain unresolved")
++	}
++	rows, e = tx.QueryContext(ctx, `SELECT q.state,q.command_id,q.generation,COALESCE(r.kind,''),COALESCE(r.body,''),COALESCE(r.body_hash,'') FROM client_command_queue q LEFT JOIN client_control_receipts r ON r.receipt_id=q.last_receipt_id AND r.project=q.project AND r.generation=q.generation AND r.command_id=q.command_id WHERE q.project=? AND q.session_id=?`, sess.project, sess.sessionID)
++	if e != nil {
++		return e
++	}
++	type terminalReceipt struct{ state, command, generation, kind, body, hash string }
++	receipts := []terminalReceipt{}
++	for rows.Next() {
++		var r terminalReceipt
++		if e = rows.Scan(&r.state, &r.command, &r.generation, &r.kind, &r.body, &r.hash); e != nil {
++			rows.Close()
++			return e
++		}
++		receipts = append(receipts, r)
++	}
++	e = rows.Err()
++	rows.Close()
++	if e != nil {
++		return e
++	}
++	for _, r := range receipts {
++		if Digest([]byte(r.body)) != r.hash {
++			return Fail(409, "SESSION_BUSY", "queue settlement receipt unavailable")
++		}
++		if r.state == "DROPPED" && r.kind == "CANCEL_FENCE" {
++			if e = s.validatePreSDKConfigurationDrop(ctx, tx, principal, sess, r.command, r.generation, r.body); e != nil {
++				return e
++			}
++		} else if (r.state == "CONSUMED" && r.kind != "command.consumed") || (r.state == "DROPPED" && r.kind != "command.cleared") {
++			return Fail(409, "SESSION_BUSY", "queue settlement receipt unavailable")
++		}
++	}
++
++	// Permission facts are related to the original Session even after its head
++	// Task/Run has advanced; inspect the complete relation, not just the head.
++	e = tx.QueryRowContext(ctx, `SELECT count(*) FROM resource_effects x JOIN domain_objects r ON r.project=x.project AND r.kind='ResourceRequest' AND r.id=json_extract(x.body,'$.permission.request_id') WHERE x.project=? AND json_extract(x.body,'$.permission.session_id')=? AND json_extract(r.body,'$.status') IN('OPEN','ACKNOWLEDGED')`, sess.project, sess.sessionID).Scan(&pending)
++	if e != nil {
++		return e
++	}
++	if pending > 0 {
++		return Fail(409, "SESSION_BUSY", "session permission remains unresolved")
++	}
++	return nil
++}
++
+ // journal appends one typed event for the command's session inside the same transaction as
+ // the business write, under the writer's own epoch and revision.
+ func (s *ClientService) journal(ctx context.Context, tx *sql.Tx, env *Envelope, sess *clientSessionRow, kind string, payload map[string]any) error {
+diff --git a/internal/domain/client_protocol_atomic_test.go b/internal/domain/client_protocol_atomic_test.go
+index 25d88f36..8ca0e445 100644
+--- a/internal/domain/client_protocol_atomic_test.go
++++ b/internal/domain/client_protocol_atomic_test.go
+@@ -1,9 +1,12 @@
+ package domain
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"database/sql"
++	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ type rejectingClientPort struct{ calls, inserted int }
+@@ -54,3 +57,261 @@ func TestClientTypedRejectionRollsBackBusinessWrites(t *testing.T) {
+ 		t.Fatalf("rejection was not committed once: %d %v", count, err)
+ 	}
+ }
++
++func TestAttachSynchronousCompletionAndExactReplay(t *testing.T) {
++	f := contextFixture(t)
++	svc, sid, _ := handlerTypedSession(t, f, "original-client")
++	svc.Host.LeaseTTL = time.Minute
++	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++		t.Fatal(err)
++	}
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("new-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	var first []byte
++	for attempt := 0; attempt < 2; attempt++ {
++		sourceTx(t, f.db, func(tx *sql.Tx) error {
++			res, replay, err := svc.Execute(context.Background(), tx, env, f.owner)
++			if err != nil {
++				return err
++			}
++			if deref(res.Status) != "COMPLETED" || res.Result["write_owner_acquired"] != true || derefI64(res.Revision, 0) != 3 || replay != (attempt == 1) {
++				t.Fatalf("attach response %s replay=%v", Bytes(res), replay)
++			}
++			if attempt == 0 {
++				first = Bytes(res)
++			} else if !bytes.Equal(first, Bytes(res)) {
++				t.Fatal("same command changed response bytes")
++			}
++			return nil
++		})
++	}
++	var epoch, rev, watermark, events int64
++	var writer string
++	if err := f.db.QueryRow(`SELECT writer_epoch,revision,event_watermark,writer_client_id FROM client_sessions WHERE id=?`, sid).Scan(&epoch, &rev, &watermark, &writer); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.db.QueryRow(`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'`, f.project, sid).Scan(&events); err != nil {
++		t.Fatal(err)
++	}
++	if epoch != 2 || rev != 3 || watermark != 1 || events != 1 || writer != "new-client" {
++		t.Fatalf("grant state epoch=%d revision=%d watermark=%d events=%d writer=%s", epoch, rev, watermark, events, writer)
++	}
++}
++
++func TestAttachHistoricalAckRemainsImmutable(t *testing.T) {
++	f := contextFixture(t)
++	svc, sid, _ := handlerTypedSession(t, f, "original-client")
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("original-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	ack := &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("ACKNOWLEDGED"), SessionID: env.SessionID, Revision: revPtr(3), Result: map[string]any{"accepted_at": Now(), "operation_id": "op-" + deref(env.CommandID), "after_sequence": int64(1), "related_resource_ref": nil}}
++	if err := ValidateResultAgainstMethod("session.attach", ack, svc.Doc); err != nil {
++		t.Fatal(err)
++	}
++	hash, err := env.ContentHash()
++	if err != nil {
++		t.Fatal(err)
++	}
++	headers, err := writeClientCommandEnvelope(svc.Doc, env)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		if _, err := reserveClientCommandIdentity(context.Background(), tx, svc.Doc, f.owner, env.originalRaw, env); err != nil {
++			return err
++		}
++		_, err := tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, f.owner, f.project, "v2:session.attach", deref(env.CommandID), hash, 0, string(Bytes(ack)), headers, Now())
++		return err
++	})
++	var original string
++	if err := f.db.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='v2:session.attach' AND key=?`, f.owner, f.project, deref(env.CommandID)).Scan(&original); err != nil {
++		t.Fatal(err)
++	}
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		res, replay, err := svc.Execute(context.Background(), tx, env, f.owner)
++		if err != nil {
++			return err
++		}
++		if !replay || deref(res.Status) != "ACKNOWLEDGED" || string(Bytes(res)) != original {
++			t.Fatalf("historical ACK changed: %s replay=%v", Bytes(res), replay)
++		}
++		return nil
++	})
++	var after string
++	if err := f.db.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='v2:session.attach' AND key=?`, f.owner, f.project, deref(env.CommandID)).Scan(&after); err != nil || after != original {
++		t.Fatalf("historical response mutated: %v", err)
++	}
++}
++
++func TestAttachGrantFaultRollsBackEpochAndIdentity(t *testing.T) {
++	f := contextFixture(t)
++	svc, sid, _ := handlerTypedSession(t, f, "original-client")
++	svc.Host.LeaseTTL = time.Minute
++	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := f.db.Exec(`CREATE TRIGGER attach_fault BEFORE UPDATE OF writer_client_id ON client_sessions BEGIN SELECT RAISE(ABORT,'attach fault'); END`); err != nil {
++		t.Fatal(err)
++	}
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("new-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	tx, err := f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	res, replay, err := svc.Execute(context.Background(), tx, env, f.owner)
++	if err == nil || res != nil || replay {
++		t.Fatalf("fault unexpectedly completed: %s replay=%v err=%v", Bytes(res), replay, err)
++	}
++	if err := tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	var rev, epoch, watermark, identities int64
++	if err := f.db.QueryRow(`SELECT revision,writer_epoch,event_watermark FROM client_sessions WHERE id=?`, sid).Scan(&rev, &epoch, &watermark); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.db.QueryRow(`SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=?`, f.owner, deref(env.CommandID)).Scan(&identities); err != nil {
++		t.Fatal(err)
++	}
++	if rev != 1 || epoch != 1 || watermark != 0 || identities != 0 {
++		t.Fatalf("fault retained writes: rev=%d epoch=%d watermark=%d identity=%d", rev, epoch, watermark, identities)
++	}
++}
++
++func TestAttachSnapshotFaultRollsBackHandoffAndJournal(t *testing.T) {
++	f := contextFixture(t)
++	svc, sid, _ := handlerTypedSession(t, f, "original-client")
++	svc.Host.LeaseTTL = time.Minute
++	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := f.db.Exec(`CREATE TRIGGER attach_snapshot_fault AFTER INSERT ON outbox WHEN json_extract(NEW.body,'$.kind')='CLIENT_HANDOFF' BEGIN UPDATE client_sessions SET created_at='invalid' WHERE id=json_extract(NEW.body,'$.session_id'); END`); err != nil {
++		t.Fatal(err)
++	}
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("new-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	tx, err := f.db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	res, replay, err := svc.Execute(context.Background(), tx, env, f.owner)
++	if err == nil || !strings.Contains(err.Error(), "SNAPSHOT_SCHEMA") || res != nil || replay {
++		t.Fatalf("snapshot failure not surfaced: %s replay=%v err=%v", Bytes(res), replay, err)
++	}
++	if err := tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	var revision, epoch, watermark, events, identities int64
++	var upstream string
++	if err := f.db.QueryRow(`SELECT revision,writer_epoch,event_watermark,upstream_session_id FROM client_sessions WHERE id=?`, sid).Scan(&revision, &epoch, &watermark, &upstream); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.db.QueryRow(`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'`, f.project, sid).Scan(&events); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.db.QueryRow(`SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=?`, f.owner, deref(env.CommandID)).Scan(&identities); err != nil {
++		t.Fatal(err)
++	}
++	if revision != 1 || epoch != 1 || watermark != 0 || upstream == "" || events != 0 || identities != 0 {
++		t.Fatalf("snapshot fault retained writes: rev=%d epoch=%d watermark=%d upstream=%s events=%d identities=%d", revision, epoch, watermark, upstream, events, identities)
++	}
++}
++
++func TestAttachJournalFaultRollsBackHandoff(t *testing.T) {
++	f:=contextFixture(t)
++	svc,sid,_:=handlerTypedSession(t,f,"original-client")
++	svc.Host.LeaseTTL=time.Minute
++	if _,err:=f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`,time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano),sid);err!=nil{t.Fatal(err)}
++	if _,err:=f.db.Exec(`CREATE TRIGGER attach_journal_fault BEFORE INSERT ON outbox WHEN json_extract(NEW.body,'$.kind')='CLIENT_HANDOFF' BEGIN SELECT RAISE(ABORT,'journal fault'); END`);err!=nil{t.Fatal(err)}
++	env:=handlerDecode(t,&Envelope{ProtocolVersion:strptr(ProtocolV2),CommandID:strptr(ID()),ClientID:strptr("new-client"),ProjectID:&f.project,SessionID:&sid,ExpectedRevision:revPtr(1),Method:strptr("session.attach"),Payload:Bytes(Object{"request_write_owner":true,"after_sequence":0})})
++	tx,err:=f.db.Begin();if err!=nil{t.Fatal(err)}
++	res,replay,err:=svc.Execute(context.Background(),tx,env,f.owner)
++	if err==nil || !strings.Contains(err.Error(),"journal fault") || res!=nil || replay {t.Fatalf("journal failure not surfaced: %s replay=%v err=%v",Bytes(res),replay,err)}
++	if err:=tx.Rollback();err!=nil{t.Fatal(err)}
++	var revision,epoch,watermark,identities int64
++	if err:=f.db.QueryRow(`SELECT revision,writer_epoch,event_watermark FROM client_sessions WHERE id=?`,sid).Scan(&revision,&epoch,&watermark);err!=nil{t.Fatal(err)}
++	if err:=f.db.QueryRow(`SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=?`,f.owner,deref(env.CommandID)).Scan(&identities);err!=nil{t.Fatal(err)}
++	if revision!=1 || epoch!=1 || watermark!=0 || identities!=0 {t.Fatalf("journal fault retained writes: rev=%d epoch=%d watermark=%d identity=%d",revision,epoch,watermark,identities)}
++}
++
++func TestAttachFiniteRefusalsLeaveWriterUntouched(t *testing.T) {
++	for _, scenario := range []string{"foreign-valid", "future-cursor", "pending-control", "restore-fenced", "non-owner", "remote-device"} {
++		t.Run(scenario, func(t *testing.T) {
++			f := contextFixture(t)
++			svc, sid, _ := handlerTypedSession(t, f, "original-client")
++			svc.Host.LeaseTTL = time.Minute
++			client, principal, code, cursor := "new-client", f.owner, "SESSION_BUSY", int64(0)
++			switch scenario {
++			case "foreign-valid":
++				code = "WRITER_BUSY"
++			case "future-cursor":
++				code, cursor = "CURSOR_INVALID", 1
++			case "pending-control":
++				if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++					t.Fatal(err)
++				}
++				if _, err := f.db.Exec(`INSERT INTO client_control_requests(principal,project,command_id,session_id,control_request_id,request_hash,target_id,task_ids,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, f.owner, f.project, ID(), sid, ID(), "fixture-hash", sid, "[]", "REQUESTED", Now()); err != nil {
++					t.Fatal(err)
++				}
++			case "restore-fenced":
++				client = "original-client"
++				if _, err := f.db.Exec(`UPDATE client_sessions SET resume_requires_explicit_user=1 WHERE id=?`, sid); err != nil {
++					t.Fatal(err)
++				}
++			case "non-owner", "remote-device":
++				principal = scenario + "-principal"
++				roles := []string{"PLANNER"}
++				if scenario == "remote-device" {
++					roles = []string{"OWNER"}
++				}
++				if err := f.s.ProvisionPrincipal(context.Background(), Principal{ID: principal, Roles: roles, Grants: []Grant{{ProjectID: f.project}}}); err != nil {
++					t.Fatal(err)
++				}
++				if scenario == "remote-device" {
++					if _, err := f.db.Exec(`INSERT INTO remote_devices(id,owner,body) VALUES(?,?,?)`, principal, f.owner, string(Bytes(Object{"status": "ACTIVE", "role": "OWNER"}))); err != nil {
++						t.Fatal(err)
++					}
++				}
++				code = "FORBIDDEN"
++			}
++			env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": cursor})})
++			sourceTx(t, f.db, func(tx *sql.Tx) error {
++				res, _, err := svc.Execute(context.Background(), tx, env, principal)
++				if err != nil {
++					return err
++				}
++				if deref(res.Status) != "REJECTED" || deref(res.ErrorCode) != code {
++					t.Fatalf("%s: %s", scenario, Bytes(res))
++				}
++				return nil
++			})
++			var revision, epoch, watermark int64
++			var writer string
++			if err := f.db.QueryRow(`SELECT revision,writer_epoch,event_watermark,writer_client_id FROM client_sessions WHERE id=?`, sid).Scan(&revision, &epoch, &watermark, &writer); err != nil {
++				t.Fatal(err)
++			}
++			if revision != 1 || epoch != 1 || watermark != 0 || writer != "original-client" {
++				t.Fatalf("refusal mutated writer: rev=%d epoch=%d watermark=%d writer=%s", revision, epoch, watermark, writer)
++			}
++		})
++	}
++}
++
++func TestAttachNullLeaseRequiresNewGrant(t *testing.T) {
++	f := contextFixture(t)
++	svc, sid, _ := handlerTypedSession(t, f, "same-client")
++	svc.Host.LeaseTTL = time.Minute
++	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=NULL WHERE id=?`, sid); err != nil {
++		t.Fatal(err)
++	}
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("same-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		res, _, err := svc.Execute(context.Background(), tx, env, f.owner)
++		if err != nil {
++			return err
++		}
++		if deref(res.Status) != "COMPLETED" || derefI64(res.Revision, 0) != 3 {
++			t.Fatalf("null lease treated as renewal: %s", Bytes(res))
++		}
++		return nil
++	})
++	var epoch, watermark int64
++	if err := f.db.QueryRow(`SELECT writer_epoch,event_watermark FROM client_sessions WHERE id=?`, sid).Scan(&epoch, &watermark); err != nil || epoch != 2 || watermark != 1 {
++		t.Fatalf("null regrant epoch=%d watermark=%d err=%v", epoch, watermark, err)
++	}
++}
+diff --git a/internal/domain/client_protocol_control_windows_test.go b/internal/domain/client_protocol_control_windows_test.go
+index b4ced3d5..4c9eecff 100644
+--- a/internal/domain/client_protocol_control_windows_test.go
++++ b/internal/domain/client_protocol_control_windows_test.go
+@@ -45,30 +45,31 @@ func TestClientCancelChangesCanonicalRun(t *testing.T) {
+ 
+ func TestClientSameWriterRenewsExpiredLease(t *testing.T) {
+ 	f := contextFixture(t)
+-	sid := mixedSessionEvents(t, f, 0)
++	svc, sid, _ := handlerTypedSession(t, f, "mixed-client")
++	svc.Host.LeaseTTL = time.Minute
+ 	if _, err := f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	svc := &ClientService{Doc: clientHistoryDoc(t), Domain: f.s, Host: ClientHostInfo{CoreBuildID: "mixed-fixture", LeaseTTL: time.Minute}}
+ 	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("mixed-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})}
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+ 		res, _, err := svc.Execute(context.Background(), tx, handlerDecode(t, env), f.owner)
+ 		if err != nil {
+ 			return err
+ 		}
+-		if deref(res.Status) != "ACKNOWLEDGED" {
++		if deref(res.Status) != "COMPLETED" || res.Result["write_owner_acquired"] != true {
+ 			t.Fatalf("renewal refused: %s", Bytes(res))
+ 		}
+ 		return nil
+ 	})
+ 	var epoch int64
++	var revision, watermark int64
+ 	var until string
+-	if err := f.db.QueryRow("SELECT writer_epoch,lease_expires_at FROM client_sessions WHERE id=?", sid).Scan(&epoch, &until); err != nil {
++	if err := f.db.QueryRow("SELECT writer_epoch,revision,event_watermark,lease_expires_at FROM client_sessions WHERE id=?", sid).Scan(&epoch, &revision, &watermark, &until); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	deadline, err := time.Parse(time.RFC3339Nano, until)
+-	if err != nil || !deadline.After(time.Now()) || epoch != 2 {
+-		t.Fatalf("new writer generation missing: epoch=%d until=%s %v", epoch, until, err)
++	if err != nil || !deadline.After(time.Now()) || epoch != 1 || revision != 1 || watermark != 0 {
++		t.Fatalf("ordinary renewal changed generation: epoch=%d revision=%d watermark=%d until=%s %v", epoch, revision, watermark, until, err)
+ 	}
+ 	env.CommandID = strptr(ID())
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+@@ -76,13 +77,40 @@ func TestClientSameWriterRenewsExpiredLease(t *testing.T) {
+ 		if err != nil {
+ 			return err
+ 		}
+-		if deref(res.ErrorCode) != "VERSION_CONFLICT" {
+-			t.Fatalf("old renewal claim accepted: %s", Bytes(res))
++		if deref(res.Status) != "COMPLETED" || derefI64(res.Revision, 0) != 1 {
++			t.Fatalf("ordinary renewal changed revision: %s", Bytes(res))
+ 		}
+ 		return nil
+ 	})
+ }
+ 
++func TestClientAttachRefusesUnsettledCanonicalRun(t *testing.T) {
++	o := orchestrationSetup(t)
++	f := o.f
++	svc, sid, _ := handlerTypedSession(t, f, "original-client")
++	svc.Host.LeaseTTL = time.Minute
++	task := o.task("attach-unsettled", Empty(), Empty())
++	r := o.claim(task)
++	if _, err := f.db.Exec(`UPDATE client_sessions SET task_id=?,run_id=?,lease_expires_at=? WHERE id=?`, task["id"], r.run["id"], time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
++		t.Fatal(err)
++	}
++	env := handlerDecode(t, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("new-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: revPtr(1), Method: strptr("session.attach"), Payload: Bytes(Object{"request_write_owner": true, "after_sequence": 0})})
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		res, _, err := svc.Execute(context.Background(), tx, env, f.owner)
++		if err != nil {
++			return err
++		}
++		if deref(res.ErrorCode) != "SESSION_BUSY" {
++			t.Fatalf("unsettled run allowed: %s", Bytes(res))
++		}
++		return nil
++	})
++	var epoch, revision int64
++	if err := f.db.QueryRow(`SELECT writer_epoch,revision FROM client_sessions WHERE id=?`, sid).Scan(&epoch, &revision); err != nil || epoch != 1 || revision != 1 {
++		t.Fatalf("unsettled run changed writer epoch=%d rev=%d err=%v", epoch, revision, err)
++	}
++}
++
+ func TestClientResumeNeverRestartsPreviousRun(t *testing.T) {
+ 	for _, status := range []string{"CANCELLED", "FAILED", "RUNNING"} {
+ 		t.Run(status, func(t *testing.T) {

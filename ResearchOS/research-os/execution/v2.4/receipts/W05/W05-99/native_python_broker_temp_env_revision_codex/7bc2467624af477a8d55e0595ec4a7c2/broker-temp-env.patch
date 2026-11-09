@@ -1,0 +1,66 @@
+--- base/root_only_native_broker.py
++++ candidate/root_only_native_broker.py
+@@ -62,6 +62,53 @@
+             value[index] = 0
+         raise
+ 
++
++def require_public_environment(env):
++    expected = {"SystemRoot", "WINDIR", "TEMP", "TMP"}
++    if not isinstance(env, dict) or set(env) != expected:
++        raise ValueError("native environment must be the fixed public four keys")
++    if any(not isinstance(value, str) or not value.strip() or "\0" in value
++           for value in env.values()):
++        raise ValueError("nonempty public environment strings required")
++    if env["TEMP"] != env["TMP"]:
++        raise ValueError("fixed TEMP TMP binding differs")
++
++    def contains(parent, child):
++        parent_key, child_key = str(parent).casefold(), str(child).casefold()
++        try:
++            return os.path.commonpath([parent_key, child_key]) == parent_key
++        except ValueError:
++            return False
++
++    def directory(value):
++        path = Path(value)
++        if not path.is_absolute() or str(path.resolve()).casefold() != str(path).casefold():
++            raise ValueError("canonical absolute public directory required")
++        if not path.is_dir():
++            raise ValueError("existing public directory required")
++        return path
++
++    local = Path("D:/作品集/ResearchOS/research-os/.local")
++    trial = local/"mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"
++    declared = Path(os.path.normpath(env["TEMP"]))
++    if not declared.is_absolute() or declared == local or not contains(local, declared):
++        raise ValueError("temporary directory must be a child of repository local directory")
++    # Reject the original trial namespace before resolving/statting proof paths.
++    # Directory metadata only: no file reads, directory listing or private resource.
++    if contains(trial, declared) or contains(declared, trial):
++        raise ValueError("original trial temporary directory forbidden")
++    local = directory(str(local))
++    root = directory(env["TEMP"])
++    if root == local or not contains(local, root):
++        raise ValueError("physical temporary directory outside isolated local root")
++    physical_trial = local/"mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"
++    if contains(physical_trial, root) or contains(root, physical_trial):
++        raise ValueError("original trial physical temporary directory forbidden")
++    for name in ("SystemRoot", "WINDIR"):
++        system = directory(env[name])
++        if contains(system, root) or contains(root, system):
++            raise ValueError("temporary directory overlaps system directory")
++
+ def main():
+     private_input = None
+     output = None
+@@ -81,8 +128,7 @@
+         output = Path(request["OutputDirectory"])
+         if not output.is_absolute() or output.parent != request_path.parent or output.exists():
+             raise ValueError("fresh sibling output directory required")
+-        if set(request["Environment"]) != {"SystemRoot", "WINDIR"}:
+-            raise ValueError("native environment must be the fixed public pair")
++        require_public_environment(request["Environment"])
+         if not isinstance(request["Arguments"], list) or not all(isinstance(v, str) for v in request["Arguments"]):
+             raise ValueError("public arguments required")
+         output.mkdir(parents=False, exist_ok=False)

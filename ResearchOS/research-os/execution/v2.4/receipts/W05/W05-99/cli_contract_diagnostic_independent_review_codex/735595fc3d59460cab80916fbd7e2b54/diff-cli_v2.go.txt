@@ -1,0 +1,33 @@
+--- main/apps/cli/cli_v2.go
++++ handler22752/apps/cli/cli_v2.go
+@@ -179,17 +179,19 @@
+ 		}
+ 	}
+ 	if method == "host.configure" {
+-		_, hasModel := keys["model_id"]
+-		_, hasProvider := keys["provider_id"]
+-		if (hasModel || hasProvider) && ctx.epoch == 0 {
+-			return nil, "MODEL_CHANGE_WITHOUT_EPOCH"
+-		}
+-		if hasModel || hasProvider {
+-			// client_protocol.go:152 rejects a configuration change that names a model while writer_epoch is absent,
+-			// so the field has to travel. Presence is all the core requires here: the epoch this CLI sends is the
+-			// caller's claim, not a value read back from the host, and the current-writer comparison at :800-808 is
+-			// only on the session-attach path. Recorded as P-R3-2 rather than described as stronger than it is.
+-			env.WriterEpoch = &ctx.epoch
++		if ctx.sessionID == "" {
++			if ctx.projectID != "" || ctx.revision != 0 || ctx.epoch != 0 {
++				return nil, "INCOMPLETE_CONFIGURE_SCOPE"
++			}
++			env.ProjectID, env.SessionID, env.ExpectedRevision, env.WriterEpoch = nil, nil, nil, nil
++		} else {
++			if ctx.epoch <= 0 {
++				return nil, "MODEL_CHANGE_WITHOUT_EPOCH"
++			}
++			if !continuationID(ctx.sessionID) || !continuationID(ctx.projectID) || ctx.revision <= 0 || ctx.revision > 9007199254740991 || ctx.epoch > 9007199254740991 {
++				return nil, "INCOMPLETE_CONFIGURE_SCOPE"
++			}
++			env.ExpectedRevision, env.WriterEpoch = &ctx.revision, &ctx.epoch
+ 		}
+ 	}
+ 	return env, ""

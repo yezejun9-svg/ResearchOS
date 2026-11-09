@@ -1,0 +1,172 @@
+--- diagnostic02/choose-owned-folder.ps1
++++ direct03/choose-owned-folder.ps1
+@@ -16,6 +16,30 @@
+ function Assert-DiagnosticOnly($Value) {
+   if ($Value -isnot [bool] -or $Value -ne $true) { throw 'DIAGNOSTIC_ONLY_SCOPE_REQUIRED_NO_OK' }
+ }
++function Select-UniqueNativeTree($Candidates,[int]$OwnerPid,[bool]$Truncated) {
++  if ($Truncated) { throw 'NATIVE_TREE_ENUMERATION_TRUNCATED_NO_OK' }
++  $matchesFound=@($Candidates | Where-Object {
++    $_.class_name -ceq 'SysTreeView32' -and $_.process_id -eq $OwnerPid -and $_.visible -eq $true -and $_.enabled -eq $true
++  })
++  if ($matchesFound.Count -ne 1) { throw 'NATIVE_TREE_NOT_UNIQUE_NO_OK' }
++  return $matchesFound[0]
++}
++function Assert-DirectNativeFacts($Facts,[int]$OwnerPid) {
++  if ($Facts.process_id -ne $OwnerPid -or $Facts.is_child -ne $true -or
++    $Facts.class_name -cne 'SysTreeView32' -or $Facts.visible -ne $true -or $Facts.enabled -ne $true) {
++    throw 'DIRECT_NATIVE_TREE_OWNER_OR_STATE_CHANGED_NO_OK'
++  }
++}
++function Project-PublicUiaValue([string]$Source,$Value) {
++  $raw=$(if ($null -eq $Value) { '' } else { [string]$Value })
++  $absolute=$false
++  try { $absolute=[IO.Path]::IsPathRooted($raw) } catch {}
++  $truncated=$raw.Length -gt 1024
++  $text=$raw
++  if ($truncated) { $text=$raw.Substring(0,1024) }
++  if ($text.Length -gt 0 -and [char]::IsHighSurrogate($text[$text.Length-1])) { $text=$text.Substring(0,$text.Length-1);$truncated=$true }
++  return @{source=$Source;value=$text;truncated=$truncated;absolute_candidate=$absolute;selection_authority=$false}
++}
+ function Limit-DiagnosticText($Value) {
+   if ($null -eq $Value) { return $null }
+   $text=[regex]::Replace([string]$Value,'[\x00-\x1f\x7f]',' ')
+@@ -128,6 +152,7 @@
+   $scope = Get-Content -LiteralPath $ScopePath -Raw -Encoding UTF8 | ConvertFrom-Json
+   if ($scope.status -cne 'ROOT_APPROVED_REAL_RUN' -or $scope.scope_nonce -cne $ScopeNonce) { throw 'SCOPE_NOT_AUTHORIZED' }
+   Assert-DiagnosticOnly $scope.native_picker.diagnostic_only
++  Assert-DiagnosticOnly $scope.native_picker.direct_native_tree
+   $runRoot = [IO.Path]::GetFullPath($scope.run_root)
+   $fixture = [IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
+   $identityFile = [IO.Path]::GetFullPath($CoreIdentityPath)
+@@ -179,6 +204,7 @@
+   [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+   [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hwnd);
++  [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
+   [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)] public static extern IntPtr ClickTimeout(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+   public static string Class(IntPtr hwnd) { var b=new StringBuilder(256); GetClassName(hwnd,b,b.Capacity); return b.ToString(); }
+   public static string Text(IntPtr hwnd) { var b=new StringBuilder(1024); GetWindowText(hwnd,b,b.Capacity); return b.ToString(); }
+@@ -333,43 +359,89 @@
+   }
+   function Read-OwnedTreeDiagnostic {
+     Assert-Dialog
+-    $dialogElement=[Windows.Automation.AutomationElement]::FromHandle($hwnd)
+-    $treeCondition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Tree)
+-    $trees=$dialogElement.FindAll([Windows.Automation.TreeScope]::Descendants,$treeCondition)
+-    $rows=[Collections.Generic.List[object]]::new()
+-    $limit=16
+-    for ($index=0; $index -lt [Math]::Min($trees.Count,$limit); $index++) {
++    $script:directChildren=[Collections.Generic.List[object]]::new()
++    $script:directTruncated=$false
++    $childCallback=[OwnedFolderWin32+EnumCallback]{ param($child,$unused)
++      if ($script:directChildren.Count -ge 64) { $script:directTruncated=$true;return $false }
++      [uint32]$childPid=0
++      $null=[OwnedFolderWin32]::GetWindowThreadProcessId($child,[ref]$childPid)
++      $script:directChildren.Add(@{hwnd=$child.ToInt64().ToString();process_id=$childPid
++        class_name=[OwnedFolderWin32]::Class($child)
++        visible=[OwnedFolderWin32]::IsWindowVisible($child);enabled=[OwnedFolderWin32]::IsWindowEnabled($child)})
++      return $true
++    }
++    $null=[OwnedFolderWin32]::EnumChildWindows($hwnd,$childCallback,[IntPtr]::Zero)
++    Assert-Dialog
++    $native=Select-UniqueNativeTree @($script:directChildren) $coreId $script:directTruncated
++    $nativeHwnd=[IntPtr][long]::Parse($native.hwnd,[Globalization.CultureInfo]::InvariantCulture)
++    function Assert-DirectNativeTree {
+       Assert-Dialog
+-      # Do not filter by PID/offscreen/enabled/HWND: record provider facts.
+-      $rows.Add((Project-TreeDiagnostic $trees[$index] $index))
+-    }
+-    $children=$null
+-    if ($trees.Count -eq 0) {
+-      Assert-Dialog
+-      $script:diagChildren=[Collections.Generic.List[object]]::new()
+-      $script:diagChildTruncated=$false
+-      $childCallback=[OwnedFolderWin32+EnumCallback]{ param($child,$unused)
+-        if ($script:diagChildren.Count -ge 32) { $script:diagChildTruncated=$true; return $false }
+-        [uint32]$childPid=0
+-        $null=[OwnedFolderWin32]::GetWindowThreadProcessId($child,[ref]$childPid)
+-        $script:diagChildren.Add(@{
+-          hwnd=$child.ToInt64().ToString(); process_id=$childPid
+-          class_name=(Limit-DiagnosticText ([OwnedFolderWin32]::Class($child)))
+-          visible=[OwnedFolderWin32]::IsWindowVisible($child)
+-          enabled=[OwnedFolderWin32]::IsWindowEnabled($child)
+-        })
+-        return $true
+-      }
+-      $null=[OwnedFolderWin32]::EnumChildWindows($hwnd,$childCallback,[IntPtr]::Zero)
+-      $children=@{ limit=32; truncated=$script:diagChildTruncated; controls=@($script:diagChildren); text_or_items_read=$false }
+-    }
+-    Assert-Dialog
++      [uint32]$nativePid=0
++      $null=[OwnedFolderWin32]::GetWindowThreadProcessId($nativeHwnd,[ref]$nativePid)
++      Assert-DirectNativeFacts @{
++        process_id=$nativePid;is_child=[OwnedFolderWin32]::IsChild($hwnd,$nativeHwnd)
++        class_name=[OwnedFolderWin32]::Class($nativeHwnd)
++        visible=[OwnedFolderWin32]::IsWindowVisible($nativeHwnd)
++        enabled=[OwnedFolderWin32]::IsWindowEnabled($nativeHwnd)
++      } $coreId
++    }
++    Assert-DirectNativeTree
++    $direct=@{native_window=$native;provider_status='NOT_READ';patterns=@{};public_values=@();absolute_candidates=@();selected=@();selection_count=$null;selected_limit=4;selected_truncated=$false;can_authorize_selection=$false}
++    $current=@{index=0;status='ELEMENT_UNAVAILABLE'}
++    function Read-PublicPatterns($Element) {
++      $support=@{};$values=[Collections.Generic.List[object]]::new()
++      $info=$Element.Current
++      if ($null -eq $info -or $info.ProcessId -ne $coreId) { throw 'UIA_PROVIDER_OWNER_UNCONFIRMED_NO_VALUES' }
++      $values.Add((Project-PublicUiaValue 'Name' $info.Name))
++      foreach ($provider in @(
++        @{source='ValuePattern';id=[Windows.Automation.ValuePattern]::Pattern},
++        @{source='LegacyIAccessiblePattern';id=[Windows.Automation.LegacyIAccessiblePattern]::Pattern}
++      )) {
++        Assert-DirectNativeTree
++        try {
++          $pattern=$null;$supported=$Element.TryGetCurrentPattern($provider.id,[ref]$pattern)
++          $support[$provider.source]=@{supported=$supported}
++          if ($supported) { $values.Add((Project-PublicUiaValue $provider.source $pattern.Current.Value)) }
++        } catch { $support[$provider.source]=@{supported=$null;error=(Limit-DiagnosticText $_.Exception.Message)} }
++      }
++      return @{support=$support;values=@($values)}
++    }
++    try {
++      $element=[Windows.Automation.AutomationElement]::FromHandle($nativeHwnd)
++      $current=Project-TreeDiagnostic $element 0
++      $direct.provider_status='FROM_HANDLE_RETURNED'
++      $read=Read-PublicPatterns $element
++      $direct.patterns=$read.support;$direct.public_values=$read.values
++      $direct.absolute_candidates=@($read.values|Where-Object {$_.absolute_candidate})
++      Assert-DirectNativeTree
++      $selection=$null;$supported=$element.TryGetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern,[ref]$selection)
++      $direct.patterns.SelectionPattern=@{supported=$supported}
++      if ($supported) {
++        $selected=$selection.GetCurrentSelection();$direct.selection_count=$selected.Count
++        $direct.selected_truncated=$selected.Count -gt 4
++        $rows=[Collections.Generic.List[object]]::new()
++        for ($i=0;$i -lt [Math]::Min($selected.Count,4);$i++) {
++          Assert-DirectNativeTree
++          try {
++            $read=Read-PublicPatterns $selected[$i]
++            $rows.Add(@{index=$i;current=(Project-TreeDiagnostic $selected[$i] $i);patterns=$read.support
++              public_values=$read.values;absolute_candidates=@($read.values|Where-Object {$_.absolute_candidate});can_authorize_selection=$false})
++          } catch { $rows.Add(@{index=$i;status='SELECTED_ELEMENT_UNAVAILABLE';error=(Limit-DiagnosticText $_.Exception.Message)}) }
++        }
++        $direct.selected=@($rows)
++      }
++    } catch {
++      $direct.provider_status='PROVIDER_UNAVAILABLE_OR_UNCONFIRMED'
++      $direct.error=Limit-DiagnosticText $_.Exception.Message
++    }
++    Assert-DirectNativeTree
+     return @{
+       schema='researchos.owned-dialog-tree-metadata/1'; diagnostic_only=$true
+       dialog_hwnd=$hwnd.ToInt64().ToString(); dialog_owner_pid=$coreId
+-      tree_count=$trees.Count; tree_limit=$limit; captured_count=$rows.Count
+-      tree_truncated=($trees.Count -gt $limit); trees=@($rows)
+-      win32_children_when_zero=$children
++      tree_source='VERIFIED_NATIVE_SYSTREEVIEW32_FROM_HANDLE'
++      tree_count=1; tree_limit=16; captured_count=1;tree_truncated=$false;trees=@($current)
++      direct_native_tree=$direct
++      win32_children_when_zero=$null
+       no_treeitem_navigation=$true; no_ok=$true; no_workspace_authorization=$true
+     }
+   }

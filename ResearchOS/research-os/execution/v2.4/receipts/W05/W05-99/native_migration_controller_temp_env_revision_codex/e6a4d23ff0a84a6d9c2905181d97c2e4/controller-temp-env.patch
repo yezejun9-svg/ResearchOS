@@ -1,0 +1,65 @@
+--- CTL2/root_native_migration_controller.py
++++ CTL3/root_native_migration_controller.py
+@@ -32,6 +32,7 @@
+     "RESEARCHOS_CONFIGURATION_SCHEMA22_HELPER",
+     "RESEARCHOS_CONFIGURATION_SCHEMA22_HELPER_SHA256",
+     "RESEARCHOS_CONFIGURATION_SCHEMA22_HELPER_ROOT", "RESEARCHOS_NODE", "RESEARCHOS_MU_BUNDLE",
++    "RESEARCHOS_NATIVE_MIGRATION_HARNESS_TEMP_ROOT",
+ }
+ PHASES = {
+     "release": ("01-release.payload.json", "01-release.ready.json", "01-release.approval.json",
+@@ -172,6 +173,45 @@
+         per_file_cap=256 * 1024 * 1024, total_cap=2 * 1024 * 1024 * 1024)
+     guard.acquire(_plain_guard_refs(refs))
+     return guard
++
++
++def _require_isolated_temp_environment(env):
++    proof_key = "RESEARCHOS_NATIVE_MIGRATION_HARNESS_TEMP_ROOT"
++    proof = env[proof_key]
++    if not isinstance(proof, str) or not proof.strip() or "\0" in proof:
++        raise ValueError("isolated temporary proof root required")
++    if env["TEMP"] != proof or env["TMP"] != proof:
++        raise ValueError("fixed proof root TEMP TMP binding differs")
++
++    def contains(parent, child):
++        parent_key, child_key = str(parent).casefold(), str(child).casefold()
++        try:
++            return os.path.commonpath([parent_key, child_key]) == parent_key
++        except ValueError:
++            return False
++
++    local = Path("D:/作品集/ResearchOS/research-os/.local")
++    trial = local/"mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"
++    declared = Path(os.path.normpath(proof))
++    if not declared.is_absolute() or declared == local or not contains(local, declared):
++        raise ValueError("temporary proof root must be a child of this repository local directory")
++    # Reject the original trial namespace before resolving/statting proof paths.
++    # Directory metadata only; no directory enumeration or private file reads.
++    if contains(trial, declared) or contains(declared, trial):
++        raise ValueError("original trial temporary root forbidden")
++    local = canonical_path(str(local))
++    root = canonical_path(proof)
++    if not local.is_dir() or not root.is_dir() or root == local or not contains(local, root):
++        raise ValueError("isolated physical temporary directory unavailable")
++    physical_trial = local/"mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"
++    if contains(physical_trial, root) or contains(root, physical_trial):
++        raise ValueError("original trial physical temporary root forbidden")
++    for name in ("SystemRoot", "WINDIR"):
++        system = canonical_path(env[name])
++        if not system.is_dir():
++            raise ValueError("public system directory unavailable")
++        if contains(system, root) or contains(root, system):
++            raise ValueError("isolated temporary root overlaps system directory")
+ 
+ def context(config_ref):
+     raw = read_ref(config_ref)
+@@ -238,6 +278,8 @@
+         raise ValueError("public environment values")
+     if not {"SystemRoot", "WINDIR", "TEMP", "TMP"}.issubset(env):
+         raise ValueError("public Windows/temp environment required")
++    if "RESEARCHOS_NATIVE_MIGRATION_HARNESS_TEMP_ROOT" in env:
++        _require_isolated_temp_environment(env)
+     for prefix in ("RootProgram", "ControlProgram"):
+         if not Path(hc[prefix]["path"]).is_file():
+             raise ValueError("case program missing")

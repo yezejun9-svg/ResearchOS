@@ -1,0 +1,39 @@
+--- baseline/internal/domain/client_protocol_sessions.go
++++ snapshot/internal/domain/client_protocol_sessions.go
+@@ -175,7 +175,7 @@
+ // this helper never manufactures a session.create command or receipt.
+ func (s *ClientService) createBoundClientSession(ctx context.Context, tx *sql.Tx, env *Envelope, principal, workspace, model, title string) (string, error) {
+ 	project := deref(env.ProjectID)
+-	if err := s.checkClientBinding(ctx, tx, principal, project, workspace, model); err != nil {
++	if err := s.checkClientCreationBinding(ctx, tx, principal, project, workspace, model); err != nil {
+ 		return "", err
+ 	}
+ 	if s.Host.LeaseTTL <= 0 || s.Host.CoreBuildID == "" {
+@@ -188,6 +188,27 @@
+ 		return "", err
+ 	}
+ 	return sid, nil
++}
++
++func (s *ClientService) checkClientCreationBinding(ctx context.Context, tx *sql.Tx, principal, project, workspace, model string) error {
++	if model == "" || s.Domain == nil {
++		return Fail(503, "MODEL_UNAVAILABLE", "explicit model binding required")
++	}
++	var n int
++	if err := tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM host_model_configurations WHERE model_config_ref=?)+(SELECT count(*) FROM idempotency WHERE operation='v2:host.configure' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.result.model_config_ref')=?)`, model, model).Scan(&n); err != nil {
++		return err
++	}
++	if n == 0 {
++		return s.checkClientBinding(ctx, tx, principal, project, workspace, model)
++	}
++	if _, err := s.visibleClientConfiguration(ctx, tx, principal, model); err != nil {
++		return err
++	}
++	b, err := s.Domain.binding(ctx, tx, workspace)
++	if err != nil || b.ProjectID == nil || *b.ProjectID != project || b.PrincipalID != principal || b.Status != WorkspaceActive {
++		return Fail(403, "WORKSPACE_REVOKED", "current project workspace binding required")
++	}
++	return nil
+ }
+ 
+ func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, error) {

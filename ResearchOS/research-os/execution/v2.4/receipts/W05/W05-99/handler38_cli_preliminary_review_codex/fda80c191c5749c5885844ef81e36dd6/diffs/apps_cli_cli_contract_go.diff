@@ -1,0 +1,93 @@
+--- prior/apps/cli/cli_contract.go
++++ current/apps/cli/cli_contract.go
+@@ -22,11 +22,11 @@
+ 	"time"
+ 
+ 	"encoding/json"
++	"encoding/json/jsontext"
+ 	"fmt"
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
+-	"researchos.local/research-os/internal/canonical"
+ 	"researchos.local/research-os/internal/domain"
+ 	"sort"
+ 	"strconv"
+@@ -571,7 +571,7 @@
+ 		if scope.epoch <= 0 {
+ 			return reject("MODEL_CHANGE_WITHOUT_EPOCH", 2)
+ 		}
+-		if !continuationID(scope.projectID) || !continuationID(scope.sessionID) || scope.revision <= 0 || scope.revision >= 9007199254740991 || scope.epoch > 9007199254740991 {
++		if !continuationID(scope.projectID) || !continuationID(scope.sessionID) || scope.revision <= 0 || scope.revision > 9007199254740991 || scope.epoch > 9007199254740991 {
+ 			return reject("INCOMPLETE_CONFIGURE_SCOPE", 2)
+ 		}
+ 	}
+@@ -624,7 +624,7 @@
+ 	if code != 0 {
+ 		return reject(why, code)
+ 	}
+-	reported, ok := cliInteger(cliObject(status["result"])["config_revision"])
++	reported, ok := configureExactInteger(cliObject(status["result"])["config_revision"])
+ 	if !ok || reported != current {
+ 		return reject("STALE_CONFIG_REVISION", 1)
+ 	}
+@@ -638,7 +638,7 @@
+ 			return reject("CONFIGURE_RESULT_MISMATCH", 1)
+ 		}
+ 	}
+-	actual, ok := cliInteger(result["config_revision"])
++	actual, ok := configureExactInteger(result["config_revision"])
+ 	ref, refOK := result["model_config_ref"].(string)
+ 	if !ok || actual != current+1 || !refOK || strings.TrimSpace(ref) == "" || result["verified_at"] != nil || ctx.credential != "" && strings.Contains(ref, ctx.credential) {
+ 		return reject("CONFIGURE_RESULT_MISMATCH", 1)
+@@ -647,7 +647,7 @@
+ 	c.Model = ref
+ 	c.ConfigRevision = int(actual)
+ 	if !defaultScope {
+-		revision, ok := cliInteger(reply["revision"])
++		revision, ok := configureExactInteger(reply["revision"])
+ 		if !ok || revision != ctx.revision+1 {
+ 			return reject("CONFIGURE_REVISION_MISMATCH", 1)
+ 		}
+@@ -681,6 +681,12 @@
+ 	}
+ 	n, e := strconv.ParseInt(s, 10, 64)
+ 	return n, e == nil && n >= 0 && n <= 9007199254740991
++}
++
++func configureExactInteger(value any) (int64, bool) {
++	// Num uses a rational parsed from json.Number, without a float64 roundtrip.
++	n, err := domain.Num(domain.Object{"value": value}, "value")
++	return n, err == nil && n >= 0
+ }
+ 
+ func configureCLICall(ctx *v2Context, method string, payload map[string]any) (map[string]any, string, int) {
+@@ -720,12 +726,15 @@
+ 	if e != nil || len(raw) > 1<<20 {
+ 		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", 1
+ 	}
+-	strict, e := canonical.JSON(raw)
+-	if e != nil {
++	// Validate raw Unicode, decoded-key uniqueness and the single complete JSON
++	// value before decoding. Canonicalization would round numeric lexemes.
++	if !jsontext.Value(raw).IsValid() {
+ 		return nil, "MALFORMED_REPLY", 1
+ 	}
+ 	var reply map[string]any
+-	if json.Unmarshal(strict, &reply) != nil {
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.UseNumber()
++	if decoder.Decode(&reply) != nil {
+ 		return nil, "MALFORMED_REPLY", 1
+ 	}
+ 	doc, e := cliProtocolDocument()
+@@ -744,6 +753,9 @@
+ 	}
+ 	if reply["status"] != "COMPLETED" {
+ 		if reply["status"] == "REJECTED" {
++			if cliObject(reply["error"])["code"] != reply["error_code"] {
++				return nil, "INVALID_CONFIGURE_REPLY", 1
++			}
+ 			errcode, _ := reply["error_code"].(string)
+ 			code := 1
+ 			switch errcode {

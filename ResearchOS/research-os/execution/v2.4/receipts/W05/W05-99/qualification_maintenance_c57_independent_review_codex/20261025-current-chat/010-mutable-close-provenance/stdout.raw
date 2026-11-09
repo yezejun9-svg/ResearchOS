@@ -1,0 +1,192 @@
+114-	if e != nil {
+115-		return fail(e)
+116-	}
+117:	x := FileIdentity{Path: path, FinalUTF16: final, Volume: v, FileID: id, SecurityDescriptor: sd.String(), Directory: directory}
+118-	if hashFile {
+119-		if directory {
+120-			return fail(errors.New("cannot hash directory"))
+121-		}
+122-		f := os.NewFile(uintptr(h), path)
+123-		if _, e = f.Seek(0, io.SeekStart); e != nil {
+124-			return fail(e)
+125-		}
+126-		s := sha256.New()
+127-		if _, e = io.Copy(s, io.LimitReader(f, 128<<20)); e != nil {
+128-			return fail(e)
+129-		}
+130-		var stat os.FileInfo
+131-		stat, e = f.Stat()
+132-		if e != nil {
+133-			return fail(e)
+134-		}
+135-		if stat.Size() > 128<<20 {
+--
+140-	return nativeHold{path: path, handle: h, identity: x}, nil
+141-}
+142-
+143:func closeHolds(holds []nativeHold) {
+144-	for i := len(holds) - 1; i >= 0; i-- {
+145-		windows.CloseHandle(holds[i].handle)
+146-	}
+147-}
+148-
+149-func identityEqual(a, b FileIdentity) bool {
+150:	return strings.EqualFold(a.Path, b.Path) && strings.EqualFold(a.FinalUTF16, b.FinalUTF16) && a.Volume == b.Volume && a.FileID == b.FileID && a.SHA256 == b.SHA256 && a.SecurityDescriptor == b.SecurityDescriptor && a.Directory == b.Directory
+151-}
+152-
+153-func pathAncestors(path string) []string {
+154-	var xs []string
+155-	for p := filepath.Dir(path); ; p = filepath.Dir(p) {
+156-		xs = append(xs, p)
+157-		if filepath.Dir(p) == p {
+158-			break
+159-		}
+160-	}
+161-	for i, j := 0, len(xs)-1; i < j; i, j = i+1, j-1 {
+162-		xs[i], xs[j] = xs[j], xs[i]
+163-	}
+164-	return xs
+165-}
+166-
+167:func openPlanHolds(p EntryFencePlan) ([]nativeHold, error) {
+168-	all := []FileIdentity{p.DataRoot, p.Database, p.Helper}
+169-	for _, t := range p.Targets {
+170-		all = append(all, t.File)
+171-	}
+172-	want := map[string]FileIdentity{}
+173-	for _, x := range all {
+174-		for _, a := range pathAncestors(x.Path) {
+175-			if _, ok := want[strings.ToLower(a)]; !ok {
+176-				want[strings.ToLower(a)] = FileIdentity{Path: a, Directory: true}
+177-			}
+178-		}
+179-		want[strings.ToLower(x.Path)] = x
+180-	}
+181-	keys := make([]string, 0, len(want))
+182-	for k := range want {
+183-		keys = append(keys, k)
+184-	}
+185-	sort.Strings(keys)
+--
+272-}
+273-
+274-func stateRoot(p EntryFencePlan) (string, error) {
+275:	base := os.Getenv("ProgramData")
+276-	if base == "" || !filepath.IsAbs(base) {
+277:		return "", errors.New("ProgramData unavailable")
+278-	}
+279-	if !validOperation(p.OperationID) {
+280-		return "", errors.New("operation invalid")
+281-	}
+282-	h := digest([]byte(strings.ToLower(p.DataRoot.FinalUTF16) + "\x00" + p.DataRoot.FileID))
+283-	return filepath.Join(base, "ResearchOS", "RecoveryBoundary", h, p.OperationID), nil
+284-}
+285-
+286:func readRecord(p EntryFencePlan) (boundaryRecord, error) {
+287-	var r boundaryRecord
+288-	dir, e := stateRoot(p)
+289-	if e != nil {
+290-		return r, e
+291-	}
+292-	// The operation directory and every record must be independently protected.
+293-	if e = checkManagedDirectory(dir, p.ManagementSID); e != nil {
+294-		return r, e
+295-	}
+296-	entries, e := os.ReadDir(dir)
+297-	if e != nil {
+298-		return r, e
+299-	}
+300-	if len(entries) < 2 || len(entries) > 22 {
+301-		return r, errors.New("boundary state inventory invalid")
+302-	}
+303-	for _, entry := range entries {
+304-		if entry.IsDir() || (entry.Name() != "plan.json" && entry.Name() != "pre.json" && entry.Name() != "post.json" && !strings.HasPrefix(entry.Name(), "event-")) {
+--
+384-	return nil
+385-}
+386-
+387:func checkFence(p EntryFencePlan, holds []nativeHold) error {
+388-	byPath := map[string]FileIdentity{}
+389-	for _, h := range holds {
+390-		byPath[strings.ToLower(h.path)] = h.identity
+391-	}
+392-	for _, t := range p.Targets {
+393-		x, ok := byPath[strings.ToLower(t.File.Path)]
+394:		if !ok || !identityEqual(x, t.File) || t.InstalledSD == "" || x.SecurityDescriptor != t.InstalledSD {
+395-			return errors.New("fence target readback mismatch")
+396-		}
+397-		// Exact deny ACE is verified from the installed descriptor, not a caller bool.
+398-		access := "FX"
+399-		if t.Mode == "script" {
+400-			access = "RD"
+401-		}
+402:		if !strings.Contains(x.SecurityDescriptor, "(D;;"+access+";;;"+p.BusinessSID+")") {
+403-			return errors.New("business SID deny ACE missing")
+404-		}
+405-	}
+406-	return nil
+407-}
+408-
+409-// OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
+410-// retains native no-delete holds through the caller's actual outer transaction.
+411-func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+412-	if e := ctx.Err(); e != nil {
+413-		return nil, e
+414-	}
+415-	if held == nil || !held.Held() || held.Root() != dataRoot || database != filepath.Join(dataRoot, "researchos.sqlite") || !validOperation(operationID) || !validDigest(planSHA256) {
+416-		return nil, errors.New("current quiescence held lease or binding invalid")
+417-	}
+418-	lease, e := held.MaintenanceIdentity()
+419-	if e != nil {
+420-		return nil, e
+421-	}
+422:	// Discovery is by fixed ProgramData inventory. We never accept a path from
+423-	// a caller or a JSON supplied capability.
+424-	p, e := discoverPlan(dataRoot, operationID, planSHA256)
+425-	if e != nil {
+426-		return nil, e
+427-	}
+428-	if e = ValidatePlan(p); e != nil {
+429-		return nil, e
+430-	}
+431-	if p.DataRoot.Path != dataRoot || p.Database.Path != database {
+432-		return nil, errors.New("current quiescence source mismatch")
+433-	}
+434-	holds, e := openPlanHolds(p)
+435-	if e != nil {
+436-		return nil, e
+437-	}
+438-	fail := func(e error) (*CurrentQuiescence, error) { closeHolds(holds); return nil, e }
+439-	r, e := readRecord(p)
+440-	if e != nil {
+--
+461-
+462-func discoverPlan(root, operation, sha string) (EntryFencePlan, error) {
+463-	var p EntryFencePlan
+464:	base := os.Getenv("ProgramData")
+465-	if base == "" {
+466:		return p, errors.New("ProgramData unavailable")
+467-	}
+468-	parent := filepath.Join(base, "ResearchOS", "RecoveryBoundary")
+469-	entries, e := os.ReadDir(parent)
+470-	if e != nil {
+471-		return p, e
+472-	}
+473-	if len(entries) > 128 {
+474-		return p, errors.New("boundary root inventory too large")
+475-	}
+476-	var found int
+477-	for _, entry := range entries {
+478-		if !entry.IsDir() || !validDigest(entry.Name()) {
+479-			return p, errors.New("unknown boundary root inventory")
+480-		}
+481-		path := filepath.Join(parent, entry.Name(), operation, "plan.json")
+482-		raw, e := os.ReadFile(path)
+483-		if errors.Is(e, os.ErrNotExist) {
+484-			continue
+
+Algorithm : SHA256
+Hash      : EA72883E28DD7C7A37D0FE3FA85957E9406CB774EBF716DE791E69D635559981
+Path      : D:\作品集\ResearchOS\research-os\.local\worktrees\qualification-maintenance-c57-20261025\internal\recoveryb
+            oundary\boot_windows.go
+

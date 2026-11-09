@@ -1,0 +1,30 @@
+from pathlib import Path
+import ast,hashlib,json,datetime,difflib
+R=Path('D:/作品集/ResearchOS/research-os');N=R/'execution/v2.4/receipts/W05/W05-99/integration_codex/parallel-source-and-go3-r320';OLD=R/'execution/v2.4/receipts/W05/W05-99/root_registration_r320_readonly_review_codex/720240f461ab4fd888837d9d3ba3f72d';O=R/'execution/v2.4/receipts/W05/W05-99/root_registration_r320_readonly_review_codex/7084b5d24e55482b8c8daa1ea920d3e9'
+checks=[]
+def ref(p):
+ p=Path(p);p=p if p.is_absolute() else R/p;b=p.read_bytes();return dict(path=p.relative_to(R).as_posix(),sha256=hashlib.sha256(b).hexdigest(),bytes=len(b))
+def ck(n,b):checks.append(dict(check=n,passed=bool(b)))
+def put(n,x):
+ with (O/n).open('xb') as f:f.write((json.dumps(x,ensure_ascii=False,indent=2,allow_nan=False)+'\n').encode('utf-8'))
+ return ref(O/n)
+def doc(p):return json.loads(Path(p).read_bytes())
+old=doc(OLD/'review.json');ck('prior review',ref(OLD/'review.json')['sha256']=='fdc5a813f9181c274f70697edfb742e6ba47bf3c9c46020cfb1419a9db6f749a');au=doc(R/old['audit_ref']['path']);ck('prior audit intact',ref(R/old['audit_ref']['path'])==old['audit_ref']);ck('103 checks preserved',len(au['checks'])==103 and all(x['passed'] for x in au['checks']))
+binding=doc(N/'sealer-fix.binding.json');ck('binding pin',ref(N/'sealer-fix.binding.json')['sha256']=='f19bb6a2010a439e95c89a6817a2e1869570a6a4102c1f025b244f4c15b8008d')
+for key in ['old_unexecuted_sealer_ref','executable_sealer_ref','prepared_ref','go3_review_ref','w09_review_ref']:ck('binding '+key,ref(binding[key]['path'])==binding[key])
+a=(N/'seal.py').read_bytes();b=(N/'seal.v2.py').read_bytes();change=binding['exact_change'];newline=b'\r\n' if b'\r\n' in a else b'\n';oldneedle=change['old'].encode();newneedle=change['new'].replace('\n',newline.decode()).encode();ck('one exact replacement',a.count(oldneedle)==1 and a.replace(oldneedle,newneedle)==b);ast.parse(b);ck('AST v2',True)
+with (O/'seal.v2.original.py').open('xb') as f:f.write(b)
+with (O/'seal.diff.txt').open('xb') as f:f.write(''.join(difflib.unified_diff(a.decode().splitlines(True),b.decode().splitlines(True),fromfile='seal.py',tofile='seal.v2.py')).encode())
+p=doc(N/'prepared_refs.json');ck('actual review pins',binding['go3_review_ref']==p['pins']['go3_review'] and binding['w09_review_ref']==p['pins']['w09_review'])
+for key,name in [('register_sha256','register.py'),('wrapper_sha256','run.py'),('prepared_refs_sha256','prepared_refs.json'),('audit_sha256','audit.json')]:ck('unchanged '+name,ref(N/name)['sha256']==old[key])
+copies=[];raws=[]
+for original,prior in zip(p['canonical_before'],old['copied_canonical_before_refs']):
+ raw=(R/prior['path']).read_bytes();ck('prior copied pin '+original['path'],hashlib.sha256(raw).hexdigest()==original['sha256'] and len(raw)==original['bytes']);ck('current exact '+original['path'],raw==(R/original['path']).read_bytes());q=O/Path(prior['path']).name
+ with q.open('xb') as f:f.write(raw)
+ copies.append(ref(q));raws.append(raw)
+cp,ow=[json.loads(x) for x in raws[:2]];ck('actual319147413',[cp['revision'],ow['revision'],len(cp['failure_counters'])]==[319,147,413]);ck('source list not accepted',cp['work_in_progress']['session_list_identity_source_ready'] is False)
+for original,raw in zip(p['canonical_before'],raws):ck('after same '+original['path'],(R/original['path']).read_bytes()==raw)
+failed=[x for x in checks if not x['passed']];audit=put('narrow-audit.json',dict(checks=checks,prior_103_checks_ref=old['audit_ref'],no_repeated_Git_or_full_refs=True,actual_candidate_or_registration_execution=False,new_failure_origins=[]))
+review=put('review.json',dict(schema='researchos.root-registration-source-review.v1',reviewer='codex:/root/w05_merge_review',decision='REGISTRATION_DRAFT_REVIEWED_FOR_ROOT_EXECUTION' if not failed else 'REQUEST_CHANGES',requested_changes=failed,actual_registration_executed=False,expected_before=[319,147,413],expected_after=[320,148,417],register_sha256=old['register_sha256'],wrapper_sha256=old['wrapper_sha256'],prepared_refs_sha256=old['prepared_refs_sha256'],audit_sha256=old['audit_sha256'],canonical_before=p['canonical_before'],copied_canonical_before_refs=copies,sealer_ref=ref(N/'seal.v2.py'),sealer_fix_binding_ref=ref(N/'sealer-fix.binding.json'),superseded_unexecuted_sealer_ref=ref(N/'seal.py'),prior_request_changes_review_ref=ref(OLD/'review.json'),prior_full_static_audit_ref=old['audit_ref'],narrow_audit_ref=audit,resolved_finding='R320-SEAL-01: exact one replacement binds actual go3_review and w09_review. Execute seal.v2.py only; old seal.py preserved unexecuted.',verified_scope='Only W09 exact4 source append/static format lease and Root exact3 once debug-component grant after actual registration+v2 seal. Existing Root14 not relaunched or accepted. No source/Main/formal acceptance.',source_acceptance=False,Main_integration_authorized=False,formal_increment=0,new_failure_origins=[],limitations=['Prior103 checks retained with their actual raw; this supplement rechecks only exact sealer delta/pins and four current canonical bytes. No Git/full resource rerun.','Registration wrapper/register must still perform their actual prelaunch and per-replace current guards. Root must use pinned v2 sealer and preserve original failure history.','Go3 actual grant is created only after registered+sealed evidence exists, with nonempty actual authority refs. No helper/controller/product execution performed by reviewer.']))
+mf=put('manifest.json',dict(entries=[ref(q) for q in sorted(O.iterdir()) if q.is_file()],self_excluded=True));ho=put('handoff.json',dict(decision='REGISTRATION_DRAFT_REVIEWED_FOR_ROOT_EXECUTION' if not failed else 'REQUEST_CHANGES',review_ref=review,manifest_ref=mf,sealer_ref=ref(N/'seal.v2.py'),actual_registration_executed=False,new_failure_origins=[]))
+print(json.dumps(dict(review=review,manifest=mf,handoff=ho,checks=len(checks),failed=failed),ensure_ascii=False))

@@ -1,0 +1,51 @@
+--- v2/controller.py
++++ v1/controller.py
+@@ -25,9 +25,8 @@
+ def pinned(reference):
+     path=Path(reference["path"])
+     require(path.is_absolute() and path.is_file(),"absolute existing pin required")
+-    raw=path.read_bytes()
+-    require({"path":str(path),"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw)}==reference,"pinned input changed")
+-    return path,raw
++    require(pin(path)==reference,"pinned input changed")
++    return path,path.read_bytes()
+ 
+ def module(reference,name):
+     path,raw=pinned(reference);m=types.ModuleType(name);m.__file__=str(path)
+@@ -90,22 +89,7 @@
+     exclusive_json(phase_dir/"canonical-lease.activated.json",result)
+     return result
+ 
+-def cleanup_confirmed(result):
+-    if type(result) is not dict:return False
+-    c=result.get("job_cleanup",{})
+-    return (type(c) is dict and c.get("errors")==[] and
+-            c.get("active_processes_last_observed")==0 and
+-            all(c.get(k) is True for k in
+-                ("primary_exit_confirmed","job_idle_confirmed","handles_closed")))
+-
+ def close_canonical_lease(doc,phase_dir,native_result,error):
+-    if not cleanup_confirmed(native_result):
+-        return exclusive_json(phase_dir/"canonical-lease.retained-unconfirmed.json",{
+-            "run_uuid":doc["run_uuid"],"state":"CLEANUP_UNCONFIRMED_ACTIVE_LEASE_RETAINED",
+-            "native_result":native_result,"exception":error,
+-            "checkpoint_ref":pin(ROOT/"execution/v2.4/checkpoint.json"),
+-            "ownership_ref":pin(ROOT/"execution/v2.4/path_ownership.json"),
+-            "automatic_recovery":False,"formal_acceptance":False})
+     cp_path=ROOT/"execution/v2.4/checkpoint.json";ow_path=ROOT/"execution/v2.4/path_ownership.json"
+     cp_raw,ow_raw=cp_path.read_bytes(),ow_path.read_bytes();cp,ow=json.loads(cp_raw),json.loads(ow_raw)
+     require(cp["work_in_progress"].get("mu_sdk_active_run_uuid")==doc["run_uuid"],"cannot close another active phase")
+@@ -144,13 +128,6 @@
+             deadline-time.monotonic()>1,"invalid or exhausted trial deadline")
+     source_path,_=pinned(seed["runner_source"]);engine=module(seed["runner_source"],"root_phase_basis_engine")
+     public_env=dict(seed["public_environment"])
+-    allowed_env={"SystemRoot","WINDIR","ComSpec","PATH","PATHEXT",
+-                 "USERPROFILE","LOCALAPPDATA","APPDATA","TEMP","TMP"}
+-    require(set(public_env)<=allowed_env and all(type(k) is str and type(v) is str
+-            and "\x00" not in k and "\x00" not in v for k,v in public_env.items()),
+-            "public process environment is not closed")
+-    require(public_env.get("SystemRoot")=="C:/Windows" and
+-            public_env.get("WINDIR")=="C:/Windows","unexpected Windows system root")
+     public_os=types.ModuleType("root_frozen_public_os")
+     public_os.__dict__.update(vars(os));public_os.environ=public_env
+     engine.os=public_os

@@ -1,0 +1,92 @@
+    rows = []
+    for path in sorted({Path(path).resolve() for path in paths}, key=lambda item: str(item).lower()):
+        if not regular(path):
+            raise RuntimeError(f"build input missing or redirected: {path}")
+        rows.append({"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size})
+    return rows
+
+
+def go_compiled_closure(go_lists, toolchain_root):
+    paths = set()
+    package_count = 0
+    fields = ("GoFiles", "CompiledGoFiles", "CgoFiles", "CFiles", "CXXFiles", "MFiles",
+              "HFiles", "FFiles", "SFiles", "SwigFiles", "SwigCXXFiles", "SysoFiles", "EmbedFiles")
+    for raw in go_lists:
+        for package in json_stream(raw):
+            package_count += 1
+            directory = Path(package["Dir"])
+            for field in fields:
+                for name in package.get(field, []):
+                    source = Path(name)
+                    paths.add(source if source.is_absolute() else directory / source)
+            module = package.get("Module") or {}
+            if module.get("GoMod"):
+                paths.add(Path(module["GoMod"]))
+    tool_dir = Path(toolchain_root) / "pkg/tool/windows_amd64"
+    tools = sorted(tool_dir.glob("*.exe"))
+    if package_count < 20 or not tools:
+        raise RuntimeError("Go package/toolchain closure incomplete")
+    paths.update(tools)
+    for name in ["go.env", "VERSION"]:
+        path = Path(toolchain_root) / name
+        if path.is_file():
+            paths.add(path)
+    return {"package_count": package_count, "tool_count": len(tools), "files": file_rows(paths)}
+
+
+def mu_vendor_closure(common):
+    manifest = json.loads((common / "third_party/mu.MANIFEST.json").read_bytes())
+    entries = manifest.get("entries") or {}
+    if manifest.get("files") != 5083 or len(entries) != 5083:
+        raise RuntimeError("public Mu 5083-file manifest unavailable")
+    paths = []
+    for relative, expected in entries.items():
+        if not relative.startswith("third_party/mu/") or ".." in Path(relative).parts:
+            raise RuntimeError("Mu vendor manifest path invalid")
+        path = common / relative
+        if not regular(path) or path.stat().st_size != expected["size"] or sha256(path) != expected["sha256"]:
+            raise RuntimeError(f"public Mu vendor source changed: {relative}")
+        paths.append({"path": str(path.resolve()), "sha256": expected["sha256"], "bytes": expected["size"]})
+    return sorted(paths, key=lambda row: row["path"].lower())
+
+
+MU_META_SCRIPT = r'''
+{
+  "schema": "researchos.desktop-complete-tree-build-invocation.v1",
+  "scope_sha256": "a9e0c1b29282468b2d7a10d2cbd3db88feaa673b8480e0aab3d6176019bc7ab3",
+  "source_freeze_sha256": "6d885a649bb020d702487d5331f394cc43b3fd1c22d00a11822289ba7d644d3b",
+  "cwd": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\desktop-main7d-native-20261025",
+  "environment": {
+    "TEMP": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\desktop-main7d-native-20261025\\.local\\test-tmp-01",
+    "TMP": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\desktop-main7d-native-20261025\\.local\\test-tmp-01",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "commands": [
+    {
+      "argv": [
+        "C:\\Users\\yqyyds\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+        "-B",
+        "-X",
+        "utf8",
+        "apps/desktop/build-development.py",
+        "--go",
+        "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\go1.27.1\\go\\bin\\go.exe",
+        "--node",
+        "C:\\nvm4w\\nodejs\\node.exe",
+        "--electron-dist",
+        "D:\\作品集\\ResearchOS\\research-os\\apps\\desktop\\node_modules\\electron\\dist",
+        "--module-cache",
+        "D:\\作品集\\ResearchOS\\research-os\\.local\\tools\\gopath\\pkg\\mod",
+        "--web-modules",
+        "D:\\作品集\\ResearchOS\\research-os\\apps\\web\\node_modules",
+        "--mu-common",
+        "D:\\作品集\\ResearchOS\\research-os",
+        "--output",
+        "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\desktop-main7d-native-20261025\\.local\\desktop-complete-20261025-01",
+        "--receipts",
+        "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\desktop_main7d_native_codex\\20261025-current-chat\\complete-tree\\build-01"
+      ],
+      "name": "build"
+    }
+  ]
+}

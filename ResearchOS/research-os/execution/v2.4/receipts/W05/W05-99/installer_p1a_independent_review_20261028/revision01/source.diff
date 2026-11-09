@@ -1,0 +1,313 @@
+diff --git a/ops/release/product_installer/build.py b/ops/release/product_installer/build.py
+index e2fc37eb..a2a3a450 100644
+--- a/ops/release/product_installer/build.py
++++ b/ops/release/product_installer/build.py
+@@ -21,6 +21,8 @@ SOURCE_COMMIT = "5c4c94022bd92da68ef544f2779527bfe065c428"
+ VERIFIER_PATH = "apps/desktop/resources/control/runtime-verifier-installation.json"
+ HASH = re.compile(r"[0-9a-f]{64}\Z")
+ ROLES = ("cli", "control", "electron", "verifier", "validator")
++REVISION_SCOPE = Path(r"D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\resume_cp528_codex\20261025-current-chat\continuation-cp570\Installer-P1a-exact4-revision-scope.json")
++REVISION_SCOPE_SHA256 = "27a928d09ede129bab29090d4db9c7705354fd02cb2788fad0db80922ec3b3bf"
+ 
+ 
+ def digest(data):
+@@ -107,6 +109,65 @@ def source_extras(root, rows):
+             for key, name in sorted(exact_tree(root).items()) if key not in expected]
+ 
+ 
++def canonical_path(value, require_existing=False):
++    """Reject lexical aliases and existing Windows reparse/case aliases."""
++    if not isinstance(value, str) or not Path(value).is_absolute() or os.path.normpath(value) != value:
++        raise ValueError(f"noncanonical absolute path: {value!r}")
++    path = Path(value)
++    if not re.fullmatch(r"[A-Z]:\\", path.anchor):
++        raise ValueError(f"canonical drive path required: {value!r}")
++    current = Path(path.anchor)
++    for part in path.parts[1:]:
++        if part.endswith((".", " ")) or part in (".", ".."):
++            raise ValueError(f"noncanonical path component: {part!r}")
++        if not current.is_dir():
++            break
++        names = os.listdir(current)
++        if part not in names:
++            if any(name.casefold() == part.casefold() for name in names):
++                raise ValueError(f"case alias path component: {part!r}")
++            break
++        current /= part
++        stat = current.lstat()
++        if current.is_symlink() or getattr(stat, "st_file_attributes", 0) & 0x400:
++            raise ValueError(f"reparse ancestor: {current}")
++    if require_existing and not path.is_dir():
++        raise ValueError(f"required directory absent: {value}")
++    if path.resolve(strict=False) != path:
++        raise ValueError(f"redirected path: {value}")
++    return path
++
++
++def related(left, right):
++    l, r = str(left).casefold(), str(right).casefold()
++    return l == r or l.startswith(r + os.sep.casefold()) or r.startswith(l + os.sep.casefold())
++
++
++def validate_destinations(candidate_raw, output_raw, receipts_raw, artifact_raw, receipt_root_raw):
++    candidate = canonical_path(candidate_raw, require_existing=True)
++    artifact = canonical_path(artifact_raw, require_existing=True)
++    receipt_root = canonical_path(receipt_root_raw, require_existing=True)
++    output = canonical_path(output_raw)
++    receipts = canonical_path(receipts_raw)
++    if output.parent != artifact or receipts.parent != receipt_root:
++        raise ValueError("output and receipts must be direct children of authorized roots")
++    if any(related(a, b) for a, b in ((candidate, output), (candidate, receipts),
++                                       (candidate, artifact), (candidate, receipt_root),
++                                       (output, receipts), (artifact, receipt_root))):
++        raise ValueError("source, output and receipt roots overlap")
++    if output.exists() or receipts.exists():
++        raise ValueError("output and receipts must be create-new")
++    return candidate, output, receipts
++
++
++def bound_roots(scope_raw):
++    scope = canonical_path(scope_raw)
++    if scope != REVISION_SCOPE or digest(scope.read_bytes()) != REVISION_SCOPE_SHA256:
++        raise ValueError("revision scope differs from approved exact4 authority")
++    document = json.loads(scope.read_bytes())
++    return document["artifact_root"], document["receipt_root"]
++
++
+ def freeze(candidate):
+     marker_path = candidate / "installed-product.json"
+     if regular(marker_path).st_size != 20401 or digest(marker_path.read_bytes()) != MARKER_SHA256:
+@@ -140,14 +201,11 @@ def freeze(candidate):
+                                   if key not in ("executable", "executable_hash")}}
+ 
+ 
+-def build(args):
+-    candidate, output, receipts = (Path(value).absolute() for value in
+-                                   (args.candidate, args.output, args.receipts))
+-    if output.exists() or receipts.exists():
+-        raise ValueError("output and receipts must be create-new")
+-    local = ROOT / ".local"
+-    if not output.is_relative_to(local) or candidate == output or output.is_relative_to(candidate):
+-        raise ValueError("output must be isolated under worktree .local")
++def build(args, authorized_roots=None):
++    args._owned_receipts = None
++    artifact_root, receipt_root = authorized_roots or bound_roots(args.scope)
++    candidate, output, receipts = validate_destinations(
++        args.candidate, args.output, args.receipts, artifact_root, receipt_root)
+     locked = json.loads((ROOT / "execution/toolchains/locked.json").read_bytes())["tools"]
+     go = Path(args.go).absolute()
+     if digest(go.read_bytes()) != locked["go"]["sha256"]:
+@@ -155,8 +213,10 @@ def build(args):
+     manifest = freeze(candidate)
+     source_extra_before = source_extras(candidate, json.loads((candidate / "installed-product.json").read_bytes())["files"])
+     raw = encode(manifest)
+-    output.mkdir(parents=True, exist_ok=False)
+-    receipts.mkdir(parents=True, exist_ok=False)
++    receipts.mkdir(exist_ok=False)
++    owned = receipts.lstat()
++    args._owned_receipts = (receipts, owned.st_dev, owned.st_ino)
++    output.mkdir(exist_ok=False)
+     (receipts / "candidate-before.json").write_bytes(encode({"marker_sha256": MARKER_SHA256,
+         "source_commit": SOURCE_COMMIT, "files": len(manifest["files"]),
+         "unreviewed_source_extras_excluded": source_extra_before}))
+@@ -205,17 +265,32 @@ def build(args):
+     print((receipts / "result.json").read_text(encoding="utf-8"), end="")
+ 
+ 
++def write_owned_failure(args, exc):
++    owned = getattr(args, "_owned_receipts", None)
++    if owned is None:
++        return False
++    target, device, inode = owned
++    try:
++        stat = target.lstat()
++        if stat.st_dev != device or stat.st_ino != inode or target.is_symlink() or \
++                getattr(stat, "st_file_attributes", 0) & 0x400:
++            return False
++        with (target / "failed.json").open("xb") as file:
++            file.write(encode({"status": "FIRST_FAILURE_RETAINED",
++                "error_type": type(exc).__name__, "error": str(exc)}))
++        return True
++    except (OSError, ValueError):
++        return False
++
++
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+-    for flag in ("candidate", "output", "receipts", "go"):
++    for flag in ("candidate", "output", "receipts", "go", "scope"):
+         parser.add_argument("--" + flag, required=True)
+     arguments = parser.parse_args()
+     try:
+         build(arguments)
+     except Exception as exc:
+-        target = Path(arguments.receipts)
+-        if target.is_dir() and not (target / "failed.json").exists():
+-            (target / "failed.json").write_bytes(encode({"status": "FIRST_FAILURE_RETAINED",
+-                "error_type": type(exc).__name__, "error": str(exc)}))
++        write_owned_failure(arguments, exc)
+         print(f"static payload build refused: {exc}", file=sys.stderr)
+         raise SystemExit(1)
+diff --git a/ops/release/product_installer/finalize/main.go b/ops/release/product_installer/finalize/main.go
+index 5a74e385..ef3b44d4 100644
+--- a/ops/release/product_installer/finalize/main.go
++++ b/ops/release/product_installer/finalize/main.go
+@@ -296,6 +296,25 @@ func writeNew(path string, raw []byte) error {
+ 	return closeErr
+ }
+ 
++// MoveFileW fails if target exists. os.Rename replaces an existing target on
++// Windows, so it cannot publish the marker under the create-new contract.
++func publishMarkerNoReplace(temp, target string, beforeMove func() error) error {
++	if beforeMove != nil {
++		if err := beforeMove(); err != nil {
++			return err
++		}
++	}
++	from, err := syscall.UTF16PtrFromString(temp)
++	if err != nil {
++		return err
++	}
++	to, err := syscall.UTF16PtrFromString(target)
++	if err != nil {
++		return err
++	}
++	return syscall.MoveFile(from, to)
++}
++
+ func finalize(root, manifest string, bound string) (string, error) {
+ 	raw, err := os.ReadFile(manifest)
+ 	if err != nil {
+@@ -349,13 +368,7 @@ func finalize(root, manifest string, bound string) (string, error) {
+ 	if err = writeNew(temp, markerRaw); err != nil {
+ 		return "", err
+ 	}
+-	if _, err = os.Lstat(filepath.Join(root, markerPath)); err == nil {
+-		return "", errors.New("product marker already exists")
+-	}
+-	if !errors.Is(err, os.ErrNotExist) {
+-		return "", err
+-	}
+-	if err = os.Rename(temp, filepath.Join(root, markerPath)); err != nil {
++	if err = publishMarkerNoReplace(temp, filepath.Join(root, markerPath), nil); err != nil {
+ 		return "", err
+ 	}
+ 	return marker["installation_id"].(string), nil
+diff --git a/ops/release/product_installer/finalize/main_test.go b/ops/release/product_installer/finalize/main_test.go
+index 56053a17..479578b3 100644
+--- a/ops/release/product_installer/finalize/main_test.go
++++ b/ops/release/product_installer/finalize/main_test.go
+@@ -225,3 +225,46 @@ func TestRejectJunctionDirectory(t *testing.T) {
+ 		t.Fatal("junction directory accepted")
+ 	}
+ }
++
++func TestPublishMarkerNoReplace(t *testing.T) {
++	for _, scenario := range []string{"success", "preexisting", "appears-before-commit"} {
++		t.Run(scenario, func(t *testing.T) {
++			root := t.TempDir()
++			temp := filepath.Join(root, ".installed-product.json.tmp")
++			target := filepath.Join(root, markerPath)
++			if err := writeNew(temp, []byte("new marker")); err != nil {
++				t.Fatal(err)
++			}
++			var hook func() error
++			if scenario == "preexisting" {
++				if err := writeNew(target, []byte("owned sentinel")); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if scenario == "appears-before-commit" {
++				hook = func() error { return writeNew(target, []byte("racing sentinel")) }
++			}
++			err := publishMarkerNoReplace(temp, target, hook)
++			actual, readErr := os.ReadFile(target)
++			if readErr != nil {
++				t.Fatal(readErr)
++			}
++			if scenario == "success" {
++				if err != nil || string(actual) != "new marker" {
++					t.Fatalf("publication failed: %v, %q", err, actual)
++				}
++				if _, statErr := os.Stat(temp); !os.IsNotExist(statErr) {
++					t.Fatal("temp marker not consumed")
++				}
++				return
++			}
++			want := "owned sentinel"
++			if scenario == "appears-before-commit" {
++				want = "racing sentinel"
++			}
++			if err == nil || string(actual) != want {
++				t.Fatalf("target clobbered: %v, %q", err, actual)
++			}
++		})
++	}
++}
+diff --git a/tests/release/product_installer_build_test.py b/tests/release/product_installer_build_test.py
+index 0115bfc5..c2ce8304 100644
+--- a/tests/release/product_installer_build_test.py
++++ b/tests/release/product_installer_build_test.py
+@@ -1,6 +1,9 @@
+ """Focused source-side checks for static P1a payload construction."""
+ import importlib.util
+ from pathlib import Path
++import subprocess
++import tempfile
++from types import SimpleNamespace
+ import unittest
+ 
+ MODULE = Path(__file__).resolve().parents[2] / "ops/release/product_installer/build.py"
+@@ -24,6 +27,52 @@ class BuildValidationTests(unittest.TestCase):
+             with self.subTest(name=name), self.assertRaises(ValueError):
+                 builder.validate_row({**good, "path": name})
+ 
++    def test_dotdot_escape_and_overlapping_roots_refused(self):
++        with tempfile.TemporaryDirectory() as temp:
++            base = Path(temp)
++            source, artifacts, receipts = (base / name for name in ("source", "artifacts", "receipts"))
++            for path in (source, artifacts, receipts):
++                path.mkdir()
++            with self.assertRaisesRegex(ValueError, "noncanonical"):
++                builder.validate_destinations(str(source), str(artifacts / ".." / "escape"),
++                                              str(receipts / "run"), str(artifacts), str(receipts))
++            with self.assertRaisesRegex(ValueError, "overlap"):
++                builder.validate_destinations(str(source), str(source / "output"),
++                                              str(receipts / "run"), str(source), str(receipts))
++
++    def test_junction_ancestor_refused(self):
++        with tempfile.TemporaryDirectory() as temp:
++            base = Path(temp)
++            source, actual, link, receipts = (base / name for name in
++                                              ("source", "actual-artifacts", "link-artifacts", "receipts"))
++            for path in (source, actual, receipts):
++                path.mkdir()
++            setup = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(actual)],
++                                   capture_output=True)
++            self.assertEqual(setup.returncode, 0, setup.stderr)
++            with self.assertRaisesRegex(ValueError, "reparse"):
++                builder.validate_destinations(str(source), str(link / "output"),
++                                              str(receipts / "run"), str(link), str(receipts))
++
++    def test_preexisting_receipts_remain_byte_for_byte(self):
++        with tempfile.TemporaryDirectory() as temp:
++            base = Path(temp)
++            source, artifacts, receipts = (base / name for name in ("source", "artifacts", "receipts"))
++            for path in (source, artifacts, receipts):
++                path.mkdir()
++            occupied = receipts / "run"
++            occupied.mkdir()
++            sentinel = occupied / "sentinel.txt"
++            sentinel.write_bytes(b"do not touch")
++            args = SimpleNamespace(candidate=str(source), output=str(artifacts / "new"),
++                                   receipts=str(occupied), go="unused", scope="unused")
++            before = {path.name: path.read_bytes() for path in occupied.iterdir()}
++            with self.assertRaisesRegex(ValueError, "create-new") as raised:
++                builder.build(args, authorized_roots=(str(artifacts), str(receipts)))
++            self.assertFalse(builder.write_owned_failure(args, raised.exception))
++            self.assertEqual(before, {path.name: path.read_bytes() for path in occupied.iterdir()})
++            self.assertFalse((artifacts / "new").exists())
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

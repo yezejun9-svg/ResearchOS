@@ -1,0 +1,1314 @@
+# 05｜任务拆分与执行 DAG
+
+版本：2.0.0。所有任务当前为 **NOT_STARTED**，所有产品验证为 **NOT_RUN**。本文件是可执行实施合同，不是完成报告；机器权威清单为 `contracts/tasks.json`。任务的规划状态与运行期 Task 状态机分开。
+
+默认首个被管理项目是这个实施包对应的 ResearchOS 自身，工作在新建隔离仓库。其他项目必须显式导入。角色是职责，实际模型/执行器由已授权且资格有效的能力登记选择；不预设某品牌或所有已调研组件必须安装。
+
+## 1. 执行顺序与通过规则
+
+`depends_on` 表示施工任务最终接受依赖。W00–W21 由外部独立 Verifier Agent/程序依据真实证据和 `execution/bootstrap_ledger.json` 推进；W00–W06 用文件冻结上下文，不依赖尚未实现的 ProjectState、ContextBundle 或 AcceptanceService。W06 后可把历史回执按来源导入/投影为 Artifact，不能追认早期已有产品验收服务。实现、fixture、live 分开记账；代码存在、退出码 0、模型高分或平台 done 均不足以完成任务。
+
+每个任务的 `task_gate_checks` 是本阶段能实际执行的子门。`acceptance_ids` 仅作追踪/回归关联，不能要求 W00/W01 等提前执行尚未实现的整套产品；`owned_acceptance_ids` 指定正式用例唯一最终负责人。阶段子门 PASS 不等于全例 PASS，未执行断言保留 NOT_RUN/PARTIAL。W21 必须审查全部 42 例完整有效结果。
+
+**架构先决条件：W01 先完成 CORE-01 并冻结唯一 selected_route，W02 才生成所选路线的实际结构、依赖与命令。** Paperclip 通过则使用其唯一组织/调度权与 PostgreSQL 域扩展；否则回退 Go/React/SQLite 薄核心。禁止同时实现两套调度器。`/v1` 是 ResearchOS 的合同，不冒充上游现有接口。
+
+W01 最多评估两种集成方案，每种最多修复一次。若关键不变量失败、证据不足或改动不可维护，就记录失败并选择薄核心；“通过回退路线选择”不等于“Paperclip 资格 PASS”。薄核心相同不变量在后续任务仍须实测。
+
+### 可并行批次
+
+以下是按依赖机械计算的最早拓扑层，不是必须整批等待的瀑布阶段；某节点自己的依赖完成即可启动。实际同时运行默认不超过 2 个，有文件或资源冲突时进一步串行。
+
+| 批次 | 可开始的任务 |
+|---|---|
+| B00 | W00 |
+| B01 | W01 |
+| B02 | W02 |
+| B03 | W03 |
+| B04 | W04、W05、W07 |
+| B05 | W06、W09 |
+| B06 | W08、W10、W12 |
+| B07 | W11、W13、W18 |
+| B08 | W14、W17 |
+| B09 | W15、W19 |
+| B10 | W16 |
+| B11 | W20 |
+| B12 | W21 |
+
+不含工时估算的最长依赖链示例：`W00 → W01 → W02 → W03 → W04 → W06 → W10 → W11 → W14 → W15 → W16 → W20 → W21`。真实关键路径须按实际耗时更新；X/Jev 凭据、Windows/手机环境与隔夜观测可能成为外部等待瓶颈，不能靠压缩文字汇报消除。
+
+### 缺资源时继续的范围
+
+若上游仅缺 live 资源，而已冻结的接口、数据与开发/fixture 证据足够，下游可开 `development_only` 子阶段，并明确记录假设、阻塞的 gate、ResourceRequest 和以后要重验的版本。上游任务仍未被最终接受，`depends_on` 不删除；后继的真实组合运行和最终交付仍等待受影响 live 门。
+
+例如 X 不可用时 GitHub/论文照常运行并标 PARTIAL，UI 与离线验收可以继续；最终 A13 仍须三类真实来源与真实 Jev。Jev 校准不达自动资格时可停在 SHADOW/ADVISORY，产品可完成；缺少真实调用则不能把 fixture 校准当作真实资格。缺资源产生一次性聚合请求，备用账号必须已授权、能力等价且用途资格有效。
+
+## 2. 命令、路径与并行归属
+
+本规格使用逻辑 `verification_command_keys`，不会声称尚未生成的产品命令已存在。W00 用交付包内实际 `tools/validate_package.py`；W01 在隔离沙箱准备资格脚本并记录真实命令与退出码；W02 再建立 `execution/commands.json`、dispatcher 与各键的可验证绑定。其实际可执行文件、argv、cwd、环境变量名称、超时和支持平台必须可查。
+
+W02 要实际运行骨架构建、合同验证和 dispatcher；未实现的功能测试必须非零返回 `NOT_IMPLEMENTED`，零用例不能 PASS。后续任务实现真实测试后，经命令登记 owner 原子更新绑定。执行器不可猜测命令、偷偷使用未锁定的全局工具或把密钥写入 argv/日志。W02 完成证明入口和骨架可执行，不代表全部产品测试通过。
+
+同一验证键可覆盖多个模块/阶段，实际调用必须绑定task/check/case选择器并报告实际执行的断言ID。前置任务只执行当前阶段和其最终负责用例要求的范围，不因键名相同而提前运行全部后置套件；未选择/未实现的其余断言仍NOT_RUN。FIXTURE用例可按合同加载冻结记录（例如W08用已封存的实验结果夹具检查无采用周期），不能声称已执行后续真实实验；A13/W20再验证组合后的真实服务。前端C23–C26先用真实前端和固定后端夹具验证完整交互，W20对最终真实API做集成复核，不能把mock服务部署成成品。
+
+`allowed_paths` 中的别名由 W02 写入 `execution/path_ownership.json`，解析到选定路线新仓库内的真实路径；未解析或越界路径不能写。目录是实施时创建的所有权合同，不是假称已经存在。
+
+| 别名 | 约束 |
+|---|---|
+| `WORKSPACE` | W00选定的新建隔离仓库根；不指向既有QuillClub/xiaoshuo。 |
+| `SPEC` | 仓库内只读规格快照；变更走规格提案及版本。 |
+| `EXECUTION` | 实际执行配置、路径/命令登记与逐任务receipt。 |
+| `QUALIFICATION` | 隔离资格沙箱及证据；不作为产品权威数据库。 |
+| `ADR` | 架构决定目录。 |
+| `CORE` | 唯一选定调度底座的骨架与必要扩展入口。 |
+| `DOMAIN` | ResearchOS领域实现；Paperclip路线为其PostgreSQL域扩展，薄核心为Go服务模块。 |
+| `ADAPTERS` | 来源、执行器、检索、决策等窄适配器。 |
+| `UI` | 选定路线的React工作台/插件界面。 |
+| `TESTS` | 产品测试、fixture与live测试驱动。 |
+| `OPS` | 运行、恢复、发行与安全支持。 |
+| `EVALUATION` | 冻结基准、资格报告与可追溯原始证据清单。 |
+| `DEPENDENCY_ROOT` | 实际构建工具的根声明/锁文件；只由平台整合者改。 |
+| `RELEASE` | 发行候选、manifest、SBOM与结果报告。 |
+| `DOCS` | 产品运行/安装/交接文档。 |
+| `CONTRACTS` | 仓库内当前已批准的数据/API合同副本；与只读规格快照区分，变更须独立批准的合同修订及影响分析。 |
+
+每个任务使用独立 worktree 和最小提交，不共享修改同一工作树。任务内子 Agent 也要继承范围和稳定 origin key。产物先交整合者，按 base_revision 检查后合并；过期版本先重基/重验，不能最后写入者覆盖。
+
+| 共享资源 | 唯一整合责任 |
+|---|---|
+| `contracts` | W03/合同整合者；冻结schema/API/状态变更需影响分析与独立评测。 |
+| `execution/route.json` | W01/架构整合者；后续改动需新ADR。 |
+| `execution/commands.json` | W02/平台整合者；其他任务提交绑定提案，不直接并发覆盖。 |
+| `execution/path_ownership.json` | W02/平台整合者；越界必须先原子变更归属记录。 |
+| `root_dependency_declarations_and_lockfiles` | W02/平台整合者；成员提出最小依赖变更，串行安装/锁定/构建。 |
+| `database_migration_sequence` | W03/数据库整合者分配唯一顺序；各模块在独立迁移文件提交。 |
+| `acceptance_baseline` | 独立评测 owner；执行者不能改自身判据或标签使任务通过。 |
+| `design_tokens` | W13/设计整合者；任务输出需引用同一版本。 |
+
+## 3. 任务合同
+
+
+### W00｜建立独立工作区并导入规格
+
+- **状态 / 责任**：NOT_STARTED；工程/平台组长。
+- **依赖**：无。
+- **需求 / 验收**：R02、R17、R20；A01、C02。
+- **最终负责整例**：无；只接受阶段子门。
+- **允许路径**：WORKSPACE/bootstrap/**、SPEC/**、EXECUTION/import_manifest.json、EXECUTION/project_identity.json、EXECUTION/bootstrap_ledger.json、EXECUTION/receipts/W00/**。
+- **验证键**：package.validate。
+
+**输入**
+
+1. 完整实施规格包、manifest 与参考主稿；用户已授权的当前 ResearchOS 目标；新仓库可写目录。
+
+**交付物**
+
+1. 独立 research-os 仓库与项目 ID；已核验的规格副本与摘要；导入清单；角色与写入范围；初始化 execution/receipts/W00/{run_id}.json。
+2. execution/bootstrap_ledger.json 与文件冻结上下文，由外部verifier维护的施工接受记录。
+
+**执行清单**
+
+1. 禁止自动继承 QuillClub/xiaoshuo 的身份、密钥、规则或私有文档。
+2. 默认首个被管理项目是本规格对应的 ResearchOS；其他项目必须显式导入并生成来源记录。
+3. 验证包结构与引用；记录 OS、shell、语言工具可用性和 Git 基线；缺项形成资源请求。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W00-G01 / DEVELOPMENT：校验当前规格包manifest/hash与引用，保存validator原始输出。 期望：包结构可验证；不代表产品用例已经通过。
+- W00-G02 / DEVELOPMENT：新建隔离仓库与project identity，核对没有继承现有项目私有配置。 期望：目标目录与授权范围唯一，现有项目未被写入。
+- W00-G03 / FIXTURE：用文件级导入清单模拟同名项目并核对目录/来源绑定。 期望：导入记录不串号；C02完整服务端隔离仍NOT_RUN。
+- W00-G04 / DEVELOPMENT：建立execution/bootstrap_ledger.json及冻结规格/上下文文件，由外部verifier核对。 期望：施工任务可独立推进，不需要未实现的ProjectState或验收服务。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：包结构验证与清单哈希；本步骤使用包内实际 validator。
+- FIXTURE / NOT_RUN：两个同名项目的隔离导入与不串号。
+
+**完成与证据**
+
+- 工作区身份唯一，来源包和当前修订可复查；无污染现有项目的写入。
+- 实际 validator 输出成功；导入失败项显式列出而非静默遗漏。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W00/{run_id}.json
+
+**失败/回退**
+
+- 导入不完整则回滚此次导入事务，保留诊断；不得删除已有用户目录。
+- 隔离身份不通过则阻断所有后续产品写入。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W01｜CORE-01 资格与唯一路线冻结
+
+- **状态 / 责任**：NOT_STARTED；工程架构组长＋独立评测员。
+- **依赖**：W00。
+- **需求 / 验收**：R09、R10、R12、R17；A02、C04、C10、C11。
+- **最终负责整例**：无；只接受阶段子门。
+- **允许路径**：QUALIFICATION/core/**、EXECUTION/route.json、ADR/ADR-001.md、EXECUTION/receipts/W01/**。
+- **验证键**：core.qualify。
+
+**输入**
+
+1. W00 项目身份与规格；Paperclip v2026.916.1 / d554c4789ed3930f8a53ac9fdf6503b3187097da；合同与 CORE-01 反例。
+
+**交付物**
+
+1. ADR-001；execution/route.json；实际资格脚本、完整命令回执和观察证据；Paperclip 路线或 Go/React/SQLite 薄核心回退的唯一决定。
+
+**执行清单**
+
+1. 先测 Paperclip 为唯一调度者：竞争领取、验收之前禁止后继启动、执行者不能修改或清空自身验收策略。
+2. 测伪造 run 回执、验收后产物变化、取消响应丢失、控制面重启而 Windows 子进程仍在、迟到/未知费用。
+3. Paperclip 最多 2 种集成方案，每种仅 1 次修复；仍失败、证据不清楚或需不可维护深改就选择薄核心回退。
+4. 将上游与 /v1 ResearchOS 合同分开；Paperclip 路线采用 PostgreSQL 域扩展；不再创建第二套权威任务库/派单器。
+5. W01 使用隔离资格脚本并记录真实 invocation；不依赖 W02 尚未存在的命令注册表。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W01-G01 / DEVELOPMENT：固定Paperclip基线，在隔离沙箱记录每种方案、实际命令、修复次数和证据。 期望：最多两种方案、各一次修复，所有未验证项可见。
+- W01-G02 / FIXTURE：在资格原型验证竞争领取、验收前置、伪造回执、取消/恢复/费用反例。 期望：每个反例有PASS/FAIL/BLOCKED原始结果；原型证据不冒充最终产品全例。
+- W01-G03 / LIVE_WINDOWS：执行Windows资格或明确记录不可验证/失败及回退理由。 期望：选Paperclip必须实测必要门；失败/不清楚则选择薄核心。
+- W01-G04 / DEVELOPMENT：外部verifier审查ADR-001与route.json只选择一条路线。 期望：路线选择可接受；选回退不把Paperclip结果改成PASS，A02完整实现留W06。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：上游固定版本、适配边界与升级成本审阅。
+- FIXTURE / NOT_RUN：单调度权和验收前置的故障注入。
+- LIVE_WINDOWS / NOT_RUN：固定 Paperclip 的实际 Windows 运行、取消、进程与重启；失败可形成有效回退结论。
+
+**完成与证据**
+
+- route.json 仅一条 selected_route 且有固定版本、理由、证据与副作用记录。
+- 选 Paperclip 必须具备全部必要资格；选择回退须真实记录失败/不可验证项目，不能假记 Paperclip PASS。
+- 回退决定本身可结束 W01；薄核心的相同不变量必须在后续实现重新证明。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W01/{run_id}.json
+
+**失败/回退**
+
+- 路线失败按限定尝试回退；不得无限叠加第三种调度底座。
+- 清理仅属于该资格沙箱的资源；保留命令/日志与失败证据。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W02｜选定路线的骨架、真实命令与依赖锁
+
+- **状态 / 责任**：NOT_STARTED；工程/平台组长。
+- **依赖**：W01。
+- **需求 / 验收**：R10、R17、R20；A03、A15。
+- **最终负责整例**：无；只接受阶段子门。
+- **允许路径**：CORE/**、EXECUTION/commands.json、EXECUTION/path_ownership.json、EXECUTION/command_dispatcher/**、DEPENDENCY_ROOT/**、TESTS/bootstrap/**、OPS/ci/**、CONTRACTS/**、EXECUTION/receipts/W02/**。
+- **验证键**：environment.verify、build.check、contracts.validate、package.validate。
+
+**输入**
+
+1. W01 route.json、ADR-001；包内 domain/openapi/tasks/acceptance 合同；W00 工具与平台清单。
+
+**交付物**
+
+1. 选定路线最小可构建骨架、锁文件；execution/commands.json 与可执行 dispatcher；execution/path_ownership.json；CI 起点和版本标识。
+
+**执行清单**
+
+1. 只生成 selected_route 对应结构；Paperclip 不搭第二 Go 调度器，薄核心不依赖 Paperclip 作为权威。
+2. 把逻辑路径别名映射为仓库内实际目录并登记唯一 owner；注册真实 executable、argv、cwd、env 名称、timeout 和支持平台。
+3. 实际执行 build、合同校验和最小测试，固定依赖；对尚未实现的测试入口返回非零 NOT_IMPLEMENTED，严禁零用例 PASS。
+4. 后续任务以逻辑 command key 请求执行；没有绑定/当前平台不支持则形成阻塞，不臆造 npm/go/python 子命令。
+5. 命令不得把 token 放 argv 或日志；记录参数与可披露环境信息，敏感值通过受控环境注入。
+6. 将评测adapter、开发结果、Verifier受限产物与UI/design_tokens纳入实际path_ownership；正式留出不能落到候选共享目录。
+7. 复用选定路线已有前端与依赖声明；评测Node工具不强迫Go控制面改栈。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W02-G01 / DEVELOPMENT：依route生成唯一骨架与依赖锁，执行干净构建和最小合同校验。 期望：构建确实运行；无第二调度器或另一条路线的权威库。
+- W02-G02 / DEVELOPMENT：创建真实命令dispatcher/registry与path_ownership映射，核对可执行路径。 期望：真实入口可执行；缺模块测试返回非零NOT_IMPLEMENTED，零用例不PASS。
+- W02-G03 / FIXTURE：验证命令错误/缺凭据/未支持平台的失败回执。 期望：失败显式、秘密不进日志；完整A03/A15仍待最终owner。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：干净检出可构建、命令存在且真实执行；schema/API静态验证。
+- FIXTURE / NOT_RUN：未实现入口必然非零、缺凭据不伪装成功、重复命令调用回执可识别。
+
+**完成与证据**
+
+- 实际存在的骨架和可验证命令绑定已提交；所有后续 command keys 标注实现状态。
+- 后续 feature 测试可以尚未实现，但登记器的未实现结果必须明确失败；W02 完成不表示后续功能通过。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W02/{run_id}.json
+
+**失败/回退**
+
+- 锁文件/骨架不一致则整组回滚，不能用全局未固定依赖填补。
+- route 改变须新 ADR 并触发依赖影响分析，不允许任务私改 route。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W03｜领域持久化、并发控制与 /v1 API
+
+- **状态 / 责任**：NOT_STARTED；工程/平台组长。
+- **依赖**：W02。
+- **需求 / 验收**：R03、R04、R06、R09、R20；A03、C04、C19。
+- **最终负责整例**：无；只接受阶段子门。
+- **允许路径**：DOMAIN/persistence/**、DOMAIN/api/**、DOMAIN/events/**、DOMAIN/migrations/**、TESTS/domain/**、CONTRACTS/**、EXECUTION/receipts/W03/**。
+- **验证键**：contracts.validate、test.domain。
+
+**输入**
+
+1. W02 选定骨架、真实命令和路径映射；03/04 合同及机器 schema/OpenAPI。
+
+**交付物**
+
+1. 领域存储、迁移、版本化 API、事务性 outbox；并发/幂等 fixture；API与schema一致性报告。
+2. Artifact.access_class及EvaluationReport/EvaluationSummary内容合同；受限内容派生分类与存储引用。
+
+**执行清单**
+
+1. 实现唯一 ProjectState、Goal/Task/Run、Artifact/Evidence、Experiment、Decision、Acceptance、ResourceRequest 等合同聚合。
+2. 实现 If-Match、revision 与409/412语义；同幂等键同请求重放原结果，不同请求返回冲突。
+3. 金额使用十进制字符串；null 表示金额不封顶；时间为 UTC RFC3339；出站事件按聚合有序、重复可去重。
+4. 执行回报→独立验证→接受分离；不可变 receipt 保存内容哈希，接受绑定输入/判据/产物版本。
+5. 所有新增字段与OpenAPI本地ref一致；评测报告不新增独立Task/Acceptance状态。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W03-G01 / DEVELOPMENT：用当前schema/OpenAPI校验持久化和API实现，执行隔离迁移。 期望：已实现的字段、操作与存储一致，缺项不返回空成功。
+- W03-G02 / FIXTURE：执行当前领域层If-Match、幂等重放、outbox及状态拒绝测试。 期望：409/412与去重可核对；尚待W06的完整验收服务断言保持NOT_RUN。
+- W03-G03 / FIXTURE：核对不可变产物哈希与金额/时间等基础类型。 期望：版本与原始证据可追踪，不提前宣称完整A03通过。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：合同、迁移、API操作和存储实现一致。
+- FIXTURE / NOT_RUN：并发写/重复请求/事件乱序/迟到响应/同源引用反例。
+
+**完成与证据**
+
+- 所有合同操作有实现或明示非首版范围；首版必须操作不可仅返回空壳成功。
+- 并发和幂等断言均通过，原始事务与API回执可核对。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W03/{run_id}.json
+
+**失败/回退**
+
+- 迁移在隔离副本上失败即不升级正式数据；保留可回滚或先恢复备份的明确路径。
+- 合同变化提交独立变更提案，列受影响任务，不单方面修改已冻结验收。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W04｜意图转 Goal、上下文快照与影响传播
+
+- **状态 / 责任**：NOT_STARTED；产品/知识组长。
+- **依赖**：W03。
+- **需求 / 验收**：R01、R02、R03、R04、R09、R10、R12、R17、R20；C01、C02、C03、C04、A01。
+- **最终负责整例**：C03、C04、A01。
+- **允许路径**：DOMAIN/context/**、DOMAIN/goals/**、DOMAIN/impact/**、TESTS/context/**、EXECUTION/receipts/W04/**。
+- **验证键**：package.validate、test.context、test.domain。
+
+**输入**
+
+1. W03 聚合与 API；用户初始想法；ResearchOS 当前项目资料与导入清单。
+
+**交付物**
+
+1. 意图解析与可执行 GoalContract；版本化 ContextBundle；冲突、废弃和下游影响流程；跨会话恢复 fixture。
+
+**执行清单**
+
+1. 从已有项目记录生成目标/不做事项/初始验收和下一步，不反复要求用户粘贴已导入资料。
+2. ContextBundle 包含源版本、hash、活动/废弃决定、未完成依赖、允许范围及恢复点。
+3. 变更只标记受影响对象 NEEDS_REVALIDATION；无关任务可继续；旧 revision 的产物不能覆盖新状态。
+4. 有冲突先保留候选与证据，唯一整合决定原子生效；跨项目信息按许可显式共享。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W04-G01 / FIXTURE：在已实现的Goal/Context导入模块验证A01完整断言。 期望：导入清单、Goal来源与Context可追溯。
+- W04-G02 / FIXTURE：执行C03/C04变更影响、并发冲突和唯一整合决定。 期望：受影响对象待重验，无关任务继续；过期写被拒绝。
+- W04-G03 / FIXTURE：以模块fixture核对跨会话快照恢复。 期望：阶段输入/输出正确；C01真实新Agent执行全例留W06。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：C01–C04：接手、隔离、变更影响与双 Agent 冲突。
+
+**完成与证据**
+
+- 新会话从数据恢复正确下一步、不会复活废弃决定；受影响链精确而可审计。
+- GoalContract 的成功条件有版本，不由执行者在完成时临时降低。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W04/{run_id}.json
+
+**失败/回退**
+
+- 快照缺来源或过期则重建并保留旧快照；不得用聊天摘要覆盖权威状态。
+- 无法合并时任务 BLOCKED 并保留冲突记录，无关支路继续。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W05｜运行适配器与一个真实执行器
+
+- **状态 / 责任**：NOT_STARTED；工程/运行组长。
+- **依赖**：W02、W03。
+- **需求 / 验收**：R10、R12、R17；A04、C11、C15。
+- **最终负责整例**：A04。
+- **允许路径**：ADAPTERS/runtime/**、OPS/runtime/**、TESTS/runtime/**、EXECUTION/receipts/W05/**。
+- **验证键**：test.runtime。
+
+**输入**
+
+1. W02命令、路线与路径边界；W03 Run/事件合同；已授权的一个模型/CLI执行器与 Windows 环境。
+
+**交付物**
+
+1. 执行适配器、能力与权限声明、生命周期映射、进程树与取消回执；至少一个真实执行器资格报告。
+
+**执行清单**
+
+1. Pi/现有CLI等按能力选一种先打通；不要求安装全部调研候选。
+2. 执行成功回报不等于 Task ACCEPTED；接入 Pi 时须等待稳定结束语义，取消覆盖队列与活动运行。
+3. 记录 stdout/stderr、exit、模型修订、资源用量、产物清单；秘密脱敏。
+4. Windows 进程树识别、取消、超时、断线、异常退出和恢复后对账；不把原生 resume 文档等同实测。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W05-G01 / FIXTURE：执行适配器状态、队列/取消、重复回报和无法确认结束反例。 期望：平台done不会映射为产品ACCEPTED。
+- W05-G02 / LIVE_WINDOWS_AND_SERVICE：一个真实授权执行器完成启动、产物、取消及恢复A04全例。 期望：真实运行和进程树证据齐全；未知结束状态不释放重复执行权。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：生命周期映射与重复回报、假成功、无法确认取消。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：一个真实授权执行器的启动/执行/取消/重启，输出实际产物。
+
+**完成与证据**
+
+- 至少一个真实执行器通过资格，执行能力和不可用能力明确登记。
+- 无法确认结束时保留 UNKNOWN/BLOCKED等适配状态，不能释放会导致重复副作用的执行权。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W05/{run_id}.json
+
+**失败/回退**
+
+- 适配器失败可换已授权等价执行器；记录同一任务资源路径不重开 Goal。
+- 停止子进程与清空待执行队列后对账；已发生外部副作用记录而非声称撤回。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W06｜任务编排与独立验收
+
+- **状态 / 责任**：NOT_STARTED；工程/治理组长＋独立评测员。
+- **依赖**：W03、W04、W05。
+- **需求 / 验收**：R01、R02、R03、R04、R09、R10、R11、R12、R17、R20；C07、C10、C16、A02、A04、C01、A03。
+- **最终负责整例**：C01、A02、A03。
+- **允许路径**：DOMAIN/orchestration/**、DOMAIN/acceptance/**、TESTS/orchestration/**、EXECUTION/receipts/W06/**。
+- **验证键**：contracts.validate、core.qualify、test.context、test.domain、test.orchestration。
+
+**输入**
+
+1. W03 状态机与事件；W04 Goal/Context；W05 已资格执行器。
+
+**交付物**
+
+1. DAG 派单、领取/租约、回执整合、独立 verifier、阻塞/取消/重验状态；不可绕过的验收门。
+
+**执行清单**
+
+1. 只有一个业务调度权；所有运行与验收关联同一 task_id/run_id。
+2. 必需检查、合格模型 rubric、无阻塞冲突和版本一致性全部满足后才 ACCEPTED。
+3. 执行者、执行子 Agent 不能修改自身 gate 或自签 Acceptance；独立 verifier 是独立权限角色而非同段自评文字。
+4. 并行只取 READY 的可执行节点；失败/缺资源依赖支路不被误放行；不进展计数由稳定 origin key 管。
+5. 来源、工具、Agent事件通过既有Run/correlation与Artifact定位，PentAGI的Finished只能作执行回执。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W06-G01 / FIXTURE：对真实选定调度实现执行A02竞争领取/验收前置及A03全部接口/接受拒绝门。 期望：只存在一个业务调度权，非法接受被拒绝。
+- W06-G02 / FIXTURE：按C01启动新Agent读取Context并执行无副作用后继。 期望：无需重述背景，不复活废弃决定，输入引用可回查。
+- W06-G03 / LIVE_WINDOWS_AND_SERVICE：执行真实报告→独立verifier→接受→后继的完整链。 期望：执行者不能自签或改gate；将产品验收与历史bootstrap验收区分。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：伪造验收/清空必测策略/修改标签、Jev高分反证、子Goal重置次数与重放事件。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：真实执行器报告后由不同权限 verifier 接受，后继才启动。
+
+**完成与证据**
+
+- 完成状态只能由可追溯验收写入；非法绕过均被拒绝并留下审计。
+- 首版实际运行能展示执行回报与验收之间的状态差别。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W06/{run_id}.json
+
+**失败/回退**
+
+- gate 绕过或重复派单属于阻断缺陷，停止受影响派单并回退该编排版本。
+- 保留已接受成果；不得批量重置状态掩盖失败。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W07｜GitHub、X、论文来源适配
+
+- **状态 / 责任**：NOT_STARTED；研究/数据组长。
+- **依赖**：W03。
+- **需求 / 验收**：R05、R06、R11、R17；A05、C06。
+- **最终负责整例**：A05。
+- **允许路径**：ADAPTERS/sources/**、TESTS/sources/**、OPS/sources/**、EXECUTION/receipts/W07/**。
+- **验证键**：test.sources.fixture、test.sources.live。
+
+**输入**
+
+1. W03 来源/Observation合同；明确来源范围；已授权凭据及访问方式。
+
+**交付物**
+
+1. GitHub/X/论文三个来源适配器、配置与能力报告；原始响应引用；限流/鉴权/失败及覆盖结果。
+
+**执行清单**
+
+1. 复用 last30days/Agent-Reach 等仅按实际接口与依赖选择；关闭其独立调度、预算和通知权。
+2. 每来源显式 window_start/window_end、实际可达范围、分页/截断和失败原因；不按工具名称推定全部30天。
+3. 规范 URL、上游来源、采集时间、内容hash和证据快照；敏感账号资料不进入日志。
+4. 缺 X 或其他来源时独立支路继续，ResearchCycle 标 PARTIAL；资源请求去重。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W07-G01 / FIXTURE：执行三来源鉴权/限流/截断/空结果/时间窗测试。 期望：覆盖与失败原因结构化，独立分支能继续。
+- W07-G02 / LIVE_SERVICE：逐一完成GitHub/X/论文真实A05只读探针。 期望：三类均有真实证据；缺任一资源则对应live gate BLOCKED。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：鉴权失败、限流、空结果、分页截断、重复来源和时间窗差异。
+- LIVE_SERVICE / NOT_RUN：GitHub、X、论文逐一真实只读探针与响应证据；权限或付费条件使用现有授权。
+
+**完成与证据**
+
+- 三类适配器合同与fixture完成；每类实际live状态单列。
+- W07的最终live门需三类均有真实探针；缺资源只能记录阻塞，不能把两类通过当三类完成。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W07/{run_id}.json
+
+**失败/回退**
+
+- 无权/限流的源停在该源分支，其他源继续；不能以模拟结果补齐真实覆盖。
+- 替代源需能满足同一覆盖合同，记录来源变更与新的资格证据。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W08｜项目相关研究周期与候选判断
+
+- **状态 / 责任**：NOT_STARTED；研究/产品组长。
+- **依赖**：W04、W06、W07。
+- **需求 / 验收**：R01、R05、R06、R07、R09、R12、R20；C05、C06、C19。
+- **最终负责整例**：C05、C06。
+- **允许路径**：DOMAIN/research/**、DOMAIN/candidates/**、TESTS/research/**、EXECUTION/receipts/W08/**。
+- **验证键**：test.experiments、test.research.fixture、test.sources.fixture。
+
+**输入**
+
+1. W04 项目背景与Goal；W06调度/验收；W07三类来源。
+
+**交付物**
+
+1. 研究周期、去重与相关性候选、覆盖声明、采用/观察/拒绝/证据不足建议；周期计划与检查点。
+
+**执行清单**
+
+1. 默认6小时周期、初次回看7天、每项目最多1个活动周期；漏掉的触发合并。
+2. 按现有项目约束与差距筛选候选，先溯源再做独立证据计数。
+3. 只有必需来源和本轮必需实验完成才能 COMPLETE；无值得采用候选是合法完成结果。
+4. 覆盖不完整为 PARTIAL，未通过采纳判据不强行制造改进；新发现生成受版本约束的候选。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W08-G01 / FIXTURE：执行C05无可采用候选、C06来源部分不可用。 期望：无候选合法结束；缺来源标PARTIAL而非COMPLETE。
+- W08-G02 / FIXTURE：验证6小时触发、漏触发合并、单活动周期及同源计数。 期望：不重复派周期，不按转载数量制造独立证据。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：无候选、所有转述同源、来源部分失败和重复触发。
+
+**完成与证据**
+
+- 每个周期可还原范围、候选去向与证据；负结论有原因而非空白成功。
+- 触发合并、单活动周期和真实覆盖状态通过。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W08/{run_id}.json
+
+**失败/回退**
+
+- 新筛选规则先在固定数据回放，失败回到前一规则版本。
+- 观察或证据不足保留后续复查条件，不无限循环当前周期。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W09｜证据索引与本地检索
+
+- **状态 / 责任**：NOT_STARTED；知识/数据组长。
+- **依赖**：W03、W07。
+- **需求 / 验收**：R03、R06、R09、R17、R20；A06、C02、C19。
+- **最终负责整例**：C19、A06。
+- **允许路径**：DOMAIN/evidence/**、ADAPTERS/retrieval/**、TESTS/retrieval/**、EXECUTION/receipts/W09/**。
+- **验证键**：test.research.fixture、test.retrieval、test.security。
+
+**输入**
+
+1. W03 Artifact/Evidence数据；W07原始来源；项目内已授权文件范围。
+
+**交付物**
+
+1. 证据图与同源关系；本地检索接口；Sirchmunk资格或 FTS/rg 回退；删除/撤回/变更失效策略。
+
+**执行清单**
+
+1. OBSERVED/SIMULATED/GENERATED严格分型；CURRENT/STALE/REVOKED随源变化传播。
+2. 检索路径与项目授权强制校验；缓存key包含project、source/hash、index版本及权限变化。
+3. Sirchmunk只做检索；固定版本读源码并通过本机资格后采用，不以README代替性能证据。
+4. 缓存过期、文档删除、越界路径、同名文件与同源转载作为必测反例。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W09-G01 / FIXTURE：执行C19同源传播及A06隔离/失效/撤回断言。 期望：引用可追溯，缓存与模拟材料不能冒充当前真实证据。
+- W09-G02 / LIVE_WINDOWS：用真实本地文件完成检索、更新、删除、越界路径与回退。 期望：索引不取代源；Sirchmunk资格失败时已验证FTS/rg可用。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：隔离、过期、撤回、同源计数与模拟标识。
+- LIVE_WINDOWS / NOT_RUN：本地真实文件读取、变更、删除和检索回退；可不用外部模型。
+
+**完成与证据**
+
+- 每个引用能回到实际源或明确失效记录；无越界检索与缓存混用。
+- 候选检索工具失败可采用已验证的FTS/rg实现同一合同。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W09/{run_id}.json
+
+**失败/回退**
+
+- 索引可重建且不取代源文档；错误索引版本撤销并恢复上一版或回退检索。
+- 无法核验引用就降级证据有效性，禁止保留虚假的当前证据。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W10｜冻结判据的有界实验
+
+- **状态 / 责任**：NOT_STARTED；算法/评测组长。
+- **依赖**：W06、W09。
+- **需求 / 验收**：R07、R09、R20；A07、C05、C07、C21。
+- **最终负责整例**：A07、C21。
+- **允许路径**：DOMAIN/experiments/**、OPS/experiment_sandbox/**、TESTS/experiments/**、EXECUTION/receipts/W10/**、ADAPTERS/evaluation/**、EVALUATION/development/**、EVALUATION/protocol/**、TESTS/evaluation/**、DOCS/components/**。
+- **验证键**：test.evaluation.fixture、test.experiments。
+
+**输入**
+
+1. W06执行/验收；W09有效证据；项目候选及真实基线。
+
+**交付物**
+
+1. 预注册 ExperimentPlan、冻结 rubric 和基线；隔离运行结果、失败/负结果和采用判据；可复查实验证据。
+2. 固定版本Promptfoo资格回执、EvaluationAdapter或有证据的等价回退；12夹具结果、完整性与篡改负例报告。
+
+**执行清单**
+
+1. 运行前固定输入、评价指标、比较对象、预算与停止规则；运行后改规则产生新实验。
+2. 基线和候选相同条件；只允许限定目录与资源；故障不得修改稳定项目。
+3. 支持 REJECT/WATCH/INCONCLUSIVE；null/缺数据不能补零伪造收益。
+4. 试验产物、日志和原始观测绑定代码/数据/模型/工具版本。
+5. 按11评测规范实施；Promptfoo仅作为运行器，先检查已有依赖和冻结版本。
+6. 单列适配、Jev、产品验收；缺失/重复/错误/弃权完整计数，导出不得泄露正式留出。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W10-G01 / FIXTURE：按A07检查预注册、判据冻结、负结果与缺数据。 期望：运行后不能改规则追认成功，null不补零。
+- W10-G02 / LIVE_WINDOWS：完成一次隔离真实基线/候选实验并复算关键结果。 期望：真实输入/版本/原始结果齐全，框架失败与候选无收益分开。
+- W10-G03 / FIXTURE：执行C21固定夹具、篡改、退化与实际出站检查。 期望：Promptfoo适配资格单列；评测合同硬门全部有效，未运行项不可通过。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：判据漂移、失败仍高分、负结果与缺数据。
+- LIVE_WINDOWS / NOT_RUN：本机一次可重跑的真实基线/候选实验，含隔离和结果证据。
+
+**完成与证据**
+
+- 验收者可复算关键结果，确认结果确实来自绑定输入与候选。
+- 实验失败是被记录的业务结果；实验框架故障不能伪装为候选无收益。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W10/{run_id}.json
+
+**失败/回退**
+
+- 越界或污染立即停止隔离运行并恢复基线，保留证据。
+- 判据有误走新版本与影响分析，不回写旧实验使其看似通过。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W11｜Jev 接口与用途资格校准
+
+- **状态 / 责任**：NOT_STARTED；算法/评测组长＋独立标注员。
+- **依赖**：W09、W10。
+- **需求 / 验收**：R07、R08、R09、R12、R20；A08、C07、C08、C20。
+- **最终负责整例**：C07、C08、A08。
+- **允许路径**：ADAPTERS/decision/**、DOMAIN/qualification/**、TESTS/jev/**、EVALUATION/jev/**、EXECUTION/receipts/W11/**。
+- **验证键**：test.jev.fixture、test.jev.live、test.orchestration。
+
+**输入**
+
+1. W09有效证据、W10冻结判据；Jev已授权真实端点、固定模型修订；独立标注数据。
+
+**交付物**
+
+1. 类型化Jev适配器、超时/未知动作回退；冻结校准集与独立holdout报告；按用途/语言/provider/模型/rubric登记的决策模式。
+
+**执行清单**
+
+1. 实现 SHADOW/ADVISORY/BOUNDED_AUTO 范围，不能给某模型全局通行资格。
+2. 初始评测至少60开发/校准案例+30独立holdout（总计至少90，holdout中文/混合各≥15）；每个拟授权task_type×language×provider×model_revision×rubric_revision须独立满足60开发+30留出，不能用合并统计授予某键auto。规则先冻结；模型多数票不能替代真实/人工标签。
+3. 升级资格需关键误接受为0、总误接受率≤5%，并报告弃权、误拒绝、延迟与成本。
+4. Jev高分不能覆盖实验失败/不存在引用/版本不符；真实超时、输出无效、版本变更触发回退或重验。
+5. 本包12条开发冒烟不替代A08；正式留出和详细结果权限隔离，并逐provider完整资格键评测。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W11-G01 / FIXTURE：执行C07/C08/C20相关决策接口反证、回退和版本绑定断言。 期望：Jev高分不能覆盖确定性失败；C20跨系统完整门仍归W16。
+- W11-G02 / LIVE_SERVICE：完成A08真实Jev初始评测，开发集至少60、独立holdout至少30，holdout中文/混合各至少15。 期望：实际调用、冻结标签/阈值、统计与安全降级可追溯。
+- W11-G03 / LIVE_SERVICE：逐个拟启用task_type×language×provider×model_revision×rubric_revision核对60开发+30独立留出和错误率门。 期望：每键关键误接受0、总误接受≤5%才可auto；聚合分数不授权，样本不足或失败键保持ADVISORY。
+- W11-G04 / FIXTURE：核对开发/holdout边界及详细日志访问；候选尝试读取必须失败。 期望：同目录不同Agent不视为隔离；不具备隔离则正式资格BLOCKED。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：类型、未知动作、缺证据、错误分数、超时与Noul/exit状态等边界。
+- LIVE_SERVICE / NOT_RUN：实际 Jev 调用与冻结holdout资格报告，真实模型/用途/语言/rubric绑定。
+
+**完成与证据**
+
+- 接口与回退必测通过；真实资格试验已完成且结果诚实登记。
+- 未达资格可保持SHADOW/ADVISORY并结束本实施任务；不得启用BOUNDED_AUTO。缺真实Jev资源则live资格仍BLOCKED。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W11/{run_id}.json
+
+**失败/回退**
+
+- 资格失败撤销该用途的自动动作授权，保留模型判断供审阅。
+- 模型/rubric变更将依赖资格标记待重验；不重新评分旧产物宣称系统提升。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W12｜预算、资源切换与耐久执行
+
+- **状态 / 责任**：NOT_STARTED；工程/平台组长。
+- **依赖**：W06。
+- **需求 / 验收**：R03、R08、R10、R11、R12、R16、R18；C11、C13、C14、C15、C16。
+- **最终负责整例**：C11、C13、C14、C15、C16。
+- **允许路径**：DOMAIN/budget/**、DOMAIN/resources/**、DOMAIN/durability/**、OPS/checkpoints/**、TESTS/resources/**、EXECUTION/receipts/W12/**。
+- **验证键**：test.context、test.orchestration、test.resources、test.runtime。
+
+**输入**
+
+1. W06唯一编排与Run；用户费用/运行偏好；账号能力与价格来源。
+
+**交付物**
+
+1. BudgetLedger与预留/结算、ResourceRequest、账号切换、检查点/恢复、限流/重试/无进展控制。
+
+**执行清单**
+
+1. 默认UNLIMITED_AMOUNT且cap=null；初始并发2、队列100；金额不封顶不代表无界重试。
+2. 用户设cap后使用所有作用域最严格值；严格模式须保留可证明有界费用，否则新调用阻塞；无默默换汇。
+3. 已产生、预估、未知、在途费用分列；迟到结算仍对原run入账。
+4. 替代账号仅在已授权、能力等价、用途资格有效时切换；不足资源请求一次性聚合、独立支路继续。
+5. 相同失败自动重试最多2次；连续3次无进展按稳定origin/candidate/input键延期。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W12-G01 / FIXTURE：完成C11/C13/C14/C15/C16全断言，覆盖恢复、无限金额、动态cap、换路与无进展。 期望：持久计数/预留/结算和幂等链可核对，不重建Goal重置。
+- W12-G02 / LIVE_WINDOWS_AND_SERVICE：完成真实运行检查点/恢复并保存用量及未知费用记录。 期望：同run续接、迟到费用保留，不虚称外部费用绝对可控。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：无限金额、动态cap、并发预留、未知/迟到费用、换路、重放及无进展。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：真实运行检查点/断开恢复与可观察用量；不能断言不可证明的外部费用上限。
+
+**完成与证据**
+
+- 预算不超许可派单、未知费用不丢失；默认不因未设置金额上限阻塞。
+- 恢复同run和幂等键，重试上限与No-progress在跨会话后继续有效。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W12/{run_id}.json
+
+**失败/回退**
+
+- 预算账异常暂停受影响新调用，对账后恢复；不可清空历史费用。
+- 取消后继续对账在途副作用，保留未能确认终止的运行。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W13｜阶段侧栏、重大成果与工作台
+
+- **状态 / 责任**：NOT_STARTED；设计/体验组长。
+- **依赖**：W04、W06、W08、W12。
+- **需求 / 验收**：R03、R04、R09、R12、R13、R14、R17、R19；A10、C17、C18、C23、C24、C25、C26。
+- **最终负责整例**：C17、C18、C23、C24、C25、C26。
+- **允许路径**：UI/workbench/**、UI/design_tokens/**、DOMAIN/milestones/**、TESTS/ui/**、EXECUTION/receipts/W13/**。
+- **验证键**：test.contracts.security、test.domain、test.ui、test.ui.preview、test.ui.recovery、test.ui.routes、test.ui.visual。
+
+**输入**
+
+1. W04权威上下文；W06任务状态；W08研究周期；W12资源与耐久事件。
+
+**交付物**
+
+1. 桌面工作台和响应式侧栏；阶段/真实计数/阻塞原因；成果详情、版本化通知与离线重连。
+2. 10_UI_UX_DESIGN.md对应页面与组件；统一双主题token、真实事件投影、桌面/手机工作台及UI验证截图。
+
+**执行清单**
+
+1. 阶段为discovery/verification/experiment/review/delivery/follow_up，计划修订与已验收/待评审分开显示。
+2. 不用无法证明的总体百分比；重大成果milestone_seq与产品semver分离。
+3. 同releaseId重复事件仅一条逻辑通知；通知与侧栏指向同一验收和产物版本。
+4. UI UX Pro Max/Impeccable等按岗位选择；设计tokens归一；不引入第二份后台状态。
+5. 面板含来源覆盖、用量/上限/资源请求、人工可看而无需频繁汇报的过程。
+6. 按contracts/ui.contract.json映射页面与API，按ui/design-tokens.json实现主题和响应式。
+7. 吸收Craft Agents/Midday/Linear/Scira的布局思路；DSH-soup/PentAGI只贡献具体交互，不新建应用或总账。
+8. 完成C23–C26；预览HTML默认无脚本，已封存产物只能生成新候选；正式留出内容不经UI泄漏。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W13-G01 / FIXTURE：执行C17通知去重与C18计划变更真实计数。 期望：侧栏/通知同版本，待评审不计已验收，无伪百分比。
+- W13-G02 / LIVE_WINDOWS：桌面浏览器检查关键流程、键盘和可读性。 期望：当前UI可操作，手机A10全部资格留W17。
+- W13-G03 / FIXTURE：逐项运行C23–C26并保存截图/交互/状态证据。 期望：路由、主题、预览、重连均实际运行；静态参考板不能算产品PASS。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：任务数变动、重复通知、旧版事件与断线重连。
+- LIVE_WINDOWS / NOT_RUN：实际桌面浏览器的关键流程、键盘与可读性。
+
+**完成与证据**
+
+- 用户能看清正在做什么、卡在哪里、结果来自哪一版；所有关键数据可追溯后台。
+- 关键布局与交互实际浏览器检查通过；手机远程配对验收留给W17。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W13/{run_id}.json
+
+**失败/回退**
+
+- 视觉或通知故障回退UI版本，不改后台验收状态弥补显示。
+- 重复事件持久去重；通知失联重试不重新执行任务。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W14｜第一个项目研究闭环端到端
+
+- **状态 / 责任**：NOT_STARTED；研究/产品组长＋独立评测员。
+- **依赖**：W08、W09、W10、W11、W12、W13。
+- **需求 / 验收**：R01、R02、R05、R06、R07、R08、R09、R11、R13、R14、R20；A13、C05、C06、C07、C19。
+- **最终负责整例**：A13。
+- **允许路径**：TESTS/e2e_cycle/**、EVALUATION/project_cycle/**、EXECUTION/receipts/W14/**。
+- **验证键**：test.cycle.live。
+
+**输入**
+
+1. W08–W13各分支开发/fixture与所需live资格；首个被管理ResearchOS项目；三类真实来源与实际Jev。
+
+**交付物**
+
+1. 一个完整真实研究周期的可复查证据包；候选筛选、实验、决策、独立验收、侧栏和重大成果记录。
+
+**执行清单**
+
+1. 先运行集成fixture，再在真实三来源和真实Jev上执行；不得从fixture复制为live证据。
+2. 从项目缺口到候选、可复现实验、采用/拒绝/观察/证据不足结果，逐项追溯。
+3. 缺来源时演示PARTIAL和独立继续，但该演示不替代最终COMPLETE所需门。
+4. 无采用价值候选可以通过闭环验收；禁止强制升级作为任务完成条件。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W14-G01 / FIXTURE：先运行跨模块E2E与失效输入/反证阻断。 期望：真实组合运行前基础接口和拒绝门通过。
+- W14-G02 / LIVE_WINDOWS_AND_SERVICE：执行A13本机研究闭环，三类真实来源+实际Jev+必要实验。 期望：全链原始证据可核对；负结论合法，缺live资源不得冒充COMPLETE。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：跨模块合同和失效输入/反证阻断。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：本机真实项目、GitHub/X/论文与Jev的完整周期及原始结果。
+
+**完成与证据**
+
+- A13 必需断言通过，覆盖来源/实验均完成，负结果合法且证据齐全。
+- 独立verifier能从receipt/日志重新核对；至少一次真实闭环为后续改进基线。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W14/{run_id}.json
+
+**失败/回退**
+
+- 集成问题归因到owner分支，保持已验证模块不重写。
+- live资源缺失将对应gate标BLOCKED，允许W15/W16等的开发和fixture先做但不终局接受。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W15｜研究成果转候选技能并验证
+
+- **状态 / 责任**：NOT_STARTED；知识/技能组长。
+- **依赖**：W09、W10、W11、W14。
+- **需求 / 验收**：R03、R06、R09、R15、R16、R20；A09、C03、C07、C20。
+- **最终负责整例**：A09。
+- **允许路径**：DOMAIN/skills/**、ADAPTERS/knowledge/**、EVALUATION/skills/**、TESTS/skills/**、EXECUTION/receipts/W15/**。
+- **验证键**：test.skills。
+
+**输入**
+
+1. W09来源与版本、W10实验框架、W11决策边界、W14真实成果；已许可的资料。
+
+**交付物**
+
+1. 资料→候选技能→离线/真实试用→晋升或拒绝流程；技能注册表、版本/来源/资格与撤回记录。
+
+**执行清单**
+
+1. book-to-skill等仅生成候选；输入source manifest与实际提取成功数对账，exit0/SKILL存在不算覆盖完整。
+2. 新技能声明输入/输出、适用任务/限制和副作用；文档提示注入不作为执行权限来源。
+3. 增量Fold-in保留旧版本、来源与冲突；晋升需要冻结用例收益且无回归。
+4. 技能中的产品背景是权威ProjectState投影，不成为第二事实库。
+5. 技能前后用相同冻结评测套件比较；Promptfoo失败不删除负结果或换题制造提升。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W15-G01 / FIXTURE：执行A09资料覆盖、来源冲突、权限注入和晋升/撤回断言。 期望：提取失败不因exit0被隐藏，技能权限不来自外部提示词。
+- W15-G02 / LIVE_WINDOWS_AND_SERVICE：用W14真实资料生成候选并按冻结用例试用。 期望：晋升或拒绝均有真实证据，权威上下文不分叉。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：提取遗漏、重复来源、冲突合并、权限注入与旧技能撤回。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：用W14实际资料生成一个候选并验证，结果可为拒绝。
+
+**完成与证据**
+
+- 资料覆盖对账通过、原始来源可追溯；候选实际做过比较评测。
+- 晋升或拒绝都有证据；未达标技能不可成为默认生产能力。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W15/{run_id}.json
+
+**失败/回退**
+
+- 失败候选保持未启用，正式技能指针不变；已启用后出问题按版本撤回。
+- 源材料撤回/更新触发对应技能待重验，不静默续用。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W16｜系统自身候选迭代、灰度与回滚
+
+- **状态 / 责任**：NOT_STARTED；工程/演进组长＋独立评测员。
+- **依赖**：W12、W14、W15、W18。
+- **需求 / 验收**：R08、R09、R12、R16、R17、R18、R20；A16、C09、C10、C12、C20。
+- **最终负责整例**：C09、C10、C12、C20、A16。
+- **允许路径**：DOMAIN/evolution/**、OPS/supervisor/**、OPS/canary/**、EVALUATION/evolution/**、TESTS/evolution/**、EXECUTION/receipts/W16/**。
+- **验证键**：acceptance.audit、test.evolution、test.jev.fixture、test.orchestration。
+
+**输入**
+
+1. W12持久与资源；W14真实基线；W15候选晋升机制；独立稳定supervisor与冻结回归集。
+
+**交付物**
+
+1. 系统代码候选隔离、变化提案、回归、canary、晋升与自动回滚流程；一次真实回滚演练。
+
+**执行清单**
+
+1. 稳定supervisor与待修改candidate代码分离；candidate不能改验收基线或自己的发布权限。
+2. 先隔离回归再canary；记录性能/正确性/真实结果，单一模型分数变高不足晋升。
+3. 触发退化时恢复已验证稳定版，冻结问题候选并保留失败证据及重开条件。
+4. 首版优化代码/工具/流程/技能，不承诺训练模型权重。
+5. EvaluationReport/Summary与独立Acceptance分开；候选无权改评测标准、监督或发布权限。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W16-G01 / DEVELOPMENT：检查W18已接受且A12真实恢复资格当前有效。 期望：备份/恢复未通过不能对稳定实例做canary或切换。
+- W16-G02 / FIXTURE：执行C09/C10/C12/C20及A16的篡改、自证、退化与版本断言。 期望：冻结门不被candidate改写，模型分数提高不等于真实改善。
+- W16-G03 / LIVE_WINDOWS：实际canary失败与回滚，稳定supervisor在切换期间保持独立。 期望：回滚恢复已验证状态、失败候选冻结，A16原始证据可核对。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：篡改测试/标签/权限、分数提升真实退化、回滚过程中重启。
+- LIVE_WINDOWS / NOT_RUN：隔离候选失败、稳定supervisor持续可用、实际canary与回滚对账。
+
+**完成与证据**
+
+- 候选无法自签接受或发布；反例触发拒绝/回滚，稳定版本仍可研究与监督。
+- A16全部必需证据成立；可拒绝改进候选而完成此机制资格。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W16/{run_id}.json
+
+**失败/回退**
+
+- 回滚指针及数据兼容策略预先可用；破坏性迁移不得进入canary。
+- supervisor不稳则停止自改支路，保留项目研究分支的稳定服务。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W17｜手机监督、配对与权限安全
+
+- **状态 / 责任**：NOT_STARTED；工程/安全组长＋体验评测员。
+- **依赖**：W12、W13。
+- **需求 / 验收**：R02、R08、R09、R11、R13、R14、R17、R19；A11、A10、C02、C17、C22。
+- **最终负责整例**：C02、A10、A11、C22。
+- **允许路径**：DOMAIN/auth/**、DOMAIN/permissions/**、OPS/remote_access/**、UI/device_pairing/**、TESTS/security/**、EXECUTION/receipts/W17/**。
+- **验证键**：test.context、test.evaluation.security、test.security、test.ui。
+
+**输入**
+
+1. W12会话/资源控制；W13响应式UI；Windows主机与真实手机/远程访问方式。
+
+**交付物**
+
+1. 真实设备配对/撤销、认证与传输方案、最小权限、secret处理；手机监督资格报告。
+
+**执行清单**
+
+1. 默认只监听本地；远程访问由已配置安全通道和认证保护，不暴露无认证公网控制面。
+2. 配对/续期/撤销有生命周期；设备被撤销后不能继续订阅项目或提交操作。
+3. 项目权限、文件范围和机密隔离在服务端执行；日志/导出脱敏。
+4. 用真实手机完成查看进度、结果、资源请求和恢复重连；可响应式页面而非首版原生App。
+5. 完成C22的API、文件、日志、搜索、事件、备份、重启访问隔离；保护正式留出及派生报告。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W17-G01 / FIXTURE：执行C02、A11跨项目权限、令牌撤销、秘密与重放门。 期望：服务端拒绝越权，不能仅靠UI隐藏。
+- W17-G02 / LIVE_WINDOWS：实际Windows与手机完成A10/A11配对、查看、撤销和重连。 期望：传输与认证实测有效；资格失败保持本地模式。
+- W17-G03 / FIXTURE：在实际访问主体边界执行C22受限标记扫描与拒绝检查。 期望：候选不可获得题库/标签/逐例反馈；受限产物不能降级公开。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：令牌过期/撤销、跨项目访问、secret泄露与重放操作。
+- LIVE_WINDOWS / NOT_RUN：实际Windows服务与手机访问、配对撤销、离线重连及传输检查。
+
+**完成与证据**
+
+- A11和手机相关A10断言在真实设备/可核验环境通过；没有凭猜测宣称安全远程可用。
+- 用户授权范围可审计，设备/账号撤销即时阻止后续访问。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W17/{run_id}.json
+
+**失败/回退**
+
+- 远程资格失败保持本地模式；禁止暂时关闭认证来宣称连通。
+- 撤销测试凭据并保留审计；不删除用户既有账号。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W18｜备份、导出、恢复与迁移
+
+- **状态 / 责任**：NOT_STARTED；工程/运维组长。
+- **依赖**：W03、W12。
+- **需求 / 验收**：R03、R12、R18、R20；A12、C11。
+- **最终负责整例**：A12。
+- **允许路径**：OPS/backup/**、OPS/export/**、OPS/restore/**、TESTS/backup/**、EXECUTION/receipts/W18/**。
+- **验证键**：test.backup。
+
+**输入**
+
+1. W03选定数据库与迁移；W12检查点/outbox；产物与索引清单。
+
+**交付物**
+
+1. 一致性备份/可移植导出、恢复工具、完整性核验、迁移预检；实际恢复演练报告。
+
+**执行清单**
+
+1. 备份权威状态、验收、来源引用、产物和必要恢复信息；检索缓存可重建但清单须明确。
+2. 恢复到隔离干净目录后校验hash、revision、任务/事件和来源链接；密钥按单独受控策略处理。
+3. 迁移先备份与兼容验证；不支持向下迁移时明示恢复备份路径。
+4. 恢复不能重发外部副作用；待确认运行先对账。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W18-G01 / FIXTURE：执行A12损坏/缺产物/错版/恢复中断反例。 期望：失败不污染原实例，恢复不重发外部副作用。
+- W18-G02 / LIVE_WINDOWS：真实备份到隔离目标并恢复，对比数据、receipt、hash和可续接任务。 期望：不仅有备份文件，实际恢复与恢复后继续运行通过。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：损坏包、缺产物、schema错版、事件重放与恢复中断。
+- LIVE_WINDOWS / NOT_RUN：真实数据库和文件备份至隔离目标，再恢复并核对。
+
+**完成与证据**
+
+- 恢复后的项目可继续原任务，接受记录和产物hash一致；不是仅证明备份文件存在。
+- 恢复副作用去重有效，失败恢复可重新开始且不污染原实例。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W18/{run_id}.json
+
+**失败/回退**
+
+- 任何完整性失败不切换正式数据；保留原实例与损坏诊断。
+- 不自动删除旧备份来腾空间；不足资源请求并让独立任务继续。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W19｜隔夜、Windows重启与恢复资格
+
+- **状态 / 责任**：NOT_STARTED；工程/可靠性组长＋独立评测员。
+- **依赖**：W14、W17、W18。
+- **需求 / 验收**：R03、R05、R11、R12、R18、R19、R20；A14、C11、C13。
+- **最终负责整例**：A14。
+- **允许路径**：TESTS/endurance/**、EVALUATION/overnight/**、OPS/recovery/**、EXECUTION/receipts/W19/**。
+- **验证键**：test.overnight。
+
+**输入**
+
+1. W14真实闭环；W17真实设备；W18恢复；Windows11x64和所需授权外部服务。
+
+**交付物**
+
+1. 持续/隔夜运行、受控断线/服务重启/系统重启后的对账证据；可靠性缺陷与修复回归。
+
+**执行清单**
+
+1. 按照A14冻结时长与注入计划运行；不以短fixture替代隔夜资格。
+2. 上下文结束由新会话接同一任务；控制面重启识别现存子进程、回调去重和未结费用。
+3. 检查漏触发合并、单活动周期、资源控制、手机离线恢复、阶段与通知一致。
+4. 重启/断线应在授权测试环境，保留稳定检查点，不破坏无关用户工作。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W19-G01 / FIXTURE：验证故障注入器及恢复脚本，冻结A14时间窗与注入计划。 期望：计划和停止条件明确，故障注入不影响无关工作。
+- W19-G02 / LIVE_WINDOWS_AND_SERVICE：执行A14真实持续/隔夜与重启恢复。 期望：要求的时长和事件真实发生；无丢任务/重复副作用，未知项保留阻塞。
+
+**验证层次**
+
+- FIXTURE / NOT_RUN：故障注入器与恢复路径先验证。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：真实持续运行和真实外部来源/执行器，跨至少一个上下文与进程恢复边界。
+
+**完成与证据**
+
+- A14规定的时间窗和关键恢复事件实际发生，原始时间戳可核验。
+- 无重复副作用、丢任务/丢验收或孤儿进程；未知情况明确阻塞而非强报完成。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W19/{run_id}.json
+
+**失败/回退**
+
+- 出现阻断问题结束本次资格、回到稳定版并保留完整时间线；修复后重跑受影响时段/故障门。
+- 资源缺失允许fixture继续，不能标live完成；不无限延长等待。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W20｜发行试用、安装与可复现交付
+
+- **状态 / 责任**：NOT_STARTED；工程/发行组长＋独立评测员。
+- **依赖**：W16、W19。
+- **需求 / 验收**：R18、R19、R20；A15、A01、A13、A14、A16。
+- **最终负责整例**：A15。
+- **允许路径**：OPS/release/**、RELEASE/**、TESTS/release/**、DOCS/installation/**、EXECUTION/receipts/W20/**。
+- **验证键**：acceptance.audit、release.reproduce。
+
+**输入**
+
+1. W16系统演进资格；W19隔夜资格；全部必要接受记录、固定依赖和版本。
+
+**交付物**
+
+1. 可复现发行包、安装/启动/更新/卸载保留数据指引、SBOM/许可清单、release manifest、试用记录。
+2. 一键可复现入口、全部页面使用说明、双主题/手机截图索引及42例验收索引。
+
+**执行清单**
+
+1. 在干净Windows目标按实际文档复建/安装，记录依赖和环境；不宣称未做的一键安装或便携版。
+2. 机器审查所有首版必要门、live证据、依赖版本、hash与尚存限制；修复只重验受影响范围。
+3. 更新保持数据与接口兼容；回滚/卸载保留用户项目数据并说明位置。
+4. 成果通知是in-app milestone；Git push、公开部署、外部消息按既有授权范围执行，不由版本号自动触发。
+5. 复核11个页面连接最终真实API/事件，执行关键读写、重连、成果版本与权限操作；不把W13固定后端夹具部署为成品。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W20-G01 / DEVELOPMENT：审查除A15自身外其余41正式用例的有效完整结果与版本。 期望：不存在必要门BLOCKED/NOT_RUN/PARTIAL；证据未失效。
+- W20-G02 / LIVE_WINDOWS：完成A15干净目标复建/安装/更新/保留数据卸载。 期望：实际命令、依赖、manifest/hash一致；独立接受A15后补齐42例索引。
+- W20-G03 / LIVE_WINDOWS：复核11个页面连接最终真实API/事件，执行关键读写、重连、成果版本与权限操作；不把W13固定后端夹具部署为成品。 期望：保存页面、实际operationId、请求/事件及持久化回执映射；不得以静态成功提示或mock服务替代。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：固定依赖可重建、manifest哈希与文档实际命令一致。
+- LIVE_WINDOWS / NOT_RUN：干净目标安装/启动/更新/卸载保留数据和恢复。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：引用全部必需且版本仍有效的A13/A14/A16等真实资格，不以fixture替代。
+
+**完成与证据**
+
+- 选定发行方式实际可用，包、源码修订、依赖和验收证据互相一致。
+- 必需门无BLOCKED/NOT_RUN；公开版本说明诚实列Jev模式、可用能力和已知限制。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W20/{run_id}.json
+
+**失败/回退**
+
+- 发行检查失败不覆盖已验证稳定发行物；修复后产生新候选版本。
+- 恢复/安装有数据损坏风险的发行禁止晋升，先回滚并修复。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。
+
+### W21｜成果基线、交接与下一轮飞轮
+
+- **状态 / 责任**：NOT_STARTED；产品/评测组长。
+- **依赖**：W20。
+- **需求 / 验收**：R01、R14、R15、R16、R20；C05、C20、A15。
+- **最终负责整例**：无；只接受阶段子门。
+- **允许路径**：DOCS/handoff/**、EVALUATION/outcome/**、EXECUTION/receipts/W21/**、RELEASE/outcome_report.json。
+- **验证键**：acceptance.audit。
+
+**输入**
+
+1. W20发行包和全部任务receipt；项目真实运行观测、候选采纳/拒绝记录。
+
+**交付物**
+
+1. 完整交接、首版OutcomeReport、实测基线与局限；下一轮候选backlog与停止/继续规则；版本化重大成果通知。
+
+**执行清单**
+
+1. 复核R01–R20与C01–C26/A01–A16覆盖、22任务DAG、UI/API/token映射、真实命令和证据链接；只重验受影响范围。
+2. 报告真正完成的能力、未采用候选、实测成本/时间/可靠性和仍未知项；模型分数变化与真实结果分开。
+3. 从实际缺口生成下一轮实验，不再把调研名单增长当完成标准。
+4. 交接包含恢复命令、当前版本、资源状态、下一步和回滚；新Agent无需用户重述已有背景。
+
+**阶段子门（全部 NOT_RUN）**
+
+- W21-G01 / DEVELOPMENT：外部verifier审查42正式用例均完整通过，owned归属唯一，所有施工阶段回执和依赖闭合。 期望：所有必要门当前有效，无NOT_RUN/PARTIAL/BLOCKED冒充PASS。
+- W21-G02 / LIVE_WINDOWS_AND_SERVICE：核对现有真实Outcome基线、Jev模式、费用/时间/可靠性与下一步交接。 期望：报告实际结果和局限，不因模型新评分宣称改善，不重跑无变化用例。
+
+**验证层次**
+
+- DEVELOPMENT / NOT_RUN：完整索引、hash、要求—任务—测试映射与版本引用检查。
+- LIVE_WINDOWS_AND_SERVICE / NOT_RUN：独立核对已有真实基线与运行证据，不重新标记fixture为live。
+
+**完成与证据**
+
+- 独立verifier签署范围明确的OutcomeReport；所有必需门通过，剩余改进明确属于下一轮非首版阻断。
+- 用户能直接找到运行中的成果、验收依据、已知限制和恢复路径。
+- 本施工阶段先通过task_gate_checks，由外部独立Verifier Agent/程序依bootstrap回执接受；owned_acceptance_ids要求在本阶段完成正式全例，acceptance_ids其余仅追踪/回归关联。未实现的后置断言保持NOT_RUN/PARTIAL，不阻塞无关前置子门、不伪造PASS。产品live资格与fixture分开。
+- 回执：execution/receipts/W21/{run_id}.json
+
+**失败/回退**
+
+- 证据缺口退回对应owner补齐，不用新总结掩盖未完事项。
+- 基线尚不能证明改善时报告无改善/不确定，禁止强行宣布飞轮成功。
+
+**重试/整合**
+
+同一失败最多自动重试2次；连续3轮无新证据则延期；按origin_problem_id + candidate_id + input_hash持久计数。
+workspace：独立 task worktree；W00 使用新建隔离仓库，W01 使用资格沙箱。
+shared_files：contracts、route、path_ownership、commands、lockfile、migration 顺序号和根依赖声明由对应登记的 owner 串行整合；任务提交提案，不越界直接覆盖。
+merge_gate：原子提交/可回退变更组；外部整合者核对bootstrap基线修订与受影响测试，外部verifier接受阶段子门后记入施工台账；产品验收另按实现后的合同运行。
+handoff：W00–W21施工由外部独立verifier和execution/bootstrap_ledger.json推进；W00–W06冻结文件上下文。W06后可导入历史回执为Artifact，不追认当时已有产品验收服务。

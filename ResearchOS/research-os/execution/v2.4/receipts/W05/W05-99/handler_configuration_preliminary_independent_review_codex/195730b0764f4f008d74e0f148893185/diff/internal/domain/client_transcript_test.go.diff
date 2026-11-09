@@ -1,0 +1,35 @@
+--- baseline/internal/domain/client_transcript_test.go
++++ snapshot/internal/domain/client_transcript_test.go
+@@ -8,20 +8,12 @@
+ 	"fmt"
+ 	"strings"
+ 	"testing"
+-	"time"
+ )
+ 
+ func transcriptSession(t *testing.T, f *fixture, count int) (*SchemaDoc, string) {
+ 	t.Helper()
+-	doc, sid := clientHistoryDoc(t), mixedSessionEvents(t, f, 0)
+-	workspace := "transcript-" + sid
+-	b := WorkspaceBinding{AuthorizedRef: workspace, DisplayName: "transcript", DisplayPath: "fixture", RealPath: t.TempDir(), Access: "READ_ONLY", ProjectID: &f.project, Revision: 1, Status: WorkspaceActive, PrincipalID: f.owner, ClientID: "mixed-client", HostPrincipalRef: "fixture", CreatedAt: Now()}
+-	if _, err := f.db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, KindWorkspaceBinding, workspace, string(Bytes(b))); err != nil {
+-		t.Fatal(err)
+-	}
+-	if _, err := f.db.Exec(`UPDATE client_sessions SET workspace_ref=?,model_config_ref='fixture-model',core_build_id='fixture-build',title='transcript',lease_expires_at=? WHERE id=?`, workspace, time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), sid); err != nil {
+-		t.Fatal(err)
+-	}
++	service, sid, _ := handlerTypedSession(t, f, "mixed-client")
++	doc := service.Doc
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+ 		for i := 0; i < count; i++ {
+ 			if err := transcriptAppend(ctxTranscript, tx, doc, f.project, sid, fmt.Sprintf("m%d", i), "中🙂"); err != nil {
+@@ -64,7 +56,8 @@
+ 	}
+ 	svc := &ClientService{Doc: doc, Domain: f.s, SessionRuntime: nextTurnFixturePort{}, Host: ClientHostInfo{CoreBuildID: "fixture-build"}}
+ 	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("mixed-client"), ProjectID: &f.project, SessionID: &sid, ExpectedRevision: &revision, WriterEpoch: revPtr(1), Method: strptr("session.send"), Payload: Bytes(Object{"text": "真正的用户发送🙂", "attachment_artifact_ids": Empty(), "delivery": "NORMAL"})}
+-	return svc, env
++	svc.ConfigurationAuthority = handlerMetadataFixture{f.owner}
++	return svc, handlerDecode(t, env)
+ }
+ 
+ func transcriptCounts(t *testing.T, f *fixture) string {

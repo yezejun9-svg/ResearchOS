@@ -1,0 +1,75 @@
+--- D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/f08_i17_binding_source_mapping_codex/83077264f7f748daa7c9452e22c5c2d0/source-snapshots/02-client_cancel_finalization_test.v3.go.proposed.txt
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/f08_i17_binding_revision_preparation_codex/66ec5753ea3249d0940b157e51a87968/client_cancel_finalization_test.v5.go.proposed.txt
+@@ -39,15 +39,19 @@
+ 
+ func f08TestSetup(t *testing.T) f08TestFixture {
+ 	t.Helper()
+-	functions, err := f08BuildCallbacks(backupConfigurationProtocol, backupConfigurationDomain)
+-	if err != nil { t.Fatal(err) }
+-	raw := []byte(`{"protocol_version":"researchos-client/2","command_id":"cancel-one","client_id":"client-one","project_id":"project-one","session_id":"session-one","expected_revision":7,"writer_epoch":3,"method":"session.control","payload":{"action":"CANCEL","target_id":"goal-one","reason":"fixture"}}`)
++ f := f08TestDataSetup(t)
++ functions, err := f08BuildCallbacks(backupConfigurationProtocol, backupConfigurationDomain)
++ if err != nil { t.Fatal(err) }; f.functions=functions; return f
++}
++func f08TestDataSetup(t *testing.T) f08TestFixture {
++ t.Helper()
++ raw := []byte(`{"protocol_version":"researchos-client/2","command_id":"cancel-one","client_id":"client-one","project_id":"project-one","session_id":"session-one","expected_revision":7,"writer_epoch":3,"method":"session.control","payload":{"action":"CANCEL","target_id":"goal-one","reason":"fixture"}}`)
+ 	envelope, err := DecodeEnvelope(raw)
+ 	if err != nil { t.Fatal(err) }
+ 	hash, err := envelope.ContentHash()
+ 	if err != nil { t.Fatal(err) }
+ 	identity := map[string]any{"format":f08IdentityFormat, "principal":"owner-one", "project":"project-one", "operation":"v2:session.control", "key":"cancel-one", "request_hash":hash, "command_id":"cancel-one", "method":"session.control", "client_id":"client-one", "session_id":"session-one", "writer_epoch":3, "expected_revision":7, "target_id":"goal-one"}
+-	return f08TestFixture{functions, f08TestHeader(t, raw), f08TestJSON(t, identity), identity}
++	return f08TestFixture{[3]f08Scalar{}, f08TestHeader(t, raw), f08TestJSON(t, identity), identity}
+ }
+ 
+ func f08TestRequireOne(t *testing.T, fn f08Scalar, args ...driver.Value) {
+@@ -447,6 +451,8 @@
+ type f08JournalFixture struct {
+ 	t *testing.T
+ 	v *f08ProofValidator
++ entities *SchemaDoc
++ frames []f08I17CapturedFrame
+ 	f f08TestFixture
+ 	rows []any
+ 	versions map[string]f08Version
+@@ -457,11 +463,11 @@
+ 	trace []string
+ }
+ func f08FixtureKey(project,kind,id string,revision any) string { return project+"|"+kind+"|"+id+"|"+fmt.Sprint(revision) }
+-func f08FixtureClone(t *testing.T,m map[string]any) map[string]any {t.Helper();x,_,e:=f08Strict(f08TestJSON(t,m));if e!=nil{t.Fatal(e)};return x.(map[string]any)}
++func f08FixtureClone(t *testing.T,m map[string]any) map[string]any {t.Helper();d:=json.NewDecoder(bytes.NewReader(f08TestJSON(t,m)));d.UseNumber();var x map[string]any;if e:=d.Decode(&x);e!=nil{t.Fatal(e)};return x}
+ func(f *f08JournalFixture) add(category string,row []any){f.rows=append(f.rows,[]any{category,row})}
+ func(f *f08JournalFixture) replace(category string,old,row []any){for i,x:=range f.rows{p:=x.([]any);if p[0]==category&&f08Equal(p[1],old){f.rows[i]=[]any{category,row};return}};f.t.Fatal("fixture missing actual OLD",category)}
+ func(f *f08JournalFixture) put(project,kind string,body map[string]any,head bool) f08Version {
+-	f.t.Helper();if e:=f.v.entities.ValidateDefInput(kind,body);e!=nil{f.t.Fatal("complete fixture schema",kind,e)}
++	f.t.Helper();if e:=f.entities.ValidateDefInput(kind,body);e!=nil{f.t.Fatal("complete fixture schema",kind,e)}
+ 	raw:=f08TestJSON(f.t,body);revision,e:=f08Integer(body["revision"],1);if e!=nil{f.t.Fatal(e)}
+ 	var hash any;if kind=="EventEnvelope"{hash=body["receipt_hash"]}
+ 	x:=f08Version{project,kind,body["id"].(string),revision,hash,raw,body};key:=f08FixtureKey(project,kind,x.id,body["revision"]);f.versions[key]=x
+@@ -481,7 +487,7 @@
+ }
+ func(f *f08JournalFixture) step(mode int64,action string,old,row []any,category string){
+ 	f.t.Helper();var oldValue any;if old!=nil{oldValue=old};raw:=f08TestJSON(f.t,map[string]any{"action":action,"row":row,"old":oldValue,"sources":f.rows})
+-	result,e:=f.v.evaluate(mode,raw);if e!=nil||result!=int64(1){f.t.Fatalf("actual pure step %s mode%d: value=%v err=%v",action,mode,result,e)}
++	f.frames=append(f.frames,f08I17CapturedFrame{Mode:mode,Action:action,Raw:bytes.Clone(raw)}) // freeze BEFORE any SUT or transition
+ 	f.trace=append(f.trace,action);if old==nil{f.add(category,row)}else{f.replace(category,old,row)}
+ }
+ func(f *f08JournalFixture) materialize(row []any,member map[string]any,pins []any,phase string){
+@@ -489,8 +495,15 @@
+ 	if phase=="FINALIZED"{prior,_:=f08Hash(f.member);child[6]=prior;action,category="final_member.insert","final_members"};f.step(7,action,nil,child,category)
+ 	for _,value:=range pins{p:=value.(map[string]any);pin:=append(append([]any{},row[:4]...),phase,p["project"],p["kind"],p["id"],p["revision"],p["content_hash"]);f.step(7,"pin.insert",nil,pin,"pins")}
+ }
++type f08I17CapturedFrame struct {Mode int64;Action string;Raw []byte}
+ func f08FullJournalFixture(t *testing.T,withACK bool,bodyType string)*f08JournalFixture {
+-	t.Helper();f:=&f08JournalFixture{t:t,v:f08AbsenceValidator(t),f:f08TestSetup(t),rows:[]any{},versions:map[string]f08Version{},edges:map[string][]any{}}
++ t.Helper();f:=f08FullJournalDataFixture(t,withACK,bodyType);f.v=f08AbsenceValidator(t)
++ for _,frame:=range f.frames{result,e:=f.v.evaluate(frame.Mode,frame.Raw);if e!=nil||result!=int64(1){t.Fatalf("actual pure step %s mode%d: value=%v err=%v",frame.Action,frame.Mode,result,e)}}
++ return f
++}
++func f08FullJournalDataFixture(t *testing.T,withACK bool,bodyType string)*f08JournalFixture {
++ t.Helper();entities,e:=LoadSchema(backupConfigurationDomain);if e!=nil{t.Fatal(e)}
++ f:=&f08JournalFixture{t:t,entities:entities,f:f08TestDataSetup(t),rows:[]any{},versions:map[string]f08Version{},edges:map[string][]any{}}
+ 	when:="2026-01-01T00:00:00Z";q:=f.f.identityObject["request_hash"]
+ 	// Copy only the full entity shapes; overwrite their IDs and every actual
+ 	// relation explicitly. No unrelated B objects enter this source bundle.

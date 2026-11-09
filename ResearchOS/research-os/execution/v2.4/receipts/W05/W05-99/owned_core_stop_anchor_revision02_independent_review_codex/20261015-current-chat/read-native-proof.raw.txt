@@ -1,0 +1,862 @@
+//go:build windows
+
+package supervisor
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// OwnedCoreNativeIdentity is entirely observed from retained native handles.
+// ParentProcessID comes from one Toolhelp snapshot and is then bound to its
+// own retained process handle, creation time, SID and image file identity.
+type OwnedCoreNativeIdentity struct {
+	PID               uint32 `json:"pid"`
+	CreatedNS         int64  `json:"created_ns"`
+	SID               string `json:"sid"`
+	ImagePath         string `json:"image_path"`
+	ImageSHA256       string `json:"image_sha256"`
+	ImageVolume       uint32 `json:"image_volume"`
+	ImageIndex        uint64 `json:"image_index"`
+	ParentPID         uint32 `json:"parent_pid"`
+	ParentCreatedNS   int64  `json:"parent_created_ns"`
+	ParentSID         string `json:"parent_sid"`
+	ParentImagePath   string `json:"parent_image_path"`
+	ParentImageSHA256 string `json:"parent_image_sha256"`
+	ParentImageVolume uint32 `json:"parent_image_volume"`
+	ParentImageIndex  uint64 `json:"parent_image_index"`
+}
+
+type ownedNativeProcess struct {
+	handle  windows.Handle
+	image   *os.File
+	path    string
+	created int64
+	sid     string
+	sha     string
+	volume  uint32
+	index   uint64
+}
+
+func (p *ownedNativeProcess) close() {
+	if p.image != nil {
+		_ = p.image.Close()
+		p.image = nil
+	}
+	if p.handle != 0 {
+		_ = windows.CloseHandle(p.handle)
+		p.handle = 0
+	}
+}
+
+func ownedNativePath(h windows.Handle) (string, error) {
+	buf := make([]uint16, 32768)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
+		return "", err
+	}
+	path := windows.UTF16ToString(buf[:size])
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") {
+		return "", errors.New("canonical executable path required")
+	}
+	actual, err := filepath.EvalSymlinks(path)
+	if err != nil || !strings.EqualFold(actual, path) {
+		return "", errors.New("executable path reparse rejected")
+	}
+	return path, nil
+}
+
+func ownedNativeImage(path string) (*os.File, string, uint32, uint64, error) {
+	wide, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, "", 0, 0, err
+	}
+	h, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return nil, "", 0, 0, err
+	}
+	f := os.NewFile(uintptr(h), path)
+	var before windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(h, &before); err != nil {
+		f.Close()
+		return nil, "", 0, 0, err
+	}
+	if before.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || before.NumberOfLinks != 1 || before.FileSizeHigh != 0 || before.FileSizeLow > 256<<20 {
+		f.Close()
+		return nil, "", 0, 0, errors.New("image reparse/alias/size rejected")
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(f, 256<<20+1))
+	if err != nil {
+		f.Close()
+		return nil, "", 0, 0, err
+	}
+	var after windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(h, &after); err != nil {
+		f.Close()
+		return nil, "", 0, 0, err
+	}
+	if n != int64(before.FileSizeLow) || before.VolumeSerialNumber != after.VolumeSerialNumber || before.FileIndexHigh != after.FileIndexHigh || before.FileIndexLow != after.FileIndexLow || before.FileSizeLow != after.FileSizeLow || before.LastWriteTime != after.LastWriteTime {
+		f.Close()
+		return nil, "", 0, 0, errors.New("image changed during retained read")
+	}
+	return f, hex.EncodeToString(hash.Sum(nil)), before.VolumeSerialNumber, uint64(before.FileIndexHigh)<<32 | uint64(before.FileIndexLow), nil
+}
+
+func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err error) {
+	p = ownedNativeProcess{handle: h}
+	defer func() {
+		if err != nil {
+			p.close()
+		}
+	}()
+	var created, exited, kernel, user windows.Filetime
+	if err = windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return p, err
+	}
+	p.created = created.Nanoseconds()
+	var token windows.Token
+	if err = windows.OpenProcessToken(h, windows.TOKEN_QUERY, &token); err != nil {
+		return p, err
+	}
+	tu, e := token.GetTokenUser()
+	_ = token.Close()
+	if e != nil || tu.User.Sid == nil || !tu.User.Sid.IsValid() {
+		return p, errors.New("process SID unavailable")
+	}
+	p.sid = tu.User.Sid.String()
+	if p.path, err = ownedNativePath(h); err != nil {
+		return p, err
+	}
+	p.image, p.sha, p.volume, p.index, err = ownedNativeImage(p.path)
+	return p, err
+}
+
+func ownedNativeParentPID(pid uint32) (uint32, error) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(snap)
+	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
+	if err = windows.Process32First(snap, &entry); err != nil {
+		return 0, err
+	}
+	for {
+		if entry.ProcessID == pid {
+			if entry.ParentProcessID == 0 || entry.ParentProcessID == pid {
+				return 0, errors.New("invalid parent identity")
+			}
+			return entry.ParentProcessID, nil
+		}
+		err = windows.Process32Next(snap, &entry)
+		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	return 0, errors.New("process absent from snapshot")
+}
+
+// OwnedCoreRetainedHandle is the sole native termination capability. The
+// capability never exports its process handle. The caller must first verify
+// the reviewed plan and all external proofs before opening it.
+type OwnedCoreRetainedHandle struct {
+	core           ownedNativeProcess
+	parent         ownedNativeProcess
+	identity       OwnedCoreNativeIdentity
+	terminateCalls int
+	closed         bool
+	// Per-handle native call seams allow deterministic failure-path fixture cuts.
+	// Nil always uses the Windows APIs; callers outside this package cannot set them.
+	terminate func(windows.Handle, uint32) error
+	wait      func(windows.Handle, uint32) (uint32, error)
+}
+
+func (h *OwnedCoreRetainedHandle) nativeWait(ms uint32) (uint32, error) {
+	if h.wait != nil {
+		return h.wait(h.core.handle, ms)
+	}
+	return windows.WaitForSingleObject(h.core.handle, ms)
+}
+
+func (h *OwnedCoreRetainedHandle) nativeTerminate(code uint32) error {
+	if h.terminate != nil {
+		return h.terminate(h.core.handle, code)
+	}
+	return windows.TerminateProcess(h.core.handle, code)
+}
+
+func ownedCoreOpen(pid uint32, access uint32) (out *OwnedCoreRetainedHandle, err error) {
+	if pid == 0 {
+		return nil, errors.New("zero PID")
+	}
+	h, err := windows.OpenProcess(access|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+	if err != nil {
+		return nil, err
+	}
+	out = &OwnedCoreRetainedHandle{}
+	defer func() {
+		if err != nil {
+			out.Close()
+			out = nil
+		}
+	}()
+	out.core, err = ownedNativeProcessFromHandle(h)
+	if err != nil {
+		return nil, err
+	}
+	actualPID, e := windows.GetProcessId(out.core.handle)
+	if e != nil || actualPID != pid {
+		return nil, errors.New("process handle PID mismatch")
+	}
+	parentPID, e := ownedNativeParentPID(pid)
+	if e != nil {
+		return nil, e
+	}
+	parentH, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, parentPID)
+	if e != nil {
+		return nil, e
+	}
+	out.parent, err = ownedNativeProcessFromHandle(parentH)
+	if err != nil {
+		return nil, err
+	}
+	actualParent, e := windows.GetProcessId(out.parent.handle)
+	if e != nil || actualParent != parentPID {
+		return nil, errors.New("parent handle PID mismatch")
+	}
+	out.identity = OwnedCoreNativeIdentity{PID: pid, CreatedNS: out.core.created, SID: out.core.sid, ImagePath: out.core.path, ImageSHA256: out.core.sha, ImageVolume: out.core.volume, ImageIndex: out.core.index, ParentPID: parentPID, ParentCreatedNS: out.parent.created, ParentSID: out.parent.sid, ParentImagePath: out.parent.path, ParentImageSHA256: out.parent.sha, ParentImageVolume: out.parent.volume, ParentImageIndex: out.parent.index}
+	return out, nil
+}
+
+// ObserveOwnedCoreReadOnly cannot terminate. It is suitable for preflight.
+func ObserveOwnedCoreReadOnly(pid uint32) (OwnedCoreNativeIdentity, error) {
+	h, err := ownedCoreOpen(pid, 0)
+	if err != nil {
+		return OwnedCoreNativeIdentity{}, err
+	}
+	defer h.Close()
+	return h.identity, nil
+}
+
+// OpenOwnedCoreRetained binds the sole termination handle to a complete exact
+// native identity obtained during reviewed preflight. It cannot accept a
+// partial PID-only expectation.
+func OpenOwnedCoreRetained(expected OwnedCoreNativeIdentity) (*OwnedCoreRetainedHandle, error) {
+	if expected.PID == 0 || expected.CreatedNS == 0 || expected.SID == "" || expected.ImageSHA256 == "" || expected.ImagePath == "" || expected.ImageIndex == 0 || expected.ParentPID == 0 || expected.ParentCreatedNS == 0 || expected.ParentSID == "" || expected.ParentImageSHA256 == "" || expected.ParentImageIndex == 0 {
+		return nil, errors.New("complete reviewed native identity required")
+	}
+	h, err := ownedCoreOpen(expected.PID, windows.PROCESS_TERMINATE)
+	if err != nil {
+		return nil, err
+	}
+	if h.identity != expected {
+		h.Close()
+		return nil, errors.New("retained native identity differs from plan")
+	}
+	return h, nil
+}
+
+func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
+	if h == nil {
+		return OwnedCoreNativeIdentity{}
+	}
+	return h.identity
+}
+
+func (h *OwnedCoreRetainedHandle) verifyRetained() error {
+	if h == nil || h.closed || h.core.handle == 0 {
+		return errors.New("native handle closed")
+	}
+	pid, err := windows.GetProcessId(h.core.handle)
+	if err != nil || pid != h.identity.PID {
+		return errors.New("retained PID changed")
+	}
+	var created, exited, kernel, user windows.Filetime
+	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
+		return errors.New("retained process creation changed")
+	}
+	// File share mode prevents replacement while the retained image is open.
+	var info windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(windows.Handle(h.core.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ImageIndex {
+		return errors.New("retained image file changed")
+	}
+	parentPID, err := windows.GetProcessId(h.parent.handle)
+	if err != nil || parentPID != h.identity.ParentPID {
+		return errors.New("retained parent PID changed")
+	}
+	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+		return errors.New("retained parent creation changed")
+	}
+	parentStatus, err := h.nativeParentWait()
+	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+		return errors.New("retained parent no longer live")
+	}
+	if err = windows.GetFileInformationByHandle(windows.Handle(h.parent.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ParentImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ParentImageIndex {
+		return errors.New("retained parent image changed")
+	}
+	return nil
+}
+
+func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {
+	return windows.WaitForSingleObject(h.parent.handle, 0)
+}
+
+// OwnedCoreNativeExit records whether the one call was made and the numeric
+// exit code from the same retained handle. Unknown wait is never retried.
+type OwnedCoreNativeExit struct {
+	TerminateCalls int    `json:"terminate_calls"`
+	ExitObserved   bool   `json:"exit_observed"`
+	ExitCode       uint32 `json:"exit_code"`
+	BeforeSignal   bool   `json:"before_signal"`
+}
+
+const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
+
+func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
+	return h.TerminateOnceAndWaitUntil(timeout, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+}
+
+// TerminateOnceAndWaitUntil applies both the invocation monotonic deadline and
+// the grant's wall expiry at the last native boundary, after pre-signal waits.
+// A failed deadline check returns with zero TerminateProcess calls; the caller's
+// already-durable intent remains consumed.
+func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+	var out OwnedCoreNativeExit
+	if timeout <= 0 || timeout > 30*time.Second {
+		return out, errors.New("bounded native wait required")
+	}
+	if err := h.verifyRetained(); err != nil {
+		return out, err
+	}
+	if h.terminateCalls != 0 {
+		return out, errors.New("native termination already attempted")
+	}
+	status, err := h.nativeWait(0)
+	if err != nil {
+		return out, err
+	}
+	if status == windows.WAIT_OBJECT_0 {
+		out.BeforeSignal = true
+		out.ExitObserved = true
+		if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+	if status != uint32(windows.WAIT_TIMEOUT) {
+		return out, fmt.Errorf("unexpected native wait status %d", status)
+	}
+	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+		return out, errors.New("grant expired before native signal")
+	}
+	h.terminateCalls = 1
+	out.TerminateCalls = 1
+	if err = h.nativeTerminate(OwnedCoreMaintenanceExitCode); err != nil {
+		return out, fmt.Errorf("one TerminateProcess failed: %w", err)
+	}
+	status, err = h.nativeWait(uint32(timeout.Milliseconds()))
+	if err != nil || status != windows.WAIT_OBJECT_0 {
+		return out, fmt.Errorf("native wait unknown: status=%d err=%v", status, err)
+	}
+	out.ExitObserved = true
+	if err = windows.GetExitCodeProcess(h.core.handle, &out.ExitCode); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func (h *OwnedCoreRetainedHandle) Close() {
+	if h == nil || h.closed {
+		return
+	}
+	h.closed = true
+	h.core.close()
+	h.parent.close()
+}
+
+//go:build windows
+
+package host
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"strings"
+
+	_ "modernc.org/sqlite"
+	"researchos.local/research-os/internal/auth"
+)
+
+// OwnedCoreStopPublicIdentity contains only public authority metadata. It
+// never reads credentials, keys, vault records or private process memory.
+type OwnedCoreStopPublicIdentity struct {
+	DataRoot        string `json:"data_root"`
+	Database        string `json:"database"`
+	DatabaseVolume  uint32 `json:"database_volume"`
+	DatabaseIndex   uint64 `json:"database_index"`
+	SID             string `json:"sid"`
+	PrincipalRef    string `json:"principal_ref"`
+	HostID          string `json:"host_id"`
+	OwnerID         string `json:"owner_id"`
+	OwnerRoot       string `json:"owner_root"`
+	HostStateSHA256 string `json:"host_state_sha256"`
+	SchemaVersion   int    `json:"schema_version"`
+}
+
+// ReadOwnedCoreStopPublicIdentity opens an existing database read-only and
+// reads the protected host_state.json through the existing same-SID reader.
+// The caller's SQLite barrier, when present, keeps this database view stable.
+func ReadOwnedCoreStopPublicIdentity(ctx context.Context, dataRoot string) (OwnedCoreStopPublicIdentity, error) {
+	var out OwnedCoreStopPublicIdentity
+	if e := replacementPath(dataRoot); e != nil {
+		return out, e
+	}
+	actual, e := filepath.EvalSymlinks(dataRoot)
+	if e != nil || !strings.EqualFold(actual, dataRoot) {
+		return out, errors.New("data-root reparse refused")
+	}
+	hostDir := filepath.Join(dataRoot, "host")
+	dbPath := filepath.Join(dataRoot, "researchos.sqlite")
+	for i, path := range []string{dataRoot, hostDir, dbPath} {
+		if _, e = replacementIdentity(path, i < 2); e != nil {
+			return out, e
+		}
+		if e = replacementACL(path, i < 2, i == 1); e != nil {
+			return out, e
+		}
+	}
+	dbID, e := replacementIdentity(dbPath, false)
+	if e != nil {
+		return out, e
+	}
+	raw, e := replacementRead(filepath.Join(hostDir, stateFile), 64<<10)
+	if e != nil {
+		return out, e
+	}
+	var state hostState
+	if e = decodeRuntimeManaged(raw, &state); e != nil {
+		return out, e
+	}
+	identity, e := auth.Current()
+	if e != nil {
+		return out, e
+	}
+	sid, e := currentSIDString()
+	if e != nil {
+		return out, e
+	}
+	if state.Version != 1 || state.HostInstanceID == "" || state.PrincipalID == "" || state.PrincipalRef != identity.Ref {
+		return out, ErrHostIdentity
+	}
+	stateHash := sha256.Sum256(raw)
+	out = OwnedCoreStopPublicIdentity{DataRoot: dataRoot, Database: dbPath, DatabaseVolume: dbID.Volume, DatabaseIndex: uint64(dbID.IndexHigh)<<32 | uint64(dbID.IndexLow), SID: sid, PrincipalRef: identity.Ref, HostID: state.HostInstanceID, OwnerID: state.PrincipalID, HostStateSHA256: hex.EncodeToString(stateHash[:])}
+	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(dbPath)}
+	q := u.Query()
+	q.Set("mode", "ro")
+	u.RawQuery = q.Encode()
+	db, e := sql.Open("sqlite", u.String())
+	if e != nil {
+		return out, e
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	var versions, minVersion int
+	if e = db.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&out.SchemaVersion, &minVersion, &versions); e != nil || out.SchemaVersion != 24 || minVersion != 1 || versions != 24 {
+		return out, errors.New("schema 24 fingerprint unavailable")
+	}
+	var owners int
+	rows, e := db.QueryContext(ctx, `SELECT id,roles,revoked FROM auth_principals ORDER BY id`)
+	if e != nil {
+		return out, e
+	}
+	for rows.Next() {
+		var id, roles string
+		var revoked int
+		if e = rows.Scan(&id, &roles, &revoked); e != nil {
+			break
+		}
+		var list []string
+		if e = decodeRuntimeManaged([]byte(roles), &list); e != nil {
+			break
+		}
+		for _, role := range list {
+			if role == "OWNER" && revoked == 0 {
+				owners++
+				if id != out.OwnerID {
+					e = ErrHostIdentity
+					break
+				}
+			}
+		}
+		if e != nil {
+			break
+		}
+	}
+	if e == nil {
+		e = rows.Err()
+	}
+	rows.Close()
+	if e != nil {
+		return out, e
+	}
+	if owners != 1 {
+		return out, fmt.Errorf("current unrevoked OWNER count %d", owners)
+	}
+	if e = db.QueryRowContext(ctx, `SELECT root FROM orchestration_identity WHERE principal=?`, out.OwnerID).Scan(&out.OwnerRoot); e != nil || out.OwnerRoot == "" {
+		return out, errors.New("Owner root unavailable")
+	}
+	return out, nil
+}
+
+//go:build windows
+
+package ownedcorestop
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+)
+
+const proofSchema = "researchos.owned-core-stop-independent-evidence.v1"
+const planReviewSchema = "researchos.owned-core-stop-independent-plan-review.v1"
+const grantAuthoritySchema = "researchos.owned-core-stop-authority-document.v1"
+const historicalManifestSchema = "researchos.owned-core-stop-historical-manifest.v1"
+
+var proofKinds = []string{"f01_ready", "retained_window", "native_entry_gates", "worker_native_exit", "verifier_native_exit", "effect_census", "independent_evidence_review"}
+
+type grantAuthorityDocument struct {
+	Schema                    string                           `json:"schema"`
+	Role                      string                           `json:"role"`
+	OperationID               string                           `json:"operation_id"`
+	Action                    string                           `json:"action"`
+	Subject                   store.OwnedStopSubject           `json:"subject"`
+	Native                    grantNativeIdentity              `json:"native"`
+	Host                      host.OwnedCoreStopPublicIdentity `json:"host"`
+	OperationDir              grantFileIdentity                `json:"operation_dir"`
+	HistoricalManifestSHA256  string                           `json:"historical_manifest_sha256"`
+	PlanSHA256                string                           `json:"plan_sha256,omitempty"`
+	PreflightManifestSHA256   string                           `json:"preflight_manifest_sha256,omitempty"`
+	PreflightGrantSHA256      string                           `json:"preflight_grant_sha256,omitempty"`
+	PreflightExecutableSHA256 string                           `json:"preflight_executable_sha256,omitempty"`
+	Reviewer                  string                           `json:"reviewer"`
+	Verdict                   string                           `json:"verdict"`
+}
+
+type historicalManifest struct {
+	Schema      string        `json:"schema"`
+	OperationID string        `json:"operation_id"`
+	Evidence    []EvidenceRef `json:"evidence"`
+}
+
+func decodeCanonicalAuthority(raw []byte, v any) error {
+	return strictJSON(raw, v)
+}
+
+func validateAuthorityDocument(d grantAuthorityDocument, g operationGrant, role, action string) error {
+	if d.Schema != grantAuthoritySchema || d.Role != role || d.OperationID != g.OperationID || d.Action != action || d.Subject != g.Subject || d.Native != g.Native || d.Host != g.Host || d.OperationDir != g.OperationDir || d.HistoricalManifestSHA256 != g.HistoricalManifest.SHA256 || d.Reviewer == "" || strings.Contains(d.Reviewer, "owned_core_stop_builder") || d.Verdict != "ACCEPTED" {
+		return errors.New("authority document semantics differ")
+	}
+	if action == "preflight" {
+		if d.PlanSHA256 != "" || d.PreflightManifestSHA256 != "" || d.PreflightGrantSHA256 != "" || d.PreflightExecutableSHA256 != "" {
+			return errors.New("preflight authority refers to future output")
+		}
+	} else if d.PlanSHA256 != g.PlanSHA256 || d.PreflightManifestSHA256 != g.PreflightManifestSHA256 || d.PreflightGrantSHA256 != g.PreflightGrantSHA256 || d.PreflightExecutableSHA256 != g.PreflightExecutableSHA256 {
+		return errors.New("stop authority predecessor differs")
+	}
+	return nil
+}
+
+func validateHistoricalManifest(g operationGrant, d *heldDocuments, evidence []EvidenceRef) error {
+	raw, err := d.read(g.HistoricalManifest, 128<<10)
+	if err != nil {
+		return err
+	}
+	var m historicalManifest
+	if err = decodeCanonicalAuthority(raw, &m); err != nil {
+		return err
+	}
+	if m.Schema != historicalManifestSchema || m.OperationID != g.OperationID || len(m.Evidence) != len(proofKinds) || len(evidence) != len(proofKinds) {
+		return errors.New("historical manifest identity/count")
+	}
+	for i, k := range proofKinds {
+		if m.Evidence[i] != evidence[i] || evidence[i].Kind != k || !validSHA(evidence[i].SHA256) {
+			return errors.New("historical manifest class/order/binding")
+		}
+	}
+	return nil
+}
+
+func validatePreflightAuthority(g operationGrant, d *heldDocuments, in Input) error {
+	if err := validateHistoricalManifest(g, d, in.Evidence); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		ref  grantDocument
+		role string
+	}{{g.PreflightScope, "root_preflight_scope"}, {g.PreflightReview, "independent_preflight_review"}} {
+		if err := verifierPath(in.SourceRepository, item.ref.Path); err != nil {
+			return err
+		}
+		raw, err := d.read(item.ref, 128<<10)
+		if err != nil {
+			return err
+		}
+		var doc grantAuthorityDocument
+		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+			return err
+		}
+		if err = validateAuthorityDocument(doc, g, item.role, "preflight"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStopAuthority(g operationGrant, d *heldDocuments, p Plan, planSHA string) error {
+	if err := validateHistoricalManifest(g, d, p.Input.Evidence); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		ref  grantDocument
+		role string
+	}{{g.StopReview, "independent_stop_review"}, {g.RootOperationScope, "root_operation_scope"}} {
+		if err := verifierPath(p.Input.SourceRepository, item.ref.Path); err != nil {
+			return err
+		}
+		raw, err := d.read(item.ref, 128<<10)
+		if err != nil {
+			return err
+		}
+		var doc grantAuthorityDocument
+		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+			return err
+		}
+		if err = validateAuthorityDocument(doc, g, item.role, "commit"); err != nil {
+			return err
+		}
+	}
+	if p.Input.PlanReviewPath != g.StopReview.Path || planSHA != g.PlanSHA256 {
+		return errors.New("plan review path/hash differs")
+	}
+	return nil
+}
+
+// These are observations in independent receipts, not caller-side booleans.
+// Every required digest names a separate raw artifact retained by its reviewer.
+type historicalEvidence struct {
+	Schema                   string                 `json:"schema"`
+	Kind                     string                 `json:"kind"`
+	OperationID              string                 `json:"operation_id"`
+	SourceCommit             string                 `json:"source_commit"`
+	CorePID                  uint32                 `json:"core_pid"`
+	CoreCreatedNS            int64                  `json:"core_created_ns"`
+	CoreImageSHA256          string                 `json:"core_image_sha256"`
+	HostID                   string                 `json:"host_id"`
+	OwnerID                  string                 `json:"owner_id"`
+	OwnerRoot                string                 `json:"owner_root"`
+	Subject                  store.OwnedStopSubject `json:"subject"`
+	Reviewer                 string                 `json:"reviewer"`
+	RawSHA256                map[string]string      `json:"raw_sha256"`
+	NativePID                uint32                 `json:"native_pid,omitempty"`
+	NativeCreatedNS          int64                  `json:"native_created_ns,omitempty"`
+	NativeExitCode           uint32                 `json:"native_exit_code,omitempty"`
+	NativeWaitAPI            string                 `json:"native_wait_api,omitempty"`
+	NativeWaitResult         uint32                 `json:"native_wait_result,omitempty"`
+	NativeExitAPI            string                 `json:"native_exit_api,omitempty"`
+	NativeHandleRecordSHA256 string                 `json:"native_handle_record_sha256,omitempty"`
+	BaselineSHA256           string                 `json:"baseline_sha256,omitempty"`
+}
+
+type operationPlanReview struct {
+	Schema                   string `json:"schema"`
+	OperationID              string `json:"operation_id"`
+	PlanSHA256               string `json:"plan_sha256"`
+	EvidenceSHA256           string `json:"evidence_sha256"`
+	SourceCommit             string `json:"source_commit"`
+	CoreCreatedNS            int64  `json:"core_created_ns"`
+	CoreImageSHA256          string `json:"core_image_sha256"`
+	Reviewer                 string `json:"reviewer"`
+	Verdict                  string `json:"verdict"`
+	RootOperationScopeSHA256 string `json:"root_operation_scope_sha256"`
+}
+
+func verifierPath(repo, path string) error {
+	if !filepath.IsAbs(repo) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("canonical independent evidence path required")
+	}
+	root := filepath.Join(repo, "execution", "verifier")
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return errors.New("evidence outside independent verifier namespace")
+	}
+	actual, err := filepath.EvalSymlinks(path)
+	if err != nil || !strings.EqualFold(actual, path) {
+		return errors.New("evidence reparse or absence")
+	}
+	return nil
+}
+
+func readEvidence(repo string, ref EvidenceRef) (historicalEvidence, error) {
+	var out historicalEvidence
+	if !validSHA(ref.SHA256) {
+		return out, errors.New("evidence hash required")
+	}
+	if err := verifierPath(repo, ref.Path); err != nil {
+		return out, err
+	}
+	raw, err := os.ReadFile(ref.Path)
+	if err != nil {
+		return out, err
+	}
+	if len(raw) == 0 || len(raw) > 128<<10 || digest(raw) != ref.SHA256 {
+		return out, errors.New("evidence content/hash mismatch")
+	}
+	if err = strictJSON(raw, &out); err != nil {
+		return out, err
+	}
+	if out.Schema != proofSchema || out.Kind != ref.Kind || out.Reviewer == "" || strings.Contains(out.Reviewer, "owned_core_stop_builder") {
+		return out, errors.New("independent evidence identity invalid")
+	}
+	return out, nil
+}
+
+func proofNeeds(kind string) []string {
+	switch kind {
+	case "f01_ready":
+		return []string{"main4f_build", "store_open_ready", "wal_full_live_core", "startup_native_identity"}
+	case "retained_window":
+		return []string{"consumed_original_request", "begin_window_marker", "end_unresolved_return", "scan_durable_fence"}
+	case "native_entry_gates":
+		return []string{"all_entry_map", "durable_prepare_before_effect", "dispatch_before_worker", "serial_desktop_serve", "no_alternate_bypass"}
+	case "worker_native_exit":
+		return []string{"original_os_wait_capture", "numeric_exit_capture", "job_drained", "owner_lock_released"}
+	case "verifier_native_exit":
+		return []string{"original_os_wait_capture", "numeric_exit_capture", "original_verifier_registration"}
+	case "effect_census":
+		return []string{"complete_current_census", "original_model_receipt", "original_request_hash", "original_dispatch_hash"}
+	case "independent_evidence_review":
+		return proofKinds[:6]
+	default:
+		return nil
+	}
+}
+
+func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []string) {
+	missing := []string{}
+	refs := map[string]EvidenceRef{}
+	for _, r := range plan.Input.Evidence {
+		if _, exists := refs[r.Kind]; exists {
+			missing = append(missing, "duplicate "+r.Kind)
+		}
+		refs[r.Kind] = r
+	}
+	if len(refs) != len(proofKinds) {
+		missing = append(missing, "exact seven independent receipts required")
+	}
+	observed := map[string]string{}
+	for _, kind := range proofKinds {
+		ref, ok := refs[kind]
+		if !ok {
+			missing = append(missing, kind+": missing")
+			continue
+		}
+		var receipt historicalEvidence
+		var err error
+		if len(held) > 0 && held[0] != nil {
+			if err = verifierPath(plan.Input.SourceRepository, ref.Path); err == nil {
+				var raw []byte
+				raw, err = held[0].read(grantDocument{Path: ref.Path, SHA256: ref.SHA256}, 128<<10)
+				if err == nil {
+					err = decodeCanonicalAuthority(raw, &receipt)
+				}
+				if err == nil && (receipt.Schema != proofSchema || receipt.Kind != ref.Kind || receipt.Reviewer == "" || strings.Contains(receipt.Reviewer, "owned_core_stop_builder")) {
+					err = errors.New("independent evidence identity invalid")
+				}
+			}
+		} else {
+			receipt, err = readEvidence(plan.Input.SourceRepository, ref)
+		}
+		if err != nil {
+			missing = append(missing, kind+": "+err.Error())
+			continue
+		}
+		if receipt.OperationID != plan.OperationID || receipt.SourceCommit != SourceBaseCommit || receipt.CorePID != plan.Native.PID || receipt.CoreCreatedNS != plan.Native.CreatedNS || receipt.CoreImageSHA256 != plan.Native.ImageSHA256 || receipt.HostID != plan.Host.HostID || receipt.OwnerID != plan.Host.OwnerID || receipt.OwnerRoot != plan.Host.OwnerRoot || receipt.Subject != plan.Input.Subject {
+			missing = append(missing, kind+": subject/authority/core binding differs")
+			continue
+		}
+		if kind == "worker_native_exit" || kind == "verifier_native_exit" {
+			// An ignored cmd.Wait error, a PID-list absence, or an assumed exit 0
+			// cannot satisfy this typed original OS wait and numeric-exit receipt.
+			if receipt.NativePID == 0 || receipt.NativePID == plan.Native.PID || receipt.NativeCreatedNS == 0 || receipt.NativeWaitAPI != "WaitForSingleObject" || receipt.NativeWaitResult != 0 || receipt.NativeExitAPI != "GetExitCodeProcess" || !validSHA(receipt.NativeHandleRecordSHA256) {
+				missing = append(missing, kind+": captured exact OS wait/exit/handle identity absent")
+			}
+		}
+		if kind == "effect_census" && receipt.BaselineSHA256 != plan.Baseline.SHA256 {
+			missing = append(missing, kind+": full baseline differs")
+		}
+		for _, name := range proofNeeds(kind) {
+			hash := receipt.RawSHA256[name]
+			if !validSHA(hash) {
+				missing = append(missing, fmt.Sprintf("%s: %s raw receipt missing", kind, name))
+			}
+			if kind == "independent_evidence_review" && hash != observed[name] {
+				missing = append(missing, kind+": evidence hash differs for "+name)
+			}
+		}
+		observed[kind] = ref.SHA256
+	}
+	// Bind the seven references and their order into a single reviewable digest.
+	raw, _ := canonicalJSON(plan.Input.Evidence)
+	return digest(raw), missing
+}
+
+func validatePlanReview(plan Plan, planSHA string) error {
+	if plan.Input.PlanReviewPath == "" {
+		return errors.New("independent operation plan review missing")
+	}
+	if err := verifierPath(plan.Input.SourceRepository, plan.Input.PlanReviewPath); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(plan.Input.PlanReviewPath)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 || len(raw) > 64<<10 {
+		return errors.New("bounded plan review required")
+	}
+	var r operationPlanReview
+	if err = strictJSON(raw, &r); err != nil {
+		return err
+	}
+	if r.Schema != planReviewSchema || r.OperationID != plan.OperationID || r.PlanSHA256 != planSHA || r.EvidenceSHA256 != plan.EvidenceSHA256 || r.SourceCommit != SourceBaseCommit || r.CoreCreatedNS != plan.Native.CreatedNS || r.CoreImageSHA256 != plan.Native.ImageSHA256 || r.Reviewer == "" || strings.Contains(r.Reviewer, "owned_core_stop_builder") || r.Verdict != "ACCEPTED" || !validSHA(r.RootOperationScopeSHA256) {
+		return errors.New("independent exact plan/root-scope review unavailable")
+	}
+	return nil
+}
+

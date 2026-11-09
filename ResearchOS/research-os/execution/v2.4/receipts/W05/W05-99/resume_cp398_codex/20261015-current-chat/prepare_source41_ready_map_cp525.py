@@ -1,0 +1,14 @@
+import hashlib,json,subprocess
+from pathlib import Path
+R=Path('D:/作品集/ResearchOS/research-os');B=Path(__file__).parent;E=R/'execution/v2.4/receipts/W05/W05-99'
+base='4f4023c956f84d65743f39ce77d6c8899a21ada1';bc='fec4a4d7bc8aa4ce6ee1e0f9a7da024bd528ca3f';sc='37a1f6d3e9d1c64b0d5fab5d30bc8000dd4ac373';git=['git','-c','maintenance.auto=false','-c','gc.auto=0']
+def g(*a):return subprocess.check_output(git+list(a),cwd=R)
+def ref(p):
+ x=p.read_bytes();return {'path':str(p),'sha256':hashlib.sha256(x).hexdigest(),'bytes':len(x)}
+bp=g('diff','--name-only',base,bc).decode().splitlines();sp=g('diff','--name-only',base,sc).decode().splitlines();assert len(bp)==22 and len(sp)==19 and not set(bp)&set(sp)
+pins={}
+for lane,c,paths in [('B_r3_Aincluded_22_NOT_ACCEPTED',bc,bp),('STOP_r5_19_LIMITED_SOURCE_ACCEPTED',sc,sp)]:
+ for p in paths:
+  data=g('show',c+':'+p);pins[p]={'source_commit':c,'lane':lane,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
+out={'schema':'researchos.source41-ready-map-draft.v1','status':'DRAFT_READONLY_NO_CONSTRUCTION_AUTHORITY','base_Main':base,'base_candidate_B_r3_not_accepted':bc,'STOP_candidate_limited_source_accepted':sc,'path_count':41,'path_overlap':[],'expected_source41_pins':pins,'activation_gates':['B-r3 independent full9/delta4 semantic acceptance by Root; current author freeze is insufficient.','Root registers exact composition Source41 card with immutable inputs/sparse worktree/ownership/guards before any construction.','Main4f dirty20/protected9/config/step_state/index remain protected.','C57 Source requires exact accepted composition and inherited new B nativehold Check/Close Tx lifetime contract.'],'proposed_mechanical_method':'New sparse worktree from accepted frozen B-r3(Aincluded), apply immutable whole19 STOP patch fromMain4f with explicit paths; exact41hashidentity check then clean local commit/full41binarypatch. No Source25 integration.','proposed_minimum_new_composition_checks':['Build genuine apps/control and ops/owned_core_stop from exact41 and record buildinfo/sourceclean.','Focused combined qualification/nativehold/Owner and ownedstop store/host integration compilation; no unrelated allrepo suites.','Independent Source41 review with own genuine B closure+completed replay census and compiled STOP nonempty fixture positive/denial as proportionate; preserve historical residual limits.'],'no_original_root_or_api_or_model_or_Stop_or_backup':True,'actual_authority':False,'formal_increment':0,'source25_overlap_inventory_reference':ref(B/'provisional-composition-inventory-cp522.json')}
+p=B/'source41-ready-map-draft-cp525.json';assert not p.exists();p.write_text(json.dumps(out,ensure_ascii=False,indent=2)+'\n',encoding='utf8');print(json.dumps({'output':ref(p),'B_Aincluded':22,'STOP':19,'intersection':0,'expected_source41_pins':len(pins),'status':out['status']},ensure_ascii=False))

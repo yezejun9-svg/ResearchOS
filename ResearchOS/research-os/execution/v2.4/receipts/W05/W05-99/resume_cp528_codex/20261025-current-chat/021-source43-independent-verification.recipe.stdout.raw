@@ -1,0 +1,122 @@
+{"verified_count": 208, "unresolved": [], "review_keys": ["schema", "verdict", "reviewer", "model", "reasoning_effort", "candidate", "tree", "findings", "blocking_findings", "source_edits", "source_pins", "independent_substantive_review", "claim_matrix", "diagnostics", "root_adoption", "main_import", "actual", "formal_increment", "C57_issued", "limitations"], "top_files": ["audit_author.py", "author-verification.json", "claim-test-matrix.json", "cleanup_owned_cache.ps1", "command-index.json", "diagnostic-ledger.json", "evidence-verification.json", "FINAL-manifest.json", "FINAL-seal.json", "freeze_review.py", "pins-verification.json", "read_sources.py", "review.json", "REVIEW.md", "review_runner.py", "seal_review.py", "setup_fixture.py", "verify_evidence.py", "verify_pins.py"]}
+REVIEW.md 4475 chars
+# Source43 独立实质复核
+
+结论：**LIMITED_SOURCE_ACCEPTED**，仅针对 `085b4711afe0c1288448b174eef24ecd5af0551b` / tree `227d36324fd1053c285d0b2846a2b707ac2df6bd`。未发现需修改候选源码的 P0/P1/P2。Root 才能签发 adoption、导入 Main 或发出 C57；本报告不增加 actual / parent / formal 验收。
+
+复核人：`codex:/root/source43_independent_review_20261025`，`gpt-6-astra` / high，按项目 AGENTS 的独立验收模型策略执行。没有源码编辑权；所有构建和测试来自独立、干净、精确提交的 sparse worktree。CodeGraph 工具不可用，使用定向 rg 与逐行源码读取。没有启动 GSD。
+
+## 源码与组合结论
+
+| 检查点 | 实质结论与位置 | 证据 |
+|---|---|---|
+| roots2 长度边界 | `internal/host/roots_windows.go:34-56` 保持 Windows 原生 UTF-16 长度单位；先拒绝零或达到/超过容量，再只转换 `buf[:n]`，不再对 UTF-8 字符串按 UTF-16 长度截断。错误分支保留错误、不接受部分路径。 | 004/010 静态读取，023 原生三项测试 |
+| 原生身份与消费者 | 同文件 `:22-33` 的共享模式、volume/file ID 计算未改；`:43` 原前缀约定未改。`internal/host/roots.go:113-125` 写入身份和完整 FinalPath，`:154-160` 仍使用 volume/file ID 复核身份。没有旧 registry 迁移或新增 FinalPath 权限比较。 | 010/022；Main 全 diff 仅 43 路径 |
+| Windows 实测 | 实际 fileIdentity 的 ASCII、中文祖先与名称、非 BMP、同前缀不同后缀目录都有精确完整路径及原生身份断言；纯转换测试验证尾部哨兵不可被读入；registry Register/save/reopen 保留路径与身份。 | `internal/host/roots_windows_test.go:51-140`；023 |
+| B 句柄持有 | `adapters/runtime/qualification_failure_proof_windows.go:258-337` 持有目录及五个原生文件；`:268-305` 的 Check 拒绝缺失/关闭状态，Close 对 nil 和重复调用安全。`internal/domain/runtime_qualification_failure_windows.go:954-998` 成功才转移 hold 所有权。 | 015/025 静态读取 |
+| B 实际事务顺序 | 两个生产消费路径 `runtime_qualification_failure_windows.go:583-596`、`:641-644` 均先 Check，实际 Rollback 返回后再 Close。创建路径 `:625-675` 先登记 Close defer，后登记 Rollback defer；成功 Commit 返回后 Close，错误回退先 Rollback 再 Close。没有新增生产调用者。 | 015/018；028 重放和持有寿命；041 实际 Commit 延迟 FK 失败切点 |
+| STOP 组合连接 | `internal/ownedcorestop/stop_windows.go:267-329` 在证据与身份校验后获取保留句柄，持有写屏障到原生退出，最后重新获取真实 root lease 和完整 census。`ops/supervisor/owned_core_handle_windows.go:404-416,443-474,504-560` 使用完整进程/父进程/映像身份及单次信号。 | 022/025 源码；033/034 非空编译夹具正例及拒绝；036 编译 CLI 无 grant 拒绝 |
+| 41+2 组合 | 41 个继承文件 SHA/bytes 与登记 B22+STOP19 完全一致；完整 Main4f diff 恰好 allowlist 43 路径，依赖文件未漂移；roots2 为唯一新增语义变更。full43 与 fix2 patch 均与作者冻结文件逐字节相同。 | 009/014/042/043/045；pins-verification.json |
+
+`scope` 中 B pin 的旧 lane 字符串含 `NOT_ACCEPTED`，它是历史标签，未改写。已核验所引用的 B-r3 Root limited-source adoption、B 独立 review/FINAL 及 STOP-r5 adoption 哈希，继承结论以这些指定回执为准；不从旧 lane 字符串推导当前权限。
+
+## 有限独立执行
+
+| 命令 | 实际验证 | 结果 |
+|---|---|---|
+| 023 | roots UTF-16 边界、真实 Unicode 目录身份、registry 持久化 | 3 top-level PASS，0 SKIP |
+| 028 | B completed-marker 精确入口重放、private consumer 原生文件持有至事务结束 | 2 top-level PASS，0 SKIP；受控本地 loopback，不是外部模型 |
+| 041 | B actual Commit deferred-FK 失败，回滚后无部分提交 | 1 top-level + 1 subtest PASS，0 SKIP；只跑该切点 |
+| 033 | 编译测试程序驱动新 fixture，非空 WAL 数据、原生单次退出、真实 lease 释放；CLI 参数拒绝 | 2 top-level PASS |
+| 034 | 原生退出后增加数据导致 maintenance blocked；无效 preflight；取消/早期 deadline | 3 top-level PASS |
+| 027/029/030/031/032 | 独立构建 fixture、STOP CLI、control 和两个测试程序 | native exit 0 |
+| 035 | fixture / STOP / control 的 buildinfo | 三者均 exact revision，Go 1.27.1/windows/amd64，vcs.modified=false |
+| 036 | 真正编译 STOP CLI 无 compiled grant 的 commit 拒绝 | expected native exit **1**，`STOP_GRANT_UNCONFIGURED`；没有观察或操作原始进程 |
+
+合计 **11 个 top-level 测试 + 1 个 subtest** 通过；不把 package pass 另计为用例。没有外部 CI run，CI references 明确为本地 Windows 原生命令证据。
+
+作者测试矩阵已按原始 Go JSON 重算：B 144 pass events / 56 skip events，56 个 skip 不计 PASS；roots3、backup integration1 可继承；作者先前 STOP fixture/ACL 失败仍留在原始账本，后来的 C 路径成功不覆盖失败。作者 FINAL、附录和 seal 及其引用已核验，独立证据分别存放。
+
+## 发现与限制
+
+候选源码 findings：空；没有以测试通过代替对实际源码和消费顺序的检查。以下是证据边界，不是本次新增源码缺陷：
+
+- 新 registry 正确写入并持久化 Unicode；已有被截断的 registry 不会自动修复。
+- 没有本轮完整 Mu bundle suite、外部模型、原始 DB/API/Host/OwnerRoot、实际产品 STOP/fence/restart 或正式 C 调用者证据。此处正例是编译测试程序与 task-owned 子进程；未宣称完整 grant-bound CLI 正例。
+- exact 15s timeout、foreign SID、完整 cleanup missing/null 笛卡尔组合、hostile 并发 race、CloseHandle/Close 注入仍未覆盖；目录 guard Close 忽略底层 CloseHandle 返回的历史限制未改变。
+- 旧 worker/verifier native Wait 结果仍未知，不补写。未来 C 必须自行验证 opaque closure 的 Check → 实际 Commit/Rollback 返回 → Close 契约。
+- 预写 recipe 的执行要求存在明确的启动例外：最初只读 AGENTS/scope bootstrap 尚未建立 runner；随后两个 launcher 因本地 `inspect.py` 遮蔽 Python stdlib 而在写 recipe 前失败。它们有本聊天工具返回和 numeric exit，缺少独立 per-command raw streams，不伪造补写为预登记。所有真正 Git、源码 pin、build、test、fixture 及 CLI 动作均有预写 recipe、stdout/stderr 和 native exit。
+- 020 的 sparse compile-dependency 缺失与 044 的复核脚本 UTF-8 解码错误已保存；修正仅涉及 sparse checkout 或 reviewer 脚本，没有修改候选源码。036 是预期拒绝，不计作异常产品失败。
+
+所有历史/作者失败只引用、不重置。本 reviewer 的诊断单独记录在 diagnostic-ledger.json。保留原始命令和结果。task-owned C bin 保留以便复查；仅清理本轮自有编译缓存和空 fixture 临时目录。
+
+最终授权：仅独立 **limited Source** 结论。Root adoption、Main import、C57 和 formal 均未由本 reviewer 执行。
+
+diagnostic-ledger.json 2751 chars
+{
+  "schema": "researchos.source43-independent-diagnostics.v1",
+  "entries": [
+    {
+      "id": "BOOTSTRAP-000",
+      "class": "CAPTURE_EXCEPTION",
+      "native_exit": 0,
+      "operation": "Read canonical AGENTS, Get-FileHash SHA256 scope, read scope",
+      "tool_chunk": "66d013",
+      "prewritten_recipe": false,
+      "separate_raw_streams": false,
+      "note": "Read-only bootstrap before runner creation. Tool transcript retained in current chat; not represented as native per-command capture."
+    },
+    {
+      "id": "LAUNCHER-002",
+      "class": "LAUNCHER_FAILURE_BEFORE_RECIPE",
+      "native_exit": 1,
+      "tool_chunk": "eefd8a",
+      "attempted": "002-read",
+      "cause": "Reviewer inspect.py shadowed Python stdlib inspect while argparse imported dataclasses. FileNotFoundError on --label before subprocess execution.",
+      "prewritten_recipe": false,
+      "separate_raw_streams": false,
+      "resolution": "Renamed reviewer-only script to read_sources.py; executed 004-read."
+    },
+    {
+      "id": "LAUNCHER-003",
+      "class": "LAUNCHER_FAILURE_BEFORE_RECIPE",
+      "native_exit": 1,
+      "tool_chunk": "c32ca9",
+      "attempted": "003-worktree-add",
+      "cause": "Same reviewer Python stdlib shadowing; Git subprocess was never invoked.",
+      "prewritten_recipe": false,
+      "separate_raw_streams": false,
+      "resolution": "005 is first actual worktree add; no source changed by failed launcher."
+    },
+    {
+      "id": "020-roots-native",
+      "class": "BUILD_SETUP_FAILURE",
+      "native_exit": 1,
+      "cause": "Sparse checkout lacked evaluation packages; no tests ran.",
+      "resolution": "021 adds immutable evaluation/spec/test/support dirs; 023 then passes."
+    },
+    {
+      "id": "036-compiled-cli-refusal",
+      "class": "EXPECTED_REFUSAL",
+      "native_exit": 1,
+      "cause": "STOP_GRANT_UNCONFIGURED",
+      "count_as_unexpected_failure": false
+    },
+    {
+      "id": "044-evidence-check",
+      "class": "REVIEW_SCRIPT_FAILURE",
+      "native_exit": 1,
+      "cause": "Default Windows text decoder misread UTF-8 scope JSON.",
+      "resolution": "Reviewer script explicitly uses UTF-8; 045 verifies all references. Candidate untouched."
+    }
+  ],
+  "counts": {
+    "pre_recipe_bootstrap_exceptions": 1,
+    "pre_recipe_launcher_failures": 2,
+    "recorded_unexpected_native_nonzero": 2,
+    "expected_native_refusals": 1,
+    "candidate_test_failures": 0
+  },
+  "author_and_historical_ledgers": "Referenced without reset or rewrite; author-verification.json and inherited references bind their immutable evidence.",
+  "definition": "Command-native nonzero, launcher failure, expected refusal and test event counts are separate; no reassignment to author source failures."
+}

@@ -1,0 +1,29 @@
+--- original/root_concrete_approval_helper.py
++++ revision/root_concrete_approval_helper.py
+@@ -58,6 +58,17 @@
+     require(type(ref) is dict and set(ref) in ({"path", "sha256", "bytes"}, {"role", "path", "sha256", "bytes"}), "exact pin shape")
+     require(type(ref["bytes"]) is int and ref["bytes"] >= 0, "exact integer pin length")
+     require(type(ref["sha256"]) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", ref["sha256"]), "SHA256 pin")
++    canonical(ref["path"])
++    return {k: ref[k] for k in ("path", "sha256", "bytes")}
++
++def inspection_database_ref(ref):
++    """Validate the Root API inspection's ordinary unprefixed receipt pin.
++    This is metadata-only: never read the retained database or normalize its
++    digest into a public RawPin.
++    """
++    require(type(ref) is dict and set(ref) == {"path", "sha256", "bytes"}, "inspection database receipt pin shape")
++    require(type(ref["bytes"]) is int and ref["bytes"] >= 0, "inspection database receipt length")
++    require(type(ref["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]), "inspection database bare SHA256")
+     canonical(ref["path"])
+     return {k: ref[k] for k in ("path", "sha256", "bytes")}
+ 
+@@ -331,7 +342,7 @@
+     guard_closed(q["reader_guard_cleanup"]); guard_closed(q["database_guard_cleanup"])
+     require(q["database_share_mode"] == "READ_WRITE_SHARED_DELETE_DENIED" and q["immutable_database_claim"] is False, "live SQLite semantics")
+     # Inspect only its public DB pin shape; do not open/read/copy SQLite or credentials.
+-    db = canonical(plain(q["database_ref"])["path"])
++    db = canonical(inspection_database_ref(q["database_ref"])["path"])
+     require(db.is_file() and db.is_relative_to(canonical(cfg["Environment"]["TEMP"])), "retained original DB no longer exists")
+     public_rows(q["typed_rows"]); require(jcs_digest(q["typed_rows"]) == q["typed_rows_sha256"], "inspection whole-row digest")
+     before = inputs.obj(q["before_ref"]); public_rows(before)

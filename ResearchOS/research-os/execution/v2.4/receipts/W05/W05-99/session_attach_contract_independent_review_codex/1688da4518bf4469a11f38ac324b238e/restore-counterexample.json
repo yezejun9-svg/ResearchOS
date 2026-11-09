@@ -1,0 +1,34 @@
+{
+  "kind": "STATIC_SOURCE_PATH_COUNTEREXAMPLE_NOT_EXECUTED",
+  "preconditions": [
+    "Authenticated original owner/client after local reauthentication, exact current Session revision and writer_epoch=null.",
+    "Session maps Run R and still has an unexpired client_sessions.lease_expires_at copied from the snapshot.",
+    "Restore runs backupFence: backup_restore_barriers(P,R) refreshed, Run status RECONCILING and Run lease expired; client Session lease/epoch remain unchanged.",
+    "No runtime observation for same project/run/current Run epoch newer than the restore barrier proves children_stopped=true AND queue_empty=true."
+  ],
+  "candidate_trace": [
+    "Execute identity replay lookup finds a new command and dispatch preserves valid identity/revision.",
+    "Candidate lines1131-1161 enters same-owner unexpired branch, updates only client lease with CAS, builds snapshot, returns COMPLETED/write_owner_acquired=true at unchanged epoch.",
+    "The only existing client restore trigger fires on UPDATE OF writer_epoch and NEW>OLD; lease-only UPDATE cannot trigger it.",
+    "runState and HandoffEpoch are below the early return and never execute."
+  ],
+  "base_trace": [
+    "T6 enters runState for a mapped unsettled RECONCILING Run and returns SESSION_BUSY.",
+    "Even with stale settled Run flags, its epoch-advancing path reaches the existing restore fresh-observation trigger."
+  ],
+  "impact": "An unresolved restored ownership claim is extended and reported acquired with the pre-restore generation. This violates the source contract; no claim is made that a later runtime tool actually launched or that other queue/dispatch fences were bypassed.",
+  "required_fix": "Fence the lease-only branch using current restore/reconciliation authority, not wall-clock expiry alone. An unresolved restored claim must be refused or routed through reviewed recovery before granting a fresh generation; ordinary active same-owner renewal without a restore fence must remain allowed.",
+  "required_witness_predicate": [
+    "Same authoritative project and Run, and the applicable current Run lease epoch.",
+    "Observation strictly newer than the most recent barrier for that project/Run.",
+    "Both children_stopped and queue_empty are true.",
+    "A restored old writer generation must not be treated as valid merely because its persisted Session lease is in the future; recovery must establish its new valid generation.",
+    "Existing session queue/control restore fences and resume_requires_explicit_user must remain effective; renewal/transfer must not clear them."
+  ],
+  "required_regressions": [
+    "Normal active Run, same owner, valid lease and no restore fence still renews with unchanged epoch/revision/events.",
+    "Restored same owner with a still-future Session lease and no fresh observation cannot extend the lease, publish a successful acquired result, or mutate ownership/journal.",
+    "Old observation, wrong project/Run/epoch, only children_stopped, and only queue_empty never satisfy recovery.",
+    "Fresh correctly bound settlement flows through the actual reviewed recovery/reacquisition generation path; exact command replay repeats neither renewal nor transfer."
+  ]
+}

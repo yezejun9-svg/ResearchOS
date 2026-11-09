@@ -1,0 +1,120 @@
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"time"
+)
+
+func latestEffect(tx *sql.Tx, project, run, key string) (Object, error) {
+	var raw string
+	e := tx.QueryRow("SELECT body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence DESC LIMIT 1", project, run, key).Scan(&raw)
+	if e != nil {
+		return nil, e
+	}
+	return Decode([]byte(raw))
+}
+func effectAppend(tx *sql.Tx, project, run, key string, o Object) error {
+	var seq int64
+	if e := tx.QueryRow("SELECT coalesce(max(sequence),0)+1 FROM resource_effects WHERE project=? AND run=? AND effect_key=?", project, run, key).Scan(&seq); e != nil {
+		return e
+	}
+	o["sequence"] = seq
+	o["observed_at"] = Now()
+	_, e := tx.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)", project, run, key, seq, string(Bytes(o)))
+	return e
+}
+func effectsReconciled(tx *sql.Tx, project, run string) error {
+	var unresolved int
+	e := tx.QueryRow(`SELECT count(*) FROM resource_effects x WHERE project=? AND run=? AND sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('STARTED','UNKNOWN')`, project, run).Scan(&unresolved)
+	if e != nil {
+		return e
+	}
+	if unresolved != 0 {
+		return Fail(409, "STATE_CONFLICT", "unknown effects require reconciliation; blind retry prohibited")
+	}
+	return nil
+}
+
+// PrepareEffect persists intent and cost admission in one transaction before
+// any provider request. The sole scheduler owns this; a worker cannot enqueue.
+func (s *Service) PrepareEffect(ctx context.Context, token, project, runID, key string, payload, cost Object) (Object, error) {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	result, e := s.prepareEffectTx(tx, token, project, runID, key, payload, cost)
+	if e != nil {
+		return nil, e
+	}
+	if e := s.Contracts.Validate("CostEntryRequest", b); e != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "invalid ledger request")
+	}
+	var prior string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_event_id')=?", project, b["provider_event_id"]).Scan(&prior)
+	if e == nil {
+		o, e := Decode([]byte(prior))
+		if e != nil {
+			return nil, e
+		}
+		payload := Object{}
+		for k := range b {
+			payload[k] = o[k]
+		}
+		if Hash(payload) != Hash(b) {
+			return nil, Fail(409, "IDEMPOTENCY_CONFLICT", "provider event payload changed")
+		}
+		return o, nil
+	}
+	if e != sql.ErrNoRows {
+		return nil, e
+	}
+	run, e := load(tx, project, "Run", Str(b, "run_id"))
+	if e != nil {
+		return nil, e
+	}
+	chain, leaves, e := runBudgetScopes(tx, project, Str(run, "id"))
+	if e != nil {
+		return nil, e
+	}
+	leaf := Str(b, "policy_id")
+	if !leaves[leaf] {
+		return nil, Fail(422, "GATE_FAILED", "ledger requires a run-bound budget scope")
+	}
+	op := Str(b, "operation")
+	basis := Str(b, "cost_basis")
+	if op == "UNKNOWN" {
+		if b["money"] != nil || basis != "UNKNOWN" {
+			return nil, Fail(422, "GATE_FAILED", "unknown must remain null")
+		}
+	} else {
+		if _, e = moneyAmount(b["money"]); e != nil {
+			return nil, e
+		}
+	}
+	var count int
+	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=?", project, run["id"], b["provider_request_id"]).Scan(&count); e != nil {
+		return nil, e
+	}
+	if op == "RESERVE" || op == "UNKNOWN" && count == 0 {
+		task, e := load(tx, project, "Task", Str(run, "task_id"))
+		if e != nil {
+			return nil, e
+		}
+		goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+		if e != nil {
+			return nil, e
+		}
+		if goal["status"] != "ACTIVE" || task["active_run_id"] != run["id"] {
+			return nil, Fail(409, "STATE_CONFLICT", "paused or superseded run cannot create liabilities")
+		}
+		if runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
+			return nil, Fail(409, "STATE_CONFLICT", "new liability forbidden after stop")
+		}
+		if count != 0 || b["reservation_id"] != nil {
+			return nil, Fail(409, "STATE_CONFLICT", "request already admitted")
+		}
+		if op == "RESERVE" && basis != "UPPER_BOUND" && basis != "ESTIMATE" {
+			return nil, Fail(422, "GATE_FAILED", "reservation requires cost bound or estimate")
+		}

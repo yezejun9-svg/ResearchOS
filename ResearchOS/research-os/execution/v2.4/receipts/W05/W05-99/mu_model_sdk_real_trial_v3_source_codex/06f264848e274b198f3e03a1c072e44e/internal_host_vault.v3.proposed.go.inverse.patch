@@ -1,0 +1,49 @@
+--- a/internal_host_vault.v3.proposed.go
++++ b/internal_host_vault.v2.proposed.go
+@@ -151,46 +151,6 @@
+     return nil
+ }
+ 
+-// ValidateTrialStorageLayout checks the actual child paths before lease, DB
+-// creation or Host.New privateDir work. A missing host/DB leaf is allowed only
+-// below an already verified ordinary data-root directory.
+-func ValidateTrialStorageLayout(dataRoot, newHostDir, oldHostDir string) error {
+-    if err := ValidateTrialVaultIsolation(dataRoot, oldHostDir); err != nil {
+-        return err
+-    }
+-    expectedHost := filepath.Join(filepath.Clean(dataRoot), "host")
+-    if !filepath.IsAbs(newHostDir) || !strings.EqualFold(filepath.Clean(newHostDir), expectedHost) {
+-        return ErrUnknownCredential
+-    }
+-    checkLeaf := func(path string, wantDir bool) error {
+-        info, err := os.Lstat(path)
+-        if os.IsNotExist(err) { return nil }
+-        if err != nil || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+-            return ErrUnknownCredential
+-        }
+-        if wantDir != info.IsDir() {
+-            return ErrUnknownCredential
+-        }
+-        resolved, err := filepath.EvalSymlinks(path)
+-        if err != nil || !strings.EqualFold(resolved, filepath.Clean(path)) {
+-            return ErrUnknownCredential
+-        }
+-        old, err := os.Stat(oldHostDir)
+-        if err != nil { return ErrUnknownCredential }
+-        actual, err := os.Stat(path)
+-        if err != nil || os.SameFile(actual, old) { return ErrUnknownCredential }
+-        oldDB := filepath.Join(filepath.Dir(oldHostDir), "researchos.sqlite")
+-        original, err := os.Stat(oldDB)
+-        if err != nil && !os.IsNotExist(err) { return ErrUnknownCredential }
+-        if err == nil && os.SameFile(actual, original) {
+-            return ErrUnknownCredential
+-        }
+-        return nil
+-    }
+-    if err := checkLeaf(newHostDir, true); err != nil { return err }
+-    return checkLeaf(filepath.Join(filepath.Clean(dataRoot), "researchos.sqlite"), false)
+-}
+-
+ func openVault(dir string) (*Vault, error) {
+ 	d := filepath.Join(dir, "credentials")
+ 	if err := os.MkdirAll(d, 0o700); err != nil {

@@ -1,0 +1,56 @@
+
+func (s *Service) completedLocalUnknownCosts(ctx context.Context) error {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	rows, e := tx.QueryContext(ctx, `SELECT project,body FROM domain_objects x WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.operation') IN ('RESERVE','UNKNOWN') AND rowid=(SELECT max(y.rowid) FROM domain_objects y WHERE y.kind='BudgetLedgerEntry' AND y.project=x.project AND json_extract(y.body,'$.run_id')=json_extract(x.body,'$.run_id') AND json_extract(y.body,'$.provider_request_id')=json_extract(x.body,'$.provider_request_id'))`)
+	if e != nil {
+		return e
+	}
+	type item struct {
+		project string
+		ledger  Object
+	}
+	items := []item{}
+	for rows.Next() {
+		var project, raw string
+		if e = rows.Scan(&project, &raw); e != nil {
+			rows.Close()
+			return e
+		}
+		ledger, err := Decode([]byte(raw))
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		items = append(items, item{project, ledger})
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, item := range items {
+		if e = s.completedLocalUnknownCost(tx, item.project, item.ledger); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger Object) error {
+	bad := func(reason string) error {
+		return errors.New("desktop exit requires complete original local MODEL evidence: " + reason + "; cost remains unknown")
+	}
+210:	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before)
+223:	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after)
+236:	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before); err != nil {
+244:	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after); err != nil {
+257:		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); err != nil {
+268:		if err := tx.QueryRow("SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=?", key).Scan(&raw); err != nil {
+285:		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); err != nil {
+361:					ledger, e := load(tx, f.project, "BudgetLedgerEntry", Str(effect, "reservation_id"))
+367:					return f.s.put(tx, "BudgetLedgerEntry", ledger)
+391:			f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before)
+399:			f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after)

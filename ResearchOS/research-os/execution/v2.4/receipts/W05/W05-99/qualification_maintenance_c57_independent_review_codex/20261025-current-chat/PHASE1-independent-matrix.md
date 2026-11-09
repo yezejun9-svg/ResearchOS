@@ -1,0 +1,95 @@
+# C57 独立复核阶段1：固定合同断言矩阵
+
+状态：`PREPARED_NOT_EXECUTED_NOT_SOURCE_ACCEPTANCE`。Root CP539 preparation scope SHA256 `b0861156ead5dd71fb081a4aea92abec37510ed5c0a263eff07d07f4f7a973de`；父 CP533 source scope SHA256 `7833f4e0527f0f6264ca5c209e9240cc5c1e82faeeb44a86e5c06d1cf647f68d`；基础 commit `085b4711afe0c1288448b174eef24ecd5af0551b`。模型按项目要求为 gpt-6-astra/high。候选尚未冻结，运行测试0，原业务资源操作0，formal increment0。本文不是 Source 接受，不是原数据修复。
+
+固定依据：CP533 的 mandatory_constraints、boot_refinements、additional_binding_requirements；CP511 adopted constraints；CP521 adopted limits；B-r3 limited-source-adopted 的 future_C_contract；revision02 C-ARCHITECTURE/C-test-cuts；revision03 C-lease-test-cuts/F01-claims；boot supplement BOOT-C-ARCHITECTURE。旧文档的 not-issued、B-r2、宽泛 NO_EFFECT 等历史状态由 CP533 最新已采用规则覆盖，不重开架构选择。
+
+资源标记：S=冻结源码与静态调用链；F=自有新建 schema24 全87应用表夹具；N=本机 Windows 原生句柄/进程/SQLite 夹具；P=不同 SID、特权 ACL/可信恢复管理主体；R=已明确授权的实际 fixture FullRestart；A=原业务完整映像/在线备份/Owner/真实操作。当前阶段均不执行；阶段2仅在 Root 精确 amendment 后执行其允许的 S/F/N。P/R/A 缺失只限制对应分支，不能记 PASS，也不应阻止无依赖的 S/F/N 验证。
+
+## 1. 固定输入和独立性
+
+| ID | 切点与输入 | 可观测断言 | 资源 |
+|---|---|---|---|
+| PIN-01 | Root frozen commit/tree、Source manifest、独立 finalizer seal 到齐后，建立自有只读来源快照 | commit/tree/每文件hash一致；diff仅父scope57；40个非重叠 inherited43 pins逐字节一致；不能用 mutable worktree通过结果代替 | S |
+| PIN-02 | 对比作者 command009 formatting 历史与最终diff | 保留20个scope外格式化/恢复事件；最终20字节等HEAD、40pins正确只证明终态，不能补造恢复前完整diff/hash | S |
+| PIN-03 | 测试运行源码、测试补充与结果 | 作者tests不等独立接受；独立断言从固定合同构造，补充tests只进reviewer自有snapshot；保留测试补丁hash、完整命令/raw stdout/raw stderr/native exit、实际case数和skip原因 | S/F/N |
+
+## 2. Lease、所有入口与双 namespace
+
+| ID | 切点与输入 | 可观测断言 | 资源 |
+|---|---|---|---|
+| C-LD01-a | 复制parent后申请maintenance borrow；从原值/拷贝调用Close | 两个Close均拒绝；两者Held仍true；竞争独立原生lease无法取得；Release后一次Close使所有copies失效 | N |
+| C-LD01-b | borrow值复制→释放→新generation borrow；旧副本Release；legacy ReturnBorrow与maintenance互换；并发申请 | stale/foreign/generation/kind不能释放当前borrow；任一时刻至多1 borrower；legacy ReturnBorrow不能使maintenance期间Close成功 | N |
+| C-LD01-c | nil/zero/closed/copy及上下文取消；重复Close/Release | 不panic，不凭零值获得authority；只允许精确owner消费；若重复Close设计为错误，则错误稳定且不能关闭后继handle；无递归同mutex死锁 | S/N |
+| C-LD02-a | 五分支schema13to14、13to20、21to22、22to23、23to24，真实held adapter进入 | 每一分支在最终upgradePaths规范化后检查相同root/source identity；同一次原生lease；source DB close先于borrow release，borrow release先于outer close | S/F/N |
+| C-LD02-b | adapter借用后、template/source打开前，替换source文件/任一root组件；normalized options copy | 替换原生sharing violation或在任一provider/key/template/store sentinel前拒绝；不能只在最初字符串path做一次检查 | N |
+| C-LD02-c | prepared local/handoff成功及内部错误；直接旧public UpgradeLocal/UpgradePreparedAbandonmentBackup | 内层不二次Acquire、不关闭outer；旧public入口在provider/key/template/store之前失败；私有legacy算法测试不得充作guarded入口正证 | S/F/N |
+| ENTRY-01 | pending C与replacement各自进入normal Core、replay、backup create/export、5 upgrades、prepared recovery/migration、replacement commit/recover、release_host legacy/control、coordinator raw lock | 保持实际lease时拒绝；所有受保护setup调用计数0；继承token gate前后仍是同一native lease；store.Open defense不得迁移或先触发PRAGMA/write | S/F/N |
+| ENTRY-02 | mixed early flags在argv前/中/后；重复C/replacement/replay/normal；缺DB/URI alias/nonWindows | 唯一early classifier在所有branch前拒绝混用；不存在维护参数被normal吸收的旁路；不存在DB时不创建，非Windows明确unsupported；restore拒绝existing root或alias | S/F/N |
+| C-LD03-a | ordinary acquire对两namespace；exact-own C/replacement recovery对同名/不同op、root、plan、namespace | ordinary全历史与当前terminal严格；own仅豁免匹配pending的inspect；other namespace、second pending、backup borrow均拒绝；锁内二次重验 | S/F/N |
+| C-LD03-b | prior committed replacement + own PUBLISHING，分别在ReplaceFile前old bytes和之后new bytes | 前者只按现有unapplied规则；后者允许识别applied完成且ReplaceFile调用增量0、不能abort；不能要求applied目标仍为旧predecessor | S/F/N |
+| C-LD03-c | PREPARED/PUBLISHING缺文件、混合stage/backup/hash、未知inventory、target漂移、断链/分叉 | unknown/tamper拒绝；不删证据、不自动重放、不把inspect permit变成launch/DB authority | S/F/N |
+
+## 3. 历史事实和私有事务消费
+
+| ID | 切点与输入 | 可观测断言 | 资源 |
+|---|---|---|---|
+| F01-D01 | 改route/capability/key/subject/first-gate源码或actual Core digest；新增TOOL prepare/start/provider/ledger或第4帧；缺raw | 私有构造拒绝；唯一窄claim HOST_TOOL_EFFECT_NOT_DISPATCHED，current Owner、run_id=null；不能作为UNIVERSAL_OS_NO_EFFECT或原online denial | S/F；实际历史身份结论需固定证据，不能由新fixture补造 |
+| F01-D02 | exact3 raw/ACK2，MODEL ACK/receipt/effect匹配；UNKNOWN effect、额外queue/control/checkpoint、缺current closure逐个变异 | raw帧3、ACK2、raw queue_empty=false字节保持；UNKNOWN effect拒绝；CONFIRMED MODEL + UNKNOWN money可保留事实但ledger/budget不归零；只在完整census及全部前提满足后构造FAILED-only derived observation | S/F/N |
+| F01-D03 | B在线ticket替代历史proof、不同namespace、伪造JSON/bool/rawhandle、仅FAILED row；当前Owner/lease/operation/plan漂移 | 不能构造私有历史authority；common FAILED transaction只接受验证variant；B原online marker和generic Finalize/Observation语义保持；D/actual权力未由F01打开 | S/F/N |
+| W-D01 | bridge SHA256 10b1a3bfa74132fbed965df31fd90125b90b1470556001e254af360c35451bce；PID69860；creation1792057406096619100；Job Local\\ResearchOS.W10.1792057404322293200；profile/SID/manifest/build/source及receipt精确链 | 任一identity/hash/stopped/drained/source链变异拒绝；只声明source-derived Job accounting ActiveProcesses==0支持Stopped及streams_drained；原exit124保留；raw WAIT/exit0/owner Close成功/DeleteAppContainerProfile成功不补造 | S/F；历史事实仅固定证据 |
+| HIST-01 | 成功/失败/replay前后全体raw、公有receipt、MODEL事实与历史version快照 | 原verifier Wait缺失仍缺失；raw3/ACK2/queue_empty=false、money UNKNOWN、原失败次数不改；新Run的derived queue_empty=true与rawfalse明确区分，不能改写旧raw | F |
+| TX-HOLD-01 | actual private validatedQualificationFailureTx返回closure；运行真实planned writes；Commit成功、Commit报错、前置失败→Rollback | 时间线必须closure.Check→实际Commit或Rollback返回→Close；事务中尝试修改/重命名/删除每个原raw+MODEL文件及祖先都失败；关闭后在自有fixture可恢复修改 | S/F/N |
+| TX-HOLD-02 | 当前quiescence+historical hold同时存在；强制GC；复制closure/quiescence；重放及所有error return | GC不能提前释放native handle；Check不释放；copy共享owner；closed/zero不能Check成功；root active borrow不能被inner关闭；所有实际tx退出路径释放，Close失败不转成功 | S/F/N |
+| TX-HOLD-03 | 两连接SQLite写竞争；C reservation前后、CAS前后、commit前schema/subject/census变化 | 同一connection一事务先获得写reservation再CAS；无nested BEGIN；不能在验证与写之间被第二writer改CAS；冲突/ctx取消得到全回滚，外部持锁与Close顺序不变 | F/N |
+
+## 4. schema24、精确delta及journal
+
+| ID | 切点与输入 | 可观测断言 | 资源 |
+|---|---|---|---|
+| DB-01 | 新建全87应用表schema24，sqlite_master表/index/trigger/view、migration rows、合同hash固定；schema号仍24但加入trigger/index漂移，及schema25 | 精确fingerprint检查在domain写之前；打开仅existing mode=rw；不自动迁移；WAL/FULL/FK以实际maintenance connection读回 | S/F/N |
+| DB-02 | exact FullPlan成功；独立按所有表稳定row编码before/after census | 仅9允许表：domain_objects、domain_versions、domain_refs、uploaded_content、runtime_observations、runtime_dispatches、outbox、event_state_snapshots、idempotency；其余78表零差异，不以rowcount相同代替字节相同 | F |
+| DB-03 | 每条planned row、ID/time/content/refs字段核对 | domain_versions恰5：Run r+1、ProjectState p+1、Artifact1、ImpactLink1、EventEnvelope1；domain_objects仅Run/ProjectState更新+3新增；one upload指uploaded_content新增1 sealed=1，runtime_uploads/artifact_uses/artifact_use_proofs均0；其余允许表只精确key/field delta | F |
+| DB-04 | 当前Owner GENERATED/LIVE/PROJECT MANIFEST，run_id=null，immutable profile-only outer input_refs；原outputs/checkpoint/Task/lease/effect/ledger等 | actual schema24 Artifact/ImpactLink/VersionRef验证；proof不附到旧result_artifact_ids；Task、consumption、NoProgress、lease、qualification、oldversions保持；event RUN_CHANGED唯一，seq=max(state,outbox)+1且overflow拒绝 | F |
+| DB-05 | same operation+same plan重试；same operation+different plan；冲突artifact/hash/id；过期或authority漂移 | 已完成同plan返回exact outcome且全87表0delta；不同plan冲突且0delta；无Now()/ID()重生成导致漂移；outcome hash避免自引用并绑定保护census | F |
+| JRN-01 | mkdir、partialplan、planflush、partialBEGIN、BEGINflush；每INSERT/UPDATE前后、commit前后、DB_COMMITTED_OBSERVED/DURABLE flush前后故障 | create-new/append-only；BEGIN durable前无DB变更；commit前任意cut全planned facts一起回滚；commit后marker+完整census决定已提交；缺尾receipt不重放DB | F/N |
+| JRN-02 | 无marker+精确before→CLASSIFIED_NOT_APPLIED；显式abort；exact marker+完整after→recover；changed before/mismarker/corrupt | NOT_APPLIED保持startup blocked；显式ABORTED在reservation下重验后仅append；exact COMMITTED recover仅补receipt、全DB0delta；UNKNOWN持续block且不删journal、不restore DB、不自动rerun | F/N |
+| JRN-03 | 丢external plan、未知file/空dir/torn JSON、reparse、ACL/owner漂移、重复seq/断链/错hash | root内完整plan可发现；全部unknown拒绝；own permit仅inspect不赋予Owner/SQL/launch；到期取消authority不自动解围栏 | S/F/N |
+
+## 5. Boot F01..09 与阶段CLI
+
+| ID | 切点与输入 | 可观测断言 | 资源 |
+|---|---|---|---|
+| bootF01 | 对root/DB/helper/entry target/每可替换ancestor读取volume+128-bit file ID/final UTF16/hash/SD/reparse；同值复制、hardlink/reparse/rename/ABA race；GC | 身份字段来自同一原生handle；hash句柄不因临时os.File finalizer消失；祖先guard持续持有；有效ACL包含防namespace替换，单个deny文本不能代替effective access证明 | S/N；有效部署完整证明P |
+| bootF02 | 精确自有祖先ACL fixture和实际部署清单分开；dense ACE before/installed/readback | 仅授权目标delta，不驱动器ACL reset；D root AU0x1301bf不能误当含DELETE_CHILD/WRITE_DAC/WRITE_OWNER；D portfolio与C home/.codex/cache边逐一明确；无scope推断权力 | S/N；实际shared ancestors A/P |
+| bootF03 | 当前PID+creation+image/argv/native RestartApps注册reader；无注册、有注册、unknown/access denied；真实程序注册fixture | runtime注册结果不能由静态无调用扫描替代；unknown或未覆盖normal branch阻塞arm；PID复用不能匹配；所有受支持重启入口均有可冻结产品专属必经阻断点 | S/N；actual supported-set A |
+| bootF04 | C journal所有pending/unknown/terminal组合对disarm-request；pre-BEGIN有/无无效应证据 | pending/unknown始终保留fence+journals；只有证明pre-BEGIN no-effect，或exact durable terminal/NOT_APPLIED/ABORTED按各自已采用条件可恢复；NOT_APPLIED的fence恢复资格不得错误清除C startup block | S/F/N；跨reboot连续性R/P |
+| bootF05 | business SID==management SID，包括同SID elevated；不同SID管理恢复；trusted owner/OWNER RIGHTS变化 | 同SID提升不能抵消deny；未证明独立恢复principal拒绝arm；不能把admin当业务Owner；真实不同SID restore正证缺失单独UNAVAILABLE | S/N；不同SID真实正证P |
+| bootF06 | ONLINE状态旧Core lease被持有；helper plan/arm流程；在线backup/restore可用性与Owner/source绑定 | ONLINE helper不Acquire业务lease、不Host.New/store.Open/provider/key/listener、不创建C BEGIN；消费另行接受一致性备份；held-lease可backup且restore usable必须独立证明，文件copy/hash不等在线backup | S/F/N；实际backup/key/Host权限A |
+| bootF07 | 历史consumer与B online namespace/ticket互换、raw/model/owner/source不同绑定 | 不借B在线私有ticket伪造历史闭环；以已接受Source43/B-r3为基线；严格私有历史构造，遵循F01-D01..03及TX-HOLD全部断言 | S/F/N |
+| bootF08 | POST_RESTART_CURRENT_QUIESCENCE_V1送入strict STOP consumer；pre/post uptime/time/host/SID/root/native DB drift | boot-only只证明当前C quiescence；strict STOP类不放行、不补历史Wait；pre uptime>=10m，post<=10m且strictly<pre，UTC delta非负且<=30m，boot time改变并一致；sleep/FastStartup/Restart API返回不当FullRestart证明 | S/N；真FullRestart R、actual A |
+| bootF09 | 持久entry/ancestor fence下原业务SID进行SQLite连接、WAL/SHM创建写入/checkpoint、lease与普通数据操作；同时真实PE执行/script read/namespace替换 | 业务DB必要操作成功，受禁entry与rename/delete/DACL恢复尝试拒绝；不能用admin身份或临时全解除来获得positive；保留业务Owner不变 | N/P；actual A |
+| BOOT-CLI | plan/arm/observe/status/disarm-request，每阶段错误前序/重复seq/过期/未知inventory；nonWindows；任意SQL/通配路径/server | 只有固定phase；所有状态转换create-new/hash-chain/flush并绑定helper/plan/op/predecessor；arm缺独立Source/native/onlinebackup/管理证明拒绝；普通Core未启动；到期不会disarm | S/N |
+| BOOT-RESTORE | installed SD与当前SD相同/第三方变更，file identity漂移，部分restore失败/进程crash | 仅恢复本operation确实写入且仍匹配的exact before SD；第三方变化拒绝覆盖；restore可追溯并验证读回，部分失败保留未恢复状态/证据；没有定时/expiry自动unlock | S/N；可信跨SID恢复P/R |
+
+## 6. 阶段2最小针对性验证顺序
+
+1. Root amendment必须给出exact commit/tree、source57 manifest和author finalizer seal；核验本scope、refs及全部pins。快照在自有临时根，禁止在builder worktree写入补充test。候选若仍dirty或seal不闭合，先停候选测试，继续可独立的证据整理。
+2. 静态审查四条实际调用链：early classifier→held lease→双journal→store；五upgrade与prepared handoff→final normalized guard→DB defers；private historical+boot holds→actual tx→Close；boot phase→fence/state/restore。源码检查必须标注行号与frozen hash。
+3. 在自有ASCII roots运行最小有针对性的原生套件：lease copy/stale/kind、五upgrade/guarded入口与pending、replacement applied/unapplied、closure文件保持+GC、同连接事务reservation与全87表delta/replay/crashcuts。先复用候选相关tests，仅对合同缺口加独立tests；每组至少一个真实正路径和对应反例，拒绝只有failclosed负路径就称实现完成。
+4. boot6纯状态/identity native/阶段CLI/自有ACL目标测试独立执行；RestartApps至少含真实注册reader案例。P/R/A分支未授权或资源缺失即具体UNAVAILABLE，不代替为bool fixture通过。不会修改OS祖先ACL、创建用户、真实Restart或打开原业务DB。
+5. 独立逐表census和句柄时序raw是关键证据，不能只引用go test PASS。只做相关package build/test和必要diff/pin检查，出现新问题再扩测；不无由重跑全仓库。
+6. 汇总 blocking findings、覆盖case数/缺口、source/native/privileged/actual各级结论及append-only diagnostics；阶段2manifest/seal绑定测试快照和原native exits。Root才可作最终Source adoption；formal保持0。
+
+## 7. 当前明确风险与状态
+
+- **契约生命周期接线风险已明确、尚待冻结验证**：Open+Check最初未显式给Close；Root与两builder后确认CurrentQuiescence私有heap owner+Close，Host在outer Commit/Rollback返回后关闭。仍须实际调用链与原生句柄证明，接口声明不足。
+- **mutable具体观察 M01/M02**：boot_windows.go hash `ea72883e28dd7c7a37d0fe3fa85957e9406cb774ebf716de791e69d635559981` 的122用os.NewFile包装同一原生handle却仅返回裸handle，存在GC finalizer提前关闭风险；143–146 closeHolds忽略CloseHandle错误、536–549 Close返回nil。已直接通知Root/boot6；boot6报告改为windows.ReadFile和聚合Close errors，并将补GC fixture。此处保留旧观察，不声称修复已独立验证；冻结后定向确认。
+- **scope外格式化历史**：作者FORMAT-DIAGNOSTIC承认command009 package-wide go fmt导致20外部路径变化，010恢复、011按字节验证。恢复前全diff/hash未持久化；最终精确终态重验不能消除这项证据限制。
+- **bootstrap捕获限制**：本复核初始scope/AGENTS/记忆查询只在tool会话保留原始输出，其中错误查找D:/作品集/ResearchOS/AGENTS.md native exit1。000-bootstrap-command-record记录该失败，后续001起使用逐命令recipe/rawstdout/rawstderr/nativeexit且不覆盖失败。不得将后补record称预写recipe；所有阶段2实际test必须使用完整捕获。
+- **oneupload与raw空队列必须分清**：oneupload为uploaded_content一行，runtime_uploads仍0；raw queue_empty=false保持，新FAILED派生观察的queue_empty=true仅在完整分类成立后生成。两处若误读会造成错误接受。
+- **资源缺口独立列示**：当前未取得distinct SID、fullRestart、真实在线备份恢复和实际supported-set/部署权限证据；不进行相关操作，也不把这些未执行当Source无法实现的结论。
+
+阶段1完成后等待Root精确freeze amendment，不轮询mutable worktree、不运行candidate测试。
+
+冻结补记：阶段1原生非零退出累计2次，工具协议诊断0。除初始AGENTS路径错误外，011 finalizer假设所有输入manifest都有entries键而在revision02 files结构处失败exit1；未产生最终manifest/seal、未触及候选。012读取真实结构后修正，013另行重试；原011 recipe/rawstdout/rawstderr/result完整保留。详见PHASE1-diagnostics.json及追加PHASE1-diagnostics-addendum-01.json，不能以较早计数1覆盖累计2。

@@ -1,0 +1,372 @@
+--- revision05/real-electron-flow.mjs
++++ native-path-entry01/real-electron-flow.mjs
+@@ -19,7 +19,12 @@
+ const sha = data => crypto.createHash('sha256').update(data).digest('hex');
+ const fileSHA = name => sha(fs.readFileSync(name));
+ const folded = name => path.resolve(name).toLowerCase();
+-const requireThat = (test, code) => { if (!test) throw Object.assign(new Error(code), { code }); };
++let activeGuardHistory = null;
++let activeRunEvidence = null;
++const requireThat = (test, code) => {
++  if (activeGuardHistory) activeGuardHistory.push({ sequence: activeGuardHistory.length + 1, code, passed: !!test });
++  if (!test) throw Object.assign(new Error(code), { code });
++};
+ const inside = (parent, child) => { const rel = path.relative(parent, child); return rel && !rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel); };
+ const pin = (file, expected) => { requireThat(HASH.test(expected || '') && fileSHA(file) === expected, 'PIN_MISMATCH:' + path.basename(file)); };
+ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+@@ -61,57 +66,58 @@
+   };
+ }
+ 
+-function requireChatGPTAuthentication(capabilities) {
+-  requireThat(capabilities?.authentication?.state === 'LOGGED_IN' &&
+-    capabilities.authentication.kind === 'chatgpt', 'CHATGPT_LOGIN_REQUIRED_NO_API_PAYMENT_OR_LOGIN_FALLBACK');
+-}
+-
+-function requireDiagnosticScope(scope) {
+-  requireThat(scope?.native_picker?.diagnostic_only === true &&
+-    scope.native_picker.direct_native_tree === true &&
+-    scope?.budget?.task_submissions === 0 &&
+-    scope?.budget?.automatic_retries === 0 &&
+-    scope?.budget?.harness_id === 'codex', 'DIAGNOSTIC_ONLY_ZERO_SUBMISSION_SCOPE_REQUIRED');
+-}
+-function parseDiagnosticReply(chosen, core) {
+-  requireThat(chosen?.exit === 2 && typeof chosen.stdout === 'string' &&
+-    Buffer.byteLength(chosen.stdout) <= 65536, 'DIAGNOSTIC_REPLY_BOUNDED_COMPLETE_JSON_REQUIRED');
++function requirePathEntryScope(scope) {
++  requireThat(scope?.native_picker?.profile === 'INVALID_VALID_PATH_ENTRY_ONLY' &&
++    scope?.budget?.task_submissions === 0 && scope?.budget?.model_calls === 0 &&
++    scope?.budget?.automatic_retries === 0 && scope?.budget?.harness_id === 'codex',
++  'PATH_ENTRY_ONLY_ZERO_TASK_MODEL_RETRY_BUDGET');
++  const warning = scope.native_picker.validation_warning;
++  requireThat(typeof warning?.caption === 'string' && warning.caption.length > 0 &&
++    typeof warning?.text === 'string' && warning.text.length > 0 && HASH.test(warning.source_sha256 || ''),
++  'BUILD07_FROZEN_WARNING_PINS_REQUIRED');
++  requireThat(scope.source?.pins?.some(row => row.path === 'internal/host/native_folder_windows.go' &&
++    row.sha256 === warning.source_sha256), 'WARNING_MATCHES_FROZEN_NATIVE_SOURCE_PIN');
++  requireThat(Number.isSafeInteger(scope.deadlines?.picker_ms) && scope.deadlines.picker_ms >= 15000 &&
++    scope.deadlines.picker_ms <= 90000 && scope.deadlines.flow_ms > scope.deadlines.picker_ms + scope.deadlines.close_ms + 10000,
++    'PICKER_DEADLINE_MUST_FIT_FLOW_AND_CLEANUP');
++}
++
++function parseNativeReply(chosen, core, fixture, invalid) {
++  requireThat(chosen?.exit === 0 && typeof chosen.stdout === 'string' &&
++    Buffer.byteLength(chosen.stdout) <= 65536, 'NATIVE_REPLY_COMPLETE_BOUNDED_UTF8_JSON_REQUIRED');
+   const reply = JSON.parse(chosen.stdout);
+-  const d = reply.diagnostic;
+-  requireThat(reply.schema === 'researchos.owned-native-folder-diagnostic/1' &&
+-    reply.clicked_ok === false && reply.ok_attempted === false &&
+-    reply.reason === 'DIAGNOSTIC_ONLY_TREE_SNAPSHOT_COMPLETE_NO_OK' &&
+-    reply.cleanup?.status === 'OWNED_IDCANCEL_CLICKED' &&
+-    reply.authorization_state === 'NO_OK_CLICKED_NO_WORKSPACE_AUTHORIZATION_REQUESTED_BY_RUNNER',
+-  'DIAGNOSTIC_CANCEL_OR_NO_OK_UNCONFIRMED');
+-  requireThat(d?.schema === 'researchos.owned-dialog-tree-metadata/1' &&
+-    d.diagnostic_only === true && d.no_ok === true &&
+-    d.no_workspace_authorization === true && d.no_treeitem_navigation === true &&
+-    d.dialog_owner_pid === core.pid && typeof d.dialog_hwnd === 'string' &&
+-    d.dialog_hwnd === reply.cleanup.hwnd &&
+-    Number.isSafeInteger(d.tree_count) && d.tree_count >= 0 && d.tree_limit === 16 &&
+-    Array.isArray(d.trees) && d.captured_count === d.trees.length &&
+-    d.captured_count === Math.min(d.tree_count, 16) &&
+-    d.tree_truncated === (d.tree_count > 16), 'DIAGNOSTIC_SCOPE_OR_COUNT_MISMATCH');
+-  requireThat(d.tree_count !== 0 || d.win32_children_when_zero &&
+-    d.win32_children_when_zero.limit === 32 &&
+-    d.win32_children_when_zero.text_or_items_read === false &&
+-    Array.isArray(d.win32_children_when_zero.controls) &&
+-    d.win32_children_when_zero.controls.length <= 32, 'ZERO_TREE_WIN32_METADATA_REQUIRED');
+-  requireThat(d.tree_source === 'VERIFIED_NATIVE_SYSTREEVIEW32_FROM_HANDLE' &&
+-    d.tree_count === 1 && d.direct_native_tree?.native_window?.process_id === core.pid &&
+-    d.direct_native_tree.native_window.class_name === 'SysTreeView32' &&
+-    d.direct_native_tree.native_window.visible === true && d.direct_native_tree.native_window.enabled === true &&
+-    d.direct_native_tree.can_authorize_selection === false &&
+-    Array.isArray(d.direct_native_tree.selected) && d.direct_native_tree.selected.length <= 4,
+-  'DIRECT_NATIVE_DIAGNOSTIC_METADATA_REQUIRED');
++  requireThat(reply.schema === 'researchos.owned-native-path-entry/1' &&
++    reply.status === 'VALID_SHELL_OK_CLOSED_REQUIRES_MAIN_BINDING' &&
++    reply.clicked_ok === true && reply.valid_ok_attempted === true && reply.invalid_ok_attempted === true &&
++    reply.invalid_kept_chooser_open === true && reply.outcome_uncertain === false &&
++    reply.input_is_authorization === false && reply.actual_task_submissions === 0 &&
++    reply.model_outcome === 'NOT_RUN_ZERO_BUDGET' &&
++    reply.authorization_state === 'SHELL_CONFIRM_OBSERVED_MAIN_BINDING_NOT_YET_VERIFIED',
++  'NATIVE_PATH_SEQUENCE_OR_OUTCOME_NOT_CONFIRMED_NO_RETRY');
++  requireThat(reply.invalid_input?.path === invalid && reply.valid_input?.path === fixture &&
++    reply.invalid_input.input_is_authorization === false && reply.valid_input.input_is_authorization === false &&
++    reply.invalid_warning?.observed === true && reply.invalid_warning.owner_pid === core.pid &&
++    Number.isSafeInteger(reply.dialog_hwnd) && reply.dialog_hwnd > 0 &&
++    reply.invalid_warning.owner === reply.dialog_hwnd &&
++    reply.invalid_input.dialog_hwnd === reply.dialog_hwnd && reply.valid_input.dialog_hwnd === reply.dialog_hwnd &&
++    Array.isArray(reply.history) && reply.history.some(row => row.event === 'INVALID_DISMISSED_SAME_CHOOSER_RETAINED') &&
++    reply.history.some(row => row.event === 'VALID_SHELL_DIALOG_CLOSED'), 'NATIVE_PATH_EVIDENCE_REQUIRED');
+   return reply;
+ }
+-function sanitizeDiagnosticScalars(value) {
+-  if (typeof value === 'string') return safeText(value);
+-  if (Array.isArray(value)) return value.map(sanitizeDiagnosticScalars);
+-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeDiagnosticScalars(item)]));
+-  return value;
++
++function verifyProjectBinding(context, listed, displayedPath, fixture) {
++  requireThat(typeof context?.project_id === 'string' && context.project_id && context.session_id == null,
++    'REAL_MAIN_FRESH_PROJECT_CONTEXT_REQUIRED');
++  requireThat(listed?.ok === true && listed.completed === true && Array.isArray(listed.result?.items) &&
++    listed.result.items.length === 1, 'REAL_MAIN_SINGLE_WORKSPACE_REPLY_REQUIRED');
++  const binding = listed.result.items[0];
++  requireThat(binding?.status === 'ACTIVE' && binding.project_id === context.project_id &&
++    typeof binding.authorized_workspace_ref === 'string' && binding.authorized_workspace_ref &&
++    binding.display_path === fixture && displayedPath === fixture, 'REAL_MAIN_ACTIVE_EXACT_FIXTURE_REQUIRED');
++  for (const key of ['real_path', 'canonical_path']) {
++    if (Object.hasOwn(binding, key)) requireThat(binding[key] === fixture, 'REAL_MAIN_CANONICAL_PATH_MISMATCH:' + key);
++  }
++  return binding;
+ }
+ 
+ function inventory(root) {
+@@ -137,7 +143,7 @@
+   requireThat(JSON.stringify(order(expected.files)) === JSON.stringify(order(actual)), 'SDK_PACKAGE_DRIFT');
+ }
+ 
+-export async function run(scopeFile, expectedScopeSHA) {
++async function runPrepared(scopeFile, expectedScopeSHA) {
+   requireThat(process.platform === 'win32', 'WINDOWS_REQUIRED');
+   pin(scopeFile, expectedScopeSHA);
+   const scope = JSON.parse(fs.readFileSync(scopeFile, 'utf8'));
+@@ -147,9 +153,11 @@
+   requireThat(HASH.test(scope.root_supervision.controller_sha256 || '') && HASH.test(scope.root_supervision.launch_contract_sha256 || ''), 'ROOT_CONTROLLER_PINS_REQUIRED');
+   requireThat(scope.root_supervision.outer_deadline_ms > scope.deadlines.flow_ms + scope.deadlines.close_ms + 10000, 'OUTER_DEADLINE_MUST_CONTAIN_FLOW_AND_CLOSE');
+   requireThat(scope.deadlines.flow_ms > 0 && scope.deadlines.flow_ms <= 600000 && scope.deadlines.close_ms > 0 && scope.deadlines.close_ms <= 60000, 'DEADLINES_INVALID');
+-  requireDiagnosticScope(scope);
++  requirePathEntryScope(scope);
+   requireThat(scope.native_picker.operator_fallback === false, 'AUTOMATION_SCOPE_HAS_NO_OPERATOR_FALLBACK');
+   requireThat(scope.contract_sha256 === CONTRACT, 'HARNESS_CONTRACT_PIN_REQUIRED');
++  requireThat(folded(scope.contract_source?.path || '') === folded('D:/作品集/ResearchOS/research-os/execution/product-v1/contracts/harness.v1.interface.rev2.json'), 'ROOT_MAIN_CONTRACT_PATH_REQUIRED');
++  pin(scope.contract_source.path, CONTRACT);
+   requireThat(/^[a-f0-9]{40}$/.test(scope.source.head || '') && scope.source.pins?.length > 0, 'INTEGRATED_SOURCE_PINS_REQUIRED');
+   for (const [name, expected] of Object.entries(UI8_SELECTOR_SOURCE)) {
+     requireThat(scope.source.pins.some(row => row.path === name && row.sha256 === expected), 'EXACT_UI8_SELECTOR_SOURCE_PIN_REQUIRED:' + name);
+@@ -184,22 +192,28 @@
+   const actualEnvNames = Object.keys(env).sort();
+   requireThat(!actualEnvNames.some(name => /^(OPENAI_|ANTHROPIC_|AZURE_|CODEX_|NODE_|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$)/i.test(name)), 'UNEXPECTED_ENV');
+ 
++  activeRunEvidence.phase = 'CREATE_FRESH_RUN_ROOT';
++  activeRunEvidence.run_root = scope.run_root;
+   fs.mkdirSync(scope.run_root); // no recursive root creation, no overwrite or reuse
+   for (const dir of ['workspace', 'receipts', 'screenshots', 'tmp']) fs.mkdirSync(path.join(scope.run_root, dir));
+   const receipts = path.join(scope.run_root, 'receipts');
+   const write = (name, value) => fs.writeFileSync(path.join(receipts, name), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+   const workspace = path.join(scope.run_root, 'workspace');
+-  // Diagnostic owns an empty fixture directory; no workspace file contents.
++  const invalid = path.join(scope.run_root, 'invalid-nonexistent-' + scope.scope_nonce);
++  requireThat(!fs.existsSync(invalid), 'INVALID_TARGET_MUST_NOT_EXIST');
++  // Empty owned directory only. Invalid sibling is deliberately never created.
+   const started = Date.now(), until = started + scope.deadlines.flow_ms;
+   let timedOut = false, closing = false, app = null, helper = null, page = null;
+-  const state = { status: 'RUNNING', formal_increment: 0, product_increment: 0,
++  const state = { guard_history: activeGuardHistory, status: 'RUNNING', formal_increment: 0, product_increment: 0,
+     scope_sha256: expectedScopeSHA, scope_nonce: scope.scope_nonce, source_head: scope.source.head,
+     bundle_manifest_sha256: scope.bundle.manifest_sha256,
+     root_job_proof: 'EXTERNAL_ROOT_CONTROLLER_ONLY_NOT_SELF_VERIFIED',
+     allowed_task_submissions: 0, actual_dom_submit_attempts: 0, actual_transport_post_count: 'NOT_INSTRUMENTED',
+     renderer_routes: [], event_refs: [], console: [], main_reports: [],
+     close: { attempted: false, app_close_resolved: false, owned_core_exit: 'UNVERIFIED' },
+-    model_outcome: 'NOT_RUN_DIAGNOSTIC_ONLY', windows_enforcement: 'NOT_MEASURED_DIAGNOSTIC_ONLY' };
++    model_outcome: 'NOT_RUN_ZERO_BUDGET', actual_model_calls: 0, windows_enforcement: 'NOT_MEASURED_PATH_ENTRY_PROFILE' };
++  activeRunEvidence.state = state;
++  activeRunEvidence.phase = 'PRELAUNCH';
+   const deadlineError = () => Object.assign(new Error('FLOW_DEADLINE'), { code: 'FLOW_DEADLINE' });
+   const guard = () => { if (timedOut || closing || Date.now() >= until) throw deadlineError(); };
+   const bounded = async (work, maximum = 30000) => {
+@@ -232,12 +246,12 @@
+   };
+   try {
+     write('launch-input.json', { scope, explicit_environment: env, argv: [path.join(bundle.bundle, 'apps/desktop')], electron_cwd: scope.run_root,
+-      workspace, diagnostic_only: true, workspace_file_contents_read: false,
++      workspace, invalid_path: invalid, profile: 'INVALID_VALID_PATH_ENTRY_ONLY', task_budget: 0, model_budget: 0, workspace_file_contents_read: false,
+       root_job_required_before_invocation: true, no_auth_files_read_or_copied: true });
+     // Importing the cached SDK and launching happen ONLY after all Root-reviewed
+     // pins and fresh-state checks. There is no install/browser discovery fallback.
+     const { _electron } = await import(pathToFileURL(path.join(scope.playwright.root, 'index.mjs')).href);
+-    guard(); state.electron_launch_attempted = true;
++    guard(); activeRunEvidence.phase = 'ELECTRON_LAUNCH_ATTEMPTED'; state.electron_launch_attempted = true;
+     app = await _electron.launch({ executablePath: path.join(bundle.bundle, 'runtime/electron/electron.exe'),
+       args: [path.join(bundle.bundle, 'apps/desktop')], cwd: scope.run_root, env, timeout: Math.min(60000, until - Date.now()) });
+     app.on('console', message => log('main:' + message.type(), message.text()));
+@@ -261,9 +275,12 @@
+     const ready = state.main_reports.find(row => row.event === 'ready_to_show' && row.owned_core_identity);
+     requireThat(ready.management_state === 'READY' && ready.renderer?.react_root === true && ready.shared_host_locator?.status === 'DISABLED', 'FRESH_OWNED_CORE_NOT_READY');
+     const core = ready.owned_core_identity;
+-    requireThat(core.image_sha256 === scope.bundle.control_sha256, 'ACTUAL_CORE_HASH_MISMATCH');
++    requireThat(core.image_sha256 === scope.bundle.control_sha256 && Number.isSafeInteger(core.pid) && core.pid > 0 &&
++      /^[0-9]+$/.test(core.created_ns || '') && /^host-[a-f0-9]{12}$/.test(core.host_id || ''), 'ACTUAL_CORE_IDENTITY_MISMATCH');
++    const pickerUntil = Math.min(until - scope.deadlines.close_ms - 5000, Date.now() + scope.deadlines.picker_ms);
++    requireThat(pickerUntil > Date.now() + 10000, 'PICKER_TIME_REMAINING_REQUIRED');
+     write('owned-core.json', { scope_nonce: scope.scope_nonce, identity_source: 'ROS_DESKTOP_REPORT.ready_to_show',
+-      action_deadline_utc: new Date(until).toISOString(), owned_core_identity: core });
++      action_deadline_utc: new Date(pickerUntil).toISOString(), owned_core_identity: core });
+     const nameOptions = page.locator('details.project-name-option');
+     requireThat(await nameOptions.count() === 1, 'EXACT_UI8_PROJECT_NAME_DETAILS_REQUIRED');
+     const nameSummary = nameOptions.locator('summary');
+@@ -271,19 +288,32 @@
+     await bounded(() => nameSummary.click());
+     await bounded(() => page.getByLabel('显示名称', { exact: true }).fill(scope.project_display_name));
+     guard(); await bounded(() => page.getByRole('button', { name: '选择目录', exact: true }).click());
++    activeRunEvidence.phase = 'NATIVE_HELPER_RUNNING_AUTHORIZATION_UNKNOWN';
++    state.native_workspace_authorization = 'UNKNOWN_WHILE_NATIVE_HELPER_PENDING';
++    const helperHistoryPath = path.join(receipts, 'native-helper-history.ndjson');
++    fs.writeFileSync(helperHistoryPath, '', {flag: 'wx'});
++    const helperStdoutPath = path.join(receipts, 'native-helper-stdout-prefix.bin');
++    const stdoutFD = fs.openSync(helperStdoutPath, 'wx');
+     const helperOutcome = new Promise(resolve => {
+       const osEnv = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('RESEARCHOS_')));
+       helper = spawn(scope.windows.powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', path.join(HERE, 'choose-owned-folder.ps1'),
+         '-ScopePath', scopeFile, '-ScopeSHA256', expectedScopeSHA, '-ScopeNonce', scope.scope_nonce,
+-        '-CoreIdentityPath', path.join(receipts, 'owned-core.json')], { env: osEnv, cwd: scope.run_root, detached: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+-      const chunks = []; let stdoutBytes = 0, stderr = '';
++        '-CoreIdentityPath', path.join(receipts, 'owned-core.json'), '-HistoryPath', helperHistoryPath], { env: osEnv, cwd: scope.run_root, detached: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
++      const chunks = []; const stdoutHash = crypto.createHash('sha256'); let stdoutBytes = 0, storedBytes = 0, stderr = '';
++      let stdoutClosed = false;
++      const closeRaw = () => { if (!stdoutClosed) { stdoutClosed = true; try { fs.closeSync(stdoutFD); } catch(error) { state.helper_stdout_io_error = safeText(error.message); } } };
+       helper.stdout.on('data', chunk => {
+-        stdoutBytes += chunk.length;
++        stdoutBytes += chunk.length; stdoutHash.update(chunk);
++        const prefix = chunk.subarray(0, Math.max(0, 65536 - storedBytes));
++        if (prefix.length && !state.helper_stdout_io_error) { try { fs.writeSync(stdoutFD, prefix); storedBytes += prefix.length; } catch(error) { state.helper_stdout_io_error = safeText(error.message); } }
++        state.helper_stdout_progress = {received_bytes: stdoutBytes, retained_prefix_bytes: storedBytes, retained_prefix: helperStdoutPath, history_journal: helperHistoryPath};
+         if (stdoutBytes <= 65536) chunks.push(Buffer.from(chunk));
+       });
+       helper.stderr.on('data', chunk => { if (stderr.length < 16384) stderr += chunk.toString('utf8'); });
+-      helper.on('error', error => resolve({ exit: null, error: safeText(error.message) }));
++      helper.on('error', error => { closeRaw(); resolve({ exit: null, error: safeText(error.message) }); });
+       helper.on('close', exit => {
++        closeRaw(); state.helper_stdout_progress = {...state.helper_stdout_progress, final_sha256: stdoutHash.digest('hex'), received_bytes: stdoutBytes};
++        if (state.helper_stdout_io_error) return resolve({ exit, stdout: null, stdout_bytes: stdoutBytes, error: 'HELPER_STDOUT_RECEIPT_WRITE_FAILED', stderr: safeText(stderr) });
+         if (stdoutBytes > 65536) return resolve({ exit, stdout: null, stdout_bytes: stdoutBytes, error: 'DIAGNOSTIC_STDOUT_LIMIT', stderr: safeText(stderr) });
+         try {
+           const stdout = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+@@ -291,28 +321,58 @@
+         } catch { resolve({ exit, stdout: null, error: 'DIAGNOSTIC_STDOUT_UTF8', stderr: safeText(stderr) }); }
+       });
+     });
+-    const chosen = await bounded(() => helperOutcome, 45000);
+-    let pickerResult;
+-    try { pickerResult = parseDiagnosticReply(chosen, core); }
+-    catch (error) {
+-      write('native-folder-automation.json', { exit: chosen.exit, error: safeText(error.message),
+-        stdout_sha256: typeof chosen.stdout === 'string' ? sha(chosen.stdout) : null,
+-        stdout_bytes: chosen.stdout_bytes, stderr: safeText(chosen.stderr || '') });
+-      throw error;
+-    }
+-    const sanitized = sanitizeDiagnosticScalars(pickerResult);
+-    write('native-folder-automation.json', { exit: chosen.exit, stdout: JSON.stringify(sanitized),
+-      stdout_sha256: sha(chosen.stdout), stdout_bytes: chosen.stdout_bytes, stderr: chosen.stderr });
+-    write('owned-tree-snapshot.json', sanitized.diagnostic);
+-    state.native_picker_cleanup = sanitized.cleanup;
+-    state.native_workspace_authorization = sanitized.authorization_state;
+-    state.native_picker = 'DIAGNOSTIC_OWNED_IDCANCEL_NO_OK';
+-    state.model_outcome = 'NOT_RUN_DIAGNOSTIC_ONLY';
+-    state.status = 'OWNED_DIALOG_TREE_DIAGNOSTIC_CAPTURED_NOT_PRODUCT_ACCEPTED';
++    const helperWaitMs = pickerUntil + scope.deadlines.close_ms + 3000 - Date.now();
++    const chosen = await bounded(() => helperOutcome, helperWaitMs);
++    // Preserve raw failure history before interpreting success. No truncation of
++    // helper JSON and no automatic second helper invocation after uncertainty.
++    write('native-folder-automation.json', chosen);
++    const pickerResult = parseNativeReply(chosen, core, workspace, invalid);
++    requireThat(pickerResult.invalid_warning.caption === scope.native_picker.validation_warning.caption &&
++      pickerResult.invalid_warning.text === scope.native_picker.validation_warning.text, 'NATIVE_WARNING_PIN_MISMATCH');
++    state.native_picker_cleanup = pickerResult.cleanup;
++    state.native_workspace_authorization = pickerResult.authorization_state;
++    state.native_picker = 'REAL_INVALID_WARNING_RETAINED_VALID_SHELL_OK_OBSERVED';
++    activeRunEvidence.phase = 'SHELL_CONFIRM_OBSERVED_MAIN_BINDING_NOT_YET_VERIFIED';
++    const resultPanel = page.locator('.project-open-result[role="status"]');
++    await bounded(() => resultPanel.waitFor({ state: 'visible', timeout: Math.min(60000, until - Date.now()) }), 60000);
++    requireThat(await resultPanel.count() === 1, 'REAL_PROJECT_SUCCESS_PANEL_NOT_UNIQUE');
++    const shownPath = resultPanel.locator('p.break-all');
++    requireThat(await shownPath.count() === 1, 'PROJECT_DISPLAY_PATH_NOT_UNIQUE');
++    const displayedPath = await shownPath.textContent();
++    requireThat(displayedPath === workspace, 'UI_DISPLAY_PATH_NOT_EXACT_OWNED_FIXTURE');
++    await screenshot('02-project-created-path');
++    // Existing readonly Main/preload calls only. These are independently
++    // observed current state, not the original chooseWorkspace Promise reply.
++    const context = await observe(() => page.evaluate(() => window.researchos.desktop.context()));
++    const listed = await observe(() => page.evaluate(() => window.researchos.v2['workspace.list']({})));
++    write('main-current-project-observation.json', {
++      source: 'EXISTING_TYPED_MAIN_BRIDGES_DESKTOP_CONTEXT_AND_V2_WORKSPACE_LIST',
++      timing: 'AFTER_REAL_SHELL_CONFIRM_AND_UI_SUCCESS_BEFORE_OPEN_WORKBENCH',
++      original_choose_workspace_reply_captured: false, context, listed, displayed_path: displayedPath,
++    });
++    const binding = verifyProjectBinding(context, listed, displayedPath, workspace);
++    state.project_id = context.project_id;
++    state.authorized_workspace_ref = binding.authorized_workspace_ref;
++    state.public_display_path = binding.display_path;
++    state.private_real_path = Object.hasOwn(binding, 'real_path') ? 'EXACT_FIXTURE_OBSERVED' : 'NOT_EXPOSED_BY_PUBLIC_BRIDGE';
++    state.native_workspace_authorization = 'REAL_MAIN_ACTIVE_PROJECT_WORKSPACE_BINDING_OBSERVED';
++    activeRunEvidence.phase = 'REAL_MAIN_ACTIVE_BINDING_OBSERVED';
++    const open = resultPanel.getByRole('button', { name: '打开工作台', exact: true });
++    requireThat(await open.count() === 1 && await open.isEnabled(), 'OPEN_WORKBENCH_BUTTON_UNIQUE_ENABLED_REQUIRED');
++    guard(); await bounded(() => open.click());
++    await bounded(() => page.waitForFunction(projectId => {
++      const url = new URL(window.location.href);
++      return url.pathname === '/p/' + encodeURIComponent(projectId) || url.hash === '#/p/' + encodeURIComponent(projectId);
++    }, context.project_id));
++    const afterContext = await observe(() => page.evaluate(() => window.researchos.desktop.context()));
++    requireThat(afterContext.project_id === context.project_id && afterContext.session_id == null, 'PROJECT_CONTEXT_CHANGED_ON_OPEN');
++    write('main-context-after-open.json', { source: 'EXISTING_TYPED_MAIN_DESKTOP_CONTEXT', context: afterContext });
++    route(); await screenshot('03-workbench-zero-task');
++    activeRunEvidence.phase = 'WORKBENCH_OPEN_SAME_PROJECT_ZERO_TASK';
++    state.status = 'REAL_NATIVE_PATH_ENTRY_AND_PROJECT_BINDING_OBSERVED_NOT_PRODUCT_ACCEPTED';
+ 
+   } catch (error) {
+     state.status = 'BLOCKED_OR_FAILED'; state.error = { code: safeText(error.code || error.message), message: safeText(error.message) };
+-    if (state.actual_dom_submit_attempts && !state.task?.terminal) state.model_outcome = 'UNKNOWN_NO_AUTOMATIC_RESUBMIT';
+     if (page && !page.isClosed()) { try { await page.screenshot({ path: path.join(scope.run_root, 'screenshots/blocked.png'), timeout: 3000 }); } catch {} }
+   } finally {
+     closing = true;
+@@ -330,8 +390,8 @@
+     }
+     state.elapsed_ms = Date.now() - started;
+     state.close.owned_core_exit = 'REQUIRES_ROOT_EXACT_PROCESS_IDENTITY_AND_JOB_ACCOUNTING';
+-    state.transport_routes = { observation: 'NO_HARNESS_ROUTES_DIAGNOSTIC_ONLY', expected: [] };
+-    state.outbox_ref_basis = 'NOT_READ_DIAGNOSTIC_ONLY';
++    state.transport_routes = { observation: 'NO_TASK_ENDPOINTS_NO_HTTP_INTERCEPTION_TYPED_MAIN_READS_ONLY', expected: [] };
++    state.outbox_ref_basis = 'NOT_READ_ZERO_BUDGET';
+     write('result.json', state);
+     console.log(JSON.stringify({ status: state.status, result: path.join(receipts, 'result.json'),
+       model_outcome: state.model_outcome, formal_increment: 0, product_increment: 0,
+@@ -340,13 +400,36 @@
+   return state;
+ }
+ 
++export async function run(scopeFile, expectedScopeSHA) {
++  const history = [];
++  activeGuardHistory = history;
++  activeRunEvidence = {phase: 'PREFLIGHT'};
++  try { return await runPrepared(scopeFile, expectedScopeSHA); }
++  catch (error) {
++    const known = activeRunEvidence.state;
++    const failure = { schema: 'researchos.path-entry-runner-failure/1', status: 'RUNNER_FAILURE_PHASE_PRESERVED',
++      code: safeText(error.code || error.message), guard_history: history,
++      phase: activeRunEvidence.phase, run_root: activeRunEvidence.run_root || null,
++      electron_launch_attempted: known?.electron_launch_attempted || false,
++      native_workspace_authorization: known?.native_workspace_authorization || 'NOT_YET_ESTABLISHED',
++      native_picker: known?.native_picker || 'NOT_YET_CONFIRMED',
++      project_id: known?.project_id || null, close: known?.close || null,
++      helper_stdout_progress: known?.helper_stdout_progress || null,
++      task_submissions: 0, model_outcome: 'NOT_RUN_ZERO_BUDGET',
++      stdout_must_be_preserved_by_root: true };
++    // Root captures complete stdout even when no fresh run root was created.
++    console.log(JSON.stringify(failure));
++    return failure;
++  } finally { activeGuardHistory = null; activeRunEvidence = null; }
++}
++
+ if (process.argv[1] && folded(process.argv[1]) === folded(fileURLToPath(import.meta.url))) {
+   const args = process.argv.slice(2);
+   if (args.length !== 5 || args[0] !== '--execute' || args[1] !== '--scope' || args[3] !== '--scope-sha256') {
+     console.log(JSON.stringify({ status: 'PREPARATION_ONLY_NOT_RUN', usage: 'Root supervised only: --execute --scope <reviewed absolute file> --scope-sha256 <reviewed hash>' }));
+     process.exitCode = 2;
+   } else {
+-    try { const result = await run(path.resolve(args[2]), args[4]); if (result.status !== 'OWNED_DIALOG_TREE_DIAGNOSTIC_CAPTURED_NOT_PRODUCT_ACCEPTED' || !result.close.app_close_resolved) process.exitCode = 2; }
+-    catch (error) { console.error(safeText(error.code || error.message)); process.exitCode = 2; }
++    const result = await run(path.resolve(args[2]), args[4]);
++    if (result.status !== 'REAL_NATIVE_PATH_ENTRY_AND_PROJECT_BINDING_OBSERVED_NOT_PRODUCT_ACCEPTED' || !result.close?.app_close_resolved) process.exitCode = 2;
+   }
+ }

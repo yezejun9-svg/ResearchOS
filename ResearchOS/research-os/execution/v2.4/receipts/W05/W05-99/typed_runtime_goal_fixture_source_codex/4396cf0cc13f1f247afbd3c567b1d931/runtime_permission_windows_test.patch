@@ -1,0 +1,48 @@
+--- D:/作品集/ResearchOS/research-os/.local/worktrees/codex-w0599-native-harness43-d74319468b584322b516e3b8b3aee4f2/internal/domain/runtime_permission_windows_test.go
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/typed_runtime_goal_fixture_source_codex/4396cf0cc13f1f247afbd3c567b1d931/candidate-root/internal/domain/runtime_permission_windows_test.go
+@@ -80,6 +80,9 @@
+ }
+ 
+ func TestRuntimeOriginalToolPermissionControlsOnePhysicalWrite(t *testing.T) {
++	if typedRuntimeFixtureChild(t) {
++		return
++	}
+ 	for _, choice := range []string{"ALLOW_ONCE", "DENY"} {
+ 		t.Run(choice, func(t *testing.T) {
+ 			runtimePermissionToolCycle(t, choice)
+@@ -88,16 +91,22 @@
+ }
+ 
+ func TestRuntimeOriginalToolPermissionExpiresWithoutPhysicalWrite(t *testing.T) {
++	if typedRuntimeFixtureChild(t) {
++		return
++	}
+ 	runtimePermissionToolCycle(t, "EXPIRE")
+ }
+ 
+ func TestRuntimePermissionDecisionWaitsForAnotherRequiredResource(t *testing.T) {
++	if typedRuntimeFixtureChild(t) {
++		return
++	}
+ 	runtimePermissionToolCycle(t, "BLOCKED_ALLOW")
+ }
+ 
+ func runtimePermissionToolCycle(t *testing.T, choice string) {
+ 	var providerCalls, physicalWrites atomic.Int32
+-	c, route, r, _ := muBrokerFixtureProgram(t, func(w http.ResponseWriter, request *http.Request) {
++	c, route, r, _ := typedMuBrokerFixtureProgram(t, func(w http.ResponseWriter, request *http.Request) {
+ 		n := providerCalls.Add(1)
+ 		var body Object
+ 		if json.NewDecoder(request.Body).Decode(&body) != nil {
+@@ -175,9 +184,10 @@
+ 	if _, err = f.db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, KindWorkspaceBinding, binding.AuthorizedRef, string(Bytes(binding))); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	service := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, WorkspaceAuthority: permissionWorkspaceFixture{workspace}, WorkspaceFiles: &clientWorkspacePort{}, Host: ClientHostInfo{CoreBuildID: "permission-fixture", LeaseTTL: time.Minute}}
++	service := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority, WorkspaceAuthority: permissionWorkspaceFixture{workspace}, WorkspaceFiles: &clientWorkspacePort{}, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: "permission-fixture", LeaseTTL: time.Minute}}
+ 	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("permission-client"), ProjectID: &f.project, Method: strptr("session.create"), Payload: Bytes(Object{"workspace_ref": binding.AuthorizedRef, "model_config_ref": modelRoute.ModelConfig["ref"], "title": "permission turn"})}
+ 	created := muClientCall(t, f, service, env)
++	attachTypedRuntimeFixture(t, f, service, created, "permission-client")
+ 	sessionID := deref(created.SessionID)
+ 	env = &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("permission-client"), ProjectID: &f.project, SessionID: created.SessionID, Method: strptr("session.send"), ExpectedRevision: revPtr(1), WriterEpoch: revPtr(1), Payload: Bytes(Object{"text": "Write draft.txt", "attachment_artifact_ids": Empty(), "delivery": "NORMAL"})}
+ 	muClientCall(t, f, service, env)

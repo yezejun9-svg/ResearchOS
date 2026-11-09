@@ -1,0 +1,182 @@
+apps/desktop/main/main.js
+1: // ResearchOS Desktop main (W13-01 increment on the W02-03 thin shell).
+2: //
+3: // It still does not start a second business scheduler: it discovers the existing Go control host, starts it
+4: // when it is genuinely unreachable, and exposes the four native clients through the channels declared in
+5: // main/lib/ipc.js. The registration and the routing are pure functions of injected collaborators, so
+6: // tests/ui/check drives them without an Electron runtime; what only a real session can prove stays disclosed.
+7: const { app, BrowserWindow, ipcMain, dialog, protocol } = require('electron');
+8: const childProcess = require('node:child_process');
+9: const crypto = require('node:crypto');
+10: const http = require('node:http');
+11: const fs = require('node:fs');
+12: const path = require('node:path');
+13: const { TextDecoder } = require('node:util');
+14: const host = require('./lib/host.js');
+15: const ipc = require('./lib/ipc.js');
+16: const { createTransport } = require('./lib/http-wire.js');
+17: const native = require('./lib/native.js');
+18: const { createAppProtocol, routeTable, APP_ORIGIN } = require('./lib/app-protocol.js');
+19: const { chooseWorkspace } = require('./lib/first-use.js');
+20: const { createContextStore } = require('./lib/context.js');
+21: const { createDesktopManagement } = require('./lib/desktop-management.js');
+22: 
+23: protocol.registerSchemesAsPrivileged([{ scheme: 'ros-app', privileges: {
+24:   standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: false,
+25: } }]);
+26: if (process.env.RESEARCHOS_DESKTOP_USER_DATA) {
+27:   const isolatedUserData = path.resolve(process.env.RESEARCHOS_DESKTOP_USER_DATA);
+28:   fs.mkdirSync(isolatedUserData, { recursive: true });
+29:   app.setPath('userData', isolatedUserData);
+30: }
+31: 
+32: const ROOT = path.resolve(__dirname, '..');
+33: const validatedV2Transport = createTransport({ appRoot: ROOT });
+34: const REPO = path.resolve(ROOT, '..', '..');
+35: const WEB_DIST = path.join(REPO, 'apps', 'web', 'dist');
+36: const DISCOVERY = path.resolve(REPO, process.env.RESEARCHOS_CLI_DISCOVERY ||
+37:   process.env.RESEARCHOS_HOST_DISCOVERY || path.join('.local', 'v24_host.json'));
+38: const PRINCIPAL = path.join(REPO, '.local', 'v24_principal.json');
+39: const SMOKE = process.env.ROS_DESKTOP_SMOKE === '1';
+40: const configuredCore = process.env.RESEARCHOS_CONTROL_EXE || '';
+41: const coreExecutable = configuredCore ? path.resolve(REPO, configuredCore) : path.join(ROOT, 'resources', 'control', 'researchos-control.exe');
+42: const dataRoot = path.resolve(REPO, process.env.RESEARCHOS_DATA_DIR || path.join('.local', 'data'));
+43: const verifierManifest = process.env.RESEARCHOS_DESKTOP_VERIFIER_MANIFEST ||
+44:   path.join(path.dirname(coreExecutable), 'runtime-verifier-installation.json');
+45: const runtimeAssetsDir = process.env.RESEARCHOS_DESKTOP_RUNTIME_ASSETS_DIR ||
+46:   path.join(path.dirname(coreExecutable), 'runtime');
+47: 
+48: // The smoke report must describe the same owned process observed on the
+49: // private management channel. A healthy HTTP endpoint alone is insufficient.
+50: function ownedCoreIdentity(machine) {
+51:   if (machine.state !== 'READY') return null;
+52:   try {
+53:     const discovery = machine.currentHost();
+54:     const identity = machine.identity;
+55:     if (!identity || discovery.pid !== identity.PID || !machine.hostId) return null;
+56:     return { pid: identity.PID, created_ns: identity.CreatedNS,
+57:       image_sha256: identity.ImageSHA256, host_id: machine.hostId };
+58:   } catch { return null; }
+59: }
+60: 
+61: function smokeReadyEvidence(renderer, nativeProbe, management, started, owned) {
+62:   return !!(renderer?.bridge && renderer.react_root && renderer.mounted_title &&
+63:     renderer.navigation > 0 && nativeProbe?.ok === true &&
+64:     management?.state === 'READY' && started?.health === 'UP' &&
+65:     started.discovery?.pid === owned?.pid && owned?.pid > 0 &&
+66:     typeof owned.created_ns === 'string' && /^[0-9]+$/.test(owned.created_ns) &&
+67:     /^[a-f0-9]{64}$/.test(owned.image_sha256) && /^host-[a-f0-9]{12}$/.test(owned.host_id));
+68: }
+69: 
+70: function smokeShutdownConfirmation(result, machine, owned) {
+71:   const identity = machine.identity;
+72:   if (result?.state !== 'STOPPED' || result.process_exit_confirmed !== true ||
+73:       machine.state !== 'STOPPED' || machine.hasUnconfirmedChild() ||
+74:       !identity || !owned || identity.PID !== owned.pid ||
+75:       identity.CreatedNS !== owned.created_ns || identity.ImageSHA256 !== owned.image_sha256 ||
+76:       machine.hostId !== owned.host_id) return null;
+77:   return { process_exit_confirmed: true, owned_core_identity: owned };
+78: }
+79: 
+80: const deps = {
+81:   fsImpl: fs,
+82:   httpImpl: http,
+83:   // A normal Desktop may only launch an owned control through the inherited
+84:   // private management pipes below. The older health route cannot spawn one.
+85:   requireLaunchDisabled: true,
+86:   discoveryFile: DISCOVERY,
+87:   credentialFor: native.createCredentialProvider({ clientId: 'desktop-shell' }),
+88:   principalFile: PRINCIPAL,
+89:   coreArgv: [],
+90:   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+{
+  "freeze_sha256": "6d885a649bb020d702487d5331f394cc43b3fd1c22d00a11822289ba7d644d3b",
+  "patch_sha256": "a9c8ca42f6b660481aee70457fa6aa19aa52bbd6c265f6b7a9d5f31336c09515",
+  "base_commit": "7d1e3ff288f91254c7304dd32f6e5bb4b66b8f1e",
+  "base_tree": "de59625ee5c1d360c741c95ec3f84b6f2764bb0e",
+  "candidate_commit": null,
+  "snapshot": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\desktop_main7d_independent_review_codex\\20261025-current-chat\\complete-tree\\source-r2",
+  "seven": {
+    "apps/desktop/build-development.py": {
+      "sha256": "f571ef6b73b8e7e2ce94113c6749b0aac0a5e1851f59dc7fbb2eafd213690032",
+      "bytes": 27035
+    },
+    "apps/desktop/launch-development.mjs": {
+      "sha256": "fb0431acc1abc2a28efbf6415fe84fba0ad274b6011270c7451aa38df7c0e321",
+      "bytes": 15579
+    },
+    "apps/desktop/main/main.js": {
+      "sha256": "47427f3077db80432f0fbce3d5e25b354469be427024447101de680eb216b3ac",
+      "bytes": 29349
+    },
+    "docs/installation/desktop-development.md": {
+      "sha256": "d58c3842e922abe2b480779853119203029b5809816f9fd761044269bd4d6a6b",
+      "bytes": 4174
+    },
+    "tests/ui/desktop/development-bundle.test.py": {
+      "sha256": "bba9ab6a2433891636aca0e2993f071b9893cb0f965e6ff479165011d2147b86",
+      "bytes": 5902
+    },
+    "tests/ui/desktop/development-launcher.test.mjs": {
+      "sha256": "54576af689a63caebba0aa24d393d53ebac1f4f8bd3d328af5898edff36dffd0",
+      "bytes": 10138
+    },
+    "tests/ui/desktop/development-smoke.test.mjs": {
+      "sha256": "a8c39fd780f29623fda064f941e937681f0263bdadba025e85eaed93308ff068",
+      "bytes": 3733
+    }
+  },
+  "unchanged_dependencies": [
+    {
+      "path": "apps/desktop/build-validator.py",
+      "sha256": "bdadaba2cbe77013665f38e0f0d6f06e05bb9cd1dc1ebf6545ea6f234b2aa331",
+      "origin": "7d1e3ff288f91254c7304dd32f6e5bb4b66b8f1e"
+    },
+    {
+      "path": "apps/desktop/main/lib/desktop-management.js",
+{
+  "schema": "researchos.desktop-complete-tree-source-freeze.v1",
+  "base_commit": "7d1e3ff288f91254c7304dd32f6e5bb4b66b8f1e",
+  "base_tree": "de59625ee5c1d360c741c95ec3f84b6f2764bb0e",
+  "scope_sha256": "a9e0c1b29282468b2d7a10d2cbd3db88feaa673b8480e0aab3d6176019bc7ab3",
+  "source_input_count": 591,
+  "source_snapshot_digest": "5515cf413e840469eb5c2c14b226295f14648762137fd80cac12aa13c01d09f1",
+  "candidate_delta": [
+    "apps/desktop/build-development.py",
+    "apps/desktop/launch-development.mjs",
+    "apps/desktop/main/main.js",
+    "docs/installation/desktop-development.md",
+    "tests/ui/desktop/development-bundle.test.py",
+    "tests/ui/desktop/development-launcher.test.mjs",
+    "tests/ui/desktop/development-smoke.test.mjs"
+  ],
+  "seven_file_hashes": {
+    "apps/desktop/build-development.py": {
+      "sha256": "f571ef6b73b8e7e2ce94113c6749b0aac0a5e1851f59dc7fbb2eafd213690032",
+      "bytes": 27035
+    },
+    "apps/desktop/launch-development.mjs": {
+      "sha256": "fb0431acc1abc2a28efbf6415fe84fba0ad274b6011270c7451aa38df7c0e321",
+      "bytes": 15579
+    },
+    "apps/desktop/main/main.js": {
+      "sha256": "47427f3077db80432f0fbce3d5e25b354469be427024447101de680eb216b3ac",
+      "bytes": 29349
+    },
+    "docs/installation/desktop-development.md": {
+      "sha256": "d58c3842e922abe2b480779853119203029b5809816f9fd761044269bd4d6a6b",
+      "bytes": 4174
+    },
+    "tests/ui/desktop/development-bundle.test.py": {
+      "sha256": "bba9ab6a2433891636aca0e2993f071b9893cb0f965e6ff479165011d2147b86",
+      "bytes": 5902
+    },
+    "tests/ui/desktop/development-launcher.test.mjs": {
+      "sha256": "54576af689a63caebba0aa24d393d53ebac1f4f8bd3d328af5898edff36dffd0",
+      "bytes": 10138
+    },
+    "tests/ui/desktop/development-smoke.test.mjs": {
+      "sha256": "a8c39fd780f29623fda064f941e937681f0263bdadba025e85eaed93308ff068",
+      "bytes": 3733
+    }
+C:\nvm4w\nodejs\node.exe

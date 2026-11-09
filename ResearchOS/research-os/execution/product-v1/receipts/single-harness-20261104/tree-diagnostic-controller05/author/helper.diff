@@ -1,0 +1,25 @@
+--- direct04/helper
++++ optionalLegacy05/helper
+@@ -398,10 +398,18 @@
+       $info=$Element.Current
+       if ($null -eq $info -or $info.ProcessId -ne $coreId) { throw 'UIA_PROVIDER_OWNER_UNCONFIRMED_NO_VALUES' }
+       $values.Add((Project-PublicUiaValue 'Name' $info.Name))
+-      foreach ($provider in @(
+-        @{source='ValuePattern';id=[Windows.Automation.ValuePattern]::Pattern},
+-        @{source='LegacyIAccessiblePattern';id=[Windows.Automation.LegacyIAccessiblePattern]::Pattern}
+-      )) {
++      $providers=[Collections.Generic.List[object]]::new()
++      $providers.Add(@{source='ValuePattern';id=[Windows.Automation.ValuePattern]::Pattern})
++      # Optional managed Legacy type is absent in some installed UIA clients.
++      # Resolve it by name; never eagerly evaluate a missing class in an array.
++      $legacyType=([Management.Automation.PSTypeName]::new('System.Windows.Automation.LegacyIAccessiblePattern')).Type
++      if ($null -eq $legacyType) {
++        $support.LegacyIAccessiblePattern=@{supported=$false;status='UNSUPPORTED_TYPE'}
++      } else {
++        try { $providers.Add(@{source='LegacyIAccessiblePattern';id=$legacyType::Pattern}) }
++        catch { $support.LegacyIAccessiblePattern=@{supported=$null;status='UNAVAILABLE_TYPE_MEMBER';error=(Limit-DiagnosticText $_.Exception.Message)} }
++      }
++      foreach ($provider in $providers) {
+         Assert-DirectNativeTree
+         try {
+           $pattern=$null;$supported=$Element.TryGetCurrentPattern($provider.id,[ref]$pattern)

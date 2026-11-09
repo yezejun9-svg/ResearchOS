@@ -1,0 +1,35 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\desktop58_root_authority_adapter_preparation_codex\9edf4a8dab83408a8614d050df1c803e\authorization_adapter.final.proposed.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\desktop58_root_authority_adapter_revision_preparation_codex\fde71451a31d4404b8e3d57b396f270c\authorization_adapter.v2.proposed.py
+@@ -608,7 +608,31 @@
+     rows = outputs[1].splitlines()
+     require(len(rows) == 13 and sum(x.startswith(b' D ') for x in rows) == 11 and
+             outputs[2] == b'' and scope['main_git']['index_empty'] is True, 'Preflight index/13 rows')
+-    for item in grant['runtime_observation_refs']:
++    observations = grant.get('runtime_observation_refs')
++    expected_paths = scope.get('expected_runtime_observation_paths')
++    require(type(expected_paths) is list and expected_paths and
++            all(type(path) is str and path for path in expected_paths),
++            'Root frozen ordered runtime observation paths are missing or empty')
++    require(type(observations) is list and observations and len(observations) == len(expected_paths),
++            'Runtime observations must be a nonempty complete list')
++    require(prelaunch.get('runtime_observation_refs') == observations,
++            'Grant runtime observations differ from sealed prelaunch selection')
++    observation_paths = set()
++    for expected_path, item in zip(expected_paths, observations):
++        require(type(item) is dict and set(item) == {'path','sha256','bytes'} and
++                type(item['path']) is str and type(item['sha256']) is str and
++                len(item['sha256']) == 64 and all(c in '0123456789abcdef' for c in item['sha256']) and
++                type(item['bytes']) is int and item['bytes'] >= 0, 'Runtime observation exact ref required')
++        path = bounded_path(item['path'])
++        expected_path_object = bounded_path(expected_path)
++        require(Path(item['path']).is_absolute() and Path(expected_path).is_absolute() and
++                str(path) == item['path'] == expected_path and
++                str(path.resolve()) == str(path) == str(expected_path_object.resolve()) and path.parent == root,
++                'Runtime observation foreign path, alias or order mismatch')
++        identity = os.path.normcase(str(path))
++        require(identity not in observation_paths, 'Duplicate runtime observation')
++        observation_paths.add(identity)
++    for item in observations:
+         require(bounded_path(item['path']).parent == root, 'Runtime observation location')
+         observed = reader.doc(item)
+         expected = {os.path.normcase(str(Path(x['path']).absolute())):x

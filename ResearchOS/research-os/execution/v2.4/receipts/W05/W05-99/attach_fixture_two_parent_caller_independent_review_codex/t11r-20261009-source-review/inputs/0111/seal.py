@@ -1,0 +1,17 @@
+from pathlib import Path
+import json,hashlib
+O=Path(__file__).resolve().parent;B=O.parent.parent
+A=B/'session_attach_restore_time_revision_codex/att3-1a11e02f790732395c39325fbb4668d'
+def j(p):return json.loads(p.read_text(encoding='utf-8'))
+def pin(p):
+ raw=p.read_bytes();return dict(path=str(p),sha256=hashlib.sha256(raw).hexdigest(),bytes=len(raw))
+def dump(name,v):(O/name).write_text(json.dumps(v,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+s=j(O/'static-checks.json');g=j(O/'sourceguard.final.json')
+checks=dict(source_inverse=s['production_inverse_exact'],outside_helper=s['all_code_outside_restore_helper_byte_equal'],old_tests=all(x['byte_equal'] for x in s['old_tests']),old_001=s['old_rejection_001_static_eliminated'],old_002=s['old_rejection_002_static_eliminated'],guard_closed=g['closed'] and g['retained_handles_count']==0 and not g['errors'] and not g['failure'] and g['verification']=='PASSED',guard_entries=all(x['verified'] and x['final_path_match'] and x['closed'] for x in g['entries']))
+dump('findings.json',dict(authority='NONE',formal_acceptance=False,critical=[],important=[],suggestions=[dict(id='ATT3-DEPENDENCY-LIMIT',scope='preexisting dependencies outside this delta',files=['client_session_fence.go:71','backup_recovery.go:236','runtime.go:121'],description='Existing shared TEXT time comparisons remain; no whole-chain positive acceptance')],prior_findings=[dict(id='ATTACH-RESTORE-001',disposition='STATIC_SOURCE_COUNTEREXAMPLE_ELIMINATED_ACTUAL_PENDING'),dict(id='ATTACH-RESTORE-002',disposition='STATIC_SOURCE_COUNTEREXAMPLE_ELIMINATED_ACTUAL_PENDING')]))
+h=dict(schema='researchos.independent-attach-restore-time-review-handoff.v1',authority='NONE',formal_acceptance=False,decision='SOURCE_ONLY_APPROVE_WITH_FRESH_POSITIVE_BLOCKED' if all(checks.values()) else 'SOURCE_REVIEW_FAILED',namespace=str(O),subject_HDF=pin(A/'HDF.json'),subject_MF=pin(A/'MF.json'),report_ref=pin(O/'report.md'),findings_ref=pin(O/'findings.json'),static_checks_ref=pin(O/'static-checks.json'),guard_final_ref=pin(O/'sourceguard.final.json'),input_pins_ref=pin(O/'input-pins.json'),input_copy_index_ref=pin(O/'input-copy-index.json'),timestamp_evidence_ref=pin(O/'timestamp-independent-evidence.json'),failure842_ref=pin(O/'failure-origin.842.json'),checks=checks,source_guard_entries=len(g['entries']),public_copies=s['copied_public_inputs'],native_positive='BLOCKED/PENDING_ROOT_RESOURCE',native_Owner_original_business_formal_acceptance=False,shared_TEXT_dependency_wholechain_acceptance=False,reviewer_Go_SQL_native_model_network_execution=False,canonical_or_Source_write=False,new_mechanical_failure_ordinals=[842],prior_failures_not_reset=True,Root_next='fresh isolated composition/build and authorized verification; no restored positive inferred',STOP=True)
+dump('HDF.json',h)
+members=[dict(relative_path=p.relative_to(O).as_posix(),**pin(p)) for p in sorted(O.rglob('*')) if p.is_file() and p.relative_to(O).as_posix() not in ('MF.json','postseal-tool-io.json')]
+dump('MF.json',dict(schema='researchos.independent-source-review-manifest.v1',authority='NONE',members=members,exclusions={'MF.json':'self fingerprint','postseal-tool-io.json':'seal original return created afterward; separately pinned'}))
+print(json.dumps(dict(decision=h['decision'],checks=checks,member_count=len(members),refs={n:pin(O/n) for n in ('HDF.json','MF.json','report.md','sourceguard.final.json','failure-origin.842.json')},new_mechanical_failure_ordinals=[842],Go_SQL_native_model_execution=False,formal_acceptance=False),ensure_ascii=False))
+

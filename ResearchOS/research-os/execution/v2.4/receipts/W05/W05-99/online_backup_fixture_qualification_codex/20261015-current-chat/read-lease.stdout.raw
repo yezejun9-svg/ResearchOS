@@ -1,0 +1,99 @@
+1://go:build windows
+3:package runtime
+5:import (
+6:	"errors"
+7:	"os"
+8:	"path/filepath"
+9:	"strings"
+10:	"sync"
+11:)
+13:// DataRootLease is an opaque, process-local owner of the existing exclusive
+14:// coordinator.lock. The control process acquires it before opening SQLite and
+15:// the in-process coordinator may borrow it without opening a second writer.
+16:type DataRootLease struct {
+17:	mu       sync.Mutex
+18:	root     string
+19:	file     *os.File
+20:	closed   bool
+21:	borrowed bool
+22:}
+24:func AcquireDataRootLease(directory string) (*DataRootLease, error) {
+25:	f, e := LockDataRoot(directory)
+26:	if e != nil {
+27:		return nil, e
+28:	}
+29:	root, e := filepath.Abs(directory)
+30:	if e != nil {
+31:		_ = f.Close()
+32:		return nil, e
+33:	}
+34:	return &DataRootLease{root: filepath.Clean(root), file: f}, nil
+35:}
+37:func (l *DataRootLease) Root() string {
+38:	if l == nil {
+39:		return ""
+40:	}
+41:	return l.root
+42:}
+44:// Held observes the owner's live handle; it neither borrows nor acquires a lease.
+45:func (l *DataRootLease) Held() bool {
+46:	if l == nil {
+47:		return false
+48:	}
+49:	l.mu.Lock()
+50:	defer l.mu.Unlock()
+51:	if l.closed || l.file == nil {
+52:		return false
+53:	}
+54:	_, err := l.file.Stat()
+55:	return err == nil
+56:}
+58:func (l *DataRootLease) Borrow(directory string) error {
+59:	if l == nil {
+60:		return errors.New("control data-root lease required")
+61:	}
+62:	root, e := filepath.Abs(directory)
+63:	if e != nil {
+64:		return e
+65:	}
+66:	l.mu.Lock()
+67:	defer l.mu.Unlock()
+68:	if l.closed || l.file == nil || !strings.EqualFold(filepath.Clean(root), l.root) {
+69:		return errors.New("control data-root lease unavailable or mismatched")
+70:	}
+71:	if l.borrowed {
+72:		return errors.New("control data-root lease already borrowed")
+73:	}
+74:	if _, e = l.file.Stat(); e != nil {
+75:		return e
+76:	}
+77:	l.borrowed = true
+78:	return nil
+79:}
+81:func (l *DataRootLease) ReturnBorrow() error {
+82:	if l == nil {
+83:		return errors.New("control data-root lease required")
+84:	}
+85:	l.mu.Lock()
+86:	defer l.mu.Unlock()
+87:	if !l.borrowed {
+88:		return errors.New("control data-root lease not borrowed")
+89:	}
+90:	l.borrowed = false
+91:	return nil
+92:}
+94:func (l *DataRootLease) Close() error {
+95:	if l == nil {
+96:		return nil
+97:	}
+98:	l.mu.Lock()
+99:	defer l.mu.Unlock()
+100:	if l.closed {
+101:		return nil
+102:	}
+103:	if l.borrowed {
+104:		return errors.New("control data-root lease still borrowed")
+105:	}
+106:	l.closed = true
+107:	return l.file.Close()
+108:}

@@ -1,0 +1,4 @@
+$w='D:\作品集\ResearchOS\research-os\.local\worktrees\owned-core-stop-anchor-r2-20261015'
+rg -n 'NativeExitCode|NativeWaitResult|receipt.NativePID|ownedNativePath|ownedNativeImage|EvalSymlinks|CreateFile|TerminateOnceAndWaitUntil|checkAction\("commit"|WithDeadline|TERMINATE_INTENT|ctx.Err|func Test' "$w\internal\ownedcorestop\proof_windows.go" "$w\internal\ownedcorestop\stop_windows.go" "$w\ops\supervisor\owned_core_handle_windows.go" "$w\internal\ownedcorestop\journal_windows_test.go" "$w\ops\supervisor\owned_core_handle_windows_test.go"
+Get-Content 'D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\qualification_failure_revision02_architecture_codex\20261015-current-chat\STOP-test-cuts.json' -Raw
+Get-Content "$e\whole19_patch-comparison.json","$e\repair_patch-comparison.json" -Raw

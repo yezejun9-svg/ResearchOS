@@ -1,0 +1,9 @@
+# Bridge07 Root calling contract
+
+Actual Source author: codex:/root/full_w09_source_review, backend /root/full_w09_source_review. Formal verifier remains /root/backup_regression_resources. This prepared Source requires a new independent Source review and actual Root authority. It issues no execution grant, Mode qualification or formal acceptance.
+
+The only code changes from sealed BR6 are BRIDGE_GENERATION=bridge-20261010-07 and TRUSTED formal_profile_w09.py SHA/bytes=1e04865beef37fdbffa06d649d072721d7b6eb0ef5e525d87bb867da414e4087/71403. Root has actually adopted the independently reviewed tuple-to-list boundary correction; original1208 remains failed. The consumer launcher is byte-identical and discovers the sealed Caller in its own directory. All ten stages, actual peer offsets, six routes, five roles, Main Native/Mode gates, exact resource/TEMP contracts, SourceReadGuard, current4 and owner/worker/lease conditions remain unchanged.
+
+BR6's original four-archive proof, normalized Canon classification, fresh request authority, separate persistent/authority snapshots and unchanged TP exclusive CAS remain mandatory. Canon aliases never substitute a different exact ref object. Root must use a fresh BR7 Source review, request and finite Scope.source_actor=/root/full_w09_source_review, with generation and current Source refs bound; no old proposal or Scope is relabeled.
+
+After adoption, rebuild the actual context seed and formal vector with the new Main pin. Native Source21 excludes formal_profile_w09.py; four existing NF6 Native reports and six Mode decisions are preserved subject to every unchanged Main gate. This Source author does not reissue or independently accept them. No Native, Go, SQL, dispatcher, TP, Root stage, Scope or Main/Canon write is performed by this preparation. Successful prior Source controls, the 47 Main candidate checks and existing Native/Mode checks are referenced without replay.

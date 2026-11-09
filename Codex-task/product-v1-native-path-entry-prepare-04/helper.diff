@@ -1,0 +1,147 @@
+--- freeze03/choose-owned-folder.ps1
++++ revision04/choose-owned-folder.ps1
+@@ -43,6 +43,29 @@
+ function Assert-ExactText([string]$Actual,[string]$Expected,[int]$Copied,[int]$Capacity) {
+   if ($Capacity -lt 2 -or $Copied -lt 0 -or $Copied -ge ($Capacity-1) -or
+     $Copied -ne $Actual.Length -or -not [string]::Equals($Actual,$Expected,[StringComparison]::Ordinal)) {throw 'INPUT_READBACK_NOT_EXACT_OR_TRUNCATED'}
++}
++function Assert-WindowHandleOwner($Identity,[int]$ExpectedPid) {
++  if ($Identity.hwnd -eq 0) {throw 'WINDOW_HANDLE_ZERO_NO_TARGET'}
++  if ($Identity.is_window -ne $true) {throw 'WINDOW_HANDLE_INVALID_NO_TARGET'}
++  if ($Identity.thread_id -le 0 -or $Identity.process_id -le 0) {throw 'WINDOW_THREAD_PID_UNAVAILABLE_NO_TARGET'}
++  if ($Identity.process_id -ne $ExpectedPid) {throw 'FOREIGN_WINDOW_PID'}
++}
++function Select-UniqueWarningIdOk($Rows,[int]$ExpectedPid,[long]$WarningHwnd,[bool]$Truncated,[long]$DirectLookupHwnd) {
++  if ($Truncated) {throw 'WARNING_CHILD_ENUMERATION_TRUNCATED_NO_POST'}
++  foreach ($row in $Rows) {
++    if ($row.hwnd -le 0 -or $row.process_id -ne $ExpectedPid -or $row.is_child -ne $true -or
++      $row.root_dialog -ne $WarningHwnd) {throw 'WARNING_CHILD_OWNERSHIP_OR_RELATION_UNCONFIRMED_NO_POST'}
++  }
++  # Control ID, never localized text, identifies IDOK. Even an invisible or
++  # non-Button duplicate ID 1 makes this set ambiguous and must block.
++  $matches=@($Rows | Where-Object {$_.control_id -eq 1})
++  if ($matches.Count -ne 1) {throw 'WARNING_IDOK_NOT_UNIQUE_NO_POST'}
++  $candidate=$matches[0]
++  if ($candidate.class_name -cne 'Button' -or $candidate.visible -ne $true -or $candidate.enabled -ne $true) {
++    throw 'WARNING_IDOK_CLASS_OR_STATE_UNCONFIRMED_NO_POST'
++  }
++  if ($DirectLookupHwnd -ne 0 -and $candidate.hwnd -ne $DirectLookupHwnd) {throw 'WARNING_IDOK_LOOKUP_CHANGED_NO_POST'}
++  return $candidate
+ }
+ function Assert-DialogThreadFacts($Snapshot,[int]$ExpectedPid,[long]$ExpectedDialog) {
+   if ($Snapshot.query_succeeded -ne $true -or $Snapshot.dialog_hwnd -ne $ExpectedDialog -or
+@@ -139,6 +162,7 @@
+   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
+   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd,uint flags);
+   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
++  [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwnd);
+   [DllImport("user32.dll",SetLastError=true)] public static extern bool PostMessageW(IntPtr hwnd,uint msg,IntPtr w,IntPtr l);
+   [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode,SetLastError=true)]
+   public static extern IntPtr SetText(IntPtr hwnd,uint msg,UIntPtr w,[MarshalAs(UnmanagedType.LPWStr)]string text,uint flags,uint timeout,out UIntPtr result);
+@@ -148,10 +172,20 @@
+ }
+ '@
+   function Facts([IntPtr]$Handle) {
+-    [uint32]$owner=0;$null=[OwnedPathWin32]::GetWindowThreadProcessId($Handle,[ref]$owner)
+-    # Identity first: never read text/provider values on an unverified PID.
+-    if ($owner -ne $coreId) {throw 'FOREIGN_WINDOW_PID'}
+-    return @{hwnd=$Handle.ToInt64();process_id=$owner;class_name=[OwnedPathWin32]::Class($Handle)
++    $identity=@{hwnd=$Handle.ToInt64();is_window=$false;thread_id=0;process_id=0}
++    if ($Handle -ne [IntPtr]::Zero) {
++      $identity.is_window=[OwnedPathWin32]::IsWindow($Handle)
++      if ($identity.is_window) {
++        [uint32]$owner=0
++        $identity.thread_id=[OwnedPathWin32]::GetWindowThreadProcessId($Handle,[ref]$owner)
++        $identity.process_id=$owner
++      }
++    }
++    # NULL, stale/unavailable, and a confirmed foreign PID are distinct.
++    # Failed ownership reads record numeric identity only, never foreign text.
++    try {Assert-WindowHandleOwner $identity $coreId}
++    catch {Record 'WINDOW_IDENTITY_REJECTED' @{identity=$identity;reason=$_.Exception.Message};throw}
++    return @{hwnd=$Handle.ToInt64();process_id=$identity.process_id;class_name=[OwnedPathWin32]::Class($Handle)
+       parent=[OwnedPathWin32]::GetAncestor($Handle,1).ToInt64();owner=[OwnedPathWin32]::GetWindow($Handle,4).ToInt64()
+       visible=[OwnedPathWin32]::IsWindowVisible($Handle);enabled=[OwnedPathWin32]::IsWindowEnabled($Handle)}
+   }
+@@ -182,13 +216,19 @@
+     return $script:dialogs.ToArray()
+   }
+   function ChildFacts([IntPtr]$Parent) {
+-    $null=Facts $Parent
+     $script:children=[Collections.Generic.List[object]]::new();$script:truncated=$false
+     $script:childEnumError=$null
++    $null=Facts $Parent
+     $callback=[OwnedPathWin32+EnumCallback]{param($child,$unused)
+       try {
+         if ($script:children.Count -ge 128) {$script:truncated=$true;return $false}
+-        $script:children.Add((Facts $child));return $true
++        $row=Facts $child
++        $row.root_dialog=$Parent.ToInt64()
++        $row.is_child=[OwnedPathWin32]::IsChild($Parent,$child)
++        $row.control_id=$null
++        # GetDlgCtrlID is defined for child controls, not top-level windows.
++        if ($row.is_child) {$row.control_id=[OwnedPathWin32]::GetDlgCtrlID($child)}
++        $script:children.Add($row);return $true
+       } catch {$script:childEnumError=$_.Exception.Message;return $false}
+     }
+     $null=[OwnedPathWin32]::EnumChildWindows($Parent,$callback,[IntPtr]::Zero)
+@@ -270,19 +310,54 @@
+     Record 'DIALOG_THREAD_ACTIVE_SNAPSHOT' $snapshot
+     Assert-DialogThreadFacts $snapshot $coreId $Dialog.ToInt64()
+   }
++  function Get-OwnedWarningIdOk([IntPtr]$Warning) {
++    Assert-Warning $Warning
++    $direct=[OwnedPathWin32]::GetDlgItem($Warning,1)
++    Record 'WARNING_IDOK_DIRECT_LOOKUP' @{dialog=$Warning.ToInt64();control_id=1;hwnd=$direct.ToInt64();is_zero=($direct -eq [IntPtr]::Zero)}
++    if ($direct -ne [IntPtr]::Zero) {
++      $lookup=Facts $direct
++      $lookup.is_child=[OwnedPathWin32]::IsChild($Warning,$direct)
++      $lookup.control_id=$null
++      if ($lookup.is_child) {$lookup.control_id=[OwnedPathWin32]::GetDlgCtrlID($direct)}
++      Record 'WARNING_IDOK_DIRECT_LOOKUP_FACTS' $lookup
++      if (-not $lookup.is_child -or $lookup.control_id -ne 1 -or $lookup.class_name -cne 'Button' -or
++        -not $lookup.visible -or -not $lookup.enabled) {throw 'WARNING_DIRECT_IDOK_LOOKUP_INVALID_NO_POST'}
++    }
++    $rows=@()
++    try {$rows=@(ChildFacts $Warning)}
++    catch {
++      Record 'WARNING_IDOK_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
++        rows=$script:children.ToArray();enumeration_error=$_.Exception.Message;window_text_read=$false}
++      throw
++    }
++    Record 'WARNING_IDOK_CHILD_METADATA' @{dialog=$Warning.ToInt64();limit=128;truncated=$script:truncated
++      rows=$rows;enumeration_error=$null;window_text_read=$false}
++    $candidate=Select-UniqueWarningIdOk $rows $coreId $Warning.ToInt64() $script:truncated $direct.ToInt64()
++    return [IntPtr]$candidate.hwnd
++  }
+   function Post-OwnedButton([IntPtr]$Dialog,[int]$Id,[string]$Purpose,[switch]$Warning,[switch]$ForCleanup) {
+     Assert-Chooser -WithWarning:$Warning -ForCleanup:$ForCleanup
+     if ($Warning) {Assert-Warning $Dialog}
+     Assert-DialogThreadState $Dialog -ForCleanup:$ForCleanup
+-    $button=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$row=Facts $button
+-    if ($row.parent -ne $Dialog.ToInt64() -or $row.class_name -cne 'Button' -or -not $row.visible -or -not $row.enabled) {throw 'OWNED_BUTTON_IDENTITY_OR_STATE'}
++    if ($Warning) {
++      if ($Id -ne 1 -or $Purpose -cne 'WARNING_DISMISS') {throw 'WARNING_ONLY_IDOK_DISMISS_ALLOWED'}
++      $button=Get-OwnedWarningIdOk $Dialog
++    } else {
++      $button=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$row=Facts $button
++      if ($row.parent -ne $Dialog.ToInt64() -or $row.class_name -cne 'Button' -or -not $row.visible -or -not $row.enabled) {throw 'OWNED_BUTTON_IDENTITY_OR_STATE'}
++    }
+     Record 'BUTTON_QUEUE_INTENT' @{dialog=$Dialog.ToInt64();button=$button.ToInt64();control_id=$Id;purpose=$Purpose}
+     # Async standard BM_CLICK avoids blocking the controller in the modal
+     # validation callback. Queue acceptance alone never establishes its result.
+     Assert-Core -ForCleanup:$ForCleanup
+-    $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
+-    if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
+-      -not $now.visible -or -not $now.enabled) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    if ($Warning) {
++      $fresh=Get-OwnedWarningIdOk $Dialog
++      if ($fresh -ne $button) {throw 'WARNING_IDOK_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    } else {
++      $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
++      if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
++        -not $now.visible -or -not $now.enabled) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    }
+     Assert-DialogThreadState $Dialog -ForCleanup:$ForCleanup
+     $messageDeadline=$actionDeadline
+     if ($ForCleanup) {$messageDeadline=$cleanupDeadline}

@@ -1,0 +1,286 @@
+FILE internal/host/runtime_verifier_replacement_journal_windows.go
+315: func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, raw []byte) (RuntimeVerifierReplacementResult, error) {
+316: 	out := replacementResult(in.Action, p, domain.Digest(raw), "UNKNOWN", "UNKNOWN")
+317: 	dir := filepath.Join(p.HostPath, replacementJournal, p.OperationID)
+318: 	guards, e := guardWriteDirectories(dir)
+319: 	if e != nil {
+320: 		return out, e
+321: 	}
+322: 	defer closeWriteGuards(guards)
+323: 	v, e := replacementReadJournal(dir, p, raw)
+324: 	if e != nil {
+325: 		return out, e
+326: 	}
+327: 	head, e := replacementReadHistory(p.DataRoot, p.OperationID)
+328: 	if e != nil {
+329: 		return out, e
+330: 	}
+331: 	if !replacementExtendsHead(p, head) {
+332: 		return out, errors.New("recovery causal predecessor differs")
+333: 	}
+334: 	state := ""
+335: 	if len(v.Events) > 0 {
+336: 		state = v.Events[len(v.Events)-1].State
+337: 	}
+338: 	current, e := replacementRead(filepath.Join(p.HostPath, "runtime-verifier-installation.json"), 64<<10)
+339: 	if e != nil {
+340: 		return out, e
+341: 	}
+342: 	backup, published := v.Files["actual-backup.bin"]
+343: 	applied := bytes.Equal(current, p.NewBytes) && published && bytes.Equal(backup, p.OldBytes) && v.Files["stage.bin"] == nil
+344: 	unapplied := bytes.Equal(current, p.OldBytes) && !published
+345: 	if state == "COMMITTED" {
+346: 		if !applied {
+347: 			return out, errors.New("committed result drift")
+348: 		}
+349: 		if e = replacementInstallationValid(p); e != nil {
+350: 			return out, e
+351: 		}
+352: 		out.State, out.Outcome = "COMMITTED", "APPLIED"
+353: 		return out, nil
+354: 	}
+355: 	if state == "ABORTED" {
+356: 		if !unapplied {
+357: 			return out, errors.New("aborted result drift")
+358: 		}
+359: 		out.State, out.Outcome = "ABORTED", "NOT_APPLIED"
+360: 		return out, nil
+361: 	}
+362: 	if applied && state == "PUBLISHING" {
+363: 		if e = replacementInstallationValid(p); e != nil {
+364: 			return out, e
+365: 		}
+366: 		if in.RecoveryAction == "abort" {
+367: 			return out, errors.New("published operation cannot abort")
+368: 		}
+369: 		if in.RecoveryAction == "complete" {
+370: 			if e = replacementApplied(p, dir); e != nil {
+371: 				return out, e
+372: 			}
+373: 			if e = replacementAppend(dir, p, raw, "COMMITTED"); e != nil {
+374: 				return out, e
+375: 			}
+376: 			if e = replacementApplied(p, dir); e != nil {
+377: 				return out, e
+378: 			}
+379: 			if e = replacementCheckHistoryCurrent(p.DataRoot); e != nil {
+380: 				return out, e
+381: 			}
+382: 			out.State, out.Outcome = "COMMITTED", "APPLIED"
+383: 			return out, nil
+384: 		}
+385: 		out.State = "PUBLISHING"
+386: 		return out, nil
+387: 	}
+388: 	if !unapplied {
+389: 		return out, errors.New("replacement evidence ambiguous; no replay or rollback")
+390: 	}
+391: 	out.State, out.Outcome = "UNAPPLIED", "NOT_APPLIED"
+392: 	if in.RecoveryAction == "complete" {
+393: 		return out, errors.New("complete never replays ReplaceFile")
+394: 	}
+395: 	if in.RecoveryAction == "abort" {
+396: 		// Also provides recovery from death immediately after operation mkdir.
+397: 		for _, v := range []struct {
+398: 			name string
+399: 			data []byte
+400: 		}{{"plan.json", raw}, {"old-registration.bin", p.OldBytes}, {"new-registration.bin", p.NewBytes}} {
+401: 			if e = replacementWrite(dir, v.name, v.data); e != nil {
+402: 				return out, e
+403: 			}
+404: 		}
+405: 		if e = replacementAppend(dir, p, raw, "ABORTED"); e != nil {
+406: 			return out, e
+407: 		}
+408: 		if e = replacementCheckHistoryCurrent(p.DataRoot); e != nil {
+409: 			return out, e
+410: 		}
+411: 		out.State = "ABORTED"
+412: 	}
+413: 	return out, nil
+414: }
+415: 
+416: func replacementValidateReverse(p replacementPlan) error {
+FILE adapters/runtime/bridge_windows.go
+FILE internal/domain/backup_configuration_upgrade.go
+20: func upgradeConfigurationRelease(root string, count int) (Object, [][]byte, error) {
+21: 	if count != 22 && count != 23 {
+22: 		return nil, nil, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+23: 	}
+24: 	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/0*.sql"))
+25: 	if e != nil || len(files) != count {
+26: 		return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS: require exact 1..%d", count)
+27: 	}
+28: 	manifest := Object{}
+29: 	sqls := make([][]byte, count+1)
+30: 	for i, file := range files {
+31: 		name := filepath.Base(file)
+32: 		if len(name) < 5 || name[:4] != fmt.Sprintf("%04d", i+1) {
+33: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS")
+34: 		}
+35: 		expected := upgradeMigrationHashes[name]
+36: 		switch name {
+37: 		case "0021_research_pending_windows.sql":
+38: 			expected = "sha256:36d4e5c93aa1edcd7ca5aca922b3bea11d5739f307bd11c6834936adf5552f32"
+39: 		case "0022_client_command_queue.sql":
+40: 			expected = upgradeQueueSQLHash
+41: 		case "0023_host_model_configuration.sql":
+42: 			expected = upgradeConfigurationSQLHash
+43: 		}
+44: 		raw, e := os.ReadFile(file)
+45: 		if e != nil || expected == "" || Digest(raw) != expected {
+46: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_HASH: %s", name)
+47: 		}
+48: 		manifest["migrations/sqlite/"+name] = expected
+49: 		sqls[i] = raw
+50: 	}
+51: 	for path, expected := range map[string]string{
+52: 		"spec/v2.0/contracts/domain.schema.json":             "sha256:b11439c80d15c9481d7940c98eb6517b5156470f871c839e505a8dce40e0b847",
+53: 		"spec/v2.0/contracts/openapi.json":                   "sha256:f1edd7955a1d134a675c5558618756db809d82729f8eebe622a9bc2605a58920",
+54: 		"internal/api/contracts/client.protocol.schema.json": "sha256:8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+55: 		"internal/api/contracts/domain.schema.json":          "sha256:b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54",
+56: 	} {
+57: 		raw, e := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+58: 		if e != nil || Digest(raw) != expected {
+59: 			return nil, nil, fmt.Errorf("UPGRADE_CONTRACT_HASH: %s", path)
+60: 		}
+61: 		manifest[path] = expected
+62: 	}
+63: 	raw, e := os.ReadFile(filepath.Join(root, "migrations/sqlite/next_v24_sessions.sql"))
+64: 	if e != nil || Digest(raw) != upgradeQueueSessionHash {
+65: 		return nil, nil, fmt.Errorf("UPGRADE_SESSION_SCHEMA_HASH")
+66: 	}
+67: 	manifest["migrations/sqlite/next_v24_sessions.sql"] = Digest(raw)
+68: 	sqls[count] = raw
+69: 	return manifest, sqls, nil
+70: }
+71: 
+72: func upgradeConfigurationTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+73: 	if len(sqls) != 24 {
+74: 		return "", "", fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+75: 	}
+76: 	stage, e := os.MkdirTemp("", ".researchos-configuration-template-")
+77: 	if e != nil {
+78: 		return "", "", e
+79: 	}
+80: 	defer backupDiscard(stage)
+81: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+82: 	if e != nil {
+83: 		return "", "", e
+84: 	}
+85: 	defer db.Close()
+86: 	for i, raw := range sqls[:22] {
+87: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+88: 			return "", "", e
+89: 		}
+90: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+91: 			return "", "", e
+92: 		}
+93: 	}
+94: 	if _, e = db.ExecContext(ctx, string(sqls[23])); e != nil {
+95: 		return "", "", e
+96: 	}
+97: 	if e = installClientSessionFence(ctx, db, false); e != nil {
+98: 		return "", "", e
+99: 	}
+100: 	before, e := backupSchema(db)
+101: 	if e != nil {
+102: 		return "", "", e
+103: 	}
+104: 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
+105: 		return "", "", e
+106: 	}
+107: 	if e = upgradeConfigurationMigration(ctx, db, sqls[22]); e != nil {
+108: 		return "", "", e
+109: 	}
+110: 	after, e := backupSchema(db)
+FILE internal/domain/backup_queue_upgrade.go
+30: }
+31: 
+32: // Same-host continuity reads only directory metadata. It does not copy a
+33: // workspace, grant access, or replace the existing host authority/pin store.
+34: func upgradeQueueWorkspaceIdentity(db *sql.DB, opt LocalUpgradeOptions) (Object, error) {
+35: 	bindings, e := workspaceBackupBindings(db)
+36: 	if e != nil {
+37: 		return nil, e
+38: 	}
+39: 	manifest := Object{}
+40: 	for _, b := range bindings {
+41: 		path, e := upgradeExistingPath(b.RealPath)
+42: 		if e != nil {
+43: 			return nil, e
+44: 		}
+45: 		if !strings.EqualFold(filepath.Clean(path), filepath.Clean(b.RealPath)) {
+46: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_ALIAS")
+47: 		}
+48: 		info, e := os.Stat(path)
+49: 		if e != nil || !info.IsDir() {
+50: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_DIRECTORY")
+51: 		}
+52: 		if backupWorkspaceOverlaps(path, opt.Destination) || backupWorkspaceOverlaps(path, opt.Snapshot) {
+53: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_OUTPUT_OVERLAP")
+54: 		}
+55: 		identity, e := retrieval.Identity(path)
+56: 		if e != nil {
+57: 			return nil, e
+58: 		}
+59: 		manifest[b.AuthorizedRef] = Object{"path": path, "identity": identity, "principal": b.PrincipalID, "host_principal": b.HostPrincipalRef, "access": b.Access, "project": b.ProjectID}
+60: 	}
+61: 	return manifest, nil
+62: }
+63: 
+64: func upgradeQueueTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+65: 	if len(sqls) != 23 {
+66: 		return "", "", fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+67: 	}
+68: 	stage, e := os.MkdirTemp("", ".researchos-backup-stage-")
+69: 	if e != nil {
+70: 		return "", "", e
+71: 	}
+72: 	defer backupDiscard(stage)
+73: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+74: 	if e != nil {
+75: 		return "", "", e
+76: 	}
+77: 	defer db.Close()
+78: 	for i, raw := range sqls[:21] {
+79: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+80: 			return "", "", e
+81: 		}
+82: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+83: 			return "", "", e
+84: 		}
+85: 	}
+86: 	if _, e = db.ExecContext(ctx, string(sqls[22])); e != nil {
+87: 		return "", "", e
+88: 	}
+89: 	if e = installClientSessionFence(ctx, db, false); e != nil {
+90: 		return "", "", e
+91: 	}
+92: 	before, e := backupSchema(db)
+93: 	if e != nil {
+94: 		return "", "", e
+95: 	}
+96: 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
+97: 		return "", "", e
+98: 	}
+99: 	if e = upgradeQueueMigration(ctx, db, sqls[21], sqls[22]); e != nil {
+100: 		return "", "", e
+101: 	}
+102: 	after, e := backupSchema(db)
+103: 	return before, after, e
+104: }
+105: 
+106: func upgradeQueueMigration(ctx context.Context, db *sql.DB, raw, additive []byte) error {
+107: 	if Digest(raw) != upgradeQueueSQLHash || Digest(additive) != upgradeQueueSessionHash {
+108: 		return fmt.Errorf("UPGRADE_MIGRATION_HASH")
+109: 	}
+110: 	versions, e := backupMigrations(db)
+adapters/runtime\bridge_windows.go:165:func LockDataRoot(directory string) (*os.File, error) {
+adapters/runtime\runtime_windows.go:96:func Hash(b []byte) string { h := sha256.Sum256(b); return "sha256:" + hex.EncodeToString(h[:]) }
+internal/host\runtime_verifier_process_windows.go:87:func decodeRuntimeManaged(raw []byte, target any) error {
+internal/domain\contracts.go:90:func Bytes(v any) []byte {
+internal/domain\contracts.go:98:func Hash(v any) string {
+internal/domain\contracts.go:105:func Receipt(o Object) string {
+
+RG_EXIT 0

@@ -1,0 +1,60 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\fresh58_desktop169_go3_controller_preparation_codex\52998fc9c4d64166b10aa02e6eca11e4\desktop_controller.v2.proposed.py
++++ desktop_controller.v3.proposed.py
+@@ -79,6 +79,7 @@
+     need(scope['native_top_command_cap']==176 and scope['process_cap']<=2048, 'Exact declared top-level operation bound')
+     start=time.monotonic();deadline=start+scope['inner_seconds']
+     need(type(scope['inner_seconds']) is int and scope['inner_seconds']>0 and scope['cleanup_seconds']==5,'Explicit finite allocation')
++    need(type(scope['controller_evidence_reserve_seconds']) is int and scope['controller_evidence_reserve_seconds']>0, 'Root controller evidence IO reserve required')
+     try:
+         out=safe(scope['output_root'],ROOT/'execution/v2.4/receipts/W13/W13-03',True);out.mkdir()
+         export=safe(scope['export_root'],ROOT/'.local',True);export.mkdir()
+@@ -97,17 +98,20 @@
+             'GOFLAGS':'-p=1 -buildvcs=false -mod=readonly','PYTHONDONTWRITEBYTECODE':'1'})
+         def run(label,argv,cwd,seconds,expected_images,ee=None,stdin=None,futures=None,context=None):
+             nonlocal stage,native,last
+-            stage=label;remaining=deadline-time.monotonic()-5
+-            need(remaining>0 and native<scope['native_top_command_cap'],'Native/time allocation exhausted')
+-            native+=1;timeout=min(seconds,remaining)
++            stage=label;remaining=deadline-time.monotonic()
++            reserve=25+scope['cleanup_seconds']+scope['controller_evidence_reserve_seconds']
++            need(remaining>reserve and native<scope['native_top_command_cap'],'Native/time allocation exhausted before process start')
++            native+=1;timeout=min(seconds,remaining-reserve)
++            helper_deadline=deadline-scope['controller_evidence_reserve_seconds']
+             req={'argv':argv,'cwd':str(cwd),'environment':ee or env,'requested_timeout':seconds,'effective_timeout':timeout,
+-                 'remaining_before_start':remaining,'future_images':futures,'future_context':context,'sequence':native}
++                 'remaining_before_start':remaining,'helper_finalization_reserve':25,'cleanup_reserve':scope['cleanup_seconds'],
++                 'controller_evidence_reserve':scope['controller_evidence_reserve_seconds'],'helper_absolute_deadline':helper_deadline,'future_images':futures,'future_context':context,'sequence':native}
+             save(out/(label+'.request.json'),req);r=None;error=None
+             try:
+                 with (out/(label+'.stdout.raw')).open('xb') as so,(out/(label+'.stderr.raw')).open('xb') as se:
+                     r=debug.run_owned(argv,str(cwd),ee or env,so,se,timeout,expected_image={k:pin(argv[0])[k] for k in ['sha256','bytes']},
+                        allowed_images=expected_images,allowed_module_files=list(ledger.members.values()),process_cap=scope['process_cap'],stdin=stdin,
+-                       future_images=futures,future_context=context)
++                       future_images=futures,future_context=context,absolute_deadline=helper_deadline)
+                     last=r
+                     if current_case is not None:
+                         current_case['native_exit']=r.get('actual_exit')
+@@ -118,7 +122,8 @@
+             finally:
+                 save(out/(label+'.invocation.json'),{'request':req,'result':r,'actual_native_exit':r.get('actual_exit') if r else None,'exception':repr(error) if error else None})
+                 for label2,fn in [('vector',lambda:ledger.check(label+'-native-after')),('runtime',lambda:save(out/(label+'.runtime.after.json'),util.module_observation(allowed,normal)))]:
+-                    try:fn()
++                    try:
++                        fn();need(time.monotonic()<=deadline,'Root inner deadline exceeded during evidence finalization')
+                     except BaseException as exc:
+                         if error is None:error=exc
+                         else:secondary.append({'stage':label+'-'+label2,'error':repr(exc),'actual_native_exit':None})
+@@ -217,10 +222,12 @@
+                 need(re.search(r'^# pass 1$',text,re.M) and re.search(r'^# fail 0$',text,re.M) and re.search(r'^# skipped 0$',text,re.M),'Node exact leaf TAP proof')
+             else:need(any(strict(line).get('status')=='PASS' for line in raw.splitlines() if line.startswith(b'{')),'Legacy program explicit PASS missing')
+             # Evaluator is a separately pinned source contract; it must inspect raw fixture/transport/renderer records.
++            state['source_assertions_passed']=True
+             evaluation=module(scope['fixture_evaluator_ref'],'desktop58_fixture_evaluator').validate_case(state,leaf if index else None,case,export,job,scope)
++            save(case/'fixture-verdict.json',evaluation)
+             need(evaluation['qualified'] is True and evaluation['source_assertions_preserved'] is True,'Fixture evidence incomplete')
+             http_total+=evaluation['HTTP'];need(http_total<=390,'Original aggregate observed HTTP cap')
+-            save(case/'fixture-verdict.json',evaluation);state.update(state='QUALIFIED',qualified=True);rows.append(dict(state))
++            state.update(state='QUALIFIED',qualified=True);rows.append(dict(state))
+             current_case=None
+             ledger.check(stage+'-fixture-after');save(case/'result.json',state)
+         need(len(rows)==170 and all(x['qualified'] for x in rows),'Finite lanes incomplete')

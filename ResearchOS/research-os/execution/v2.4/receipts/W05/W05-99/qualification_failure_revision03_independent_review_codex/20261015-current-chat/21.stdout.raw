@@ -1,0 +1,125 @@
+FILE execution\v2.4\receipts\W05\W05-99\historical_qualification_public_provenance_codex\20261015-current-chat\semantics01\02-public-bridge-structural-metadata.json
+{
+  "bridge_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\live\\current-chat-normal-desktop-first-use-20261012\\data\\runtime-dispatches\\705b11ec99044fef19e85f57e2d2b712\\bridge.json",
+    "sha256": "10b1a3bfa74132fbed965df31fd90125b90b1470556001e254af360c35451bce",
+    "bytes": 234176
+  },
+  "subject": {
+    "project_id": "a7ebcf2a322c6abcf87e043f601ee804",
+    "task_id": "0469d97b91b04fd7fdeed77770ea1bed",
+    "run_id": "f3dcb996b2e43cf52cba874be7abfc70",
+    "runtime_id": "db26746ff0420ca156d315f0de00fb53",
+    "epoch": 1
+  },
+  "artifacts": [],
+  "artifacts_count": 0,
+  "queue_required": false,
+  "manifest_queue_control_present": false,
+  "native_capabilities": [],
+  "native_identity": {
+    "pid": 69860,
+    "process_created_ns": "1792057406096619100",
+    "job": "Local\\ResearchOS.W10.1792057404322293200",
+    "appcontainer_sid": "S-1-15-2-2797586420-3256022233-2511509497-106693375-1501773781-46548057-3438755017",
+    "profile": "ResearchOS.W10.1792057404322293200",
+    "staging_directory": "C:\\Users\\yqyyds\\AppData\\Local\\Temp\\researchos-w10-staging-966532266"
+  },
+  "native_receipt_public_fields": {
+    "pid": 69860,
+    "process_created_ns": "1792057406096619100",
+    "job": "Local\\ResearchOS.W10.1792057404322293200",
+    "profile": "ResearchOS.W10.1792057404322293200",
+    "appcontainer_sid": "S-1-15-2-2797586420-3256022233-2511509497-106693375-1501773781-46548057-3438755017",
+    "executable": "C:\\Users\\yqyyds\\AppData\\Local\\Temp\\researchos-w10-staging-966532266\\input\\worker.exe",
+    "args": null,
+    "directory": null,
+    "capabilities": [],
+    "exit_code": 124,
+    "children_stopped": true,
+    "job_total_processes": 2,
+    "timed_out": true,
+    "streams_drained": true,
+    "cleanup_complete": true,
+    "output_copied": true,
+    "started_at": "2026-10-15T09:43:25.0001067Z",
+    "finished_at": "2026-10-15T09:43:32.8733359Z"
+  },
+  "raw_private_frame_or_credential_content_exported": false,
+  "semantic_acceptance": false
+}
+
+FILE internal\domain\runtime_broker_windows.go
+66: 	}
+67: 	ip := net.ParseIP(u.Hostname())
+68: 	return provider.MeasurementMode == "FIXTURE" && ip != nil && ip.IsLoopback()
+69: }
+70: 
+71: func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, frame rt.BridgeFrame) (RuntimeProviderRoute, error) {
+72: 	manifest := dispatch["manifest"].(map[string]any)
+73: 	admission := manifest["admission"].(map[string]any)
+74: 	profile := admission["profile"].(map[string]any)
+75: 	if c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil {
+76: 		return RuntimeProviderRoute{}, Fail(400, "INVALID_REQUEST", "stable effect key required")
+77: 	}
+78: 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+79: 	if e != nil {
+80: 		return RuntimeProviderRoute{}, e
+81: 	}
+82: 	if admission["qualification_bootstrap"] == true {
+83: 		if e = qualificationModelEffectAllowed(tx, route.ProjectID, task, Object{"capability": frame.Capability, "route": frame.Route}); e != nil {
+84: 			return RuntimeProviderRoute{}, e
+85: 		}
+86: 		permission := profile["model_qualification"].(map[string]any)
+87: 		if e = runtimeModelCallGate(tx, route.ProjectID, Str(run, "id"), frame.Key, permission); e != nil {
+88: 			return RuntimeProviderRoute{}, e
+89: 		}
+90: 	}
+91: 	for _, provider := range c.runtimeProviders() {
+92: 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != task["task_type"] || provider.Capability != frame.Capability || provider.MeasurementMode != admission["mode"] {
+93: 			continue
+94: 		}
+95: 		bound := false
+96: 		for _, v := range Arr(profile, "effect_routes") {
+97: 			p, ok := v.(map[string]any)
+98: 			if ok && p["id"] == provider.ID && p["capability"] == provider.Capability && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+99: 				bound = true
+100: 			}
+R2 files ['B-ARCHITECTURE.md', 'C-ARCHITECTURE.md', 'C-exact-scope.json', 'C-test-cuts.json', 'D-ARCHITECTURE.md', 'STOP-ARCHITECTURE.md']
+18: 
+19: ## F02 author, envelope and existing contracts
+20: 
+21: Create one separate MANIFEST Artifact, GENERATED, LIVE, PROJECT access, run_id=null, produced_by=current unrevoked Owner principal. Current same-SID Host metadata and Owner-root authority are checked in the private maintenance path; they do not impersonate the original executor. Envelope contains: schema/version/kind, current author ID and Owner-root public binding, observed_at, operation_id, plan_hash (defined below), historical project/task/run/runtime/epoch/dispatch identity, every evidence path/size/digest, original native artifacts list, original frame/ACK/native/cost facts, inference premises, rule version, explicit limitations and derived FAILED observation. Raw historical subject IDs/hashes are inside the envelope. Outer input_refs contains exactly the immutable profile Artifact VersionRef, source_refs=[], preventing the newly changed Run version from making the proof stale. Verify profile access is PROJECT and effective for this exact plan; a protected/stale profile is outside v1.
+22: 
+23: Do not call recoverArtifact: its author and use records belong to the old executor. Do not call serverArtifactMode: it emits OBSERVED. Do not append the new MANIFEST to old result_artifact_ids or the native output list. `run_id=null` means runtime_uploads, artifact_uses and artifact_use_proofs each have **zero** new rows. One DERIVED_FROM ImpactLink ties the new proof to profile. Contract fixtures must pass the actual immutable schema24 Artifact/ImpactLink/VersionRef schemas before Source acceptance.
+24: 
+25: ## Frozen plan and deterministic writes
+26: 
+27: Preflight allocates operation ID, proof Artifact ID, upload key, ImpactLink ID and EventEnvelope ID, a current observation timestamp and bounded expiry. PlanCore freezes native root/database identity, schema fingerprint, contracts hashes, all input/authority/body hashes, those IDs/times, expected event sequence and target subject. `plan_hash = SHA256(canonical PlanCore)`; proof embeds this hash. A FullPlan then contains PlanCore, exact proof bytes and planned output rows; its raw file digest is `plan_file_sha256`. Idempotency request_hash uses plan_file_sha256. There is no self-referential proof/full-plan hash. Current identity/time are checked at preflight and commit; changed inputs require a new reviewed plan. No materialized default Now()/ID() may silently change frozen rows at commit.
+28: 
+29: Use a new transaction-only planned writer in qualification_failure_maintenance_windows.go. It rechecks the same author, reference access, byte hash/size, unique artifact content and provenance invariants as upload+seal, inserts the planned upload, calls existing `s.put` for planned Artifact/ImpactLink/Run/ProjectState/EventEnvelope, and sets upload sealed in that transaction. Construct ImpactLink with existing semantics (validate both versions; ACTIVE/DERIVED_FROM/DETERMINISTIC/evidence_refs=[]). Use a planned event helper with the exact semantics of store.go:event, but explicit IDs/timestamp and no internal commit. This avoids reusing random-ID helpers or adding a broad clock injection. Schema validation and `s.put` still enforce all ordinary entity/revision/reference invariants. No raw generic SQL endpoint or blanket helper bypass is added.
+30: 
+31: The exact C v1 subject must already have old result_artifact_ids matching its original native output manifest byte-for-byte, or both must be empty. A historical unimported output requires a separately expanded scope; this package does not import REPORT outputs as an incidental repair. Preserve checkpoint pointer and validate any existing pointer; no new checkpoint.
+32: 
+33: The schema24 transaction uses one existing DB connection and one transaction with a proven SQLite write reservation. Revalidate full schema and before census, all CAS subjects, current Owner/Host/root and immutable evidence. No constructor that calls store.Open migrations, Service.New/NewCurrentMu, Host.New bootstrap, provider/vault/coordinator or listeners is allowed. New store helper opens existing `mode=rw`, refuses absent DB/URI aliases, validates WAL/FULL/foreign-key settings on this maintenance connection and exact schema fingerprint (sqlite_master tables, indexes, triggers/views + migration rows + contracts hashes), and takes the reservation before CAS. Source must prove its transaction primitive is compatible with the tx-aware domain writers; no nested BEGIN/implicit helper transaction.
+38: 
+39: | Table | Exact rows/fields allowed |
+40: |---|---|
+41: | domain_objects | UPDATE current Run and current ProjectState only; INSERT one Artifact, one ImpactLink, one EventEnvelope. No old object delete. |
+42: | domain_versions | INSERT exactly five versions: Run r+1, ProjectState p+1, Artifact1, ImpactLink1, EventEnvelope1. Old versions byte-identical. |
+43: | domain_refs | INSERT precisely the references generated by these five frozen bodies; enumerate project/kind/id/revision/field/target tuple in FullPlan. No old ref changes. |
+44: | uploaded_content | INSERT one planned upload key, current Owner principal, exact proof bytes/content_hash/size-derived body, frozen expires_at; sealed final1. No old content changes. |
+45: | runtime_observations | INSERT one (project,run,epoch,receipt_hash=Hash(derived observation)) with exact canonical body and frozen observed_at. |
+46: | runtime_dispatches | UPDATE exactly (project,run,epoch): state OBSERVED, observation_sequence=max(original bridge sequence,stored observation_sequence)+1, observation_hash, updated_at and a deterministic reconstruction reason. Identity/manifest/manifest_hash/dispatch_key/worker/locator/prepared_at unchanged. |
+47: | outbox | INSERT one (project,sequence,id), body identical to new EventEnvelope, acknowledged0. No old acknowledgement edits. |
+48: | event_state_snapshots | INSERT one (project,event_id,revision=ProjectState p+1,body=exact updated ProjectState). |
+49: | idempotency | INSERT one (principal=currentOwner,project,operation=`host:qualification-failure-maintenance`,key=operationID), request_hash=plan_file_sha256,status200,headers={},created_at=frozen time, body={schema,operation_id,plan_hash,plan_file_sha256,subject,proof_ref,observation_hash,terminal_run_ref,outcome_hash}. |
+50: | runtime_uploads / artifact_uses / artifact_use_proofs | ZERO rows: current maintenance proof has run_id=null. |
+96:   "verifier_binding_supplement_sha256": "29872605ae6a972dbcbbfaf77b675859b4f8c975ee270b9ae974ae38ed36c558",
+97:   "verdict": "B_AND_D_DESIGN_DIRECTION_ACCEPTABLE_C_ADDENDUM_REQUIRED_F01_NOT_PROVABLE_STOP_ACTUAL_UNAVAILABLE",
+98:   "b_design": "Firstgate exact typed construction, dispatchGate write serialization, admission-close/all-goroutine completion+drain/heartbeat join and private persisted validator correctly address F06. Requires real source+fixtures; historicalgeneric503 remains UNKNOWN.",
+99:   "c_design": "F02/F03 authorship and exact five-version single-transaction design resolved at architecture level. F04 concrete all-entry/lease gap persists. Actual C blocked by F01 and STOP.",
+100:   "d_design": "F05 exact binding reuse, all three runtime-only lookups, per-grant original subject, atomic schema24 intent/index lineage and unchanged NoProgress/budget ancestry correctly specified. D-addendum01 supersedes fixture-stub dependency and fake JS paths; accepted real B mandatory.",
+101:   "stop_design": "No console/PID/tree fallback; exact retained handles and explicit zero-row BEGIN IMMEDIATE/query_only reservation are coherent conditional architecture. Native fixture query_only lock preservation remains required. Originalverifier actual proof and concrete approval anchor unresolved.",
+102:   "previous_findings": {
+103:     "F01": "PARTIALLY_ADDRESSED_IDENTITY_BOUND_FULL_SEMANTICS_NOT_PROVABLE",

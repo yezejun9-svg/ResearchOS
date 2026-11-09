@@ -1,0 +1,78 @@
+{
+  "schema": "researchos.w05.normal-model-configuration-ui-repair-v2-independent-review/1",
+  "reviewer": "/root/runtime_identity_boundary",
+  "reviewer_role": "Independent source and development-component reviewer; no participation in candidate implementation",
+  "decision": "REQUEST_CHANGES",
+  "candidate": "9602f61c05325fc9bd1b523398a8f9721eded72e",
+  "initial_candidate": "c12847d7ee7b37a15d875929738fe84fd7ba6964",
+  "base": "292ad860f9e76cf2795d5a3010da1d114d01ff56",
+  "frozen_author_manifest": "normal_model_configuration_ui_repair_v2_codex/20261012-current-chat/receipt_manifest.json",
+  "frozen_author_manifest_sha256": "48673f91653c39a273d9a3dfe7a93c3180271ea245fee413c16d711ac9453dcb",
+  "scope": "Source and development-component only; actual Chromium DOM, real candidate IPC, source-bound Go validator and synthetic loopback HTTP",
+  "model_calls": 0,
+  "external_calls": 0,
+  "formal_acceptance_delta": 0,
+  "parent_acceptance_delta": 0,
+  "normal_electron_core_acceptance": "NOT_RUN",
+  "findings": [
+    {
+      "id": "W05-UI-V2-001",
+      "priority": "P1",
+      "file": "apps/web/src/workbench.jsx",
+      "line_start": 71,
+      "line_end": 77,
+      "related_lines": [28, 30, 51, 55, 56, 63, 95, 99],
+      "title": "A completion received by the unmounted component leaves the new component offering a new write as the same-command replay",
+      "trigger": "Submit a valid model configuration; while the real HTTP request is in flight, navigate away and remount NativeModelConfiguration. The new instance snapshots the shared pending payload. Then let the original HTTP request complete.",
+      "observed": "The old instance clears modelConfigurationPending after COMPLETED or STALE_RESPONSE. The new instance still has the old non-null pendingPayload ref and disabled form, because the shared Map does not notify it. The screen shows host revision 1 but still offers Continue Same Configuration. Clicking it sees remembered undefined at line 51, reads the current host revision and submits a new command ID at revision 2.",
+      "raw_evidence": {
+        "first_command_id": "review-3-host.configure",
+        "first_config_revision": 1,
+        "second_command_id": "review-6-host.configure",
+        "second_config_revision": 2,
+        "http_configuration_requests": 2,
+        "evidence_files": ["reviewer-dom-results.json", "inflight-remount-before-repeat.dom.html", "inflight-remount-completion-stale-pending.dom.html", "raw-http/inflight-remount-completion-stale-pending", "dom-attempt1.stdout", "dom-attempt1.invocation.json"]
+      },
+      "impact": "Ordinary navigation during a slow save defeats the promised same-command recovery: an already completed configuration is written again under a new command identity and revision when the user explicitly requests continuation. It also leaves a stale locked form until that unintended extra write.",
+      "requested_change": "Make the pending command owner and its terminal transition observable across component lifetimes. A new component must reconcile completion/removal with its displayed pending state; a continue action must never fall through to constructing a new command when its original pending command has already completed. Preserve the original envelope for genuinely pending operations, and add this in-flight navigation/completion counterexample without weakening the shell barrier or accepting caller-supplied status."
+    }
+  ],
+  "original_findings": [
+    {"id": "W05-UI-001", "status": "REPAIRED_IN_TESTED_PATHS", "evidence": "Actual DOM whitespace correction succeeds; IPC source-bound invalid request is NOT_SENT and a corrected payload completes."},
+    {"id": "W05-UI-002", "status": "REPAIRED_FOR_ALREADY_ACKNOWLEDGED_REMOUNT_WITH_REMAINING_ASYNC_GAP", "evidence": "ACK followed by remount retains the original full envelope and command_id; completion arriving after remount has new finding W05-UI-V2-001."}
+  ],
+  "verified_boundaries": [
+    "Author manifest and current source/build input verification: 7432/7432, including 972 author receipt entries, validator inputs, binary, module inventory and all seven Git-delta files.",
+    "Trusted transport emits NOT_SENT from local pre-POST failure only. After post() is entered it never copies a remote dispatch_state to the IPC control field.",
+    "Independent synthetic remote dispatch_state=NOT_SENT is rejected as INVALID_RESPONSE_SCHEMA; the possibly-sent write barrier remains and a changed payload receives COMMAND_PENDING with zero additional HTTP requests.",
+    "ACK and uncertain-send lifetimes survive later local preflight refusal and credential unavailability. Full original envelope and command_id are reused for a legitimate replay.",
+    "Selected project without a session uses all-null initial scope; active session preserves project/session/CAS/writer epoch; missing writer is refused before HTTP.",
+    "Actual DOM project A ACK, switch to B and submit another payload: no B configure reaches HTTP and B remains editable. Return to A replays the original envelope and completes.",
+    "The renderer cache is in-memory and contains the five public ConfigurePayload fields and corresponding form fields; no bearer, credential value or host secret is read into it. IPC retained headers omit Authorization."
+  ],
+  "validation": {
+    "independent_boundary_run": "14/15 passed; one stale test expectation retained as failure",
+    "boundary_failure": "prebuilder/partial-scope expects a selected project with no session to be rejected; current intentional initial-configuration path normalizes this state to all-null and completes. This test now contradicts model-config/selected-project-first-use. Update the test to exercise a genuinely partial active-session tuple; do not change the legitimate all-null behavior to make it pass.",
+    "independent_actual_dom": "Three positive flows passed; one additional P1 counterexample reproduced with exact HTTP identities. No page errors.",
+    "independent_remote_flag": "PASS: remote NOT_SENT cannot release barrier",
+    "normal_electron_startup_and_real_core": "NOT_RUN",
+    "live_provider_or_model": "NOT_RUN"
+  },
+  "existing_limitations_not_new_v2_findings": [
+    {
+      "name": "Host namespace is not bound to the pending lifetime",
+      "source": "ipc.js:67-72 uses only the sessionState object for lifetime namespace; ipc.js:105 sends the retained request to the latest discovery URL. The new UI Map uses projectId only.",
+      "observed": "Independent synthetic test obtains ACK from host A, changes discovery to host B with different host_instance_id/data_dir while retaining sessionState, then repeats the payload: the identical original envelope reaches B and completes. This shell behavior predates this v2 repair and is reported as an existing integration limitation, not as a newly introduced regression.",
+      "scope_limit": "Synthetic dependency-boundary reproduction only; no actual native bootstrap, user data directory switch or Electron host replacement was performed.",
+      "evidence": ["reviewer-extra-results.json", "extra-http/host-change", "extra.stdout"]
+    },
+    {"name": "Whole renderer restart", "status": "Declared limitation accepted as scope disclosure; no shell pending query/recovery API exists. Same-renderer component remount remains in scope and is the subject of the P1."}
+  ],
+  "test_history": [
+    "The independent boundary run exited 1 because the existing partial-scope assertion contradicted the new initial-configuration normalization; all raw output and the failure are retained. No rerun relabeled it PASS.",
+    "The independent actual-DOM run exited 0 because its assertions prove both positive boundaries and the new negative counterexample; exit 0 does not mean candidate acceptance.",
+    "The extra real-IPC/source-bound-validator run exited 0, proving remote-flag refusal and observing the inherited host-namespace limitation."
+  ],
+  "write_scope": "Only this independent review receipt directory. Candidate, Main product source, Canon, frozen contracts and parameters were not edited.",
+  "cleanup": "Review scripts, source snapshots, raw captures and Vite cache are retained as sealed evidence. No deletion of any previously policy-blocked cache was attempted."
+}

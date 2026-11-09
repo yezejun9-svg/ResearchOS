@@ -1,0 +1,178 @@
+--- T7/internal/domain/native_migration_authority_harness_windows_test.go
++++ candidate-root/internal/domain/native_migration_authority_harness_windows_test.go
+@@ -323,13 +323,19 @@
+ func nativeHarnessBroker(t *testing.T, ctx context.Context, cfg nativeMigrationHarnessConfig, name string,
+ 	program recoveryauthority.RawPin, arguments []string, input string) (nativeMigrationHarnessBrokerResult, []byte, []byte) {
+ 	t.Helper()
++	publicEnvironment, err := nativeHarnessBrokerPublicEnvironment(
++		os.Getenv("RESEARCHOS_NATIVE_MIGRATION_HARNESS_TEMP_ROOT"),
++		map[string]string{"SystemRoot": os.Getenv("SystemRoot"), "WINDIR": os.Getenv("WINDIR"), "TEMP": os.Getenv("TEMP"), "TMP": os.Getenv("TMP")})
++	if err != nil {
++		t.Fatal(err)
++	}
+ 	for _, pin := range []recoveryauthority.RawPin{cfg.PythonProgram, cfg.BrokerSource, cfg.PrivateStdinHelper, program} {
+ 		nativeHarnessRequirePin(t, pin)
+ 	}
+ 	output := filepath.Join(cfg.OutputDirectory, name)
+ 	request := nativeMigrationHarnessBrokerRequest{Schema: "researchos.synthetic-native-broker.v1",
+ 		Program: program, Arguments: arguments, CWD: cfg.BuildRoot,
+-		Environment:     map[string]string{"SystemRoot": os.Getenv("SystemRoot"), "WINDIR": os.Getenv("WINDIR")},
++		Environment:     publicEnvironment,
+ 		OutputDirectory: output, TimeoutSeconds: 180, PrivateStdinHelper: cfg.PrivateStdinHelper}
+ 	requestPath := filepath.Join(cfg.OutputDirectory, name+".request.json")
+ 	nativeHarnessWrite(t, requestPath, request)
+@@ -345,7 +351,7 @@
+ 	defer stderr.Close()
+ 	command := exec.CommandContext(ctx, cfg.PythonProgram.Path, "-I", "-S", "-B", "-X", "utf8", cfg.BrokerSource.Path, requestPath)
+ 	command.Dir = cfg.BuildRoot
+-	command.Env = []string{"SystemRoot=" + os.Getenv("SystemRoot"), "WINDIR=" + os.Getenv("WINDIR")}
++	command.Env = []string{"SystemRoot=" + publicEnvironment["SystemRoot"], "WINDIR=" + publicEnvironment["WINDIR"], "TEMP=" + publicEnvironment["TEMP"], "TMP=" + publicEnvironment["TMP"]}
+ 	// os/exec creates an anonymous input pipe for this non-file Reader and
+ 	// closes its writer after copying. Only the reviewed broker receives it.
+ 	// This broker inherits Root's outer owned Job; no breakaway is requested.
+@@ -717,3 +723,145 @@
+ 		"before_schema_sha256": beforeSchema, "after_schema_sha256": afterSchema, "expected_rejection": expectedError,
+ 		"inner_native_job_id_independently_observed": false, "fixture_retained_until_root_release": true})
+ }
++
++
++// Root supplies this public proof root only to the fixed harness process.
++// It is never forwarded to the broker or any native child.
++func nativeHarnessBrokerPublicEnvironment(proofRoot string, environment map[string]string) (map[string]string, error) {
++	if len(environment) != 4 {
++		return nil, fmt.Errorf("synthetic native broker public environment must contain exactly four keys")
++	}
++	resolve := func(name, path string) (string, error) {
++		if strings.TrimSpace(path) == "" || !filepath.IsAbs(path) {
++			return "", fmt.Errorf("synthetic native broker %s must be an absolute directory", name)
++		}
++		info, err := os.Stat(path)
++		if err != nil || !info.IsDir() {
++			return "", fmt.Errorf("synthetic native broker %s directory unavailable", name)
++		}
++		resolved, err := filepath.EvalSymlinks(path)
++		if err != nil || !filepath.IsAbs(resolved) {
++			return "", fmt.Errorf("synthetic native broker %s physical directory unavailable", name)
++		}
++		return filepath.Clean(resolved), nil
++	}
++	root, err := resolve("proof root", proofRoot)
++	if err != nil {
++		return nil, err
++	}
++	physical := make(map[string]string, 4)
++	for _, name := range []string{"SystemRoot", "WINDIR", "TEMP", "TMP"} {
++		path, ok := environment[name]
++		if !ok {
++			return nil, fmt.Errorf("synthetic native broker public environment key unavailable")
++		}
++		physical[name], err = resolve(name, path)
++		if err != nil {
++			return nil, err
++		}
++	}
++	for _, name := range []string{"SystemRoot", "WINDIR"} {
++		if nativeHarnessTempWithin(root, physical[name]) || nativeHarnessTempWithin(physical[name], root) {
++			return nil, fmt.Errorf("synthetic native broker proof root overlaps a system directory")
++		}
++	}
++	for _, name := range []string{"TEMP", "TMP"} {
++		if !nativeHarnessTempWithin(proofRoot, environment[name]) || !nativeHarnessTempWithin(root, physical[name]) {
++			return nil, fmt.Errorf("synthetic native broker %s escapes the isolated proof root", name)
++		}
++	}
++	return map[string]string{
++		"SystemRoot": environment["SystemRoot"], "WINDIR": environment["WINDIR"],
++		"TEMP": environment["TEMP"], "TMP": environment["TMP"],
++	}, nil
++}
++
++// Windows comparisons apply to the original and EvalSymlinks-resolved paths.
++func nativeHarnessTempWithin(root, path string) bool {
++	relative, err := filepath.Rel(strings.ToLower(filepath.Clean(root)), strings.ToLower(filepath.Clean(path)))
++	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
++}
++
++// Synthetic local filesystem/env fixtures only; no native migration authority.
++func TestNativeHarnessBrokerIsolatedTempEnvironment(t *testing.T) {
++	proof, outside, system := t.TempDir(), t.TempDir(), t.TempDir()
++	temp, tmp := filepath.Join(proof, "temp"), filepath.Join(proof, "tmp")
++	for _, path := range []string{temp, tmp} {
++		if err := os.Mkdir(path, 0700); err != nil {
++			t.Fatal(err)
++		}
++	}
++	file := filepath.Join(proof, "not-directory")
++	if err := os.WriteFile(file, []byte("synthetic fixture"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	base := map[string]string{"SystemRoot": system, "WINDIR": system, "TEMP": temp, "TMP": tmp}
++	cases := []struct {
++		name, proof, key, value string
++		valid                  bool
++	}{
++		{"local-temp-allowed", proof, "", "", true},
++		{"case-normalized-root", strings.ToUpper(proof), "", "", true},
++		{"empty-proof", "", "", "", false},
++		{"relative-proof", ".", "", "", false},
++		{"missing-proof", filepath.Join(proof, "missing"), "", "", false},
++		{"empty-temp", proof, "TEMP", "", false},
++		{"empty-tmp", proof, "TMP", "", false},
++		{"relative-temp", proof, "TEMP", "temp", false},
++		{"relative-tmp", proof, "TMP", "tmp", false},
++		{"missing-temp", proof, "TEMP", filepath.Join(proof, "missing"), false},
++		{"file-as-temp", proof, "TEMP", file, false},
++		{"temp-outside-proof", proof, "TEMP", outside, false},
++		{"tmp-different-root", proof, "TMP", outside, false},
++		{"proof-is-system-directory", system, "", "", false},
++		{"proof-contains-system-directory", filepath.Dir(system), "", "", false},
++		{"empty-system-root", proof, "SystemRoot", "", false},
++		{"empty-windir", proof, "WINDIR", "", false},
++		{"unexpected-environment-key", proof, "RESEARCHOS_NATIVE_MIGRATION_HARNESS_TEMP_ROOT", proof, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			env := map[string]string{"SystemRoot": base["SystemRoot"], "WINDIR": base["WINDIR"], "TEMP": base["TEMP"], "TMP": base["TMP"]}
++			if tc.key != "" {
++				env[tc.key] = tc.value
++			}
++			actual, err := nativeHarnessBrokerPublicEnvironment(tc.proof, env)
++			if !tc.valid {
++				if err == nil || actual != nil {
++					t.Fatal("invalid isolated public environment was accepted")
++				}
++				return
++			}
++			if err != nil || !reflect.DeepEqual(actual, base) {
++				t.Fatal("valid isolated public environment changed or was rejected", err)
++			}
++		})
++	}
++}
++
++// Pure path-boundary comparisons are synthetic; these do not create a junction
++// or claim actual reparse-point execution. The env helper always EvalSymlinks.
++func TestNativeHarnessBrokerTempBoundaryComparison(t *testing.T) {
++	cases := []struct {
++		name, root, path string
++		inside           bool
++	}{
++		{"same-directory", "D:/isolated", "D:/isolated", true},
++		{"child-directory", "D:/isolated", "D:/isolated/temp", true},
++		{"windows-case", "D:/Isolated", "d:/isolated/TEMP", true},
++		{"prefix-sibling", "D:/isolated", "D:/isolated-escape/temp", false},
++		{"parent-escape", "D:/isolated", "D:/isolated/../outside", false},
++		{"resolved-alias-escape", "D:/isolated", "D:/outside", false},
++		{"different-volume", "D:/isolated", "C:/temp", false},
++		{"system-outside-proof", "D:/isolated", "C:/Windows", false},
++		{"system-contains-root", "C:/Windows", "C:/Windows/temp", true},
++		{"root-contains-system", "C:/", "C:/Windows", true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if actual := nativeHarnessTempWithin(tc.root, tc.path); actual != tc.inside {
++				t.Fatal("Windows physical path boundary comparison differs", tc.name)
++			}
++		})
++	}
++}

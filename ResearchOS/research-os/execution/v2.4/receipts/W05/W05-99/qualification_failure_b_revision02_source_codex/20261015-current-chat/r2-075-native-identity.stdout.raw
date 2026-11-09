@@ -1,0 +1,96 @@
+45: 	Version                  string          `json:"version"`
+46: 	PauseID                  string          `json:"pause_id"`
+47: 	Binding                  json.RawMessage `json:"binding"`
+48: 	Sequence                 int64           `json:"checkpoint_sequence"`
+49: 	ContentHash              string          `json:"content_hash"`
+50: 	CheckpointArtifactID     string          `json:"checkpoint_artifact_id"`
+51: 	CheckpointUseReceiptHash string          `json:"checkpoint_use_receipt_hash"`
+52: 	JournalCheckpointHash    string          `json:"journal_checkpoint_hash"`
+53: }
+54: 
+55: type BridgeFrame struct {
+56: 	Sequence   int64           `json:"sequence"`
+57: 	Type       string          `json:"type"`
+58: 	Key        string          `json:"key,omitempty"`
+59: 	Route      string          `json:"route,omitempty"`
+60: 	Capability string          `json:"capability,omitempty"`
+61: 	Payload    json.RawMessage `json:"payload,omitempty"`
+62: 	Path       string          `json:"path,omitempty"`
+63: }
+64: 
+65: type BridgeRequest struct {
+66: 	WorkerID     string
+67: 	Manifest     json.RawMessage
+68: 	ManifestHash string
+69: 	Executable   string
+70: 	// Only explicit immutable inputs cross into the task sandbox. Credentials,
+71: 	// authority paths and the host manifest never enter this map.
+72: 	Inputs       map[string][]byte
+73: 	BeforeResume func(sandbox.Identity) error
+74: }
+75: 
+76: type BridgeJournal struct {
+77: 	PauseProtocol      string           `json:"pause_protocol,omitempty"`
+78: 	PauseRequested     bool             `json:"pause_requested,omitempty"`
+79: 	PauseID            string           `json:"pause_id,omitempty"`
+80: 	QueueBinding       json.RawMessage  `json:"queue_binding,omitempty"`
+81: 	Checkpoint         *PauseCheckpoint `json:"checkpoint,omitempty"`
+82: 	CheckpointSeal     *CheckpointSeal  `json:"checkpoint_seal,omitempty"`
+83: 	Version            int              `json:"version"`
+84: 	Manifest           json.RawMessage  `json:"manifest"`
+85: 	ManifestHash       string           `json:"manifest_hash"`
+86: 	DispatchKey        string           `json:"dispatch_key"`
+87: 	Worker             string           `json:"worker"`
+88: 	Revision           string           `json:"adapter_revision"`
+89: 	Identity           sandbox.Identity `json:"identity"`
+90: 	State              string           `json:"state"`
+91: 	Reason             string           `json:"reason"`
+92: 	Started            string           `json:"started"`
+93: 	Ended              string           `json:"ended"`
+94: 	Sequence           int64            `json:"observation_sequence"`
+95: 	Frames             int64            `json:"frames"`
+96: 	Acknowledged       int64            `json:"acknowledged"`
+97: 	ContextReady       bool             `json:"context_ready"`
+98: 	CheckpointSequence int64            `json:"checkpoint_sequence"`
+99: 	Paused             bool             `json:"paused"`
+100: 	InputHash          string           `json:"input_hash"`
+101: 	ProtocolComplete   bool             `json:"protocol_complete"`
+102: 	Cancelled          bool             `json:"cancelled"`
+103: 	Receipt            sandbox.Receipt  `json:"sandbox_receipt"`
+104: 	Artifacts          []Artifact       `json:"artifacts"`
+105: 	StdoutHash         string           `json:"stdout_hash"`
+106: 	StderrHash         string           `json:"stderr_hash"`
+107: 	QueueRequired      bool             `json:"queue_required"`
+108: 	QueueSealed        bool             `json:"queue_sealed"`
+109: 	QueueAbortObserved bool             `json:"queue_abort_observed"`
+110: 	QueueCancelIdle    bool             `json:"queue_cancel_idle"`
+111: 	QueueIdle          bool             `json:"queue_idle"`
+112: 	QueueInitSequence  int64            `json:"queue_init_sequence"`
+113: 	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
+114: }
+115: 
+116: type Bridge struct {
+117: 	mu                                        sync.Mutex
+118: 	directory                                 string
+119: 	lock                                      *os.File
+120: 	process                                   *sandbox.Process
+121: 	cancel                                    context.CancelFunc
+122: 	journal                                   BridgeJournal
+123: 	frames                                    chan BridgeFrame
+124: 	done                                      chan struct{}
+125: 	deadline                                  time.Time
+126: 	wallDeadline                              time.Time
+127: 	pending                                   []byte
+128: 	stdout, stderr                            *os.File
+129: 	streamOffsets                             map[string]int64
+130: 	err                                       error
+131: 	writeMu                                   sync.Mutex
+132: 	modelInitDelivered                        bool
+133: 	modelStreams                              []*ModelStream
+134: 	modelObservations                         chan ModelStreamObservation
+135: 	modelChanged                              chan struct{}
+136: 	modelDataRecords, modelObservationRecords int
+137: }
+138: 
+139: func bridgeMap(raw []byte) (map[string]any, error) {
+140: 	d := json.NewDecoder(bytes.NewReader(raw))

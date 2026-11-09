@@ -1,0 +1,132 @@
+def _database(raw, identity):
+    # Only a Root-materialized complete, quiescent SQLite snapshot is supported.
+    if type(raw) is not bytes or not raw.startswith((b'SQLite format 3' + bytes((0,)))):
+        raise ValueError('OPEN_COMPLETE_SQLITE_ORIGINAL')
+    import sqlite3
+    db = sqlite3.connect(':memory:')
+    try:
+        db.deserialize(raw)
+        db.execute('PRAGMA query_only=ON')
+        result = {}
+        for kind, key, output_key in (('Task', 'task_id', 'Task'), ('Run', 'run_id', 'TaskRun')):
+            rows = db.execute('SELECT revision,content_hash,body FROM domain_objects WHERE project=? AND kind=? AND id=?',
+                              (identity['project_id'], kind, identity[key])).fetchall()
+            if len(rows) != 1:
+                raise ValueError('OPEN_DATABASE_CURRENT_IDENTITY')
+            result[output_key] = _database_row(kind, *rows[0], identity, identity[key])
+        artifact_ids = result['TaskRun']['result_artifact_ids']
+        if len(set(artifact_ids)) != len(artifact_ids):
+            raise ValueError('OPEN_DUPLICATE_RESULT_ARTIFACT')
+        result['Artifacts'] = {}
+        for artifact_id in artifact_ids:
+            rows = db.execute('SELECT revision,content_hash,body FROM domain_objects WHERE project=? AND kind=\'Artifact\' AND id=?',
+                              (identity['project_id'], artifact_id)).fetchall()
+            if len(rows) != 1:
+                raise ValueError('OPEN_DATABASE_CURRENT_ARTIFACT')
+            result['Artifacts'][artifact_id] = _database_row('Artifact', *rows[0], identity, artifact_id)
+        result['acceptance_count'] = db.execute(
+            "SELECT count(*) FROM domain_objects WHERE project=? AND kind='AcceptanceReceipt' AND json_extract(body,'$.task_id')=?",
+            (identity['project_id'], identity['task_id'])).fetchone()[0]
+        return result
+    finally:
+        db.close()
+
+
+def _jsonl(raw, identity):
+    lines = raw.decode('utf-8').splitlines()
+    if not lines or any(not line.strip() for line in lines):
+        raise ValueError('OPEN_COMPLETE_JSONL')
+    frames = [_json_original(line) for line in lines]
+    events, finals, event_ids = [], [], set()
+    for ordinal, frame in enumerate(frames):
+        if type(frame) is not dict:
+            raise ValueError('OPEN_JSONL_OBJECT')
+        if frame.get('type') == 'session.event':
+            if finals:
+                raise ValueError('OPEN_EVENT_AFTER_FINAL')
+            event = frame.get('event')
+            _event_schema(event)
+            if event['session_id'] != identity['session_id'] or event['core_build_id'] != identity['core_build_id']:
+                raise ValueError('OPEN_EVENT_IDENTITY')
+            if event['event_id'] in event_ids:
+                raise ValueError('OPEN_DUPLICATE_EVENT_ID')
+            event_ids.add(event['event_id'])
+            if events and event['sequence'] != events[-1]['sequence'] + 1:
+                raise ValueError('OPEN_EVENT_GAP')
+            if event['run_id'] not in (None, identity['run_id']):
+                raise ValueError('OPEN_FOREIGN_RUN_EVENT')
+            if event['kind'] == 'RUN_STATE' and event['payload']['run_id'] != event['run_id']:
+                raise ValueError('OPEN_RUN_STATE_EVENT_RUN')
+            if event['kind'] == 'GOAL_STATE' and event['payload']['goal_id'] != identity['goal_id']:
+                raise ValueError('OPEN_GOAL_STATE_EVENT_GOAL')
+            events.append(event)
+        elif frame.get('type') == 'session.snapshot':
+            raise ValueError('OPEN_EVENT_RESYNC_OR_SNAPSHOT')
+        else:
+            if ordinal != len(frames)-1 or finals or type(frame.get('execution')) is not dict:
+                raise ValueError('OPEN_SINGLE_FINAL_REQUIRED')
+            finals.append(frame['execution'])
+    if not events or len(finals) != 1:
+        raise ValueError('OPEN_ORIGINAL_EVENT_STREAM')
+    final = finals[0]
+    for key in ('project_id', 'session_id', 'goal_id', 'task_id', 'run_id'):
+        if final.get(key) != identity[key]:
+            raise ValueError('OPEN_FINAL_IDENTITY')
+    _integer(final.get('event_sequence'), 'final event sequence')
+    if final['event_sequence'] != events[-1]['sequence'] or final.get('independent_acceptance') != 'NOT_EVALUATED':
+        raise ValueError('OPEN_FINAL_CURSOR_ACCEPTANCE')
+    _native_exit(final.get('exit_code'), 'actual CLI exit')
+    return events, final
+
+
+def verify_refusal(doc, raw, context, row):
+    identity = row['product_identity']
+    expected = {'run_id': context['run_id'], 'task_id': identity['task_id'],
+                'lane': row['lane'], 'assertion_id': row['id'],
+                'negative_condition': row['expected'], 'product_identity': identity}
+    issuance, _ = _original(doc, raw, context.get('root_grant_issuance_ref'))
+    if issuance.get('schema') != 'researchos.w05.original-root-grant-issuance.v2' or issuance.get('actor_id') != 'codex:/root' or issuance.get('run_id') != context['run_id'] or issuance.get('grant_ref') != context['root_grant_ref']:
+        raise ValueError('OPEN_NEGATIVE_ROOT_ISSUANCE')
+    scope_refs = _nonempty(issuance.get('negative_scope_refs'), 'Root negative scope refs', list)
+    if any(type(ref) is not dict or set(ref) != {'path', 'sha256'} for ref in scope_refs) or len({ref['path'] for ref in scope_refs}) != len(scope_refs):
+        raise ValueError('OPEN_NEGATIVE_ROOT_SCOPE_REFS')
+    original_result = issuance.get('original_result')
+    if type(original_result) is not dict or type(original_result.get('exit_code')) is not int or original_result['exit_code'] != 0 or type(original_result.get('output')) is not str:
+        raise ValueError('OPEN_NEGATIVE_ROOT_ISSUANCE_RESULT')
+    observed = [_json_original(line) for line in original_result['output'].splitlines() if line.startswith('{')]
+    if len(observed) != 1 or type(observed[0]) is not dict or observed[0].get('grant_ref') != context['root_grant_ref'] or observed[0].get('negative_scope_refs') != scope_refs:
+        raise ValueError('OPEN_NEGATIVE_ROOT_ORIGINAL_SCOPE_BINDING')
+    for reference in _nonempty(row.get('refusal_evidence_refs'), 'actual refusal refs', list):
+        refusal, _ = _original(doc, raw, reference)
+        if refusal.get('schema') != 'researchos.w05.actual-refusal.v2' or refusal.get('rejected') is not True or any(refusal.get(key) != expected[key] for key in ('assertion_id', 'run_id', 'lane', 'task_id', 'negative_condition')):
+            raise ValueError('OPEN_ACTUAL_REFUSAL_IDENTITY')
+        if refusal.get('invocation_ref') != row['negative_invocation_ref']:
+            raise ValueError('OPEN_FROZEN_NEGATIVE_BINDING')
+        invocation, _ = _original(doc, raw, refusal['invocation_ref'])
+        if invocation.get('schema') != 'researchos.w05.negative-invocation.v3' or any(invocation.get(key) != value for key, value in expected.items()) or invocation.get('root_grant_ref') != context['root_grant_ref']:
+            raise ValueError('OPEN_NEGATIVE_INVOCATION_IDENTITY')
+        if invocation.get('scope_ref') not in scope_refs:
+            raise ValueError('OPEN_NEGATIVE_SCOPE_NOT_ROOT_ISSUED')
+        scope, _ = _original(doc, raw, invocation['scope_ref'])
+        if scope.get('schema') != 'researchos.w05.a04-negative-scope.v3' or any(scope.get(key) != value for key, value in expected.items()) or scope.get('root_grant_ref') != context['root_grant_ref'] or invocation.get('scope') != scope:
+            raise ValueError('OPEN_NEGATIVE_SCOPE_IDENTITY')
+        for key in ('argv', 'cwd', 'env_names', 'initial_tool_input', 'producer_ref'):
+            if key not in scope or invocation.get(key) != scope[key]:
+                raise ValueError('OPEN_NEGATIVE_SCOPE_ABI')
+        _nonempty(invocation['argv'], 'negative argv', list)
+        _nonempty(invocation['cwd'], 'negative cwd')
+        if invocation['cwd'] != context['worktree'] or type(invocation['env_names']) is not list or any(type(v) is not str or not v for v in invocation['env_names']):
+            raise ValueError('OPEN_NEGATIVE_CURRENT_WORKTREE')
+        _native_exit(invocation.get('native_exit'), 'refusal native exit')
+        pair, _ = _original(doc, raw, invocation['root_tool_pair_ref'])
+        closed = _root_pair(pair, scope)
+        if closed['actual_launcher_native_exit'] != invocation['native_exit'] or invocation['native_exit'] == 0:
+            raise ValueError('OPEN_REFUSAL_ACTUAL_NONZERO')
+        response, _ = _original(doc, raw, refusal['original_response_ref'])
+        if response.get('schema') != 'researchos.w05.original-negative-response.v3' or any(response.get(key) != value for key, value in expected.items()) or response.get('scope_ref') != invocation['scope_ref'] or response.get('status') not in ('REJECTED', 'BLOCKED', 'DENIED'):
+            raise ValueError('OPEN_ORIGINAL_REFUSAL_RESPONSE')
+        # These fields must occur in the Root-observed terminal stdout itself.
+        # The response/scope precede the pair and invocation; no backward hash cycle.
+        if closed.get('negative_identity') != expected or closed.get('negative_scope_ref') != invocation['scope_ref'] or closed.get('actual_refusal_response') != response:
+            raise ValueError('OPEN_REFUSAL_NOT_FROM_ORIGINAL_TERMINAL')
+

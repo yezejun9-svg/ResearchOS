@@ -1,0 +1,82 @@
+--- v3/candidate-root/internal/domain/prepared_run_abandonment_windows_test.go
++++ v4/candidate-root/internal/domain/prepared_run_abandonment_windows_test.go
+@@ -59,15 +59,48 @@
+ }
+ 
+ 
+-func preparedChangeManifest(t *testing.T, r *runtimeFixture, e *PreparedRunAbandonmentEvidence, change func(Object)) {
+-    t.Helper()
+-    var raw string
+-    if err:=r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?",e.ProjectID,e.RunID,e.Epoch).Scan(&raw);err!=nil{t.Fatal(err)}
+-    manifest,err:=Decode([]byte(raw))
+-    if err!=nil{t.Fatal(err)}
+-    change(manifest)
+-    e.ManifestHash=Hash(manifest)
+-    if _,err=r.f.db.Exec("UPDATE runtime_dispatches SET manifest=?,manifest_hash=? WHERE project=? AND run=? AND epoch=?",string(Bytes(manifest)),e.ManifestHash,e.ProjectID,e.RunID,e.Epoch);err!=nil{t.Fatal(err)}
++// These five cases exercise the real profile checker with typed in-memory
++// copies of a persisted manifest. They are checker coverage, not top-level
++// AbandonPreparedQualification coverage: the production manifest trigger is
++// intentionally left enabled and no persisted immutable JSON is changed.
++func TestPreparedRunAbandonmentProfileCheckerRejectsMemoryManifestPins(t *testing.T) {
++    cases:=[]struct{name string; change func(Object)}{
++        {"profile_ref_mismatch",func(m Object){m["admission"].(map[string]any)["profile_ref"].(map[string]any)["id"]="different-profile"}},
++        {"profile_hash_mismatch",func(m Object){m["admission"].(map[string]any)["profile_hash"]=Digest([]byte("different-profile-pin"))}},
++        {"plan_pin_mismatch",func(m Object){m["admission"].(map[string]any)["permission"].(map[string]any)["plan_hash"]=Digest([]byte("different-plan-pin"))}},
++        {"profile_body_mismatch",func(m Object){m["admission"].(map[string]any)["profile"].(map[string]any)["model"]="different-model"}},
++        {"input_pin_mismatch",func(m Object){m["input_refs"]=Empty()}},
++    }
++    for _,case_:=range cases {
++        t.Run(case_.name,func(t *testing.T){
++            _,_,r,e:=preparedFixture(t)
++            expectedKey:=preparedAssertCleanProfile(t,r,e)
++            before:=preparedDatabaseSnapshot(t,r)
++            tx,err:=r.f.db.Begin()
++            if err!=nil{t.Fatal(err)}
++            defer tx.Rollback()
++            run,err:=load(tx,e.ProjectID,"Run",e.RunID)
++            if err!=nil{t.Fatal(err)}
++            task,err:=load(tx,e.ProjectID,"Task",e.TaskID)
++            if err!=nil{t.Fatal(err)}
++            dispatch,err:=runtimeDispatch(tx,e.ProjectID,e.RunID,e.Epoch)
++            if err!=nil{t.Fatal(err)}
++            persisted,ok:=dispatch["manifest"].(map[string]any)
++            if !ok{t.Fatal("persisted manifest is not a typed object")}
++            persistedHash:=Hash(persisted)
++            // The same real checker must accept the persisted clean baseline.
++            key,err:=r.f.s.preparedRunAbandonmentProfileUpload(tx,e,run,task,persisted)
++            if err!=nil || key!=expectedKey{t.Fatalf("clean checker baseline failed: %s %v",key,err)}
++            mutated,err:=Decode(Bytes(persisted))
++            if err!=nil{t.Fatal(err)}
++            case_.change(mutated)
++            if Hash(persisted)!=persistedHash || Hash(mutated)==persistedHash{t.Fatal("fault injection did not isolate a changed in-memory copy")}
++            _,err=r.f.s.preparedRunAbandonmentProfileUpload(tx,e,run,task,mutated)
++            preparedAssertFault(t,err,409,"STATE_CONFLICT","preparation profile immutable binding differs")
++            if err=tx.Rollback();err!=nil{t.Fatal(err)}
++            if after:=preparedDatabaseSnapshot(t,r);after!=before{t.Fatal("read-only checker case changed fixture database")}
++        })
++    }
+ }
+ 
+ func TestPreparedRunAbandonmentRejectsPreparationUploadAndPins(t *testing.T) {
+@@ -104,21 +137,6 @@
+         {"upload_unsealed","sealed runtime profile unavailable",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+             _,err:=r.f.db.Exec("UPDATE uploaded_content SET sealed=0 WHERE storage_key=?",key)
+             if err!=nil{t.Fatal(err)}
+-        }},
+-        {"profile_ref_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+-            preparedChangeManifest(t,r,e,func(m Object){m["admission"].(map[string]any)["profile_ref"].(map[string]any)["id"]="different-profile"})
+-        }},
+-        {"profile_hash_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+-            preparedChangeManifest(t,r,e,func(m Object){m["admission"].(map[string]any)["profile_hash"]=Digest([]byte("different-profile-pin"))})
+-        }},
+-        {"plan_pin_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+-            preparedChangeManifest(t,r,e,func(m Object){m["admission"].(map[string]any)["permission"].(map[string]any)["plan_hash"]=Digest([]byte("different-plan-pin"))})
+-        }},
+-        {"profile_body_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+-            preparedChangeManifest(t,r,e,func(m Object){m["admission"].(map[string]any)["profile"].(map[string]any)["model"]="different-model"})
+-        }},
+-        {"input_pin_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+-            preparedChangeManifest(t,r,e,func(m Object){m["input_refs"]=Empty()})
+         }},
+         {"marker_profile_pin_mismatch","preparation profile immutable binding differs",func(t *testing.T,r *runtimeFixture,e *PreparedRunAbandonmentEvidence,key string){
+             // Replace one marker in this disposable fixture using its real schema.

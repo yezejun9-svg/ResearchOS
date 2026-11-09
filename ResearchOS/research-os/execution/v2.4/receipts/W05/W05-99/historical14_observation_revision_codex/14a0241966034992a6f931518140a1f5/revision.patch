@@ -1,0 +1,55 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\prepared_abandonment_schema_upgrade_revision_codex\6b0cb88050554e688314092dbebc6ba6\candidate-root\internal\domain\backup_historical14_resume_test.go
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\historical14_observation_revision_codex\14a0241966034992a6f931518140a1f5\candidate-root\internal\domain\backup_historical14_resume_test.go
+@@ -120,3 +120,33 @@
+ 	}
+ 	return out, tx.Commit()
+ }
++
++// Test-only ObserveRuntime from exact schema14 runtime.go; see method provenance.
++// The version14 callsite checks the restored exact schema before this invocation.
++func (s *Service) upgradeHistorical14ObserveRuntime(ctx context.Context, project, runID string, epoch int64, observation Object) error {
++	if epoch < 1 {
++		return Fail(400, "INVALID_REQUEST", "invalid epoch")
++	}
++	spec, _ := observation["spec"].(map[string]any)
++	n, e := Num(spec, "epoch")
++	if e != nil || n != epoch || spec["run_id"] != runID {
++		return Fail(422, "GATE_FAILED", "observation identity mismatch")
++	}
++	tx, e := s.DB.BeginTx(ctx, nil)
++	if e != nil {
++		return e
++	}
++	defer tx.Rollback()
++	r, e := load(tx, project, "Run", runID)
++	if e != nil {
++		return e
++	}
++	if spec["task_id"] != r["task_id"] {
++		return Fail(422, "GATE_FAILED", "observation task mismatch")
++	}
++	_, e = tx.Exec("INSERT OR IGNORE INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)", project, runID, epoch, Hash(observation), string(Bytes(observation)), Now())
++	if e != nil {
++		return e
++	}
++	return tx.Commit()
++}
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\prepared_abandonment_schema_upgrade_revision_codex\6b0cb88050554e688314092dbebc6ba6\candidate-root\internal\domain\backup_upgrade_test.go
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\historical14_observation_revision_codex\14a0241966034992a6f931518140a1f5\candidate-root\internal\domain\backup_upgrade_test.go
+@@ -774,7 +774,15 @@
+ 	}
+ 	_, resumeErr = resume(ctx, token, f.project, Str(current, "id"), "before-fresh-observation", rev)
+ 	upgradeAssert(t, "OLD-OBSERVATION-REJECTED", true, resumeErr != nil)
+-	pending.observe(pending.observation("LOST", false))
++	if version == 14 {
++		upgradeHistoricalFixtureService(t, db, opt.TargetRoot, 14, true)
++		epoch, _ := Num(pending.run, "lease_epoch")
++		if e = svc.upgradeHistorical14ObserveRuntime(ctx, f.project, Str(pending.run, "id"), epoch, pending.observation("LOST", false)); e != nil {
++			t.Fatal(e)
++		}
++	} else {
++		pending.observe(pending.observation("LOST", false))
++	}
+ 	continued, e := resume(ctx, token, f.project, Str(current, "id"), "after-fresh-observation", rev)
+ 	if e != nil {
+ 		t.Fatal(e)

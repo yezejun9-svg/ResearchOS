@@ -1,0 +1,161 @@
+# Current Root continuation: CP375 / OW179 / CM40 / live next1111
+
+W09 profile and CM40 actually adopted. Native scope proposal failed on the legitimate .local path before any product process; minimal Source repair in progress. Old21 nine Go phases passed and independent programme review delivered; Root binding pending. Goal ACTIVE; formal0/42. Diagnostics1097..1108 registered once; original1109 and1110 pending; old failures and body preserved.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp375-w09-profile-adopted.live1111.root.json
+SHA256 d679503f896c929aad88b4fd1ce447f7d989a33244a56ae10c2b2b69c1ce0441 bytes 3923
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp375.live1111.root.json
+SHA256 ae67c0982e8c9aa45fdffee0ac82b8cde7633f05c9a699965a3c4cdc396c2fe5 bytes 3807
+
+# Current Root continuation: CP374 / OW178 / CM39 / live next1098
+
+Old21 Root registration actually committed; Sources and runtime qualified; actual build not started. W09 adoption Source independently accepted and actual peer deliveries validated. Main23 programme qualified. Goal ACTIVE; formal0/42. Diagnostics1067..1096 registered once; original1097 pending; counters and old body preserved.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp374-old21-registration.live1098.root.json
+SHA256 0348517dcbbc73e45e77297bb7cf54c8b4997a76038e67bd350418e0ffb9ab1d bytes 2771
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp374.live1098.root.json
+SHA256 810d36d4eb608dee90a92f50a67cf7bf75551e4d0a2a648b0592b357be09140e bytes 2370
+
+# Current Root continuation: CP373 / OW177 / CM39 / live next1097
+
+Main23 programme qualified. Old21 Caller03 and builder actual Root witnesses passed; runtime03 qualified; fresh registration ready. W09 Task78 Source review seal continuation pending. Goal ACTIVE; formal0/42; original counters/NULL exits and all old work preserved.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp373-source-adoptions.live1097.root.json
+SHA256 c60e5b0fefbad9a43ddc7a55963f3547afdcfac0f2d09461fedfcd296817f4d3 bytes 3198
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp373.live1097.root.json
+SHA256 fd7176305e001328ace48dd955a6f89c4f24d0b803667252293af25543c347ac bytes 38468
+
+# Current Root continuation: CP373 / OW177 / CM39 / live next1092
+
+Main23 programme qualified. Old21 Source02/runtime02 accepted; Source03 repairs genuine 1ms peer timestamp rejection. W09 Root adopter Source Task75 ready; non-author Task78 review active. No actual old21/full-W09 execution yet. Goal ACTIVE; formal0/42; all counters and old work retained.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp373-source-adoptions.live1092.root.json
+SHA256 af87d93495550beaaf2eb1a18bc0d838e290e3502f535bc00835f5b0694b2011 bytes 3841
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp373.live1092.root.json
+SHA256 7a3c197a90930ed5b93f97b75bbad67c36c67c117374057a61ba1e66bf0f2e83 bytes 32172
+
+# Current Root continuation: CP373 / OW177 / CM39 / live next1089
+
+Main23 current programme qualified with actual five-Go build, non-author review and genuine Root binding. W09 Q/NF3 four actual peer deliveries captured; Root adopter Source Task75 active. Old21 Caller needs two minimal Source fixes under Task73. No actual old21/full-W09 run yet. Goal ACTIVE; formal0/42; original counters and old body preserved.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp373-source-adoptions.live1089.root.json
+SHA256 5a83243b68e6796f9a6b567435bd0449370cf9c7c0715800dda96b5d388eeab6 bytes 3295
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp373.live1089.root.json
+SHA256 6bab318465c9ee9fa6df207ac7a108daa83e564b95ae85f65abfd6327402874f bytes 28525
+
+# Current Root continuation: CP373 / OW177 / CM39 / live next1087
+
+Main23 current build has five Go exits0, independent programme review and genuine Root qualification binding. Old21 Source review found a counter-regression boundary; repair precedes actual build. W09 reviewed Source awaits Root adoption. Goal ACTIVE; formal0/42. Counters and prior work preserved.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp373-main23-qualified.live1087.root.json
+SHA256 0a66cc646c93ea2e3b6e632a50e9aad60e95cdf0aec6fcced496dc89d5492c5d bytes 3296
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp373.live1087.root.json
+SHA256 e72871f5be6905628320b6e04d20b68a9e52e7bbe0595acee5dd0aee9fea4121 bytes 25897
+
+# Current Root continuation: CP373 / OW177 / CM39
+
+Goal remains ACTIVE; 0 of 42 formal cases accepted. Main23 actual build completed with 5 Go exits0; candidate awaits independent final delivery and Root qualification binding. All original failures retained; canonical next1067, live next1076; pending1067..1073 sealed, Source captures1074..1075 await sealing. Original API stdout truncation is preserved, complete durable state independently read back.
+
+Current resume: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp373-main23-built-pending-review.live1074.root.json
+SHA256 21bf7e56694c94a50e08d9a07419e985e8bc6f5f5ef53be99c2eee98eb170e24 bytes 4149
+
+Pending diagnostics: D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\pending-diagnostics.cp373.live1074.root.json
+SHA256 5f7296e7d25a53bed378a21687ef07d544ce56b8c9609851dd5ca515fdb8d019 bytes 9899
+
+# 当前续跑入口：CP372 / OW176 / CM39 / live next1065
+
+读取 D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp372-public22-readonly-actual.live1065.root.json。Root已完成public22既有产物只读真实复核：83表，零新Native，原1025失败保留；独立actual复核Task64进行中。41个原始诊断1024至1064已封待登记，失败计数未重置。M4 Source修正37项有限控通过待独立复核。正式接受0/42，目标ACTIVE。
+
+# 当前续跑入口：Root live1064 / Canon CP371-OW175-CM39
+
+读取 D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME_POINTER.live1064.root.json 与 D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W09\W09-99\checkpoint_r370_c19_dispatcher_source_root\cp370-c19-20261009\RESUME.cp371-time-contract-live1059.root.json。35个待登记原件已封至1058，1059至1063待完整IO关联。正式接受0/42，目标ACTIVE；旧失败和完整交接正文保留。
+
+<!-- R371 continuation: read HANDOFF_RESUME_PACK_R371.md and its exact pinned live1042 Root resume. Older continuation/body content below is historical; current Canon is authoritative. -->
+
+<!-- R370 continuation: read HANDOFF_RESUME_PACK_R370.md and the exact pinned live1013 Root resume. The R156 content below is retained as historical evidence and must not override current Canon. -->
+
+# ResearchOS v2.4 resume pack (rewritten 2026-10-05 from disk at HEAD b6ac2d69)
+
+Read this first, then re-verify it. Every figure below was produced by `.local/rewrite_resume_pack.py`
+reading `execution/v2.4/step_state.json`, `checkpoint.json` and `commands.json` at run time; nothing here
+is carried over from the previous pack's numbers. If this file and the state files disagree, the state
+files are right and this file is the bug.
+
+## 1. Where the build stands (measured)
+
+- checkpoint revision **156** (expected_previous 155); `next_step_id` = **W10-01**; failure counters
+  and integrity events carried forward, never reset: 17
+- cards accepted: **28 of 71**; statuses {'ACCEPTED': 28, 'BLOCKED': 2, 'IN_PROGRESS': 1}
+- parent gates: accepted **1 of 22** (['W00-99']); BLOCKED: ['W01-99']
+- formal cases accepted: **none of 42**
+- registry: revision **22**, 24 keys, **16 BOUND**; the plan declares 33
+  distinct keys, of which **20 are absent from the v2.4 registry**: ['acceptance.audit', 'core.qualify', 'environment.verify', 'package.validate', 'release.reproduce', 'test.backup', 'test.contracts.security', 'test.cycle.live', 'test.evaluation.fixture', 'test.evaluation.security', 'test.evolution', 'test.experiments', 'test.jev.fixture', 'test.jev.live', 'test.overnight', 'test.skills', 'test.sources.fixture', 'test.ui', 'test.ui.preview', 'test.ui.visual']
+- protected-work audit just now: **585 registered evidence rows across 585 distinct files,
+  0 drifted, 0 missing**, and neither state file is registered as evidence
+- obligation register: **237 entries**, append-only; it is a queue to triage, not a list of failures
+
+## 2. What is in flight, and what can be started
+
+**W10-01** (see its row note and receipt directory)
+
+**Dependency-eligible now (3):** W12-02 (用途等价资源切换与用户可操作请求, prio 1390), W17-02 (数据出口与独立holdout权限隔离, prio 1500), W18-01 (一致性备份和迁移前快照, prio 1520). `task_packet next` selects by DAG then priority,
+so compare against its output rather than assuming the lowest card number.
+
+## 3. Route feasibility — the check that was missing until 2026-10-05
+
+A card is executable only if all three hold: its declared key is BOUND, the key's selectors resolve that
+card's `--task-id/--check-id/--case-id`, **and the program behind the key is inside that card's own
+`write_scope`.** The third was never checked before. Measured over the open slices: 1_key_absent_or_unbound: 20, 2_selector_not_routed: 3.
+
+**Nobody may write `migrations/sqlite/**`** — no card's write_scope covers it — so anything needing a new
+column or table must derive from existing tables.
+
+## 4. Corrections to earlier handoffs, so they are not re-inherited
+
+- **`cli.entry_run` is not the parent-gate neck.** No card's `verification_commands` names it. The gate
+  chain runs through `W01-99`, and `W01-99`'s blocker is not a missing dependency: all four deps are
+  ACCEPTED and the row's own reason is that **A02 and C10 have no registered selector at all**, nothing
+  emits `A02-02`/`A02-03`, `C11-04` has no emitter (it belongs to `W12-02`, which is eligible), `C04` is
+  already covered, and the LIVE dual-end run needs the resource `Windows_desktop_session`.
+- **`test.retrieval` is bound** (rev 21) and `test.retrieval.revocation` (rev 22) exists. The older note
+  "no Go key runs the domain suite" is false: `tests/evidence/check/main.py` runs
+  `go test -json -run '^TestW0901' ./internal/domain`.
+- **The product's own CLI builds and runs** (`go build -o .local/bin/researchos.exe ./apps/cli`, then
+  `version` → `researchos 0.2.4-w0203 protocol=researchos-client/2`, exit 0). `W01-G03`'s
+  `own_cli_entry_present` is false only because `qualification/v2.4/qualify.py:218` scans filenames under
+  `apps/cli`, while the accepted build step deliberately emits the binary to `.local/bin/`.
+- **`test.security` and `test.experiments` answer gate ids, not slice ids**, so W09-02 and W10-01 each had
+  to bind a new key to a handler in their own scope. Those two deviations are disclosed in their receipts;
+  `W09-99` still declares the dead `test.security` pair.
+
+## 5. How to re-verify every number in section 1
+
+    python -B .local/rewrite_resume_pack.py            # re-derives this file
+    python -B .local/protected_evidence_audit.py       # recomputes all registered digests
+    python -B .local/measure_route_feasibility.py      # the three-condition route audit
+    cd "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4" && python tools/task_packet.py next --state "D:/作品集/ResearchOS/research-os/execution/v2.4/step_state.json"
+
+## 6. Constraints that are easy to break by accident
+
+- A registered receipt is byte-frozen. Corrections land in a **new** file (`claim_corrections_*`,
+  `post_review_actions_*`, `prerequisite_inventory_correction_*`), and the superseded sentence is struck
+  through in the row note rather than deleted.
+- Read acceptance from `step_state.json`, never from a receipt's `status` field.
+- `commands.json` is a shared append point: appending a key can silently re-route an existing selector.
+  Regress every selector accepted cards actually dispatch, and assert the pre-existing entries are
+  byte-identical before `os.replace`.
+- **Never append a selector to a key whose handler emits another card's roster** — that manufactures a PASS.
+- Hash raw bytes; a re-encoded or newline-normalised read hides drift in exactly the files that are empty.
+- Resolve toolchains from `execution/toolchains/locked.json`; set `RESEARCHOS_GO` or legacy domain reds are
+  misattributed (this has happened repeatedly, including while writing this pack).
+- Running a project's own verification driver is a **write**: `qualify.py` rewrites its own evidence file.
+- Mutation discipline: one mutant per operand, never one per condition; and a guard written to enforce that
+  must itself be exercised against a violating input before it is cited as evidence.
+- No push, no deploy, no purchases, no reading secret values, no second construction session, never
+  `git reset/clean/checkout .` against the tree, explicit paths only in `git add`.

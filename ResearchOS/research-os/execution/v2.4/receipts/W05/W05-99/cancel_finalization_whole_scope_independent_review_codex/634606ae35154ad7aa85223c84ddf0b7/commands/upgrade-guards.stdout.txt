@@ -1,0 +1,509 @@
+FILE migrations/sqlite/0002_domain.sql SHA256 90d6c36100cbfaddf85c23f603b686336d161e43eeeed47c034ab85415b25db4 LINES 1-46
+1: CREATE TABLE IF NOT EXISTS domain_objects (
+2:  project TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+3:  body TEXT NOT NULL CHECK(json_valid(body)), content_hash TEXT, immutable INTEGER NOT NULL DEFAULT 0,
+4:  PRIMARY KEY(project,kind,id), UNIQUE(project,kind,id,revision)
+5: );
+6: CREATE TABLE IF NOT EXISTS domain_versions (
+7:  project TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,
+8:  body TEXT NOT NULL CHECK(json_valid(body)), content_hash TEXT,
+9:  PRIMARY KEY(project,kind,id,revision)
+10: );
+11: CREATE TABLE IF NOT EXISTS domain_refs (
+12:  project TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, field TEXT NOT NULL,
+13:  target_project TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_revision INTEGER NOT NULL,
+14:  FOREIGN KEY(project,kind,id,revision) REFERENCES domain_versions(project,kind,id,revision) DEFERRABLE INITIALLY DEFERRED,
+15:  FOREIGN KEY(target_project,target_kind,target_id,target_revision) REFERENCES domain_versions(project,kind,id,revision) DEFERRABLE INITIALLY DEFERRED,
+16:  CHECK(target_project=project OR (target_project='' AND target_kind IN ('BudgetPolicy','RunPolicy')))
+17: );
+18: CREATE UNIQUE INDEX IF NOT EXISTS one_project_state ON domain_objects(project) WHERE kind='ProjectState';
+19: CREATE UNIQUE INDEX IF NOT EXISTS artifact_content ON domain_objects(project,json_extract(body,'$.content_hash'),json_extract(body,'$.kind')) WHERE kind='Artifact';
+20: CREATE UNIQUE INDEX IF NOT EXISTS no_progress_key ON domain_objects(project,json_extract(body,'$.key_hash')) WHERE kind='NoProgressRecord';
+21: CREATE UNIQUE INDEX IF NOT EXISTS active_cycle ON domain_objects(project) WHERE kind='ResearchCycle' AND json_extract(body,'$.status') IN ('PLANNED','RUNNING');
+22: CREATE UNIQUE INDEX IF NOT EXISTS active_run ON domain_objects(project,json_extract(body,'$.task_id')) WHERE kind='Run' AND json_extract(body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING');
+23: CREATE UNIQUE INDEX IF NOT EXISTS evidence_snapshot ON domain_objects(project,json_extract(body,'$.canonical_url'),coalesce(json_extract(body,'$.upstream_revision'),''),json_extract(body,'$.snapshot_artifact_ref.content_hash')) WHERE kind='Evidence';
+24: CREATE UNIQUE INDEX IF NOT EXISTS source_cursor ON domain_objects(project,json_extract(body,'$.source_id'),json_extract(body,'$.query_hash')) WHERE kind='SourceCursor';
+25: CREATE UNIQUE INDEX IF NOT EXISTS active_request ON domain_objects(project,json_extract(body,'$.category'),coalesce(json_extract(body,'$.account_ref'),''),json_extract(body,'$.reason_code')) WHERE kind='ResourceRequest' AND json_extract(body,'$.status') IN ('OPEN','ACKNOWLEDGED');
+26: CREATE UNIQUE INDEX IF NOT EXISTS release_sequence ON domain_objects(project,json_extract(body,'$.sequence')) WHERE kind='MilestoneRelease';
+27: CREATE UNIQUE INDEX IF NOT EXISTS notification_dedup ON domain_objects(project,coalesce(json_extract(body,'$.release_id'),''),coalesce(json_extract(body,'$.resource_request_id'),''),json_extract(body,'$.recipient_id'),json_extract(body,'$.channel')) WHERE kind='Notification';
+28: CREATE UNIQUE INDEX IF NOT EXISTS billing_event ON domain_objects(project,json_extract(body,'$.policy_id'),json_extract(body,'$.provider_event_id')) WHERE kind='BudgetLedgerEntry';
+29: CREATE UNIQUE INDEX IF NOT EXISTS policy_scope ON domain_objects(kind,project,json_extract(body,'$.scope_type'),json_extract(body,'$.scope_id')) WHERE kind IN ('BudgetPolicy','RunPolicy');
+30: CREATE TABLE IF NOT EXISTS outbox(project TEXT NOT NULL, sequence INTEGER NOT NULL, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project,sequence));
+31: CREATE TABLE IF NOT EXISTS idempotency(principal TEXT NOT NULL, project TEXT NOT NULL, operation TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, status INTEGER NOT NULL, body BLOB NOT NULL, headers TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(principal,project,operation,key));
+32: CREATE TABLE IF NOT EXISTS auth_principals(id TEXT PRIMARY KEY, roles TEXT NOT NULL CHECK(json_valid(roles)), can_create_project INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0);
+33: CREATE TABLE IF NOT EXISTS auth_grants(principal TEXT NOT NULL REFERENCES auth_principals(id), project TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', run TEXT NOT NULL DEFAULT '', restricted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(principal,project,task,run));
+34: CREATE TABLE IF NOT EXISTS auth_credentials(token_hash TEXT PRIMARY KEY, principal TEXT NOT NULL REFERENCES auth_principals(id), expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+35: CREATE TABLE IF NOT EXISTS uploaded_content(storage_key TEXT PRIMARY KEY, project TEXT NOT NULL, principal TEXT NOT NULL REFERENCES auth_principals(id), bytes BLOB NOT NULL, content_hash TEXT NOT NULL, expires_at TEXT NOT NULL, sealed INTEGER NOT NULL DEFAULT 0);
+36: CREATE TABLE IF NOT EXISTS page_cursors(id TEXT PRIMARY KEY, principal TEXT NOT NULL, project TEXT NOT NULL, operation TEXT NOT NULL, grant_hash TEXT NOT NULL, body TEXT NOT NULL, expires_at TEXT NOT NULL);
+37: CREATE TRIGGER IF NOT EXISTS versions_no_update BEFORE UPDATE ON domain_versions BEGIN SELECT RAISE(ABORT,'immutable version'); END;
+38: CREATE TRIGGER IF NOT EXISTS versions_no_delete BEFORE DELETE ON domain_versions BEGIN SELECT RAISE(ABORT,'immutable version'); END;
+39: CREATE TRIGGER IF NOT EXISTS objects_immutable BEFORE UPDATE ON domain_objects WHEN OLD.immutable=1 BEGIN SELECT RAISE(ABORT,'immutable receipt'); END;
+40: CREATE TRIGGER IF NOT EXISTS artifact_immutable BEFORE UPDATE ON domain_objects WHEN OLD.kind='Artifact' AND (NEW.content_hash IS NOT OLD.content_hash OR json_extract(NEW.body,'$.storage_key') IS NOT json_extract(OLD.body,'$.storage_key') OR json_extract(NEW.body,'$.access_class') IS NOT json_extract(OLD.body,'$.access_class')) BEGIN SELECT RAISE(ABORT,'sealed content'); END;
+41: CREATE TRIGGER IF NOT EXISTS content_immutable BEFORE UPDATE OF bytes,content_hash,project ON uploaded_content WHEN OLD.sealed=1 BEGIN SELECT RAISE(ABORT,'sealed bytes'); END;
+42: CREATE TRIGGER IF NOT EXISTS content_no_delete BEFORE DELETE ON uploaded_content WHEN OLD.sealed=1 BEGIN SELECT RAISE(ABORT,'sealed bytes'); END;
+43: CREATE TRIGGER IF NOT EXISTS artifact_metadata_immutable BEFORE UPDATE ON domain_objects WHEN OLD.kind='Artifact' AND json_remove(NEW.body,'$.revision','$.updated_at','$.validity') != json_remove(OLD.body,'$.revision','$.updated_at','$.validity') BEGIN SELECT RAISE(ABORT,'sealed metadata'); END;
+44: CREATE TRIGGER IF NOT EXISTS outbox_immutable BEFORE UPDATE OF project,sequence,id,body ON outbox BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+45: CREATE TRIGGER IF NOT EXISTS outbox_no_delete BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT,'durable event'); END;
+46: CREATE TRIGGER IF NOT EXISTS idempotency_immutable BEFORE UPDATE ON idempotency BEGIN SELECT RAISE(ABORT,'immutable replay'); END;
+
+FILE migrations/sqlite/0022_client_command_queue.sql SHA256 e2abcc078bbac1c076736a40249d50c85e25b4c8fd93e975f8528f8f8277abcd LINES 1-34
+1: -- Internal operational evidence. No dependency on the later additive session schema.
+2: CREATE TABLE client_queue_fences (
+3:  project TEXT NOT NULL, task_id TEXT NOT NULL, session_id TEXT NOT NULL,
+4:  generation TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('OPEN','SEALING','SEALED','CANCEL_FENCED','RECONCILING')),
+5:  accepted_through INTEGER NOT NULL DEFAULT 0, sealed_through INTEGER NOT NULL DEFAULT 0,
+6:  run_id TEXT, runtime_epoch INTEGER, dispatch_key TEXT, manifest_hash TEXT, process_identity TEXT,
+7:  restore_fenced INTEGER NOT NULL DEFAULT 0 CHECK(restore_fenced IN (0,1)),
+8:  revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(project,task_id)
+9: );
+10: CREATE TABLE client_command_queue (
+11:  principal TEXT NOT NULL, project TEXT NOT NULL, command_id TEXT NOT NULL,
+12:  session_id TEXT NOT NULL, task_id TEXT NOT NULL, goal_id TEXT NOT NULL,
+13:  generation TEXT NOT NULL REFERENCES client_queue_fences(generation), queue_sequence INTEGER NOT NULL,
+14:  request_hash TEXT NOT NULL, message_id TEXT NOT NULL UNIQUE, accepted_writer_epoch INTEGER NOT NULL,
+15:  delivery TEXT NOT NULL CHECK(delivery IN ('STEER','FOLLOW_UP')), content TEXT NOT NULL, content_hash TEXT NOT NULL,
+16:  state TEXT NOT NULL CHECK(state IN ('ENQUEUED','SENDING','SDK_ACCEPTED','CONSUMED','DROP_REQUESTED','DROPPED','UNKNOWN')),
+17:  revision INTEGER NOT NULL DEFAULT 1, last_receipt_id TEXT, created_at TEXT NOT NULL,
+18:  PRIMARY KEY(principal,project,command_id), UNIQUE(generation,queue_sequence)
+19: );
+20: CREATE INDEX client_queue_pending ON client_command_queue(project,session_id,state);
+21: CREATE TABLE client_control_requests (
+22:  principal TEXT NOT NULL, project TEXT NOT NULL, command_id TEXT NOT NULL,
+23:  session_id TEXT NOT NULL, control_request_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL,
+24:  target_id TEXT NOT NULL, task_ids TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('REQUESTED','RECONCILING','CONFIRMED')),
+25:  original_response TEXT, final_response TEXT, created_at TEXT NOT NULL,
+26:  PRIMARY KEY(principal,project,command_id)
+27: );
+28: CREATE TABLE client_control_receipts (
+29:  receipt_id TEXT PRIMARY KEY, project TEXT NOT NULL, generation TEXT NOT NULL,
+30:  command_id TEXT, kind TEXT NOT NULL, body TEXT NOT NULL, body_hash TEXT NOT NULL,
+31:  previous_receipt_id TEXT, created_at TEXT NOT NULL
+32: );
+33: CREATE TRIGGER client_receipt_no_update BEFORE UPDATE ON client_control_receipts BEGIN SELECT RAISE(ABORT,'append-only control receipt'); END;
+34: CREATE TRIGGER client_receipt_no_delete BEFORE DELETE ON client_control_receipts BEGIN SELECT RAISE(ABORT,'append-only control receipt'); END;
+
+FILE migrations/sqlite/0023_host_model_configuration.sql SHA256 07feef35d8d114f3d31aa99684ce85be9d2fafd2d5090a2c8548789b636cf794 LINES 1-64
+1: -- Private configuration foundation only. No dependency on the later additive
+2: -- session schema. Runtime qualification and public configure wiring are separate.
+3: -- The redundant unique index permits an exact deferred request-hash foreign key
+4: -- without rewriting any existing replay row or changing its logical uniqueness.
+5: CREATE UNIQUE INDEX client_identity_receipt_request
+6:  ON idempotency(principal,project,operation,key,request_hash);
+7: 
+8: CREATE TABLE client_command_identities (
+9:  principal TEXT NOT NULL REFERENCES auth_principals(id),
+10:  command_id TEXT NOT NULL CHECK(length(command_id)>0),
+11:  protocol TEXT NOT NULL CHECK(protocol='researchos-client/2'),
+12:  project TEXT NOT NULL,
+13:  method TEXT NOT NULL CHECK(length(method)>0),
+14:  operation TEXT NOT NULL CHECK(operation='v2:'||method),
+15:  request_hash TEXT NOT NULL CHECK(length(request_hash)=71 AND substr(request_hash,1,7)='sha256:' AND substr(request_hash,8) NOT GLOB '*[^0-9a-f]*'),
+16:  created_at TEXT NOT NULL CHECK(length(created_at)>0),
+17:  PRIMARY KEY(principal,command_id),
+18:  UNIQUE(principal,command_id,request_hash),
+19:  FOREIGN KEY(principal,project,operation,command_id,request_hash)
+20:   REFERENCES idempotency(principal,project,operation,key,request_hash)
+21:   DEFERRABLE INITIALLY DEFERRED
+22: );
+23: CREATE TRIGGER client_identity_no_update BEFORE UPDATE ON client_command_identities BEGIN SELECT RAISE(ABORT,'immutable command identity'); END;
+24: CREATE TRIGGER client_identity_no_delete BEFORE DELETE ON client_command_identities BEGIN SELECT RAISE(ABORT,'immutable command identity'); END;
+25: CREATE TRIGGER client_identity_no_replace BEFORE INSERT ON client_command_identities WHEN EXISTS(SELECT 1 FROM client_command_identities WHERE principal=NEW.principal AND command_id=NEW.command_id) BEGIN SELECT RAISE(ABORT,'immutable command identity'); END;
+26: 
+27: CREATE TABLE host_model_configurations (
+28:  model_config_ref TEXT PRIMARY KEY CHECK(length(model_config_ref)>0),
+29:  owner_host_ref TEXT NOT NULL CHECK(length(owner_host_ref)=17 AND substr(owner_host_ref,1,5)='host-' AND substr(owner_host_ref,6) NOT GLOB '*[^0-9a-f]*'),
+30:  principal TEXT NOT NULL,
+31:  config_revision INTEGER NOT NULL CHECK(typeof(config_revision)='integer' AND config_revision BETWEEN 1 AND 9007199254740991),
+32:  canonical_config_json TEXT NOT NULL CHECK(json_valid(canonical_config_json) AND json_type(canonical_config_json)='object'),
+33:  config_hash TEXT NOT NULL CHECK(length(config_hash)=71 AND substr(config_hash,1,7)='sha256:' AND substr(config_hash,8) NOT GLOB '*[^0-9a-f]*'),
+34:  command_id TEXT NOT NULL,
+35:  request_hash TEXT NOT NULL,
+36:  operation_scope_json TEXT NOT NULL CHECK(json_valid(operation_scope_json) AND json_type(operation_scope_json)='object'),
+37:  scope_hash TEXT NOT NULL CHECK(length(scope_hash)=71 AND substr(scope_hash,1,7)='sha256:' AND substr(scope_hash,8) NOT GLOB '*[^0-9a-f]*'),
+38:  created_at TEXT NOT NULL CHECK(length(created_at)>0),
+39:  CHECK(json_extract(canonical_config_json,'$.config_revision')=config_revision),
+40:  UNIQUE(owner_host_ref,principal,config_revision),
+41:  UNIQUE(owner_host_ref,principal,config_revision,model_config_ref),
+42:  UNIQUE(principal,command_id),
+43:  FOREIGN KEY(principal,command_id,request_hash)
+44:   REFERENCES client_command_identities(principal,command_id,request_hash)
+45:   DEFERRABLE INITIALLY DEFERRED
+46: );
+47: CREATE TRIGGER host_config_no_update BEFORE UPDATE ON host_model_configurations BEGIN SELECT RAISE(ABORT,'immutable model configuration'); END;
+48: CREATE TRIGGER host_config_no_delete BEFORE DELETE ON host_model_configurations BEGIN SELECT RAISE(ABORT,'immutable model configuration'); END;
+49: CREATE TRIGGER host_config_no_replace BEFORE INSERT ON host_model_configurations WHEN EXISTS(SELECT 1 FROM host_model_configurations WHERE model_config_ref=NEW.model_config_ref OR (owner_host_ref=NEW.owner_host_ref AND principal=NEW.principal AND config_revision=NEW.config_revision) OR (principal=NEW.principal AND command_id=NEW.command_id)) BEGIN SELECT RAISE(ABORT,'immutable model configuration'); END;
+50: 
+51: CREATE TABLE host_model_config_heads (
+52:  owner_host_ref TEXT NOT NULL,
+53:  principal TEXT NOT NULL,
+54:  current_revision INTEGER NOT NULL CHECK(typeof(current_revision)='integer' AND current_revision BETWEEN 1 AND 9007199254740991),
+55:  default_model_config_ref TEXT NOT NULL,
+56:  PRIMARY KEY(owner_host_ref,principal),
+57:  FOREIGN KEY(owner_host_ref,principal,current_revision,default_model_config_ref)
+58:   REFERENCES host_model_configurations(owner_host_ref,principal,config_revision,model_config_ref)
+59:   DEFERRABLE INITIALLY DEFERRED
+60: );
+61: CREATE TRIGGER host_config_head_first BEFORE INSERT ON host_model_config_heads WHEN NEW.current_revision<>1 BEGIN SELECT RAISE(ABORT,'configuration head must begin at one'); END;
+62: CREATE TRIGGER host_config_head_monotonic BEFORE UPDATE ON host_model_config_heads WHEN NEW.owner_host_ref<>OLD.owner_host_ref OR NEW.principal<>OLD.principal OR NEW.current_revision<>OLD.current_revision+1 OR NEW.default_model_config_ref=OLD.default_model_config_ref BEGIN SELECT RAISE(ABORT,'configuration head CAS must advance one'); END;
+63: CREATE TRIGGER host_config_head_no_delete BEFORE DELETE ON host_model_config_heads BEGIN SELECT RAISE(ABORT,'configuration head cannot be deleted'); END;
+64: CREATE TRIGGER host_config_head_no_replace BEFORE INSERT ON host_model_config_heads WHEN EXISTS(SELECT 1 FROM host_model_config_heads WHERE owner_host_ref=NEW.owner_host_ref AND principal=NEW.principal) BEGIN SELECT RAISE(ABORT,'configuration head cannot be replaced'); END;
+
+FILE internal/domain/backup_configuration_upgrade.go SHA256 10bf8703d377c4034d515b9c3c0f28a496830a83d5c00084a884309120ae6835 LINES 1-220
+1: package domain
+2: 
+3: // Exact schema22 ->23 coordinator. Historical upgrade plans remain separate.
+4: import (
+5: 	"context"
+6: 	"database/sql"
+7: 	"fmt"
+8: 	"os"
+9: 	"path/filepath"
+10: 	"reflect"
+11: 	"researchos.local/research-os/internal/store"
+12: 	"strings"
+13: )
+14: 
+15: const ConfigurationSchemaUpgradePlan = "schema22-to23-host-model-configuration-v1"
+16: const upgradeConfigurationSQLHash = "sha256:07feef35d8d114f3d31aa99684ce85be9d2fafd2d5090a2c8548789b636cf794"
+17: 
+18: var upgradeConfigurationTables = map[string]bool{"client_command_identities": true, "host_model_configurations": true, "host_model_config_heads": true}
+19: 
+20: func upgradeConfigurationRelease(root string, count int) (Object, [][]byte, error) {
+21: 	if count != 22 && count != 23 {
+22: 		return nil, nil, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+23: 	}
+24: 	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/0*.sql"))
+25: 	if e != nil || len(files) != count {
+26: 		return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS: require exact 1..%d", count)
+27: 	}
+28: 	manifest := Object{}
+29: 	sqls := make([][]byte, count+1)
+30: 	for i, file := range files {
+31: 		name := filepath.Base(file)
+32: 		if len(name) < 5 || name[:4] != fmt.Sprintf("%04d", i+1) {
+33: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS")
+34: 		}
+35: 		expected := upgradeMigrationHashes[name]
+36: 		switch name {
+37: 		case "0021_research_pending_windows.sql":
+38: 			expected = "sha256:36d4e5c93aa1edcd7ca5aca922b3bea11d5739f307bd11c6834936adf5552f32"
+39: 		case "0022_client_command_queue.sql":
+40: 			expected = upgradeQueueSQLHash
+41: 		case "0023_host_model_configuration.sql":
+42: 			expected = upgradeConfigurationSQLHash
+43: 		}
+44: 		raw, e := os.ReadFile(file)
+45: 		if e != nil || expected == "" || Digest(raw) != expected {
+46: 			return nil, nil, fmt.Errorf("UPGRADE_RELEASE_HASH: %s", name)
+47: 		}
+48: 		manifest["migrations/sqlite/"+name] = expected
+49: 		sqls[i] = raw
+50: 	}
+51: 	for path, expected := range map[string]string{
+52: 		"spec/v2.0/contracts/domain.schema.json":             "sha256:b11439c80d15c9481d7940c98eb6517b5156470f871c839e505a8dce40e0b847",
+53: 		"spec/v2.0/contracts/openapi.json":                   "sha256:f1edd7955a1d134a675c5558618756db809d82729f8eebe622a9bc2605a58920",
+54: 		"internal/api/contracts/client.protocol.schema.json": "sha256:8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+55: 		"internal/api/contracts/domain.schema.json":          "sha256:b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54",
+56: 	} {
+57: 		raw, e := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+58: 		if e != nil || Digest(raw) != expected {
+59: 			return nil, nil, fmt.Errorf("UPGRADE_CONTRACT_HASH: %s", path)
+60: 		}
+61: 		manifest[path] = expected
+62: 	}
+63: 	raw, e := os.ReadFile(filepath.Join(root, "migrations/sqlite/next_v24_sessions.sql"))
+64: 	if e != nil || Digest(raw) != upgradeQueueSessionHash {
+65: 		return nil, nil, fmt.Errorf("UPGRADE_SESSION_SCHEMA_HASH")
+66: 	}
+67: 	manifest["migrations/sqlite/next_v24_sessions.sql"] = Digest(raw)
+68: 	sqls[count] = raw
+69: 	return manifest, sqls, nil
+70: }
+71: 
+72: func upgradeConfigurationTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (string, string, error) {
+73: 	if len(sqls) != 24 {
+74: 		return "", "", fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+75: 	}
+76: 	stage, e := os.MkdirTemp("", ".researchos-configuration-template-")
+77: 	if e != nil {
+78: 		return "", "", e
+79: 	}
+80: 	defer backupDiscard(stage)
+81: 	db, e := store.Open(filepath.Join(stage, "schema.sqlite"))
+82: 	if e != nil {
+83: 		return "", "", e
+84: 	}
+85: 	defer db.Close()
+86: 	for i, raw := range sqls[:22] {
+87: 		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+88: 			return "", "", e
+89: 		}
+90: 		if _, e = db.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(?)", i+1); e != nil {
+91: 			return "", "", e
+92: 		}
+93: 	}
+94: 	if _, e = db.ExecContext(ctx, string(sqls[23])); e != nil {
+95: 		return "", "", e
+96: 	}
+97: 	if e = installClientSessionFence(ctx, db, false); e != nil {
+98: 		return "", "", e
+99: 	}
+100: 	before, e := backupSchema(db)
+101: 	if e != nil {
+102: 		return "", "", e
+103: 	}
+104: 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
+105: 		return "", "", e
+106: 	}
+107: 	if e = upgradeConfigurationMigration(ctx, db, sqls[22]); e != nil {
+108: 		return "", "", e
+109: 	}
+110: 	after, e := backupSchema(db)
+111: 	return before, after, e
+112: }
+113: 
+114: func upgradeConfigurationMigration(ctx context.Context, db *sql.DB, raw []byte) error {
+115: 	if Digest(raw) != upgradeConfigurationSQLHash {
+116: 		return fmt.Errorf("UPGRADE_MIGRATION_HASH")
+117: 	}
+118: 	versions, e := backupMigrations(db)
+119: 	if e != nil || !reflect.DeepEqual(versions, upgradeVersions(22)) {
+120: 		return fmt.Errorf("UPGRADE_SOURCE_VERSION")
+121: 	}
+122: 	before, e := upgradeRows(db)
+123: 	if e != nil {
+124: 		return e
+125: 	}
+126: 	tx, e := db.BeginTx(ctx, nil)
+127: 	if e != nil {
+128: 		return e
+129: 	}
+130: 	defer tx.Rollback()
+131: 	if _, e = tx.ExecContext(ctx, string(raw)); e != nil {
+132: 		return e
+133: 	}
+134: 	if _, e = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES(23)"); e != nil {
+135: 		return e
+136: 	}
+137: 	after, e := upgradeQueueRows(tx)
+138: 	if e != nil {
+139: 		return e
+140: 	}
+141: 	for table, rows := range before {
+142: 		if table != "schema_migrations" && Hash(rows) != Hash(after[table]) {
+143: 			return fmt.Errorf("UPGRADE_MIGRATION_MUTATED_HISTORY: %s", table)
+144: 		}
+145: 	}
+146: 	for table := range upgradeConfigurationTables {
+147: 		rows, ok := after[table]
+148: 		if !ok || len(rows) != 0 {
+149: 			return fmt.Errorf("UPGRADE_CONFIGURATION_NOT_EMPTY")
+150: 		}
+151: 	}
+152: 	for table := range after {
+153: 		if _, ok := before[table]; !ok && !upgradeConfigurationTables[table] {
+154: 			return fmt.Errorf("UPGRADE_UNEXPECTED_TABLE")
+155: 		}
+156: 	}
+157: 	var integrity string
+158: 	if e = tx.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); e != nil || integrity != "ok" {
+159: 		return fmt.Errorf("UPGRADE_TARGET_INTEGRITY")
+160: 	}
+161: 	rows, e := tx.QueryContext(ctx, "PRAGMA foreign_key_check")
+162: 	if e != nil {
+163: 		return e
+164: 	}
+165: 	bad := rows.Next()
+166: 	e = rows.Err()
+167: 	rows.Close()
+168: 	if bad || e != nil {
+169: 		return fmt.Errorf("UPGRADE_TARGET_REFERENCE")
+170: 	}
+171: 	return tx.Commit()
+172: }
+173: 
+174: func upgradeConfigurationLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+175: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+176: 	if e := upgradePaths(&opt); e != nil {
+177: 		return report, e
+178: 	}
+179: 	sourceRelease, _, e := upgradeConfigurationRelease(opt.SourceRoot, 22)
+180: 	if e != nil {
+181: 		return report, e
+182: 	}
+183: 	targetRelease, sqls, e := upgradeConfigurationRelease(opt.TargetRoot, 23)
+184: 	if e != nil {
+185: 		return report, e
+186: 	}
+187: 	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+188: 	if e != nil {
+189: 		return report, e
+190: 	}
+191: 	expectedSourceSchema, expectedTargetSchema, e := upgradeConfigurationTemplate(ctx, sqls, contracts)
+192: 	if e != nil {
+193: 		return report, e
+194: 	}
+195: 	key, e := os.ReadFile(opt.KeyFile)
+196: 	if e != nil || len(key) != 32 {
+197: 		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+198: 	}
+199: 	defer clear(key)
+200: 	db, e := upgradeOpenExclusive(ctx, opt.Source)
+201: 	if e != nil {
+202: 		return report, e
+203: 	}
+204: 	defer db.Close() // The native source lock spans snapshot through publication.
+205: 	versions, e := backupMigrations(db)
+206: 	if e != nil || !reflect.DeepEqual(versions, upgradeVersions(22)) {
+207: 		return report, fmt.Errorf("UPGRADE_SOURCE_VERSION: require exact 1..22")
+208: 	}
+209: 	schema, e := backupSchema(db)
+210: 	if e != nil || schema != expectedSourceSchema {
+211: 		return report, fmt.Errorf("UPGRADE_SOURCE_SCHEMA")
+212: 	}
+213: 	guard := &upgradeQueueProtection{upgradeProtection: upgradeProtection{ctx: ctx, verifier: verifier}, contracts: contracts}
+214: 	if e = guard.refresh(db); e != nil {
+215: 		return report, e
+216: 	}
+217: 	// Reject any host-side protected storage before reading ordinary BLOB rows
+218: 	// for the logical inventory or creating a snapshot.
+219: 	original, e := upgradeRows(db)
+220: 	if e != nil {
+
+FILE internal/domain/backup_migration.go SHA256 569226e3326d3d1469de3154752ff02d00f7e0e5fa84c2e19ec04df0e97a6ae1 LINES 1-136
+1: package domain
+2: 
+3: import (
+4: 	"context"
+5: 	"database/sql"
+6: 	"fmt"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"strconv"
+10: 	"strings"
+11: )
+12: 
+13: // Existing authority requires matching-program backup and isolated migration.
+14: // This is a read-only domain guard; store.Open may already have selected WAL.
+15: func CheckMigrationSafety(db *sql.DB, files []string) error {
+16: 	applied, e := checkMigrationInventory(db, files)
+17: 	if e != nil {
+18: 		return e
+19: 	}
+20: 	populated, e := migrationAuthorityPresent(db)
+21: 	if e != nil {
+22: 		return e
+23: 	}
+24: 	if !populated {
+25: 		return nil
+26: 	}
+27: 	if applied != len(files) {
+28: 		return fmt.Errorf("MIGRATION_PREBACKUP_REQUIRED: back up with matching program and verify an isolated restore before migration %d", applied+1)
+29: 	}
+30: 	raw, e := os.ReadFile(filepath.Join(filepath.Dir(files[0]), "next_v24_sessions.sql"))
+31: 	if e != nil || Digest(raw) != upgradeQueueSessionHash {
+32: 		return fmt.Errorf("MIGRATION_ADDITIVE_SOURCE")
+33: 	}
+34: 	expected, e := sql.Open("sqlite", ":memory:")
+35: 	if e != nil {
+36: 		return e
+37: 	}
+38: 	defer expected.Close()
+39: 	expected.SetMaxOpenConns(1)
+40: 	if _, e = expected.Exec(string(raw)); e != nil {
+41: 		return e
+42: 	}
+43: 	if e = installClientSessionFence(context.Background(), expected, false); e != nil {
+44: 		return e
+45: 	}
+46: 	want, e := migrationSessionSchema(expected)
+47: 	if e != nil {
+48: 		return e
+49: 	}
+50: 	got, e := migrationSessionSchema(db)
+51: 	if e != nil {
+52: 		return e
+53: 	}
+54: 	if Hash(got) != Hash(want) {
+55: 		return fmt.Errorf("MIGRATION_PREBACKUP_REQUIRED: additive session schema or fence differs")
+56: 	}
+57: 	return nil
+58: }
+59: 
+60: func checkMigrationInventory(db *sql.DB, files []string) (int, error) {
+61: 	if len(files) == 0 || len(files) > 23 {
+62: 		return 0, fmt.Errorf("MIGRATION_SOURCE_INVENTORY")
+63: 	}
+64: 	for i, file := range files {
+65: 		base := filepath.Base(file)
+66: 		if len(base) < 6 || base[4] != '_' {
+67: 			return 0, fmt.Errorf("MIGRATION_FILENAME_INVALID")
+68: 		}
+69: 		v, e := strconv.Atoi(base[:4])
+70: 		if e != nil || v != i+1 {
+71: 			return 0, fmt.Errorf("MIGRATION_SOURCE_INVENTORY")
+72: 		}
+73: 	}
+74: 	var exists int
+75: 	if e := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'").Scan(&exists); e != nil {
+76: 		return 0, e
+77: 	}
+78: 	if exists == 0 {
+79: 		return 0, fmt.Errorf("MIGRATION_BOOTSTRAP_REQUIRED")
+80: 	}
+81: 	rows, e := db.Query("SELECT version,typeof(version) FROM schema_migrations ORDER BY version")
+82: 	if e != nil {
+83: 		return 0, e
+84: 	}
+85: 	defer rows.Close()
+86: 	n := 0
+87: 	for rows.Next() {
+88: 		var v int
+89: 		var kind string
+90: 		if e = rows.Scan(&v, &kind); e != nil {
+91: 			return 0, e
+92: 		}
+93: 		n++
+94: 		if kind != "integer" || v != n || v > len(files) {
+95: 			return 0, fmt.Errorf("MIGRATION_UNSUPPORTED_OR_GAPPED_VERSION")
+96: 		}
+97: 	}
+98: 	if e = rows.Err(); e != nil {
+99: 		return 0, e
+100: 	}
+101: 	if n == 0 {
+102: 		return 0, fmt.Errorf("MIGRATION_BOOTSTRAP_REQUIRED")
+103: 	}
+104: 	return n, nil
+105: }
+106: 
+107: func migrationAuthorityPresent(db *sql.DB) (bool, error) {
+108: 	rows, e := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+109: 	if e != nil {
+110: 		return false, e
+111: 	}
+112: 	names := []string{}
+113: 	for rows.Next() {
+114: 		var name string
+115: 		if e = rows.Scan(&name); e != nil {
+116: 			rows.Close()
+117: 			return false, e
+118: 		}
+119: 		names = append(names, name)
+120: 	}
+121: 	e = rows.Err()
+122: 	rows.Close()
+123: 	if e != nil {
+124: 		return false, e
+125: 	}
+126: 	for _, name := range names {
+127: 		if name == "schema_migrations" {
+128: 			continue
+129: 		}
+130: 		query := `SELECT count(*) FROM "` + strings.ReplaceAll(name, `"`, `""`) + `"`
+131: 		// Only the exact source-defined mutex seed is structural, not authority.
+132: 		if name == "resource_write_lock" {
+133: 			query += " WHERE id<>1 OR value<>0"
+134: 		}
+135: 		var n int
+136: 		if e = db.QueryRow(query).Scan(&n); e != nil {

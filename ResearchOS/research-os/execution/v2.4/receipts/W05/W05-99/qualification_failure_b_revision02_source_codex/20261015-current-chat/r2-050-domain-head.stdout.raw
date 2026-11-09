@@ -1,0 +1,100 @@
+1: //go:build windows
+2: 
+3: package domain
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"errors"
+9: 	"fmt"
+10: 	"path/filepath"
+11: 	"strconv"
+12: 	"strings"
+13: 	"sync"
+14: 	"time"
+15: 
+16: 	rt "researchos.local/research-os/adapters/runtime"
+17: )
+18: 
+19: const onlineQualificationDenial = "ONLINE_FIRST_GATE_TOOL_DENIAL"
+20: 
+21: // A typed rejection is constructed only inside the serialized first dispatch
+22: // gate. Its existence alone never authorizes terminal closure.
+23: type qualificationPreEffectRejection struct {
+24: 	receipt Object
+25: 	digest  string
+26: 	cause   error
+27: }
+28: 
+29: type qualificationBrokerDrain struct {
+30: 	accepted      int
+31: 	completed     int
+32: 	pending       int
+33: 	closed        bool
+34: 	disqualified  bool
+35: 	rejectedSeq   int64
+36: 	frameHashes   map[int64]string
+37: 	completionSet map[int64]string
+38: }
+39: 
+40: type qualificationBrokerRegistry struct {
+41: 	mu           sync.Mutex
+42: 	closed       bool
+43: 	disqualified bool
+44: 	rejectedSeq  int64
+45: 	admitted     map[int64]string
+46: 	completed    map[int64]string
+47: }
+48: 
+49: func newQualificationBrokerRegistry() *qualificationBrokerRegistry {
+50: 	return &qualificationBrokerRegistry{admitted: map[int64]string{}, completed: map[int64]string{}}
+51: }
+52: 
+53: func (r *qualificationBrokerRegistry) admit(frame rt.BridgeFrame) bool {
+54: 	r.mu.Lock()
+55: 	defer r.mu.Unlock()
+56: 	if r.closed || r.admitted[frame.Sequence] != "" {
+57: 		r.disqualified = true
+58: 		return false
+59: 	}
+60: 	r.admitted[frame.Sequence] = Hash(frame)
+61: 	return true
+62: }
+63: 
+64: func (r *qualificationBrokerRegistry) complete(sequence int64, digest string) bool {
+65: 	r.mu.Lock()
+66: 	defer r.mu.Unlock()
+67: 	if r.admitted[sequence] == "" || r.completed[sequence] != "" {
+68: 		r.disqualified = true
+69: 		return false
+70: 	}
+71: 	r.completed[sequence] = digest
+72: 	return true
+73: }
+74: 
+75: func (r *qualificationBrokerRegistry) close(rejectedSeq int64) {
+76: 	r.mu.Lock()
+77: 	r.closed = true
+78: 	if rejectedSeq > 0 && r.rejectedSeq == 0 {
+79: 		r.rejectedSeq = rejectedSeq
+80: 	}
+81: 	r.mu.Unlock()
+82: }
+83: 
+84: func (r *qualificationBrokerRegistry) disqualify() {
+85: 	r.mu.Lock()
+86: 	r.disqualified = true
+87: 	r.mu.Unlock()
+88: }
+89: 
+90: func (r *qualificationBrokerRegistry) snapshot() qualificationBrokerDrain {
+91: 	r.mu.Lock()
+92: 	defer r.mu.Unlock()
+93: 	t := qualificationBrokerDrain{accepted: len(r.admitted), completed: len(r.completed), pending: len(r.admitted) - len(r.completed), closed: r.closed, disqualified: r.disqualified, rejectedSeq: r.rejectedSeq, frameHashes: map[int64]string{}, completionSet: map[int64]string{}}
+94: 	for k, v := range r.admitted {
+95: 		t.frameHashes[k] = v
+96: 	}
+97: 	for k, v := range r.completed {
+98: 		t.completionSet[k] = v
+99: 	}
+100: 	return t

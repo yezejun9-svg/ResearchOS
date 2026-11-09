@@ -1,0 +1,13 @@
+# Public Web build inputs copied
+
+The new D resource root contains only `web-node_modules/` plus `INPUTS.json`. The source was this project's existing public `apps/web/node_modules`; no account/profile/auth configuration, user database, Electron distribution or Go module tree was copied.
+
+Use `D:/作品集/ResearchOS/research-os/.local/product-v1-build-inputs-20261104/web-node_modules` as the later reviewed builder's `--web-modules`. This physical copy was made only after the C scope and fsynced journal existed, rejecting reparse/symlink/nonregular entries and confirming destination free space. No hardlink, junction, source rename/delete or old-cache write was used. Public native `.node` files were treated only as bytes and were not loaded.
+
+Actual result: 365 files, 50 directories, 45,843,230 logical bytes. Source-before, source-after and full target readback have the same digest `e1c316403d5e6614a48ade25ad8169227d39200a30426f213dbec73bcdebde26`. The D/C `INPUTS.json` SHA is `87856127688f28e6d3b3cb24addbefbb1b6bfb3630690be8b76085d16113ddff`. Free D space was 36,296,921,088 bytes before and 36,249,636,864 after; the copy required 585,704,222 bytes including per-file allocation slack and 512MiB margin. Space figures are observations, not guarantees for a later full build.
+
+The one copy command was `ed2b28/session59548 → c2cf38 exit0`; the initial C scope/journal was `60206a exit0`. Every original source, target and scope file manifest and the raw copy log is retained here. Do not run `copy_public_web.py` again against this consumed target; a transport uncertainty must be resolved by readback, not replay or overwriting the folder. Future build-generated temporary files in this new owned cache require their own build scope and before/after accounting.
+
+Go was only inventoried, as finite19 declared versions and57 metadata files. They are all present; extracted public source is329,205,714 bytes and metadata9,280 bytes. This is a declared module superset, not a verified exact target-package closure or full Go h1 authentication. Root chose the existing public module cache as a later explicitly registered read-only input intention, with offline Go and fresh builder GOCACHE/GOTMPDIR. No Go command or module copy was executed. The known metadata/lock side-effect boundary and optional finite-copy method are preserved in `GOMODCACHE-READONLY.json`; no broader cache or account scan occurred.
+
+No build, installation, GUI/Electron, model, old qualification/probe or product-source change occurred. This is a verified dependency-copy result, not a source-bound V1 build or runtime acceptance. The new supervisor remains frozen and unchanged; its top Job is unnamed, and no controller expansion was made for GUI discovery.

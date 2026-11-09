@@ -1,0 +1,45 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\f08_driver18_root_binding_revision_preparation_codex\ae14ede5d4d34ea493f9945886997cb2\authority_adapter.v2.final.proposed.py
++++ authority_adapter.v3.proposed.py
+@@ -383,6 +383,42 @@
+          type(initial['session_id']) is int and initial['session_id']==original['session_id']==d['session_id'] and
+          initial.get('exit_code') is None and d['tool_completion_session_id']==d['session_id'],
+          'ORIGINAL_OUTER_INVOCATION_COMPLETION_PAIR')
++    # Root captures original tool input and its paired response as immutable
++    # action records. A claimed session on a completion summary is insufficient.
++    iaref=original['tool_initial_action_ref'];ta_ref=d['terminal_tool_action_ref']
++    ia=r.doc(iaref);ta=r.doc(ta_ref)
++    identity={'launcher_ref':s['launcher_ref'],'argv':d['argv'],'cwd':str(ROOT),
++              'phase':phase,'scope_ref':sref,'grant_ref':gref,
++              'run_uuid':s['actual_Root_registration']['run_uuid']}
++    keys={'schema','actor','tool_name','input_ref','response_ref','initial_action_ref',
++          'command_identity','request_event_locator','response_event_locator'}
++    for action in [ia,ta]:
++        need(set(action)==keys and action['schema']=='researchos.driver18-original-tool-action.v1' and
++             action['actor']=='codex:/root' and action['command_identity']==identity,
++             'ORIGINAL_TOOL_ACTION_IDENTITY')
++        need(all(isinstance(action[k],str) and action[k] for k in
++                 ['request_event_locator','response_event_locator']), 'ORIGINAL_TOOL_EVENT_LOCATORS')
++    need(ia['tool_name']=='exec_command' and ia['initial_action_ref'] is None and
++         same_ref(ia['input_ref'],original['tool_initial_input_ref']) and
++         same_ref(ia['response_ref'],original['tool_initial_result_ref']), 'INITIAL_ACTION_INPUT_RESULT')
++    first_input=r.doc(ia['input_ref'])
++    need(isinstance(first_input,dict) and isinstance(first_input['cmd'],str) and first_input['cmd'] and
++         first_input['cmd']==original['tool_command'] and safe(first_input['workdir'])==ROOT,
++         'ORIGINAL_INITIAL_COMMAND_AND_CWD')
++    need(ta['tool_name']=='write_stdin' and same_ref(ta['initial_action_ref'],iaref) and
++         same_ref(ta['response_ref'],d['tool_result_ref']) and not same_ref(ta_ref,iaref) and
++         ta['request_event_locator']!=ia['request_event_locator'], 'TERMINAL_ACTION_EXACT_RESPONSE')
++    terminal_input=r.doc(ta['input_ref'])
++    need(isinstance(terminal_input,dict) and set(terminal_input)<=
++         {'session_id','chars','yield_time_ms','max_output_tokens'} and
++         type(terminal_input['session_id']) is int and
++         terminal_input['session_id']==initial['session_id']==original['session_id'] and
++         terminal_input.get('chars','')=='', 'ACTUAL_TERMINAL_WAIT_INPUT')
++    # Only this concrete asynchronous exec_command -> write_stdin contract is
++    # supported. Never synthesize a session/cursor for a direct completion.
++    if 'session_id' in raw:
++        need(type(raw['session_id']) is int and raw['session_id']==terminal_input['session_id'],
++             'TERMINAL_RESPONSE_SESSION_CONTRADICTION')
+     need(d['actual_native_launcher_exit'] is None,'UNSAMPLED_OUTER_NATIVE_REMAINS_NULL')
+     need(d['schema']=='researchos.driver18-root-outer-completion.v1' and d['actor']=='codex:/root' and
+          d['phase']==phase and zero(d['actual_outer_exit']) and zero(raw['exit_code']) and

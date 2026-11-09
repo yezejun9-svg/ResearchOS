@@ -1,0 +1,15 @@
+# Main Desktop 七文件整合后独立复核
+
+**结论：EXACT_MAIN_FAST_FORWARD_POST_REVIEW_PASS；阻断0，新诊断0。** 可供CP556收敛封存。
+
+实际读取Git确认 Main分支为 `main`，HEAD `ecc28dd3c91a0f68dcddb41b53325aa7f0e81419`，tree `1d44a02c9483fc529b08ffe81895ec443920bdd1`，直接父为 `7d1e3ff288f91254c7304dd32f6e5bb4b66b8f1e`。差异仅已批准的6A/1M七路径；七文件磁盘字节、Git blob与r3候选SHA逐项相等，index为空。
+
+原20条tracked dirty与独立preflight记录逐行一致。Root整合前48项保护refs在整合后55项refs中完整保留且hash/bytes相同，新增的7项恰为本次文件。Root新post gate已按ecc28检查Main，未把旧Main7d约束误用为当前HEAD。此处核对原保全回执，没有扩大访问原数据或凭据。
+
+C57工作树实际HEAD仍为 `03aa4d687dfaa541d9b18d4c766805307a537d1d` 且clean；只读Git ancestry查询确认它不是Main祖先，未被此次fast-forward合入。该谓词预期返回1，已单独记录，不计为新诊断或产品失败。
+
+两份commands、dispatcher、Desktop package与既有W13测试入口均与preflight hash一致。desktop.shell_launch和desktop.installer_build仍UNBOUND。读取当前状态为CP555/ownership341/mixed2250；既有历史不重置，未提升平台命令登记或正式接受。整合scope `ecf4ed370ee094af13a290d1c04c6d7925da7823ab4b273b84efcb97297ae8a2` 与实际runner/post-gate、前序review seals全部核对；Git执行及外层090回执均exit0，raw证明执行的仅为精确候选本地fast-forward。
+
+已有source/build与有限owned native smoke可继续按相同提交/blob及原绑定开发产物引用；本次没有重新构建、测试或启动原生程序，也不把带原20条dirty的完整Main工作树视为干净候选。C57原恢复、installer、W13/W20全项或正式v2.4接受均不从本次整合推出，formal_increment=0。
+
+复核仅在本独立main-integration-post目录写回执；source/shared-state写入0、GUI/Core启动或进程控制0、清理与被拒绝操作重试0。实际只读Git命令及期望退出码见ACTUAL-READ-ONLY-GIT-COMMANDS.json，原始整合证据副本见inputs目录。

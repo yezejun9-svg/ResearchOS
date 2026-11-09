@@ -1,0 +1,43 @@
+internal/domain\client_protocol_sessions.go:22:func clientAuthenticatedPrincipal(ctx context.Context, tx *sql.Tx, id string) (Principal, error) {
+internal/domain\store.go:132:func Base(project string) Object {
+internal/domain\contracts.go:134:func Ref(o Object, kind string) Object {
+				return nil, Fail(422, "GATE_FAILED", "evaluation schema mismatch")
+			}
+			if report["project_id"] != project {
+				return nil, Fail(422, "GATE_FAILED", "evaluation project mismatch")
+			}
+			return nil, Fail(503, "RESOURCE_UNAVAILABLE", "evaluation execution and independent summary publication require W10/W17")
+		}
+	}
+	o := Merge(Base(project), b)
+	validity := "CURRENT"
+	for _, field := range []string{"input_refs", "source_refs"} {
+		for _, v := range Arr(b, field) {
+			r := v.(map[string]any)
+			if _, e = version(tx, project, r); e != nil {
+				return nil, e
+			}
+			if e = s.effective(tx, project, r); e != nil {
+				validity = "STALE"
+			}
+		}
+	}
+	Merge(o, Object{"validity": validity, "sealed_at": Now()})
+	var priorRaw string
+	lookupErr := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.content_hash')=? AND json_extract(body,'$.kind')=?", project, hash, b["kind"]).Scan(&priorRaw)
+	if lookupErr == nil {
+		prior, e := Decode([]byte(priorRaw))
+		if e != nil {
+			return nil, e
+		}
+		if e = s.reusableArtifact(tx, p, project, prior, b, contributionRun); e != nil {
+			return nil, e
+		}
+		if _, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"]); e != nil {
+			return nil, e
+		}
+		if e = s.recordArtifactUse(tx, p, project, contributionRun, prior, b); e != nil {
+			return nil, e
+		}
+		return prior, nil
+	}

@@ -1,0 +1,555 @@
+diff --git a/adapters/runtime/bridge_legacy_checkpoint_windows_test.go b/adapters/runtime/bridge_legacy_checkpoint_windows_test.go
+new file mode 100644
+index 00000000..e1cbf0e2
+--- /dev/null
++++ b/adapters/runtime/bridge_legacy_checkpoint_windows_test.go
+@@ -0,0 +1,292 @@
++//go:build windows
++
++package runtime
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	sandbox "researchos.local/research-os/ops/experiment_sandbox"
++)
++
++func checkpointCompatInputs(backend string, protocol any) ([]byte, []byte) {
++	manifest, _ := json.Marshal(map[string]any{"task_id": "task", "run_id": "run", "epoch": 1, "dispatch_key": "dispatch", "admission": map[string]any{"profile": map[string]any{"backend": backend, "outputs": []any{}}}})
++	request := map[string]any{"task_id": "task", "run_id": "run", "epoch": 1}
++	if protocol != nil {
++		request["pause_protocol"] = protocol
++	}
++	raw, _ := json.Marshal(request)
++	return manifest, raw
++}
++
++func TestBridgeCheckpointModeFrozenInputs(t *testing.T) {
++	for _, tc := range []struct {
++		name, backend string
++		protocol      any
++		mode          bridgeCheckpointMode
++		fails         bool
++	}{
++		{"legacy", "fixture", nil, checkpointLegacy, false},
++		{"old-mu-normal", "mu-sdk-broker-v1", nil, checkpointDisabled, false},
++		{"mu-v1", "mu-sdk-broker-v1", PauseProtocol, checkpointPauseV1, false},
++		{"non-mu-explicit-v1", "fixture", PauseProtocol, checkpointPauseV1, false},
++		{"unknown", "fixture", "RESEARCHOS_PAUSE_V2", 0, true},
++		{"empty-negotiation", "fixture", "", 0, true},
++		{"invalid-type", "fixture", true, 0, true},
++		{"no-profile", "", nil, 0, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			manifest, raw := checkpointCompatInputs(tc.backend, tc.protocol)
++			m, _ := bridgeMap(manifest)
++			mode, err := checkpointModeForRequest(m, raw)
++			if (err != nil) != tc.fails || err == nil && mode != tc.mode {
++				t.Fatalf("mode=%v err=%v", mode, err)
++			}
++		})
++	}
++	manifest, raw := checkpointCompatInputs("fixture", nil)
++	m, _ := bridgeMap(manifest)
++	for _, key := range []string{"task_id", "run_id", "epoch"} {
++		t.Run("foreign-"+key, func(t *testing.T) {
++			r, _ := bridgeMap(raw)
++			r[key] = "foreign"
++			bad, _ := json.Marshal(r)
++			if _, err := checkpointModeForRequest(m, bad); err == nil {
++				t.Fatal("foreign request accepted")
++			}
++		})
++	}
++}
++
++func checkpointCompatBridge(t *testing.T, backend string, protocol any) *Bridge {
++	t.Helper()
++	manifest, request := checkpointCompatInputs(backend, protocol)
++	m, _ := bridgeMap(manifest)
++	mode, err := checkpointModeForRequest(m, request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	directory := t.TempDir()
++	f, err := os.Create(filepath.Join(directory, "stdout.raw"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { f.Close() })
++	w := &Bridge{directory: directory, checkpointMode: mode, stdout: f, frames: make(chan BridgeFrame, 8), streamOffsets: map[string]int64{}, journal: BridgeJournal{Manifest: manifest, InputHash: Hash(request), ContextReady: true, Frames: 1, Acknowledged: 1}}
++	if mode == checkpointPauseV1 {
++		w.journal.PauseProtocol = PauseProtocol
++	}
++	return w
++}
++
++func checkpointCompatConsume(w *Bridge, frame BridgeFrame) error {
++	raw, _ := json.Marshal(frame)
++	return w.consume(sandbox.StreamChunk{Stream: "stdout", Offset: w.streamOffsets["stdout"], Data: append(raw, '\n')})
++}
++
++func TestBridgeCheckpointCrossModeFrames(t *testing.T) {
++	for _, tc := range []struct {
++		name, backend string
++		protocol      any
++		frame         BridgeFrame
++		fails         bool
++	}{
++		{"legacy-inline", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{"cursor":"saved"}`)}, false},
++		{"legacy-inline-file-label", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Path: "checkpoint.json", Payload: json.RawMessage(`{"cursor":"saved"}`)}, false},
++		{"legacy-v1-file", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Path: PauseCheckpointFilename, Payload: json.RawMessage(`{}`)}, true},
++		{"legacy-v1-key", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Key: "checkpoint.sealed", Payload: json.RawMessage(`{}`)}, true},
++		{"legacy-v1-payload", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{"version":"RESEARCHOS_PAUSE_V1"}`)}, true},
++		{"legacy-empty", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint"}, true},
++		{"mu-unnegotiated-inline", "mu-sdk-broker-v1", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{}`)}, true},
++		{"mu-unnegotiated-normal", "mu-sdk-broker-v1", nil, BridgeFrame{Sequence: 2, Type: "turn.completed"}, false},
++		{"v1-inline", "mu-sdk-broker-v1", PauseProtocol, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{"cursor":"saved"}`)}, true},
++		{"v1-missing-metadata", "mu-sdk-broker-v1", PauseProtocol, BridgeFrame{Sequence: 2, Type: "checkpoint", Path: PauseCheckpointFilename, Key: "checkpoint.sealed", Payload: json.RawMessage(`{}`)}, true},
++		{"explicit-non-mu-cannot-fallback", "fixture", PauseProtocol, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{}`)}, true},
++		{"legacy-oversized-inline", "fixture", nil, BridgeFrame{Sequence: 2, Type: "checkpoint", Payload: json.RawMessage(`{"cursor":"` + strings.Repeat("x", 64*1024) + `"}`)}, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			w := checkpointCompatBridge(t, tc.backend, tc.protocol)
++			err := checkpointCompatConsume(w, tc.frame)
++			if (err != nil) != tc.fails {
++				t.Fatalf("err=%v", err)
++			}
++			if tc.fails && w.journal.Frames != 1 {
++				t.Fatal("rejected frame advanced journal")
++			}
++		})
++	}
++	for _, tc := range []struct {
++		name, backend string
++		protocol      any
++		payload       json.RawMessage
++		fails         bool
++	}{
++		{"legacy-empty-paused", "fixture", nil, nil, false},
++		{"legacy-typed-paused", "fixture", nil, json.RawMessage(`{"version":"RESEARCHOS_PAUSE_V1"}`), true},
++		{"mu-empty-paused", "mu-sdk-broker-v1", nil, nil, true},
++		{"v1-empty-paused", "mu-sdk-broker-v1", PauseProtocol, nil, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			w := checkpointCompatBridge(t, tc.backend, tc.protocol)
++			w.journal.CheckpointSequence = 1
++			if tc.protocol == PauseProtocol {
++				w.journal.Checkpoint = &PauseCheckpoint{Version: PauseProtocol, Binding: json.RawMessage(`{}`)}
++				w.journal.CheckpointSeal = &CheckpointSeal{Version: PauseProtocol}
++			}
++			err := checkpointCompatConsume(w, BridgeFrame{Sequence: 2, Type: "turn.paused", Payload: tc.payload})
++			if (err != nil) != tc.fails {
++				t.Fatalf("err=%v", err)
++			}
++			if tc.fails && w.journal.Paused {
++				t.Fatal("rejected pause became terminal")
++			}
++		})
++	}
++}
++
++func TestBridgeCheckpointCrossModeAcknowledgements(t *testing.T) {
++	legacy := map[string]any{"sequence": 2, "type": "checkpoint.sealed", "artifact_ref": map[string]any{"entity_type": "Artifact", "id": "artifact"}}
++	typed := map[string]any{"sequence": 2, "key": "checkpoint.sealed", "state": "CONFIRMED", "payload": map[string]any{"version": PauseProtocol}}
++	for _, tc := range []struct {
++		name, backend   string
++		protocol, reply any
++	}{
++		{"v1-legacy-ack", "mu-sdk-broker-v1", PauseProtocol, legacy},
++		{"v1-weak-ack", "mu-sdk-broker-v1", PauseProtocol, typed},
++		{"legacy-typed-ack", "fixture", nil, typed},
++		{"legacy-nil-ack", "fixture", nil, nil},
++		{"mu-unnegotiated-legacy-ack", "mu-sdk-broker-v1", nil, legacy},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			w := checkpointCompatBridge(t, tc.backend, tc.protocol)
++			w.journal.Frames = 2
++			w.journal.CheckpointSequence = 2
++			if err := w.Acknowledge(context.Background(), 2, tc.reply); err == nil {
++				t.Fatal("cross-mode or incomplete ACK accepted")
++			}
++			if w.journal.Acknowledged != 1 {
++				t.Fatal("invalid ACK advanced state")
++			}
++		})
++	}
++}
++
++func checkpointCompatTerminal(t *testing.T, backend string, protocol any) (string, BridgeJournal) {
++	t.Helper()
++	directory := t.TempDir()
++	manifest, request := checkpointCompatInputs(backend, protocol)
++	hash, _ := canonicalHash(manifest)
++	if err := os.Mkdir(filepath.Join(directory, "input"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(directory, "input", "request.json"), request, 0600); err != nil {
++		t.Fatal(err)
++	}
++	for _, name := range []string{"stdout.raw", "stderr.raw"} {
++		if err := os.WriteFile(filepath.Join(directory, name), nil, 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	j := BridgeJournal{Manifest: manifest, ManifestHash: hash, DispatchKey: "dispatch", InputHash: Hash(request), Ended: "2026-10-14T00:00:00Z", State: "PAUSED", Frames: 3, Acknowledged: 3, ContextReady: true, ProtocolComplete: true, Paused: true, CheckpointSequence: 2, StdoutHash: Hash(nil), StderrHash: Hash(nil), Receipt: sandbox.Receipt{Stopped: true, StreamsDrained: true, CleanupComplete: true, OutputCopied: true}}
++	if protocol == PauseProtocol {
++		j.PauseProtocol = PauseProtocol
++		j.PauseRequested = true
++		j.PauseID = "pause"
++		checkpoint := []byte(`{"sdk":"frozen"}`)
++		binding := json.RawMessage(`{"project_id":"project","run_id":"run","runtime_epoch":1}`)
++		j.Checkpoint = &PauseCheckpoint{Version: PauseProtocol, PauseID: "pause", Binding: binding, Bytes: int64(len(checkpoint)), ContentHash: Hash(checkpoint)}
++		fact, _ := json.Marshal(map[string]any{"project_id": "project", "run_id": "run", "epoch": 1, "manifest_hash": hash, "dispatch_key": "dispatch", "sequence": 2, "content_hash": j.Checkpoint.ContentHash})
++		if err := os.WriteFile(filepath.Join(directory, "checkpoint.sealed.json"), checkpoint, 0600); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(directory, "checkpoint-2.json"), fact, 0600); err != nil {
++			t.Fatal(err)
++		}
++		j.CheckpointSeal = &CheckpointSeal{Type: "checkpoint.sealed", Version: PauseProtocol, PauseID: "pause", Binding: binding, Sequence: 2, ContentHash: j.Checkpoint.ContentHash, CheckpointArtifactID: "artifact", CheckpointUsePrincipal: "executor", CheckpointUseReceiptHash: Hash([]byte("use")), JournalCheckpointHash: Hash(fact)}
++	}
++	return directory, j
++}
++
++func TestBridgeCheckpointRecoveryNoProtocolDowngrade(t *testing.T) {
++	for _, tc := range []struct {
++		name, backend string
++		protocol      any
++		mutate        func(string, *BridgeJournal)
++		fails         bool
++	}{
++		{"legacy-paused", "fixture", nil, nil, false},
++		{"v1-paused", "mu-sdk-broker-v1", PauseProtocol, nil, false},
++		{"v1-erased-mode", "mu-sdk-broker-v1", PauseProtocol, func(_ string, j *BridgeJournal) { j.PauseProtocol = "" }, true},
++		{"v1-erased-all-pause-fields", "fixture", PauseProtocol, func(_ string, j *BridgeJournal) {
++			j.PauseProtocol = ""
++			j.Checkpoint = nil
++			j.CheckpointSeal = nil
++			j.PauseRequested = false
++			j.PauseID = ""
++		}, true},
++		{"v1-changed-mode", "mu-sdk-broker-v1", PauseProtocol, func(_ string, j *BridgeJournal) { j.PauseProtocol = "RESEARCHOS_PAUSE_V2" }, true},
++		{"v1-missing-seal", "mu-sdk-broker-v1", PauseProtocol, func(_ string, j *BridgeJournal) { j.CheckpointSeal = nil }, true},
++		{"v1-changed-checkpoint", "mu-sdk-broker-v1", PauseProtocol, func(d string, j *BridgeJournal) {
++			os.WriteFile(filepath.Join(d, "checkpoint.sealed.json"), []byte("changed"), 0600)
++		}, true},
++		{"v1-erased-request-mode", "mu-sdk-broker-v1", PauseProtocol, func(d string, j *BridgeJournal) {
++			_, r := checkpointCompatInputs("mu-sdk-broker-v1", nil)
++			os.WriteFile(filepath.Join(d, "input", "request.json"), r, 0600)
++		}, true},
++		{"foreign-request-even-with-new-hash", "fixture", nil, func(d string, j *BridgeJournal) {
++			r := []byte(`{"task_id":"task","run_id":"foreign","epoch":1}`)
++			j.InputHash = Hash(r)
++			os.WriteFile(filepath.Join(d, "input", "request.json"), r, 0600)
++		}, true},
++		{"changed-manifest-profile", "mu-sdk-broker-v1", PauseProtocol, func(_ string, j *BridgeJournal) { j.Manifest, _ = checkpointCompatInputs("fixture", nil) }, true},
++		{"legacy-mixed-seal", "fixture", nil, func(_ string, j *BridgeJournal) { j.CheckpointSeal = &CheckpointSeal{} }, true},
++		{"legacy-undrained", "fixture", nil, func(_ string, j *BridgeJournal) { j.Receipt.StreamsDrained = false }, true},
++		{"legacy-unacked", "fixture", nil, func(_ string, j *BridgeJournal) { j.Acknowledged = 1 }, true},
++		{"mu-unnegotiated-paused", "mu-sdk-broker-v1", nil, nil, true},
++		{"mu-unnegotiated-normal", "mu-sdk-broker-v1", nil, func(_ string, j *BridgeJournal) { j.Paused = false; j.CheckpointSequence = 0; j.State = "SETTLED" }, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			d, j := checkpointCompatTerminal(t, tc.backend, tc.protocol)
++			hash := j.ManifestHash
++			if tc.mutate != nil {
++				tc.mutate(d, &j)
++			}
++			if err := save(filepath.Join(d, "bridge.json"), j); err != nil {
++				t.Fatal(err)
++			}
++			_, err := ReadBridgeTerminal(d, hash)
++			if (err != nil) != tc.fails {
++				t.Fatalf("err=%v", err)
++			}
++		})
++	}
++}
++
++func TestBridgeCheckpointFrozenRequestNoReparse(t *testing.T) {
++	directory := t.TempDir()
++	targetDirectory := filepath.Join(directory, "target")
++	if err := os.Mkdir(targetDirectory, 0700); err != nil {
++		t.Fatal(err)
++	}
++	target := filepath.Join(targetDirectory, "request.json")
++	if err := os.WriteFile(target, []byte(`{"request":"frozen"}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	linkDirectory := filepath.Join(directory, "input")
++	// A directory junction exercises reparse ancestors without requiring the
++	// machine-wide symbolic-link privilege or Developer Mode.
++	if output, err := exec.Command("cmd", "/c", "mklink", "/J", linkDirectory, targetDirectory).CombinedOutput(); err != nil {
++		t.Fatalf("create junction negative: %v %s", err, output)
++	}
++	if _, err := readBridgeInputFile(filepath.Join(linkDirectory, "request.json"), 64*1024*1024); err == nil {
++		t.Fatal("reparse request accepted")
++	}
++	if _, err := readBridgeInputFile(target, 4); err == nil {
++		t.Fatal("bounded request reader exceeded limit")
++	}
++}
+diff --git a/adapters/runtime/bridge_windows.go b/adapters/runtime/bridge_windows.go
+index 5b2661a7..25189ca1 100644
+--- a/adapters/runtime/bridge_windows.go
++++ b/adapters/runtime/bridge_windows.go
+@@ -113,7 +113,16 @@ type BridgeJournal struct {
+ 	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
+ }
+ 
++type bridgeCheckpointMode uint8
++
++const (
++	checkpointDisabled bridgeCheckpointMode = iota
++	checkpointLegacy
++	checkpointPauseV1
++)
++
+ type Bridge struct {
++	checkpointMode                            bridgeCheckpointMode
+ 	mu                                        sync.Mutex
+ 	directory                                 string
+ 	lock                                      *os.File
+@@ -160,6 +169,45 @@ func canonicalHash(raw []byte) (string, error) {
+ 	return Hash(b), nil
+ }
+ 
++// The host request and manifest select the protocol before any worker output.
++// In particular, an older Mu worker can run normally without pause capability,
++// but its frames cannot opt into the legacy context-rebuild checkpoint path.
++func checkpointModeForRequest(manifest map[string]any, raw []byte) (bridgeCheckpointMode, error) {
++	if _, err := canonical.JSON(raw); err != nil {
++		return checkpointDisabled, errors.New("invalid frozen checkpoint request")
++	}
++	request, err := bridgeMap(raw)
++	if err != nil {
++		return checkpointDisabled, err
++	}
++	if request["task_id"] != manifest["task_id"] || request["run_id"] != manifest["run_id"] || bridgeNumber(request, "epoch") != bridgeNumber(manifest, "epoch") {
++		return checkpointDisabled, errors.New("checkpoint request differs from manifest")
++	}
++	if protocol, exists := request["pause_protocol"]; exists {
++		if protocol != PauseProtocol {
++			return checkpointDisabled, errors.New("unknown pause protocol")
++		}
++		return checkpointPauseV1, nil
++	}
++	admission, _ := manifest["admission"].(map[string]any)
++	profile, _ := admission["profile"].(map[string]any)
++	if bridgeString(profile, "backend") == "" {
++		return checkpointDisabled, errors.New("checkpoint profile backend required")
++	}
++	if profile["backend"] == "mu-sdk-broker-v1" {
++		return checkpointDisabled, nil
++	}
++	return checkpointLegacy, nil
++}
++
++func validateLegacyCheckpoint(frame BridgeFrame) error {
++	payload, err := bridgeMap(frame.Payload)
++	if err != nil || len(frame.Payload) > 64*1024 || (frame.Path != "" && frame.Path != "checkpoint.json") || frame.Key != "" || payload["version"] == PauseProtocol {
++		return errors.New("bounded legacy inline checkpoint required")
++	}
++	return nil
++}
++
+ // LockDataRoot is held for the complete control coordinator lifetime. It uses
+ // an OS-exclusive non-inherited handle, not the SQLite connection count.
+ func LockDataRoot(directory string) (*os.File, error) {
+@@ -193,6 +241,10 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
+ 	}
+ 	admission, _ := manifest["admission"].(map[string]any)
+ 	profile, _ := admission["profile"].(map[string]any)
++	checkpointMode, e := checkpointModeForRequest(manifest, request.Inputs["request.json"])
++	if e != nil {
++		return nil, e
++	}
+ 	if e = validateBridgeProgram(profile, request.Inputs); e != nil {
+ 		return nil, e
+ 	}
+@@ -228,12 +280,12 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
+ 		return nil, e
+ 	}
+ 	child, cancel := context.WithCancel(ctx)
+-	w := &Bridge{directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}, modelObservations: make(chan ModelStreamObservation, ModelStreamWindow), modelChanged: make(chan struct{})}
++	w := &Bridge{checkpointMode: checkpointMode, directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}, modelObservations: make(chan ModelStreamObservation, ModelStreamWindow), modelChanged: make(chan struct{})}
+ 	w.journal = BridgeJournal{Version: 1, Manifest: append(json.RawMessage(nil), request.Manifest...), ManifestHash: digest, DispatchKey: bridgeString(manifest, "dispatch_key"), Worker: request.WorkerID, Revision: BridgeRevision, State: "PREPARED", Started: now(), Artifacts: []Artifact{}, InputHash: Hash(request.Inputs["request.json"])}
+ 	inputRequest, _ := bridgeMap(request.Inputs["request.json"])
+ 	w.journal.QueueRequired = inputRequest["queue_control"] == true
+ 	w.journal.QueueBinding, _ = json.Marshal(inputRequest["queue_binding"])
+-	if inputRequest["pause_protocol"] == PauseProtocol {
++	if checkpointMode == checkpointPauseV1 {
+ 		w.journal.PauseProtocol = PauseProtocol
+ 	}
+ 	failed := true
+@@ -408,18 +460,39 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+ 				return errors.New("context and queue initialization acknowledgement required before work")
+ 			}
+ 			if frame.Type == "checkpoint" {
+-				if err := w.capturePauseCheckpoint(frame); err != nil {
+-					return err
++				switch w.checkpointMode {
++				case checkpointPauseV1:
++					if err := w.capturePauseCheckpoint(frame); err != nil {
++						return err
++					}
++				case checkpointLegacy:
++					if err := validateLegacyCheckpoint(frame); err != nil {
++						return err
++					}
++				default:
++					return errors.New("checkpoint capability was not negotiated")
+ 				}
+ 				w.journal.CheckpointSequence = frame.Sequence
+ 			}
+ 		case "turn.paused":
+-			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence || w.journal.CheckpointSeal == nil {
++			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence {
+ 				return errors.New("durably acknowledged checkpoint required before pause")
+ 			}
+-			var paused CheckpointSeal
+-			if json.Unmarshal(frame.Payload, &paused) != nil || paused.Version != PauseProtocol || !samePauseBinding(paused.Binding, w.journal.Checkpoint.Binding) || paused.Sequence != w.journal.CheckpointSequence || paused.ContentHash != w.journal.Checkpoint.ContentHash || paused.PauseID != w.journal.PauseID || paused.CheckpointUsePrincipal != w.journal.CheckpointSeal.CheckpointUsePrincipal || paused.CheckpointArtifactID != w.journal.CheckpointSeal.CheckpointArtifactID || paused.CheckpointUseReceiptHash != w.journal.CheckpointSeal.CheckpointUseReceiptHash || paused.JournalCheckpointHash != w.journal.CheckpointSeal.JournalCheckpointHash {
+-				return errors.New("paused seal correlation mismatch")
++			switch w.checkpointMode {
++			case checkpointPauseV1:
++				if w.journal.CheckpointSeal == nil || w.journal.Checkpoint == nil {
++					return errors.New("typed checkpoint seal required before pause")
++				}
++				var paused CheckpointSeal
++				if json.Unmarshal(frame.Payload, &paused) != nil || paused.Version != PauseProtocol || !samePauseBinding(paused.Binding, w.journal.Checkpoint.Binding) || paused.Sequence != w.journal.CheckpointSequence || paused.ContentHash != w.journal.Checkpoint.ContentHash || paused.PauseID != w.journal.PauseID || paused.CheckpointUsePrincipal != w.journal.CheckpointSeal.CheckpointUsePrincipal || paused.CheckpointArtifactID != w.journal.CheckpointSeal.CheckpointArtifactID || paused.CheckpointUseReceiptHash != w.journal.CheckpointSeal.CheckpointUseReceiptHash || paused.JournalCheckpointHash != w.journal.CheckpointSeal.JournalCheckpointHash {
++					return errors.New("paused seal correlation mismatch")
++				}
++			case checkpointLegacy:
++				if len(frame.Payload) != 0 {
++					return errors.New("legacy pause cannot carry a typed seal")
++				}
++			default:
++				return errors.New("pause capability was not negotiated")
+ 			}
+ 			w.journal.Paused, w.journal.ProtocolComplete = true, true
+ 		case "turn.completed":
+@@ -635,18 +708,31 @@ func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any)
+ 			w.mu.Unlock()
+ 			return e
+ 		}
+-		var reply struct {
+-			Sequence int64          `json:"sequence"`
+-			Key      string         `json:"key"`
+-			State    string         `json:"state"`
+-			Payload  CheckpointSeal `json:"payload"`
+-		}
+-		if json.Unmarshal(raw, &reply) != nil || reply.Sequence != sequence || reply.Key != "checkpoint.sealed" || reply.State != "CONFIRMED" || w.validateCheckpointSeal(reply.Payload) != nil {
++		switch w.checkpointMode {
++		case checkpointPauseV1:
++			var reply struct {
++				Sequence int64          `json:"sequence"`
++				Key      string         `json:"key"`
++				State    string         `json:"state"`
++				Payload  CheckpointSeal `json:"payload"`
++			}
++			if json.Unmarshal(raw, &reply) != nil || reply.Sequence != sequence || reply.Key != "checkpoint.sealed" || reply.State != "CONFIRMED" || w.validateCheckpointSeal(reply.Payload) != nil {
++				w.mu.Unlock()
++				return errors.New("checkpoint requires durable artifact/use/journal seal")
++			}
++			seal := reply.Payload
++			w.journal.CheckpointSeal = &seal
++		case checkpointLegacy:
++			reply, e := bridgeMap(raw)
++			artifact, _ := reply["artifact_ref"].(map[string]any)
++			if e != nil || bridgeNumber(reply, "sequence") != sequence || reply["type"] != "checkpoint.sealed" || reply["payload"] != nil || artifact["entity_type"] != "Artifact" || bridgeString(artifact, "id") == "" {
++				w.mu.Unlock()
++				return errors.New("legacy checkpoint requires artifact acknowledgement")
++			}
++		default:
+ 			w.mu.Unlock()
+-			return errors.New("checkpoint requires durable artifact/use/journal seal")
++			return errors.New("checkpoint acknowledgement without negotiated capability")
+ 		}
+-		seal := reply.Payload
+-		w.journal.CheckpointSeal = &seal
+ 	}
+ 	w.journal.Acknowledged = sequence
+ 	err := w.persist()
+@@ -819,6 +905,34 @@ func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+ 	if e != nil || digest != manifestHash || j.ManifestHash != manifestHash {
+ 		return j, errors.New("recovery manifest mismatch")
+ 	}
++	manifest, e := bridgeMap(j.Manifest)
++	if e != nil {
++		return j, e
++	}
++	request, e := readBridgeInputFile(filepath.Join(directory, "input", "request.json"), 64*1024*1024)
++	if e != nil || Hash(request) != j.InputHash {
++		return j, errors.New("recovery frozen request mismatch")
++	}
++	mode, e := checkpointModeForRequest(manifest, request)
++	if e != nil {
++		return j, e
++	}
++	expectedProtocol := ""
++	if mode == checkpointPauseV1 {
++		expectedProtocol = PauseProtocol
++	}
++	if j.PauseProtocol != expectedProtocol {
++		return j, errors.New("recovery pause protocol differs from frozen request")
++	}
++	if mode != checkpointPauseV1 && (j.Checkpoint != nil || j.CheckpointSeal != nil || j.PauseRequested || j.PauseID != "") {
++		return j, errors.New("recovery mixed checkpoint protocol")
++	}
++	if mode == checkpointDisabled && (j.Paused || j.CheckpointSequence != 0) {
++		return j, errors.New("recovery unnegotiated checkpoint")
++	}
++	if j.Paused && (!j.ContextReady || !j.ProtocolComplete || j.CheckpointSequence <= 0 || j.Acknowledged < j.CheckpointSequence || j.Acknowledged != j.Frames || j.State != "PAUSED" || j.Receipt.ExitCode != 0 || !j.Receipt.OutputCopied || j.Cancelled) {
++		return j, errors.New("recovery pause terminal incomplete")
++	}
+ 	if j.Identity.PID != 0 {
+ 		alive, e := inspectIdentity(j.Identity.PID, j.Identity.Created)
+ 		if e != nil || alive {
+@@ -848,13 +962,9 @@ func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+ 			return j, errors.New("recovery checkpoint bytes changed")
+ 		}
+ 	}
+-	if j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
++	if mode == checkpointPauseV1 && j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
+ 		return j, errors.New("recovery checkpoint seal missing")
+ 	}
+-	manifest, e := bridgeMap(j.Manifest)
+-	if e != nil {
+-		return j, e
+-	}
+ 	admission, _ := manifest["admission"].(map[string]any)
+ 	profile, _ := admission["profile"].(map[string]any)
+ 	expected, _ := profile["outputs"].([]any)
+@@ -972,6 +1082,10 @@ func ReconcileBridge(directory, manifestHash string) (BridgeJournal, error) {
+ // readPauseFile opens the final path without following a reparse point and
+ // denies concurrent writes/deletion while reading at most 12 MiB + 1 byte.
+ func readPauseFile(path string) ([]byte, error) {
++	return readBridgeInputFile(path, MaxPauseCheckpointBytes)
++}
++
++func readBridgeInputFile(path string, maxBytes int64) ([]byte, error) {
+ 	actual, err := filepath.EvalSymlinks(path)
+ 	if err != nil || !strings.EqualFold(filepath.Clean(actual), filepath.Clean(path)) {
+ 		return nil, errors.New("checkpoint reparse rejected")
+@@ -997,11 +1111,11 @@ func readPauseFile(path string) ([]byte, error) {
+ 		return nil, errors.New("regular non-reparse checkpoint required")
+ 	}
+ 	stat, err := file.Stat()
+-	if err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > MaxPauseCheckpointBytes {
++	if err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > maxBytes {
+ 		return nil, errors.New("checkpoint size invalid")
+ 	}
+-	raw, err := io.ReadAll(io.LimitReader(file, MaxPauseCheckpointBytes+1))
+-	if err != nil || len(raw) > MaxPauseCheckpointBytes || int64(len(raw)) != stat.Size() {
++	raw, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
++	if err != nil || int64(len(raw)) > maxBytes || int64(len(raw)) != stat.Size() {
+ 		return nil, errors.New("checkpoint read bound violated")
+ 	}
+ 	return raw, nil

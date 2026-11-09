@@ -1,0 +1,417 @@
+{
+  "all": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "names": [
+    "artifact_use_proofs",
+    "artifact_uses",
+    "auth_credentials",
+    "auth_grants",
+    "auth_principals",
+    "backup_restore_barriers",
+    "client_command_identities",
+    "client_command_queue",
+    "client_control_receipts",
+    "client_control_requests",
+    "client_queue_fences",
+    "client_sessions",
+    "consumer_inbox",
+    "consumer_positions",
+    "context_changes",
+    "context_imports",
+    "context_projection",
+    "decision_lineage",
+    "domain_objects",
+    "domain_refs",
+    "domain_versions",
+    "evaluation_native_tools",
+    "event_state_snapshots",
+    "evidence_origins",
+    "evolution_builds",
+    "evolution_candidates",
+    "evolution_executions",
+    "evolution_hosts",
+    "evolution_journal",
+    "evolution_release_operations",
+    "evolution_slots",
+    "evolution_tasks",
+    "experiment_executions",
+    "experiment_runs",
+    "experiment_tasks",
+    "host_model_config_heads",
+    "host_model_configurations",
+    "idempotency",
+    "intent_plan_bindings",
+    "orchestration_contracts",
+    "orchestration_failures",
+    "orchestration_fixtures",
+    "orchestration_goal_contracts",
+    "orchestration_identity",
+    "orchestration_rejections",
+    "orchestration_run_dependencies",
+    "orchestration_task_controls",
+    "outbox",
+    "page_cursors",
+    "remote_audit",
+    "remote_challenges",
+    "remote_devices",
+    "remote_refresh",
+    "remote_replays",
+    "research_candidate_reviews",
+    "research_cycle_work",
+    "research_monitor_cycles",
+    "research_pending_windows",
+    "resource_checkpoint_carries",
+    "resource_effects",
+    "resource_progress_resumes",
+    "resource_progress_runs",
+    "resource_resolutions",
+    "resource_route_grants",
+    "resource_route_history",
+    "resource_write_lock",
+    "retrieval_dedupe",
+    "retrieval_fts",
+    "retrieval_fts_config",
+    "retrieval_fts_content",
+    "retrieval_fts_data",
+    "retrieval_fts_docsize",
+    "retrieval_fts_idx",
+    "retrieval_index",
+    "retrieval_roots",
+    "retrieval_snapshots",
+    "runtime_bindings",
+    "runtime_dispatches",
+    "runtime_observations",
+    "runtime_prepared_abandonments",
+    "runtime_qualification_approvals",
+    "runtime_qualification_plans",
+    "runtime_qualification_runs",
+    "runtime_uploads",
+    "schema_migrations",
+    "source_pages",
+    "sqlite_sequence",
+    "uploaded_content"
+  ],
+  "integrity": "ok",
+  "restoredIntegrity": "ok",
+  "differences": [
+    "auth_credentials",
+    "domain_objects"
+  ]
+}
+package domain
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
+	"strconv"
+	"strings"
+	"time"
+	_ "time/tzdata"
+)
+
+type Service struct {
+	DB        *sql.DB
+	Contracts *Contracts
+	Protected protectedstore.Provider
+	// Fixed by a trusted constructor, never by a request or environment selector.
+	projectBindingRoute string
+	// Supplied only by a trusted local Root witness integration; nil fails closed.
+	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
+}
+type Fault struct {
+	Status        int
+	Code, Message string
+	Current       any
+}
+
+func (f *Fault) Error() string { return f.Code + ": " + f.Message }
+func Fail(status int, code, msg string) error {
+	return &Fault{Status: status, Code: code, Message: msg}
+}
+
+// NewCurrentMu is the installed current host's fixed construction policy. New
+// remains the legacy constructor so existing stored projects and fixtures keep
+// their historical binding semantics. Children inherit their stored parent.
+func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+		return nil, err
+	}
+	s, err := New(db, contractsDir, migrationFile)
+	if err != nil {
+		return nil, err
+	}
+	s.projectBindingRoute = "MU_FORK"
+	return s, nil
+}
+
+func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	c, e := LoadContracts(contractsDir)
+	if e != nil {
+		return nil, e
+	}
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
+	if e != nil {
+		return nil, e
+	}
+	if _, e = os.Stat(migrationFile); e != nil {
+		return nil, e
+	}
+	// Refuse future/gapped inventories before domain, additive or fence DDL.
+	// The lower storage layer has already opened the file and selected WAL.
+	if _, e = checkMigrationInventory(db, files); e != nil {
+		return nil, e
+	}
+	if e = CheckMigrationSafety(db, files); e != nil {
+		return nil, e
+	}
+	tx, e := db.Begin()
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	for _, file := range files {
+		version, err := strconv.Atoi(filepath.Base(file)[:4])
+		if err != nil {
+			return nil, err
+		}
+		if version < 2 {
+			continue
+		}
+		var applied int
+		if err := tx.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=?", version).Scan(&applied); err != nil {
+			return nil, err
+		}
+		if applied != 0 {
+			continue
+		}
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(string(b)); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", version); err != nil {
+			return nil, err
+		}
+	}
+	// W03's additive session schema has its own unnumbered, idempotent path.
+	// The production host must install it as well as the tests and import tools.
+	// Keep it in the same transaction so a missing or invalid schema cannot
+	// leave the business migrations committed with the typed client unusable.
+	sessionSchema, err := os.ReadFile(filepath.Join(filepath.Dir(migrationFile), "next_v24_sessions.sql"))
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(string(sessionSchema)); err != nil {
+		return nil, err
+	}
+	if err = installClientSessionFence(context.Background(), tx, false); err != nil {
+		return nil, err
+	}
+	if e = tx.Commit(); e != nil {
+		return nil, e
+	}
+	return &Service{DB: db, Contracts: c, projectBindingRoute: "THIN_CORE"}, nil
+}
+func ID() string {
+	var b [16]byte
+	if _, e := rand.Read(b[:]); e != nil {
+		panic(e)
+	}
+	return hex.EncodeToString(b[:])
+}
+func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+func Base(project string) Object {
+	now := Now()
+	return Object{"id": ID(), "project_id": project, "revision": 1, "created_at": now, "updated_at": now}
+}
+func Merge(o Object, fields Object) Object {
+	for k, v := range fields {
+		o[k] = v
+	}
+	return o
+}
+func Empty() []any { return []any{} }
+func load(tx *sql.Tx, project, kind, id string) (Object, error) {
+	var raw string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind=? AND id=?", project, kind, id).Scan(&raw)
+	if errors.Is(e, sql.ErrNoRows) {
+		return nil, Fail(404, "NOT_FOUND", "object unavailable")
+	}
+	if e != nil {
+		return nil, e
+	}
+	return Decode([]byte(raw))
+}
+func singleton(tx *sql.Tx, project, kind string) (Object, error) {
+	var raw string
+	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind=?", project, kind).Scan(&raw)
+	if errors.Is(e, sql.ErrNoRows) {
+		return nil, Fail(404, "NOT_FOUND", "object unavailable")
+	}
+	if e != nil {
+		return nil, e
+	}
+	return Decode([]byte(raw))
+}
+func bump(o Object) error {
+	n, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
+	if n == 1<<63-1 {
+		return Fail(409, "STATE_CONFLICT", "revision exhausted")
+	}
+	o["revision"] = n + 1
+	o["updated_at"] = Now()
+	return nil
+}
+
+var idTargets = map[string]string{
+	"budget_policy_id": "BudgetPolicy", "run_policy_id": "RunPolicy", "goal_id": "Goal", "task_id": "Task", "task_ids": "Task", "dependency_task_ids": "Task", "active_run_id": "Run", "run_id": "Run", "run_ids": "Run", "runtime_id": "RuntimeRegistration", "context_bundle_id": "ContextBundle", "no_progress_record_id": "NoProgressRecord", "acceptance_id": "AcceptanceReceipt", "acceptance_ids": "AcceptanceReceipt", "output_artifact_ids": "Artifact", "result_artifact_ids": "Artifact", "checkpoint_artifact_id": "Artifact", "blocking_conflict_ids": "Conflict", "conflict_ids": "Conflict", "active_goal_ids": "Goal", "active_cycle_id": "ResearchCycle", "latest_release_id": "MilestoneRelease", "pending_change_ids": "ChangeProposal", "origin_evidence_id": "Evidence", "verified_by_run_id": "Run", "candidate_evidence_ids": "Evidence", "required_experiment_ids": "Experiment", "decision_ids": "DecisionReceipt", "follow_up_task_ids": "Task", "cycle_id": "ResearchCycle", "qualification_id": "Qualification", "qualification_ids": "Qualification", "impact_link_ids": "ImpactLink", "semantic_review_run_id": "Run", "blocked_task_ids": "Task", "continuable_task_ids": "Task", "parent_release_id": "MilestoneRelease", "open_resource_request_ids": "ResourceRequest", "baseline_skill_id": "SkillVersion", "experiment_id": "Experiment", "rollback_skill_id": "SkillVersion", "regression_acceptance_id": "AcceptanceReceipt", "canary_acceptance_id": "AcceptanceReceipt", "rollback_verified_receipt_id": "AcceptanceReceipt", "last_cycle_id": "ResearchCycle", "policy_id": "BudgetPolicy", "reservation_id": "BudgetLedgerEntry", "release_id": "MilestoneRelease", "resource_request_id": "ResourceRequest", "resolution_proposal_id": "ChangeProposal",
+}
+
+func relationKind(owner, field string) string {
+	if owner == "RuntimeRegistration" && field == "qualification_ids" {
+		return "AcceptanceReceipt"
+	}
+		config.ManagedStartupHold = managedQualification != nil
+		config.ClientSchema, e = api.ClientProtocolDocument()
+		if e != nil {
+			log.Fatalf("client protocol unavailable: %v", e)
+		}
+		if *coordinatorFile == "" {
+			assets := *runtimeAssetsDir
+			if assets == "" {
+				executable, err := os.Executable()
+				if err != nil {
+					log.Fatal("installed runtime asset location unavailable")
+				}
+				assets = filepath.Join(filepath.Dir(executable), "runtime")
+			}
+			setup := localHost.NewRuntimeSetup(service, config.ClientSchema, assets)
+			config.PrepareLocalRuntime = setup.Reconcile
+		}
+		coordinator, e = service.NewRuntimeCoordinatorWithLease(ctx, config, lease)
+		if e != nil {
+			log.Fatalf("runtime coordinator unavailable: %v", e)
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\host.go:142:	if err := privateDir(cfg.Dir); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\host.go:223:	if err := privateFile(tmp.Name()); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\native.go:94:	if err := privateFile(tmp); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_other.go:9:// privateDir and privateFile refuse rather than degrading to 0700-only semantics: the product
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_other.go:12:func privateDir(string) error  { return errNoSID }
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_other.go:13:func privateFile(string) error { return errNoSID }
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_windows.go:11:// privateDir applies a protected current-user-only DACL to the host directory. The owner ACE
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_windows.go:14:func privateDir(path string) error {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_windows.go:34:// privateFile does the same for one file; it is applied before the durable rename so a
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\private_windows.go:36:func privateFile(path string) error {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\roots.go:47:func openRootRegistry(dir string) (*RootRegistry, error) {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\roots.go:52:	if err := privateDir(d); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\runtime_verifier_replacement_journal_windows.go:111:	if e = privateFile(tmp.Name()); e != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\selections.go:50:func openSelectionStore(dir string) (*SelectionStore, error) {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\selections.go:55:	if err := privateDir(d); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\state.go:28:func loadHostState(dir string) (*hostState, error) {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\vault.go:66:func openVaultReadOnly(hostDir, ref, provider string) (*Vault, error) {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\vault.go:155:// creation or Host.New privateDir work. A missing host/DB leaf is allowed only
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\vault.go:194:func openVault(dir string) (*Vault, error) {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\vault.go:199:	if err := privateDir(d); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\workspace_write_windows.go:175:		if err := privateDir(p); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\workspace_write_windows.go:187:	if err := privateFile(p); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\workspace_write_windows.go:236:	if err = privateFile(tmp.Name()); err != nil {
+D:\作品集\ResearchOS\research-os\.local\worktrees\online-backup-fixture-qualification-20261015\internal\host\workspace_write_windows.go:277:	if err = privateFile(tmp.Name()); err != nil {

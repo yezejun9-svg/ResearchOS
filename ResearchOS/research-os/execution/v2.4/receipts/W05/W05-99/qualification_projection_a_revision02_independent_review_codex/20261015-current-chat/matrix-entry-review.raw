@@ -1,0 +1,69 @@
+291: 				t.Fatalf("rejected projection reached provider %d times", calls.Load())
+292: 			}
+293: 		})
+294: 	}
+295: }
+296: 
+297: func TestQualificationProjectionBrokerEffectEntryFullMatrix(t *testing.T) {
+298: 	request := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}}
+299: 	check := func(t *testing.T, mutation *qualificationProjectionMutation) {
+300: 		t.Helper()
+301: 		var seed func(Object) Object
+302: 		if mutation != nil {
+303: 			seed = func(manifest Object) Object { return qualificationProjectionMutant(t, manifest, *mutation) }
+304: 		}
+305: 		c, route, r, calls := muBrokerFirstDispatchFixture(t, seed)
+306: 		runID := Str(r.run, "id")
+307: 		frame := rt.BridgeFrame{Key: Str(r.task, "id") + ":" + runID + ":1:model:1", Route: "model-fixture", Capability: "MODEL", Payload: Bytes(request)}
+308: 		var ledgerBefore string
+309: 		if scanErr := r.f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); scanErr != nil {
+310: 			t.Fatal(scanErr)
+311: 		}
+312: 		_, err := c.brokerEffect(context.Background(), route, runID, r.lease, 1, nil, frame)
+313: 		if mutation != nil {
+314: 			t.Logf("entry=brokerEffect mutation=%s rejection=%v", mutation.name, err)
+315: 		}
+316: 		var effects, observations int
+317: 		var state, worker, ledgerAfter string
+318: 		if scanErr := r.f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); scanErr != nil {
+319: 			t.Fatal(scanErr)
+320: 		}
+321: 		if scanErr := r.f.db.QueryRow("SELECT count(*) FROM resource_effects WHERE run=?", runID).Scan(&effects); scanErr != nil {
+322: 			t.Fatal(scanErr)
+323: 		}
+324: 		if scanErr := r.f.db.QueryRow("SELECT count(*) FROM runtime_observations WHERE run=?", runID).Scan(&observations); scanErr != nil {
+325: 			t.Fatal(scanErr)
+326: 		}
+327: 		if scanErr := r.f.db.QueryRow("SELECT state,worker FROM runtime_dispatches WHERE run=?", runID).Scan(&state, &worker); scanErr != nil {
+328: 			t.Fatal(scanErr)
+329: 		}
+330: 		if mutation == nil {
+331: 			if calls.Load() != 1 || effects < 2 {
+332: 				t.Fatalf("unmodified first dispatch did not reach provider after PREPARED: calls=%d effects=%d err=%v", calls.Load(), effects, err)
+333: 			}
+334: 		} else if err == nil || calls.Load() != 0 || effects != 0 || ledgerBefore != ledgerAfter {
+335: 			t.Fatalf("brokerEffect accepted %s or crossed prepare/transport: err=%v calls=%d effects=%d ledgerChanged=%t", mutation.name, err, calls.Load(), effects, ledgerBefore != ledgerAfter)
+336: 		}
+337: 		if mutation != nil {
+338: 			cause := "STALE_INPUT: dispatch authority snapshot changed"
+339: 			switch {
+340: 			case strings.HasPrefix(mutation.name, "marker."):
+341: 				cause = "projection"
+342: 			case mutation.name == "authority.qualification_bootstrap":
+343: 				cause = "runtime not available"
+344: 			case mutation.name == "authority.profile_ref":
+345: 				cause = "immutable profile ref hash mismatch"
+346: 			}
+347: 			if !strings.Contains(err.Error(), cause) {
+348: 				t.Fatalf("%s rejected for unrelated cause: %v", mutation.name, err)
+349: 			}
+350: 		}
+351: 		if observations != 0 || state != "PREPARED" || worker != "" {
+352: 			t.Fatalf("brokerEffect launched worker: observation=%d state=%s worker=%q", observations, state, worker)
+353: 		}
+354: 	}
+355: 	t.Run("unmodified_seed", func(t *testing.T) { check(t, nil) })
+356: 	for _, mutation := range qualificationProjectionMutations() {
+357: 		t.Run(mutation.name, func(t *testing.T) { check(t, &mutation) })
+358: 	}
+359: }

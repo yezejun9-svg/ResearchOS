@@ -1,0 +1,147 @@
+{
+  "schema": "researchos.independent_security_review.v1",
+  "decision": "BLOCKED",
+  "reviewed_freeze": "product-v1-native-qualification-producer-author-20261105-rev2",
+  "candidate_manifest_sha256": "37dcac943c5a8fe694f24d152b4a34fbaf46914d25b0a4942f2aa74a54e5d503",
+  "lease_sha256": "e8713eb8a566557406c795eb8d399dac4f3df74e307891fd9a5f2c1d2a23774d",
+  "source_sha256": {
+    "adapters/runtime/codex_qualification_windows.go": "ae603be5fb0566ff010c9da48451f13a1073de6ba91ecaf4884938fd67e3a621",
+    "adapters/runtime/codex_qualification_capture_windows.go": "6f2ba96e7e0f9cf739e49251a1f92ab94977588fa54dd9600e2c7e15c7560d26",
+    "adapters/runtime/codex_qualification_windows_test.go": "9bb0edaa0e3967bd4ba226b2ab7b162c8613e145a3997dbe282151337db8552b",
+    "adapters/runtime/codex_qualification_capture_windows_test.go": "5cce6f3df67f151262d0e27c6649848ab27717032a2b752ab832f9af2487d32e",
+    "internal/qualificationprobe/plan.go": "0005183086beade6418afb14c507cf39ea81f3003ef957188c92c8b9d2109aea",
+    "internal/qualificationprobe/plan_test.go": "f52ce98d9dc76d88841ded125448e9441f3468edd6ed23347e98c9f5f68713d0",
+    "cmd/researchos-qualification-helper/main_windows.go": "efc13ad7476d262c21e8cdf8167600d1b6bbc54f8d7f6f6ec550ca00abc97378",
+    "cmd/researchos-qualification-helper/main_windows_test.go": "a0239ba407e5829360a3924490c4a6b602e6b737cfec703873e8e48707d93c61"
+  },
+  "exact_eight_lease_paths": true,
+  "source_hash_mismatches": [],
+  "review_scope": "All eight source files, all four production files and all four test files; source-level wrapper checks included. Separate wrapper/provenance reviewer supplies additional lifecycle depth; no claim of actual qualification.",
+  "contract_sha256": {
+    "execution/product-v1/contracts/native-qualification-producer.v1.md": "a932a1c84652dc3a9af78ae5299701e74da2dc70e4749a94906e321ae012b9e7",
+    "execution/product-v1/contracts/native-qualification-source-boundary.v1.md": "352d0ececab646215b34473bf23592f9e816f6dc6db5002c1f0e34af24e16ece"
+  },
+  "pending_blockers": [
+    {
+      "id": "B3-F1",
+      "origin_key": "native-qualification-b3:unused-strconv-import",
+      "severity": "high",
+      "location": "adapters/runtime/codex_qualification_windows.go:18",
+      "detail": "strconv is imported and has no reference anywhere in this file. This Windows source cannot compile.",
+      "minimal_fix": "Remove the unused import in a new frozen revision; preserve rev2. Root-owned compile evidence remains separate."
+    },
+    {
+      "id": "B3-F2",
+      "origin_key": "native-qualification-b3:stream-io-error-not-sticky",
+      "severity": "high",
+      "location": "adapters/runtime/codex_qualification_capture_windows.go:97-109,220-233,277-294,338-354",
+      "detail": "Final partial-file Sync/Close errors remain only in qualificationStream.err. CleanupComplete checks out.Err but not either stream.err; qualificationCaptureReason also ignores them. A fully received valid transcript with drained=true and a final persistence error can therefore qualify once the child has exited with code0 and JobZero. Even the branch that kills on stream.err does not make the error sticky.",
+      "counterexample": "Completed valid transcript reaches EOF; final partial.Sync or Close fails. Stream still has drained=true and a full hash. Root already exited0, so kill has no relevant effect. Capture can have CleanupComplete=true and reason empty.",
+      "minimal_fix": "Fold all stdout/stderr errors into terminal capture failure regardless of arrival phase; prohibit complete hashes/qualification on failed durable persistence. Add injected EOF-final-Sync/Close and post-root-exit stream-error cases."
+    },
+    {
+      "id": "B3-F3",
+      "origin_key": "native-qualification-b3:terminal-evidence-omitted",
+      "severity": "high",
+      "location": "adapters/runtime/codex_qualification_capture_windows.go:302-317; adapters/runtime/codex_qualification_windows.go:434,530-542,612",
+      "detail": "The paired StdoutPrefix/StderrPrefix fields share json:\"stdout_prefix\" and paired hashes share json:\"stdout_hash\". encoding/json treats the competing fields as ambiguous and omits them. More broadly, the terminal record contains capture status only: actual plan/nonce/IPv4 tuple, rendered argv or digest, originating Task/Run/epoch/source/native/helper/template/build bindings, evaluated cases, Host controls and queried Job-limit evidence are not persisted. The live obs hash is not an independently reviewable run receipt.",
+      "minimal_fix": "Give each field a distinct explicit JSON tag. Persist a bounded Host-owned preparation/terminal record binding actual plan and identity, the ordered argv/projection hash, baselines/controls/case outcomes, precise diagnostic errors and requested/queried limits before admission. Do not make this record importable as authority. Assert serialized keys and bindings, not only exclusive-file behavior."
+    },
+    {
+      "id": "B3-F4",
+      "origin_key": "native-qualification-b3:external-io-bounds-and-drain",
+      "severity": "medium",
+      "location": "adapters/runtime/codex_qualification_capture_windows.go:53-83,277-295; adapters/runtime/codex_qualification_windows.go:358-361",
+      "detail": "Stream ingestion always reads an 8192-byte buffer before checking the 1MiB cap, so bytes beyond the hard ingestion budget are consumed/discarded. The listener uses ReadString with a 128-byte buffer, which does not impose a 128-byte line limit. On stream-drain timeout, the collector sets local readiness booleans and returns without closing and joining outstanding readers, permitting capture writes after terminal return.",
+      "minimal_fix": "Clamp read slices to remaining capacity and fail closed at the ceiling; bound the listener line with a limited read and explicit oversize classification. On timeout close owned read handles and collect/join worker termination under the cleanup budget before publishing terminal state. Preserve partial diagnostics and never claim drained on uncertainty."
+    },
+    {
+      "id": "B3-F5",
+      "origin_key": "native-qualification-b3:controls-and-violation-precedence",
+      "severity": "medium",
+      "location": "adapters/runtime/codex_qualification_windows.go:489-511,542-610",
+      "detail": "Read and existing-file write controls are implemented, but exact fixed CREATE_NEW targets have only absence checks, with no matched Host create-positive pre/post controls. A target-specific denial is not distinguished from the requested sandbox effect. Also the mutable reason string can overwrite a proven forbidden success with later CONTROL_INVALID/INCOMPLETE/IDENTITY_CHANGED; map iteration over case results makes final classification order-dependent. These paths remain closed, but lose the required violation evidence and finite-probe attribution.",
+      "minimal_fix": "Add bounded Host create controls for the exact synthetic targets, restoring absence before the child and only after first preserving any forbidden-create evidence during post-audit. Keep an immutable list/bitmap of observed violations and errors; choose deterministic precedence without erasing a forbidden success. Add actual Host-control/evaluator negative fixtures, including wrong errno, changed bytes, failed controls and simultaneous violation+incomplete cases."
+    },
+    {
+      "id": "B3-F6",
+      "origin_key": "native-qualification-b3:ancestor-no-reparse-not-enforced",
+      "severity": "medium",
+      "location": "adapters/runtime/codex_qualification_windows.go:289-294,438-439,481-482,572-573",
+      "detail": "exactReal compares EvalSymlinks output with the supplied spelling. It does not inspect FILE_ATTRIBUTE_REPARSE_POINT for every ancestor and leaf; reparse kinds that do not produce a changed resolved spelling are not explicitly refused. This does not implement the contract's ancestor no-reparse invariant for S/QW/D/helper.",
+      "minimal_fix": "Before qualification, inspect each authorized ancestor and relevant leaf with a narrow Windows attributes/handle check and reject every reparse tag, then perform canonical equality and record identities. Recheck the fixed fixture paths before accepting post-audit. No traversal of unrelated user directories is needed."
+    },
+    {
+      "id": "B3-F7",
+      "origin_key": "native-qualification-wrapper:preflight-before-native",
+      "severity": "high",
+      "location": "adapters/runtime/codex_qualification_windows.go:168-197",
+      "detail": "Wrapper Start performs only partial Launch checks before ensureLaunch can start Native. Canonical positive epoch, prompt nonblank/maximum length, and required callbacks are not checked until delegated B1.Start. Invalid trusted-Go input can consume a Native qualification and mutate fixtures before B1 rejects it. The independent wrapper reviewer reported this same issue; this report inspected the partial validation and cross-references that finding without recounting it.",
+      "minimal_fix": "Mirror or reuse B1's pure full launch preflight before state consumption/preparation/Native spawn, without editing B1-owned files in this lease. Add invalid-launch cases proving no qualification and no RPC creation. Coordinate exact origin with the supplemental reviewer."
+    }
+  ],
+  "diagnostic_events": [
+    {
+      "origin_key": "native-qualification-b3:unused-strconv-import",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "strconv is imported and has no reference anywhere in this file. This Windows source cannot compile."
+    },
+    {
+      "origin_key": "native-qualification-b3:stream-io-error-not-sticky",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "Final partial-file Sync/Close errors remain only in qualificationStream.err. CleanupComplete checks out.Err but not either stream.err; qualificationCaptureReason also ignores them. A fully received valid transcript with drained=true and a final persistence error can therefore qualify once the child has exited with code0 and JobZero. Even the branch that kills on stream.err does not make the error sticky."
+    },
+    {
+      "origin_key": "native-qualification-b3:terminal-evidence-omitted",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "The paired StdoutPrefix/StderrPrefix fields share json:\"stdout_prefix\" and paired hashes share json:\"stdout_hash\". encoding/json treats the competing fields as ambiguous and omits them. More broadly, the terminal record contains capture status only: actual plan/nonce/IPv4 tuple, rendered argv or digest, originating Task/Run/epoch/source/native/helper/template/build bindings, evaluated cases, Host controls and queried Job-limit evidence are not persisted. The live obs hash is not an independently reviewable run receipt."
+    },
+    {
+      "origin_key": "native-qualification-b3:external-io-bounds-and-drain",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "Stream ingestion always reads an 8192-byte buffer before checking the 1MiB cap, so bytes beyond the hard ingestion budget are consumed/discarded. The listener uses ReadString with a 128-byte buffer, which does not impose a 128-byte line limit. On stream-drain timeout, the collector sets local readiness booleans and returns without closing and joining outstanding readers, permitting capture writes after terminal return."
+    },
+    {
+      "origin_key": "native-qualification-b3:controls-and-violation-precedence",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "Read and existing-file write controls are implemented, but exact fixed CREATE_NEW targets have only absence checks, with no matched Host create-positive pre/post controls. A target-specific denial is not distinguished from the requested sandbox effect. Also the mutable reason string can overwrite a proven forbidden success with later CONTROL_INVALID/INCOMPLETE/IDENTITY_CHANGED; map iteration over case results makes final classification order-dependent. These paths remain closed, but lose the required violation evidence and finite-probe attribution."
+    },
+    {
+      "origin_key": "native-qualification-b3:ancestor-no-reparse-not-enforced",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "exactReal compares EvalSymlinks output with the supplied spelling. It does not inspect FILE_ATTRIBUTE_REPARSE_POINT for every ancestor and leaf; reparse kinds that do not produce a changed resolved spelling are not explicitly refused. This does not implement the contract's ancestor no-reparse invariant for S/QW/D/helper."
+    },
+    {
+      "origin_key": "native-qualification-wrapper:preflight-before-native",
+      "classification": "SOURCE_BLOCKER",
+      "detail": "Wrapper Start performs only partial Launch checks before ensureLaunch can start Native. Canonical positive epoch, prompt nonblank/maximum length, and required callbacks are not checked until delegated B1.Start. Invalid trusted-Go input can consume a Native qualification and mutate fixtures before B1 rejects it. The independent wrapper reviewer reported this same issue; this report inspected the partial validation and cross-references that finding without recounting it."
+    }
+  ],
+  "formal_increment": 0,
+  "product_increment": 0,
+  "native_invocations": 0,
+  "model_invocations": 0,
+  "tests_executed_by_reviewer": 0,
+  "source_modifications_by_reviewer": 0,
+  "positive_findings": [
+    "Rev2 consumes first Ensure attempt even when identity validation fails; private live observation is not reconstructed from JSON.",
+    "Constructor composes ordinary NewCodexRPC with a private concrete provider; old nil path stays closed. Qualification receipt directory does not precreate B1 launch.Directory.",
+    "Helper uses fixed seven cases only; actual source digest, denied open, Win32 GENERIC_WRITE/OPEN_EXISTING and CREATE_NEW, and one IPv4 TCP tuple. No shell/interpreter/generic command or expected digest in helper input.",
+    "Canonical roundtrip plan/transcript validation enforces size, exact field representation, ordered START/RESULT and complete bitmap. Unrecognized stdout and nonempty stderr block success.",
+    "Host performs source/denied reads, existing-file write/restore checks and nonce-labelled IPv4 pre/post roundtrips. Unexpected accept blocks success.",
+    "Qualification argv preserves B1 ordered config arguments and replaces only validated app-server suffix with sandbox --include-managed-config --permission-profile nonce -C QW -- helper --plan-v1 encoded. No windows subcommand, new grants or unsafe fallback.",
+    "Job applies KILL_ON_JOB_CLOSE plus active-process16 and Job-commit2048MiB and verifies via QueryInformationJobObject before launch. These are active count/commit limits, not cumulative process count/RSS.",
+    "One qualification attempt is consumed; wrapper subtracts preparation elapsed time before delegating B1. Helper watchdog10s and loopback connect1s are explicit."
+  ],
+  "test_coverage_limits": [
+    "No tests executed. Existing source tests cover plan/canonical framing, narrow helper operations, Ensure identity and private failure accessor, small/overflow local fake collector.",
+    "No current test exercises whole wrapper phase handoff or full Host ensureLaunch/evaluator with all controls. Supplemental reviewer owns deeper wrapper analysis.",
+    "No final Sync/Close-failure injection, exact-cap ingestion accounting, unterminated listener-line bound, forced reader-drain join, or serialized receipt-field assertions found."
+  ],
+  "runtime_prerequisites": [
+    "Fix blockers in a new freeze; preserve originals and any Root test failure. Root registers all Go/fake runs separately.",
+    "Host factory, shipped helper build/hash and authorized synthetic S binding remain a separate serial wiring scope; this source cannot self-authorize them.",
+    "Finite synthetic S/D/QW and one IPv4 tuple observations do not prove a complete Native permission graph or universal isolation. B1 same-process nonce barrier and B2 final fence remain mandatory.",
+    "No Native/model execution, setup, credential read or old echo/task replay authorized by this review. Normal Native platform-context limitations D03 remain."
+  ]
+}

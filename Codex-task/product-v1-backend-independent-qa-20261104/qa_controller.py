@@ -1,0 +1,86 @@
+from pathlib import Path
+import datetime, hashlib, json, os, subprocess, sys
+
+HERE=Path(__file__).resolve().parent
+ROOT=Path('D:/作品集/ResearchOS/research-os')
+WT=ROOT/'.local/worktrees/product-v1-backend-20261104'
+AUTHOR=HERE.parent/'product-v1-backend-author'
+RUN=HERE/'run-01'
+GO=ROOT/'.local/tools/go1.27.1/go/bin/go.exe'
+MOD=HERE.parent/'cp586-continuation/production-binding-review/run-01/private/gopath/pkg/mod'
+EXPECTED='ddfcfd8530b1fe88aa065c02bae3a9443e8354939a8649ec2bc5e5c4411ce3f5'
+
+def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def save(name,value):
+    p=RUN/name
+    assert not p.exists(),'Do not overwrite evidence: '+str(p)
+    p.parent.mkdir(parents=True,exist_ok=True)
+    p.write_text(json.dumps(value,ensure_ascii=True,indent=2)+'\n',encoding='utf-8')
+
+def prepare():
+    assert not RUN.exists(),'Run exists: inspect state before retry'
+    manifest=AUTHOR/'final/source-manifest.json'
+    assert sha(manifest)==EXPECTED
+    m=json.loads(manifest.read_bytes())
+    sc=json.loads((HERE/'prepared-inputs/scope.json').read_bytes())
+    assert m['author_stopped_source_changes'] and m['interface_sha256']=='046a49b2b1f82593fe86924913b2ee4d77152ac1cef7dbbb86562f6dfe0cfa1c'
+    assert len(m['pins'])==18 and set(x['path'] for x in m['pins'])==set(sc['production_paths']+sc['test_paths'])
+    assert sha(GO)=='d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490'
+    assert MOD.is_dir()
+    RUN.mkdir()
+    source={}
+    for item in m['pins']:
+        p=WT/item['path']; frozen=AUTHOR/'final/source'/item['path']
+        assert sha(p)==item['sha256'] and sha(frozen)==item['sha256'],item['path']
+        target=RUN/'frozen-source'/item['path']
+        target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(p.read_bytes())
+        source[item['path']]={'sha256':sha(target),'bytes':target.stat().st_size}
+    (RUN/'author-source-manifest.json').write_bytes(manifest.read_bytes())
+    save('inputs.json',{'source_manifest_sha256':EXPECTED,'source':source,'source_sha256':{p:x['sha256'] for p,x in source.items()},'worktree':str(WT),'base_head':m['base_head'],'interface_sha256':m['interface_sha256'],'go':str(GO),'go_sha256':sha(GO),'go_mod_sha256':sha(WT/'go.mod'),'go_sum_sha256':sha(WT/'go.sum'),'module_inputs':str(MOD),'formal_increment':0,'network':False})
+    print(json.dumps({'prepared':True,'source_count':18,'run':str(RUN)}))
+
+def check_source(frozen_overlay=False):
+    inputs=json.loads((RUN/'inputs.json').read_bytes())
+    for name,pin in inputs['source'].items():
+        source=RUN/'frozen-source'/name if frozen_overlay else WT/name
+        assert sha(source)==pin['sha256'], 'Frozen source drift: '+name
+    if frozen_overlay:
+        overlay=json.loads((RUN/'overlay.json').read_bytes())['Replace']
+        assert all(overlay[str(WT/name)]==str(RUN/'frozen-source'/name) for name in inputs['source'])
+
+def run(phase,args,frozen_overlay=False):
+    check_source(frozen_overlay)
+    for rel in ['private/cache','private/tmp','private/profile','private/appdata','private/localappdata','private/gopath']:
+        (RUN/rel).mkdir(parents=True,exist_ok=True)
+    env={k:os.environ[k] for k in ['SystemRoot','WINDIR','COMSPEC'] if k in os.environ}
+    env.update({'PATH':str(GO.parent)+os.pathsep+str(Path(env['SystemRoot'])/'System32'),
+      'USERPROFILE':str(RUN/'private/profile'),'APPDATA':str(RUN/'private/appdata'),'LOCALAPPDATA':str(RUN/'private/localappdata'),
+      'TEMP':str(RUN/'private/tmp'),'TMP':str(RUN/'private/tmp'),'GOTMPDIR':str(RUN/'private/tmp'),
+      'GOCACHE':str(RUN/'private/cache'),'GOPATH':str(RUN/'private/gopath'),'GOMODCACHE':str(MOD),
+      'GOENV':'off','GOTOOLCHAIN':'local','GOPROXY':'off','GOSUMDB':'off','GOWORK':'off','CGO_ENABLED':'0','GOTELEMETRY':'off','GOVCS':'*:off','GOFLAGS':'-mod=readonly'})
+    cmd=[str(GO)]+args
+    save(phase+'.command.json',{'argv':cmd,'cwd':str(WT),'environment':env,'source_mode':'FROZEN_C_OVERLAY_ALL18' if frozen_overlay else 'FROZEN_WORKTREE_WITH_NO_DRIFT_CHECK','execution_class':'FRESH_DB_RECORDER_OWNED_FAKE_JOB_NO_REAL_CODEX_MODEL_OLD_DB_GUI','formal_increment':0})
+    save(phase+'.started.json',{'at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    with (RUN/(phase+'.stdout.raw')).open('wb') as out,(RUN/(phase+'.stderr.raw')).open('wb') as err:
+        p=subprocess.Popen(cmd,cwd=WT,env=env,stdout=out,stderr=err)
+        code=p.wait()
+    counts={'run':0,'pass':0,'fail':0,'skip':0,'top_pass':0,'sub_pass':0};roster=[]
+    for line in (RUN/(phase+'.stdout.raw')).read_bytes().splitlines():
+        try: item=json.loads(line)
+        except (ValueError,UnicodeError): continue
+        action=item.get('Action');name=item.get('Test')
+        if name and action in counts: counts[action]+=1
+        if name and action in ['pass','fail','skip']:
+            roster.append({'package':item.get('Package'),'test':name,'action':action})
+            if action=='pass':counts['sub_pass' if '/' in name else 'top_pass']+=1
+    result={'exit_code':code,'counts':counts,'roster':roster,'stdout_sha256':sha(RUN/(phase+'.stdout.raw')),'stderr_sha256':sha(RUN/(phase+'.stderr.raw')),'formal_increment':0}
+    save(phase+'.result.json',result)
+    check_source(frozen_overlay)
+    print(json.dumps({'phase':phase,'exit_code':code,'counts':counts}));return code
+
+if __name__=='__main__':
+    if sys.argv[1]=='prepare':prepare()
+    elif sys.argv[1]=='focused':sys.exit(run('independent-focused',['test','-json','-count=1','-vet=off','-timeout=150s','-p=1','-parallel=1','-run','^(TestHarness|TestCodexHarness)','./internal/domain','./internal/api','./internal/host','./adapters/runtime']))
+    elif sys.argv[1]=='attacks':sys.exit(run('independent-attacks',['test','-json','-count=1','-vet=off','-timeout=150s','-p=1','-parallel=1','-overlay='+str(RUN/'overlay.json'),'-run','^TestIndependentHarness','./internal/domain','./internal/api','./adapters/runtime'],frozen_overlay=True))
+    elif sys.argv[1]=='vet':sys.exit(run('independent-vet',['vet','-p=1','./internal/domain','./internal/api','./internal/host','./adapters/runtime','./apps/control']))
+    else:raise SystemExit('unknown phase')

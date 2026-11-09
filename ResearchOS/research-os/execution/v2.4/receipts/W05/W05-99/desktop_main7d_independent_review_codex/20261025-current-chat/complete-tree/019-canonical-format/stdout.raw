@@ -1,0 +1,66 @@
+apps/desktop/build-development.py
+1: #!/usr/bin/env python3
+2: """Build a source-bound, repo-shaped Windows Desktop development tree.
+3: 
+4: The output is a development fixture. It is not an installer or a portable
+5: release. All generated files stay in a new ignored worktree directory.
+6: """
+7: 
+8: import argparse
+9: import datetime
+10: import hashlib
+11: import json
+12: import os
+13: from pathlib import Path
+14: import re
+15: import shutil
+16: import stat
+17: import subprocess
+18: import sys
+19: 
+20: 
+21: ROOT = Path(__file__).resolve().parents[2]
+22: ALLOWLIST = {
+23:     "apps/desktop/build-development.py",
+24:     "apps/desktop/launch-development.mjs",
+25:     "apps/desktop/main/main.js",
+26:     "tests/ui/desktop/development-launcher.test.mjs",
+27:     "tests/ui/desktop/development-bundle.test.py",
+28:     "tests/ui/desktop/development-smoke.test.mjs",
+29:     "docs/installation/desktop-development.md",
+30: }
+31: SOURCE_PREFIXES = ("adapters/", "internal/", "apps/control/", "apps/runtime-verifier/",
+32:                    "apps/desktop/main/", "apps/desktop/preload/", "apps/desktop/validator/",
+33:                    "apps/web/src/", "migrations/sqlite/", "spec/v2.0/contracts/")
+34: SOURCE_EXACT = {"go.mod", "go.sum", "go.work", "go.work.sum", "execution/toolchains/locked.json",
+35:                 "apps/desktop/package.json", "apps/desktop/package-lock.json", "apps/web/package.json",
+36:                 "apps/web/package-lock.json", "apps/web/index.html", "apps/desktop/build-validator.py"}
+37: SCHEMA = "researchos.desktop-development-tree/1"
+38: MU_COMMIT = "8dfebe36508ac0c2508735bb866756dab9283e74"
+39: REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+40: 
+41: 
+42: def sha256(path):
+43:     hasher = hashlib.sha256()
+44:     with Path(path).open("rb") as stream:
+45:         while block := stream.read(1024 * 1024):
+46:             hasher.update(block)
+47:     return hasher.hexdigest()
+48: 
+49: 
+50: def canonical(value):
+51:     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+52: 
+53: 
+54: def put(path, value):
+55:     path = Path(path)
+56:     path.parent.mkdir(parents=True, exist_ok=True)
+57:     with path.open("xb") as stream:
+58:         stream.write(canonical(value))
+59: 
+60: 
+61: def regular(path):
+62:     path = Path(path)
+63:     info = path.lstat()
+64:     return path.is_file() and not path.is_symlink() and not (info.st_file_attributes & REPARSE)
+65: 

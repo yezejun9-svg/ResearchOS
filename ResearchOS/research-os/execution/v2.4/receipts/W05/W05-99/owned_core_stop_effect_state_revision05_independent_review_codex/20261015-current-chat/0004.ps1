@@ -1,0 +1,2 @@
+$r='D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/owned_core_stop_authority_revision04_independent_review_codex/20261015-current-chat'
+foreach($f in @('prepare_fixtures.py','fixture_e2e_review.py','prepare_malformed_preflight.py','fixture_e2e_malformed_preflight.py','reviewer_logger.py','independent_store_review_windows_test.go','fixture_parent_r4.go')){Write-Output "FILE $f"; Get-Content "$r/$f"}

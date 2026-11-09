@@ -1,0 +1,212 @@
+FILE internal/host/owned_core_stop_identity_windows.go SHA256 bc901da3af77e0d6ea40df009480b82940dfc6aaf7600a76bb0d619ebac953b7
+1: //go:build windows
+2: 
+3: package host
+4: 
+5: import (
+6: 	"context"
+7: 	"crypto/sha256"
+8: 	"database/sql"
+9: 	"encoding/hex"
+10: 	"errors"
+11: 	"fmt"
+12: 	"net/url"
+13: 	"path/filepath"
+14: 	"strings"
+15: 
+16: 	_ "modernc.org/sqlite"
+17: 	"researchos.local/research-os/internal/auth"
+18: )
+19: 
+20: // OwnedCoreStopPublicIdentity contains only public authority metadata. It
+21: // never reads credentials, keys, vault records or private process memory.
+22: type OwnedCoreStopPublicIdentity struct {
+23: 	DataRoot        string `json:"data_root"`
+24: 	Database        string `json:"database"`
+25: 	DatabaseVolume  uint32 `json:"database_volume"`
+26: 	DatabaseIndex   uint64 `json:"database_index"`
+27: 	SID             string `json:"sid"`
+28: 	PrincipalRef    string `json:"principal_ref"`
+29: 	HostID          string `json:"host_id"`
+30: 	OwnerID         string `json:"owner_id"`
+31: 	OwnerRoot       string `json:"owner_root"`
+32: 	HostStateSHA256 string `json:"host_state_sha256"`
+33: 	SchemaVersion   int    `json:"schema_version"`
+34: }
+35: 
+36: // ReadOwnedCoreStopPublicIdentity opens an existing database read-only and
+37: // reads the protected host_state.json through the existing same-SID reader.
+38: // The caller's SQLite barrier, when present, keeps this database view stable.
+39: func ReadOwnedCoreStopPublicIdentity(ctx context.Context, dataRoot string) (OwnedCoreStopPublicIdentity, error) {
+40: 	var out OwnedCoreStopPublicIdentity
+41: 	if e := replacementPath(dataRoot); e != nil {
+42: 		return out, e
+43: 	}
+44: 	actual, e := filepath.EvalSymlinks(dataRoot)
+45: 	if e != nil || !strings.EqualFold(actual, dataRoot) {
+46: 		return out, errors.New("data-root reparse refused")
+47: 	}
+48: 	hostDir := filepath.Join(dataRoot, "host")
+49: 	dbPath := filepath.Join(dataRoot, "researchos.sqlite")
+50: 	for i, path := range []string{dataRoot, hostDir, dbPath} {
+51: 		if _, e = replacementIdentity(path, i < 2); e != nil {
+52: 			return out, e
+53: 		}
+54: 		if e = replacementACL(path, i < 2, i == 1); e != nil {
+55: 			return out, e
+56: 		}
+57: 	}
+58: 	dbID, e := replacementIdentity(dbPath, false)
+59: 	if e != nil {
+60: 		return out, e
+61: 	}
+62: 	raw, e := replacementRead(filepath.Join(hostDir, stateFile), 64<<10)
+63: 	if e != nil {
+64: 		return out, e
+65: 	}
+66: 	var state hostState
+67: 	if e = decodeRuntimeManaged(raw, &state); e != nil {
+68: 		return out, e
+69: 	}
+70: 	identity, e := auth.Current()
+71: 	if e != nil {
+72: 		return out, e
+73: 	}
+74: 	sid, e := currentSIDString()
+75: 	if e != nil {
+76: 		return out, e
+77: 	}
+78: 	if state.Version != 1 || state.HostInstanceID == "" || state.PrincipalID == "" || state.PrincipalRef != identity.Ref {
+79: 		return out, ErrHostIdentity
+80: 	}
+81: 	stateHash := sha256.Sum256(raw)
+82: 	out = OwnedCoreStopPublicIdentity{DataRoot: dataRoot, Database: dbPath, DatabaseVolume: dbID.Volume, DatabaseIndex: uint64(dbID.IndexHigh)<<32 | uint64(dbID.IndexLow), SID: sid, PrincipalRef: identity.Ref, HostID: state.HostInstanceID, OwnerID: state.PrincipalID, HostStateSHA256: hex.EncodeToString(stateHash[:])}
+83: 	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(dbPath)}
+84: 	q := u.Query()
+85: 	q.Set("mode", "ro")
+86: 	u.RawQuery = q.Encode()
+87: 	db, e := sql.Open("sqlite", u.String())
+88: 	if e != nil {
+89: 		return out, e
+90: 	}
+91: 	defer db.Close()
+92: 	db.SetMaxOpenConns(1)
+93: 	var versions, minVersion int
+94: 	if e = db.QueryRowContext(ctx, `SELECT max(version),min(version),count(DISTINCT version) FROM schema_migrations`).Scan(&out.SchemaVersion, &minVersion, &versions); e != nil || out.SchemaVersion != 24 || minVersion != 1 || versions != 24 {
+95: 		return out, errors.New("schema 24 fingerprint unavailable")
+96: 	}
+97: 	var owners int
+98: 	rows, e := db.QueryContext(ctx, `SELECT id,roles,revoked FROM auth_principals ORDER BY id`)
+99: 	if e != nil {
+100: 		return out, e
+101: 	}
+102: 	for rows.Next() {
+103: 		var id, roles string
+104: 		var revoked int
+105: 		if e = rows.Scan(&id, &roles, &revoked); e != nil {
+106: 			break
+107: 		}
+108: 		var list []string
+109: 		if e = decodeRuntimeManaged([]byte(roles), &list); e != nil {
+110: 			break
+111: 		}
+112: 		for _, role := range list {
+113: 			if role == "OWNER" && revoked == 0 {
+114: 				owners++
+115: 				if id != out.OwnerID {
+116: 					e = ErrHostIdentity
+117: 					break
+118: 				}
+119: 			}
+120: 		}
+121: 		if e != nil {
+122: 			break
+123: 		}
+124: 	}
+125: 	if e == nil {
+126: 		e = rows.Err()
+127: 	}
+128: 	rows.Close()
+129: 	if e != nil {
+130: 		return out, e
+131: 	}
+132: 	if owners != 1 {
+133: 		return out, fmt.Errorf("current unrevoked OWNER count %d", owners)
+134: 	}
+135: 	if e = db.QueryRowContext(ctx, `SELECT root FROM orchestration_identity WHERE principal=?`, out.OwnerID).Scan(&out.OwnerRoot); e != nil || out.OwnerRoot == "" {
+136: 		return out, errors.New("Owner root unavailable")
+137: 	}
+138: 	return out, nil
+139: }
+FILE internal/host/owned_core_stop_identity_windows_test.go SHA256 612d6a29f8790d99b78bcd66534115b6ad85d406e3817d5e827d09cf773905a0
+1: //go:build windows
+2: 
+3: package host
+4: 
+5: import (
+6: 	"context"
+7: 	"database/sql"
+8: 	"encoding/json"
+9: 	"os"
+10: 	"path/filepath"
+11: 	"testing"
+12: 
+13: 	_ "modernc.org/sqlite"
+14: 	"researchos.local/research-os/internal/auth"
+15: )
+16: 
+17: func TestOwnedCoreStopPublicIdentitySameSIDOwnerAndSchema(t *testing.T) {
+18: 	root := t.TempDir()
+19: 	hostDir := filepath.Join(root, "host")
+20: 	if err := os.Mkdir(hostDir, 0700); err != nil {
+21: 		t.Fatal(err)
+22: 	}
+23: 	if err := privateDir(hostDir); err != nil {
+24: 		t.Fatal(err)
+25: 	}
+26: 	identity, err := auth.Current()
+27: 	if err != nil {
+28: 		t.Fatal(err)
+29: 	}
+30: 	state := hostState{Version: 1, PrincipalRef: identity.Ref, PrincipalID: "owner-fixture", HostInstanceID: "host-fixture"}
+31: 	raw, err := json.Marshal(state)
+32: 	if err != nil {
+33: 		t.Fatal(err)
+34: 	}
+35: 	statePath := filepath.Join(hostDir, stateFile)
+36: 	if err = os.WriteFile(statePath, raw, 0600); err != nil {
+37: 		t.Fatal(err)
+38: 	}
+39: 	if err = privateFile(statePath); err != nil {
+40: 		t.Fatal(err)
+41: 	}
+42: 	db, err := sql.Open("sqlite", filepath.Join(root, "researchos.sqlite"))
+43: 	if err != nil {
+44: 		t.Fatal(err)
+45: 	}
+46: 	defer db.Close()
+47: 	if _, err = db.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);CREATE TABLE auth_principals(id TEXT PRIMARY KEY,roles TEXT,revoked INTEGER);CREATE TABLE orchestration_identity(principal TEXT PRIMARY KEY,root TEXT)`); err != nil {
+48: 		t.Fatal(err)
+49: 	}
+50: 	for i := 1; i <= 24; i++ {
+51: 		if _, err = db.Exec(`INSERT INTO schema_migrations VALUES(?)`, i); err != nil {
+52: 			t.Fatal(err)
+53: 		}
+54: 	}
+55: 	if _, err = db.Exec(`INSERT INTO auth_principals VALUES('owner-fixture','["OWNER"]',0);INSERT INTO orchestration_identity VALUES('owner-fixture','root-fixture')`); err != nil {
+56: 		t.Fatal(err)
+57: 	}
+58: 	public, err := ReadOwnedCoreStopPublicIdentity(context.Background(), root)
+59: 	if err != nil {
+60: 		t.Fatal(err)
+61: 	}
+62: 	if public.OwnerID != "owner-fixture" || public.OwnerRoot != "root-fixture" || public.HostID != "host-fixture" || public.SchemaVersion != 24 || public.DatabaseIndex == 0 || public.SID == "" {
+63: 		t.Fatalf("incomplete public authority: %+v", public)
+64: 	}
+65: 	if _, err = db.Exec(`UPDATE auth_principals SET revoked=1`); err != nil {
+66: 		t.Fatal(err)
+67: 	}
+68: 	if _, err = ReadOwnedCoreStopPublicIdentity(context.Background(), root); err == nil {
+69: 		t.Fatal("revoked owner accepted")
+70: 	}
+71: }

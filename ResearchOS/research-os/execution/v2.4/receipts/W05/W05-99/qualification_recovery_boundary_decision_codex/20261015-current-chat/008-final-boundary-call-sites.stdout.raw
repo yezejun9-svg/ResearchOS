@@ -1,0 +1,223 @@
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\apps\\control\\main.go', 'sha256': 'e2590cf34de926ef1a87e00b88f970ae5519c4fddc62988db61d247f04031e48', 'start': 110, 'end': 172}
+110: 	defer func() {
+111: 		if err := lease.Close(); err != nil {
+112: 			log.Fatalf("data-root lease close failed: %v", err)
+113: 		}
+114: 	}()
+115: 	dataDir = lease.Root()
+116: 	if err := runtimeVerifierReplacementStartupGate(lease); err != nil {
+117: 		log.Fatalf("runtime verifier replacement recovery required: %v", err)
+118: 	}
+119: 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
+120: 	if err != nil {
+121: 		log.Fatalf("database unavailable: %v", err)
+122: 	}
+123: 	defer func() {
+124: 		if err := db.Close(); err != nil {
+125: 			log.Fatalf("database close failed: %v", err)
+126: 		}
+127: 	}()
+128: 	if err := store.Bootstrap(context.Background(), db, filepath.Join("migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
+129: 		log.Fatalf("database bootstrap failed: %v", err)
+130: 	}
+131: 	service, err := domain.NewCurrentMu(db, filepath.Join("spec", "v2.0", "contracts"), filepath.Join("migrations", "sqlite", "0002_domain.sql"))
+132: 	if err != nil {
+133: 		log.Fatalf("domain unavailable: %v", err)
+134: 	}
+135: 	service.Protected = &protectedstore.FrozenProvider{}
+136: 	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
+137: 	if err != nil {
+138: 		log.Fatalf("private drain capability unavailable: %v", err)
+139: 	}
+140: 	if *desktopManagement && boot != nil {
+141: 		log.Fatal("Desktop management cannot share a release supervisor capability")
+142: 	}
+143: 	if boot != nil && boot.FixtureStore != "" {
+144: 		fixture, e := protectedstore.OpenCanary(boot.FixtureStore)
+145: 		if e != nil {
+146: 			log.Fatalf("private fixture store unavailable: %v", e)
+147: 		}
+148: 		defer fixture.Close()
+149: 		service.Protected = fixture
+150: 	}
+151: 	if *provision != "" || *issue != "" {
+152: 		if e := adminCredential(service, *provision, *issue, *credentialFile); e != nil {
+153: 			log.Fatalf("local credential administration failed: %v", e)
+154: 		}
+155: 		return
+156: 	}
+157: 	if *bootstrapOwner {
+158: 		if *credentialFile == "" {
+159: 			log.Fatal("credential-file required")
+160: 		}
+161: 		if err = bootstrap(service, *credentialFile); err != nil {
+162: 			log.Fatalf("Owner bootstrap failed: %v", err)
+163: 		}
+164: 		return
+165: 	}
+166: 	if *importJev != "" {
+167: 		raw, e := os.ReadFile(*credentialFile)
+168: 		if e != nil {
+169: 			log.Fatal("private credential file required")
+170: 		}
+171: 		credential, e := domain.Decode(raw)
+172: 		if e != nil {
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\owned-core-stop-anchor-r2-20261015\\internal\\ownedcorestop\\stop_windows.go', 'sha256': '50ce9babf1e355ed0703d20fcefdb30d2ed1a168f2ea537d920e2fc12681fe50', 'start': 112, 'end': 145}
+112: 	}
+113: 	if p.Baseline.SchemaSHA256 != g.SchemaSHA256 {
+114: 		return p, "", errors.New("grant-pinned schema inventory differs")
+115: 	}
+116: 	if _, err = g.checkAction("preflight", true); err != nil {
+117: 		return p, "", err
+118: 	}
+119: 	p.PreflightSafety, err = store.ReadOwnedStopSafetyPreflight(ctx, p.Host.Database, in.Subject)
+120: 	if err != nil {
+121: 		p.Missing = append(p.Missing, "preflight safety catalog: "+err.Error())
+122: 	} else if !p.PreflightSafety.ExactOldSubjectSafe() {
+123: 		p.Missing = append(p.Missing, "additional unresolved work or exact old subject differs")
+124: 	}
+125: 	proofSHA, missing := validateHistoricalEvidence(p, docs)
+126: 	p.EvidenceSHA256 = proofSHA
+127: 	p.Missing = append(p.Missing, missing...)
+128: 	if len(p.Missing) == 0 {
+129: 		p.Eligibility = "ELIGIBLE_FOR_INDEPENDENT_REVIEW"
+130: 	}
+131: 	if err = validatePlan(p); err != nil {
+132: 		return p, "", err
+133: 	}
+134: 	backupManifestSHA, err := writeOwnedJournal(outDir, "backup-manifest.json", struct {
+135: 		Schema, OperationID, BackupSHA256 string
+136: 		Census                            store.OwnedStopCensus `json:"census"`
+137: 	}{"researchos.owned-core-stop-backup.v1", p.OperationID, p.BackupSHA256, p.Baseline})
+138: 	if err != nil {
+139: 		return p, "", err
+140: 	}
+141: 	planSHA, err := writeOwnedJournal(outDir, "plan.json", p)
+142: 	if err != nil {
+143: 		return p, "", err
+144: 	}
+145: 	planFile, err := openHeldFile(filepath.Join(outDir, "plan.json"), false)
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\owned-core-stop-anchor-r2-20261015\\internal\\ownedcorestop\\stop_windows.go', 'sha256': '50ce9babf1e355ed0703d20fcefdb30d2ed1a168f2ea537d920e2fc12681fe50', 'start': 225, 'end': 267}
+225: 		}
+226: 	}
+227: 	if p.Eligibility != "ELIGIBLE_FOR_INDEPENDENT_REVIEW" || len(p.Missing) != 0 {
+228: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "historical proof missing"), nil
+229: 	}
+230: 	if err = validateStopAuthority(g, docs, p, planSHA); err != nil {
+231: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+232: 	}
+233: 	proofSHA, missing := validateHistoricalEvidence(p, docs)
+234: 	if len(missing) != 0 || proofSHA != p.EvidenceSHA256 {
+235: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "independent evidence drift"), nil
+236: 	}
+237: 	backup, backupSHA, err := store.ReadOwnedStopBackup(ctx, p.BackupPath)
+238: 	if err != nil || backupSHA != p.BackupSHA256 || backup != p.Baseline {
+239: 		return stopResult(p, planSHA, "STALE_PLAN", "reviewed backup/hash/census differs"), nil
+240: 	}
+241: 	rootHandle, err := openHeldFile(g.DataRoot.Path, true)
+242: 	if err != nil {
+243: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+244: 	}
+245: 	docs.files = append(docs.files, rootHandle)
+246: 	if nativeFileIdentity(rootHandle.info, g.DataRoot.Path) != g.DataRoot {
+247: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", "data-root native identity differs"), nil
+248: 	}
+249: 	if _, err = g.checkAction("commit", true); err != nil {
+250: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+251: 	}
+252: 	// PROCESS_TERMINATE is requested only after all external evidence and exact
+253: 	// operation-plan review checks have passed. The native handle stays retained.
+254: 	h, err := supervisor.OpenOwnedCoreRetained(p.Native)
+255: 	if err != nil {
+256: 		return stopResult(p, planSHA, "STOP_UNAVAILABLE", err.Error()), nil
+257: 	}
+258: 	defer h.Close()
+259: 	if _, err = writeOwnedJournal(p.OutputDir, "STOP_ATTEMPT.json", stopAttemptRecord{Schema: "researchos.owned-core-stop-attempt.v1", OperationID: p.OperationID, GrantSHA256: g.digest, PlanSHA256: planSHA}); err != nil {
+260: 		return Result{}, err
+261: 	}
+262: 	if _, err = g.checkAction("commit", true); err != nil {
+263: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "grant expired after consumed attempt"))
+264: 	}
+265: 	if _, err = writeOwnedJournal(p.OutputDir, "BEGIN.json", struct{ Schema, OperationID, PlanSHA256, GrantSHA256 string }{"researchos.owned-core-stop-begin.v1", p.OperationID, planSHA, g.digest}); err != nil {
+266: 		return Result{}, err
+267: 	}
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\owned-core-stop-anchor-r2-20261015\\internal\\ownedcorestop\\stop_windows.go', 'sha256': '50ce9babf1e355ed0703d20fcefdb30d2ed1a168f2ea537d920e2fc12681fe50', 'start': 286, 'end': 347}
+286: 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "grant expired before native intent"))
+287: 	}
+288: 	if _, err = writeOwnedJournal(p.OutputDir, "TERMINATE_INTENT.json", struct {
+289: 		Schema, OperationID, PlanSHA256, GrantSHA256 string
+290: 		Native                                       supervisor.OwnedCoreNativeIdentity `json:"native"`
+291: 	}{"researchos.owned-core-stop-terminate-intent.v1", p.OperationID, planSHA, g.digest, p.Native}); err != nil {
+292: 		return Result{}, err
+293: 	}
+294: 	if _, err = g.checkAction("commit", true); err != nil {
+295: 		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "grant expired after durable intent; zero signal"))
+296: 	}
+297: 	exit, nativeErr := h.TerminateOnceAndWaitUntil(15*time.Second, deadline, g.expires)
+298: 	if nativeErr != nil {
+299: 		result := stopResult(p, planSHA, "UNKNOWN", fmt.Sprintf("single native attempt or wait unknown: %v", nativeErr))
+300: 		result.Native = &exit
+301: 		return persistStopResult(p, result)
+302: 	}
+303: 	if _, err = writeOwnedJournal(p.OutputDir, "NATIVE_EXIT.json", struct {
+304: 		Schema, OperationID, PlanSHA256, GrantSHA256 string
+305: 		Native                                       supervisor.OwnedCoreNativeExit `json:"native"`
+306: 	}{"researchos.owned-core-stop-native-exit.v1", p.OperationID, planSHA, g.digest, exit}); err != nil {
+307: 		return Result{}, err
+308: 	}
+309: 	if err = barrier.Close(); err != nil {
+310: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "writer reservation release failed")
+311: 		result.Native = &exit
+312: 		return persistStopResult(p, result)
+313: 	}
+314: 	return finishAfterNativeExit(ctx, p, planSHA, exit)
+315: }
+316: 
+317: // Called only after an observed native exit and release of the reserved writer.
+318: // A real DataRootLease plus fresh database and authority reads determine state.
+319: func finishAfterNativeExit(ctx context.Context, p Plan, planSHA string, exit supervisor.OwnedCoreNativeExit) (Result, error) {
+320: 	if !exit.ExitObserved {
+321: 		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "native exit not observed"))
+322: 	}
+323: 	lease, err := rt.AcquireDataRootLease(p.Input.DataRoot)
+324: 	if err != nil {
+325: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease unavailable")
+326: 		result.Native = &exit
+327: 		return persistStopResult(p, result)
+328: 	}
+329: 	defer lease.Close()
+330: 	if !lease.Held() {
+331: 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease not held")
+332: 		result.Native = &exit
+333: 		return persistStopResult(p, result)
+334: 	}
+335: 	post, postErr := store.ReadOwnedStopCensus(ctx, p.Host.Database)
+336: 	postAuthority, authorityErr := host.ReadOwnedCoreStopPublicIdentity(ctx, p.Input.DataRoot)
+337: 	result := stopResult(p, planSHA, "STOPPED_LEASE_VERIFIED", "")
+338: 	result.Native = &exit
+339: 	result.Postflight = &post
+340: 	if exit.BeforeSignal {
+341: 		result.State = "OBSERVED_BEFORE_SIGNAL"
+342: 	}
+343: 	if postErr != nil || authorityErr != nil || post != p.Baseline || postAuthority != p.Host {
+344: 		result.State = "STOP_OBSERVED_MAINTENANCE_BLOCKED"
+345: 		result.Reason = "poststop logical/schema/authority/integrity drift"
+346: 	}
+347: 	return persistStopResult(p, result)
+REF {'path': 'D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\owned-core-stop-anchor-r2-20261015\\internal\\ownedcorestop\\contract.go', 'sha256': 'f0e22243f90ffac03753a135fa43ce8b87d67e4eb264828801718520ce1fed08', 'start': 303, 'end': 315}
+303: type Result struct {
+304: 	Schema          string                          `json:"schema"`
+305: 	OperationID     string                          `json:"operation_id"`
+306: 	PlanSHA256      string                          `json:"plan_sha256"`
+307: 	StopGrantSHA256 string                          `json:"stop_grant_sha256,omitempty"`
+308: 	State           string                          `json:"state"`
+309: 	Reason          string                          `json:"reason,omitempty"`
+310: 	Native          *supervisor.OwnedCoreNativeExit `json:"native,omitempty"`
+311: 	Postflight      *store.OwnedStopCensus          `json:"postflight,omitempty"`
+312: }
+313: 
+314: func digest(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
+315: func validSHA(s string) bool {
+SPEC_MANIFEST_SHAPE
+dict ['package_id', 'package_version', 'specification_date', 'user_timezone', 'status', 'product_implementation_status', 'product_test_status', 'entrypoint', 'execution_goal', 'source_snapshot']
+manifest sha 2949300fd249ea814714411a509d7fe25323e4be6fc11e6f2077c24fa76c351e

@@ -1,0 +1,71 @@
+{
+  "runner": [
+    {
+      "label": "three-dynamic-images-within-original64",
+      "old": "need(images and len(images)<=62,'Finite compiler image list must leave two slots for the new test and CLI')",
+      "new": "need(images and len(images)<=61,'Finite compiler image list must leave three slots for test2json, test and CLI')"
+    },
+    {
+      "label": "explicit-tool-graph-and-fresh-build",
+      "old": "        cli=build/'researchos-cli.exe';test=build/'cli.test.exe'\n",
+      "new": "        # Build the standard-library tool explicitly; never invoke go tool's implicit builder.\n        tool_graph,_=run('go-list-test2json',[go,'list','-buildvcs=false','-mod=readonly','-compiled','-deps',\n             '-json','-work','-x','cmd/test2json'],export,240,True,images,2048)\n        tool_text=tool_graph.decode('utf-8',errors='strict');tool_idx=0;tool_packages=[]\n        while tool_idx<len(tool_text):\n            if tool_text[tool_idx].isspace(): tool_idx+=1;continue\n            obj,tool_idx=decoder.raw_decode(tool_text,tool_idx);tool_packages.append(obj)\n        need(tool_packages and all(p.get('Goroot') is True and not p.get('Error') and not p.get('DepsErrors')\n             for p in tool_packages),'TEST2JSON_GRAPH_OUTSIDE_FROZEN_GOROOT_OR_ERROR')\n        need(sum(p.get('ImportPath')=='cmd/test2json' and p.get('Name')=='main' for p in tool_packages)==1,\n             'TEST2JSON_MAIN_GRAPH_MISSING_OR_AMBIGUOUS')\n        tool_graph_files=[];tool_root=Path(compiler['GOROOT']).absolute()\n        for p in tool_packages:\n            need(not p.get('Module'),'TEST2JSON_UNEXPECTED_MODULE')\n            for field in fields:\n                for name in p.get(field,[]):\n                    q=Path(name) if Path(name).is_absolute() else Path(p['Dir'])/name\n                    q=q.absolute()\n                    need(q.is_file() and q.resolve()==q and q.is_relative_to(tool_root)\n                         and str(q) in ledger.members,'TEST2JSON_UNCATALOGUED_SOURCE: '+str(q))\n                    tool_graph_files.append(q)\n        save(out/'test2json-graph.actual.json',{'packages':tool_packages,\n             'all_referenced_files':[pin(p) for p in sorted(set(tool_graph_files))],\n             'only_existing_frozen_GOROOT_sources':True})\n        ledger.add('test2json-actual-source-graph',tool_graph_files)\n        tool_bin=safe(export/'bin',export)\n        if not tool_bin.exists(): tool_bin.mkdir()\n        need(tool_bin.is_dir(),'TEST2JSON_OUTPUT_PARENT_NOT_DIRECTORY')\n        test2json=safe(tool_bin/'test2json.exe',export,True)\n        save(out/'test2json-build.before.json',{'output_path':str(test2json),'output_absent':True,\n             'WORK':[pin(p) for p in files(build/'gotmp')],'cache':[pin(p) for p in files(build/'gocache')]})\n        ledger.check('test2json-before-build')\n        run('build-test2json',[go,'build','-p=1','-mod=readonly','-buildvcs=false','-work','-x','-o',\n             str(test2json),'cmd/test2json'],export,600,True,images,2048)\n        need(test2json.is_file(),'TEST2JSON_BUILD_OUTPUT_MISSING')\n        ledger.add('fresh-test2json-executable',[test2json])\n        save(out/'test2json-build.after.json',{'test2json':pin(test2json),\n             'WORK':[pin(p) for p in files(build/'gotmp')],'cache':[pin(p) for p in files(build/'gocache')],\n             'fresh_build':True,'installed_or_old_tool_reused':False})\n        ledger.check('test2json-after-build')\n        cli=build/'researchos-cli.exe';test=build/'cli.test.exe'\n"
+    },
+    {
+      "label": "full-compiled-artifact-ledger",
+      "old": "allwork+allcache+archives+[cli,test])",
+      "new": "allwork+allcache+archives+[cli,test,test2json])"
+    },
+    {
+      "label": "compiled-closure-tool-pin",
+      "old": "'cli':pin(cli),'testexe':pin(test),'same_round':True",
+      "new": "'cli':pin(cli),'testexe':pin(test),'test2json':pin(test2json),'same_round':True"
+    },
+    {
+      "label": "tool-buildinfo-before-first-case",
+      "old": "        ledger.check('compiled-before-first-case')",
+      "new": "        run('buildinfo-test2json',[go,'version','-m',str(test2json)],export,30,True,images,4)\n        ledger.check('compiled-before-first-case')"
+    },
+    {
+      "label": "direct-pinned-tool-argv",
+      "old": "argv=[go,'tool','test2json','-t','-p'",
+      "new": "argv=[str(test2json),'-t','-p'"
+    },
+    {
+      "label": "finite-case-image-set",
+      "old": "510,True,images+[pin(cli),pin(test)],16,ee)",
+      "new": "510,True,images+[pin(cli),pin(test),pin(test2json)],16,ee)"
+    },
+    {
+      "label": "tool-output-failure-inventory",
+      "old": "            if ledger:\n",
+      "new": "            if 'test2json' in locals():\n                try: save(out/'test2json-artifact.finally.json',{'output_path':str(test2json),\n                    'exists':test2json.exists(),'file':pin(test2json) if test2json.is_file() else None,\n                    'partial_if_failed':first is not None})\n                except BaseException as e: secondary.append({'stage':'test2json-partial-artifact','error':repr(e)})\n            if ledger:\n"
+    }
+  ],
+  "helper": [
+    {
+      "label": "first-rejected-load-bounded-diagnostic",
+      "old": "        'events': [], 'modules': [], 'exit_event_observed': False,",
+      "new": "        'events': [], 'modules': [], 'exit_event_observed': False,\r\n        'rejected_load_facts': [], 'bounded_rejected_load_facts': 1,"
+    },
+    {
+      "label": "diagnostic-from-already-hashed-fact",
+      "old": "        def capture_file(raw_handle, event_code, image_base, process_id):\r\n",
+      "new": "        def reject_load(fact, expected_pin, reason):\r\n            # Preserve only facts already read from this event's actual hFile.\r\n            # This never authorizes the load, performs extra IO, or appends a qualified module.\r\n            if not debug['rejected_load_facts']:\r\n                proc=processes[fact['pid']]\r\n                generation=next(i+1 for i,p in enumerate(generations) if p is proc)\r\n                debug['rejected_load_facts'].append({**fact,'process_generation':generation,\r\n                    'expected_pin':expected_pin,'rejection_reason':reason,\r\n                    'qualified_module':False,'diagnostic_only':True})\r\n            raise RuntimeError(reason)\r\n\r\n        def capture_file(raw_handle, event_code, image_base, process_id):\r\n"
+    },
+    {
+      "label": "unknown-module-before-rejection",
+      "old": "                    raise RuntimeError('Actual loaded module outside frozen runtime universe')",
+      "new": "                    reject_load(fact,module_pins.get(image_key(path_buffer.value)),\r\n                                'Actual loaded module outside frozen runtime universe')"
+    },
+    {
+      "label": "unknown-image-before-rejection",
+      "old": "                        raise RuntimeError('Actual CREATE_PROCESS file path/bytes outside pinned executable set')",
+      "new": "                        reject_load(fact,image_pins.get(loaded_image_key),\r\n                                    'Actual CREATE_PROCESS file path/bytes outside pinned executable set')"
+    },
+    {
+      "label": "primary-image-mismatch-diagnostic",
+      "old": "                        raise RuntimeError('Primary image mismatch')",
+      "new": "                        reject_load(fact,expected_image,'Primary image mismatch')"
+    }
+  ]
+}

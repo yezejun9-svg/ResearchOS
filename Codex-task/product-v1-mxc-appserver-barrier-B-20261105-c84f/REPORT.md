@@ -1,0 +1,43 @@
+# B: same-thread app-server permission barrier, static feasibility
+
+Status: BLOCKED_FOR_MODEL_ADMISSION for the proposed ID-only barrier; useful conditional fallback detection is established. Slice A remains production UNVERIFIED. No product source, saved configuration, private authentication/configuration, execution scope, or historical receipts were changed. No Native/CLI/App/echo/model/probe/setup was run. The two local echo attempts remain consumed. This report concerns public source tagged rust-v0.166.0, not a runtime attestation of the installed binary.
+
+## Positive data flow
+
+`thread/start` obtains `thread.config_snapshot()` and builds its response's activePermissionProfile from that snapshot; the conversion helper maps the effective core value into the API type. It does not directly echo the requested profile ID. Core `CodexThread::config_snapshot` calls the session snapshot method; that method copies the live session configuration and asks for its effective snapshot. Therefore this field can provide meaningful evidence about the selected thread, rather than merely acknowledge a request.
+
+Sources: [thread_processor.rs, thread/start response](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/request_processors/thread_processor.rs), [thread_summary.rs, thread_response_active_permission_profile](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/request_processors/thread_summary.rs), [codex_thread.rs, config_snapshot](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/codex_thread.rs), [session/mod.rs, resume_config_snapshot](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/mod.rs).
+
+## Fallback and managed requirements
+
+In core configuration, named-selection fallback changes the selected name before compilation; the active ID is assigned from that resolved name. A later constrained permission-profile fallback clears the active ID and profile roots. Restoration of a legacy saved filesystem policy also clears the ID. Managed requirements declaring a profile whose name collides with a configured profile cause an error, rather than replacing its graph under the same name. These inspected fallback paths support checking exact ID and extends. They do not establish the stronger invariant that every modification of the effective graph clears its ID.
+
+A concrete counterexample is later helper-root augmentation: active arg0 helper roots, and memories_root when MemoryTool plus use_memories are enabled, are added to filesystem permissions while the existing ID is retained. This happens after fallback handling and before PermissionProfileState construction. Mandatory deny-read additions are another graph change, normally narrowing access. Exact equality and bounded non-widening are different claims.
+
+Source: [core/config/mod.rs, resolve_default_permissions; merge_managed_permission_profiles; helper_readable_roots; PermissionProfileState construction](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/mod.rs).
+
+`with_additional_readable_roots` adds a concrete Read entry when the path was not already readable. The longest matching path controls access, so retaining a root Deny does not prevent a more-specific Read exception. Native arg0 startup can itself create and prepend its per-process helper directory on Windows; sanitizing the inherited PATH alone does not prove that helper augmentation is absent. This is a Native helper behavior, not evidence that this run read credentials. No private path was inspected.
+
+Sources: [protocol/permissions.rs, with_additional_readable_roots and resolve_access](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/permissions.rs), [arg0/src/lib.rs, arg0_dispatch and prepare_aliases_in_home](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/arg0/src/lib.rs).
+
+## Stronger same-ID counterexample: ordinary configuration layers
+
+Even if helper roots are separately bounded, the premise that Host's inline table defines the whole effective graph is not presently established. `build_cli_overrides_layer` replaces a table within the SessionFlags layer. `ConfigLayerStack::effective_config` subsequently merges enabled layers from low to high. The table/table merge recursively overlays present keys and retains absent keys; there is no permission-profile whole-table replacement special case in that merge.
+
+Hypothetical public-source counterexample, NOT observed local configuration and NOT executed: a lower ordinary config layer gives `permissions.researchos-readonly.filesystem` an extra `C:/synthetic-extra = read` entry. Host supplies its complete root-deny/minimal-read/source-read inline table but does not mention that extra key. Cross-layer merging retains it. The profile ID remains researchos-readonly, extends can remain absent, and no named-selection fallback is required. Replacing Read with Write is also a graph-widening example if otherwise allowed by requirements. This is ordinary config layering, distinct from the managed-requirements duplicate-name error.
+
+Sources: [config/src/overrides.rs, build_cli_overrides_layer/apply_toml_override](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/overrides.rs), [config/src/state.rs, effective_config](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/state.rs), [config/src/merge.rs, merge_toml_values_at_path](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/merge.rs).
+
+## Turn sequencing
+
+The app-server supports a pre-prompt sequencing boundary: start a fresh thread, inspect the response, then send turn/start. With no environment/cwd/model/permission settings overrides, the inspected turn handler does not call its permission-config loader and returns absent permission overrides. Runtime MCP/user refresh starts from the retained Config and modifies MCP-related fields, rather than reconstructing permissions. This is positive evidence for retaining checked thread settings, not a proof against arbitrary concurrent RPC mutations. A Host-owned single connection must serialize operations, reject unexpected state changes, and never resume a different thread.
+
+Explicit turn/start permissions takes a different path: it reloads permission configuration using retained session flags and rejects a permission_profile disallowed startup warning before submitting input. That improves fallback behavior but does not remove the ordinary-layer merge counterexample or retained-ID helper augmentation. Sending explicit permissions each turn also introduces a fresh config load; do not describe it as retaining exactly the previously inspected graph.
+
+Sources: [turn_processor.rs, build_environment_override/build_thread_settings_overrides/start_or_steer_turn](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/request_processors/turn_processor.rs), [config_manager.rs, load_permission_config_for_thread](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/config_manager.rs), [core/config/runtime_refresh.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/runtime_refresh.rs).
+
+## Bounded next decision
+
+An ID barrier remains a useful component: reject absent/different ID or extends, mismatched cwd/runtime roots/approval, initialization errors, and unexpected thread identity before sending any prompt. It is insufficient alone for exact root-deny/minimal/source-read admission in the current layering model. To admit, Host needs either a source-supported way to replace/isolate the named profile from unknown ordinary-layer entries, or a same-thread narrow effective filesystem/network projection that it can compare without reading unrelated config/auth content. Helper read additions must then be excluded or explicitly bounded within an accepted platform-minimum contract. This report does not authorize loosening that contract, a new probe, a CLI invocation, or a model task.
+
+Do not replace these remaining checks with TTL, a past echo, fixture PASS, user JSON, or the word verified. Conversely, do not require proof that Native loads no other context: hooks/MCP/account/cloud configuration remain D03 PLATFORM_POLICY; workload network=false does not imply outer Native makes no network requests. The next investigation can remain narrowly focused on a public per-thread effective permission projection or true profile replacement semantics. No claim of permanent impossibility is made.

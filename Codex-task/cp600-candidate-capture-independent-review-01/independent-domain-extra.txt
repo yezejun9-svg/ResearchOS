@@ -1,0 +1,22 @@
+// Independent predicates only: no producer or sandbox call is added.
+func TestIndependentCaptureCarrierCanonicalEpochAndNoWireAuthority(t *testing.T) {
+    for _, raw := range []string{
+        `{"codingCapture":{"view":{"Schema":"researchos.coding-private-capture-context.v1"}},"Name":"run_check"}`,
+        `{"coding\u0043apture":{"view":{}},"Policy":{"capture":true},"IntentKey":"coding.pure-scalar-bundle-v1"}`,
+        `{"CodingCapture":null,"Arguments":{"check_id":"coding.pure-scalar-bundle-v1"}}`,
+    } { t.Run("wire-"+Digest([]byte(raw))[7:15],func(t *testing.T){
+        var request RuntimeToolRequest
+        if err:=json.Unmarshal([]byte(raw),&request);err!=nil {t.Fatal(err)}
+        if view,err:=request.CodingCapture();view!=nil||err!=nil {t.Fatal("wire minted context")}
+    }) }
+    for _, epoch:=range []string{"+1"," 1","1 ","1.0","1e0"} {t.Run("epoch-"+Digest([]byte(epoch))[7:15],func(t *testing.T){
+        view:=captureTestView();view.LeaseEpoch=epoch
+        request:=RuntimeToolRequest{codingCapture:&runtimeToolCaptureContext{view:view}}
+        if got,err:=request.CodingCapture();got!=nil||err==nil {t.Fatal("noncanonical epoch accepted")}
+    })}
+    view:=captureTestView();view.LeaseEpoch="9007199254740993"
+    request:=RuntimeToolRequest{codingCapture:&runtimeToolCaptureContext{view:view}}
+    first,err:=request.CodingCapture();if err!=nil {t.Fatal(err)}
+    first.LeaseEpoch="9007199254740992";first.ProjectID="changed";first.GoModHash="changed"
+    again,err:=request.CodingCapture();if err!=nil||*again!=view {t.Fatal("copied scalar context changed",err)}
+}

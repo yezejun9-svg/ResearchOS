@@ -1,0 +1,87 @@
+diff --git a/internal/store/owned_stop_barrier_windows.go b/internal/store/owned_stop_barrier_windows.go
+index fb715ca979d12ae315ce7ee708774d05bcfd9e37..ea98b922880abc7ec42304be9dd0705af3810414 100644
+--- a/internal/store/owned_stop_barrier_windows.go
++++ b/internal/store/owned_stop_barrier_windows.go
+@@ -153,6 +153,8 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
+ 	if err := source.QueryRowContext(ctx, `SELECT state,dispatch_key FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.Project, subject.Run, subject.Epoch).Scan(&s.DispatchState, &s.DispatchKey); err != nil {
+ 		return s, err
+ 	}
++	// SQLite != yields NULL for a missing/null state. IS NOT makes that
++	// latest effect unsafe without changing the per-key latest-row selection.
+ 	queries := []struct {
+ 		sql  string
+ 		args []any
+@@ -161,7 +163,7 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
+ 		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND NOT(project=? AND id=?) AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, []any{subject.Project, subject.Run}, &s.UnresolvedOtherRuns},
+ 		{`SELECT count(*) FROM runtime_dispatches WHERE NOT(project=? AND run=? AND epoch=?) AND state IN ('PREPARED','STARTED','UNKNOWN')`, []any{subject.Project, subject.Run, subject.Epoch}, &s.UnresolvedOtherDispatches},
+ 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, nil, &s.UnresolvedExternalEffects},
+-		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state')!='CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state') IS NOT 'CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
+ 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.payload.capability')='MODEL' AND json_extract(body,'$.state')='CONFIRMED' AND x.project=? AND x.run=?`, []any{subject.Project, subject.Run}, &s.ConfirmedModelEffects},
+ 		{`SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`, nil, &s.PendingClientCommands},
+ 		{`SELECT count(*) FROM client_control_requests WHERE state!='CONFIRMED'`, nil, &s.PendingControlRequests},
+diff --git a/internal/store/owned_stop_barrier_windows_test.go b/internal/store/owned_stop_barrier_windows_test.go
+index d903b319ec3947bb8121615469ca0d8577c41432..2d3059a9c57b8c55856461391aa98cc5fe9a1db5 100644
+--- a/internal/store/owned_stop_barrier_windows_test.go
++++ b/internal/store/owned_stop_barrier_windows_test.go
+@@ -107,6 +107,60 @@ func TestOwnedStopSchema24SafetyRejectsUnresolvedEffectsAndOtherDispatches(t *te
+ 	}
+ }
+ 
++func TestOwnedStopLatestEffectStateFiniteMatrix(t *testing.T) {
++	cases := []struct {
++		name, key, body string
++		sequence        int
++		wantSafe        bool
++	}{
++		{"additional null", "extra", `{"state":null,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional missing", "extra", `{"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional boolean", "extra", `{"state":true,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional numeric", "extra", `{"state":0,"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional array", "extra", `{"state":[],"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional object", "extra", `{"state":{},"payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional empty string", "extra", `{"state":"","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional unknown enum", "extra", `{"state":"UNRECOGNIZED","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional UNKNOWN", "extra", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 1, false},
++		{"additional CONFIRMED", "extra", `{"state":"CONFIRMED","payload":{"capability":"MODEL"}}`, 1, false},
++		{"missing capability", "extra", `{"state":null}`, 1, false},
++		{"null capability", "extra", `{"state":null,"payload":{"capability":null}}`, 1, false},
++		{"old latest null", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 2, false},
++		{"old latest missing", "old-model", `{"payload":{"capability":"MODEL"}}`, 2, false},
++		{"old history null before valid latest", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 0, true},
++		{"old history UNKNOWN before valid latest", "old-model", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 0, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			path, db, subject := ownedStopSchema24Fixture(t)
++			if _, err := db.Exec(`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)`, subject.Project, subject.Run, tc.key, tc.sequence, tc.body); err != nil {
++				t.Fatalf("real schema fixture insert: %v", err)
++			}
++			preflight, err := ReadOwnedStopSafetyPreflight(context.Background(), path, subject)
++			if err != nil || preflight.ExactOldSubjectSafe() != tc.wantSafe {
++				t.Fatalf("preflight safety=%v want=%v snapshot=%+v error=%v", preflight.ExactOldSubjectSafe(), tc.wantSafe, preflight, err)
++			}
++			barrier, err := AcquireOwnedStopBarrier(context.Background(), path)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer barrier.Close()
++			reserved, err := barrier.SafetySnapshot(context.Background(), subject)
++			if err != nil || reserved.ExactOldSubjectSafe() != tc.wantSafe {
++				t.Fatalf("reserved safety=%v want=%v snapshot=%+v error=%v", reserved.ExactOldSubjectSafe(), tc.wantSafe, reserved, err)
++			}
++			if preflight != reserved {
++				t.Fatalf("preflight and reserved classifications differ: %+v %+v", preflight, reserved)
++			}
++			if tc.key == "extra" && (tc.name == "additional null" || tc.name == "additional missing") {
++				if reserved.NonModelEffects != 1 || reserved.ConfirmedModelEffects != 1 {
++					t.Fatalf("latest extra malformed MODEL was not counted unsafe: %+v", reserved)
++				}
++			}
++		})
++	}
++}
++
+ func TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter(t *testing.T) {
+ 	path, db := ownedStopFixtureDB(t)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

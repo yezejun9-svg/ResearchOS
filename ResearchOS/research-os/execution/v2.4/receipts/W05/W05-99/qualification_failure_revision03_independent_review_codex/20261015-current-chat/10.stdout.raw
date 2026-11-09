@@ -1,0 +1,529 @@
+FILE ops/supervisor/control_fixture_windows.go
+89: func (d *ControlFixtureDriver) Start(image, token, data string) (ProcessIdentity, error) {
+90: 	if d.Journal == nil {
+91: 		return ProcessIdentity{}, errors.New("supervisor journal required")
+92: 	}
+93: 	s := d.Journal.State()
+94: 	if s.RestoreContext != nil {
+95: 		return ProcessIdentity{}, errors.New(RecoveryAuthorizationBlocked)
+96: 	}
+97: 	if (s.Phase != "STARTING" && s.Phase != "SWITCHED") || s.PID != 0 || s.Data != data || token == "" {
+98: 		return ProcessIdentity{}, errors.New("durable unstarted slot required")
+99: 	}
+100: 	lease, e := rt.AcquireDataRootLease(data)
+101: 	if e != nil {
+102: 		return ProcessIdentity{}, e
+103: 	}
+104: 	if e = lease.Close(); e != nil {
+105: 		return ProcessIdentity{}, e
+106: 	}
+107: 	actual, digest, e := exactImage(image)
+108: 	if e != nil || digest != s.Active {
+109: 		return ProcessIdentity{}, errors.New("control image differs from durable slot")
+110: 	}
+111: 	peer, e := ObserveProcess(uint32(os.Getpid()))
+112: 	if e != nil {
+113: 		return ProcessIdentity{}, e
+114: 	}
+115: 	name, e := NewDrainPipeName()
+116: 	if e != nil {
+117: 		return ProcessIdentity{}, e
+118: 	}
+119: 	boot := &DrainBootstrap{Pipe: name, Root: filepath.Clean(data), Key: make([]byte, 32), Peer: peer, Token: token, Epoch: s.Epoch, Listener: d.Listen}
+120: 	boot.FixtureStore = d.FixtureStore
+121: 	if _, e = rand.Read(boot.Key); e != nil {
+122: 		return ProcessIdentity{}, e
+123: 	}
+124: 	r, w, e := os.Pipe()
+125: 	if e != nil {
+126: 		return ProcessIdentity{}, e
+127: 	}
+128: 	defer r.Close()
+129: 	defer w.Close()
+130: 	if e = windows.SetHandleInformation(windows.Handle(r.Fd()), windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
+131: 		return ProcessIdentity{}, e
+132: 	}
+133: 	args := []string{}
+134: 	if d.CoordinatorConfig != "" {
+135: 		args = append(args, "--runtime-coordinator-config", d.CoordinatorConfig)
+136: 	}
+137: 	cmd := exec.Command(actual, args...)
+138: 	cmd.Dir = d.WorkDir
+139: 	for _, v := range os.Environ() {
+140: 		name, _, _ := strings.Cut(v, "=")
+141: 		if strings.EqualFold(name, drainHandleEnv) || strings.EqualFold(name, "RESEARCHOS_DATA_DIR") || strings.EqualFold(name, "RESEARCHOS_WEB_DIR") || strings.EqualFold(name, "RESEARCHOS_LISTEN") {
+142: 			continue
+143: 		}
+144: 		cmd.Env = append(cmd.Env, v)
+145: 	}
+146: 	cmd.Env = append(cmd.Env, drainHandleEnv+"="+strconv.FormatUint(uint64(r.Fd()), 10), "RESEARCHOS_DATA_DIR="+data, "RESEARCHOS_WEB_DIR="+d.WebDir, "RESEARCHOS_LISTEN="+d.Listen)
+147: 	cmd.Stdout, cmd.Stderr = d.Output, d.Output
+148: 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW, AdditionalInheritedHandles: []syscall.Handle{syscall.Handle(r.Fd())}}
+149: 	if e = cmd.Start(); e != nil {
+150: 		return ProcessIdentity{}, e
+151: 	}
+152: 	go func() { _ = cmd.Wait() }()
+153: 	p, e := ObserveProcess(uint32(cmd.Process.Pid))
+154: 	if e != nil {
+155: 		return ProcessIdentity{}, e
+156: 	}
+157: 	d.boot, d.process, d.frame = boot, p, DrainFrame{}
+158: 	if e = json.NewEncoder(w).Encode(boot); e != nil {
+159: 		return p, e
+160: 	}
+161: 	return p, nil
+162: }
+163: 
+164: func (d *ControlFixtureDriver) Alive(p ProcessIdentity) (bool, error) {
+284: 	}
+285: 	f := d.frame
+286: 	f.Kind = "COMMIT_EXIT"
+287: 	if e = d.send(c, f); e != nil {
+288: 		return e
+289: 	}
+290: 	r, e := d.read(c, f)
+291: 	if e != nil {
+292: 		return e
+293: 	}
+294: 	if r.Kind != "COMMIT_READY" || r.State != "QUIESCED" || r.Receipt != f.Receipt {
+295: 		return errors.New("commit outcome unknown")
+296: 	}
+297: 	f.Kind = "EXIT_ACK"
+298: 	if e = d.send(c, f); e != nil {
+299: 		return e
+300: 	}
+301: 	wait, e := windows.WaitForSingleObject(h, 15000)
+302: 	if e != nil || wait != windows.WAIT_OBJECT_0 {
+303: 		return fmt.Errorf("normal exit not observed: %d %v", wait, e)
+304: 	}
+305: 	var code uint32
+306: 	if e = windows.GetExitCodeProcess(h, &code); e != nil || code != 0 {
+307: 		return fmt.Errorf("control exit was not clean: %d %v", code, e)
+308: 	}
+309: 	lease, e := rt.AcquireDataRootLease(s.Data)
+310: 	if e != nil {
+311: 		return e
+312: 	}
+313: 	return lease.Close()
+314: }
+315: 
+316: func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, token string) error {
+388: func (d *ControlFixtureDriver) Compatible(ctx context.Context, s ReleaseState) error {
+389: 	if (d.RestoreWithContext == nil && d.Restore == nil) || s.Cutover == nil {
+390: 		return errors.New("actual control rollback requires a separately qualified restore")
+391: 	}
+392: 	if d.Journal == nil || d.Journal.State().Operation != s.Operation || d.Journal.State().Epoch != s.Epoch {
+393: 		return errors.New("restore journal operation changed")
+394: 	}
+395: 	if bound := d.Journal.State().RestoreContext; bound != nil {
+396: 		if _, err := ValidateReleaseRestoreResult(d.Journal.State(), *bound); err != nil {
+397: 			return err
+398: 		}
+399: 		return errors.New(RecoveryAuthorizationBlocked)
+400: 	}
+401: 	lease, err := rt.AcquireDataRootLease(s.Data)
+402: 	if err != nil {
+403: 		return err
+404: 	}
+405: 	defer lease.Close()
+406: 	if d.RestoreWithContext != nil {
+407: 		result, err := d.RestoreWithContext(ctx, s, lease)
+408: 		if err != nil {
+409: 			return err // Never fall back to an untyped restore after uncertainty.
+410: 		}
+411: 		if err = d.Journal.BindRestoreContext(result); err != nil {
+412: 			return err
+413: 		}
+414: 		// The real restored copy is fenced, but no current recovery actor/proof
+415: 		// exists in this bounded slice. Do not select its Data or start control.
+416: 		return errors.New(RecoveryAuthorizationBlocked)
+417: 	}
+418: 	// Legacy synthetic fixture callback remains compatible; it cannot consume
+419: 	// a typed context and is not selected by the actual-control host.
+420: 	dest, err := d.Restore(ctx, s, lease)
+421: 	if err != nil {
+422: 		return err
+423: 	}
+424: 	current := d.Journal.State()
+425: 	current.Data = dest
+426: 	clearProcess(&current)
+427: 	return d.Journal.Append(current)
+428: }
+429: 
+FILE ops/supervisor/release_host/control_windows.go
+20: 	Action        string          `json:"action"`
+21: 	Project       string          `json:"project"`
+22: 	Candidate     string          `json:"candidate"`
+23: 	CandidatePath string          `json:"candidate_path"`
+24: 	Operation     string          `json:"operation"`
+25: 	Request       json.RawMessage `json:"request"`
+26: }
+27: 
+28: func runControlHost(control, root, work, web, listen, private, contracts string) error {
+29: 	if !filepath.IsAbs(root) || !filepath.IsAbs(control) || !filepath.IsAbs(work) || !filepath.IsAbs(web) || !filepath.IsAbs(private) || contracts == "" || listen == "" {
+30: 		return errors.New("absolute actual-control fixture host bindings required")
+31: 	}
+32: 	j, e := supervisor.OpenReleaseJournal(filepath.Join(root, "release-state"))
+33: 	if e != nil {
+34: 		return e
+35: 	}
+36: 	defer j.Close()
+37: 	d := &supervisor.ControlFixtureDriver{Journal: j, WorkDir: work, WebDir: web, Listen: listen, FixtureStore: private, Output: os.Stderr}
+38: 	d.RestoreWithContext = func(ctx context.Context, s supervisor.ReleaseState, lease *rt.DataRootLease) (supervisor.ReleaseRestoreResult, error) {
+39: 		return domain.RestoreEvolutionCutoverContext(ctx, s, lease, contracts, private)
+40: 	}
+41: 	verify := func(a supervisor.ReleaseAdmission) error {
+42: 		state := j.State()
+43: 		_, e := d.Private(context.Background(), "FIXTURE_CURRENT", supervisor.ReleasePrivateMessage{Admission: &a, Snapshot: &state})
+44: 		return e
+45: 	}
+46: 	engine, e := supervisor.NewReleaseEngine(j, d, d, verify)
+47: 	if e != nil {
+48: 		return e
+49: 	}
+50: 	if j.Sequence() == 0 {
+51: 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+52: 		e = engine.BootstrapFixture(ctx, control, filepath.Join(root, "data"))
+53: 		cancel()
+54: 		if e != nil {
+55: 			return e
+56: 		}
+57: 	}
+58: 	encoder := json.NewEncoder(os.Stdout)
+59: 	if e = encoder.Encode(map[string]any{"status": "HOST_READY", "state": j.State(), "recovered": j.State().Phase != "STABLE"}); e != nil {
+60: 		return e
+61: 	}
+62: 	scan := bufio.NewScanner(os.Stdin)
+63: 	scan.Buffer(make([]byte, 1024), 8192)
+64: 	for scan.Scan() {
+65: 		var c command
+66: 		if e = json.Unmarshal(scan.Bytes(), &c); e != nil {
+67: 			return e
+68: 		}
+69: 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+70: 		result, err := controlCommand(ctx, c, root, j, d, engine)
+71: 		cancel()
+72: 		reply := map[string]any{"action": c.Action, "state": j.State(), "result": result}
+73: 		if err != nil {
+74: 			reply["error"] = err.Error()
+75: 		}
+76: 		if e = encoder.Encode(reply); e != nil {
+77: 			return e
+78: 		}
+79: 		if c.Action == "stop" && err == nil {
+80: 			return nil
+81: 		}
+82: 	}
+83: 	// EOF releases only the host journal. It does not repeat stop or launch.
+84: 	return scan.Err()
+85: }
+86: 
+87: func controlCommand(ctx context.Context, c command, root string, j *supervisor.ReleaseJournal, d *supervisor.ControlFixtureDriver, engine *supervisor.ReleaseEngine) (any, error) {
+88: 	state := j.State()
+89: 	switch c.Action {
+90: 	case "status":
+91: 		return engine.Reconcile()
+92: 	case "current":
+93: 		if state.Phase != "STABLE" {
+94: 			return nil, errors.New("current control proof requires stable host")
+95: 		}
+96: 		return d.Private(ctx, "CURRENT_CONTROL", supervisor.ReleasePrivateMessage{Request: c.Request, Snapshot: &state})
+97: 	case "seal":
+98: 		if state.Phase != "STABLE" {
+99: 			return nil, errors.New("stable host required to seal")
+100: 		}
+101: 		return d.Private(ctx, "FIXTURE_SEAL", supervisor.ReleasePrivateMessage{Project: c.Project, Candidate: c.Candidate, Request: c.Request, Snapshot: &state})
+102: 	case "execute":
+103: 		// CANARY is an observation/projection retry only; no switch is dispatched.
+104: 		if state.Phase == "STABLE" {
+105: 			if len(c.Operation) != 64 || filepath.Base(c.Operation) != c.Operation {
+106: 				return nil, errors.New("sealed operation identifier required")
+107: 			}
+108: 			raw, e := os.ReadFile(filepath.Join(root, "release-state", "admissions", c.Operation+".json"))
+109: 			if e != nil {
+110: 				return nil, e
+111: 			}
+112: 			var a supervisor.ReleaseAdmission
+113: 			if e = json.Unmarshal(raw, &a); e != nil {
+114: 				return nil, e
+115: 			}
+116: 			if a.Operation != c.Operation {
+117: 				return nil, errors.New("sealed operation mismatch")
+118: 			}
+119: 			state, e = engine.PrepareFixture(a, c.CandidatePath)
+120: 			if e != nil {
+121: 				return nil, e
+122: 			}
+123: 		}
+124: 		if state.Operation != c.Operation {
+125: 			return nil, errors.New("current host operation differs")
+126: 		}
+127: 		if state.Phase == "PREPARED" {
+128: 			if _, e := d.Private(ctx, "FIXTURE_DISPATCH", supervisor.ReleasePrivateMessage{Snapshot: &state, Admission: state.AdmissionBundle}); e != nil {
+129: 				return nil, e
+130: 			}
+131: 			var e error
+132: 			state, e = engine.SwitchFixture(ctx, c.Operation)
+133: 			if e != nil {
+134: 				return nil, e
+135: 			}
+136: 		} else if state.Phase != "CANARY" {
+137: 			return nil, errors.New("release outcome unknown; journal inspection only")
+138: 		}
+139: 		receipt, _, e := supervisor.WriteFixtureReceipt(filepath.Join(root, "release-state"), j, d)
+140: 		if e != nil {
+141: 			return nil, e
+142: 		}
+143: 		return d.Private(ctx, "FIXTURE_PROJECT", supervisor.ReleasePrivateMessage{Snapshot: &state, Observation: &receipt})
+144: 	case "rollback":
+145: 		return engine.RollbackFixture(ctx, c.Operation)
+146: 	case "stop":
+147: 		return nil, d.ShutdownFixture(ctx)
+148: 	default:
+149: 		return nil, fmt.Errorf("unknown bounded host command %q", c.Action)
+150: 	}
+151: }
+FILE apps/control/prepared_recovery_windows.go
+1: //go:build windows
+2: 
+3: package main
+4: 
+5: import (
+6:     "bytes"
+7:     "context"
+8:     "database/sql"
+9:     "encoding/json"
+10:     "errors"
+11:     "net/url"
+12:     "os"
+13:     "path/filepath"
+14:     "strings"
+15:     "time"
+16: 
+17:     "researchos.local/research-os/internal/domain"
+18:     "researchos.local/research-os/internal/recoveryauthority"
+19: )
+20: 
+21: // Runs before all normal flags, migrations, protected stores, recovery scans,
+22: // provider configuration and listeners. A public invocation alone lacks the
+23: // inherited OS/crypto authority and therefore cannot open the database.
+24: func runPreparedRecoveryMaintenance(args []string) (bool,error) {
+25:     if len(args)==0 || (args[0]!=recoveryauthority.MaintenanceArgument && args[0]!=recoveryauthority.MigrationArgument) { return false,nil }
+26:     if len(args)!=1 { return true,errors.New("private recovery accepts no caller paths or authority options") }
+27:     ctx,cancel:=context.WithTimeout(context.Background(),5*time.Minute); defer cancel()
+28:     if args[0]==recoveryauthority.MigrationArgument { return true,runPreparedSchemaMaintenance(ctx) }
+29:     token,ownerToken,err:=recoveryauthority.ReceiveInherited(ctx); if err!=nil { return true,err }
+30:     defer token.Close()
+31:     adoption,err:=token.Adoption(); if err!=nil { return true,err }
+32:     db,err:=openExclusiveRecoveryDB(ctx,adoption.Database); if err!=nil { return true,err }; defer db.Close()
+33:     result,err:=domain.ExecutePreparedAbandonmentMaintenance(ctx,db,filepath.Join("spec","v2.0","contracts"),token,ownerToken)
+34:     ownerToken=""
+35:     if err!=nil { return true,err }; return true,json.NewEncoder(os.Stdout).Encode(result)
+36: }
+37: func openExclusiveRecoveryDB(ctx context.Context,path string) (*sql.DB,error) {
+38:     u:=url.URL{Scheme:"file",Opaque:filepath.ToSlash(path)}; q:=u.Query(); q.Set("mode","rw"); u.RawQuery=q.Encode()
+39:     db,err:=sql.Open("sqlite",u.String()); if err!=nil { return nil,err }
+40:     db.SetMaxOpenConns(1); db.SetMaxIdleConns(1)
+41:     ok:=false; defer func(){ if !ok { _=db.Close() } }()
+42:     for _,statement:=range []string{"PRAGMA busy_timeout=5000","PRAGMA foreign_keys=ON","PRAGMA synchronous=FULL","PRAGMA locking_mode=EXCLUSIVE"} { if _,err=db.ExecContext(ctx,statement); err!=nil { return nil,err } }
+43:     var mode string; if err=db.QueryRowContext(ctx,"PRAGMA locking_mode").Scan(&mode); err!=nil || strings.ToLower(mode)!="exclusive" { return nil,errors.New("native recovery requires exclusive SQLite connection") }
+44:     // EXCLUSIVE locking mode retains the OS SQLite lock across later domain
+45:     // transactions until this single-connection pool is closed.
+46:     if _,err=db.ExecContext(ctx,"BEGIN EXCLUSIVE"); err!=nil { return nil,err }
+47:     if _,err=db.ExecContext(ctx,"COMMIT"); err!=nil { return nil,err }
+48:     ok=true; return db,nil
+49: }
+50: func runPreparedSchemaMaintenance(ctx context.Context) error {
+51:     token,ownerToken,err:=recoveryauthority.ReceiveMigrationInherited(ctx); if err!=nil { return err }; defer token.Close()
+52:     binding,err:=token.Binding(); if err!=nil { return err }
+53:     raw,err:=token.Options(); if err!=nil { return err }
+54:     var opt domain.LocalUpgradeOptions
+55:     decoder:=json.NewDecoder(bytes.NewReader(raw)); decoder.DisallowUnknownFields()
+56:     if err=decoder.Decode(&opt); err!=nil { return err }
+57:     canonical,err:=json.Marshal(opt); if err!=nil || domain.Digest(canonical)!=binding.OptionsSHA256 || !bytes.Equal(canonical,raw) { return errors.New("native schema maintenance options differ from grant") }
+58:     db,err:=openExclusiveRecoveryDB(ctx,binding.Database); if err!=nil { return err }; defer db.Close()
+59:     result,err:=domain.ExecutePreparedAbandonmentSchemaUpgrade(ctx,db,token,ownerToken,opt)
+60:     ownerToken=""
+61:     if err!=nil { return err }; return json.NewEncoder(os.Stdout).Encode(result)
+62: }
+FILE apps/control/replay_command.go
+1: package main
+2: 
+3: import (
+4: 	"bytes"
+5: 	"encoding/json"
+6: 	"fmt"
+7: 	"net/http/httptest"
+8: 	"os"
+9: 	"path/filepath"
+10: 	"strings"
+11: 	"unsafe"
+12: 
+13: 	"golang.org/x/sys/windows"
+14: 
+15: 	"researchos.local/research-os/evaluation/evolution"
+16: 	"researchos.local/research-os/internal/domain"
+17: 	"researchos.local/research-os/internal/store"
+18: )
+19: 
+20: // Called before ordinary control initialization. It neither starts a listener
+21: // nor loads real credentials, a provider, coordinator or service capability.
+22: func runFixtureControlReplay(args []string) (bool, error) {
+23: 	if len(args) == 0 || args[0] != "--fixture-control-replay" {
+24: 		return false, nil
+25: 	}
+26: 	if len(args) != 2 {
+27: 		return true, fmt.Errorf("one fixture replay request required")
+28: 	}
+29: 	return true, fixtureControlReplay(args[1])
+30: }
+31: 
+32: func replayPlain(path string) error {
+33: 	if !filepath.IsAbs(path) {
+34: 		return fmt.Errorf("absolute replay path required")
+35: 	}
+36: 	name, err := windows.UTF16PtrFromString(path)
+37: 	if err != nil {
+38: 		return err
+39: 	}
+40: 	h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+41: 	if err != nil {
+42: 		return err
+43: 	}
+44: 	defer windows.CloseHandle(h)
+45: 	var info windows.ByHandleFileInformation
+46: 	if err = windows.GetFileInformationByHandle(h, &info); err != nil {
+47: 		return err
+48: 	}
+49: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+50: 		return fmt.Errorf("replay reparse leaf refused")
+51: 	}
+52: 	// The host has copied every ancestor into a fresh tree while rejecting
+53: 	// reparses. AppContainer intentionally cannot query C:\Users metadata, so
+54: 	// do not demand ancestor enumeration or grant it broader filesystem access.
+55: 	return nil
+56: }
+57: 
+58: func replayRead(path string, limit int64) ([]byte, error) {
+59: 	if err := replayPlain(path); err != nil {
+60: 		return nil, err
+61: 	}
+62: 	info, err := os.Stat(path)
+63: 	if err != nil || !info.Mode().IsRegular() || info.Size() > limit {
+64: 		return nil, fmt.Errorf("bounded regular replay file required")
+65: 	}
+66: 	return os.ReadFile(path)
+67: }
+68: 
+69: // The replay output is a freshly created AppContainer-only clone. Keep the
+70: // same native share-mode-zero coordinator lock without enumerating ancestors
+71: // outside the sandbox. Ordinary control still uses its canonical root lease.
+72: func replayOutputLease(data string) (*os.File, error) {
+73: 	if err := replayPlain(data); err != nil {
+74: 		return nil, err
+75: 	}
+76: 	path := filepath.Join(data, "coordinator.lock")
+77: 	name, err := windows.UTF16PtrFromString(path)
+78: 	if err != nil {
+79: 		return nil, err
+80: 	}
+81: 	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+82: 	if err != nil {
+83: 		return nil, err
+84: 	}
+85: 	return os.NewFile(uintptr(h), path), nil
+86: }
+87: 
+88: func fixtureControlReplay(requestPath string) error {
+89: 	token, err := windows.OpenCurrentProcessToken()
+90: 	if err != nil {
+91: 		return err
+92: 	}
+93: 	var appContainer, size uint32
+94: 	const tokenIsAppContainer = 29 // TOKEN_INFORMATION_CLASS from Windows SDK winnt.h.
+95: 	err = windows.GetTokenInformation(token, tokenIsAppContainer, (*byte)(unsafe.Pointer(&appContainer)), uint32(unsafe.Sizeof(appContainer)), &size)
+96: 	token.Close()
+97: 	if err != nil || appContainer != 1 {
+98: 		return fmt.Errorf("fixture control replay requires AppContainer")
+99: 	}
+100: 	if err := replayPlain(requestPath); err != nil {
+101: 		return err
+102: 	}
+103: 	input := filepath.Dir(requestPath)
+104: 	output, err := os.Getwd()
+105: 	if err != nil {
+106: 		return err
+107: 	}
+108: 	if err = replayPlain(output); err != nil {
+109: 		return err
+110: 	}
+111: 	if filepath.Base(requestPath) != "current-case.json" || filepath.Base(input) != "input" || filepath.Base(output) != "output" || !strings.EqualFold(filepath.Dir(input), filepath.Dir(output)) {
+112: 		return fmt.Errorf("replay requires isolated sibling input/output roots")
+113: 	}
+114: 	entries, err := os.ReadDir(output)
+115: 	if err != nil || len(entries) != 0 {
+116: 		return fmt.Errorf("empty replay output required")
+117: 	}
+118: 	raw, err := replayRead(requestPath, 64*1024)
+119: 	if err != nil {
+120: 		return err
+121: 	}
+122: 	var request evolution.ControlRequest
+123: 	if err = evolution.StrictControlJSON(raw, &request); err != nil {
+124: 		return err
+125: 	}
+126: 	if err = evolution.ValidateControlCase(request.Case, request.Binding); err != nil {
+127: 		return err
+128: 	}
+129: 	bundle := evolution.ControlBundle{Binding: request.Binding, Files: map[string][]byte{}}
+130: 	for name := range evolution.ControlReleaseHashes() {
+131: 		b, e := replayRead(filepath.Join(input, filepath.FromSlash(name)), 2*1024*1024)
+132: 		if e != nil {
+133: 			return e
+134: 		}
+135: 		bundle.Files[name] = b
+136: 	}
+137: 	bundle.Files["snapshot.sqlite"], err = replayRead(filepath.Join(input, "snapshot.sqlite"), 32*1024*1024)
+138: 	if err != nil {
+139: 		return err
+140: 	}
+141: 	if err = bundle.Validate(); err != nil {
+142: 		return err
+143: 	}
+144: 	data := filepath.Join(output, "replay-data")
+145: 	if err = os.Mkdir(data, 0700); err != nil {
+146: 		return err
+147: 	}
+148: 	path := filepath.Join(data, "researchos.sqlite")
+149: 	if err = os.WriteFile(path, bundle.Files["snapshot.sqlite"], 0600); err != nil {
+150: 		return err
+151: 	}
+152: 	lease, err := replayOutputLease(data)
+153: 	if err != nil {
+154: 		return err
+155: 	}
+156: 	defer lease.Close()
+157: 	db, err := store.Open(path)
+158: 	if err != nil {
+159: 		return err
+160: 	}
+161: 	defer db.Close()
+162: 	state, err := evolution.ControlDatabaseHash(db)
+163: 	if err != nil || state != request.Binding.ProjectionHash {
+164: 		return fmt.Errorf("replay projection differs from frozen host binding")
+165: 	}
+166: 	service, err := domain.NewCurrentMu(db, filepath.Join(input, "spec/v2.0/contracts"), filepath.Join(input, "migrations/sqlite/0002_domain.sql"))
+167: 	if err != nil {
+168: 		return err
+169: 	}
+170: 	result := evolution.ControlReplayResult{Binding: request.Binding, CaseID: request.Case.ID, Results: []evolution.ControlHTTPResult{}}
+171: 	handler := service.Handler()
+172: 	for _, step := range request.Case.Steps {
+173: 		r := httptest.NewRequest(step.Method, "http://fixture.invalid"+step.Path, bytes.NewReader(step.Body))
+174: 		if step.Authenticated {
+175: 			r.Header.Set("Authorization", "Bearer "+evolution.ControlCredential)
+176: 		}
+177: 		if len(step.Body) > 0 {
+178: 			r.Header.Set("Content-Type", "application/json")
+179: 		}
+180: 		if step.ETag != "" {

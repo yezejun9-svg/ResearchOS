@@ -1,0 +1,46 @@
+// Build in a SEPARATE module using pristine v1.60.1, without local replacement.
+// No FunctionImpl/Innocuous field is referenced, and no UDF is registered.
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	sqlite "modernc.org/sqlite"
+)
+
+func run() (resultErr error) {
+	if len(os.Args)!=3||!filepath.IsAbs(os.Args[1])||!filepath.IsAbs(os.Args[2]){return fmt.Errorf("absolute existing DB and fresh result path required")}
+	p,out:=os.Args[1],os.Args[2]
+	s,err:=os.Lstat(p);if err!=nil||!s.Mode().IsRegular(){return fmt.Errorf("regular DB required: %v",err)}
+	if _,err:=os.Lstat(out);!os.IsNotExist(err){return fmt.Errorf("result path must be absent: %v",err)}
+	db,err:=sql.Open("sqlite",p);if err!=nil{return err};db.SetMaxOpenConns(1)
+	closed:=false;defer func(){if !closed{if err:=db.Close();err!=nil&&resultErr==nil{resultErr=err}}}()
+	ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second);defer cancel()
+	c,err:=db.Conn(ctx);if err!=nil{return err};connClosed:=false
+	defer func(){if !connClosed{if err:=c.Close();err!=nil&&resultErr==nil{resultErr=err}}}()
+	if _,err=c.ExecContext(ctx,"PRAGMA trusted_schema=OFF");err!=nil{return err}
+	var off int;if err=c.QueryRowContext(ctx,"PRAGMA trusted_schema").Scan(&off);err!=nil||off!=0{return fmt.Errorf("OFF readback %d %v",off,err)}
+	var functions,before,after int
+	if err=c.QueryRowContext(ctx,"SELECT count(*) FROM pragma_function_list WHERE name='ros_i16'").Scan(&functions);err!=nil||functions!=0{return fmt.Errorf("unexpected function registration %d %v",functions,err)}
+	var ddl string;if err=c.QueryRowContext(ctx,"SELECT sql FROM sqlite_schema WHERE type='table' AND name='checked'").Scan(&ddl);err!=nil||ddl!="CREATE TABLE checked(x INTEGER CHECK(ros_i16(x)=1))"{return fmt.Errorf("unexpected checked schema %q %v",ddl,err)}
+	if err=c.QueryRowContext(ctx,"SELECT count(*) FROM checked").Scan(&before);err!=nil||before!=1{return fmt.Errorf("before=%d %v",before,err)}
+	_,writeErr:=c.ExecContext(ctx,"INSERT INTO checked VALUES(9)")
+	var native *sqlite.Error
+	if writeErr==nil||!errors.As(writeErr,&native)||native.Code()!=1||!strings.Contains(writeErr.Error(),"no such function: ros_i16"){return fmt.Errorf("wrong rejection cause: %T %v",writeErr,writeErr)}
+	if err=c.QueryRowContext(ctx,"SELECT count(*) FROM checked").Scan(&after);err!=nil||after!=before{return fmt.Errorf("rows changed %d %v",after,err)}
+	if err=c.Close();err!=nil{return err};connClosed=true
+	if err=db.Close();err!=nil{return err};closed=true
+	report:=map[string]any{"schema":"researchos.driver18.old-probe.v1","database":p,"function_count":functions,"error_code":native.Code(),"error":writeErr.Error(),"before":before,"after":after,"closed":true}
+	f,err:=os.OpenFile(out,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if err!=nil{return err}
+	encodeErr:=json.NewEncoder(f).Encode(report);closeErr:=f.Close();if encodeErr!=nil{return encodeErr};if closeErr!=nil{return closeErr}
+	return json.NewEncoder(os.Stdout).Encode(report)
+}
+func main(){if err:=run();err!=nil{fmt.Fprintln(os.Stderr,err);os.Exit(1)}}

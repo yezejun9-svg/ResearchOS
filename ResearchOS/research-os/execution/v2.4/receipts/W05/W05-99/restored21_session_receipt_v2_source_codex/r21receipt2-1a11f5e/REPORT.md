@@ -1,0 +1,15 @@
+# Restored21 session receipt v2 Source
+
+R21-RECEIPT-01 is addressed in a narrow Source candidate: session evidence is attached before the existing restore-report serialization and publication. The existing top-level Recovery.restored21_session_initialization field is retained, so returned/CLI and persisted reports use the same field. Actual equality remains to be exercised by Root.
+
+Complete Purpose participates in backupMAC and the exact readBackupPolicy purpose comparison. The first unsealed purpose-mutation draft was rejected, never compiled or executed, and is retained as historical Source construction evidence only. The final implementation never changes Purpose, its fields, plan selection, MAC or hash inputs. It uses a separate private typed Object field populated at the end of the new handler's successful afterRecovery phase.
+
+The existing restore helper passes its original r.Recovery map to a dedicated report hook before backupWrite(Bytes(r)) and rename. The hook requires the fixed restored21 plan and local-upgrade format, exactly10 evidence fields, four lowercase SHA256 strings, the original true/false invariants and integer zero external actions. It writes only after every check passes. Old plans keep a nil field and skip the branch. All existing authentication and publication functions remain intact; backup.go changes only the private field and this report branch. Dispatch and CLI Source mirrors remain exact old bytes.
+
+Five Source mirrors are included; only the handler, backup.go and associated test change. The old accepted Source package, old profiles, SQL, original tests, Main, canonical and actual candidates were not changed. Complete old/new byte inverse records cover every mirror. Identical reconstructed original bytes imply the same AST under the same parser; no Go parser, compiler, formatter or AST execution occurred here.
+
+77 targeted static checks passed and32 sealed input refs remained unchanged. The9 parent/4 drift-leaf test roster is unchanged. New declarations compare the full returned/persisted Recovery, assert no public report on early rejection, reject seven invalid hook cases without mutating Recovery or signed Purpose, prove old-plan nil hook behavior and check valid evidence placement. These are written Source tests, not executed tests. No Go, SQL, Git, native product, private credential, account or model call occurred.
+
+Non-author Source review and runtime qualification remain pending. Public coordinator late-stage failure/no-publication, genuine21/22 release-program provenance, the remaining restored22-to24 chain and Owner/cutover acceptance remain OPEN. One new original Source tool failure is retained:4e57d0, an unmatched final parenthesis in the seal script prevented all execution, outer1/explicit SourcePython1/native-modelNULL. The syntax was corrected without changing or rerunning successful production Source controls. Root has been notified and owns the global ordinal assignment; no ordinal is self-reserved. Original936 remains under its prior immutable partial-origin pin; the rejected draft is a design decision, not a failed tool invocation.
+
+STOP / FINAL.

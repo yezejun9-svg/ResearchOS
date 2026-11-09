@@ -1,0 +1,23 @@
+# MXC availability rev05: one target-argv correction
+
+PREPARATION_ONLY_NOT_AUTHORIZED. Root requested source preparation only; independent review and explicit final scope registration remain required before any execution. No native CLI, echo, model, App, administrator action or setup was executed in this preparation.
+
+Diagnostic origin: mxc_availability_20261105_e91c:local-command-syntax-error
+Diagnostic attempt: 2 (planned, not executed)
+Prior attempt: rev04 / mxc_availability_20261105_e91c remains failed and consumed. No receipt, scope, counter or old source was overwritten or reset.
+New scope ID: mxc_availability_20261105_f602
+New run root: C:/Users/yqyyds/Documents/Codex/2026-11-04/task/product-v1-owned-verification-20261104/runs/mxc_availability_20261105_f602/mxc
+
+The only functional command delta is argv[7], C:/Windows/System32/cmd.exe -> C:\Windows\System32\cmd.exe. The wrapper retains CMD='C:/Windows/System32/cmd.exe' for its existing binary pin/source guard and COMSPEC. Its ARGV entry is now a separate backslash-spelled literal. The filesystem object and SHA remain identical. All other argv entries are identical. No extra quoting, shell layer, command, retry, model action or fallback was added.
+
+Mechanical isolation changes: wrapper SCOPE_ID, template scope/run/preparation paths and wrapper SHA are changed to this new revision. TEMP/TMP and cwd follow the new owned run as they previously followed rev04. The environment builder, normal native profile fields, COMSPEC, public binary canonical paths, binary hashes, ordinary() checks, model0/native1 per-scope limits, one spawn, capture implementation, 35s soft/45s hard/5s cleanup/16 process/2048 MiB budgets and original f13 remain unchanged. Capture SHA is 5b1092acf0d4727bab5885cd8e7ce6c9d46420d8bcb63bedca65ce1198272740; f13 SHA is f13f630d21548bf8bbb9f1bdaf08b78adc41546d32f00216c05f6ae3664a218c.
+
+The inner template adds diagnostic_origin, diagnostic_attempt=2 and prior_attempt_retained=true as review/registration metadata. These are pinned by the final inner scope hash; they do not modify the wrapper's runtime policy. Outer template changes are only mechanical scope/preparation path/hash substitutions. The existing per-scope native_invocations=1 does not reset the diagnostic's cumulative attempt count; root must retain attempt 1 in its canonical ledger and link this as attempt 2.
+
+Validation performed: exact full wrapper comparison to rev04 with only the target token substitution and scope ID substitution; all non-target argv values identical; inner fields identical except those substitutions and lineage metadata; exact outer raw-text substitution comparison; 7 existing public-file pins match; prior rev04 manifest members match; no new registered inner scope or run exists; Node --check wrapper exit0. The capture module is byte-identical. No stream fixture suite was rerun. All checks inspect data/source or parse syntax without importing/executing the wrapper.
+
+Evidence basis: product-v1-mxc04-argv-diagnosis-20261105-f24c/MICROSOFT_DEPENDENCY_ADDENDUM.md, SHA d093df54dc339f0c5bd1ba1ddf80e2d4f949f380065f2ba00082ed1ae6431116. Fixed upstream SDK passes the forward-slash string directly to CreateProcessW. Microsoft documentation supports a slash compatibility concern but does not prove the observed root cause. This candidate tests that hypothesis only if Root later authorizes execution.
+
+Root registration, after independent review: set inner state ROOT_REVIEWED_EXACT_COMMAND in a newly created mxc.scope.json; preserve diagnostic lineage fields; hash exact registered bytes; fill both outer ROOT_FILL_REGISTERED_INNER_SCOPE_SHA256 locations; update outer authorization according to Root's existing reviewed scope procedure and register using unchanged f13. This preparation creates neither the registered file nor the f13 scope and does not invoke execute. Do not reuse the consumed rev04 scope.
+
+Normal Native CLI configuration/cache effects remain possible if later run; this preparation does not read private configuration/authentication. The explicit MXC mode and built-in :workspace echo check do not alter the product root-deny/minimal-read/source-read profile. Even a successful echo would establish only this command's startup availability. resource_ready=false/product_can_submit=false remain; no split-read enforcement proof or model retry permission follows. The original global real product Task remains consumed and unchanged.

@@ -1,0 +1,48 @@
+--- pinned-original
++++ windows_debug_job_tree.diagnostic.proposed.py
+@@ -89,6 +89,7 @@
+     result['debug_capture'] = {
+         'mode': 'CREATE_OWN_JOB_DEBUG_PROCESS_TREE',
+         'events': [], 'modules': [], 'exit_event_observed': False,
++        'rejected_load_facts': [], 'bounded_rejected_load_facts': 1,
+         'bounded_events': 131072, 'bounded_module_files': 32768,
+         'actual_loaded_file_handles_only': True, 'complete': False,
+     }
+@@ -295,6 +296,17 @@
+                 deadline_check(deadline, 'module hash')
+             return {'sha256': digest.hexdigest(), 'bytes': total}
+ 
++        def reject_load(fact, expected_pin, reason):
++            # Preserve only facts already read from this event's actual hFile.
++            # This never authorizes the load, performs extra IO, or appends a qualified module.
++            if not debug['rejected_load_facts']:
++                proc=processes[fact['pid']]
++                generation=next(i+1 for i,p in enumerate(generations) if p is proc)
++                debug['rejected_load_facts'].append({**fact,'process_generation':generation,
++                    'expected_pin':expected_pin,'rejection_reason':reason,
++                    'qualified_module':False,'diagnostic_only':True})
++            raise RuntimeError(reason)
++
+         def capture_file(raw_handle, event_code, image_base, process_id):
+             if not raw_handle or raw_handle == 0xFFFFFFFFFFFFFFFF:
+                 raise RuntimeError('Actual load event has no readable file handle; capture is incomplete')
+@@ -314,14 +326,16 @@
+                         'path_from_actual_file_handle':path_buffer.value,
+                         'before':hash_loaded_file(retained, capture_deadline)}
+                 if module_pins.get(image_key(path_buffer.value)) != fact['before']:
+-                    raise RuntimeError('Actual loaded module outside frozen runtime universe')
++                    reject_load(fact,module_pins.get(image_key(path_buffer.value)),
++                                'Actual loaded module outside frozen runtime universe')
+                 if event_code == 3:
+                     loaded_image_key = image_key(path_buffer.value)
+                     if image_pins.get(loaded_image_key) != fact['before']:
+-                        raise RuntimeError('Actual CREATE_PROCESS file path/bytes outside pinned executable set')
++                        reject_load(fact,image_pins.get(loaded_image_key),
++                                    'Actual CREATE_PROCESS file path/bytes outside pinned executable set')
+                     processes[process_id]['image'] = fact
+                     if process_id == pi.dwProcessId and fact['before'] != expected_image:
+-                        raise RuntimeError('Primary image mismatch')
++                        reject_load(fact,expected_image,'Primary image mismatch')
+                 loaded_files.append((retained.value, fact))
+                 debug['modules'].append(fact)
+                 if sum(row['before']['bytes'] for row in debug['modules']) > 128 * 1024 * 1024 * 1024:

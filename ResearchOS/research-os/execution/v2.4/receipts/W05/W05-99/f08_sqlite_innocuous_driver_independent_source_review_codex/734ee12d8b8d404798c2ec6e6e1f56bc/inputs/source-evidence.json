@@ -1,0 +1,146 @@
+[
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go",
+      "sha256": "095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9",
+      "bytes": 44703
+    },
+    "lines": [
+      510,
+      533
+    ],
+    "text": "510: type FunctionImpl struct {\n511: \t// NArgs is the required number of arguments that the function accepts.\n512: \t// If NArgs is negative, then the function is variadic.\n513: \tNArgs int32\n514: \n515: \t// If Deterministic is true, the function must always give the same\n516: \t// output when the input parameters are the same. This enables functions\n517: \t// to be used in additional contexts like the WHERE clause of partial\n518: \t// indexes and enables additional optimizations.\n519: \t//\n520: \t// See https://sqlite.org/c3ref/c_deterministic.html#sqlitedeterministic\n521: \t// for more details.\n522: \tDeterministic bool\n523: \n524: \t// Scalar is called when a scalar function is invoked in SQL. Neither ctx\n525: \t// nor the argument Values are valid past the return of the function.\n526: \tScalar func(ctx *FunctionContext, args []driver.Value) (driver.Value, error)\n527: \n528: \t// MakeAggregate is called at the beginning of each evaluation of an\n529: \t// aggregate function.\n530: \tMakeAggregate func(ctx FunctionContext) (AggregateFunction, error)\n531: \n532: \t// VolatileArgs is an opt-in performance flag that eliminates the per-call\n533: \t// allocation of string and []byte argument bodies. When true, the driver"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go",
+      "sha256": "095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9",
+      "bytes": 44703
+    },
+    "lines": [
+      729,
+      734
+    ],
+    "text": "729: func RegisterFunction(\n730: \tzFuncName string,\n731: \timpl *FunctionImpl,\n732: ) error {\n733: \treturn d.registerFunction(zFuncName, impl)\n734: }"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go",
+      "sha256": "095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9",
+      "bytes": 44703
+    },
+    "lines": [
+      754,
+      762
+    ],
+    "text": "754: \txFunc func(ctx *FunctionContext, args []driver.Value) (driver.Value, error),\n755: ) (err error) {\n756: \tif dmesgs {\n757: \t\tdefer func() {\n758: \t\t\tdmesg(\"zFuncName %q, nArg %v, xFunc %p: err %v\", zFuncName, nArg, xFunc, err)\n759: \t\t}()\n760: \t}\n761: \treturn d.registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: false})\n762: }"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go",
+      "sha256": "095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9",
+      "bytes": 44703
+    },
+    "lines": [
+      794,
+      812
+    ],
+    "text": "794: // RegisterDeterministicScalarFunction registers a deterministic scalar\n795: // function named zFuncName with nArg arguments. Passing -1 for nArg indicates\n796: // the function is variadic. A deterministic function means that the function\n797: // always gives the same output when the input parameters are the same.\n798: //\n799: // The new function will be available to all new connections the driver\n800: // registered as \"sqlite\" opens after executing\n801: // RegisterDeterministicScalarFunction.\n802: func RegisterDeterministicScalarFunction(\n803: \tzFuncName string,\n804: \tnArg int32,\n805: \txFunc func(ctx *FunctionContext, args []driver.Value) (driver.Value, error),\n806: ) (err error) {\n807: \tif dmesgs {\n808: \t\tdefer func() {\n809: \t\t\tdmesg(\"zFuncName %q, nArg %v, xFunc %p: err %v\", zFuncName, nArg, xFunc, err)\n810: \t\t}()\n811: \t}\n812: \treturn d.registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: true})"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/sqlite.go",
+      "sha256": "095b77ed583de9b845814210debf6ca0a4e3b23d0134006db9e577e81db709d9",
+      "bytes": 44703
+    },
+    "lines": [
+      815,
+      868
+    ],
+    "text": "815: func (d *Driver) registerFunction(\n816: \tzFuncName string,\n817: \timpl *FunctionImpl,\n818: ) error {\n819: \td.mu.Lock()\n820: \tdefer d.mu.Unlock()\n821: \n822: \tif d.udfs == nil {\n823: \t\td.udfs = map[string]*userDefinedFunction{}\n824: \t}\n825: \tif _, ok := d.udfs[zFuncName]; ok {\n826: \t\treturn fmt.Errorf(\"a function named %q is already registered\", zFuncName)\n827: \t}\n828: \n829: \t// dont free, functions registered on the driver live as long as the program\n830: \tname, err := libc.CString(zFuncName)\n831: \tif err != nil {\n832: \t\treturn err\n833: \t}\n834: \n835: \tvar textrep int32 = sqlite3.SQLITE_UTF8\n836: \n837: \tif impl.Deterministic {\n838: \t\ttextrep |= sqlite3.SQLITE_DETERMINISTIC\n839: \t}\n840: \n841: \tudf := &userDefinedFunction{\n842: \t\tzFuncName: name,\n843: \t\tnArg:      impl.NArgs,\n844: \t\teTextRep:  textrep,\n845: \t}\n846: \n847: \tif impl.Scalar != nil {\n848: \t\txFuncs.mu.Lock()\n849: \t\tid := xFuncs.ids.next()\n850: \t\txFuncs.m[id] = xFuncEntry{fn: impl.Scalar, volatile: impl.VolatileArgs}\n851: \t\txFuncs.mu.Unlock()\n852: \n853: \t\tudf.scalar = true\n854: \t\tudf.pApp = id\n855: \t} else {\n856: \t\txAggregateFactories.mu.Lock()\n857: \t\tid := xAggregateFactories.ids.next()\n858: \t\txAggregateFactories.m[id] = xAggregateFactoryEntry{factory: impl.MakeAggregate, volatile: impl.VolatileArgs}\n859: \t\txAggregateFactories.mu.Unlock()\n860: \n861: \t\tudf.pApp = id\n862: \t}\n863: \n864: \td.udfs[zFuncName] = udf\n865: \n866: \treturn nil\n867: }\n868: "
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/conn.go",
+      "sha256": "bfdea7f66925af2c90b4e414f163818ea4e8c6c1d91d73647dddcbd1f2be5cac",
+      "bytes": 41738
+    },
+    "lines": [
+      1075,
+      1119
+    ],
+    "text": "1075: type userDefinedFunction struct {\n1076: \tzFuncName uintptr\n1077: \tnArg      int32\n1078: \teTextRep  int32\n1079: \tpApp      uintptr\n1080: \n1081: \tscalar   bool\n1082: \tfreeOnce sync.Once\n1083: }\n1084: \n1085: func (c *conn) createFunctionInternal(fun *userDefinedFunction) error {\n1086: \tvar rc int32\n1087: \n1088: \tif fun.scalar {\n1089: \t\trc = sqlite3.Xsqlite3_create_function(\n1090: \t\t\tc.tls,\n1091: \t\t\tc.db,\n1092: \t\t\tfun.zFuncName,\n1093: \t\t\tfun.nArg,\n1094: \t\t\tfun.eTextRep,\n1095: \t\t\tfun.pApp,\n1096: \t\t\tcFuncPointer(funcTrampoline),\n1097: \t\t\t0,\n1098: \t\t\t0,\n1099: \t\t)\n1100: \t} else {\n1101: \t\trc = sqlite3.Xsqlite3_create_window_function(\n1102: \t\t\tc.tls,\n1103: \t\t\tc.db,\n1104: \t\t\tfun.zFuncName,\n1105: \t\t\tfun.nArg,\n1106: \t\t\tfun.eTextRep,\n1107: \t\t\tfun.pApp,\n1108: \t\t\tcFuncPointer(stepTrampoline),\n1109: \t\t\tcFuncPointer(finalTrampoline),\n1110: \t\t\tcFuncPointer(valueTrampoline),\n1111: \t\t\tcFuncPointer(inverseTrampoline),\n1112: \t\t\t0,\n1113: \t\t)\n1114: \t}\n1115: \n1116: \tif rc != sqlite3.SQLITE_OK {\n1117: \t\treturn c.errstr(rc)\n1118: \t}\n1119: \treturn nil"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/driver.go",
+      "sha256": "5b0b9aa8b86b6c7946c5dba22b666a17140c202d564b81c4d9aa1a664f4a3276",
+      "bytes": 21946
+    },
+    "lines": [
+      287,
+      311
+    ],
+    "text": "287: func (d *Driver) Open(name string) (conn driver.Conn, err error) {\n288: \tif dmesgs {\n289: \t\tdefer func() {\n290: \t\t\tdmesg(\"name %q: (driver.Conn %p, err %v)\", name, conn, err)\n291: \t\t}()\n292: \t}\n293: \tc, err := newConn(name)\n294: \tif err != nil {\n295: \t\treturn nil, err\n296: \t}\n297: \n298: \tfor _, udf := range d.udfs {\n299: \t\tif err = c.createFunctionInternal(udf); err != nil {\n300: \t\t\tc.Close()\n301: \t\t\treturn nil, err\n302: \t\t}\n303: \t}\n304: \tfor _, coll := range d.collations {\n305: \t\tif err = c.createCollationInternal(coll); err != nil {\n306: \t\t\tc.Close()\n307: \t\t\treturn nil, err\n308: \t\t}\n309: \t}\n310: \tfor _, connHookFn := range d.connectionHooks {\n311: \t\tif err = connHookFn(c, name); err != nil {"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/lib/sqlite.go",
+      "sha256": "17cce24fa2c422a0b6cfa6511193d174b98819ef6b56223977411afc6bc2754c",
+      "bytes": 1336924
+    },
+    "lines": [
+      3708,
+      3708
+    ],
+    "text": "3708: const SQLITE_FUNC_UNSAFE = 2097152"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/lib/sqlite.go",
+      "sha256": "17cce24fa2c422a0b6cfa6511193d174b98819ef6b56223977411afc6bc2754c",
+      "bytes": 1336924
+    },
+    "lines": [
+      3782,
+      3782
+    ],
+    "text": "3782: const SQLITE_INNOCUOUS = 2097152"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/lib/sqlite_windows.go",
+      "sha256": "4bd37c8278b040a0e02f2c80714af515482c6b4447d1c18788211295e039ee3e",
+      "bytes": 5492650
+    },
+    "lines": [
+      71155,
+      71162
+    ],
+    "text": "71155: \tif zFunctionName == uintptr(0) || __ccgo_fp_xSFunc != uintptr(0) && __ccgo_fp_xFinal != uintptr(0) || libc.BoolInt32(__ccgo_fp_xFinal == uintptr(0)) != libc.BoolInt32(__ccgo_fp_xStep == uintptr(0)) || libc.BoolInt32(__ccgo_fp_xValue == uintptr(0)) != libc.BoolInt32(__ccgo_fp_xInverse == uintptr(0)) || (nArg < -int32(1) || nArg > int32(SQLITE_MAX_FUNCTION_ARG)) || int32(255) < _sqlite3Strlen30(tls, zFunctionName) {\n71156: \t\treturn _sqlite3MisuseError(tls, int32(189760))\n71157: \t}\n71158: \textraFlags = enc & (libc.Int32FromInt32(SQLITE_DETERMINISTIC) | libc.Int32FromInt32(SQLITE_DIRECTONLY) | libc.Int32FromInt32(SQLITE_SUBTYPE) | libc.Int32FromInt32(SQLITE_INNOCUOUS) | libc.Int32FromInt32(SQLITE_RESULT_SUBTYPE) | libc.Int32FromInt32(SQLITE_SELFORDER1))\n71159: \tenc = enc & (libc.Int32FromInt32(SQLITE_FUNC_ENCMASK) | libc.Int32FromInt32(SQLITE_ANY))\n71160: \t/* The SQLITE_INNOCUOUS flag is the same bit as SQLITE_FUNC_UNSAFE.  But\n71161: \t ** the meaning is inverted.  So flip the bit. */\n71162: \textraFlags = extraFlags ^ int32(SQLITE_FUNC_UNSAFE) /* tag-20230109-1 */"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/lib/sqlite_g_0000000000060000.go",
+      "sha256": "0e5e7499e7ad20bdf4dbf1db0d8644b160b754d795a49748b59faf5d411aea84",
+      "bytes": 2928321
+    },
+    "lines": [
+      1,
+      5
+    ],
+    "text": "1: // Code generated by modernc.org/undup from the per-target sqlite_*.go files; DO NOT EDIT.\n2: \n3: //go:build (windows && (amd64 || arm64)) || (windows && 386)\n4: \n5: package sqlite3"
+  },
+  {
+    "source": {
+      "path": "D:/作品集/ResearchOS/research-os/.local/gopath/pkg/mod/modernc.org/sqlite@v1.60.1/lib/sqlite_g_0000000000060000.go",
+      "sha256": "0e5e7499e7ad20bdf4dbf1db0d8644b160b754d795a49748b59faf5d411aea84",
+      "bytes": 2928321
+    },
+    "lines": [
+      108271,
+      108300
+    ],
+    "text": "108271: //\t**\n108272: //\t**    SQLITE_FUNC_UNSAFE    -     Usable if TRUSTED_SCHEMA or from\n108273: //\t**                                top-level SQL\n108274: //\t**\n108275: //\t** If the function is not usable, create an error.\n108276: //\t*/\n108277: func _sqlite3ExprFunctionUsable(tls *libc.TLS, pParse uintptr, pExpr uintptr, pDef uintptr) {\n108278: \tbp := tls.Alloc(16)\n108279: \tdefer tls.Free(16)\n108280: \tif (*TExpr)(unsafe.Pointer(pExpr)).Fflags&uint32(libc.Int32FromInt32(EP_FromDDL)) != uint32(0) || int32((*TParse)(unsafe.Pointer(pParse)).FprepFlags)&int32(SQLITE_PREPARE_FROM_DDL) != 0 {\n108281: \t\tif (*TFuncDef)(unsafe.Pointer(pDef)).FfuncFlags&uint32(SQLITE_FUNC_DIRECT) != uint32(0) || (*Tsqlite3)(unsafe.Pointer((*TParse)(unsafe.Pointer(pParse)).Fdb)).Fflags&uint64(SQLITE_TrustedSchema) == uint64(0) {\n108282: \t\t\t/* Functions prohibited in triggers and views if:\n108283: \t\t\t **     (1) tagged with SQLITE_DIRECTONLY\n108284: \t\t\t **     (2) not tagged with SQLITE_INNOCUOUS (which means it\n108285: \t\t\t **         is tagged with SQLITE_FUNC_UNSAFE) and\n108286: \t\t\t **         SQLITE_DBCONFIG_TRUSTED_SCHEMA is off (meaning\n108287: \t\t\t **         that the schema is possibly tainted).\n108288: \t\t\t */\n108289: \t\t\t_sqlite3ErrorMsg(tls, pParse, __ccgo_ts+9247, libc.VaList(bp+8, pExpr))\n108290: \t\t}\n108291: \t}\n108292: }\n108293: \n108294: // C documentation\n108295: //\n108296: //\t/*\n108297: //\t** If the input expression is an ID with the name \"true\" or \"false\"\n108298: //\t** then convert it into an TK_TRUEFALSE term.  Return non-zero if\n108299: //\t** the conversion happened, and zero if the expression is unaltered.\n108300: //\t*/"
+  }
+]

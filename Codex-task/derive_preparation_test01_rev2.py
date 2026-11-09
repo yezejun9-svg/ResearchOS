@@ -1,0 +1,4 @@
+from pathlib import Path
+root=Path(__file__).resolve().parent;s=(root/'prepare_preparation_test01_overlay.py').read_text(encoding='utf8');s=s.replace('wiring-author-20261105-rev1','wiring-author-20261105-rev2').replace('deec53a9352aea097142c0e6183c287bd61e4c1e7c68bb5ae586332fb4954b50','f89b7ea96232accec10adaa5f1e07eb6e6e7da268f67769df017b1cedc87713d').replace('native-preparation-test01-overlay','native-preparation-test01-rev2-overlay')
+s=s.replace("for row in json.loads((OWNER/'MANIFEST.json').read_bytes())['files']:assert sha(WT/row['path'])==row['source_sha256'],row['path']","for ref,row in json.loads((OWNER/'MANIFEST.json').read_bytes())['paths'].items():assert sha(WT/ref)==row['source_sha256'],ref")
+p=root/'prepare_preparation_test01_rev2_overlay.py';assert not p.exists();p.write_text(s,encoding='utf8');exec(compile(s,str(p),'exec'))

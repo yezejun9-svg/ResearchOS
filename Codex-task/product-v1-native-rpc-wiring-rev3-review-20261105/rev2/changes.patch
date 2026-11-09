@@ -1,0 +1,224 @@
+diff --git a/internal/domain/runtime_harness_windows_test.go b/internal/domain/runtime_harness_windows_test.go
+index 7780e12..18b8e39 100644
+--- a/internal/domain/runtime_harness_windows_test.go
++++ b/internal/domain/runtime_harness_windows_test.go
+@@ -5,6 +5,7 @@ package domain
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
+@@ -450,3 +451,211 @@ func TestHarnessUnknownTransitionAtomic(t *testing.T) {
+ 		t.Fatal("reconciliation duplicated terminal event or execution")
+ 	}
+ }
++
++// This driver is deliberately in-process. It exercises the real coordinator's
++// two callbacks and database fences but never starts Native or writes a prompt.
++type harnessRPCTurnFixtureDriver struct {
++	descriptor    rt.CodexDescriptor
++	snapshot      rt.CodexReadiness
++	resumed       chan error
++	proceed       chan struct{}
++	launch        rt.CodexLaunch
++	firstErr      error
++	secondErr     error
++	duplicate     bool
++	tamperProcess bool
++	starts        atomic.Int64
++	turns         atomic.Int64
++}
++
++func (d *harnessRPCTurnFixtureDriver) Descriptor() rt.CodexDescriptor       { return d.descriptor }
++func (d *harnessRPCTurnFixtureDriver) ReadinessSnapshot() rt.CodexReadiness { return d.snapshot }
++func (d *harnessRPCTurnFixtureDriver) Start(ctx context.Context, in rt.CodexLaunch, cb rt.CodexCallbacks) (rt.CodexHandle, error) {
++	d.starts.Add(1)
++	d.launch = in
++	if err := os.MkdirAll(in.Directory, 0700); err != nil {
++		return nil, err
++	}
++	process := rt.CodexIdentity{PID: 42, Created: 12345, Job: "trusted-go-only-job"}
++	err := cb.BeforeResume(process)
++	d.resumed <- err
++	if err != nil {
++		return nil, err
++	}
++	<-d.proceed
++	evidence := rt.CodexTurnEvidence{PolicyIdentity: rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash),
++		RenderedConfigSHA256: "sha256:trusted-rendered", SourceBindingHash: in.SourceBindingHash,
++		ProfileNonce: "trusted-go-nonce", ThreadID: "trusted-go-thread", TaskID: in.TaskID,
++		RunID: in.RunID, Epoch: in.Epoch, Process: process, CaptureBytes: 12}
++	if d.tamperProcess {
++		evidence.Process.Created++
++	}
++	d.firstErr = cb.BeforeModelTurn(evidence)
++	if d.firstErr == nil {
++		d.turns.Add(1)
++	}
++	if d.duplicate {
++		d.secondErr = cb.BeforeModelTurn(evidence)
++	}
++	return nil, errors.New("trusted Go fixture stops before model prompt")
++}
++
++func harnessRPCTurnFixture(t *testing.T) (*fixture, *RuntimeCoordinator, *WorkspaceBinding, *harnessRPCTurnFixtureDriver) {
++	t.Helper()
++	f := contextFixtureFrom(setupWithConstructor(t, NewCurrentMu))
++	b := &WorkspaceBinding{AuthorizedRef: "workspace-harness", DisplayName: "fixture", DisplayPath: "fixture", RealPath: t.TempDir(), Access: "READ_ONLY", ProjectID: &f.project, Revision: 1, Status: WorkspaceActive, PrincipalID: f.owner, ClientID: "fixture-client", HostPrincipalRef: "fixture-host", CreatedAt: Now()}
++	sourceTx(t, f.db, func(tx *sql.Tx) error {
++		return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
++	})
++	d := &harnessRPCTurnFixtureDriver{descriptor: rt.CodexDescriptor{Present: true, Version: "0.166.0", ExecutableHash: "sha256:trusted-go-only", AuthState: "LOGGED_IN", AuthKind: "chatgpt", ConfigurationControlled: true, NativeTransport: rt.CodexRPCTransport}, resumed: make(chan error, 1), proceed: make(chan struct{})}
++	d.snapshot = rt.CodexReadiness{State: "PREPARATION_READY", PolicyIdentity: rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash)}
++	var seq int
++	var name, dbpath string
++	if err := f.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &dbpath); err != nil {
++		t.Fatal(err)
++	}
++	c, err := f.s.NewRuntimeCoordinator(context.Background(), RuntimeCoordinatorConfig{DataRoot: filepath.Dir(dbpath), APIURL: "http://127.0.0.1:1", WorkspaceAuthority: clientWorkspaceAuthority{}, HarnessAuthority: &harnessAuthorityFixture{principal: f.owner}, HarnessDriver: d})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		if err := c.Close(); err != nil {
++			t.Error(err)
++		}
++	})
++	return f, c, b, d
++}
++
++func TestHarnessRPCTurnSecondFence(t *testing.T) {
++	for _, mode := range []string{"one_turn", "duplicate", "owner", "source_rebind", "source_revision", "policy_seal", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
++		t.Run(mode, func(t *testing.T) {
++			f, c, b, d := harnessRPCTurnFixture(t)
++			caps, err := c.HarnessV1().Capabilities(context.Background(), f.token)
++			if err != nil {
++				t.Fatal(err)
++			}
++			data := caps["data"].(map[string]any)
++			verification := data["verification"].(map[string]any)
++			if data["can_submit"] != true || verification["execution"] != "UNVERIFIED" || verification["workspace_read_scope"] != "UNVERIFIED" || verification["cancellation"] != "UNVERIFIED" || data["security_scope"].(map[string]any)["enforcement_verified"] != false {
++				t.Fatal("preparation misrepresented as verified execution", caps)
++			}
++			id, _ := harnessSubmitFixture(t, f, c, b, "trusted Go callback fixture only")
++			if mode == "duplicate" || mode == "artifact_fault" {
++				d.duplicate = true
++			}
++			if mode == "process_identity" {
++				d.tamperProcess = true
++			}
++			if err := c.Scan(context.Background()); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case err := <-d.resumed:
++				if err != nil {
++					t.Fatal("first fence rejected fixture", err)
++				}
++			case <-time.After(10 * time.Second):
++				close(d.proceed)
++				c.workers.Wait()
++				t.Fatal("first fence did not arrive")
++			}
++			released := false
++			defer func() {
++				if !released {
++					close(d.proceed)
++					c.workers.Wait()
++				}
++			}()
++			switch mode {
++			case "owner":
++				c.config.HarnessAuthority = &harnessAuthorityFixture{principal: "foreign"}
++			case "source_rebind", "source_revision":
++				sourceTx(t, f.db, func(tx *sql.Tx) error {
++					if mode == "source_rebind" {
++						b.RealPath = t.TempDir()
++					}
++					b.Revision++
++					return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
++				})
++			case "policy_seal":
++				d.snapshot.PolicyIdentity = rt.CodexRPCPolicyIdentity("sha256:stale-binary")
++			case "auth_metadata":
++				d.descriptor.AuthState = "LOGGED_OUT"
++			case "lease_epoch":
++				sourceTx(t, f.db, func(tx *sql.Tx) error {
++					run, err := load(tx, f.project, "Run", d.launch.RunID)
++					if err != nil {
++						return err
++					}
++					run["lease_epoch"] = int64(99)
++					if err = bump(run); err != nil {
++						return err
++					}
++					return f.s.put(tx, "Run", run)
++				})
++			case "cancel":
++				view := harnessViewFixture(t, f, c, id)
++				run := view["run"].(map[string]any)
++				runID, epoch := Str(run, "run_id"), Str(run, "epoch")
++				if _, err := c.HarnessV1().Cancel(context.Background(), f.token, f.project, id, HarnessCancel{RequestID: "cancel-at-second-fence", ExpectedTaskRevision: Str(view, "task_revision"), ExpectedRunID: &runID, ExpectedEpoch: &epoch}); err != nil {
++					t.Fatal(err)
++				}
++			case "artifact_fault":
++				if _, err := f.db.Exec("CREATE TRIGGER harness_turn_artifact_fault BEFORE INSERT ON domain_objects WHEN NEW.kind='Artifact' BEGIN SELECT RAISE(ABORT,'trusted turn artifact fault'); END"); err != nil {
++					t.Fatal(err)
++				}
++			}
++			close(d.proceed)
++			released = true
++			c.workers.Wait()
++			if d.starts.Load() != 1 {
++				t.Fatal("fixture started more than one Run")
++			}
++			marker := filepath.Join(d.launch.Directory, "native-turn-authorization.json")
++			_, markerErr := os.Stat(marker)
++			wantMarker := mode == "one_turn" || mode == "duplicate" || mode == "artifact_fault"
++			if (markerErr == nil) != wantMarker {
++				t.Fatalf("turn marker mismatch for %s: %v", mode, markerErr)
++			}
++			if mode == "one_turn" || mode == "duplicate" {
++				if d.firstErr != nil || d.turns.Load() != 1 {
++					t.Fatal("one trusted callback failed", d.firstErr)
++				}
++				var audits int
++				if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-turn-authorization.v1%'").Scan(&audits); err != nil || audits != 1 {
++					t.Fatal("sanitized turn LOG not durable once", audits, err)
++				}
++				if mode == "duplicate" && !errors.Is(d.secondErr, os.ErrExist) {
++					t.Fatal("duplicate turn did not fail at exclusive marker", d.secondErr)
++				}
++			} else if d.firstErr == nil || d.turns.Load() != 0 {
++				t.Fatal("stale or failed second fence granted turn", mode)
++			}
++			if mode == "artifact_fault" {
++				if _, err := f.db.Exec("DROP TRIGGER harness_turn_artifact_fault"); err != nil {
++					t.Fatal(err)
++				}
++				if d.firstErr == nil {
++					t.Fatal("artifact failure allowed turn")
++				}
++				if !errors.Is(d.secondErr, os.ErrExist) {
++					t.Fatal("failed artifact transaction reused consumed marker", d.secondErr)
++				}
++				var audits int
++				if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-turn-authorization.v1%'").Scan(&audits); err != nil || audits != 0 {
++					t.Fatal("rolled-back artifact escaped failed turn", audits, err)
++				}
++			}
++			if view := harnessViewFixture(t, f, c, id); view["result"] != nil {
++				t.Fatal("fixture produced a model result")
++			}
++			if err := c.Scan(context.Background()); err != nil && (mode == "one_turn" || mode == "duplicate") {
++				t.Fatal(err)
++			}
++			c.workers.Wait()
++			if d.starts.Load() != 1 {
++				t.Fatal("consumed Run relaunched")
++			}
++		})
++	}
++}

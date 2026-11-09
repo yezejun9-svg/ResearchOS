@@ -1,0 +1,158 @@
+{
+  "schema": "researchos.stop-anchor-independent-design-review.v1",
+  "owner": "codex:/root/stop_anchor_design_review",
+  "mode": "READONLY_DESIGN_REVIEW_ONLY",
+  "verdict": "ACCEPT_DESIGN_DIRECTION_WITH_MANDATORY_ADDENDUM_BEFORE_SOURCE_CARD",
+  "unamended_three_files_accepted": false,
+  "source_card_condition": "Root card must incorporate SA-D01..SA-D05 verbatim in substance and override the contradictory accepted-base wording. No further architecture round is required if incorporated without weakening.",
+  "frozen_scope_sha256": "4e6df8550087d4fdf0ae8294ecba3a0a7d788e132a5316409b05af4421ed5802",
+  "input_hashes_verified": 6,
+  "confirmed_current_source_vulnerabilities": "NOT_ASSESSED_NO_SOURCE_AUDIT",
+  "design_findings_count": {
+    "critical": 0,
+    "high": 0,
+    "medium": 5,
+    "low": 0
+  },
+  "mandatory_addendum": [
+    {
+      "id": "SA-D01",
+      "severity": "MEDIUM",
+      "location": "STOP-anchor-addendum.md:14,26,30,38; STOP-anchor-exact-scope.json:4",
+      "title": "无环字节谱系和先存在的操作目录",
+      "requirements": [
+        "Root Source card may select its frozen 56e44e1b candidate without implying it is accepted. Repair must not wait for acceptance of the defect being repaired. Final whole Source acceptance remains mandatory before actual use.",
+        "Prepare an empty private non-reparse operation directory in the separately authorized preparation scope BEFORE materializing PREFLIGHT_ONLY grant. Pin its existing canonical native volume/file ID and SID/ACL. Source fixtures do this only for new owned fixtures. Grant-aware command never creates its own pinned operation directory.",
+        "Use an acyclic DAG: existing proposal/scope/review/historical documents -> PREFLIGHT grant -> preflight binary/external build receipt -> generated plan and backup artifacts -> preflight manifest -> stop review/scope -> STOP grant -> STOP binary/external build receipt. References point only backward. Scope/review identify exact subject/action and already-existing artifact digests, not hashes of future grant/binary.",
+        "Final plan may include predecessor PREFLIGHT grant/binary digests, but NOT its own SHA or successor STOP grant/binary digest. Manifest pins plan/member byte hashes and measured postcreation identities, but not its own hash. STOP BEGIN/INTENT pin successor grant and final plan; external detached receipts bind executable output. The phrase in L38 requiring plan to bind both hashes is replaced by this directional rule.",
+        "Proposal pins future output canonical names and creation constraints, not nonexistent future native file identities. Once files exist, plan/manifest and STOP grant freeze the required identities. No self-member in manifests and no recursive final-manifest members."
+      ],
+      "tests": [
+        "SA12: build both real grants without placeholders or post-build patching; assert full dependency graph acyclic",
+        "SA13: missing/recreated/swapped pinned directory and output alias/reparse rejected; final-output identities are measured only after creation"
+      ]
+    },
+    {
+      "id": "SA-D02",
+      "severity": "MEDIUM",
+      "location": "STOP-anchor-addendum.md:12,38,40; STOP-anchor-test-cuts.json:11-12",
+      "title": "阶段接续与永久消费属于同一个 operation",
+      "requirements": [
+        "Specify immutable preflight-complete record plus one shared operation lock and durable STOP attempt/intent state under the same pinned directory. STOP accepts exactly the predecessor grant/binary/manifest compiled into it. This single forward transition is the sole exception to different-grant conflict; arbitrary replacement STOP grants remain conflicts.",
+        "Do not rewrite predecessor records. PREFLIGHT replay may only observe its frozen completed output; it cannot overwrite/refresh backup or plan. At any STOP attempt/intent state, PREFLIGHT must not reset the operation.",
+        "Create/claim durable attempt state atomically under the exclusive operation lock and use create-new/nontruncating writes with explicit flush failures handled as UNKNOWN/consumed. Existing intent permanently consumes the operation across all binaries/grants. BEGIN-only, torn, missing-required state or uncertain durability must fail closed; no automatic delete/repair/rebuild retry.",
+        "Completed commit replay only reads the immutable outcome; inspect never repairs or creates state. Distinguish a fresh, structurally valid preflight-complete state from an invalid/missing commit state. Do not claim resistance to malicious same-SID rollback/deletion beyond the declared operator trust boundary."
+      ],
+      "tests": [
+        "SA14: legitimate predecessor→successor succeeds; third grant/same-op substitution, preflight rerun and concurrent phases fail to reset state",
+        "extend SA06/SA07: crashes before/after claim, BEGIN, intent flush and native call; torn/missing-required journal cannot enable a second call"
+      ]
+    },
+    {
+      "id": "SA-D03",
+      "severity": "MEDIUM",
+      "location": "STOP-anchor-addendum.md:20,22,36; STOP-anchor-test-cuts.json:6,8,15",
+      "title": "入口先验证授权，过期 inspect 独立只读",
+      "requirements": [
+        "Strictly parse exactly one command/action and an action-specific flag set. Reject mixed action flags, duplicate flags, conflicting positional actions and unexpected arguments before filesystem/DB/process/journal side effects. Resolve proposal-vs-plan expected SHA by grant kind; preflight cannot be forced to supply a nonexistent final plan hash.",
+        "Entrypoints first perform pure argument parsing and compiled-grant schema/canonical validation/action selection. No constructor, route setup or error-output setup may open DB, process handles, backup or output journal before this gate. Package init must not perform these actions.",
+        "Separate grant structural validation (including interval ordering and <=30 minutes) from live freshness. Expired inspect accepts only structurally valid grants and reads existing matching immutable receipts with no target-process/DB/backup probes or new lock/journal creation. Filesystem read handles needed to read receipts are allowed; no interpretation that bans filesystem access itself.",
+        "Inspect for either phase reads only its existing authorized receipt subset. If a writer currently owns the operation or no immutable outcome exists, return bounded unavailable/in-progress without mutation."
+      ],
+      "tests": [
+        "extend SA01/SA03/SA10: malformed and cross-phase mixed CLI arguments show zero side-effect counters; expired inspect is DB/process-free and writes zero files"
+      ]
+    },
+    {
+      "id": "SA-D04",
+      "severity": "MEDIUM",
+      "location": "STOP-anchor-addendum.md:26,32,38,40; STOP-anchor-test-cuts.json:9,13",
+      "title": "同一文件句柄读取、拒绝写入替换，闭合 TOCTOU",
+      "requirements": [
+        "Do not merely retain a handle after hashing by path. Open every authority document/manifest member through validated non-reparse ancestry and a handle whose sharing denies write/delete for its required lifetime (or an equally strong proved native primitive). Reject writable sharing conflicts/hardlink aliases where identity constraints require distinct artifacts.",
+        "Hash and strict-decode the same bounded byte buffer read from that handle; verify file identity/size/canonical root and do not reopen by name for semantics or action. Retain directory/image/authority handles across waits/barrier/native action as applicable. Validate ancestor identity, ACL and same-owner rules without a check-then-open path race.",
+        "Pin and compare exact Core and parent process creation identities, parent canonical executable path/native file identity+hash, current SID/Owner principal/root, Host public identity/hash, DB/root identity and full old-window tuple. A matching hash alone does not accept a semantically different document or silently choose another proof class.",
+        "The Windows implementation must use existing allowed wrappers/files; if any needed primitive cannot be implemented there, stop that branch and request a narrow explicit scope amendment rather than silently reopening by path."
+      ],
+      "tests": [
+        "SA15: mutate/replace authority file, directory ancestor and parent image between hash/decode/action; write-sharing or identity mismatch denies before action",
+        "extend SA04/SA08: hash-matching semantically wrong acceptance/subject and Host/Owner/parent mismatches rejected"
+      ]
+    },
+    {
+      "id": "SA-D05",
+      "severity": "MEDIUM",
+      "location": "STOP-anchor-addendum.md:36,40; STOP-anchor-test-cuts.json:10-12",
+      "title": "有效期覆盖最终 signal 边界且不恢复已消费权限",
+      "requirements": [
+        "Compute invocation monotonic deadline from the initial remaining wall-clock validity and never extend it on revalidation. Enforce wall AND monotonic conditions after waits and immediately before intent and native call; no unbounded lock/backup wait may outrun the budget.",
+        "If expiry/cancellation occurs after durable intent but before TerminateProcess, perform zero native calls and retain consumed state with explicit zero-signal/unknown outcome as evidence permits. It is not refundable and cannot authorize a later retry.",
+        "After one native call, expiry allows only bounded wait/postflight/error recording under a separately finite completion bound, no new preflight/backup/stop. Preserve UNKNOWN or MAINTENANCE_BLOCKED when outcome/lease/baseline cannot be proved.",
+        "Cross-invocation clock rollback resistance is not newly claimed; the selected design guarantees the stated <=30-minute wall interval plus monotonic bound within each invocation, under the declared trusted OS/operator clock assumption."
+      ],
+      "tests": [
+        "extend SA05/SA06: expiry between intent flush and native call yields zero signal and consumed operation; expiry after signal still cannot retry; long waits honor finite cancellation/deadlines"
+      ]
+    }
+  ],
+  "paths_sufficient": {
+    "existing19": true,
+    "new_paths": [],
+    "anchor_subset_production": [
+      "internal/ownedcorestop/contract.go",
+      "internal/ownedcorestop/proof_windows.go",
+      "internal/ownedcorestop/stop_windows.go",
+      "internal/ownedcorestop/journal_windows.go",
+      "ops/owned_core_stop/main_windows.go",
+      "ops/owned_core_stop/main_nonwindows.go"
+    ],
+    "anchor_subset_tests": [
+      "internal/ownedcorestop/proof_windows_test.go",
+      "internal/ownedcorestop/stop_windows_test.go",
+      "internal/ownedcorestop/journal_windows_test.go",
+      "ops/owned_core_stop/main_windows_test.go",
+      "ops/owned_core_stop/fixture/main_windows.go"
+    ],
+    "existing19_native_support_if_needed": [
+      "ops/supervisor/owned_core_handle_windows.go",
+      "ops/supervisor/owned_core_handle_windows_test.go",
+      "internal/host/owned_core_stop_identity_windows.go",
+      "internal/host/owned_core_stop_identity_windows_test.go"
+    ],
+    "note": "Design-level sufficiency, not verified implementation ability. Original19 includes necessary native/store boundaries; no new deps/proofclass required."
+  },
+  "acceptance_requirements": [
+    "Two real nonempty link-time binaries through the production CLI; actual isolated native termination, original retained handle wait, SQLite online backup/census and real DataRootLease/postflight",
+    "SA01..SA11 plus explicit refinements/new SA12..SA15; affected S209/S216 through grant path; failures retained",
+    "Empty-default rejection is not usable Source acceptance",
+    "Source author cannot accept own whole Source/fixture output; independent acceptance after final frozen combined candidate, before actual operation"
+  ],
+  "preserved": {
+    "F01": "NOT_PROVABLE",
+    "verifier_native_closure": "NOT_PROVABLE",
+    "STOP_actual": "UNAVAILABLE",
+    "C": "UNCHANGED_OUT_OF_SCOPE",
+    "NEVER_JOB_AUTHORIZED": "NOT_ACCEPTED_NOT_ADDED",
+    "source_accepted": false,
+    "actual_authorized": false,
+    "formal_increment": 0
+  },
+  "evidence_limits": [
+    "No Source read/compile/test/process/DB/model/GUI/private-pipe/key/backup operation performed; only scope/design/prior manifest and explicit evidence reads",
+    "Optional Source index not read or relied upon; Root reported corrected index hash; prior transcription mismatch is not attributed to the reviewed six inputs",
+    "No dependency CVE or broad OWASP product audit; this finite architecture review introduces no dependency and makes no product-wide security claim"
+  ],
+  "diagnostics": [
+    {
+      "id": "D01",
+      "status": "RECORDED",
+      "detail": "Initial discovery command executed before durable receipt directory setup; replayed verbatim with raw/exit retained. Later read command recipes were saved from exact issued tool strings after execution. No observed read/hash errors."
+    },
+    {
+      "id": "D02",
+      "status": "OUT_OF_SCOPE",
+      "detail": "Root correction: optional Source index actual SHA 2a43ef48c86466a5c86ea1cd76f3f53edebdf78d6291f120756cd712e7a0cf93; Root prior typo caused a separate strict-check failure. Not read here and not counted as reviewer verification."
+    }
+  ],
+  "memory_used": "Only registry lines33-34 for separation of fixture/source/formal acceptance; current constraints confirmed by scoped card."
+}

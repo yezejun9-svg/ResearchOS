@@ -1,0 +1,217 @@
+--- original
++++ v2
+@@ -1,4 +1,5 @@
+ import sys
++sys.dont_write_bytecode = True
+ sys.dont_write_bytecode = True
+ 
+ import base64
+@@ -17,8 +18,8 @@
+     raise RuntimeError('Optimized Python prohibited')
+ ROOT = Path.cwd().resolve()
+ DRAFT = Path(__file__).resolve().parent
+-OUT = ROOT / 'execution/v2.4/receipts/W05/W05-99/session_list_closedcopy_exact1_root_replay_codex/8351a3261c8d418e8e8eb3d9cb192139'
+-EXPORT = ROOT / '.local/independent-session-list-closedcopy-root-8351a3261c8d418e8e8eb3d9cb192139'
++OUT = ROOT / 'execution/v2.4/receipts/W05/W05-99/session_list_closedcopy_exact1_root_replay_codex/a452e0211f5846db95514697db075e61'
++EXPORT = ROOT / '.local/independent-session-list-closedcopy-root-a452e0211f5846db95514697db075e61'
+ CANDIDATE = 'a5d6d16ffaf129de0361470c3a1570228bd259a2'
+ SOURCE_PARENT = '534857db99fa5e694987f877af74c322eaa2a0b3'
+ BASE = '22752a6a41732c8c158d7d7e1b8932ec958f8cb8'
+@@ -31,6 +32,7 @@
+ RESOURCE_PLAN_REF = {'path': 'execution/v2.4/receipts/W05/W05-99/cli_exact8_execution_preparation_codex/7d5925dba96b4c04baa2b6e6e33d164f/public_compiler_export_plan.v2.json', 'sha256': '598adac08e7c638bda6b783a78dc8541847b8e48054e196dd6da6eb728319bc2', 'bytes': 1573436}
+ STATE = {'phase': 'NOT_STARTED', 'frozen_inputs': [], 'completed_cases': []}
+ OWN_OUT_CREATED = False
++AUTHORIZATION_PATHS = []
+ 
+ 
+ def sha(path):
+@@ -101,6 +103,32 @@
+     return after
+ 
+ 
++def merge_frozen(*vectors):
++    entries = {}
++    for frozen in vectors:
++        assert len({item['path'] for item in frozen}) == len(frozen)
++        for item in frozen:
++            if item['path'] in entries:
++                assert entries[item['path']] == item, 'Conflicting already-frozen input: ' + item['path']
++            else:
++                entries[item['path']] = dict(item)
++    return [entries[path] for path in sorted(entries)]
++
++
++def extend_vector(before, paths):
++    # Existing rows are immutable. Hash only genuinely new paths; never absorb drift.
++    assert len({item['path'] for item in before}) == len(before)
++    requested = {str(Path(path).resolve()) for path in paths}
++    originals = {item['path']: item for item in before}
++    assert set(originals).issubset(requested)
++    check_vector(before)
++    added = vector(requested.difference(originals))
++    extended = merge_frozen(before, added)
++    assert all(item == {row['path']: row for row in extended}[item['path']] for item in before)
++    check_vector(extended)
++    return extended
++
++
+ def runtime_paths():
+     paths = {Path(path).resolve() for path in PROCESS_HELPER.runtime_resource_paths()}
+     for module in list(sys.modules.values()):
+@@ -145,10 +173,32 @@
+     return tuple((typ, float(payload).hex() if typ == 'real' else payload) for typ, payload in pairs)
+ 
+ 
++def check_python_sidecars(directory, database, stage):
++    facts = {}
++    for suffix in ('-wal', '-shm'):
++        try:
++            Path(str(database) + suffix).lstat()
++        except FileNotFoundError:
++            facts[suffix] = {'exists': False, 'error': None}
++        except OSError as error:
++            facts[suffix] = {'exists': None, 'error': repr(error)}
++        else:
++            facts[suffix] = {'exists': True, 'error': None}
++    evidence = save((directory / ('independent-python.' + stage + '.sidecars.json')).relative_to(OUT), facts)
++    assert all(item['exists'] is False and item['error'] is None for item in facts.values()), facts
++    return {'facts': facts, 'evidence': evidence}
++
++
+ def check_closed(directory):
+     database = directory / 'closed.sqlite'
+     before = row(database)
+-    assert not Path(str(database) + '-wal').exists() and not Path(str(database) + '-shm').exists()
++    go_sidecar_observations = {}
++    for name in ['closed-original.sidecars.json', 'closed-copy.before.sidecars.json', 'closed-copy.after.sidecars.json']:
++        sidecars = load(directory / name)
++        assert set(sidecars) == {'-wal', '-shm'}
++        assert all(set(item) == {'exists', 'error'} and item['exists'] is False and item['error'] is None for item in sidecars.values())
++        go_sidecar_observations[name] = {'facts': sidecars, 'evidence': row(directory / name)}
++    python_before = check_python_sidecars(directory, database, 'before_read')
+     recorded = load(directory / 'closed.rows.json')
+     assert recorded == load(directory / 'post-open.rows.json')
+     connection = sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True)
+@@ -170,15 +220,21 @@
+             assert actual == expected
+             table_counts[name] = sum(actual.values())
+     finally:
+-        connection.close()
++        try:
++            connection.close()
++        finally:
++            python_after = check_python_sidecars(directory, database, 'after_connection_close')
+     assert row(database) == before
+     proof = load(directory / 'closed-proof.json')
+     assert proof['closed_copy_sha256'] == before['sha256']
+     assert proof['all_table_schema_multisets_equal'] is True and proof['closed_copy_bytes_unchanged_by_read'] is True
++    assert proof['closed_copy_sidecars_absent'] is True
+     assert proof['case_failed'] is False and proof['SDK_worker_model_external_paid'] == 0
+     return {'database': before, 'independent_python_sqlite_version': sqlite3.sqlite_version,
+         'schema_all_columns_all_typed_row_multisets_equal': True, 'table_counts': table_counts,
+-        'readonly_bytes_unchanged': True, 'rowid_not_separately_exported': True}
++        'readonly_bytes_unchanged': True, 'rowid_not_separately_exported': True,
++        'go_three_closed_sidecar_observations': go_sidecar_observations,
++        'python_before_read': python_before, 'python_after_connection_close': python_after}
+ 
+ 
+ def check_wire(directory, name):
+@@ -221,14 +277,24 @@
+ 
+ 
+ def main():
+-    global ENV, OVERRIDES, CLEARED, RUN_OWNED, OWN_OUT_CREATED, PROCESS_HELPER
+-    assert len(sys.argv) == 3
++    global ENV, OVERRIDES, CLEARED, RUN_OWNED, OWN_OUT_CREATED, PROCESS_HELPER, AUTHORIZATION_PATHS
++    assert len(sys.argv) == 5
+     scope_path = Path(sys.argv[1]).resolve()
+-    assert scope_path == DRAFT / 'root_finite14_scope.draft.json' and sha(scope_path) == sys.argv[2]
++    assert scope_path == DRAFT / 'root_finite14_scope.v2.json' and sha(scope_path) == sys.argv[2]
+     scope = load(scope_path)
+     assert scope['source_commit'] == CANDIDATE and scope['owner'] == 'codex:/root'
+     assert scope['runner_ref']['sha256'] == sha(Path(__file__))
+     assert scope['ordered_cases'] == NAMES and scope['source_paths_sha256'] == SOURCES
++    gate_path = (ROOT / scope['authorization_gate_ref']['path']).resolve()
++    gate_raw = gate_path.read_bytes()
++    assert len(gate_raw) == scope['authorization_gate_ref']['bytes']
++    assert hashlib.sha256(gate_raw).hexdigest() == scope['authorization_gate_ref']['sha256']
++    gate_module = types.ModuleType('researchos_finite14_actual_authorization_gate')
++    gate_module.__file__ = str(gate_path)
++    exec(compile(gate_raw, str(gate_path), 'exec'), gate_module.__dict__)
++    authorization = gate_module.validate_grant(scope_path, sys.argv[2], Path(sys.argv[3]).resolve(), sys.argv[4])
++    AUTHORIZATION_PATHS = [Path(path).resolve() for path in authorization['authorization_paths']]
++    assert gate_path in AUTHORIZATION_PATHS
+     helper_path = (ROOT / scope['owned_process_helper_ref']['path']).resolve()
+     assert scope['owned_process_helper_ref']['sha256'] == sha(helper_path)
+     helper_raw = helper_path.read_bytes()
+@@ -241,11 +307,10 @@
+     PROCESS_HELPER = helper_module
+     # Pure local URI conversion loads lazy standard-library modules before any input freeze.
+     (ROOT / '__pure_uri_preload_no_file_access__').as_uri()
+-    cp = load(ROOT / 'execution/v2.4/checkpoint.json')
+-    assert cp['revision'] >= 317
+-    pin = cp['work_in_progress']['session_list_closedcopy_root_finite14_scope_ref']
+-    assert (ROOT / pin['path']).resolve() == scope_path and pin['sha256'] == sys.argv[2]
+-    assert cp['work_in_progress']['session_list_identity_source_ready'] is False
++    # All authority came from the actual sealed registration and its immutable canonical copies.
++    # Subsequent Root canonical progress does not alter this registered execution snapshot.
++    assert authorization['scope']['source_commit'] == CANDIDATE
++    assert authorization['grant']['actual_registration_completed'] is True
+     assert not OUT.exists() and not EXPORT.exists()
+     lock_path = ROOT / 'execution/toolchains/locked.json'
+     lock = load(lock_path)['tools']
+@@ -277,6 +342,7 @@
+             str(system / 'System32/WindowsPowerShell/v1.0'), str(system / 'System32')])})
+     ENV.update(OVERRIDES)
+     save('scope.original.json', scope)
++    save('authorization-inputs.original.json', vector(AUTHORIZATION_PATHS))
+     delta = run('candidate-source-delta', [git, 'diff-tree', '--no-commit-id', '--name-only', '-r', CANDIDATE], ROOT).decode().splitlines()
+     assert delta == ['internal/api/v2_sessions_test.go']
+     assert run('candidate-parent', [git, 'rev-parse', CANDIDATE + '^'], ROOT).decode().strip() == SOURCE_PARENT
+@@ -325,6 +391,7 @@
+     initial_paths.update([Path(lock[key]['path']) for key in ['python', 'git', 'go']])
+     initial_paths.update([Path(go).parent / 'gofmt.exe', Path(__file__), helper_path, scope_path, lock_path, plan_path])
+     initial_paths.update(runtime_paths())
++    initial_paths.update(AUTHORIZATION_PATHS)
+     initial_freeze = vector(initial_paths)
+     STATE['frozen_inputs'] = initial_freeze
+     save('inputs.before_Go_tools.json', initial_freeze)
+@@ -371,7 +438,7 @@
+     inputs.update(Path(module.__file__).resolve() for module in list(sys.modules.values()) if getattr(module, '__file__', None) and Path(module.__file__).is_file())
+     inputs.update(path for path in Path(sys.executable).parent.glob('python*.dll') if path.is_file())
+     save('generated-advertised.json', {'paths': generated_advertised, 'classification': 'Own new cache generated testmain/compiledGoFiles; never mislabeled Git source'})
+-    before = vector(inputs)
++    before = extend_vector(initial_freeze, inputs)
+     STATE['frozen_inputs'] = before
+     save('inputs.before_compile.json', before)
+     executable = OUT / 'session-list-api.test.exe'
+@@ -401,12 +468,27 @@
+     generated_mains = list((OUT / 'generated').rglob('_testmain.go'))
+     assert len(generated_mains) == 1 and 'TestSessionListHTTPOriginalContextIdentity' in generated_mains[0].read_text(encoding='utf-8', errors='strict')
+     save('inputs.after_compile.json', check_vector(before))
+-    save('compiled_WORK_vector.json', vector(artifacts))
++    work_freeze = vector(artifacts)
++    save('compiled_WORK_vector.json', work_freeze)
++    archive_freeze = merge_frozen(*[[item['archive']] for item in importcfg_refs])
++    compiled_freeze = merge_frozen(before, work_freeze, archive_freeze, vector([executable]))
++    check_vector(compiled_freeze)
+     run('exe-buildinfo', [go, 'version', '-m', str(executable)])
+     inputs.update(artifacts)
+     inputs.add(executable)
+     inputs.update(runtime_paths())
+-    freeze = vector(inputs)
++    check_vector(compiled_freeze)
++    freeze = extend_vector(compiled_freeze, inputs)
++    final_map = {item['path']: item for item in freeze}
++    assert all(final_map[item['path']] == item for item in initial_freeze)
++    assert all(final_map[item['path']] == item for item in before)
++    assert all(final_map[item['path']] == item for item in work_freeze)
++    save('immutable-input-vector-extension-proof.json', {
++        'initial_count': len(initial_freeze), 'before_compile_count': len(before),
++        'WORK_count': len(work_freeze), 'compiled_count': len(compiled_freeze), 'before_first_count': len(freeze),
++        'initial_subset_before_compile_exact': True, 'before_compile_subset_before_first_exact': True,
++        'WORK_and_archives_and_exe_after_buildinfo_unchanged': True, 'new_paths_only_appended': True,
++        'same_path_new_baseline_prohibited': True})
+     STATE['frozen_inputs'] = freeze
+     save('inputs.before_first_case.json', freeze)
+     results = []

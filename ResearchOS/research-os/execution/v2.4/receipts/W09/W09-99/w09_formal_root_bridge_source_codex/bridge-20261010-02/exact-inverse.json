@@ -1,0 +1,75 @@
+{
+  "schema": "researchos.w09-bridge-c19-delta-inverse.v1",
+  "base_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-01\\w09_root_bridge.source.py",
+    "sha256": "7b11082d9938d1611fb74bca12945d188436501d5e905b97b0ee828939810a53",
+    "bytes": 36616
+  },
+  "candidate_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-02\\w09_root_bridge.source.py",
+    "sha256": "007dc1ffd8b446cdd164e3f822adf2fb4c41d1c41f18eb568d0d9d18756dfd2d",
+    "bytes": 40243
+  },
+  "edits": [
+    {
+      "before": "    for row in rows:\n        # All real Native runs/modes must pass Main before a new Scope or child.\n        profile._native(api._profile_api(), reader, row, closure, router, pinned, sources)\n",
+      "after": "    reader.bridge_native_checks = {}\n    for row in rows:\n        # All four selector Native runs must pass Main current Source21/mode gates.\n        route = tuple(row[k] for k in (\"command_key\",\"check_id\",\"case_id\"))\n        reader.bridge_native_checks[route] = profile._native(\n            api._profile_api(), reader, row, closure, router, pinned, sources)\n"
+    },
+    {
+      "before": "def seed(req, out, eng):",
+      "after": "\ndef consumer_plan(req, eng, context, pinned):\n    \"\"\"Choose four or six consumers only after Main has checked current Native evidence.\"\"\"\n    api, reader, profile = eng\n    policy = req[\"c19_policy\"]\n    need(policy in {\"REUSE_CURRENT_SOURCE21\", \"RUN_CURRENT_CM40\"}, \"C19_POLICY\")\n    proofs = getattr(reader, \"bridge_native_checks\", {})\n    need(set(proofs) == set(ROUTES), \"MAIN_CURRENT_NATIVE_GATE_REQUIRED\")\n    # Report identity and selector semantics are validated by Main _native, not by this map.\n    selected = {}\n    for row in context[\"registered_commands\"]:\n        key = row[\"check_id\"] or row[\"case_id\"]\n        pair = (row[\"native_report_ref\"][\"path\"], row[\"native_report_ref\"][\"sha256\"],\n                row[\"native_tool_run_ref\"][\"path\"], row[\"native_tool_run_ref\"][\"sha256\"])\n        need(key not in selected or selected[key] == pair, \"SAME_SELECTOR_NATIVE_BUNDLE\")\n        selected[key] = pair\n    need(set(selected) == {\"W09-G01\",\"W09-G02\",\"C19\",\"A06\"}\n         and len({value[0] for value in selected.values()}) == 4, \"FOUR_CURRENT_NATIVE_REPORTS\")\n    if policy == \"RUN_CURRENT_CM40\":\n        return ROUTES\n    # No fallback to stale history: a rejected Source21 or historical pin stops the stage.\n    registry_path = reader.path(\"execution/v2.4/commands.json\")\n    registry = reader.read(registry_path)\n    authority = document(req[\"c19_reuse_registry_ref\"])\n    need(authority[\"roles\"][\"executor\"] == ROOT_ACTOR, \"C19_REUSE_ACTUAL_EXECUTOR\")\n    for row in context[\"registered_commands\"]:\n        route = tuple(row[k] for k in (\"command_key\",\"check_id\",\"case_id\"))\n        if route[2] != \"C19\":\n            continue\n        receipt = profile._doc(api._profile_api(), reader, row[\"receipt_ref\"], \"execution/invocations/\")\n        need(profile._historical_registry(api._profile_api(), reader, row, receipt, registry,\n                                         pinned[registry_path]) is True, \"ONLY_FIXED_CM39_C19_REUSE\")\n        report, native, mode, intervals = proofs[route]\n        output = reader.document(receipt[\"stdout\"])\n        need(output.get(\"native_tool_run_ref\") == row[\"native_tool_run_ref\"][\"path\"]\n             and output.get(\"mode_evidence\") == mode\n             and any(ref.get(\"path\") == row[\"native_report_ref\"][\"path\"]\n                     and ref.get(\"sha256\") == row[\"native_report_ref\"][\"sha256\"]\n                     for ref in output.get(\"source_pins\", [])), \"HISTORICAL_CONSUMER_SAME_NATIVE\")\n        decision = document(row[\"mode_decision_ref\"])\n        profile._route_execution_actor(api._profile_api(), reader, row, receipt, decision, authority)\n    return NEW\n\ndef seed(req, out, eng):"
+    },
+    {
+      "before": "    context, *_ = native_inputs(req, eng)\n    need(context[\"executor_id\"] == ROOT_ACTOR, \"ROOT_EXECUTOR\")",
+      "after": "    context, pinned, *_ = native_inputs(req, eng)\n    planned = consumer_plan(req, eng, context, pinned)\n    need(context[\"executor_id\"] == ROOT_ACTOR, \"ROOT_EXECUTOR\")"
+    },
+    {
+      "before": "    routes = [dict(zip((\"command_key\",\"check_id\",\"case_id\"), route)) for route in NEW]",
+      "after": "    route_bindings = [dict(zip((\"command_key\",\"check_id\",\"case_id\"), route)) for route in planned]\n    routes = list(dict.fromkeys(route[0] for route in planned))"
+    },
+    {
+      "before": "                 slice_id=\"W09_FULL_FORMAL_CONSUMERS\", routes=routes)",
+      "after": "                 slice_id=\"W09_FULL_FORMAL_CONSUMERS\", routes=routes, route_bindings=route_bindings)"
+    },
+    {
+      "before": "                 \"source_ref\": req[\"bridge_source_ref\"], \"source_review_ref\": req[\"source_review_ref\"]}",
+      "after": "                 \"source_ref\": req[\"bridge_source_ref\"], \"source_review_ref\": req[\"source_review_ref\"],\n                 \"route_bindings\": route_bindings if name == \"consumers\" else []}"
+    },
+    {
+      "before": "    return {\"schema\": \"researchos.w09-bridge-proposal.v1\", \"documents\": docs,",
+      "after": "    return {\"schema\": \"researchos.w09-bridge-proposal.v1\", \"documents\": docs,\n            \"c19_policy\": req[\"c19_policy\"], \"planned_routes\": route_bindings,"
+    },
+    {
+      "before": "    proposal = document(req[\"proposal_ref\"])\n    need(proposal[\"source_ref\"]",
+      "after": "    proposal = document(req[\"proposal_ref\"])\n    need(proposal[\"c19_policy\"] == req[\"c19_policy\"], \"PROPOSAL_C19_POLICY\")\n    need(proposal[\"source_ref\"]"
+    },
+    {
+      "before": "    proposal = document(ref)\n    for name, refs in proposal[\"documents\"].items():",
+      "after": "    proposal = document(ref)\n    need(proposal[\"c19_policy\"] == req[\"c19_policy\"], \"REGISTERED_C19_POLICY\")\n    for name, refs in proposal[\"documents\"].items():"
+    },
+    {
+      "before": "    registered(req)\n    context, *_ = native_inputs(req, eng)\n    snap = snapshot(api, reader, context)",
+      "after": "    proposal = registered(req)\n    context, pinned, *_ = native_inputs(req, eng)\n    planned = consumer_plan(req, eng, context, pinned)\n    need(proposal[\"planned_routes\"] == [dict(zip((\"command_key\",\"check_id\",\"case_id\"), r)) for r in planned],\n         \"REGISTERED_EXACT_CONSUMER_ROUTES\")\n    snap = snapshot(api, reader, context)"
+    },
+    {
+      "before": "        if route[2] == \"C19\":\n            checked(row[\"receipt_ref\"])  # Preserved exactly; never invoke old C19.\n            continue",
+      "after": "        if route not in planned:\n            checked(row[\"receipt_ref\"])  # Exact fixed history already passed Main current Source21 gates.\n            continue"
+    },
+    {
+      "before": "            \"formal_acceptance\":False,\"producer_rerun\":False}",
+      "after": "            \"formal_acceptance\":False,\"producer_rerun\":False,\"c19_policy\":req[\"c19_policy\"],\n            \"executed_consumer_routes\":[list(route) for route in planned]}"
+    }
+  ],
+  "inverse_sha256": "7b11082d9938d1611fb74bca12945d188436501d5e905b97b0ee828939810a53",
+  "exact_inverse": true,
+  "unmodified_base_hdf_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-01\\HDF.json",
+    "sha256": "a48c7f18f62f3ce4ccf707f54c53cafd4ac31f98f6e45f3356413d3a09f89679",
+    "bytes": 3428
+  },
+  "unmodified_base_mf_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W09\\W09-99\\w09_formal_root_bridge_source_codex\\bridge-20261010-01\\MF.json",
+    "sha256": "26f5504a13790dbe290bf39660580cb0d183c0e2860be2eea4f20ed1b5b39f8e",
+    "bytes": 10100
+  }
+}

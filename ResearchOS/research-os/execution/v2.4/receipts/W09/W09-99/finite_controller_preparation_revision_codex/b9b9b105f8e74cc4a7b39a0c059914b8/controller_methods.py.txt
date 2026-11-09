@@ -1,0 +1,101 @@
+ def run(self,label,argv,cwd,timeout,process_cap,images,env=None,stdin_path=None):
+  self.serial+=1
+  if self.serial>128:raise Stop('Total native invocation cap')
+  d=self.out/'native'/('%03d-%s'%(self.serial,label));d.mkdir(parents=True)
+  started=time.time();result=None;wrapper=None;request=None;cause=FirstCause();effective=self.environment if env is None else env
+  item={'serial':self.serial,'label':label,'directory':str(d),'actualargv':argv,'cwd':str(cwd),'environment':effective,'started_at_unix':started,'actual_native_exit':None,'owned_result':None,'wrapper_ref':None,'first_error':None,'secondary_errors':[]}
+  self.attempts.append(item)
+  write_json(d/'invocation.started.json',item)
+  try:
+   self.ledger.check('%03d-%s-before'%(self.serial,label))
+   primary=file_ref(argv[0]);pins=[{'path':r['path'],'sha256':r['sha256'],'bytes':r['bytes']} for r in images]
+   if label.startswith('case-'):
+    worker=self.s['case_worker_ref'];python=self.g['tools']['python']
+    request=write_json(d/'case-request.json',{'schema':'researchos.w09.owned-case-request.v2','grant_ref':self.g['_grant_ref'],'source_commit':CANDIDATE,'self_ref':worker,'python_ref':python,'debug_helper_ref':self.g['debug_helper_ref'],'argv':argv,'cwd':str(cwd),'env':effective,'output_dir':str(d),'timeout':120,'process_cap':process_cap,'images':pins,'allowed_module_files':[r['ref'] for r in self.ledger.rows.values()],'expected_image':{'sha256':primary['sha256'],'bytes':primary['bytes']}})
+    wrapperargv=[python['path'],*FLAGS,worker['path'],'--request',request['path'],'--sha256',request['sha256']]
+    write_json(d/'wrapper.started.json',{'actualargv':wrapperargv,'request_ref':request,'actual_native_exit':None})
+    try:
+     with (d/'wrapper.stdout.raw').open('xb') as so,(d/'wrapper.stderr.raw').open('xb') as se:wrapper=self.normal.run_owned(wrapperargv,str(PREP),self.environment,so,se,150)
+     require_job(wrapper)
+    except BaseException as e:cause.record(e,'case-wrapper')
+    finally:
+     item['wrapper_ref']=write_json(d/'wrapper.json',{'actualargv':wrapperargv,'cwd':str(PREP),'owned_result':wrapper,'actual_native_exit':None if wrapper is None else wrapper.get('actual_exit'),'request_ref':request,'stdout_ref':existing_ref(d/'wrapper.stdout.raw'),'stderr_ref':existing_ref(d/'wrapper.stderr.raw'),'first_error':cause.primary})
+    if (d/'case-owned.json').is_file():result=raw_json((d/'case-owned.json').read_bytes())
+    cause.raise_if_any()
+   else:
+    import contextlib
+    with (d/'stdout.raw').open('xb') as so,(d/'stderr.raw').open('xb') as se, (Path(stdin_path).open('rb') if stdin_path else contextlib.nullcontext(None)) as si:
+     result=self.debug.run_owned(argv,str(cwd),effective,so,se,timeout,{'sha256':primary['sha256'],'bytes':primary['bytes']},pins,[r['ref'] for r in self.ledger.rows.values()],process_cap,stdin=si,creation_flags=0x08000000)
+   require_job(result,True)
+   rawlimit=512*1024*1024 if label=='git-export' else 64*1024*1024
+   if any((d/name).stat().st_size>rawlimit for name in ['stdout.raw','stderr.raw']):raise Stop('Native raw bound exceeded')
+   modules=[]
+   for entry in result['debug_capture']['modules']:
+    p=entry['path_from_actual_file_handle'];slash=chr(92)
+    if p.startswith(slash*2+'?'+slash+'UNC'+slash):p=slash*2+p[8:]
+    elif p.startswith(slash*2+'?'+slash):p=p[4:]
+    pin=file_ref(p)
+    if pin['sha256']!=entry['before']['sha256'] or pin['bytes']!=entry['before']['bytes'] or entry['before']!=entry['after']:raise Stop('Actual held module differs')
+    modules.append(p)
+   self.ledger.add(modules,'actual-loaded-images-'+label)
+  except BaseException as e:
+   if cause.primary is None:cause.record(e,'native-stage')
+  finally:
+   item.update(ended_at_unix=time.time(),actual_native_exit=None if result is None else result.get('actual_exit'),owned_result=result,stdout_ref=existing_ref(d/'stdout.raw'),stderr_ref=existing_ref(d/'stderr.raw'),stdin_ref=existing_ref(stdin_path) if stdin_path else None)
+   cause.attempt('after-vector',lambda:self.ledger.check('%03d-%s-after'%(self.serial,label)))
+   item.update(first_error=cause.primary,secondary_errors=cause.secondary)
+   cause.attempt('save-native-invocation',lambda:write_json(d/'invocation.json',item))
+   if cause.primary:cause.attempt('save-first-cause',lambda:write_json(d/'failure.origin.json',{'first_error':cause.primary,'secondary_errors':cause.secondary,'actual_native_exit':item['actual_native_exit'],'counter_reset':False}))
+  cause.raise_if_any()
+  return d,result
+
+ def export_source(self):
+  git=self.g['tools']['git'];root=no_alias(self.g['repository']);images=self.g['git_images']
+  d,_=self.run('git-parent',[git['path'],'rev-parse',CANDIDATE+'^'],root,30,4,images)
+  if (d/'stdout.raw').read_text(encoding='ascii').strip()!=BASE:raise Stop('Candidate parent differs')
+  d,_=self.run('git-four-diff',[git['path'],'diff-tree','--no-commit-id','--name-only','-r',CANDIDATE],root,30,4,images)
+  if set((d/'stdout.raw').read_text(encoding='utf-8').splitlines())!=set(self.s['exact4_paths']):raise Stop('Candidate not exact4')
+  catalog=read_bound(self.g['source_catalog_ref']);rows=catalog['files']
+  if len(rows)>4096 or len({x['path'].casefold() for x in rows})!=len(rows):raise Stop('Catalog duplicate/cap')
+  # Query exact candidate:path, then independently verify Git blob AND SHA/size. No tree-wide extraction/private data.
+  for row in rows:
+   name=row['path'];parts=Path(name).parts
+   if Path(name).is_absolute() or '..' in parts or any(':' in p or p.rstrip(' .')!=p for p in parts) or row['mode']!='100644' or row['type']!='blob':raise Stop('Catalog path/mode')
+  request=write_bytes(self.out/'git-export.stdin.raw',''.join(CANDIDATE+':'+r['path']+'\n' for r in rows).encode('utf-8'))
+  self.ledger.add([request['path']],'exact-export-request')
+  d,_=self.run('git-export',[git['path'],'cat-file','--batch'],root,90,4,images,stdin_path=request['path'])
+  raw=(d/'stdout.raw').read_bytes();pos=0;self.tree.mkdir();members=[]
+  for row in rows:
+   end=raw.index(b'\n',pos);oid,kind,n=raw[pos:end].decode('ascii','strict').split();n=int(n);pos=end+1
+   body=raw[pos:pos+n];pos+=n
+   if oid!=row['git_blob'] or kind!='blob' or n!=row['bytes'] or len(body)!=n or raw[pos:pos+1]!=b'\n' or hashlib.sha256(body).hexdigest()!=row['sha256']:raise Stop('Actual exported blob framing/hash differs')
+   pos+=1;members.append(write_bytes(self.tree/row['path'],body))
+  if pos!=len(raw):raise Stop('Unexpected extra export bytes')
+  for pin in self.s['exact4_pins']:
+   actual=file_ref(self.tree/pin['path'])
+   if (actual['sha256'],actual['bytes'])!=(pin['sha256'],pin['bytes']):raise Stop('Exported candidate test differs')
+  if {str(p.relative_to(self.tree)).replace(chr(92),'/') for p in walk_files(self.tree)}!={r['path'] for r in rows}:raise Stop('Complete export catalog differs BEFORE any Go')
+  write_json(self.out/'source-export.json',{'candidate':CANDIDATE,'architecture_base':BASE,'catalog_ref':self.g['source_catalog_ref'],'stdin_ref':request,'raw_ref':file_ref(d/'stdout.raw'),'files':members,'complete_before_any_Go':True,'not_combined_Main':True})
+  self.ledger.add([r['path'] for r in members],'fixed-Git-export')
+
+ def resources(self):
+  self.resource={'symlink':'HOLD_NOT_GRANTED','junction':'HOLD_NOT_GRANTED'};self.link=None
+  # Only a frozen false resource grant produces HOLD. Every granted OS error is an unexpected failure.
+  if self.g['resources']['symlink']:
+   root=self.out/'symlink-prerequisite';root.mkdir();a=root/'A';b=root/'B';a.mkdir();b.mkdir()
+   try:
+    os.symlink(str(b),str(a/'outside'),target_is_directory=True)
+    if not stat.S_ISLNK((a/'outside').lstat().st_mode) or (a/'outside').resolve()!=b.resolve():raise Stop('Wrong symlink identity')
+    self.resource['symlink']='AVAILABLE'
+   except BaseException as e:
+    write_json(root/'failure.json',{'actual_native_exit':None,'type':type(e).__name__,'message':str(e),'winerror':getattr(e,'winerror',None),'errno':getattr(e,'errno',None),'classification':'UNEXPECTED_STOP_NOT_HOLD'});raise
+  if self.g['resources']['junction']:
+   root=self.out/'junction-resource';root.mkdir();a=root/'A';b=root/'B';a.mkdir();b.mkdir()
+   for p in [a/'same.txt',b/'same.txt']:write_bytes(p,b'owned-public-marker')
+   link=a/'outside'
+   if any(c in str(root) for c in '"%&|<>^!\r\n'):raise Stop('Unsafe cmd resource path')
+   cmd=self.g['tools']['cmd'];command='mklink /J "'+str(link)+'" "'+str(b)+'"'
+   self.run('junction-resource',[cmd['path'],'/D','/V:OFF','/S','/C',command],root,15,1,[cmd])
+   if not getattr(link.lstat(),'st_file_attributes',0)&0x400 or link.resolve()!=b.resolve():raise Stop('Wrong actual junction target')
+   self.resource['junction']='AVAILABLE';self.link=root
+  write_json(self.out/'resource-status.json',{'states':self.resource,'grant_ref':self.g['_grant_ref'],'granted':self.g['resources'],'hold_policy':'ONLY_EXPLICIT_FALSE_GRANT'})

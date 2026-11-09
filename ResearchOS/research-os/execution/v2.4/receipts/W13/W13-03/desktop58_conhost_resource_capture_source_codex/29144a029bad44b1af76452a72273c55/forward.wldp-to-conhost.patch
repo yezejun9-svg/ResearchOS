@@ -1,0 +1,185 @@
+--- a/construct_root_inputs.desktop58.wldp.proposed.py
++++ b/construct_root_inputs.desktop58.conhost.proposed.py
+@@ -26,6 +26,30 @@
+               'expected_runtime_observation_paths', 'runtime_observation_phases')
+ CODE_KEYS = ('controller_ref', 'launcher_ref', 'authorization_verifier_ref',
+              'owned_helper_ref', 'debug_helper_ref', 'utility_ref')
++CONHOST_NS = ROOT / ('execution/v2.4/receipts/W13/W13-03/'
++                     'desktop58_conhost_resource_diagnostic_codex/'
++                     '0a2dfbb74d3b4f0fb12192390b80cbea')
++CONHOST_PINS = {
++    'conhost_diagnostic_report_ref':
++        ('report.json', '6584aa7e854b9fad0978e7d09aa64f510eab86d77a478f72e76c0f6b869858fc', 3664),
++    'conhost_resource_delta_ref':
++        ('exact-resource-delta.json', 'bf28231fe85094bb12fe7728b7dde3ad2f2616c295c982a3fc98654d9cbb80ae', 1981),
++    'conhost_diagnostic_handoff_ref':
++        ('handoff.json', '57f9799a1b69574894f59956853ef412229b778274d6458af760791a61a80b5c', 1503),
++    'conhost_diagnostic_manifest_ref':
++        ('manifest.json', 'd10e269678421a8741a09571df7a12e9fb6091be1bd50dbbde8849a99d4488db', 2915),
++}
++CONHOST_EVIDENCE_REF = {
++    'path': str(CONHOST_NS / 'pe-and-catalog-evidence.json'),
++    'sha256': '00ef2b029a884180e72834f4cda5644d46106a2cd63bebb4b8833305fb5ca2c1',
++    'bytes': 34632}
++OLD_WLDP_CONSTRUCTOR_REF = {
++    'path': str(ROOT / ('execution/v2.4/receipts/W13/W13-03/'
++                        'desktop58_windows_resource_capture_source_revision_codex/'
++                        '3aff012b57924a41a233cb9e162cfc0d/'
++                        'construct_root_inputs.desktop58.wldp.proposed.py')),
++    'sha256': '9f64bd96b11ea017656e1262b0caaede1cf295ee5e75dd689751439a868834a7',
++    'bytes': 25948}
+ 
+ 
+ def need(ok, why):
+@@ -161,6 +185,67 @@
+     return [row for row in full if Path(row['path']).is_relative_to(root)]
+ 
+ 
++def validate_conhost_chain(q, delta, report, handoff, manifest, evidence):
++    """Bind one independent static diagnostic to six distinct reviewed rows."""
++    for key, (name, digest, size) in CONHOST_PINS.items():
++        need(q[key] == {'path': str(CONHOST_NS / name), 'sha256': digest,
++                        'bytes': size}, 'Conhost diagnostic pin: ' + key)
++    need(handoff['decision'] == 'RESOURCE_GAP_CONFIRMED_NEW_INPUT_REQUIRED' and
++         handoff['report_ref'] == q['conhost_diagnostic_report_ref'] and
++         handoff['resource_delta_ref'] == q['conhost_resource_delta_ref'] and
++         handoff['manifest_ref'] == q['conhost_diagnostic_manifest_ref'] and
++         handoff['evidence_ref'] == CONHOST_EVIDENCE_REF and
++         report['reviewer'] == 'codex:/root/w05_merge_review' and
++         report['decision'] == handoff['decision'] and
++         report['constructor_ref'] == OLD_WLDP_CONSTRUCTOR_REF and
++         report['evidence_ref'] == CONHOST_EVIDENCE_REF and
++         report['new_failure_count'] == 0 and
++         report['source_acceptance'] is False and
++         manifest['schema'] == 'researchos.public-review-manifest.v1' and
++         manifest['self_excluded'] is True and
++         manifest['count'] == len(manifest['entries']) == 9,
++         'Conhost independent review chain')
++    entries = manifest['entries']
++    need(len({row['path'].casefold() for row in entries}) == 9 and
++         all(Path(row['path']).parent == CONHOST_NS for row in entries) and
++         all(ref in entries for ref in
++             [q['conhost_diagnostic_report_ref'], q['conhost_resource_delta_ref'],
++              CONHOST_EVIDENCE_REF]), 'Conhost sealed diagnostic members')
++    need(delta['schema'] == 'researchos.desktop58-conhost-exact-static-delta.v1' and
++         delta['base_counts'] == {'resource_catalog': 23868, 'runtime_files': 1297,
++                                  'compiler_files': 22138, 'process_images': 16} and
++         delta['conditional_new_counts'] ==
++         {'resource_catalog_files': 23874, 'runtime_files': 1303,
++          'compiler_files': 22138, 'static_images': 17} and
++         delta['recursive_pe_or_os_loaded_closure_proven'] is False and
++         delta['actual_execution_authorized'] is False, 'Conhost count contract')
++    refs = delta['additions_to_catalog_and_runtime']
++    names = ('conhost.exe', 'icu.dll', 'PROPSYS.dll', 'd2d1.dll', 'dxgi.dll', 'd3d11.dll')
++    need(type(refs) is list and len(refs) == 6 and
++         all(type(ref) is dict and set(ref) == {'path', 'sha256', 'bytes'} and
++             Path(ref['path']) == Path('C:/Windows/System32') / name
++             for ref, name in zip(refs, names)) and
++         len({ref['path'].casefold() for ref in refs}) == 6 and
++         delta['static_images_add'] == [refs[0]], 'Exactly six conhost rows and one image')
++    need(evidence['schema'] == 'researchos.desktop58-conhost-pe-resource-diagnostic.v1' and
++         evidence['static_only'] is True and evidence['candidate_executed'] is False and
++         evidence['conhost']['file_ref'] == refs[0] and
++         evidence['conhost']['actual_loaded_proven'] is False and
++         evidence['new_direct_dependency_pins'] == refs[1:] and
++         evidence['original_counts'] == delta['base_counts'] and
++         all(value is None for value in evidence['conhost_old_coverage'].values()),
++         'Conhost static PE source and old coverage')
++    for ref in refs[1:]:
++        edges = [edge for edge in evidence['direct_edges']
++                 if edge['import_name'].casefold() == Path(ref['path']).name.casefold()]
++        need(len(edges) == 1 and edges[0]['kind'] == 'delay_imports' and
++             edges[0]['file']['file_ref'] == ref and
++             edges[0]['coverage']['resource_catalog'] is None and
++             edges[0]['coverage']['runtime_files'] is None,
++             'Reviewed direct dependency: ' + ref['path'])
++    return refs
++
++
+ def run():
+     need(sys.flags.isolated and sys.flags.no_site and sys.flags.utf8_mode,
+          'Pinned -I -S -X utf8 required')
+@@ -178,7 +263,9 @@
+               'Root_forward_head_review_ref', 'negative_alias_declarations',
+               'inner_seconds', 'outer_seconds', 'builder_seconds',
+               'controller_evidence_reserve_seconds', 'launcher_evidence_reserve_seconds',
+-              'wldp_static_ref', 'wldp_candidate_report_ref')
++               'wldp_static_ref', 'wldp_candidate_report_ref',
++               'conhost_diagnostic_report_ref', 'conhost_resource_delta_ref',
++               'conhost_diagnostic_handoff_ref', 'conhost_diagnostic_manifest_ref')
+     need(all(q.get(key) is not None for key in future), 'Root literal future value missing')
+     need(len(q['canonical_copies']) == 4 and type(q['pending_origin_refs']) is list,
+          'Four copies and explicit pending origin cut')
+@@ -257,6 +344,17 @@
+              edge['system32_filename_matches'] == [wldp_ref['path']] and
+              edge['catalog_matches'] == [] for edge in names['edges']),
+          'Direct static PE dependency and old-catalog gap')
++    conhost_report = parse(frozen(q['conhost_diagnostic_report_ref']))
++    conhost_delta = parse(frozen(q['conhost_resource_delta_ref']))
++    conhost_handoff = parse(frozen(q['conhost_diagnostic_handoff_ref']))
++    conhost_manifest = parse(frozen(q['conhost_diagnostic_manifest_ref']))
++    conhost_evidence = parse(frozen(CONHOST_EVIDENCE_REF))
++    conhost_refs = validate_conhost_chain(q, conhost_delta, conhost_report,
++                                          conhost_handoff, conhost_manifest,
++                                          conhost_evidence)
++    for member in conhost_manifest['entries']:
++        frozen(member)
++    conhost_before = [actual(ref) for ref in conhost_refs]
+ 
+     compiler = copy.deepcopy(parse(frozen(q['compiler_base_ref'])))
+     runtime = copy.deepcopy(parse(frozen(q['runtime_base_ref'])))
+@@ -274,9 +372,16 @@
+         group['files'] = members
+     membership = {'compiler_roots': [physical_members(group['path'], group['files'])
+                                     for group in compiler['complete_public_roots']]}
+-    for ref in runtime['files'] + correction['missing_Windows_refs'] + [wldp_ref]:
++    old_runtime = runtime['files'] + correction['missing_Windows_refs'] + [wldp_ref]
++    conhost_keys = {os.path.normcase(ref['path']) for ref in conhost_refs}
++    need(len(conhost_keys) == 6 and
++         not conhost_keys.intersection(compiler_rows) and
++         not conhost_keys.intersection(os.path.normcase(ref['path']) for ref in old_runtime),
++         'Conhost six are new physical identities')
++    for ref in old_runtime + conhost_refs:
+         add(runtime_rows, ref)
+-    need(len(runtime_rows) == 1283, 'Runtime base plus Windows40 plus Wldp identity count')
++    need(len(runtime_rows) == 1289,
++         'Runtime base plus Windows40, Wldp and six Conhost identities')
+     need(len(q['metadata_code_refs']) == 8, 'Current Desktop metadata8 only')
+     metadata_names = {Path(ref['path']).name for ref in q['metadata_code_refs']}
+     need(metadata_names == {'scope_builder.py', 'prepare.py', 'register.py',
+@@ -297,10 +402,15 @@
+         'Windows_Wldp_static_ref': actual(wldp_ref),
+         'Windows_Wldp_static_evidence_ref': q['wldp_candidate_report_ref'],
+         'Windows_Wldp_actual_loaded_proven': False,
++        'Windows_Conhost_static_refs': conhost_before,
++        'Windows_Conhost_independent_diagnostic_ref': q['conhost_diagnostic_report_ref'],
++        'Windows_Conhost_exact_delta_ref': q['conhost_resource_delta_ref'],
++        'Windows_Conhost_actual_loaded_proven': False,
+         'metadata8_refs': [actual(ref) for ref in q['metadata_code_refs']],
+         'six_runtime_controller_refs': [actual(template[key]) for key in CODE_KEYS],
+         'old_CLI_metadata8_inherited': False,
+         'actual_case_acceptance': False}
++    need(len(runtime['files']) == 1303, 'Conhost runtime final identity count')
+     compiler['files'] = sorted(compiler_rows.values(),
+                                key=lambda row: os.path.normcase(row['path']))
+     for group in compiler['complete_public_roots']:
+@@ -364,6 +474,10 @@
+     need(all(tool in images for tool in tools.values()) and
+          all(image in images for image in compiler['compiler_images']),
+          'Five tools and compiler images in static executable set')
++    need(len(images) == 17 and images.count(conhost_before[0]) == 1 and
++         all(ref not in images for ref in conhost_before[1:]),
++         'Conhost executable image only; five DLLs are runtime files')
++    need(len(union) == 23874, 'Conhost complete resource union count')
+     for name in ('GOMODCACHE', 'web_modules'):
+         root = compiler[name] if name == 'GOMODCACHE' else web_root
+         need(Path(root).is_dir(), 'Required physical public root')
+@@ -466,6 +580,8 @@
+         p = Path(path)
+         need(p.stat().st_size == size and hashlib.sha256(p.read_bytes()).hexdigest() == digest,
+              'Final immutable input drift')
++    need([actual(ref) for ref in conhost_refs] == conhost_before,
++         'Conhost six physical pins changed during construction')
+     root_ref = save('root-inputs.desktop58.pre-review.json', inputs)
+     audit_ref = save('root-construction.audit.json', {
+         'actor': 'codex:/root', 'root_inputs_ref': root_ref, 'before': q['before'],

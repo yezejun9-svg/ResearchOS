@@ -1,0 +1,441 @@
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+530: 
+531: func (p HistoricalQualificationPlan) beforeHash() string {
+532: 	return Hash(Object{"census": p.BeforeCensus, "run": p.BeforeRun,
+533: 		"state": p.BeforeState, "dispatch": p.BeforeDispatch, "dispatch_row": p.BeforeDispatchRow,
+534: 		"protected": p.BeforeProtectedSHA256, "residual": p.BeforeResidualSHA256})
+535: }
+536: 
+537: // Keep the raw SQL image of every dispatch column. The decoded dispatch
+538: // object does not retain the exact manifest/identity bytes or prepared_at.
+539: type historicalQualificationDispatchRow struct {
+540: 	Project             string                             `json:"project"`
+541: 	Run                 string                             `json:"run"`
+542: 	Epoch               int64                              `json:"epoch"`
+543: 	DispatchKey         string                             `json:"dispatch_key"`
+544: 	Manifest            string                             `json:"manifest"`
+545: 	ManifestHash        string                             `json:"manifest_hash"`
+546: 	State               string                             `json:"state"`
+547: 	Worker              string                             `json:"worker"`
+548: 	JournalLocator      string                             `json:"journal_locator"`
+549: 	Identity            string                             `json:"identity"`
+550: 	ObservationSequence int64                              `json:"observation_sequence"`
+551: 	ObservationHash     string                             `json:"observation_hash"`
+552: 	PreparedAt          string                             `json:"prepared_at"`
+553: 	UpdatedAt           string                             `json:"updated_at"`
+554: 	Reason              string                             `json:"reason"`
+555: 	Cells               [15]historicalQualificationSQLCell `json:"cells"`
+556: }
+557: 
+558: type historicalQualificationSQLCell struct {
+559: 	Type string `json:"type"`
+560: 	Data []byte `json:"data"`
+561: }
+562: 
+563: func historicalQualificationReadDispatchRow(ctx context.Context, tx *sql.Tx, subject HistoricalQualificationSubject) (historicalQualificationDispatchRow, error) {
+564: 	var r historicalQualificationDispatchRow
+565: 	err := tx.QueryRowContext(ctx, `SELECT project,run,epoch,dispatch_key,manifest,manifest_hash,state,worker,journal_locator,identity,observation_sequence,observation_hash,prepared_at,updated_at,reason
+566: 		FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.ProjectID, subject.RunID, subject.Epoch).
+567: 		Scan(&r.Project, &r.Run, &r.Epoch, &r.DispatchKey, &r.Manifest, &r.ManifestHash,
+568: 			&r.State, &r.Worker, &r.JournalLocator, &r.Identity, &r.ObservationSequence,
+569: 			&r.ObservationHash, &r.PreparedAt, &r.UpdatedAt, &r.Reason)
+570: 	if err != nil {
+571: 		return r, err
+572: 	}
+573: 	// SQLite affinity permits BLOB or numeric storage in a TEXT column.
+574: 	// Preserve every cell's storage class and exact bytes across JSON round trips.
+575: 	cols := []string{"project", "run", "epoch", "dispatch_key", "manifest", "manifest_hash", "state", "worker", "journal_locator", "identity", "observation_sequence", "observation_hash", "prepared_at", "updated_at", "reason"}
+576: 	fields := make([]string, 0, len(cols)*2)
+577: 	args := make([]any, 0, len(cols)*2)
+578: 	for i, col := range cols {
+579: 		fields = append(fields, "typeof("+col+")", "CAST("+col+" AS BLOB)")
+580: 		args = append(args, &r.Cells[i].Type, &r.Cells[i].Data)
+581: 	}
+582: 	err = tx.QueryRowContext(ctx, "SELECT "+strings.Join(fields, ",")+" FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?",
+583: 		subject.ProjectID, subject.RunID, subject.Epoch).Scan(args...)
+584: 	return r, err
+585: }
+586: 
+587: func (p HistoricalQualificationPlan) residualSelectors() (store.QualificationResidualSelectors, error) {
+588: 	runRev, e := Num(p.Run, "revision")
+589: 	if e != nil {
+590: 		return store.QualificationResidualSelectors{}, e
+591: 	}
+592: 	stateRev, e := Num(p.ProjectState, "revision")
+593: 	if e != nil {
+594: 		return store.QualificationResidualSelectors{}, e
+595: 	}
+596: 	return store.QualificationResidualSelectors{
+597: 		Project: p.Subject.ProjectID, Run: p.Subject.RunID, Operation: p.OperationID,
+598: 		Principal: p.AuthorID, UploadKey: p.UploadKey, EventID: Str(p.Event, "id"),
+599: 		Epoch: p.Subject.Epoch, EventSequence: p.EventSequence, ArtifactID: Str(p.Artifact, "id"),
+600: 		ImpactLinkID: Str(p.ImpactLink, "id"), StateID: Str(p.ProjectState, "id"),
+601: 		RunRevision: runRev, StateRevision: stateRev, ObservationHash: Hash(p.Observation),
+602: 	}, nil
+603: }
+604: 
+605: func (p HistoricalQualificationPlan) afterHash() string {
+606: 	return Hash(Object{"artifact": p.Artifact, "impact_link": p.ImpactLink,
+607: 		"run": p.Run, "state": p.ProjectState, "event": p.Event,
+608: 		"observation": p.Observation, "dispatch_sequence": p.DispatchSequence,
+609: 		"upload_hash": Digest(p.ProofBytes), "outcome_hash": p.OutcomeHash})
+610: }
+611: 
+612: // JournalHashes allow a lower-dependency journal to bind every immutable
+613: // planned payload without importing domain or exposing SQL authority.
+614: func (p HistoricalQualificationPlan) JournalHashes() (plan, before, after, subject, evidence string) {
+615: 	return p.coreHash(), p.beforeHash(), p.afterHash(), Hash(p.Subject),
+616: 		Hash(Object{"source": p.Source, "native": p.Proof["native"], "model": p.Proof["model_binding"]})
+617: }
+618: 
+619: func (s *Service) buildHistoricalQualificationPlan(ctx context.Context, tx *sql.Tx, verified verifiedHistoricalQualification,
+620: 	operationID, boundaryPlanSHA256, dataRoot, database, directory, sid string, before store.OwnedStopCensus,
+621: 	frozen *HistoricalQualificationPlan) (HistoricalQualificationPlan, error) {
+622: 	var plan HistoricalQualificationPlan
+623: 	if len(operationID) != 32 || before.Tables < 87 || before.SHA256 == "" ||
+624: 		dataRoot == "" || boundaryPlanSHA256 == "" || database != filepath.Join(dataRoot, "researchos.sqlite") {
+625: 		return plan, qualificationDenialUnavailable("historical plan inputs invalid")
+626: 	}
+627: 	beforeDispatchRow, err := historicalQualificationReadDispatchRow(ctx, tx, verified.subject)
+628: 	if err != nil || beforeDispatchRow.DispatchKey != verified.subject.DispatchKey ||
+629: 		beforeDispatchRow.ManifestHash != Str(verified.dispatch, "manifest_hash") {
+630: 		return plan, qualificationDenialUnavailable("historical dispatch SQL image unavailable")
+631: 	}
+632: 	currentRun, err := cloneQualificationObject(verified.run)
+633: 	if err != nil {
+634: 		return plan, err
+635: 	}
+636: 	currentState, err := cloneQualificationObject(verified.state)
+637: 	if err != nil {
+638: 		return plan, err
+639: 	}
+640: 	observation, err := cloneQualificationObject(verified.observation)
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1210: 			if e != nil {
+1211: 				return false, e
+1212: 			}
+1213: 			if actualRevision != rev || body != string(Bytes(entry.object)) {
+1214: 				return false, nil
+1215: 			}
+1216: 			wantHash := ""
+1217: 			if entry.kind == "Artifact" {
+1218: 				wantHash = Str(entry.object, "content_hash")
+1219: 			}
+1220: 			if entry.kind == "EventEnvelope" {
+1221: 				wantHash = Str(entry.object, "receipt_hash")
+1222: 			}
+1223: 			wantImmutable := 0
+1224: 			if entry.kind == "EventEnvelope" {
+1225: 				wantImmutable = 1
+1226: 			}
+1227: 			if contentHash.Valid != (wantHash != "") || contentHash.Valid && contentHash.String != wantHash ||
+1228: 				table == "domain_objects" && immutable != wantImmutable {
+1229: 				return false, nil
+1230: 			}
+1231: 		}
+1232: 	}
+1233: 	// New revisions of the two mutable objects must carry the same reference
+1234: 	// edges as their immediately preceding versions.
+1235: 	for _, entry := range []struct {
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1320: 	if observed != string(Bytes(plan.Observation)) || observedAt != plan.ObservedAt {
+1321: 		return false, nil
+1322: 	}
+1323: 	dispatchRow, err := historicalQualificationReadDispatchRow(ctx, tx, plan.Subject)
+1324: 	if err == sql.ErrNoRows {
+1325: 		return false, nil
+1326: 	}
+1327: 	if err != nil {
+1328: 		return false, err
+1329: 	}
+1330: 	expectedDispatchRow := plan.BeforeDispatchRow
+1331: 	expectedDispatchRow.State = "OBSERVED"
+1332: 	expectedDispatchRow.ObservationSequence = plan.DispatchSequence
+1333: 	expectedDispatchRow.ObservationHash = Hash(plan.Observation)
+1334: 	expectedDispatchRow.UpdatedAt = plan.ObservedAt
+1335: 	expectedDispatchRow.Reason = "historical qualification first-gate TOOL reconstruction " + plan.OperationID
+1336: 	expectedDispatchRow.Cells[6] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.State)}
+1337: 	expectedDispatchRow.Cells[10] = historicalQualificationSQLCell{Type: "integer", Data: []byte(strconv.FormatInt(expectedDispatchRow.ObservationSequence, 10))}
+1338: 	expectedDispatchRow.Cells[11] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.ObservationHash)}
+1339: 	expectedDispatchRow.Cells[13] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.UpdatedAt)}
+1340: 	expectedDispatchRow.Cells[14] = historicalQualificationSQLCell{Type: "text", Data: []byte(expectedDispatchRow.Reason)}
+1341: 	if !reflect.DeepEqual(dispatchRow, expectedDispatchRow) || expectedDispatchRow.Project != plan.Subject.ProjectID ||
+1342: 		expectedDispatchRow.Run != plan.Subject.RunID || expectedDispatchRow.Epoch != plan.Subject.Epoch ||
+1343: 		expectedDispatchRow.DispatchKey != plan.Subject.DispatchKey ||
+1344: 		expectedDispatchRow.ManifestHash != Str(plan.BeforeDispatch, "manifest_hash") {
+1345: 		return false, nil
+1346: 	}
+1347: 	var outbox string
+1348: 	var acknowledged int
+1349: 	err = tx.QueryRowContext(ctx, `SELECT body,acknowledged FROM outbox WHERE project=? AND sequence=? AND id=?`,
+1350: 		plan.Subject.ProjectID, plan.EventSequence, Str(plan.Event, "id")).Scan(&outbox, &acknowledged)
+1351: 	if err == sql.ErrNoRows {
+1352: 		return false, nil
+1353: 	}
+1354: 	if err != nil {
+1355: 		return false, err
+1356: 	}
+1357: 	if outbox != string(Bytes(plan.Event)) || acknowledged != 0 {
+1358: 		return false, nil
+1359: 	}
+1360: 	var snapshot string
+
+FILE internal/domain/qualification_failure_maintenance_windows_test.go
+786: 		}
+787: 		t.Fatalf("applied: %s %v", state, e)
+788: 	}
+789: 	planJSON, e := json.Marshal(plan)
+790: 	if e != nil {
+791: 		t.Fatal(e)
+792: 	}
+793: 	var roundTripped HistoricalQualificationPlan
+794: 	if e = json.Unmarshal(planJSON, &roundTripped); e != nil {
+795: 		t.Fatal(e)
+796: 	}
+797: 	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
+798: 	if e != nil || state != "APPLIED" {
+799: 		t.Fatalf("serialized plan classified %s: %v", state, e)
+800: 	}
+801: 	// The target dispatch row is excluded from the residual census. Each
+802: 	// unlicensed column must therefore be checked against its raw preimage.
+803: 	for _, drift := range []struct{ column, changed, original string }{
+804: 		{"worker", "changed-worker", plan.BeforeDispatchRow.Worker},
+805: 		{"identity", `{"changed":true}`, plan.BeforeDispatchRow.Identity},
+806: 		{"journal_locator", "changed-locator", plan.BeforeDispatchRow.JournalLocator},
+807: 	} {
+808: 		if _, e = db.Exec(`UPDATE runtime_dispatches SET `+drift.column+`=? WHERE project=? AND run=? AND epoch=?`,
+809: 			drift.changed, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
+810: 			t.Fatal(e)
+811: 		}
+812: 		state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+813: 		if e != nil || state != "UNKNOWN" {
+814: 			t.Fatalf("%s drift classified %s: %v", drift.column, state, e)
+815: 		}
+816: 		if _, e = db.Exec(`UPDATE runtime_dispatches SET `+drift.column+`=? WHERE project=? AND run=? AND epoch=?`,
+817: 			drift.original, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
+818: 			t.Fatal(e)
+819: 		}
+820: 		state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+821: 		if e != nil || state != "APPLIED" {
+822: 			t.Fatalf("%s restore classified %s: %v", drift.column, state, e)
+823: 		}
+824: 	}
+825: 	if _, e = db.Exec(`UPDATE runtime_dispatches SET worker=CAST(? AS BLOB) WHERE project=? AND run=? AND epoch=?`,
+826: 		plan.BeforeDispatchRow.Worker, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
+827: 		t.Fatal(e)
+828: 	}
+829: 	var workerCellType string
+830: 	if e = db.QueryRow(`SELECT typeof(worker) FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`,
+831: 		plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch).Scan(&workerCellType); e != nil || workerCellType != "blob" {
+832: 		t.Fatalf("worker BLOB precondition: %q %v", workerCellType, e)
+833: 	}
+834: 	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
+835: 	if e != nil || state != "UNKNOWN" {
+836: 		t.Fatalf("same worker bytes with BLOB cell type classified %s: %v", state, e)
+837: 	}
+838: 	if _, e = db.Exec(`UPDATE runtime_dispatches SET worker=? WHERE project=? AND run=? AND epoch=?`,
+839: 		plan.BeforeDispatchRow.Worker, plan.Subject.ProjectID, plan.Subject.RunID, plan.Subject.Epoch); e != nil {
+840: 		t.Fatal(e)
+841: 	}
+842: 	state, e = ClassifyHistoricalQualification(ctx, db, roundTripped, planFileSHA256)
+843: 	if e != nil || state != "APPLIED" {
+844: 		t.Fatalf("BLOB worker restore classified %s: %v", state, e)
+845: 	}
+846: 	immutableUpdate, e := db.Exec(`UPDATE domain_objects SET immutable=2 WHERE project=? AND kind='Artifact' AND id=?`,
+847: 		plan.Subject.ProjectID, plan.Artifact["id"])
+848: 	if e != nil {
+849: 		t.Fatal(e)
+850: 	}
+851: 	changedRows, e := immutableUpdate.RowsAffected()
+852: 	if e != nil || changedRows != 1 {
+853: 		t.Fatalf("immutable UPDATE rows: %d %v", changedRows, e)
+854: 	}
+855: 	var actualImmutable int
+856: 	if e = db.QueryRow(`SELECT immutable FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?`,
+857: 		plan.Subject.ProjectID, plan.Artifact["id"]).Scan(&actualImmutable); e != nil || actualImmutable != 2 {
+858: 		t.Fatalf("immutable 0->2 readback: %d %v", actualImmutable, e)
+859: 	}
+860: 	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+861: 	if e != nil || state != "UNKNOWN" {
+862: 		t.Fatalf("domain_objects immutable 0->2 classified %s: %v", state, e)
+863: 	}
+864: 	if _, e = db.Exec(`UPDATE domain_objects SET immutable=0 WHERE project=? AND kind='Artifact' AND id=?`,
+865: 		plan.Subject.ProjectID, plan.Artifact["id"]); e != nil {
+866: 		t.Fatal(e)
+867: 	}
+868: 	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+869: 	if e != nil || state != "APPLIED" {
+870: 		t.Fatalf("domain_objects immutable restore classified %s: %v", state, e)
+871: 	}
+872: 	if _, e = db.Exec(`INSERT INTO outbox(project,sequence,id,body) VALUES('project',2,'unrelated','{}')`); e != nil {
+873: 		t.Fatal(e)
+874: 	}
+875: 	state, e = ClassifyHistoricalQualification(ctx, db, plan, planFileSHA256)
+876: 	if e != nil || state != "UNKNOWN" {
+877: 		t.Fatalf("unrelated row: %s %v", state, e)
+878: 	}
+879: }
+
+FILE internal/host/qualification_failure_maintenance_windows.go
+258: func qualificationReadStrict(path string, limit int64, out any) ([]byte, error) {
+259: 	info, e := os.Lstat(path)
+260: 	if e != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > limit {
+261: 		return nil, errors.New("qualification input absent or invalid")
+262: 	}
+263: 	raw, e := os.ReadFile(path)
+264: 	if e != nil || int64(len(raw)) != info.Size() {
+265: 		return nil, errors.New("qualification input changed")
+266: 	}
+267: 	if _, e = canonical.JSON(raw); e != nil {
+268: 		return nil, e
+269: 	}
+270: 	d := json.NewDecoder(bytes.NewReader(raw))
+271: 	d.DisallowUnknownFields()
+272: 	if e = d.Decode(out); e != nil {
+273: 		return nil, e
+274: 	}
+275: 	var tail any
+276: 	if d.Decode(&tail) != io.EOF {
+277: 		return nil, errors.New("qualification input trailing JSON")
+278: 	}
+279: 	return raw, nil
+280: }
+281: 
+282: func qualificationExternalPath(root, path string) error {
+
+FILE internal/host/qualification_failure_maintenance_windows.go
+305: func qualificationJournalRaw(plan domain.HistoricalQualificationPlan, raw []byte) ([]byte, error) {
+306: 	core, before, after, subject, evidence := plan.JournalHashes()
+307: 	return json.Marshal(qualificationmaintenancejournal.JournalPlan{
+308: 		Schema: "researchos.qualification-failure-maintenance-plan.v1", OperationID: plan.OperationID,
+309: 		DataRoot: plan.DataRoot, Database: plan.Database, PlanHash: core, BeforeHash: before, AfterHash: after,
+310: 		SubjectHash: subject, EvidenceHash: evidence, FullPlan: append(json.RawMessage(nil), raw...)})
+311: }
+312: 
+313: func qualificationResult(action, state, operation, digest string, outcome ...string) QualificationMaintenanceResult {
+
+FILE internal/qualificationmaintenancejournal/journal_windows.go
+52: func qualificationFullPlanMatches(plan JournalPlan) error {
+53: 	decoder := json.NewDecoder(bytes.NewReader(plan.FullPlan))
+54: 	decoder.UseNumber()
+55: 	var f map[string]any
+56: 	if err := decoder.Decode(&f); err != nil {
+57: 		return err
+58: 	}
+59: 	var trailing any
+60: 	if decoder.Decode(&trailing) != io.EOF {
+61: 		return errors.New("qualification full plan trailing data")
+62: 	}
+63: 	get := func(key string) any { return f[key] }
+64: 	if get("schema") != "researchos.qualification-failure-maintenance-full-plan.v1" ||
+65: 		get("operation_id") != plan.OperationID || get("data_root") != plan.DataRoot || get("database") != plan.Database {
+66: 		return errors.New("qualification full plan identity mismatch")
+67: 	}
+68: 	outcome, _ := get("outcome_hash").(string)
+69: 	if !validDigest(outcome) {
+70: 		return errors.New("qualification full outcome invalid")
+71: 	}
+72: 	core, ok := get("core").(map[string]any)
+73: 	if !ok {
+74: 		return errors.New("qualification full core absent")
+75: 	}
+76: 	if value, err := hash(core); err != nil || value != plan.PlanHash {
+77: 		return errors.New("qualification full core hash mismatch")
+78: 	}
+79: 	before := map[string]any{
+80: 		"census": get("before_census"), "run": get("before_run"), "state": get("before_state"),
+81: 		"dispatch": get("before_dispatch"), "protected": get("before_protected_sha256"),
+82: 		"residual": get("before_residual_sha256"),
+83: 	}
+84: 	if value, err := hash(before); err != nil || value != plan.BeforeHash {
+85: 		return errors.New("qualification before hash mismatch")
+86: 	}
+87: 	proofBytesText, ok := get("proof_bytes").(string)
+88: 	if !ok {
+89: 		return errors.New("qualification proof bytes absent")
+90: 	}
+91: 	proofBytes, err := base64.StdEncoding.DecodeString(proofBytesText)
+92: 	if err != nil || len(proofBytes) == 0 || len(proofBytes) > 64<<10 {
+93: 		return errors.New("qualification proof bytes invalid")
+94: 	}
+95: 	after := map[string]any{
+96: 		"artifact": get("artifact"), "impact_link": get("impact_link"), "run": get("run"),
+97: 		"state": get("project_state"), "event": get("event"), "observation": get("observation"),
+98: 		"dispatch_sequence": get("dispatch_sequence"), "upload_hash": digest(proofBytes),
+99: 		"outcome_hash": get("outcome_hash"),
+100: 	}
+101: 	if value, err := hash(after); err != nil || value != plan.AfterHash {
+102: 		return errors.New("qualification after hash mismatch")
+103: 	}
+104: 	if value, err := hash(get("subject")); err != nil || value != plan.SubjectHash {
+105: 		return errors.New("qualification subject hash mismatch")
+106: 	}
+107: 	proof, ok := get("proof").(map[string]any)
+108: 	if !ok {
+109: 		return errors.New("qualification proof absent")
+110: 	}
+111: 	evidence := map[string]any{"source": get("source"), "native": proof["native"], "model": proof["model_binding"]}
+112: 	if value, err := hash(evidence); err != nil || value != plan.EvidenceHash {
+113: 		return errors.New("qualification evidence hash mismatch")
+114: 	}
+115: 	return nil
+
+FILE internal/qualificationmaintenancejournal/journal_windows.go
+434: func StartQualification(root string, planRaw []byte) (string, error) {
+435: 	var plan JournalPlan
+436: 	if err := strictJSON(planRaw, &plan); err != nil {
+437: 		return "", err
+438: 	}
+439: 	if plan.Schema != qualificationPlanSchema || !validOperation(plan.OperationID) ||
+440: 		plan.DataRoot != root || plan.Database != filepath.Join(root, "researchos.sqlite") ||
+441: 		!validDigest(plan.PlanHash) || !validDigest(plan.BeforeHash) || !validDigest(plan.AfterHash) ||
+442: 		!validDigest(plan.SubjectHash) || !validDigest(plan.EvidenceHash) || len(plan.FullPlan) == 0 {
+443: 		return "", errors.New("qualification journal plan invalid")
+444: 	}
+445: 	if err := qualificationFullPlanMatches(plan); err != nil {
+446: 		return "", err
+447: 	}
+448: 	if err := checkPrivateDirectory(filepath.Join(root, "host")); err != nil {
+449: 		return "", err
+450: 	}
+451: 	namespace := filepath.Join(root, "host", QualificationNamespace)
+452: 	if _, err := os.Lstat(namespace); os.IsNotExist(err) {
+453: 		if err := createPrivateDirectory(namespace); err != nil {
+454: 			return "", err
+455: 		}
+456: 	} else if err != nil {
+457: 		return "", err
+458: 	}
+459: 	if err := checkPrivateDirectory(namespace); err != nil {
+460: 		return "", err
+461: 	}
+462: 	dir := filepath.Join(namespace, plan.OperationID)
+463: 	if err := createPrivateDirectory(dir); err != nil {
+464: 		return "", err
+465: 	}
+466: 	if err := createPrivateFile(filepath.Join(dir, "plan.json"), planRaw); err != nil {
+467: 		return "", err
+468: 	}
+469: 	planDigest := digest(planRaw)
+470: 	event := QualificationEvent{Schema: qualificationEventSchema, Sequence: 1, OperationID: plan.OperationID,
+471: 		PlanSHA256: planDigest, State: "BEGIN", At: time.Now().UTC().Format(time.RFC3339Nano)}
+472: 	var err error
+473: 	event.Hash, err = hash(event)
+474: 	if err != nil {
+475: 		return "", err
+476: 	}
+477: 	raw, err := json.Marshal(event)
+478: 	if err != nil {
+479: 		return "", err
+480: 	}
+481: 	if err := createPrivateFile(filepath.Join(dir, "0001-BEGIN.json"), raw); err != nil {
+482: 		return "", err
+483: 	}
+484: 	return planDigest, nil
+485: }
+486: 
+487: // AppendQualification records an observation after the caller has independently
+488: // classified the exact SQLite state. It cannot infer that state from a flag.

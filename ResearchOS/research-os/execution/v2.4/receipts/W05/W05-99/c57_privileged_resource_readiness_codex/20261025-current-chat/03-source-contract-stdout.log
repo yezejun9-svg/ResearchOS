@@ -1,0 +1,97 @@
+{"argv": ["git", "-C", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os", "show", "03aa4d687dfaa541d9b18d4c766805307a537d1d:internal/recoveryboundary/boot_windows.go"], "exit": 0, "source_sha256": "8cb1639c9e8643dcc3520a699bf6dc1090028e7f7d5347c35ea56171a0c56afe"}
+876: func rejectFenceBypassPrivileges(raw []byte) error {
+877: 	const countBytes = 4
+878: 	if len(raw) < countBytes {
+879: 		return errors.New("business token privilege inventory truncated")
+880: 	}
+881: 	count := binary.LittleEndian.Uint32(raw[:countBytes])
+882: 	start := uint64(unsafe.Offsetof(windows.Tokenprivileges{}.Privileges))
+883: 	stride := uint64(unsafe.Sizeof(windows.LUIDAndAttributes{}))
+884: 	if start+uint64(count)*stride > uint64(len(raw)) {
+885: 		return errors.New("business token privilege inventory length invalid")
+886: 	}
+887: 	privileges := (*windows.Tokenprivileges)(unsafe.Pointer(&raw[0])).AllPrivileges()
+888: 	for _, name := range [...]string{"SeTakeOwnershipPrivilege", "SeRestorePrivilege", "SeBackupPrivilege"} {
+889: 		namePtr, err := windows.UTF16PtrFromString(name)
+890: 		if err != nil {
+891: 			return err
+892: 		}
+893: 		var luid windows.LUID
+894: 		if err := windows.LookupPrivilegeValue(nil, namePtr, &luid); err != nil {
+895: 			return fmt.Errorf("business token privilege lookup %s: %w", name, err)
+896: 		}
+897: 		for _, privilege := range privileges {
+898: 			if privilege.Luid == luid {
+899: 				return fmt.Errorf("business token assigned fence-bypass privilege %s", name)
+900: 			}
+901: 		}
+902: 	}
+903: 	return nil
+1268: func ensureOwnerRestorable(managementSID string, originalOwner *windows.SID) error {
+1269: 	var token windows.Token
+1270: 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &token); err != nil {
+1271: 		return err
+1272: 	}
+1273: 	defer token.Close()
+1274: 	user, err := token.GetTokenUser()
+1275: 	if err != nil || user.User.Sid.String() != managementSID {
+1276: 		return errors.New("owner restore token is not frozen management SID")
+1277: 	}
+1278: 	eligible, err := ownerAssignableWithoutRestore(token, originalOwner)
+1279: 	if err != nil || eligible {
+1280: 		return err
+1281: 	}
+1282: 	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
+1283: 	if err != nil {
+1284: 		return err
+1285: 	}
+1286: 	var luid windows.LUID
+1287: 	if err = windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+1288: 		return err
+1289: 	}
+1290: 	privilegePresent := func() (bool, bool, error) {
+1291: 		raw, err := tokenInfoBytes(token, windows.TokenPrivileges)
+1292: 		if err != nil || len(raw) < 4 {
+1293: 			return false, false, errors.Join(err, errors.New("restore privilege inventory unavailable"))
+1294: 		}
+1295: 		for _, privilege := range (*windows.Tokenprivileges)(unsafe.Pointer(&raw[0])).AllPrivileges() {
+1296: 			if privilege.Luid == luid {
+1297: 				return true, privilege.Attributes&windows.SE_PRIVILEGE_ENABLED != 0, nil
+1298: 			}
+1299: 		}
+1300: 		return false, false, nil
+1301: 	}
+1302: 	present, enabled, err := privilegePresent()
+1303: 	if err != nil {
+1304: 		return err
+1305: 	}
+1306: 	if !present {
+1307: 		return errors.New("SeRestorePrivilege not assigned to management token")
+1308: 	}
+1309: 	if !enabled {
+1310: 		state := windows.Tokenprivileges{PrivilegeCount: 1, Privileges: [1]windows.LUIDAndAttributes{{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}}}
+1311: 		if err = windows.AdjustTokenPrivileges(token, false, &state, 0, nil, nil); err != nil {
+1312: 			return fmt.Errorf("enable SeRestorePrivilege: %w", err)
+1313: 		}
+1314: 		_, enabled, err = privilegePresent()
+1315: 		if err != nil {
+1316: 			return err
+1317: 		}
+1318: 	}
+1319: 	if !enabled {
+1320: 		return errors.New("SeRestorePrivilege absent after enable readback")
+1321: 	}
+1322: 	return nil
+1734: func managedToken(p EntryFencePlan) error {
+1735: 	token := windows.GetCurrentProcessToken()
+1736: 	if !token.IsElevated() {
+1737: 		return errors.New("trusted management elevation required")
+1738: 	}
+1739: 	u, e := token.GetTokenUser()
+1740: 	if e != nil {
+1741: 		return e
+1742: 	}
+1743: 	if u.User.Sid.String() != p.ManagementSID || p.BusinessSID == p.ManagementSID {
+1744: 		return errors.New("management SID cannot be business owner")
+1745: 	}
+1746: 	return nil

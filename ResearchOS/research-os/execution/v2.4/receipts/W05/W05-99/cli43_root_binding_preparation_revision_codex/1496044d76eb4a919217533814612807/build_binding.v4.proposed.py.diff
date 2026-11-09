@@ -1,0 +1,41 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cli43_root_binding_preparation_codex\629d2cb794ab4ae4a04a1db9d8a3f8ef\build_binding.proposed.py
++++ build_binding.v4.proposed.py
+@@ -31,11 +31,20 @@
+         if q==ROOT:break
+     return p
+ 
++VERIFIED_BYTES = {}
++
++def verified_bytes(ref):
++    p=Path(ref['path']); p=p if p.is_absolute() else ROOT/p
++    return VERIFIED_BYTES[str(p.absolute())]
++
+ def pinned(value):
+     r=strict(value.encode('utf-8')); need(isinstance(r,dict) and set(r)=={'path','sha256','bytes'},'exact JSON ref')
+     p=Path(r['path']); p=p if p.is_absolute() else ROOT/p
+     if p.is_relative_to(ROOT): p=safe(p)
+     raw=p.read_bytes(); need(len(raw)==r['bytes'] and hashlib.sha256(raw).hexdigest()==r['sha256'],'ref bytes')
++    key=str(p.absolute())
++    if key in VERIFIED_BYTES: need(VERIFIED_BYTES[key]==raw,'public input drift during binding')
++    VERIFIED_BYTES[key]=raw
+     return r
+ 
+ def main():
+@@ -50,7 +59,7 @@
+     for name in ('run-uuid','registration-namespace','controller-review-path','new-output-root','new-wrapper-root',
+                  'new-export-root','new-authorization-root','output'):
+         ap.add_argument('--'+name,required=True)
+-    a=ap.parse_args(); s=strict(safe(a.scope_template_ref['path']).read_bytes())
++    a=ap.parse_args(); s=strict(verified_bytes(a.scope_template_ref))
+     need(s['authorization_gate_ref']['sha256']==V3_GATE_SHA,'new v3 scope template required')
+     need(s['preparation_only'] is True and s['execution_authorized'] is False,'template provenance')
+     for t in (a.before,a.after):need(isinstance(t,list) and len(t)==3 and all(type(x)is int for x in t),'explicit tuple')
+@@ -64,7 +73,7 @@
+     need(all(not x.is_relative_to(y) for x in roots for y in roots if x!=y),'overlap')
+     ns=safe(a.registration_namespace); need(ns.is_relative_to(ROOT/'execution/v2.4/receipts/W05/W05-99/integration_codex'),'Root namespace')
+     dest=safe(a.output,False); need(dest.parent==ns,'binding output location')
+-    code=strict(safe(a.metadata_code_refs_ref['path']).read_bytes())['entries']
++    code=strict(verified_bytes(a.metadata_code_refs_ref))['entries']
+     for r in code:pinned(json.dumps(r))
+     rreview=None if a.controller_review_ref=='null' else pinned(a.controller_review_ref)
+     if rreview:need(safe(rreview['path'])==safe(a.controller_review_path),'review path')

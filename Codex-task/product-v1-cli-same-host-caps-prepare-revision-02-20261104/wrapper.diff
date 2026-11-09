@@ -1,0 +1,49 @@
+--- freeze01/same-host-caps.mjs
++++ freeze02/same-host-caps.mjs
+@@ -42,6 +42,24 @@
+   const u=new URL(d.url);need(u.protocol==='http:'&&['127.0.0.1','[::1]'].includes(u.hostname)&&!u.username&&!u.password,'NUMERIC_LOOPBACK_DISCOVERY');
+   need(d.pid===core.pid&&d.host_instance_id===core.host_id&&same(d.data_dir,env.RESEARCHOS_DATA_DIR),'DISCOVERY_CORE_IDENTITY');
+   return {url:d.url,pid:d.pid,data_dir:d.data_dir,host_instance_id:d.host_instance_id};
++}
++export function parsePublicCaps(stdout,core){
++  let report;
++  try{report=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(stdout));}
++  catch{need(false,'CAPS_JSON_INVALID');} // Never persist parser messages containing input.
++  need(report?.command==='harness caps'&&report.status==='COMPLETED'&&report.completion_scope==='HOST_QUERY'&&report.exit_code===0,'CAPS_JSON_OUTCOME');
++  const data=report.response?.data;
++  need(report.response?.api_version==='harness.v1'&&data?.harness_id==='codex'&&typeof data.can_submit==='boolean'&&Array.isArray(data.reason_codes)&&data.reason_codes.length<=16,'CAPABILITIES_DATA');
++  const hostRefs=[],nativePids=[];
++  function refs(v){if(!v||typeof v!=='object')return;for(const [k,x]of Object.entries(v)){
++    need(!/^(authorization|credentials?|credential[_-]?value|(?:access|refresh)[_-]?token|token|api[_-]?key|password|client[_-]?secret|secret)$/i.test(k),'CLI_SECRET_OUTPUT_REFUSED');
++    if(['host_id','host_instance_id'].includes(k))hostRefs.push(x);if(['native_server_pid','host_pid'].includes(k))nativePids.push(x);refs(x);
++  }}
++  refs(report);need(hostRefs.every(x=>x===core.host_id)&&nativePids.every(x=>x===core.pid),'CLI_REPORTED_HOST_MISMATCH');
++  const summary={harness_id:'codex',can_submit:data.can_submit,reason_code_count:data.reason_codes.length};
++  return {identity_fields:{host_ids:hostRefs,native_or_host_pids:nativePids},summary,
++    public_report:{command:'harness caps',status:'COMPLETED',completion_scope:'HOST_QUERY',exit_code:0,
++      response:{api_version:'harness.v1',data:summary}}};
+ }
+ 
+ export async function run(scopeFile,expectedSHA){
+@@ -113,17 +131,11 @@
+     const closed=await within(()=>new Promise(resolve=>cli.once('close',(code,signal)=>{cliClosed=true;resolve({code,signal});})),Math.min(scope.deadlines.cli_ms,until-Date.now()),'CAPS_CLOSE_UNCONFIRMED');
+     state.cli_close=closed;
+     const stdout=Buffer.concat(parts.stdout),stderr=Buffer.concat(parts.stderr);
+-    write('cli-streams.json',{stdout_bytes:sizes.stdout,stdout_sha256:hash(stdout),stdout_text:safe(new TextDecoder('utf8',{fatal:true}).decode(stdout)),stderr_bytes:sizes.stderr,stderr_sha256:hash(stderr),stderr_text:safe(new TextDecoder('utf8',{fatal:true}).decode(stderr)),overflow,spawn_error:spawnError});
++    write('cli-streams.json',{stdout_bytes:sizes.stdout,retained_stdout_sha256:hash(stdout),stderr_bytes:sizes.stderr,retained_stderr_sha256:hash(stderr),exit_code:closed.code,signal:closed.signal,overflow,spawn_error:spawnError});
+     need(!spawnError&&!overflow&&closed.code===0&&!closed.signal,'CAPS_EXIT_UNCONFIRMED');
+-    const report=JSON.parse(new TextDecoder('utf8',{fatal:true}).decode(stdout));
+-    need(report.command==='harness caps'&&report.status==='COMPLETED'&&report.completion_scope==='HOST_QUERY'&&report.exit_code===0,'CAPS_JSON_OUTCOME');
+-    need(report.response?.api_version==='harness.v1'&&report.response?.data?.harness_id==='codex'&&typeof report.response.data.can_submit==='boolean'&&Array.isArray(report.response.data.reason_codes),'CAPABILITIES_DATA');
+-    const hostRefs=[],nativePids=[];
+-    function refs(v){if(!v||typeof v!=='object')return;for(const [k,x]of Object.entries(v)){need(!/^(authorization|credential|credential_value|access_token|refresh_token|api_key|password)$/i.test(k),'CLI_SECRET_OUTPUT_REFUSED');if(['host_id','host_instance_id'].includes(k))hostRefs.push(x);if(['native_server_pid','host_pid'].includes(k))nativePids.push(x);refs(x);}}
+-    refs(report);need(hostRefs.every(x=>x===core.host_id)&&nativePids.every(x=>x===core.pid),'CLI_REPORTED_HOST_MISMATCH');
+-    state.cli_output_identity_fields={host_ids:hostRefs,native_or_host_pids:nativePids};
+-    state.capabilities={can_submit:report.response.data.can_submit,reason_codes:report.response.data.reason_codes};
+-    write('cli-caps.json',report);
++    const checked=parsePublicCaps(stdout,core);
++    state.cli_output_identity_fields=checked.identity_fields;state.capabilities=checked.summary;
++    write('cli-caps.json',checked.public_report);
+     const after=publicDiscovery(env.RESEARCHOS_CLI_DISCOVERY,core,env);need(JSON.stringify(before)===JSON.stringify(after),'HOST_CHANGED_DURING_CAPS');
+     write('owned-core-and-discovery.after.json',{core,discovery:after});
+     state.status='SAME_HOST_CLI_CAPS_OBSERVED_PENDING_OUTER_JOB_STOP';

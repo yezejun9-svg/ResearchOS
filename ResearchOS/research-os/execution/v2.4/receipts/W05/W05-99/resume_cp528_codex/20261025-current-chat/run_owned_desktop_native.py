@@ -1,0 +1,71 @@
+"""Execute only the separately registered fresh-state Desktop native scope."""
+import datetime,json,os,subprocess,sys
+from pathlib import Path
+from preserve_main_baseline import verify,read,ref,git,R,N
+def new(p,v):
+ with p.open('x',encoding='utf8')as stream:json.dump(v,stream,ensure_ascii=False,indent=2);stream.write('\n')
+def now():return datetime.datetime.now(datetime.timezone.utc).isoformat()
+owned_receipts=False
+out=None
+def execute():
+ global owned_receipts,out
+ s=read(Path(sys.argv[1]));assert s['native_launch_authorized'] is True and s['formal_increment']==0
+ assert s['mode']=='OWNED_FRESH_DESKTOP_NATIVE_SMOKE_ONLY'
+ B=Path(s['bundle_root']).resolve();state=Path(s['state_root']).resolve();out=Path(s['receipts_root']).resolve()
+ W=R/'.local/worktrees/desktop-main7d-native-20261025'
+ assert git(W,'rev-parse','HEAD').decode().strip()==s['candidate_commit']
+ assert git(W,'show','-s','--format=%T','HEAD').decode().strip()==s['candidate_tree']
+ assert not git(W,'status','--porcelain=v1','--untracked-files=all')
+ assert B.is_relative_to(W/'.local') and state.is_relative_to(W/'.local') and not state.exists()
+ assert out.is_relative_to(N) and not out.exists() and not B.is_relative_to(state) and not state.is_relative_to(B)
+ for x in s['bound_files']:
+  a=ref(Path(x['path']));assert a['sha256']==x['sha256'] and a['bytes']==x['bytes']
+ preserved=verify();out.mkdir();owned_receipts=True;new(out/'originals.before.json',preserved)
+ node=B/'apps/desktop/resources/control/runtime/node.exe';launcher=B/'launch-development.mjs'
+ argv=[str(node),str(launcher),'--bundle',str(B),'--state',str(state),'--launch','--smoke']
+ env={k:v for k,v in os.environ.items()if k.upper() in {'SYSTEMROOT','WINDIR','COMSPEC','OS','PATHEXT','PATH'}}
+ new(out/'native-invocation.pre.json',{'at':now(),'argv':argv,'cwd':str(B),'environment_keys':sorted(env),'scope_ref':ref(Path(sys.argv[1])),'timeout_seconds':120,'timeout_policy':'Record unresolved owned launcher; never kill unknown/original processes'})
+ started=now();timed_out=False
+ with(out/'stdout.raw').open('xb')as stdout,(out/'stderr.raw').open('xb')as stderr:
+  proc=subprocess.Popen(argv,cwd=B,env=env,stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,creationflags=subprocess.CREATE_NO_WINDOW)
+  new(out/'spawn.json',{'at':now(),'owned_launcher_pid':proc.pid,'argv':argv})
+  try:code=proc.wait(timeout=120)
+  except subprocess.TimeoutExpired:timed_out=True;code=None
+ new(out/'native-result.json',{'started_at':started,'ended_at':now(),'owned_launcher_pid':proc.pid,'native_exit':code,'timed_out':timed_out,'raw_capture_status':'UNSEALED_TIMEOUT_SNAPSHOT_CHILD_MAY_STILL_WRITE' if timed_out else 'SEALED_AFTER_LAUNCHER_EXIT','stdout_ref':ref(out/'stdout.raw'),'stderr_ref':ref(out/'stderr.raw'),'state_created':state.exists(),'formal_increment':0})
+ if timed_out:
+  print(json.dumps({'status':'OWNED_NATIVE_TIMEOUT_UNRESOLVED','owned_launcher_pid':proc.pid,'receipt':str(out),'formal_increment':0}));raise SystemExit(124)
+ text=(out/'stdout.raw').read_text(encoding='utf8');reports=[];final=[]
+ for line in text.splitlines():
+  if line.startswith('ROS_DESKTOP_REPORT '):reports.append(json.loads(line[len('ROS_DESKTOP_REPORT '):]))
+  elif line.startswith('{'):
+   try:final.append(json.loads(line))
+   except json.JSONDecodeError:pass
+ ready=[x for x in reports if x.get('event')=='ready_to_show'];stopped=[x for x in reports if x.get('event')=='shutdown_confirmed']
+ assert code==0 and len(ready)==len(stopped)==1
+ a,b=ready[0],stopped[0];identity=a['owned_core_identity'];assert a['management_state']=='READY' and a['host_health']=='UP' and a['native_probe']['ok'] is True
+ assert a['renderer']['bridge'] is True and a['renderer']['react_root'] is True and a['renderer']['mounted_title'] and a['renderer']['navigation']>0
+ assert b['process_exit_confirmed'] is True and b['owned_core_identity']==identity
+ assert identity['image_sha256']==ref(B/'apps/desktop/resources/control/researchos-control.exe')['sha256']
+ assert len([x for x in final if x.get('status')=='NATIVE_SMOKE_CONFIRMED' and x.get('owned_core_identity')==identity])==1
+ assert not any(x.get('event')in {'shutdown_unconfirmed','boot_failed','malformed_report'}for x in reports)
+ pids=[a['pid'],identity['pid']];assert all(type(pid)is int and pid>0 for pid in pids)
+ ps=Path('C:/Users/yqyyds/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/powershell/pwsh.EXE')
+ script='$ErrorActionPreference="Stop"; $rows=@(); foreach($ownedId in @('+','.join(map(str,pids))+')) { $p=Get-CimInstance Win32_Process -Filter ("ProcessId="+$ownedId); $rows+=@{pid=$ownedId;present=($null -ne $p);creation=if($p){[string]$p.CreationDate}else{$null}} }; ConvertTo-Json -InputObject @($rows) -Depth 4 -Compress'
+ check_argv=[str(ps),'-NoLogo','-NoProfile','-NonInteractive','-Command',script]
+ new(out/'exact-owned-pids-postcheck.pre.json',{'argv':check_argv,'cwd':str(R),'pids':pids,'scope':'Only the two owned PIDs from the new native report; no all-process enumeration'})
+ check=subprocess.run(check_argv,cwd=R,capture_output=True);(out/'exact-owned-pids-postcheck.stdout.raw').write_bytes(check.stdout);(out/'exact-owned-pids-postcheck.stderr.raw').write_bytes(check.stderr)
+ new(out/'exact-owned-pids-postcheck.result.json',{'native_exit':check.returncode,'stdout':ref(out/'exact-owned-pids-postcheck.stdout.raw'),'stderr':ref(out/'exact-owned-pids-postcheck.stderr.raw')})
+ assert check.returncode==0;rows=json.loads(check.stdout.decode('utf-8-sig'));assert len(rows)==2 and not any(row['present']for row in rows)
+ new(out/'native-proof.json',{'status':'OWNED_NATIVE_DESKTOP_REACT_HOST_STATUS_AND_CONFIRMED_EXIT','at':now(),'scope_ref':ref(Path(sys.argv[1])),'native_result':ref(out/'native-result.json'),'ready_report':a,'shutdown_report':b,'exact_owned_pids_absent':rows,'fresh_state_root':str(state),'raw_report_sha256':ref(out/'stdout.raw')['sha256'],'original_data_or_process_actions':False,'C57_recovery_or_fullrestart_acceptance':False,'installer_acceptance':False,'formal_increment':0})
+ print(json.dumps({'status':'OWNED_NATIVE_DESKTOP_REACT_HOST_STATUS_AND_CONFIRMED_EXIT','owned_desktop_pid':a['pid'],'owned_core':identity,'native_exit':code,'exact_pids_absent':True,'proof':ref(out/'native-proof.json'),'formal_increment':0},ensure_ascii=False))
+
+try:
+ execute()
+finally:
+ if owned_receipts:
+  preserve_original_exception=sys.exc_info()[0] is not None
+  try:
+   new(out/'originals.after.json',verify())
+  except BaseException as final_error:
+   new(out/'originals.after.error.json',{'at':now(),'error_type':type(final_error).__name__,'error':str(final_error),'original_exception_preserved':preserve_original_exception})
+   if not preserve_original_exception:raise

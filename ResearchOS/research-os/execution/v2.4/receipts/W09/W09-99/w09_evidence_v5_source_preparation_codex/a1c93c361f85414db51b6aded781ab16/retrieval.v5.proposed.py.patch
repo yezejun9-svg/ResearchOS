@@ -1,0 +1,53 @@
+--- v4/retrieval.proposed.py
++++ v5/retrieval.v5.proposed.py
+@@ -85,8 +85,8 @@
+         out, err = out or exc.stdout or b"", err or exc.stderr or b""
+     stdout = evidence / "go-test.stdout.jsonl"
+     stderr = evidence / "go-test.stderr.txt"
+-    stdout.write_bytes(out)
+-    stderr.write_bytes(err)
++    with stdout.open("xb") as stream: stream.write(out)
++    with stderr.open("xb") as stream: stream.write(err)
+     return (-1 if timed_out else process.returncode), timed_out, stdout, stderr
+ 
+ 
+@@ -145,7 +145,8 @@
+         "scope": "LIVE_WINDOWS_LOCAL" if check == "W09-G02" else "FIXTURE_IMPLEMENTED_SERVICE",
+         "retrieval_backend": "SQLite FTS5 with bounded scan on FTS failure",
+         "sirchmunk_status": "NOT_SELECTED",
+-        "formal_construction_acceptance": "PENDING_INDEPENDENT_VERIFIER",
++        "formal_construction_acceptance": "NOT_RUN_POSTRUN_REVIEW_PENDING",
++        "formal_case_accepted_delta": 0,
+         "assertions": 0, "assertion_ids": [],
+         "started_at": datetime.now(timezone.utc).isoformat(),
+         "run_id": evidence.name.removeprefix("run-"),
+@@ -225,8 +226,27 @@
+         report["error"] = str(exc)
+     report["ended_at"] = datetime.now(timezone.utc).isoformat()
+     path = evidence / "report.json"
+-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+-    report["report_reference"] = str(path.relative_to(ROOT)).replace("\\", "/")
++    with path.open("xb") as stream:
++        stream.write((json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
++    report_ref = str(path.relative_to(ROOT)).replace("\\", "/")
++    tool_run = {"schema": "researchos.w09-native-producer-tool-run.v1",
++                "run_id": report["run_id"], "report_ref": report_ref,
++                "report_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
++                "native_exit_code": report.get("exit_code"),
++                "actual_invocation": report.get("actual_invocation"),
++                "stdout_ref": report.get("raw_evidence_references", [None])[0],
++                "stderr_ref": report.get("raw_evidence_references", [None, None])[1],
++                "stdout_sha256": hashlib.sha256((evidence / "go-test.stdout.jsonl").read_bytes()).hexdigest()
++                                 if (evidence / "go-test.stdout.jsonl").is_file() else None,
++                "stderr_sha256": hashlib.sha256((evidence / "go-test.stderr.txt").read_bytes()).hexdigest()
++                                 if (evidence / "go-test.stderr.txt").is_file() else None,
++                "formal_acceptance": "NOT_RUN"}
++    tool_path = evidence / "native-tool-run.json"
++    with tool_path.open("xb") as stream:
++        stream.write((json.dumps(tool_run, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
++    report["report_reference"] = report_ref
++    report["tool_run_reference"] = str(tool_path.relative_to(ROOT)).replace("\\", "/")
++    report["tool_run_sha256"] = hashlib.sha256(tool_path.read_bytes()).hexdigest()
+     print(json.dumps({key: value for key, value in report.items() if key not in {"assertion_results", "owned_export"}}, ensure_ascii=False))
+     return 0 if report["status"] == "PASS" and report["assertions"] > 0 else 1
+ 

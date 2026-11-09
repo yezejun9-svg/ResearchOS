@@ -1,0 +1,81 @@
+250: 	s.failed = true
+251: 	frame := ModelStreamFrame{ModelStreamVersion, "stream.fail", s.binding, s.dataSequence, int64(len(s.raw)), Hash(s.raw), map[string]any{"code": "MODEL_STREAM_ABORTED"}}
+252: 	w.modelNotifyLocked()
+253: 	w.mu.Unlock()
+254: 	_ = w.writeModelFrame(ctx, frame)
+255: }
+256: 
+257: // Called under the bridge lock, before ordinary BridgeFrame sequence handling.
+258: func (w *Bridge) consumeModelFrame(line []byte) error {
+259: 	var frame ModelStreamFrame
+260: 	d := json.NewDecoder(bytes.NewReader(line))
+261: 	d.UseNumber()
+262: 	d.DisallowUnknownFields()
+263: 	if d.Decode(&frame) != nil || d.Decode(new(any)) != io.EOF || frame.Version != ModelStreamVersion || frame.Binding == nil || frame.Payload == nil {
+264: 		return errors.New("invalid MODEL auxiliary frame")
+265: 	}
+266: 	keys, err := bridgeMap(line)
+267: 	if err != nil || !exactModelKeys(keys, "version", "type", "binding", "sequence", "offset", "digest", "payload") {
+268: 		return errors.New("MODEL auxiliary exact keys")
+269: 	}
+270: 	if !w.modelInitDelivered || w.journal.Cancelled || w.validateControlBinding(frame.Binding) != nil {
+271: 		return errors.New("MODEL auxiliary old initialization or generation")
+272: 	}
+273: 	var s *ModelStream
+274: 	for _, candidate := range w.modelStreams {
+275: 		if candidate.binding["stream_id"] == frame.Binding["stream_id"] {
+276: 			s = candidate
+277: 			break
+278: 		}
+279: 	}
+280: 	if s == nil || modelStreamHash(s.binding) != modelStreamHash(frame.Binding) || s.failed {
+281: 		return errors.New("foreign MODEL stream")
+282: 	}
+283: 	switch frame.Type {
+284: 	case "stream.transport_credit":
+285: 		if len(frame.Payload) != 0 || frame.Sequence < 1 || frame.Sequence > s.dataSequence {
+286: 			return errors.New("invalid MODEL transport credit")
+287: 		}
+288: 		check := s.dataChecks[frame.Sequence-1]
+289: 		if check.offset != frame.Offset || check.digest != frame.Digest || frame.Sequence > s.creditedData+1 {
+290: 			return errors.New("changed MODEL credit or gap")
+291: 		}
+292: 		if frame.Sequence == s.creditedData+1 {
+293: 			s.creditedData = frame.Sequence
+294: 			w.modelNotifyLocked()
+295: 		}
+296: 	case "stream.observe":
+297: 		if !exactModelKeys(frame.Payload, "event", "message_ordinal", "text_part", "sdk_content_index", "text") || frame.Sequence < 1 || frame.Sequence > s.observationSequence+1 || frame.Offset < 0 || frame.Offset > ModelStreamMaxRaw {
+298: 			return errors.New("invalid MODEL observation fields or sequence")
+299: 		}
+300: 		typeName := bridgeString(frame.Payload, "event")
+301: 		text := bridgeString(frame.Payload, "text")
+302: 		if _, ok := frame.Payload["text"].(string); !ok || !utf8.ValidString(text) || len(text) > ModelStreamFragment || utf8.RuneCountInString(text) > 16384 {
+303: 			return errors.New("MODEL observation text bound")
+304: 		}
+305: 		ordinal, validOrdinal := modelWireInteger(frame.Payload["message_ordinal"])
+306: 		part, validPart := modelWireInteger(frame.Payload["text_part"])
+307: 		index, validIndex := modelWireInteger(frame.Payload["sdk_content_index"])
+308: 		if !validOrdinal || !validPart || !validIndex || ordinal < 1 || ordinal > 32 || part < 0 || part >= 64 || index < 0 || index >= 4096 {
+309: 			return errors.New("MODEL observation identity bound")
+310: 		}
+311: 		if typeName != "text_delta" && text != "" || typeName == "text_delta" && text == "" {
+312: 			return errors.New("MODEL observation phase content")
+313: 		}
+314: 		if typeName != "text_start" && typeName != "text_delta" && typeName != "text_end" && typeName != "message_end" {
+315: 			return errors.New("MODEL observation phase")
+316: 		}
+317: 		fingerprint := modelStreamHash(frame)
+318: 		if frame.Sequence <= s.observationSequence {
+319: 			if s.observationHashes[frame.Sequence-1] != fingerprint {
+320: 				return errors.New("changed duplicate MODEL observation")
+321: 			}
+322: 		} else {
+323: 			if s.closed || w.modelObservationRecords >= modelStreamRecordLimit || len(s.pending) >= ModelStreamWindow || frame.Offset != s.observationOffset+int64(len(text)) || frame.Digest != modelStreamHash(map[string]any{"previous": s.observationDigest, "payload": frame.Payload}) || typeName == "message_end" && !s.terminal {
+324: 				return errors.New("MODEL observation digest, bound or terminal gate")
+325: 			}
+326: 			s.observationSequence = frame.Sequence
+327: 			s.observationOffset = frame.Offset
+328: 			s.observationDigest = frame.Digest
+329: 			s.observationHashes = append(s.observationHashes, fingerprint)
+330: 			w.modelObservationRecords++

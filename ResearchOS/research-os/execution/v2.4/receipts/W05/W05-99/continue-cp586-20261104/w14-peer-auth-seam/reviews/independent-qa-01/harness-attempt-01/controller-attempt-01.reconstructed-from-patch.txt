@@ -1,0 +1,84 @@
+"""Exact frozen W14 seam QA: injected peers, Recorder and fresh SQLite only."""
+from pathlib import Path
+import datetime,hashlib,json,os,re,shutil,subprocess,time
+
+ROOT=Path(__file__).resolve().parent
+MAIN=Path('D:/作品集/ResearchOS/research-os')
+CANDIDATE=MAIN/'.local/worktrees/w14-peer-auth-seam-20261104'
+AUTHOR=MAIN/'execution/v2.4/receipts/W05/W05-99/continue-cp586-20261104/w14-peer-auth-seam/author'
+RUN=ROOT/'run-01'
+OLD=ROOT.parent/'production-binding-review/run-01/private'
+def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
+def put(name,value):
+ with (RUN/name).open('x',encoding='utf-8',newline='\n') as stream:json.dump(value,stream,indent=2,ensure_ascii=False);stream.write('\n')
+expected={'source-manifest.json':'2628e7d22108bc481d0efd1a1f40de5f7da82a3b4614cb67b3fef5b79390c6c7','author-summary.json':'84f257a485cebb7341cb38d4a4075ffaf51a7f26ee688e12fc6d37e903c4560c','packet-manifest.json':'04435637f83d1c5b718ebd6a64c430b2e012127d8743f0b39d40388c342b7828'}
+assert all(sha(AUTHOR/name)==digest for name,digest in expected.items())
+manifest=json.loads((AUTHOR/'source-manifest.json').read_bytes())
+pins={item['path']:item['sha256'] for item in manifest['files']}
+assert len(pins)==9 and manifest['base_head']=='ebc340ef35cfdbf4449642ed559a05e5cdbaaee6'
+def source_match():return all(sha(CANDIDATE/path)==digest for path,digest in pins.items())
+assert source_match()
+packet=json.loads((AUTHOR/'packet-manifest.json').read_bytes())
+assert all(sha(AUTHOR/item['path'])==item['sha256'] and (AUTHOR/item['path']).stat().st_size==item['bytes'] for item in packet['files'])
+lock=MAIN/'execution/toolchains/locked.json';tools=json.loads(lock.read_bytes())['tools']
+assert tools['go']['sha256']=='d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490'
+assert tools['python']['sha256']=='cce21c0e8710e304273e98ac4b2b0f5aceb639acbcd2343cbaa5c4e81619c45b'
+for name in ('go','python'):assert sha(tools[name]['path'])==tools[name]['sha256']
+assert (OLD/'go-cache').is_dir() and (OLD/'gopath/pkg/mod').is_dir()
+RUN.mkdir(parents=True,exist_ok=False)
+shutil.copyfile(Path(__file__),RUN/'controller.py.txt')
+for name in expected:shutil.copyfile(AUTHOR/name,RUN/name)
+for name in pins:
+ target=RUN/'frozen-source'/(name+'.txt');target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(CANDIDATE/name,target)
+private=RUN/'private';overrides={}
+for name,relative in {'GOPATH':'gopath','GOTMPDIR':'go-tmp','TEMP':'tmp','TMP':'tmp','USERPROFILE':'profile','APPDATA':'profile/AppData/Roaming','LOCALAPPDATA':'profile/AppData/Local'}.items():
+ path=private/relative;path.mkdir(parents=True,exist_ok=True);overrides[name]=str(path)
+overrides.update(GOCACHE=str(OLD/'go-cache'),GOMODCACHE=str(OLD/'gopath/pkg/mod'),GOROOT=str(Path(tools['go']['path']).parent.parent),GOPROXY='off',GOSUMDB='off',GOENV='off',GOTOOLCHAIN='local',GOTELEMETRY='off',GOWORK='off',GOFLAGS='-mod=readonly',GO111MODULE='on',CGO_ENABLED='0',GOCACHEPROG='',PYTHONDONTWRITEBYTECODE='1',GIT_OPTIONAL_LOCKS='0')
+env=dict(os.environ,**overrides)
+put('inputs.json',{'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source_sha256':pins,'author_packet_pins':expected,'tool_lock_sha256':sha(lock),'tools':{name:tools[name] for name in ('go','python')},'environment_overrides':overrides,'disk_before':shutil.disk_usage(ROOT)._asdict(),'cache_policy':'Reuse own completed binding review public module inputs/build cache to avoid duplicate disk use. Each test executes with -count=1; remove only regenerative owned build cache after terminal QA/process check, retaining all module/source/log/exe evidence.','forbidden_actions':['listener','native pipe/backend','model/provider','old database','real AppData','frozen source edits'],'old_compatibility_classification':'Author seven retained compatibility cases include DEVELOPMENT_HTTP_FIXTURE ephemeral loopback. They are not rerun by this stricter no-listener independent QA.','formal_increment':0})
+replacements={};extra={}
+for package in ('host','domain','api'):
+ source=ROOT/(package+'_independent_test.go')
+ target=RUN/(package+'_independent_test.go.txt');shutil.copyfile(source,target)
+ replacements[str(CANDIDATE/'internal'/package/'w14_peer_auth_independent_review_test.go')]=str(source)
+ names=re.findall(r'^func (TestReview\w+)\(',source.read_text(encoding='utf-8'),re.M)
+ assert names;extra[package]=names
+put('overlay.json',{'Replace':replacements})
+put('overlay-inputs.json',{'files':{name:sha(Path(name)) for name in replacements.values()},'exact_tests':extra,'physical_candidate_writes':False})
+new_tests={
+ 'host':['TestNativePeerCapabilityPreservesFactsAndGeneration','TestNativePeerCapabilityRejectsUntrustedInputs','TestHostBootEntropyFailurePrecedesMutableInitialization'],
+ 'domain':['TestCommandAuthContextBindsTransactionServiceAndPrincipal','TestCommandAuthContextRejectsInvalidCredentialState','TestCommandAuthContextReadsUncommittedCallerTransaction','TestCommandAuthContextKeepsRemoteConstraints'],
+ 'api':['TestCommandAuthHTTPOrdinaryTokenAndErrorPrecedence','TestCommandAuthHTTPRevocationExpiryAndProjectRBAC','TestCommandAuthHTTPRemoteAuthorityRemainsConstrained','TestCommandAuthHTTPExecutionFailureRollsBack','TestCommandAuthHTTPAuthTransactionFailureKeepsLegacyStatus']}
+go=tools['go']['path'];commands=[]
+for prefix,rosters,use_overlay in [('new',new_tests,False),('independent',extra,True)]:
+ for package,names in rosters.items():
+  argv=[go,'test','-mod=readonly','-count=1','-timeout=120s','-json','-vet=off']
+  if use_overlay:argv+=['-overlay',str(RUN/'overlay.json')]
+  argv+=['-run','^('+'|'.join(names)+')$','./internal/'+package]
+  commands.append((prefix+'-'+package,argv,names))
+commands.append(('independent-vet',[go,'vet','-mod=readonly','./internal/host','./internal/domain','./internal/api'],None))
+results=[]
+for name,argv,expected_names in commands:
+ assert source_match(),'FROZEN_SOURCE_DRIFT_BEFORE_'+name
+ put(name+'.command.json',{'argv':argv,'cwd':str(CANDIDATE),'environment_overrides':overrides,'expected_top_level_tests':expected_names})
+ start=time.monotonic()
+ with (RUN/(name+'.stdout.txt')).open('wb') as out,(RUN/(name+'.stderr.txt')).open('wb') as err:
+  try:
+   process=subprocess.Popen(argv,cwd=CANDIDATE,env=env,stdout=out,stderr=err)
+   put(name+'.started.json',{'pid':process.pid,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()})
+   try:code=process.wait(timeout=360);cause=None
+   except subprocess.TimeoutExpired:process.kill();code=process.wait();cause='REVIEW_TOOL_TIMEOUT_AFTER_360_SECONDS'
+  except OSError as error:code=125;cause=repr(error)
+ result={'name':name,'exit_code':code,'cause':cause,'elapsed_seconds':round(time.monotonic()-start,3),'terminal':True,'source_unchanged':source_match()}
+ if expected_names is not None:
+  events=[]
+  for line in (RUN/(name+'.stdout.txt')).read_text(encoding='utf-8').splitlines():
+   try:events.append(json.loads(line))
+   except ValueError:pass
+  run={x['Test'] for x in events if x.get('Action')=='run' and 'Test' in x};passed={x['Test'] for x in events if x.get('Action')=='pass' and 'Test' in x}
+  result.update(top_level_passed=sorted(n for n in passed if '/' not in n),subtests_passed=len([n for n in passed if '/' in n]),run_test_count=len(run),pass_test_count=len(passed),run_pass_rosters_equal=run==passed,exact_top_level_roster=set(expected_names)=={n for n in passed if '/' not in n},failed=[x.get('Test',x.get('Package')) for x in events if x.get('Action')=='fail'],skipped=[x.get('Test') for x in events if x.get('Action')=='skip'],package_terminal_pass=any(x.get('Action')=='pass' and 'Test' not in x for x in events))
+  if code==0 and (run!=passed or not result['exact_top_level_roster'] or result['skipped'] or not result['package_terminal_pass']):result['review_roster_error']='Actual run/pass/exact roster not satisfied.'
+ put(name+'.result.json',result);results.append(result);print(json.dumps(result),flush=True)
+first=next((r for r in results if r['exit_code']!=0 or r.get('review_roster_error') or not r['source_unchanged']),None)
+put('result.json',{'status':'PRECONDITION_SEAM_QA_PASSED_NOT_HANDOFF_ACCEPTANCE' if first is None else 'INDEPENDENT_QA_FAILURE_PRESERVED','results':results,'first_failure':first,'source_sha256':pins,'frozen_source_unchanged':source_match(),'disk_after_QA':shutil.disk_usage(ROOT)._asdict(),'formal_increment':0,'old_database_connections':0,'listener_starts':0,'native_model_provider_starts':0,'frozen_source_writes':0,'counter_reset':False})
+raise SystemExit(0 if first is None else 1)

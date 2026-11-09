@@ -1,0 +1,105 @@
+--- v4/execute.go
++++ v5/execute.go
+@@ -4,6 +4,7 @@
+ 
+ import (
+ 	"bufio"
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+@@ -13,6 +14,7 @@
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"syscall"
+@@ -21,6 +23,7 @@
+ 
+ 	"researchos.local/research-os/adapters/local_workspace"
+ 	"researchos.local/research-os/internal/api"
++	"researchos.local/research-os/internal/canonical"
+ 	"researchos.local/research-os/internal/domain"
+ 	hostboundary "researchos.local/research-os/internal/host"
+ )
+@@ -216,6 +219,60 @@
+ 	}
+ 	return domain.Decode(raw)
+ }
++// readPinnedOwnedJobObject permits one lossless FILETIME integer in pinned
++// owned-Job evidence. Every other number retains domain.Decode's safety check.
++func readPinnedOwnedJobObject(p pinnedFile) (domain.Object, error) {
++	raw, err := verifiedBytes(p)
++	if err != nil {
++		return nil, err
++	}
++	// Validate original syntax, Unicode, duplicate keys, and the full document.
++	// Canonical bytes are intentionally discarded: JCS rounds this FILETIME.
++	if _, err = canonical.JSON(raw); err != nil {
++		return nil, err
++	}
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.UseNumber()
++	var obj domain.Object
++	if err = decoder.Decode(&obj); err != nil {
++		return nil, err
++	}
++	if obj == nil {
++		return nil, errors.New("owned Host Job evidence must be an object")
++	}
++	schema, ok := obj["schema"].(string)
++	if !ok || (schema != "researchos.mu-trial-host-job.v1" && schema != "researchos.mu-trial-host-job-probe.v1") {
++		return nil, errors.New("unknown owned Host Job evidence schema")
++	}
++	held, ok := obj["held_identity"].(map[string]any)
++	if !ok {
++		return nil, errors.New("owned Host Job held identity missing")
++	}
++	filetime, ok := held["creation_time_100ns"].(json.Number)
++	if !ok {
++		return nil, errors.New("owned Host Job FILETIME must be a JSON number")
++	}
++	literal := filetime.String()
++	if len(literal) == 0 || literal[0] < '1' || literal[0] > '9' {
++		return nil, errors.New("owned Host Job FILETIME must be a positive decimal uint64 integer")
++	}
++	for i := 1; i < len(literal); i++ {
++		if literal[i] < '0' || literal[i] > '9' {
++			return nil, errors.New("owned Host Job FILETIME must be a positive decimal uint64 integer")
++		}
++	}
++	parsed, err := strconv.ParseUint(literal, 10, 64)
++	if err != nil {
++		return nil, errors.New("owned Host Job FILETIME exceeds uint64")
++	}
++	held["creation_time_100ns"] = strconv.FormatUint(parsed, 10)
++	normalized, err := json.Marshal(obj)
++	if err != nil {
++		return nil, err
++	}
++	return domain.Decode(normalized)
++}
++
+ func verifyGOEvidence(a goAuthority, v state) error {
+ 	grant, err := readPinnedObject(a.RootGrant)
+ 	if err != nil {
+@@ -231,7 +288,7 @@
+ 	if once["schema"] != "researchos.mu-trial-once.v1" || once["qualification_run_id"] != v.RunID || once["state"] != "CONSUMED_FOR_HOST_GO" {
+ 		return errors.New("Root once marker does not fence this Run")
+ 	}
+-	contract, err := readPinnedObject(a.OuterJobContract)
++	contract, err := readPinnedOwnedJobObject(a.OuterJobContract)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -246,7 +303,7 @@
+ 	if contract["schema"] != "researchos.mu-trial-host-job.v1" || contractPID != int64(os.Getpid()) || contract["deadline_utc"] != started.Add(300*time.Second).Format(time.RFC3339Nano) || domain.Str(contract, "root_job_id") == "" {
+ 		return errors.New("owned Host Job contract does not bind this process and deadline")
+ 	}
+-	probe, err := readPinnedObject(a.HostJobProbe)
++	probe, err := readPinnedOwnedJobObject(a.HostJobProbe)
+ 	if err != nil {
+ 		return err
+ 	}

@@ -1,0 +1,11 @@
+# Direct native HWND 诊断修订三
+
+仅C新包，待独立复核，未运行GUI/SDK/helper入口/UIA/模型。正常04、诊断01/02、实际run04证据不改。预算仍0，noOK、ownedCancel、UTC、SystemDrive、Electron cwd/Root Job不变。
+
+依据 BASELINE.json 实际snapshot，UIA按ControlType.Tree查询为0但ownedDialog内有唯一visible/enabled同Core的SysTreeView32。因此本修订每次新run重新EnumChildWindows（上限64），仅选唯一满足同PID/class/visible/enabled的native控件；0/2匹配或枚举截断拒绝。绝不复用旧PID/HWND。读取前/后按Core原创建/hash、dialog、IsChild、PID/class/状态重验，变化就阻塞并走原ownedCancel；ownership不明则Root Job收束。
+
+只从AutomationElement.FromHandle(nativeHwnd)读取Current公开元数据及Value/Legacy/Selection支持。provider/selected的Current PID不符或不可读则记录unavailable、不读该元素值；最多4个selected元素，不FindAll TreeItem、不Expand/Select/导航/OK。各Name/Value/Legacy值上限1024并标truncated，所有可读rooted候选分别保留。没有专门LegacyPath保证；这些数据全部can_authorize_selection=false，不采用displayName链或编辑文字作为FS身份。provider不支持时只记录事实，下一步由Root决定真实BIF_EDITBOX产品切片，不继续猜selector。
+
+输出仍沿用私有tree snapshot容器，但tree_source明确VERIFIED_NATIVE_SYSTREEVIEW32_FROM_HANDLE，tree_count=1表示本次验证的物理native候选数，不声称UIA已识别出ControlType.Tree。新direct_native_tree字段包含provider状态、模式支持、selected与绝对候选；旧diagnosticOnly、noOK、对应ownedCancel仍必须成立。
+
+新增7项Node、11项PS纯反例及syntax通过。只执行提取函数/数据边界，未加载UIA或实际查询窗口。旧18/33/8等检查不重跑、不累计正式资格。所有实际诊断仍等待Root fresh scope，不能借旧成功或本地假数据宣称路径可靠。

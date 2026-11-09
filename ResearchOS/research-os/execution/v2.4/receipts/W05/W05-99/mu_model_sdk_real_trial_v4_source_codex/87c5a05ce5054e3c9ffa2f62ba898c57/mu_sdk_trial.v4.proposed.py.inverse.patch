@@ -1,0 +1,279 @@
+--- a/mu_sdk_trial.v4.proposed.py
++++ b/mu_sdk_trial.v3.proposed.py
+@@ -40,8 +40,7 @@
+     "cli_binary", "intake_review", "public_route_manifest", "runtime_profile",
+     "cancel_fixture_receipt", "bootstrap_receipt", "credential_revision",
+     "data_root", "workspace", "repository_root", "discovery_file",
+-    "cli_config_file", "initial_discovery_state", "initial_config_state",
+-    "outcome_dir", "once_path", "root_registration_started_at_utc",
++    "cli_config_file", "outcome_dir", "once_path", "root_registration_started_at_utc",
+     "project_id", "goal_id", "runtime_id", "qualification_task_id",
+     "qualification_run_id", "qualification_epoch", "qualification_owner_root",
+     "qualification_profile_hash", "profile_entity_ref", "config_revision",
+@@ -91,52 +90,6 @@
+                 getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400), label + " reparse ancestor")
+     require(str(path.resolve(strict=True)).casefold() == str(path).casefold(), label + " alias")
+     return path
+-
+-
+-def consumed_file_state(raw_path, isolated_root, label):
+-    """One checked raw read, or an exact absent precondition, in the isolated root."""
+-    path = Path(raw_path)
+-    require(path.is_absolute() and path != isolated_root and
+-            path.is_relative_to(isolated_root), label + " outside isolated root")
+-    for item in (path, *path.parents):
+-        if not os.path.lexists(item):
+-            continue
+-        info = item.lstat()
+-        require(not item.is_symlink() and not getattr(item, "is_junction", lambda: False)() and
+-                not getattr(info, "st_file_attributes", 0) &
+-                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400), label + " reparse")
+-        if item == isolated_root:
+-            break
+-    require(str(path.resolve(strict=False)).casefold() == str(path).casefold(),
+-            label + " alias")
+-    if not os.path.lexists(path):
+-        return {"path": str(path), "exists": False}, None
+-    info = path.lstat()
+-    require(path.is_file() and stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+-            label + " nonregular or linked")
+-    raw = path.read_bytes()
+-    return {"path": str(path), "exists": True,
+-            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}, raw
+-
+-
+-def strict_consumed_json(raw, label):
+-    require(raw is not None, label + " absent")
+-    def unique(items):
+-        result = {}
+-        for key, value in items:
+-            require(key not in result, label + " duplicate JSON key")
+-            result[key] = value
+-        return result
+-    value = json.loads(raw, object_pairs_hook=unique)
+-    require(isinstance(value, dict), label + " object required")
+-    return value
+-
+-
+-def current_consumed_states(doc):
+-    root = canonical_dir(doc["data_root"], "isolated product root")
+-    discovery = consumed_file_state(doc["discovery_file"], root, "discovery")
+-    config = consumed_file_state(doc["cli_config_file"], root, "CLI config")
+-    return discovery, config
+ 
+ 
+ def parse_pinned_json(pin, label):
+@@ -197,65 +150,6 @@
+         expected = [project if value == "<CLI_INIT_PROJECT_ID>" else value for value in expected]
+     require(argv == expected and str(cwd) == frozen["cwd"] and
+             env == frozen["child_environment"], "CHILD_ARGV_CWD_ENV_CHANGED")
+-    # The reviewed Root basis fixes the original bytes/absence. A later
+-    # authorized CLI write advances only _expected_config_state below.
+-    pin_file(doc["cli_binary"], "cli_binary before child")
+-    discovery, config = current_consumed_states(doc)
+-    require(discovery[0] == doc["initial_discovery_state"] and discovery[0]["exists"],
+-            "DISCOVERY_CHANGED_BEFORE_CHILD")
+-    require(config[0] == doc["_expected_config_state"], "CONFIG_CHANGED_BEFORE_CHILD")
+-    doc["_pre_child_config_json"] = (strict_consumed_json(config[1], "CLI config")
+-                                     if config[0]["exists"] else None)
+-    doc["_pre_child_config_raw"] = config[1]
+-
+-
+-def after_child_consumed_states(doc, label, parsed):
+-    """Bind only the CLI's own two known config writes to its raw JSONL result."""
+-    discovery, config = current_consumed_states(doc)
+-    require(discovery[0] == doc["initial_discovery_state"] and discovery[0]["exists"],
+-            "DISCOVERY_CHANGED_DURING_CHILD")
+-    prior = doc["_expected_config_state"]
+-    old = doc["_pre_child_config_json"]
+-    if label == "cli-init":
+-        require(not prior["exists"] and old is None, "CLI_INIT_CONFIG_PREIMAGE_CHANGED")
+-        rows = [row for row in parsed if row.get("command") == "init" and
+-                row.get("status") == "COMPLETED" and row.get("exit_code") == 0]
+-        require(len(rows) == 1 and isinstance(rows[0].get("project_id"), str) and
+-                isinstance(rows[0].get("workspace_ref"), str) and
+-                rows[0]["project_id"] and rows[0]["workspace_ref"],
+-                "CLI_INIT_RESULT_NOT_ORIGINAL")
+-        expected = {"config_revision": 0, "model": "", "settled_run_id": "",
+-                    "workspace_ref": rows[0]["workspace_ref"],
+-                    "project_id": rows[0]["project_id"], "session_id": "",
+-                    "session_revision": 0, "writer_epoch": 0, "updated_by": ""}
+-        require(config[0]["exists"] and
+-                strict_consumed_json(config[1], "CLI init config") == expected,
+-                "CLI_INIT_CONFIG_POSTIMAGE_NOT_DERIVED")
+-    elif label == "cli-config":
+-        require(prior["exists"] and isinstance(old, dict), "CLI_CONFIG_PREIMAGE_CHANGED")
+-        rows = [row for row in parsed if row.get("command") == "config" and
+-                row.get("status") == "COMPLETED" and row.get("exit_code") == 0]
+-        require(len(rows) == 1 and
+-                rows[0].get("selected_model") == PROVIDER + "/" + MODEL and
+-                rows[0].get("method_sent") == "host.configure" and
+-                rows[0].get("previous_model") == old.get("model") and
+-                type(old.get("config_revision")) is int and
+-                old["config_revision"] == doc["config_revision"] and
+-                rows[0].get("config_revision") == old["config_revision"] + 1 and
+-                isinstance(rows[0].get("model"), str) and rows[0]["model"],
+-                "CLI_CONFIG_RESULT_NOT_ORIGINAL")
+-        expected = dict(old, config_revision=old["config_revision"] + 1,
+-                        model=rows[0]["model"])
+-        require(config[0]["exists"] and
+-                strict_consumed_json(config[1], "CLI configured state") == expected,
+-                "CLI_CONFIG_POSTIMAGE_NOT_DERIVED")
+-    else:
+-        require(label in ("cli-goal", "cli-run") and config[0] == prior,
+-                "UNAUTHORIZED_CONFIG_TRANSITION")
+-    doc["_expected_config_state"] = config[0]
+-    return ({"discovery_state": discovery[0], "config_before_state": prior,
+-             "config_after_state": config[0], "transition_label": label},
+-            doc["_pre_child_config_raw"], config[1])
+ 
+ 
+ def authority_binding(doc, mode):
+@@ -389,9 +283,8 @@
+     return deadline
+ 
+ 
+-def pin_path(path, raw=None):
+-    if raw is None:
+-        raw = path.read_bytes()
++def pin_path(path):
++    raw = path.read_bytes()
+     return {"path": str(path), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+ 
+ 
+@@ -605,13 +498,8 @@
+     require(data_root != private_root and data_root not in private_root.parents and
+             private_root not in data_root.parents and Path(doc["workspace"]).is_absolute(),
+             "trial data root must be disjoint from the entire old product resource root")
+-    discovery, config = current_consumed_states(doc)
+-    require(discovery[0] == doc.get("initial_discovery_state") and
+-            discovery[0]["exists"] and
+-            config[0] == doc.get("initial_config_state") and
+-            (not config[0]["exists"] if mode == "bootstrap" else config[0]["exists"]),
+-            "isolated discovery/config original bytes or absence changed")
+-    doc["_expected_config_state"] = config[0]
++    require(Path(doc["discovery_file"]).is_absolute() and Path(doc["cli_config_file"]).is_absolute(),
++            "isolated discovery/config paths required")
+     require(len(doc.get("prompt", "").encode("utf-8")) <= 4096 and
+             "evidence.txt" in doc.get("prompt", ""), "bounded read witness prompt required")
+     require(doc.get("workspace_witness") and len(doc["workspace_witness"]) <= 128,
+@@ -634,10 +522,6 @@
+ 
+ def consume_once(doc, deadline):
+     guard_deadline(deadline, "one-time grant consumption")
+-    discovery, config = current_consumed_states(doc)
+-    require(discovery[0] == doc["initial_discovery_state"] and
+-            config[0] == doc["_expected_config_state"],
+-            "CONSUMED_INPUT_CHANGED_BEFORE_ONCE")
+     marker = {"schema": "researchos.mu-sdk-trial-once-consumption.v1",
+               "run_uuid": doc["run_uuid"], "grant_ref": doc["root_grant"],
+               "phase": doc["phase"], "consumed_monotonic": time.monotonic(),
+@@ -660,16 +544,9 @@
+             try:
+                 require(deadline - time.monotonic() > 1.0,
+                         "absolute Root deadline lacks Popen/evidence reserve")
+-                authorized_child(doc, label, argv, cwd, env)
+                 child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err,
+                                          stdin=subprocess.DEVNULL, creationflags=0)
+-                while True:
+-                    observed_exit = child.poll()
+-                    if observed_exit is not None:
+-                        actual_exit = observed_exit
+-                        if actual_exit != 0 and first_cause is None:
+-                            first_cause = "CHILD_NONZERO_EXIT:" + str(actual_exit)
+-                        break
++                while child.poll() is None:
+                     if time.monotonic() >= deadline - 0.5:
+                         first_cause = "DEADLINE_WITH_EVIDENCE_RESERVE"
+                     elif stdout.stat().st_size > MAX_RAW_BYTES or stderr.stat().st_size > MAX_RAW_BYTES:
+@@ -680,16 +557,10 @@
+                     time.sleep(min(0.05, max(0.0, deadline - 0.5 - time.monotonic())))
+                 remaining = max(0.0, deadline - time.monotonic())
+                 actual_exit = child.wait(timeout=remaining) if remaining else child.poll()
+-                if actual_exit is not None and actual_exit != 0 and first_cause is None:
+-                    first_cause = "CHILD_NONZERO_EXIT:" + str(actual_exit)
+                 if actual_exit is None:
+                     first_cause = first_cause or "CHILD_LIFECYCLE_INCOMPLETE"
+             except BaseException as exc:
+-                observed_error = type(exc).__name__ + ":" + str(exc)
+-                if first_cause is None:
+-                    first_cause = observed_error
+-                else:
+-                    secondary.append(observed_error)
++                first_cause = first_cause or type(exc).__name__ + ":" + str(exc)
+                 if child is not None and child.poll() is None:
+                     try:
+                         child.kill()
+@@ -697,66 +568,33 @@
+                     except BaseException as cleanup_exc:
+                         secondary.append(type(cleanup_exc).__name__ + ":" + str(cleanup_exc))
+     except BaseException as exc:
+-        observed_error = type(exc).__name__ + ":" + str(exc)
+-        if first_cause is None:
+-            first_cause = observed_error
+-        else:
+-            secondary.append("stream_close:" + observed_error)
++        first_cause = first_cause or type(exc).__name__ + ":" + str(exc)
+     # Native exit is known now. Freeze it before any later raw hash/parse error.
+     if actual_exit is not None and actual_exit != 0 and first_cause is None:
+         first_cause = "CHILD_NONZERO_EXIT:" + str(actual_exit)
+-    raw_refs, raw_payloads = {}, {}
++    raw_refs = {}
+     for name, path in (("stdout_ref", stdout), ("stderr_ref", stderr)):
+         try:
+-            if path.is_file():
+-                raw_payloads[name] = path.read_bytes()
+-                raw_refs[name] = pin_path(path, raw_payloads[name])
+-            else:
+-                raw_refs[name] = None
++            raw_refs[name] = pin_path(path) if path.is_file() else None
+         except BaseException as exc:
+             raw_refs[name] = None
+             secondary.append(name + ":" + type(exc).__name__ + ":" + str(exc))
+-    parsed, transition = None, None
++    parsed = None
+     if first_cause is None and not secondary:
+         try:
+             guard_deadline(deadline, label + " parsing")
+             require(actual_exit == 0, "CHILD_NONZERO_EXIT")
+             require(stdout.stat().st_size <= MAX_RAW_BYTES and stderr.stat().st_size <= MAX_RAW_BYTES,
+                     "OUTPUT_OVERFLOW")
+-            parsed = [json.loads(line) for line in
+-                      raw_payloads["stdout_ref"].decode("utf-8", errors="strict").splitlines()]
++            parsed = [json.loads(line) for line in stdout.read_text(encoding="utf-8", errors="strict").splitlines()]
+             require(parsed and all(isinstance(row, dict) for row in parsed), "JSONL_MISSING")
+-            transition, before_config_raw, after_config_raw = (
+-                after_child_consumed_states(doc, label, parsed))
+-            if label in ("cli-init", "cli-config"):
+-                if before_config_raw is not None:
+-                    before_path = directory / (label + ".config.before.raw")
+-                    with before_path.open("xb") as original:
+-                        original.write(before_config_raw)
+-                    original_before = before_path.read_bytes()
+-                    require(original_before == before_config_raw,
+-                            "CONFIG_PREIMAGE_EXPORT_CHANGED")
+-                    transition["config_before_original_ref"] = pin_path(
+-                        before_path, original_before)
+-                else:
+-                    transition["config_before_original_ref"] = None
+-                require(after_config_raw is not None, "CONFIG_POSTIMAGE_RAW_ABSENT")
+-                after_path = directory / (label + ".config.after.raw")
+-                with after_path.open("xb") as original:
+-                    original.write(after_config_raw)
+-                original_after = after_path.read_bytes()
+-                require(original_after == after_config_raw,
+-                        "CONFIG_POSTIMAGE_EXPORT_CHANGED")
+-                transition["config_after_original_ref"] = pin_path(
+-                    after_path, original_after)
+         except BaseException as exc:
+             first_cause = type(exc).__name__ + ":" + str(exc)
+     if first_cause is None and secondary:
+         first_cause = secondary[0]
+     receipt = {"argv": argv, "cwd": str(cwd), "started_monotonic": started,
+                "ended_monotonic": time.monotonic(), "actual_exit": actual_exit,
+-               "first_cause": first_cause, "secondary_failures": secondary,
+-               "consumed_file_transition": transition, **raw_refs}
++               "first_cause": first_cause, "secondary_failures": secondary, **raw_refs}
+     put_json(directory / (label + ".invocation.json"), receipt)
+     guard_deadline(deadline, label + " evidence completion")
+     require(first_cause is None and actual_exit == 0 and not secondary and parsed is not None,

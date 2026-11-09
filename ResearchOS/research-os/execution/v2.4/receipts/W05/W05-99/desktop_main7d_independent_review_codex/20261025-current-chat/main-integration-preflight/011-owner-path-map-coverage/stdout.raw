@@ -1,0 +1,62 @@
+
+
+def g02(g):
+    registry=read(ROOT/'execution/v2.4/commands.json');locked=read(g.source('execution/toolchains/locked.json'))
+    g.inputs[str(ROOT/'execution/v2.4/commands.json')]=sha(ROOT/'execution/v2.4/commands.json')
+    inventory=[]
+    for key,entry in registry['commands'].items():
+        state=entry.get('state');issues=[];paths=[]
+        if state=='BOUND':
+            for field in ('executable_tool','argv','cwd','platforms','required_env','allowed_env','timeout_seconds'):
+                if field not in entry:issues.append('missing:'+field)
+            tool=locked['tools'].get(entry.get('executable_tool'),{})
+            executable=Path(tool.get('path',''))
+            if not executable.is_file() or sha(executable)!=tool.get('sha256'):issues.append('executable_unverified')
+            for arg in entry.get('argv',[]):
+                if arg.endswith(('.py','.js','.mjs','.cjs','.ps1')):
+                    path=ROOT/arg;paths.append({'path':arg,'exists':path.is_file(),'sha256':sha(path) if path.is_file() else None})
+                    if not path.is_file():issues.append('missing_handler:'+arg)
+            if not (ROOT/entry.get('cwd','.')).is_dir():issues.append('missing_cwd')
+            if not isinstance(entry.get('timeout_seconds'),(int,float)) or entry.get('timeout_seconds',0)<=0:issues.append('invalid_timeout')
+        inventory.append({'command_key':key,'registry_state':state,'paths':paths,'issues':issues,
+                          'behavior_status':'NOT_OBSERVED_PER_SELECTOR' if state=='BOUND' else 'NOT_IMPLEMENTED',
+                          'owner':entry.get('owner_card',entry.get('owner','registry integrator')),
+                          'selectors':entry.get('selectors',{}),'platforms':entry.get('platforms',[])})
+    save(g.out/'command-inventory.json',inventory)
+    g.check('CURRENT_REAL_COMMAND_PATHS',bool(inventory) and all(not row['issues'] and row['registry_state'] in ('BOUND','UNBOUND') for row in inventory),
+            {'count':len(inventory),'bound_count':sum(r['registry_state']=='BOUND' for r in inventory),'behavior_limit':'Paths checked; all formal selector behavior NOT_OBSERVED. Known C24/A12 child-handler case rejection and auto-routing legacy selector gaps stay unaccepted.'})
+    entry=registry['commands']['build.check']
+    rel=(HERE/'dispatch_parent_exact.py').relative_to(ROOT).as_posix()
+    binding=entry.get('argv')==['-B',rel] and all(x in entry.get('selectors',{}).get('check_id',[]) for x in SELECTORS)
+    g.pending=not binding
+    g.check('EXACT_PARENT_BINDING',binding,{'expected_argv':['-B',rel],'actual_argv':entry.get('argv'),'state':'BOUND' if binding else 'PENDING_INTEGRATION'})
+    owner_path=g.main/'execution/v2.4/path_ownership.json'
+    owner=read(owner_path);g.inputs[str(owner_path)]=sha(owner_path)
+    seen={};aliases=[];errors=[]
+    for alias,item in owner['aliases'].items():
+        for annotated in item['paths']:
+            relpath=annotated;glob='*' in relpath
+            if relpath in seen and seen[relpath]!=item['owner']:errors.append('duplicate_owner:'+relpath)
+            seen[relpath]=item['owner']
+            exists=(ROOT/relpath).exists() if not glob else None
+            if not glob and not exists:errors.append('missing_alias:'+relpath)
+            aliases.append({'alias':alias,'path':relpath,'owner':item['owner'],'exists':exists,'kind':'future_scoped_glob' if glob else 'actual'})
+    save(g.out/'path-inventory.json',aliases)
+    g.check('PATH_OWNER_UNIQUENESS',not errors,{'errors':errors,'rule':'exact registered paths unique and resolve as-is; parent scopes may contain child aliases; future scoped globs are not claimed as existing directories'})
+    legacy=read(g.source('execution/path_ownership.json'))
+    special=owner.get('special_paths',legacy['special_paths']);restricted=special['verifier_restricted_store']
+    mapped=(ROOT/special['evaluation_adapter']['path']).is_dir() and (ROOT/special['design_tokens']['path']).is_file() and (ROOT/'evaluation/development').is_dir()
+    development=special.get('development_results',{})
+    mapped=mapped and bool(development.get('owner')) and (ROOT/development.get('path','__unmapped__')).is_dir()
+    g.check('EVALUATION_UI_RESTRICTED_MAPPING',mapped and restricted.get('access_class')=='VERIFIER_ONLY' and restricted.get('status')=='UNBOUND' and restricted.get('path') is None,
+            {'inherited_mapping':special,'restricted_scope':'Explicit UNBOUND until W17 provisioning under separate OS identity; no formal labels read/written'})
+    mapping=read(g.source('execution/v2.4/client_mapping.json'))
+    proto=read(g.source('internal/api/contracts/client.protocol.schema.json'))
+    methods=set(proto['x-method-contracts'])
+    mapped_methods={r['method'] for r in mapping['method_map']}
+    g.check('CLIENT_MAP_COVERAGE',methods==mapped_methods and len(mapping['event_map'])==14 and all(r.get('owner_card') for r in mapping['method_map']),
+            {'methods':len(methods),'events':len(mapping['event_map']),'protocol':mapping['protocol'],'historical_statuses':'PLANNED labels retained, not upgraded by this structural check'})
+    component=read(g.source('execution/v2.4/component_lock.json'))
+    lock_paths=component['single_integrator']['locks']+['apps/web/package-lock.json','apps/desktop/package-lock.json']
+    lock_rows=[{'path':p,'exists':(ROOT/p).is_file(),'sha256':sha(ROOT/p) if (ROOT/p).is_file() else None,
+                'serial_integrator':owner.get('active_integrator',{}).get('id',owner['shared_integrator'])} for p in lock_paths]

@@ -1,0 +1,143 @@
+def all_refs(value):
+    if isinstance(value,dict):
+        if set(value)=={"path","sha256","bytes"}:
+            yield value
+        else:
+            for item in value.values(): yield from all_refs(item)
+    elif isinstance(value,list):
+        for item in value: yield from all_refs(item)
+def live_four(expected):
+    need(len(expected)==4 and all(safe(name).read_bytes()==raw for name,raw in zip(CANON,expected)),"current exact ordered four")
+def preflight(q,request_sha256,self_sha256):
+    # No output, sentinel, helper import, native process, temp or CAS before all pins bind.
+    need(type(q)is dict and set(q)==set(INPUT_BASE)|{"source_ref","amended_at"},"exact request keys")
+    need(all(q[k]==v for k,v in INPUT_BASE.items()),"all fixed request fields/refs")
+    need(q["source_ref"]==pin(safe(__file__)) and q["source_ref"]["sha256"]==self_sha256,"actual candidate self hash")
+    raw=safe(NS/"original-input.json").read_bytes()
+    need(hashlib.sha256(raw).hexdigest()==request_sha256 and parse(raw)==q,"actual request raw hash/value")
+    need(sys.flags.isolated==1 and sys.flags.no_site==1 and sys.flags.utf8_mode==1,"isolated no-site utf8 Python")
+    need(Path(sys.executable).resolve()==Path(q["python_pin"]["path"]).resolve(),"pinned Python identity")
+    stamp=datetime.datetime.fromisoformat(q["amended_at"])
+    need(stamp.utcoffset()==datetime.timedelta(0),"Root explicit UTC amendment")
+    for r in all_refs(q): verify(r)
+    need([r["path"] for r in q["canonical_before"]]==CANON,"ordered canonical input refs")
+    before=[verify(r) for r in q["canonical_before"]]
+    live_four(before)
+    cp,ow=map(parse,before[:2])
+    need([cp["revision"],ow["revision"],len(cp["failure_counters"])]==q["before"] and cp["head"]==q["main_head"],"actual current tuple/head")
+    b=doc(q["binding_ref"])
+    # This binding was made at revision336. It supplies tools/430prefix, never current-before.
+    need(b["main_git"]==q["main_git"] and b["owned_process_helper_ref"]==q["helper_ref"] and q["pipeline_ref"] in b["metadata_code_refs"],"original tool/binding source")
+    verify(b["toolchain_lock_ref"])
+    lock=doc(b["toolchain_lock_ref"])["tools"]
+    need(lock["python"]["path"]==q["python_pin"]["path"] and lock["python"]["sha256"]==q["python_pin"]["sha256"],"locked Python pin")
+    verify({"path":lock["git"]["path"],"sha256":lock["git"]["sha256"],"bytes":46480})
+    prefix=doc(b["failure_prefix430_ref"])["failure_counters"]
+    need(len(prefix)==430 and cp["failure_counters"][:430]==prefix,"original430 prefix")
+    closure=doc(q["closure_review_ref"]);root_closure=doc(q["closure_report_ref"])
+    need(closure["reviewer"]=="codex:/root/w05_merge_review" and closure["decision"]=="FAILED_EXECUTION_EVIDENCE_CLOSED_QUALIFICATION_WITHHELD" and closure["requested_changes"]==[],"real independent execution closure")
+    need(closure["scope_ref"]==cp["work_in_progress"]["desktop58_finite_validation_scope_ref"],"closed exact scope")
+    need(closure["report_ref"]==q["closure_report_ref"] and closure["root_manifest_ref"]==q["closure_manifest_ref"],"independent closure exact root evidence")
+    need(closure["qualification"] is False and closure["source_acceptance"] is False and closure["formal_increment"]==0 and closure["same_scope_rerun_allowed"] is False,"failed qualification remains withheld")
+    need(root_closure["scope_uid"]==q["old_run_uuid"] and root_closure["scope_ref"]==closure["scope_ref"] and root_closure["canonical_tuple"]==q["before"],"failed run identity/current tuple")
+    need(root_closure["root_native_session_active"] is False and root_closure["case_state_counts"]=={"NOT_STARTED":170} and root_closure["qualified_case_count"]==0 and root_closure["actual_observed_HTTP_total"]==0,"closed failure not runtime success")
+    need(root_closure["builder_job_cleanup"]["job_idle_confirmed"] is True and root_closure["builder_job_cleanup"]["explicit_owned_handles_remaining"]==0 and root_closure["builder_debug_capture_summary"]["complete"] is False,"failed job closed without capture promotion")
+    mf=doc(q["closure_manifest_ref"]);h=doc(q["closure_handoff_ref"])
+    need(h["report_ref"]==q["closure_report_ref"] and h["manifest_ref"]==q["closure_manifest_ref"] and q["closure_report_ref"] in mf["entries"],"sealed root report membership")
+    for r in mf["entries"]: verify(r)
+    records=root_closure["pending_failure_origin_records"]
+    need([x["failure_index"] for x in records]==list(range(618,636)) and [x["origin_ref"] for x in records]==q["pending_origin_refs"],"exact18 pending origins618..635")
+    seen=set();rows=[]
+    for r in q["pending_origin_refs"]:
+        payload=doc(r)
+        need(r["sha256"] not in seen and all(old.get("evidence_ref",{}).get("sha256")!=r["sha256"] for old in cp["failure_counters"]),"origin is unique and not already registered")
+        seen.add(r["sha256"])
+        rows.append({"origin_key":r["sha256"],"evidence_ref":r,"original_payload":payload,"counter_reset":False,"counted_once":True,"automatic_retry":False})
+    lease=ow["card_path_bindings"]["W13-03"]["subtasks"]["desktop58_finite_validation"]
+    need(lease["run_uuid"]==q["old_run_uuid"] and lease["state"]=="REGISTERED_PENDING_ONCE_EXECUTION" and lease["scope_ref"]==closure["scope_ref"] and lease["source_commit"]==q["main_head"] and lease["owner"]=="codex:/root" and lease["current_source_writer"] is None,"exact failed b4d lease")
+    need(cp["work_in_progress"]["desktop58_finite_validation_state"]=="REGISTERED_PENDING_ONCE_EXECUTION","pending WIP")
+    return before,cp,ow,b,rows
+def desired_values(q,cp,ow,rows):
+    newcp,newow=copy.deepcopy(cp),copy.deepcopy(ow)
+    newcp.update(revision=q["after"][0],expected_previous_revision=q["before"][0],updated_at=q["amended_at"],updated_by="codex:/root")
+    newcp["failure_counters"].extend(copy.deepcopy(rows))
+    newcp["work_in_progress"].update(desktop58_finite_validation_state="FAILED_EXECUTION_CLOSED_QUALIFICATION_WITHHELD",desktop58_finite_validation_failed_closure_review_ref=q["closure_review_ref"],desktop58_finite_validation_failed_closure_root_ref=q["closure_report_ref"])
+    newow.update(revision=q["after"][1],amended_at=q["amended_at"],amended_by="codex:/root")
+    lease=newow["card_path_bindings"]["W13-03"]["subtasks"]["desktop58_finite_validation"]
+    lease.update(state="FAILED_EXECUTION_CLOSED_QUALIFICATION_WITHHELD",failed_closure_review_ref=q["closure_review_ref"],failed_closure_root_ref=q["closure_report_ref"],execution_grant=False,qualification=False,formal_increment=0)
+    need(newcp["failure_counters"][:617]==cp["failure_counters"] and len(newcp["failure_counters"])==635,"all617 and18 exact append")
+    cd=differences(cp,newcp);od=differences(ow,newow)
+    ca={"/revision","/expected_previous_revision","/updated_at","/updated_by","/failure_counters","/work_in_progress/desktop58_finite_validation_state","/work_in_progress/desktop58_finite_validation_failed_closure_review_ref","/work_in_progress/desktop58_finite_validation_failed_closure_root_ref"}
+    ob="/card_path_bindings/W13-03/subtasks/desktop58_finite_validation/"
+    oa={"/revision","/amended_at","/amended_by",ob+"state",ob+"failed_closure_review_ref",ob+"failed_closure_root_ref",ob+"execution_grant",ob+"qualification",ob+"formal_increment"}
+    need(set(cd)<=ca and set(od)<=oa,"exact allowed pointer changes")
+    return newcp,newow,cd,od
+def draft(q,context):
+    before,cp,ow,b,rows=context
+    need({x.name for x in NS.iterdir()}=={"original-input.json"},"allocated draft output only exact request; no retry")
+    save(NS/"draft.started.json",{"actor":"codex:/root","once":True,"input_ref":pin(NS/"original-input.json"),"source_ref":pin(__file__)})
+    cut=save(NS/"origin-cut.json",{"schema":"researchos.failure-origin-cut.v1","owner":"codex:/root","before":q["before"],"after":q["after"],"origins":rows,"counter_reset":False})
+    pipeline=load_module(q["pipeline_ref"],"reviewed_desktop_metadata_origin_formatter")
+    need(pipeline.origins({"origin_cut_ref":cut,"before":q["before"],"after":q["after"]},cp)==rows,"original pipeline opaque verifier")
+    nc,no,cd,od=desired_values(q,cp,ow,rows)
+    desired=[encode(nc),encode(no),before[2],before[3]]
+    originals=[copy_bytes(NS/(Path(n).stem+".before.json"),v) for n,v in zip(CANON,before)]
+    targets=[copy_bytes(NS/(Path(n).stem+".desired.json"),v) for n,v in zip(CANON,desired)]
+    audit=save(NS/"audit.json",{"schema":"researchos.desktop58-failed-lease-closure-cas-audit.v1","author":"codex:/root","before":q["before"],"after":q["after"],"checkpoint_changed_pointers":cd,"ownership_changed_pointers":od,"original_failure_prefix617_equal":True,"original_failure_prefix430_equal":True,"original_origin_count":18,"step_state_commands_byte_identical":True,"main_source_head":q["main_head"],"closed_run_uuid":q["old_run_uuid"],"failed_closure_review_ref":q["closure_review_ref"],"qualification_granted":False,"formal_increment":0,"parent_acceptance_increment":0,"new_execution_scope":False,"new_execution_grant":False,"counter_reset":False,"automatic_retry":False})
+    live_four(before)
+    prepared=save(NS/"prepared.json",{"schema":"researchos.desktop58-failed-lease-closure-cas-prepared.v1","author":"codex:/root","input_ref":pin(NS/"original-input.json"),"source_ref":pin(__file__),"before":q["before"],"after":q["after"],"original_refs":originals,"desired_refs":targets,"origin_cut_ref":cut,"audit_ref":audit,"old_closed_run_review_ref":q["closure_review_ref"],"formal_increment":0,"execution_grant":False})
+    mf=save(NS/"manifest.draft.json",{"schema":"researchos.receipt-manifest.v1","owner":"codex:/root","purpose":"failed_lease_closure_metadata_only","members":[pin(x) for x in sorted(NS.iterdir()) if x.is_file()],"self_excluded":True})
+    print(json.dumps({"prepared_ref":prepared,"audit_ref":audit,"manifest_ref":mf,"before":q["before"],"after":q["after"],"native_product_calls":0,"canonical_writes":0},ensure_ascii=False))
+# INSERT_GIT_HELPERS
+def commit(q,review_ref,context):
+    before,cp,ow,b,rows=context
+    prepared_ref=pin(safe(NS/"prepared.json"));p=doc(prepared_ref);rev=doc(review_ref)
+    need(rev["schema"]=="researchos.desktop58-failed-lease-closure-cas-review.v1" and rev["reviewer"]=="codex:/root/f08_whole_scope_review" and rev["decision"]=="READY_FOR_ROOT_OLD_FAILED_LEASE_CLOSURE_CAS_ONCE" and rev["requested_changes"]==[] and rev["actual_registration_executed"] is False,"actual independent F08 CAS review")
+    need(rev["prepared_ref"]==prepared_ref and rev["source_ref"]==pin(__file__) and rev["input_ref"]==pin(NS/"original-input.json") and rev["audit_ref"]==p["audit_ref"] and rev["manifest_ref"]==pin(NS/"manifest.draft.json"),"review all prepared pins")
+    need(rev["expected_before"]==q["before"] and rev["expected_after"]==q["after"] and rev["original_refs"]==p["original_refs"] and rev["desired_refs"]==p["desired_refs"],"review exact targets/transition")
+    need(p["input_ref"]==pin(NS/"original-input.json") and q==doc(p["input_ref"]) and p["source_ref"]==pin(__file__),"prepared source and request")
+    need(p["before"]==q["before"] and p["after"]==q["after"] and p["formal_increment"]==0 and p["execution_grant"] is False,"narrow prepared")
+    for x in doc(pin(NS/"manifest.draft.json"))["members"]: verify(x)
+    need([verify(x) for x in p["original_refs"]]==before,"prepared originals exact current input")
+    nc,no,cd,od=desired_values(q,cp,ow,rows)
+    desired=[encode(nc),encode(no),before[2],before[3]]
+    need([verify(x) for x in p["desired_refs"]]==desired,"prepared desired recomputed exact")
+    cut=doc(p["origin_cut_ref"])
+    need(cut=={"schema":"researchos.failure-origin-cut.v1","owner":"codex:/root","before":q["before"],"after":q["after"],"origins":rows,"counter_reset":False},"prepared origin cut exact")
+    audit=doc(p["audit_ref"])
+    need(audit["checkpoint_changed_pointers"]==cd and audit["ownership_changed_pointers"]==od,"reviewed exact change pointers")
+    live_four(before)
+    save(NS/"commit.started.json",{"actor":"codex:/root","once":True,"review_ref":review_ref,"input_ref":p["input_ref"],"source_ref":p["source_ref"]})
+    git_guard(q,b,"commit.before")
+    live_four(before)
+    intent=save(NS/"canonical-write.intent.json",{"actor":"codex:/root","prepared_ref":prepared_ref,"review_ref":review_ref,"before":q["before"],"after":q["after"],"write_paths":CANON[:2],"unchanged_paths":CANON[2:],"automatic_retry":False,"counter_reset":False,"recovery":"FORWARD_ONLY_SEPARATE_ROOT_DECISION_NO_ROLLBACK"})
+    expected=list(before)
+    for i,name in enumerate(CANON[:2]):
+        target=safe(name);tmp=target.with_name(target.name+"."+q["run_uuid"]+".tmp")
+        copy_bytes(tmp,desired[i])
+        git_guard(q,b,"commit.pre-replace-"+str(i))
+        live_four(expected)
+        os.replace(tmp,target);expected[i]=desired[i]
+        need(target.read_bytes()==desired[i],"verified individual write")
+        save(NS/("canonical-write."+target.stem+".done.json"),{"intent_ref":intent,"desired_ref":p["desired_refs"][i]})
+    git_guard(q,b,"commit.after")
+    live_four(desired)
+    verified=save(NS/"canonical-write.verified.json",{"schema":"researchos.desktop58-failed-lease-closure-cas-verified.v1","actor":"codex:/root","before":q["before"],"after":q["after"],"intent_ref":intent,"review_ref":review_ref,"canonical_refs":[pin(safe(x)) for x in CANON],"step_state_commands_unchanged":True,"old_lease_closed_failed":True,"execution_grant":False,"formal_increment":0,"counter_reset":False})
+    resume=save(NS/"RESUME.failed-lease.closed.json",{"schema":"researchos.resume.v1","actor":"codex:/root","canonical_tuple":q["after"],"closed_run_uuid":q["old_run_uuid"],"old_state":"FAILED_EXECUTION_CLOSED_QUALIFICATION_WITHHELD","next_action":"Separate fresh Root scope/UUID only after resource Source review; retain post635 origin refs outside this immutable cut","goal_status":"ACTIVE","parent_accepted":6,"parents_total":22,"formal_accepted":0,"formal_total":42,"verified_ref":verified})
+    mf=save(NS/"manifest.closed.json",{"schema":"researchos.receipt-manifest.v1","owner":"codex:/root","members":[pin(x) for x in sorted(NS.iterdir()) if x.is_file()],"self_excluded":True,"metadata_only":True,"formal_increment":0})
+    print(json.dumps({"verified_ref":verified,"resume_ref":resume,"manifest_ref":mf,"canonical_tuple":q["after"],"canonical_refs":[pin(safe(x)) for x in CANON]},ensure_ascii=False))
+def main():
+    ap=argparse.ArgumentParser()
+    mode=ap.add_mutually_exclusive_group(required=True);mode.add_argument("--draft",action="store_true");mode.add_argument("--commit-review-ref")
+    ap.add_argument("--request-sha256",required=True);ap.add_argument("--source-sha256",required=True)
+    a=ap.parse_args()
+    q=parse(safe(NS/"original-input.json").read_bytes())
+    context=preflight(q,a.request_sha256,a.source_sha256)
+    if a.draft: draft(q,context)
+    else: commit(q,parse(a.commit_review_ref.encode("utf8")),context)
+if __name__=="__main__":
+    try: main()
+    except BaseException as e:
+        print(repr(e),file=sys.stderr);traceback.print_exc()
+        raise
+

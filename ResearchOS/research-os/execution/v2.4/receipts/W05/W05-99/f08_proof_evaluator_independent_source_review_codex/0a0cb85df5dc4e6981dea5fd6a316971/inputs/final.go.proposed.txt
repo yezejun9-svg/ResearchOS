@@ -1,0 +1,88 @@
+// Source-derived NO_EXECUTION finalization. Native settlement is deliberately
+// refused until its accounting, original observation and SDK chains are all
+// implemented. No proof_kind label or supplied hash selects a weaker branch.
+func f08Pending(s *f08Sources,project,session,settling string)[]any{
+	ids:=map[string]bool{}
+	for _,q:=range s.selectRows("queue",[]int{1,3},[]any{project,session}){if q[14]!="CONSUMED" && q[14]!="DROPPED"{ids[q[2].(string)]=true}}
+	for _,c:=range s.selectRows("controls",[]int{1,3},[]any{project,session}){if c[8]!="CONFIRMED" && c[2]!=settling{ids[c[2].(string)]=true}}
+	result:=[]any{};for id:=range ids{result=append(result,id)};sort.Slice(result,func(i,j int)bool{return result[i].(string)<result[j].(string)});return result
+}
+
+func (v *f08ProofValidator) emptyQueueFinal(s *f08Sources,project,task string,original any)(map[string]any,error){
+	before,e:=f08Object(original,"variant","session_id","generation","revision","state","accepted_through","sealed_through","run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity","restore_fenced");if e!=nil{return nil,e}
+	q,e:=v.queueAdmission(s,project,task);if e!=nil{return nil,e}
+	if before["variant"]=="NO_SESSION"{
+		if !f08Equal(q,before){return nil,f08Binding}
+	}else{
+		if q["session_id"]!=before["session_id"] || q["variant"]!="ORIGINAL_FENCE"{return nil,f08Binding}
+		if q["state"]!="CANCEL_FENCED" && q["state"]!="SEALED"{return nil,f08Binding}
+		if !f08Equal(q["restore_fenced"],f08Number(0)) || !f08NullFields(q,"run_id","runtime_epoch","dispatch_key","manifest_hash","process_identity"){return nil,f08Binding}
+		accepted,e:=f08Integer(q["accepted_through"],0);if e!=nil{return nil,e};sealed,e:=f08Integer(q["sealed_through"],0);if e!=nil || sealed!=accepted{return nil,f08Binding}
+		// Nonempty canonical delivery/receipt histories require the distinct
+		// full queue-chain evaluator, never an empty-chain shortcut.
+		if accepted!=0 || len(s.selectRows("queue",[]int{1,4},[]any{project,task}))!=0 || len(s.selectRows("receipts",[]int{1,2},[]any{project,q["generation"]}))!=0{return nil,f08NativeProofGap}
+		if before["variant"]=="REAL_SESSION_NO_ORIGINAL_FENCE"{
+			q["variant"]="CREATED_SAME_TRANSACTION"
+		}else if before["variant"]=="ORIGINAL_FENCE"{
+			if before["generation"]!=q["generation"] || !f08Equal(before["accepted_through"],f08Number(0)) || !f08Equal(before["sealed_through"],f08Number(0)){return nil,f08Binding}
+			prior,e:=f08Integer(before["revision"],1);if e!=nil{return nil,e};now,e:=f08Integer(q["revision"],prior);if e!=nil || now<prior{return nil,f08Binding}
+		}else{return nil,f08Shape}
+	}
+	q["entry_refs"]=[]any{};q["receipt_refs"]=[]any{};return q,nil
+}
+
+func (v *f08ProofValidator) finalGroup(s *f08Sources,row []any,current bool)(*f08Group,error){
+	g,e:=f08ParseGroup("final",row);if e!=nil{return nil,e}
+	ar,e:=s.one("admitted",[]int{0,1,2,3},row[:4]);if e!=nil{return nil,e};a,e:=v.admitted(s,ar,false);if e!=nil{return nil,e}
+	if e=v.completeMaterializations(s,a);e!=nil{return nil,e}
+	if row[4]!=a.rootHash || len(g.members)!=len(a.members) || g.root["control_request_id"]!="ctrl-"+row[2].(string){return nil,f08Binding}
+	req,e:=v.groupRequest(s,a);if e!=nil{return nil,e}
+	control,e:=s.one("controls",[]int{0,1,2,5},row[:4]);if e!=nil{return nil,e}
+	if control[3]!=req.session || control[4]!=g.root["control_request_id"] || control[6]!=req.target{return nil,f08Binding}
+	taskIDs,_,e:=f08JSONHex(control[7]);if e!=nil || !f08Equal(taskIDs,a.root["member_task_ids"]){return nil,f08Binding}
+	switch g.root["completion_mode"]{
+	case "ACK_TO_COMPLETED":
+		original,e:=f08Hex(control[9]);if e!=nil || f08RawHash(original)!=g.root["original_response_digest"]{return nil,f08Binding}
+		if _,e=v.responseBody(req,original,"ACKNOWLEDGED");e!=nil{return nil,e}
+	case "ORIGINAL_COMPLETED":
+		if g.root["original_response_digest"]!=g.root["final_response_digest"]{return nil,f08Binding}
+		if control[9]!=nil{raw,e:=f08Hex(control[9]);if e!=nil || f08RawHash(raw)!=g.root["original_response_digest"]{return nil,f08Binding}}
+	default:return nil,f08Shape
+	}
+	for _,key:=range []string{"original_response_digest","final_response_digest"}{if _,e=f08HashString(g.root[key]);e!=nil{return nil,e}}
+	sb,e:=f08Object(g.root["final_snapshot_binding"],"session_id","project_id","revision","event_sequence","pending_command_ids_digest");if e!=nil{return nil,e}
+	if sb["session_id"]!=req.session || sb["project_id"]!=req.project{return nil,f08Binding}
+	if current{
+		session,e:=s.one("sessions",[]int{0,1},[]any{req.session,req.project});if e!=nil{return nil,e}
+		if !f08Equal(sb["revision"],session[2]) || !f08Equal(sb["event_sequence"],session[11]){return nil,f08Binding}
+		h,e:=f08Hash(f08Pending(s,req.project,req.session,req.command));if e!=nil || sb["pending_command_ids_digest"]!=h{return nil,f08Binding}
+	}
+	all:=map[string]any{}
+	for i,item:=range g.members{
+		m:=item.(map[string]any);original:=a.members[i].(map[string]any)
+		originalTask,e:=v.version(s,req.project,original["task_ref"]);if e!=nil{return nil,e};mh,e:=f08Hash(original);if e!=nil{return nil,e}
+		if !f08Equal(m["admitted_member_ref"],f08MemberReference("ADMITTED",originalTask.id,mh)) || !f08Equal(m["task_admitted_ref"],original["task_ref"]) || !f08Equal(m["run_admitted_ref"],original["run_ref"]){return nil,f08Binding}
+		if original["dispatch_stage"]!="NO_RUN" || m["proof_kind"]!="NO_EXECUTION"{return nil,f08NativeProofGap}
+		if !f08NullFields(m,"run_admitted_ref","run_before_settlement_ref","run_final_ref","dispatch_origin_ref","dispatch_final_binding","observation_ref","run_event_ref","prelaunch_checkpoint_carry") || !f08EmptyArray(m["native_artifact_refs"]) || !f08EmptyArray(m["sdk_receipt_refs"]) || !f08EmptyArray(m["prior_epoch_closure"]){return nil,f08Binding}
+		task,e:=v.version(s,req.project,m["task_final_ref"]);if e!=nil || task.kind!="Task" || task.id!=originalTask.id || task.body["goal_id"]!=originalTask.body["goal_id"] || task.revision<originalTask.revision{return nil,f08Binding}
+		if task.body["status"]!="CANCELLED" && task.body["status"]!="ACCEPTED"{return nil,f08Binding}
+		if current{head,e:=v.head(s,req.project,"Task",task.id);if e!=nil || !f08SameVersion(head,task){return nil,f08Binding};if e=v.noRun(s,task);e!=nil{return nil,e}}
+		if !f08Equal(m["effect_closure"],map[string]any{"run_id":nil,"epoch":nil,"histories":[]any{},"non_effect_reservations":[]any{}}){return nil,f08Binding}
+		// Historical queue-binding validation still requires an immutable
+		// chain evaluator. Do not substitute today's fence for history.
+		if !current{return nil,f08NativeProofGap}
+		queue,e:=v.emptyQueueFinal(s,req.project,task.id,original["queue_admission"]);if e!=nil || !f08Equal(queue,m["queue_final_binding"]){return nil,f08Binding}
+		event,e:=v.eventClaim(s,req.project,m["task_event_ref"],task,"TASK_CHANGED");if e!=nil{return nil,e}
+		if task.revision>originalTask.revision && event.body["correlation_id"]!=req.command{return nil,f08Binding}
+		goal,e:=v.version(s,req.project,original["goal_ref"]);if e!=nil{return nil,e}
+		closure,anchors,e:=v.referenceClosure(s,[]f08Version{originalTask,goal,task,event});if e!=nil || !f08Equal(closure,m["reference_closure"]){return nil,f08Binding}
+		for _,anchor:=range anchors{k,_:=f08Key(anchor);all[k]=anchor}
+	}
+	if !f08Equal(g.pins,f08Pins(f08SortedAnchors(all))){return nil,f08Binding};return g,nil
+}
+func(v *f08ProofValidator) responseBody(req f08CancelRequest,raw []byte,status string)(f08ValidatedResponse,error){return f08ResponseBody(v.protocol,req,raw,status)}
+func(v *f08ProofValidator) eventClaim(s *f08Sources,project string,claim any,aggregate f08Version,kind string)(f08Version,error){
+	var zero f08Version;m,e:=f08Object(claim,"version_ref","outbox_id","sequence","body_digest");if e!=nil{return zero,e}
+	event,e:=v.version(s,project,m["version_ref"]);if e!=nil || event.kind!="EventEnvelope" || event.body["event_type"]!=kind || !f08Equal(event.body["aggregate_ref"],aggregate.ref()){return zero,f08Binding}
+	want,e:=v.exactEvent(s,event);if e!=nil || !f08Equal(want,m){return zero,f08Binding};return event,nil
+}

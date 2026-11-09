@@ -1,0 +1,68 @@
+--- base/internal/domain/backup_command_queue_test.go
++++ candidate-root/internal/domain/backup_command_queue_test.go
+@@ -117,9 +117,9 @@
+ }
+ func TestClientQueueFreshNumberedSchema(t *testing.T) {
+ 	f := setup(t)
+-	_, sqls, err := upgradeConfigurationRelease("../..", 23)
+-	if err != nil || len(sqls) != 24 {
+-		t.Fatalf("exact installed schema23 release: %d %v", len(sqls), err)
++	_, sqls, err := preparedUpgradeRelease("../..", 24)
++	if err != nil || len(sqls) != 25 {
++		t.Fatalf("exact installed schema24 release: %d %v", len(sqls), err)
+ 	}
+ 	want := len(sqls) - 1 // The final entry is the separately pinned additive SQL.
+ 	rows, err := f.db.Query(`SELECT version FROM schema_migrations ORDER BY version`)
+@@ -153,7 +153,7 @@
+ 	if raw, err := os.ReadFile("../../migrations/sqlite/0022_client_command_queue.sql"); err != nil || len(raw) == 0 {
+ 		t.Fatal("numbered SQL absent", err)
+ 	}
+-	configurationEvidenceSnapshot(t, f.db, "fresh-current23")
++	configurationEvidenceSnapshot(t, f.db, "fresh-current24")
+ }
+ 
+ func TestClientQueueHistorical22NumberedSchema(t *testing.T) {
+--- base/internal/domain/backup_host_configuration_test.go
++++ candidate-root/internal/domain/backup_host_configuration_test.go
+@@ -289,7 +289,20 @@
+ }
+ 
+ func TestHandlerRejectedSessionPublicBackupReplay(t *testing.T) {
+-	f := setup(t)
++	t.Run("current24", func(t *testing.T) {
++		handlerRejectedSessionPublicBackupReplay(t, setup(t), 24)
++	})
++	t.Run("historical23", func(t *testing.T) {
++		root := configurationUpgradeReleaseFixture(t, 23)
++		f := setupWithConstructor(t, func(db *sql.DB, _, _ string) (*Service, error) {
++			return New(db, filepath.Join(root, "spec/v2.0/contracts"), filepath.Join(root, "migrations/sqlite/0002_domain.sql"))
++		})
++		handlerRejectedSessionPublicBackupReplay(t, f, 23)
++	})
++}
++
++func handlerRejectedSessionPublicBackupReplay(t *testing.T, f *fixture, version int) {
++	t.Helper()
+ 	doc := configurationSchema(t)
+ 	port := handlerBackupWorkspace{t.TempDir(), f.owner}
+ 	owner := Principal{ID: f.owner, Roles: []string{"OWNER"}, CanCreateProject: true}
+@@ -377,7 +390,7 @@
+ 		}
+ 		return pins, nil
+ 	}
+-	if _, e := RestoreBackup(context.Background(), dir, dst, RestoreOptions{Key: key, SupportedMigrations: upgradeVersions(23), Contracts: f.s.Contracts, DatabaseName: "researchos.sqlite", WorkspaceTarget: pin}); e != nil {
++	if _, e := RestoreBackup(context.Background(), dir, dst, RestoreOptions{Key: key, SupportedMigrations: upgradeVersions(version), Contracts: f.s.Contracts, DatabaseName: "researchos.sqlite", WorkspaceTarget: pin}); e != nil {
+ 		t.Fatal(e)
+ 	}
+ 	db, e := store.Open(filepath.Join(dst, "researchos.sqlite"))
+--- base/internal/domain/client_configuration_test.go
++++ candidate-root/internal/domain/client_configuration_test.go
+@@ -300,7 +300,7 @@
+ 			t.Fatal(e)
+ 		}
+ 		var version int
+-		if e := db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&version); e != nil || version != 23 {
++		if e := db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&version); e != nil || version != 24 {
+ 			t.Fatalf("%d %v", version, e)
+ 		}
+ 		if configurationCount(t, db, "client_sessions") != 0 || configurationCount(t, db, "host_model_configurations") != 0 {

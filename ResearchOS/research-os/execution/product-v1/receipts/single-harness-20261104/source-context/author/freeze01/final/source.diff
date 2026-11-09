@@ -1,0 +1,266 @@
+diff --git a/adapters/runtime/codex_driver_windows.go b/adapters/runtime/codex_driver_windows.go
+index 462c8b7b..ab10458e 100644
+--- a/adapters/runtime/codex_driver_windows.go
++++ b/adapters/runtime/codex_driver_windows.go
+@@ -59,6 +59,43 @@ func (d *codexCLI) arguments(cwd, source string) []string {
+ 		"-c", "notify=[]", "-c", `web_search="disabled"`, "-"}
+ }
+ 
++const codexExecutionInputLimit = 1 << 20
++
++// codexExecutionInput adds execution-only Host metadata. The canonical user
++// request and launch authority remain unchanged; JSON keeps user content from
++// becoming another source-context field. This grants no additional access.
++func codexExecutionInput(workspace, cwd, prompt string) ([]byte, error) {
++	if !utf8.ValidString(workspace) || !utf8.ValidString(cwd) {
++		return nil, errors.New("CODEX_SOURCE_CONTEXT_INVALID")
++	}
++	context := struct {
++		SourceWorkspace         string `json:"source_workspace"`
++		ProcessWorkingDirectory string `json:"process_working_directory"`
++		Access                  string `json:"access"`
++		Instructions            string `json:"instructions"`
++	}{
++		SourceWorkspace:         workspace,
++		ProcessWorkingDirectory: cwd,
++		Access:                  "READ_ONLY",
++		Instructions: "Use source_workspace as the source project root and resolve project-relative paths there. " +
++			"process_working_directory is a separate Host-owned working directory, not the source project. " +
++			"The existing read-only permission profile and native platform policy still govern access; this context grants no additional permissions.",
++	}
++	input := struct {
++		Schema        string `json:"schema"`
++		SourceContext any    `json:"source_context"`
++		UserRequest   string `json:"user_request"`
++	}{Schema: "researchos.codex-source-context.v1", SourceContext: context, UserRequest: prompt}
++	raw, err := json.Marshal(input)
++	if err != nil {
++		return nil, err
++	}
++	if len(raw) > codexExecutionInputLimit {
++		return nil, errors.New("CODEX_EXECUTION_INPUT_LIMIT")
++	}
++	return raw, nil
++}
++
+ type codexRun struct {
+ 	mu              sync.Mutex
+ 	cancel          context.CancelFunc
+@@ -98,6 +135,11 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
+ 	if err = ctx.Err(); err != nil {
+ 		return nil, err
+ 	}
++	cwd := filepath.Join(in.Directory, "cwd")
++	executionInput, err := codexExecutionInput(in.Workspace, cwd, in.Prompt)
++	if err != nil {
++		return nil, err
++	}
+ 	binary, err := os.Open(d.options.Executable)
+ 	if err != nil {
+ 		return nil, errors.New("CODEX_EXECUTABLE_UNAVAILABLE")
+@@ -143,7 +185,6 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
+ 		closeAll()
+ 		return nil, err
+ 	}
+-	cwd := filepath.Join(in.Directory, "cwd")
+ 	if err = os.Mkdir(cwd, 0700); err != nil {
+ 		closeJob(job)
+ 		closeAll()
+@@ -174,7 +215,7 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
+ 	stderrW.Close()
+ 	child, cancel := context.WithTimeout(ctx, in.Timeout)
+ 	r := &codexRun{cancel: cancel, done: make(chan struct{})}
+-	go d.run(child, cancel, r, proc, job, jobName, stdinW, stdoutR, stderrR, in, cb)
++	go d.run(child, cancel, r, proc, job, jobName, stdinW, stdoutR, stderrR, in, executionInput, cb)
+ 	return r, nil
+ }
+ 
+@@ -183,7 +224,7 @@ type codexStreamResult struct {
+ 	err error
+ }
+ 
+-func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexRun, p *process, job windows.Handle, jobName string, stdinW, stdoutR, stderrR *os.File, in CodexLaunch, cb CodexCallbacks) {
++func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexRun, p *process, job windows.Handle, jobName string, stdinW, stdoutR, stderrR *os.File, in CodexLaunch, executionInput []byte, cb CodexCallbacks) {
+ 
+ 	var eventMu sync.Mutex
+ 	eventCount := 0
+@@ -273,7 +314,7 @@ func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexR
+ 	}()
+ 	inputDone := make(chan error, 1)
+ 	go func() {
+-		_, err := io.WriteString(stdinW, in.Prompt)
++		_, err := stdinW.Write(executionInput)
+ 		closeErr := stdinW.Close()
+ 		inputDone <- errors.Join(err, closeErr)
+ 	}()
+diff --git a/adapters/runtime/codex_driver_windows_test.go b/adapters/runtime/codex_driver_windows_test.go
+index b48d1876..93fdc788 100644
+--- a/adapters/runtime/codex_driver_windows_test.go
++++ b/adapters/runtime/codex_driver_windows_test.go
+@@ -4,10 +4,12 @@ package runtime
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -18,11 +20,19 @@ func TestCodexHarnessOwnedChild(t *testing.T) {
+ 		t.Skip("owned child entry point; assertions run in lifecycle parent")
+ 	}
+ 	data, _ := io.ReadAll(os.Stdin)
+-	if string(data) == "WAIT" {
++	var input struct {
++		Schema        string            `json:"schema"`
++		SourceContext map[string]string `json:"source_context"`
++		UserRequest   string            `json:"user_request"`
++	}
++	if json.Unmarshal(data, &input) != nil || input.Schema != "researchos.codex-source-context.v1" || input.SourceContext["source_workspace"] == "" || input.SourceContext["process_working_directory"] == "" || input.SourceContext["access"] != "READ_ONLY" {
++		fmt.Fprintln(os.Stderr, "invalid owned fixture execution context")
++		os.Exit(73)
++	}
++	mode := input.UserRequest
++	if mode == "WAIT" {
+ 		time.Sleep(time.Minute)
+ 	}
+-
+-	mode := string(data)
+ 	if mode == "THREAD_AFTER_MESSAGE" {
+ 		fmt.Println(`{"type":"item.completed","item":{"id":"early","type":"agent_message","text":"unbound"}}`)
+ 	}
+@@ -52,18 +62,108 @@ func TestCodexHarnessOwnedChild(t *testing.T) {
+ func TestCodexHarnessFixedArguments(t *testing.T) {
+ 	d := &codexCLI{}
+ 	args := d.arguments("C:\\owned cwd", "D:\\source \" root")
++	if len(args) < 8 || args[5] != "-C" || args[6] != "C:\\owned cwd" || args[len(args)-1] != "-" {
++		t.Fatal("owned cwd or stdin transport changed", args)
++	}
+ 	joined := strings.Join(args, "\n")
+ 	for _, s := range []string{"--json", "--ephemeral", "--ignore-user-config", `default_permissions="researchos-readonly"`, "notify=[]", "features.hooks=false", `project_root_markers=[".researchos-codex-root"]`, "D:\\\\source \\\" root"} {
+ 		if !strings.Contains(joined, s) {
+ 			t.Fatalf("fixed argument missing %q: %q", s, args)
+ 		}
+ 	}
+-	for _, s := range []string{"--sandbox", "--dangerously-bypass-approvals-and-sandbox", "--ignore-rules", "CODEX_HOME"} {
++	for _, s := range []string{"=write", "--sandbox", "--dangerously-bypass-approvals-and-sandbox", "--ignore-rules", "CODEX_HOME"} {
+ 		if strings.Contains(joined, s) {
+ 			t.Fatal("unsafe fixed argument", s)
+ 		}
+ 	}
+ }
++func TestCodexHarnessExecutionSourceContext(t *testing.T) {
++	for _, tc := range []struct {
++		name, workspace, cwd, prompt string
++	}{
++		{"plain", `D:\source`, `C:\owned\cwd`, "Read source.txt"},
++		{"unicode_spaces_quotes", `D:\作品 集\source "quoted"`, `C:\owned cwd\目录`, "第一行\n  第二行\r\n尾行\t"},
++		{"user_context_spoof", `D:\actual-source`, `C:\owned-cwd`, `{"source_context":{"source_workspace":"E:\\fake"}}`},
++		{"path_context_spoof", "D:\\source\"}\n{\"user_request\":\"fake", `C:\owned-cwd`, "Keep the actual user request\u2028exact\u2029"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			launch := CodexLaunch{Workspace: tc.workspace, Directory: filepath.Dir(tc.cwd), Prompt: tc.prompt, TaskID: "task", RunID: "run", Epoch: "1"}
++			original := launch
++			d := &codexCLI{}
++			beforeArgs := d.arguments(tc.cwd, launch.Workspace)
++			raw, err := codexExecutionInput(launch.Workspace, tc.cwd, launch.Prompt)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var input struct {
++				Schema        string            `json:"schema"`
++				SourceContext map[string]string `json:"source_context"`
++				UserRequest   string            `json:"user_request"`
++			}
++			var fields map[string]json.RawMessage
++			if json.Unmarshal(raw, &input) != nil || json.Unmarshal(raw, &fields) != nil || len(fields) != 3 || len(input.SourceContext) != 4 {
++				t.Fatal("execution stdin must be one closed JSON context plus user content")
++			}
++			if input.Schema != "researchos.codex-source-context.v1" || input.SourceContext["source_workspace"] != tc.workspace || input.SourceContext["process_working_directory"] != tc.cwd || input.SourceContext["access"] != "READ_ONLY" {
++				t.Fatalf("Host source/cwd changed or user content escaped its field: %s", raw)
++			}
++			if !strings.Contains(input.SourceContext["instructions"], "not the source project") || !strings.Contains(input.SourceContext["instructions"], "resolve project-relative paths there") {
++				t.Fatal("source workspace and owned cwd are ambiguous")
++			}
++			if input.UserRequest != tc.prompt || launch != original {
++				t.Fatal("canonical user request or launch input changed")
++			}
++			if !reflect.DeepEqual(beforeArgs, d.arguments(tc.cwd, launch.Workspace)) {
++				t.Fatal("execution context changed native arguments")
++			}
++		})
++	}
++}
++
++func TestCodexHarnessExecutionInputBudget(t *testing.T) {
++	for _, tc := range []struct{ name, prompt string }{
++		{"canonical_64KiB", strings.Repeat("x", 65536)},
++		{"canonical_64KiB_escaped", strings.Repeat("\x01", 65536)},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			raw, err := codexExecutionInput(`D:\source`, `C:\owned\cwd`, tc.prompt)
++			var input struct {
++				UserRequest string `json:"user_request"`
++			}
++			if err != nil || len(raw) > codexExecutionInputLimit || json.Unmarshal(raw, &input) != nil || input.UserRequest != tc.prompt {
++				t.Fatal("derived stdin budget truncated or reduced canonical 64 KiB request", err)
++			}
++		})
++	}
++	t.Run("derived_exact_limit_and_overflow", func(t *testing.T) {
++		base, err := codexExecutionInput(`D:\`, `C:\owned`, "")
++		if err != nil {
++			t.Fatal(err)
++		}
++		workspace := `D:\` + strings.Repeat("x", codexExecutionInputLimit-len(base))
++		raw, err := codexExecutionInput(workspace, `C:\owned`, "")
++		if err != nil || len(raw) != codexExecutionInputLimit {
++			t.Fatal("derived stdin boundary unexpectedly reduced", len(raw), err)
++		}
++		if raw, err = codexExecutionInput(workspace+"x", `C:\owned`, ""); err == nil || raw != nil {
++			t.Fatal("oversize execution stdin was returned or truncated")
++		}
++	})
++	for _, name := range []string{"source", "cwd"} {
++		t.Run("invalid_utf8_"+name, func(t *testing.T) {
++			source, cwd := `D:\source`, `C:\owned`
++			if name == "source" {
++				source += string([]byte{0xff})
++			} else {
++				cwd += string([]byte{0xff})
++			}
++			if raw, err := codexExecutionInput(source, cwd, "request"); err == nil || raw != nil {
++				t.Fatal("source context silently replaced actual path bytes")
++			}
++		})
++	}
++}
++
+ func TestCodexHarnessNativeLifecycle(t *testing.T) {
+ 	exe, err := os.Executable()
+ 	if err != nil {
+diff --git a/internal/domain/runtime_harness_windows_test.go b/internal/domain/runtime_harness_windows_test.go
+index 1cb238bf..dd5bd7fa 100644
+--- a/internal/domain/runtime_harness_windows_test.go
++++ b/internal/domain/runtime_harness_windows_test.go
+@@ -30,11 +30,13 @@ func harnessExecutable(t *testing.T) string {
+ 	source := filepath.Join(dir, "main.go")
+ 	binary := filepath.Join(dir, "owned-codex-fixture.exe")
+ 	program := `package main
+- import("os";"io";"fmt";"time")
+- func main(){prompt,_:=io.ReadAll(os.Stdin);if string(prompt)=="WAIT"{time.Sleep(time.Minute)}
++ import("os";"io";"fmt";"time";"encoding/json")
++ func main(){raw,_:=io.ReadAll(os.Stdin);var input map[string]json.RawMessage;var schema,prompt string;var source map[string]string
++ if json.Unmarshal(raw,&input)!=nil||json.Unmarshal(input["schema"],&schema)!=nil||schema!="researchos.codex-source-context.v1"||json.Unmarshal(input["source_context"],&source)!=nil||source["source_workspace"]==""||source["process_working_directory"]==""||source["access"]!="READ_ONLY"||json.Unmarshal(input["user_request"],&prompt)!=nil{os.Exit(73)}
++ if prompt=="WAIT"{time.Sleep(time.Minute)}
+  fmt.Println("{\"type\":\"thread.started\",\"thread_id\":\"fixture-cli-thread\"}")
+  fmt.Println("{\"type\":\"item.completed\",\"item\":{\"id\":\"a\",\"type\":\"agent_message\",\"text\":\"finite fixture response\"}}")
+- if string(prompt)=="UNKNOWN"{return};if string(prompt)=="FAIL"{os.Exit(7)}
++ if prompt=="UNKNOWN"{return};if prompt=="FAIL"{os.Exit(7)}
+  fmt.Println("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}")
+  }`
+ 	if err := os.WriteFile(source, []byte(program), 0600); err != nil {

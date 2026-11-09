@@ -1,0 +1,3162 @@
+diff --git a/internal/recoveryboundary/contract.go b/internal/recoveryboundary/contract.go
+new file mode 100644
+index 00000000..b8d230b3
+--- /dev/null
++++ b/internal/recoveryboundary/contract.go
+@@ -0,0 +1,290 @@
++package recoveryboundary
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++const (
++	PlanSchema    = "researchos.recovery-boundary-plan.v1"
++	EventSchema   = "researchos.recovery-boundary-event.v1"
++	WitnessSchema = "researchos.post-restart-current-quiescence.v1"
++	// CurrentQuiescenceClass is scoped only to the C maintenance transaction.
++	// It is not a historical Wait, STOP closure, B drain ticket, or D proof.
++	CurrentQuiescenceClass = "POST_RESTART_CURRENT_QUIESCENCE_V1"
++	MaxElapsed             = 30 * time.Minute
++	MaxPostUptime          = 10 * time.Minute
++)
++
++// FileIdentity is evidence only. The native checker always reopens the object.
++type FileIdentity struct {
++	Path               string `json:"path"`
++	FinalUTF16         string `json:"final_utf16"`
++	Volume             uint64 `json:"volume"`
++	FileID             string `json:"file_id"`
++	SHA256             string `json:"sha256,omitempty"`
++	SecurityDescriptor string `json:"security_descriptor"`
++	Directory          bool   `json:"directory"`
++}
++
++type FenceTarget struct {
++	File              FileIdentity `json:"file"`
++	Mode              string       `json:"mode"` // executable or script; exact access is checked natively
++	InstalledSD       string       `json:"installed_sd,omitempty"`
++	RestartArgsSHA256 []string     `json:"restart_args_sha256,omitempty"`
++}
++
++// EntryFencePlan describes the complete, frozen official entry inventory.
++// Merely decoding one never grants an operation.
++type EntryFencePlan struct {
++	Schema                 string         `json:"schema"`
++	OperationID            string         `json:"operation_id"`
++	PlanSHA256             string         `json:"plan_sha256"`
++	DataRoot               FileIdentity   `json:"data_root"`
++	Database               FileIdentity   `json:"database"`
++	Helper                 FileIdentity   `json:"helper"`
++	BusinessSID            string         `json:"business_sid"`
++	BusinessGroupSIDs      []string       `json:"business_group_sids"` // native enabled groups excluding only per-logon SID and integrity label
++	ManagementSID          string         `json:"management_sid"`
++	HostIdentitySHA256     string         `json:"host_identity_sha256"`
++	SubjectSHA256          string         `json:"subject_sha256"`
++	EvidenceSHA256         string         `json:"evidence_sha256"`
++	BackupManifestSHA256   string         `json:"backup_manifest_sha256"`
++	SourceAcceptanceSHA256 string         `json:"source_acceptance_sha256"`
++	NativeAcceptanceSHA256 string         `json:"native_acceptance_sha256"`
++	RecoveryPackageSHA256  string         `json:"recovery_package_sha256"`
++	Targets                []FenceTarget  `json:"targets"`
++	Ancestors              []FileIdentity `json:"ancestors"`
++}
++
++type BootWitness struct {
++	Schema                     string    `json:"schema"`
++	OperationID                string    `json:"operation_id"`
++	PlanSHA256                 string    `json:"plan_sha256"`
++	HelperSHA256               string    `json:"helper_sha256"`
++	UTC                        time.Time `json:"utc"`
++	UptimeMilliseconds         uint64    `json:"uptime_milliseconds"`
++	LastBootUTC                time.Time `json:"last_boot_utc"`
++	RestartApps                uint32    `json:"restart_apps"`
++	FenceSHA256                string    `json:"fence_sha256"`
++	BusinessEnabledSIDsSHA256  string    `json:"business_enabled_sids_sha256,omitempty"`
++	BusinessSessionID          uint32    `json:"business_session_id,omitempty"`
++	BusinessElevationType      uint32    `json:"business_elevation_type,omitempty"`
++	BusinessIntegritySID       string    `json:"business_integrity_sid,omitempty"`
++	BusinessLogonSID           string    `json:"business_logon_sid,omitempty"`
++	BusinessPrivilegesSHA256   string    `json:"business_privileges_sha256,omitempty"`
++	BusinessProcessPID         uint32    `json:"business_process_pid,omitempty"`
++	BusinessProcessCreatedUTC  time.Time `json:"business_process_created_utc,omitempty"`
++	BusinessProcessImageSHA256 string    `json:"business_process_image_sha256,omitempty"`
++	FullRestartEvidenceSHA256  string    `json:"full_restart_evidence_sha256,omitempty"`
++}
++
++type BoundaryEvent struct {
++	Schema         string    `json:"schema"`
++	Sequence       uint64    `json:"sequence"`
++	PreviousSHA256 string    `json:"previous_sha256"`
++	SHA256         string    `json:"sha256"`
++	OperationID    string    `json:"operation_id"`
++	PlanSHA256     string    `json:"plan_sha256"`
++	State          string    `json:"state"`
++	UTC            time.Time `json:"utc"`
++}
++
++// BoundaryAttestation is a protected external reviewer or backup report.
++// A digest alone, a static copy, or a caller assertion cannot satisfy arm.
++type BoundaryAttestation struct {
++	Schema                string    `json:"schema"`
++	Kind                  string    `json:"kind"`
++	Status                string    `json:"status"`
++	OperationID           string    `json:"operation_id"`
++	PlanCoreSHA256        string    `json:"plan_core_sha256"`
++	Issuer                string    `json:"issuer"`
++	EvidenceSHA256        string    `json:"evidence_sha256"`
++	BackupID              string    `json:"backup_id,omitempty"`
++	RestoreTestSHA256     string    `json:"restore_test_sha256,omitempty"`
++	CredentialProbeSHA256 string    `json:"credential_probe_sha256,omitempty"`
++	RecordedUTC           time.Time `json:"recorded_utc"`
++}
++
++func digest(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToString(h[:]) }
++func validDigest(s string) bool {
++	if len(s) != 64 {
++		return false
++	}
++	_, e := hex.DecodeString(s)
++	return e == nil && s == strings.ToLower(s)
++}
++func validOperation(s string) bool {
++	if len(s) != 32 || s != strings.ToLower(s) {
++		return false
++	}
++	for _, c := range s {
++		if !(c >= 'a' && c <= 'f' || c >= '0' && c <= '9') {
++			return false
++		}
++	}
++	return true
++}
++
++func PlanCoreSHA256(p EntryFencePlan) (string, error) {
++	p.PlanSHA256 = ""
++	p.SourceAcceptanceSHA256 = ""
++	p.NativeAcceptanceSHA256 = ""
++	p.BackupManifestSHA256 = ""
++	p.RecoveryPackageSHA256 = ""
++	raw, e := json.Marshal(p)
++	if e != nil {
++		return "", e
++	}
++	return digest(raw), nil
++}
++
++func ComputePlanSHA256(p EntryFencePlan) (string, error) {
++	p.PlanSHA256 = ""
++	raw, e := json.Marshal(p)
++	if e != nil {
++		return "", e
++	}
++	return digest(raw), nil
++}
++
++func ValidatePlan(p EntryFencePlan) error {
++	expected, err := ComputePlanSHA256(p)
++	if err != nil || p.PlanSHA256 != expected {
++		return errors.New("boundary plan canonical digest mismatch")
++	}
++	if p.Schema != PlanSchema || !validOperation(p.OperationID) || !validDigest(p.PlanSHA256) ||
++		!validDigest(p.HostIdentitySHA256) || !validDigest(p.SubjectSHA256) ||
++		!validDigest(p.EvidenceSHA256) || !validDigest(p.BackupManifestSHA256) ||
++		!validDigest(p.SourceAcceptanceSHA256) || !validDigest(p.NativeAcceptanceSHA256) ||
++		!validDigest(p.RecoveryPackageSHA256) || p.BusinessSID == "" || p.ManagementSID == "" ||
++		strings.EqualFold(p.BusinessSID, p.ManagementSID) || len(p.Targets) == 0 || len(p.Targets) > 64 {
++		return errors.New("recovery boundary plan incomplete")
++	}
++	if p.DataRoot.Path == "" || p.Database.Path != filepath.Join(p.DataRoot.Path, "researchos.sqlite") || p.Helper.Path == "" {
++		return errors.New("recovery boundary root, database or helper mismatch")
++	}
++	if len(p.BusinessGroupSIDs) == 0 || len(p.BusinessGroupSIDs) > 64 {
++		return errors.New("business enabled group inventory missing")
++	}
++	seen := map[string]bool{}
++	if len(p.Ancestors) == 0 || len(p.Ancestors) > 256 {
++		return errors.New("boundary ancestor inventory missing")
++	}
++	for _, a := range p.Ancestors {
++		if !a.Directory || a.FileID == "" || a.FinalUTF16 == "" || a.SecurityDescriptor == "" || seen[strings.ToLower(a.Path)] {
++			return errors.New("boundary ancestor identity invalid")
++		}
++		seen[strings.ToLower(a.Path)] = true
++	}
++	for _, t := range p.Targets {
++		if t.Mode != "executable" && t.Mode != "script" {
++			return errors.New("unknown fence target mode")
++		}
++		if !filepath.IsAbs(t.File.Path) || filepath.Clean(t.File.Path) != t.File.Path || seen[strings.ToLower(t.File.Path)] || t.File.Directory {
++			return errors.New("fence inventory path invalid")
++		}
++		seen[strings.ToLower(t.File.Path)] = true
++		if len(t.RestartArgsSHA256) > 16 {
++			return errors.New("restart argv inventory unbounded")
++		}
++		for _, sha := range t.RestartArgsSHA256 {
++			if !validDigest(sha) {
++				return errors.New("restart argv digest invalid")
++			}
++		}
++	}
++	return nil
++}
++
++func ValidateRestart(pre, post BootWitness) error {
++	if pre.Schema != WitnessSchema || post.Schema != WitnessSchema || pre.OperationID != post.OperationID || pre.PlanSHA256 != post.PlanSHA256 || pre.HelperSHA256 != post.HelperSHA256 || pre.FenceSHA256 != post.FenceSHA256 || !validDigest(pre.PlanSHA256) || !validDigest(pre.FenceSHA256) || !validDigest(pre.HelperSHA256) {
++		return errors.New("witness binding changed")
++	}
++	if pre.UptimeMilliseconds < uint64(MaxPostUptime/time.Millisecond) || post.UptimeMilliseconds >= uint64(MaxPostUptime/time.Millisecond) || post.UptimeMilliseconds >= pre.UptimeMilliseconds {
++		return errors.New("uptime does not prove fresh restart")
++	}
++	if pre.LastBootUTC.IsZero() || post.LastBootUTC.IsZero() || !post.LastBootUTC.After(pre.LastBootUTC) {
++		return errors.New("boot time did not advance")
++	}
++	if pre.UTC.IsZero() || post.UTC.IsZero() || post.UTC.Before(pre.UTC) || post.UTC.Sub(pre.UTC) > MaxElapsed {
++		return errors.New("witness outside bounded UTC window")
++	}
++	if post.LastBootUTC.Before(pre.UTC.Add(-2*time.Minute)) || post.LastBootUTC.After(post.UTC) {
++		return errors.New("boot time contradicts witness UTC")
++	}
++	for _, w := range []BootWitness{pre, post} {
++		expected := w.UTC.Add(-time.Duration(w.UptimeMilliseconds) * time.Millisecond)
++		if w.LastBootUTC.Before(expected.Add(-2*time.Minute)) || w.LastBootUTC.After(expected.Add(2*time.Minute)) {
++			return errors.New("native uptime and boot time disagree")
++		}
++	}
++	if pre.RestartApps > 1 || post.RestartApps > 1 || pre.RestartApps != post.RestartApps {
++		return errors.New("RestartApps state unknown")
++	}
++	if pre.FullRestartEvidenceSHA256 != "" || !validDigest(post.FullRestartEvidenceSHA256) {
++		return errors.New("explicit FullRestart evidence missing")
++	}
++	if !validDigest(pre.BusinessEnabledSIDsSHA256) || pre.BusinessEnabledSIDsSHA256 != post.BusinessEnabledSIDsSHA256 ||
++		!validDigest(pre.BusinessPrivilegesSHA256) || pre.BusinessPrivilegesSHA256 != post.BusinessPrivilegesSHA256 ||
++		pre.BusinessElevationType < 1 || pre.BusinessElevationType > 3 || pre.BusinessElevationType != post.BusinessElevationType ||
++		pre.BusinessIntegritySID == "" || pre.BusinessIntegritySID != post.BusinessIntegritySID ||
++		pre.BusinessLogonSID == "" || post.BusinessLogonSID == "" {
++		return errors.New("business token permission semantics changed across restart")
++	}
++	for _, w := range []BootWitness{pre, post} {
++		if w.BusinessProcessPID == 0 || !validDigest(w.BusinessProcessImageSHA256) || w.BusinessProcessCreatedUTC.IsZero() ||
++			w.BusinessProcessCreatedUTC.Before(w.LastBootUTC.Add(-2*time.Second)) || w.BusinessProcessCreatedUTC.After(w.UTC.Add(2*time.Second)) {
++			return errors.New("business token source process identity invalid")
++		}
++	}
++	return nil
++}
++
++func transition(from, to string) bool {
++	switch from {
++	case "":
++		return to == "PREPARED"
++	case "PREPARED":
++		return to == "APPLYING" || to == "BOUNDARY_ABORTED"
++	case "APPLYING":
++		return to == "ARMED" || to == "BOUNDARY_ABORTED"
++	case "ARMED":
++		return to == "BOOT_OBSERVED" || to == "BOUNDARY_ABORTED"
++	case "BOOT_OBSERVED":
++		return to == "C_HELD" || to == "BOUNDARY_ABORTED"
++	case "C_HELD":
++		return to == "C_DURABLE" || to == "BOUNDARY_ABORTED"
++	case "C_DURABLE", "BOUNDARY_ABORTED":
++		return to == "DISARMING"
++	case "DISARMING":
++		return to == "CLOSED"
++	}
++	return false
++}
++
++func ValidateEvents(events []BoundaryEvent, operation, plan string) error {
++	if len(events) == 0 || len(events) > 16 {
++		return errors.New("boundary event inventory invalid")
++	}
++	prevState, prevHash := "", ""
++	for i, e := range events {
++		if e.Schema != EventSchema || e.Sequence != uint64(i+1) || e.PreviousSHA256 != prevHash || e.OperationID != operation || e.PlanSHA256 != plan || !transition(prevState, e.State) || e.UTC.IsZero() {
++			return fmt.Errorf("boundary event %d invalid", i+1)
++		}
++		copy := e
++		copy.SHA256 = ""
++		raw := []byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s", copy.Schema, copy.Sequence, copy.PreviousSHA256, copy.OperationID, copy.PlanSHA256, copy.State, copy.UTC.UTC().Format(time.RFC3339Nano)))
++		if e.SHA256 != digest(raw) {
++			return fmt.Errorf("boundary event %d hash drift", i+1)
++		}
++		prevState, prevHash = e.State, e.SHA256
++	}
++	return nil
++}
+diff --git a/internal/recoveryboundary/boot_windows.go b/internal/recoveryboundary/boot_windows.go
+new file mode 100644
+index 00000000..bc10fc1c
+--- /dev/null
++++ b/internal/recoveryboundary/boot_windows.go
+@@ -0,0 +1,2015 @@
++//go:build windows
++
++package recoveryboundary
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++	"golang.org/x/sys/windows/registry"
++	rt "researchos.local/research-os/adapters/runtime"
++	"researchos.local/research-os/internal/qualificationmaintenancejournal"
++)
++
++type nativeHold struct {
++	path     string
++	handle   windows.Handle
++	identity FileIdentity
++}
++type quiescenceOwner struct {
++	mu     sync.Mutex
++	closed bool
++	lease  rt.DataRootLeaseIdentity
++	plan   EntryFencePlan
++	post   BootWitness
++	holds  []nativeHold
++}
++
++// CurrentQuiescence has no public constructor or serializable authority.
++// Value copies share one owner; Close consumes every copy's held native state.
++type CurrentQuiescence struct{ owner *quiescenceOwner }
++
++type boundaryRecord struct {
++	Plan       EntryFencePlan  `json:"plan"`
++	Pre        BootWitness     `json:"pre"`
++	Post       BootWitness     `json:"post"`
++	Events     []BoundaryEvent `json:"events"`
++	Generation uint64          `json:"generation"`
++}
++
++func nativeFileID(h windows.Handle) (uint64, string, error) {
++	var x struct {
++		VolumeSerialNumber uint64
++		FileID             [16]byte
++	}
++	if err := windows.GetFileInformationByHandleEx(h, windows.FileIdInfo, (*byte)(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x))); err != nil {
++		return 0, "", err
++	}
++	return x.VolumeSerialNumber, hex.EncodeToString(x.FileID[:]), nil
++}
++
++func finalPath(h windows.Handle) (string, error) {
++	buf := make([]uint16, 512)
++	for len(buf) <= 32768 {
++		n, e := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
++		if e != nil {
++			return "", e
++		}
++		if n == 0 {
++			return "", errors.New("empty final path")
++		}
++		if int(n) < len(buf) {
++			return windows.UTF16ToString(buf[:n]), nil
++		}
++		buf = make([]uint16, int(n)+1)
++	}
++	return "", errors.New("final path exceeds Windows bound")
++}
++
++func openNative(path string, directory bool, hashFile bool) (nativeHold, error) {
++	return openNativeAccess(path, directory, hashFile, 0)
++}
++
++func openNativeAccess(path string, directory bool, hashFile bool, extraAccess uint32) (nativeHold, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nativeHold{}, errors.New("native path is not canonical absolute")
++	}
++	if strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
++		return nativeHold{}, errors.New("alternate data stream forbidden")
++	}
++	w, e := windows.UTF16PtrFromString(path)
++	if e != nil {
++		return nativeHold{}, e
++	}
++	// No FILE_SHARE_DELETE: the live owner pins every opened component against
++	// rename/delete until the caller's actual outer transaction has returned.
++	h, e := windows.CreateFile(w, windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES|windows.FILE_READ_DATA|extraAccess,
++		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING,
++		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
++	if e != nil {
++		return nativeHold{}, e
++	}
++	fail := func(e error) (nativeHold, error) { windows.CloseHandle(h); return nativeHold{}, e }
++	var info windows.ByHandleFileInformation
++	if e = windows.GetFileInformationByHandle(h, &info); e != nil {
++		return fail(e)
++	}
++	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
++		return fail(errors.New("reparse point or file kind mismatch"))
++	}
++	if !directory && info.NumberOfLinks != 1 {
++		return fail(errors.New("hard-linked boundary file forbidden"))
++	}
++	v, id, e := nativeFileID(h)
++	if e != nil {
++		return fail(e)
++	}
++	final, e := finalPath(h)
++	if e != nil {
++		return fail(e)
++	}
++	sd, e := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
++	if e != nil {
++		return fail(e)
++	}
++	x := FileIdentity{Path: path, FinalUTF16: final, Volume: v, FileID: id, SecurityDescriptor: sd.String(), Directory: directory}
++	if hashFile {
++		if directory {
++			return fail(errors.New("cannot hash directory"))
++		}
++		s := sha256.New()
++		var total int64
++		buf := make([]byte, 64<<10)
++		for {
++			var n uint32
++			e = windows.ReadFile(h, buf, &n, nil)
++			if e != nil {
++				return fail(e)
++			}
++			if n == 0 {
++				break
++			}
++			total += int64(n)
++			if total > 128<<20 {
++				return fail(errors.New("hash input exceeds bound"))
++			}
++			_, _ = s.Write(buf[:n])
++		}
++		x.SHA256 = hex.EncodeToString(s.Sum(nil))
++	}
++	return nativeHold{path: path, handle: h, identity: x}, nil
++}
++
++func closeHolds(holds []nativeHold) error {
++	var out error
++	for i := len(holds) - 1; i >= 0; i-- {
++		out = errors.Join(out, windows.CloseHandle(holds[i].handle))
++	}
++	return out
++}
++
++func identityEqual(a, b FileIdentity) bool {
++	return strings.EqualFold(a.Path, b.Path) && strings.EqualFold(a.FinalUTF16, b.FinalUTF16) && a.Volume == b.Volume && a.FileID == b.FileID && a.SHA256 == b.SHA256 && a.SecurityDescriptor == b.SecurityDescriptor && a.Directory == b.Directory
++}
++func identityCoreEqual(a, b FileIdentity) bool {
++	a.SecurityDescriptor = ""
++	b.SecurityDescriptor = ""
++	return identityEqual(a, b)
++}
++
++func pathAncestors(path string) []string {
++	var xs []string
++	for p := filepath.Dir(path); ; p = filepath.Dir(p) {
++		xs = append(xs, p)
++		if filepath.Dir(p) == p {
++			break
++		}
++	}
++	for i, j := 0, len(xs)-1; i < j; i, j = i+1, j-1 {
++		xs[i], xs[j] = xs[j], xs[i]
++	}
++	return xs
++}
++
++func openPlanHolds(p EntryFencePlan) ([]nativeHold, error) {
++	all := []FileIdentity{p.DataRoot, p.Database, p.Helper}
++	all = append(all, p.Ancestors...)
++	for _, t := range p.Targets {
++		all = append(all, t.File)
++	}
++	want := map[string]FileIdentity{}
++	for _, x := range all {
++		want[strings.ToLower(x.Path)] = x
++	}
++	for _, x := range all {
++		for _, a := range pathAncestors(x.Path) {
++			if _, ok := want[strings.ToLower(a)]; !ok {
++				return nil, fmt.Errorf("ancestor absent from frozen inventory: %s", a)
++			}
++		}
++	}
++	keys := make([]string, 0, len(want))
++	for k := range want {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	var holds []nativeHold
++	for _, k := range keys {
++		x := want[k]
++		h, e := openNative(x.Path, x.Directory, !x.Directory)
++		if e != nil {
++			closeHolds(holds)
++			return nil, fmt.Errorf("open boundary identity %s: %w", x.Path, e)
++		}
++		matches := identityEqual(x, h.identity)
++		if !matches {
++			for _, target := range p.Targets {
++				if strings.EqualFold(target.File.Path, x.Path) && identityCoreEqual(x, h.identity) && target.InstalledSD == h.identity.SecurityDescriptor {
++					matches = true
++					break
++				}
++			}
++		}
++		if !matches {
++			windows.CloseHandle(h.handle)
++			closeHolds(holds)
++			return nil, fmt.Errorf("boundary identity drift: %s", x.Path)
++		}
++		holds = append(holds, h)
++	}
++	return holds, nil
++}
++
++func checkHolds(holds []nativeHold) error {
++	if len(holds) == 0 {
++		return errors.New("native boundary holds missing")
++	}
++	for _, h := range holds {
++		fresh, e := openNative(h.path, h.identity.Directory, !h.identity.Directory)
++		if e != nil {
++			return e
++		}
++		same := identityEqual(h.identity, fresh.identity)
++		if e = windows.CloseHandle(fresh.handle); e != nil {
++			return e
++		}
++		if !same {
++			return fmt.Errorf("native boundary identity changed: %s", h.path)
++		}
++	}
++	return nil
++}
++
++func registryRestartApps(businessSID string) (uint32, error) {
++	if _, e := windows.StringToSid(businessSID); e != nil {
++		return 0, e
++	}
++	k, e := registry.OpenKey(registry.USERS, businessSID+`\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`, registry.QUERY_VALUE)
++	if e != nil {
++		return 0, e
++	}
++	defer k.Close()
++	v, _, e := k.GetIntegerValue("RestartApps")
++	if e != nil || v > 1 {
++		return 0, errors.New("RestartApps registry state unavailable")
++	}
++	return uint32(v), nil
++}
++
++var getTick = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetTickCount64")
++var ntSystem = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQuerySystemInformation")
++var getApplicationRestartSettings = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetApplicationRestartSettings")
++
++func restartSettingsForProcess(h windows.Handle) (string, uint32, bool, error) {
++	var size, flags uint32
++	r, _, _ := getApplicationRestartSettings.Call(uintptr(h), 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&flags)))
++	if uint32(r) == 0x80070490 {
++		return "", 0, false, nil
++	} // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++	if uint32(r) != 0 || size == 0 || size > 1025 {
++		return "", 0, false, fmt.Errorf("restart registration size/status invalid: %#x/%d", uint32(r), size)
++	}
++	buf := make([]uint16, size)
++	r, _, _ = getApplicationRestartSettings.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&flags)))
++	if uint32(r) != 0 || size == 0 || size > uint32(len(buf)) || flags&^uint32(0xf) != 0 {
++		return "", 0, false, fmt.Errorf("restart registration read/status invalid: %#x/%d/%#x", uint32(r), size, flags)
++	}
++	return windows.UTF16ToString(buf[:size]), flags, true, nil
++}
++
++func bootClock() (uint64, time.Time, error) {
++	u, _, e := getTick.Call()
++	if e != windows.ERROR_SUCCESS && e != nil {
++		return 0, time.Time{}, e
++	}
++	var x struct {
++		BootTime          int64
++		CurrentTime       int64
++		TimeZoneBias      int64
++		CurrentTimeZoneID uint32
++		Reserved          uint32
++		BootTimeBias      uint64
++		SleepTimeBias     uint64
++	}
++	r, _, e := ntSystem.Call(3, uintptr(unsafe.Pointer(&x)), unsafe.Sizeof(x), 0)
++	if r != 0 {
++		return 0, time.Time{}, fmt.Errorf("NtQuerySystemInformation status %#x: %v", r, e)
++	}
++	if x.BootTime <= 0 {
++		return 0, time.Time{}, errors.New("native boot time unavailable")
++	}
++	return uint64(u), time.Unix(0, (x.BootTime-116444736000000000)*100).UTC(), nil
++}
++
++func witness(p EntryFencePlan, fenceHash string) (BootWitness, error) {
++	u, b, e := bootClock()
++	if e != nil {
++		return BootWitness{}, e
++	}
++	r, e := registryRestartApps(p.BusinessSID)
++	if e != nil {
++		return BootWitness{}, e
++	}
++	return BootWitness{Schema: WitnessSchema, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, HelperSHA256: p.Helper.SHA256, UTC: time.Now().UTC(), UptimeMilliseconds: u, LastBootUTC: b, RestartApps: r, FenceSHA256: fenceHash}, nil
++}
++
++func stateRoot(p EntryFencePlan) (string, error) {
++	base := os.Getenv("ProgramData")
++	if base == "" || !filepath.IsAbs(base) {
++		return "", errors.New("ProgramData unavailable")
++	}
++	if !validOperation(p.OperationID) {
++		return "", errors.New("operation invalid")
++	}
++	h := digest([]byte(strings.ToLower(p.DataRoot.FinalUTF16) + "\x00" + p.DataRoot.FileID))
++	return filepath.Join(base, "ResearchOS", "RecoveryBoundary", h, p.OperationID), nil
++}
++
++func readRecord(p EntryFencePlan) (boundaryRecord, error) {
++	var r boundaryRecord
++	dir, e := stateRoot(p)
++	if e != nil {
++		return r, e
++	}
++	// The operation directory and every record must be independently protected.
++	if e = checkManagedChain(p); e != nil {
++		return r, e
++	}
++	entries, e := os.ReadDir(dir)
++	if e != nil {
++		return r, e
++	}
++	if len(entries) < 2 || len(entries) > 24 {
++		return r, errors.New("boundary state inventory invalid")
++	}
++	for _, entry := range entries {
++		if entry.IsDir() || (entry.Name() != "plan.json" && entry.Name() != "pre.json" && entry.Name() != "post.json" && entry.Name() != "full-restart-complete.json" && entry.Name() != "source-accepted.json" && entry.Name() != "native-accepted.json" && entry.Name() != "backup-verified.json" && entry.Name() != "recovery-ready.json" && !strings.HasPrefix(entry.Name(), "event-")) {
++			return r, errors.New("unknown boundary state entry")
++		}
++	}
++	raw, e := os.ReadFile(filepath.Join(dir, "plan.json"))
++	if e != nil || len(raw) > 256<<10 {
++		return r, errors.New("boundary plan file unavailable")
++	}
++	if e = json.Unmarshal(raw, &r.Plan); e != nil {
++		return r, e
++	}
++	if r.Plan.OperationID != p.OperationID || r.Plan.PlanSHA256 != p.PlanSHA256 {
++		return r, errors.New("boundary record plan mismatch")
++	}
++	pre, e := os.ReadFile(filepath.Join(dir, "pre.json"))
++	if e != nil || len(pre) > 16<<10 {
++		return r, errors.New("boundary pre witness unavailable")
++	}
++	if e = json.Unmarshal(pre, &r.Pre); e != nil {
++		return r, e
++	}
++	post, e := os.ReadFile(filepath.Join(dir, "post.json"))
++	if e == nil {
++		if len(post) > 16<<10 {
++			return r, errors.New("boundary post witness oversized")
++		}
++		if e = json.Unmarshal(post, &r.Post); e != nil {
++			return r, e
++		}
++	} else if !errors.Is(e, os.ErrNotExist) {
++		return r, e
++	}
++	for i := 1; i <= 16; i++ {
++		name := fmt.Sprintf("event-%02d.json", i)
++		raw, e := os.ReadFile(filepath.Join(dir, name))
++		if errors.Is(e, os.ErrNotExist) {
++			break
++		}
++		if e != nil || len(raw) > 16<<10 {
++			return r, errors.New("boundary event missing or oversized")
++		}
++		var ev BoundaryEvent
++		if e = json.Unmarshal(raw, &ev); e != nil {
++			return r, e
++		}
++		r.Events = append(r.Events, ev)
++	}
++	if e = ValidateEvents(r.Events, p.OperationID, p.PlanSHA256); e != nil {
++		return r, e
++	}
++	fullRestartRaw, fullRestartErr := os.ReadFile(filepath.Join(dir, "full-restart-complete.json"))
++	if fullRestartErr != nil && !errors.Is(fullRestartErr, os.ErrNotExist) {
++		return r, fullRestartErr
++	}
++	if !r.Post.UTC.IsZero() && (fullRestartErr != nil || digest(fullRestartRaw) != r.Post.FullRestartEvidenceSHA256) {
++		return r, errors.New("FullRestart evidence drift")
++	}
++	if len(entries) != 6+len(r.Events)+boolInt(!r.Post.UTC.IsZero())+boolInt(fullRestartErr == nil) {
++		return r, errors.New("boundary event inventory gap")
++	}
++	return r, nil
++}
++func boolInt(b bool) int {
++	if b {
++		return 1
++	}
++	return 0
++}
++
++func checkManagedDirectory(path, sid string) error {
++	h, e := openNative(path, true, false)
++	if e != nil {
++		return e
++	}
++	defer windows.CloseHandle(h.handle)
++	sd, e := windows.GetSecurityInfo(h.handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
++	if e != nil {
++		return e
++	}
++	return checkManagedDescriptor(sd, sid)
++}
++
++func checkManagedDescriptor(sd *windows.SECURITY_DESCRIPTOR, sid string) error {
++	if sd == nil {
++		return errors.New("management descriptor missing")
++	}
++	owner, _, e := sd.Owner()
++	if e != nil || owner == nil || owner.String() != sid {
++		return errors.New("boundary management owner mismatch")
++	}
++	control, _, e := sd.Control()
++	if e != nil || control&windows.SE_DACL_PROTECTED == 0 {
++		return errors.New("boundary state DACL not protected")
++	}
++	acl, _, e := sd.DACL()
++	if e != nil || acl == nil || acl.AceCount < 1 || acl.AceCount > 2 {
++		return errors.New("boundary state DACL inventory invalid")
++	}
++	managerFull := false
++	for i := uint32(0); i < uint32(acl.AceCount); i++ {
++		var ace *windows.ACCESS_ALLOWED_ACE
++		if e = windows.GetAce(acl, i, &ace); e != nil {
++			return e
++		}
++		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
++			return errors.New("boundary state ACE type forbidden")
++		}
++		trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
++		if trustee != sid && trustee != "S-1-5-18" {
++			return errors.New("boundary state nonmanagement ACE forbidden")
++		}
++		if trustee == sid && uint32(ace.Mask)&0x001f01ff == 0x001f01ff {
++			managerFull = true
++		} // FILE_ALL_ACCESS
++	}
++	if !managerFull {
++		return errors.New("boundary state manager full access absent")
++	}
++	return nil
++}
++
++func checkManagedChain(p EntryFencePlan) error {
++	dir, e := stateRoot(p)
++	if e != nil {
++		return e
++	}
++	base := os.Getenv("ProgramData")
++	for _, path := range pathAncestors(dir) {
++		if strings.EqualFold(path, base) {
++			continue
++		}
++		if strings.HasPrefix(strings.ToLower(path), strings.ToLower(base)+string(filepath.Separator)) {
++			if e = checkManagedDirectory(path, p.ManagementSID); e != nil {
++				return e
++			}
++		}
++	}
++	return checkManagedDirectory(dir, p.ManagementSID)
++}
++
++func checkCurrentBoot(post BootWitness, businessSID string) error {
++	u, b, e := bootClock()
++	if e != nil {
++		return e
++	}
++	if b.Before(post.LastBootUTC.Add(-2*time.Second)) || b.After(post.LastBootUTC.Add(2*time.Second)) || u < post.UptimeMilliseconds {
++		return errors.New("current boot differs from post witness")
++	}
++	if time.Since(post.UTC) < 0 || time.Since(post.UTC) > MaxElapsed {
++		return errors.New("post witness expired")
++	}
++	r, e := registryRestartApps(businessSID)
++	if e != nil {
++		return e
++	}
++	if r != post.RestartApps {
++		return errors.New("RestartApps state changed")
++	}
++	return nil
++}
++
++func checkPreCurrent(pre BootWitness, businessSID string) error {
++	u, b, e := bootClock()
++	if e != nil {
++		return e
++	}
++	if b.Before(pre.LastBootUTC.Add(-2*time.Second)) || b.After(pre.LastBootUTC.Add(2*time.Second)) || u < pre.UptimeMilliseconds {
++		return errors.New("pre witness boot changed before arm")
++	}
++	if time.Since(pre.UTC) < 0 || time.Since(pre.UTC) > MaxElapsed {
++		return errors.New("pre witness expired before arm")
++	}
++	r, e := registryRestartApps(businessSID)
++	if e != nil {
++		return e
++	}
++	if r != pre.RestartApps {
++		return errors.New("RestartApps changed before arm")
++	}
++	return nil
++}
++
++func checkFence(p EntryFencePlan, holds []nativeHold) error {
++	byPath := map[string]FileIdentity{}
++	for _, h := range holds {
++		byPath[strings.ToLower(h.path)] = h.identity
++	}
++	for _, t := range p.Targets {
++		x, ok := byPath[strings.ToLower(t.File.Path)]
++		if !ok || !identityCoreEqual(x, t.File) || t.InstalledSD == "" || x.SecurityDescriptor != t.InstalledSD {
++			return errors.New("fence target readback mismatch")
++		}
++		expected, e := denyDescriptor(t.File.SecurityDescriptor, p.BusinessSID, p.ManagementSID, t.Mode)
++		if e != nil || expected != x.SecurityDescriptor {
++			return errors.New("business SID exact deny descriptor absent")
++		}
++	}
++	return nil
++}
++
++func businessEnabledGroupDigest(p EntryFencePlan) (string, error) {
++	claimed := append([]string(nil), p.BusinessGroupSIDs...)
++	sort.Strings(claimed)
++	for i, sid := range claimed {
++		if _, err := windows.StringToSid(sid); err != nil || (i > 0 && sid == claimed[i-1]) {
++			return "", errors.New("invalid business enabled group inventory")
++		}
++	}
++	raw, _ := json.Marshal(claimed)
++	return digest(raw), nil
++}
++
++// Before plan, inspect a live exact official executable's token. Later phases
++// use the protected pre witness because the fence deliberately stops that app.
++func verifiedBusinessGroups(p EntryFencePlan) (map[string]bool, error) {
++	expected, err := businessEnabledGroupDigest(p)
++	if err != nil {
++		return nil, err
++	}
++	dir, err := stateRoot(p)
++	if err != nil {
++		return nil, err
++	}
++	var pre BootWitness
++	if raw, readErr := os.ReadFile(filepath.Join(dir, "pre.json")); readErr == nil {
++		if len(raw) > 16<<10 || json.Unmarshal(raw, &pre) != nil || pre.OperationID != p.OperationID || pre.PlanSHA256 != p.PlanSHA256 || pre.BusinessEnabledSIDsSHA256 != expected {
++			return nil, errors.New("business token witness mismatch")
++		}
++		// The pre token was captured before the fence. A restart may change
++		// group activation, so an active business logon token must still match.
++		shape, captureErr := inspectExistingBusinessProcess(p, expected, pre)
++		if captureErr != nil {
++			return nil, captureErr
++		}
++		if postRaw, postErr := os.ReadFile(filepath.Join(dir, "post.json")); postErr == nil {
++			var post BootWitness
++			if len(postRaw) > 16<<10 || json.Unmarshal(postRaw, &post) != nil || post.OperationID != p.OperationID || post.PlanSHA256 != p.PlanSHA256 || sameCurrentProcessWitness(post, shape) != nil {
++				return nil, errors.New("current business process identity differs from post witness")
++			}
++		} else if !errors.Is(postErr, os.ErrNotExist) {
++			return nil, postErr
++		}
++		return shape.EffectiveSIDs, nil
++	} else if !errors.Is(readErr, os.ErrNotExist) {
++		return nil, readErr
++	} else {
++		shape, captureErr := captureOfficialBusinessToken(p, expected)
++		if captureErr != nil {
++			return nil, captureErr
++		}
++		return shape.EffectiveSIDs, nil
++	}
++}
++
++func tokenGroupState(token windows.Token, businessSID string) (string, map[string]bool, string, error) {
++	user, userErr := token.GetTokenUser()
++	groups, groupsErr := token.GetTokenGroups()
++	if userErr != nil || groupsErr != nil {
++		return "", nil, "", errors.Join(userErr, groupsErr)
++	}
++	if user.User.Sid.String() != businessSID {
++		return "", nil, "", errors.New("native token user differs from frozen business SID")
++	}
++	var stable []string
++	var logonSID string
++	effective := map[string]bool{businessSID: true}
++	for _, group := range groups.AllGroups() {
++		if group.Attributes&windows.SE_GROUP_LOGON_ID == windows.SE_GROUP_LOGON_ID {
++			if logonSID != "" {
++				return "", nil, "", errors.New("multiple token logon SIDs")
++			}
++			logonSID = group.Sid.String()
++		}
++		if group.Attributes&windows.SE_GROUP_ENABLED != 0 && group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
++			effective[group.Sid.String()] = true
++			// Logon SID and integrity label are per logon/boot. Keep them in
++			// the current access map, but not in the frozen stable group hash.
++			if group.Attributes&(windows.SE_GROUP_LOGON_ID|windows.SE_GROUP_INTEGRITY) == 0 {
++				stable = append(stable, group.Sid.String())
++			}
++		}
++	}
++	if logonSID == "" {
++		return "", nil, "", errors.New("token logon SID unavailable")
++	}
++	sort.Strings(stable)
++	raw, _ := json.Marshal(stable)
++	return digest(raw), effective, logonSID, nil
++}
++
++type businessTokenShape struct {
++	SessionID        uint32
++	ElevationType    uint32
++	IntegritySID     string
++	LogonSID         string
++	PrivilegesSHA256 string
++	GroupsSHA256     string
++	EffectiveSIDs    map[string]bool
++	ProcessID        uint32
++	ProcessCreated   time.Time
++	ProcessImageSHA  string
++}
++
++func tokenInfoBytes(token windows.Token, class uint32) ([]byte, error) {
++	buf := make([]byte, 128)
++	for {
++		var size uint32
++		err := windows.GetTokenInformation(token, class, &buf[0], uint32(len(buf)), &size)
++		if err == nil {
++			if size > uint32(len(buf)) {
++				return nil, errors.New("token information size invalid")
++			}
++			return buf[:size], nil
++		}
++		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || size > 64<<10 || size <= uint32(len(buf)) {
++			return nil, err
++		}
++		buf = make([]byte, size)
++	}
++}
++
++func tokenSecurityShape(token windows.Token, pid uint32, businessSID string) (businessTokenShape, error) {
++	var shape businessTokenShape
++	var session, elevation, size uint32
++	if err := windows.ProcessIdToSessionId(pid, &session); err != nil {
++		return shape, err
++	}
++	if err := windows.GetTokenInformation(token, windows.TokenElevationType, (*byte)(unsafe.Pointer(&elevation)), 4, &size); err != nil || size != 4 {
++		return shape, errors.Join(err, errors.New("token elevation type unavailable"))
++	}
++	labelBytes, err := tokenInfoBytes(token, windows.TokenIntegrityLevel)
++	if err != nil || len(labelBytes) < int(unsafe.Sizeof(windows.Tokenmandatorylabel{})) {
++		return shape, errors.Join(err, errors.New("token integrity label unavailable"))
++	}
++	groupSHA, effective, logonSID, err := tokenGroupState(token, businessSID)
++	if err != nil {
++		return shape, err
++	}
++	privBytes, err := tokenInfoBytes(token, windows.TokenPrivileges)
++	if err != nil || len(privBytes) < int(unsafe.Sizeof(windows.Tokenprivileges{})) {
++		return shape, errors.Join(err, errors.New("token privileges unavailable"))
++	}
++	var privilegeLines []string
++	for _, priv := range (*windows.Tokenprivileges)(unsafe.Pointer(&privBytes[0])).AllPrivileges() {
++		privilegeLines = append(privilegeLines, fmt.Sprintf("%08x:%08x:%08x", uint32(priv.Luid.HighPart), priv.Luid.LowPart, priv.Attributes))
++	}
++	sort.Strings(privilegeLines)
++	privJSON, _ := json.Marshal(privilegeLines)
++	shape = businessTokenShape{SessionID: session, ElevationType: elevation, IntegritySID: (*windows.Tokenmandatorylabel)(unsafe.Pointer(&labelBytes[0])).Label.Sid.String(), LogonSID: logonSID, PrivilegesSHA256: digest(privJSON), GroupsSHA256: groupSHA, EffectiveSIDs: effective}
++	return shape, nil
++}
++
++// Existing Explorer supplies a fresh business process token after restart.
++// Its current PID, session and logon SID are evidence, never compared to the
++// pre-restart values. Elevated-admin cross-account TOKEN_QUERY is probed.
++func inspectExistingBusinessProcess(p EntryFencePlan, expected string, pre BootWitness) (businessTokenShape, error) {
++	var zero businessTokenShape
++	if pre.BusinessLogonSID == "" || !validDigest(pre.BusinessPrivilegesSHA256) || pre.BusinessIntegritySID == "" {
++		return zero, errors.New("pre business token shape unavailable")
++	}
++	systemRoot, rootErr := windows.GetSystemWindowsDirectory()
++	if rootErr != nil || !filepath.IsAbs(systemRoot) || filepath.Clean(systemRoot) != systemRoot {
++		return zero, errors.Join(rootErr, errors.New("native system root unavailable"))
++	}
++	explorerPath := filepath.Join(systemRoot, "explorer.exe")
++	_, currentBoot, err := bootClock()
++	if err != nil {
++		return zero, err
++	}
++	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
++	if err != nil {
++		return zero, err
++	}
++	defer windows.CloseHandle(snapshot)
++	var entry windows.ProcessEntry32
++	entry.Size = uint32(unsafe.Sizeof(entry))
++	if err = windows.Process32First(snapshot, &entry); err != nil {
++		return zero, err
++	}
++	var matched *businessTokenShape
++	for {
++		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), "explorer.exe") {
++			proc, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
++			if openErr != nil {
++				return zero, fmt.Errorf("Explorer candidate inaccessible: %w", openErr)
++			}
++			buf := make([]uint16, 32768)
++			n := uint32(len(buf))
++			imageErr := windows.QueryFullProcessImageName(proc, 0, &buf[0], &n)
++			if imageErr != nil {
++				windows.CloseHandle(proc)
++				return zero, imageErr
++			}
++			if !strings.EqualFold(windows.UTF16ToString(buf[:n]), explorerPath) {
++				windows.CloseHandle(proc)
++				goto nextProcess
++			}
++			var created, exited, kernel, userTime windows.Filetime
++			if err = windows.GetProcessTimes(proc, &created, &exited, &kernel, &userTime); err != nil || time.Unix(0, created.Nanoseconds()).Before(currentBoot.Add(-2*time.Second)) {
++				windows.CloseHandle(proc)
++				return zero, errors.Join(err, errors.New("Explorer creation predates current boot"))
++			}
++			var token windows.Token
++			tokenErr := windows.OpenProcessToken(proc, windows.TOKEN_QUERY, &token)
++			if tokenErr != nil {
++				windows.CloseHandle(proc)
++				return zero, tokenErr
++			}
++			user, userErr := token.GetTokenUser()
++			if userErr != nil {
++				token.Close()
++				windows.CloseHandle(proc)
++				return zero, userErr
++			}
++			if user.User.Sid.String() != p.BusinessSID {
++				token.Close()
++				windows.CloseHandle(proc)
++				goto nextProcess
++			}
++			shape, shapeErr := tokenSecurityShape(token, entry.ProcessID, p.BusinessSID)
++			closeErr := token.Close()
++			if shapeErr != nil || closeErr != nil {
++				windows.CloseHandle(proc)
++				return zero, errors.Join(shapeErr, closeErr)
++			}
++			imageSHA, imageErr := osProcessImageIdentity(explorerPath)
++			closeErr = windows.CloseHandle(proc)
++			if imageErr != nil || closeErr != nil {
++				return zero, errors.Join(imageErr, closeErr)
++			}
++			shape.ProcessID = entry.ProcessID
++			shape.ProcessCreated = time.Unix(0, created.Nanoseconds()).UTC()
++			shape.ProcessImageSHA = imageSHA
++			if err := sameBusinessPermissionSemantics(pre, shape, expected); err != nil {
++				return zero, err
++			}
++			if matched != nil {
++				if matched.SessionID != shape.SessionID || matched.LogonSID != shape.LogonSID || matched.ProcessImageSHA != shape.ProcessImageSHA {
++					return zero, errors.New("multiple current business Explorer sessions ambiguous")
++				}
++				if shape.ProcessCreated.Before(matched.ProcessCreated) {
++					matched = &shape
++				}
++			} else {
++				matched = &shape
++			}
++		}
++	nextProcess:
++		err = windows.Process32Next(snapshot, &entry)
++		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
++			break
++		}
++		if err != nil {
++			return zero, err
++		}
++	}
++	if matched == nil {
++		return zero, errors.New("current business Explorer token unavailable")
++	}
++	return *matched, nil
++}
++
++func sameBusinessPermissionSemantics(pre BootWitness, current businessTokenShape, expected string) error {
++	if current.LogonSID == "" || current.IntegritySID == "" || current.GroupsSHA256 != expected || current.ElevationType != pre.BusinessElevationType || current.IntegritySID != pre.BusinessIntegritySID || current.PrivilegesSHA256 != pre.BusinessPrivilegesSHA256 {
++		return errors.New("current business token permission semantics differ from pre witness")
++	}
++	return nil
++}
++
++func sameCurrentProcessWitness(post BootWitness, current businessTokenShape) error {
++	if post.BusinessEnabledSIDsSHA256 != current.GroupsSHA256 || post.BusinessSessionID != current.SessionID || post.BusinessLogonSID != current.LogonSID || post.BusinessProcessPID != current.ProcessID || !post.BusinessProcessCreatedUTC.Equal(current.ProcessCreated) || post.BusinessProcessImageSHA256 != current.ProcessImageSHA {
++		return errors.New("current business process identity changed")
++	}
++	return nil
++}
++
++// Windows may legitimately hard-link its own Explorer image. Read identity
++// from one held native handle without applying the product target's hard-link
++// ban to this OS image.
++func osProcessImageIdentity(path string) (string, error) {
++	ptr, err := windows.UTF16PtrFromString(path)
++	if err != nil {
++		return "", err
++	}
++	h, err := windows.CreateFile(ptr, windows.FILE_READ_DATA|windows.FILE_READ_ATTRIBUTES,
++		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING,
++		windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
++	if err != nil {
++		return "", err
++	}
++	defer windows.CloseHandle(h)
++	var info windows.ByHandleFileInformation
++	if err = windows.GetFileInformationByHandle(h, &info); err != nil {
++		return "", err
++	}
++	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
++		return "", errors.New("OS process image is directory or reparse point")
++	}
++	volume, fileID, err := nativeFileID(h)
++	if err != nil {
++		return "", err
++	}
++	final, err := finalPath(h)
++	if err != nil {
++		return "", err
++	}
++	sum := sha256.New()
++	buf := make([]byte, 64<<10)
++	var total int64
++	for {
++		var n uint32
++		if err = windows.ReadFile(h, buf, &n, nil); err != nil {
++			return "", err
++		}
++		if n == 0 {
++			break
++		}
++		total += int64(n)
++		if total > 128<<20 {
++			return "", errors.New("OS process image exceeds hash bound")
++		}
++		_, _ = sum.Write(buf[:n])
++	}
++	return digest([]byte(fmt.Sprintf("%s|%d|%s|%x", strings.ToLower(final), volume, fileID, sum.Sum(nil)))), nil
++}
++
++func inspectLiveBusinessToken(p EntryFencePlan, expected string) error {
++	_, err := captureOfficialBusinessToken(p, expected)
++	return err
++}
++
++func captureOfficialBusinessToken(p EntryFencePlan, expected string) (businessTokenShape, error) {
++	var zero businessTokenShape
++	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
++	if err != nil {
++		return zero, err
++	}
++	defer windows.CloseHandle(snapshot)
++	var entry windows.ProcessEntry32
++	entry.Size = uint32(unsafe.Sizeof(entry))
++	if err = windows.Process32First(snapshot, &entry); err != nil {
++		return zero, err
++	}
++	for {
++		for _, target := range p.Targets {
++			if target.Mode != "executable" || !strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), filepath.Base(target.File.Path)) {
++				continue
++			}
++			proc, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
++			if openErr != nil {
++				return zero, openErr
++			}
++			buf := make([]uint16, 32768)
++			n := uint32(len(buf))
++			nameErr := windows.QueryFullProcessImageName(proc, 0, &buf[0], &n)
++			if nameErr != nil {
++				windows.CloseHandle(proc)
++				return zero, nameErr
++			}
++			if !strings.EqualFold(windows.UTF16ToString(buf[:n]), target.File.Path) {
++				windows.CloseHandle(proc)
++				continue
++			}
++			var token windows.Token
++			tokenErr := windows.OpenProcessToken(proc, windows.TOKEN_QUERY, &token)
++			var created, exited, kernel, userTime windows.Filetime
++			timeErr := windows.GetProcessTimes(proc, &created, &exited, &kernel, &userTime)
++			windows.CloseHandle(proc)
++			if tokenErr != nil || timeErr != nil {
++				if tokenErr == nil {
++					token.Close()
++				}
++				return zero, errors.Join(tokenErr, timeErr)
++			}
++			shape, shapeErr := tokenSecurityShape(token, entry.ProcessID, p.BusinessSID)
++			closeErr := token.Close()
++			if shapeErr != nil || closeErr != nil {
++				return zero, errors.Join(shapeErr, closeErr)
++			}
++			if shape.GroupsSHA256 != expected {
++				return zero, errors.New("actual business token enabled groups differ from frozen inventory")
++			}
++			shape.ProcessID = entry.ProcessID
++			shape.ProcessCreated = time.Unix(0, created.Nanoseconds()).UTC()
++			shape.ProcessImageSHA = digest([]byte(fmt.Sprintf("%s|%d|%s|%s", strings.ToLower(target.File.FinalUTF16), target.File.Volume, target.File.FileID, target.File.SHA256)))
++			return shape, nil
++		}
++		err = windows.Process32Next(snapshot, &entry)
++		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
++			return zero, errors.New("exact official process token unavailable for ancestor proof")
++		}
++		if err != nil {
++			return zero, err
++		}
++	}
++}
++
++func checkAncestorControl(p EntryFencePlan, holds []nativeHold) error {
++	enabled, err := verifiedBusinessGroups(p)
++	if err != nil {
++		return err
++	}
++	return checkAncestorACL(p, holds, enabled)
++}
++
++func checkAncestorACL(p EntryFencePlan, holds []nativeHold, enabled map[string]bool) error {
++	protected := map[string]bool{}
++	for _, a := range p.Ancestors {
++		protected[strings.ToLower(a.Path)] = true
++	}
++	protected[strings.ToLower(p.DataRoot.Path)] = true
++	for _, h := range holds {
++		if !protected[strings.ToLower(h.path)] {
++			continue
++		}
++		sd, e := windows.SecurityDescriptorFromString(h.identity.SecurityDescriptor)
++		if e != nil {
++			return e
++		}
++		owner, _, e := sd.Owner()
++		osAnchor := filepath.Dir(h.path) == h.path || strings.EqualFold(h.path, filepath.Join(filepath.VolumeName(h.path)+`\`, "Users"))
++		ownerTrusted := owner != nil && (owner.String() == p.ManagementSID || owner.String() == "S-1-5-18" || (osAnchor && owner.String() == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"))
++		if e != nil || !ownerTrusted || enabled[owner.String()] {
++			return fmt.Errorf("ancestor owner can revoke boundary: %s", h.path)
++		}
++		acl, _, e := sd.DACL()
++		if e != nil || acl == nil {
++			return fmt.Errorf("ancestor DACL unavailable: %s", h.path)
++		}
++		for i := uint32(0); i < uint32(acl.AceCount); i++ {
++			var ace *windows.ACCESS_ALLOWED_ACE
++			if e = windows.GetAce(acl, i, &ace); e != nil {
++				return e
++			}
++			if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
++				continue
++			}
++			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
++				return fmt.Errorf("ancestor ACL ACE unsupported: %s", h.path)
++			}
++			trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
++			if !enabled[trustee] {
++				continue
++			}
++			forbidden := uint32(0x40 | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_ALL) // FILE_DELETE_CHILD; GENERIC_WRITE maps to file writes only.
++			if filepath.Dir(h.path) != h.path {
++				forbidden |= windows.DELETE
++			}
++			if uint32(ace.Mask)&forbidden != 0 {
++				return fmt.Errorf("business group can replace ancestor: %s", h.path)
++			}
++		}
++	}
++	return nil
++}
++
++func preflightManagementRestore(p EntryFencePlan) error {
++	for _, t := range p.Targets {
++		h, e := openNativeAccess(t.File.Path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
++		if e != nil {
++			return fmt.Errorf("management cannot open target for reversible ACL operation: %w", e)
++		}
++		matched := identityEqual(h.identity, t.File)
++		closeErr := windows.CloseHandle(h.handle)
++		if closeErr != nil {
++			return closeErr
++		}
++		if !matched {
++			return errors.New("management ACL preflight target identity drift")
++		}
++	}
++	return nil
++}
++
++func denyDescriptor(original, sidText, managementSID, mode string) (string, error) {
++	sid, e := windows.StringToSid(sidText)
++	if e != nil {
++		return "", e
++	}
++	sd, e := windows.SecurityDescriptorFromString(original)
++	if e != nil {
++		return "", e
++	}
++	old, _, e := sd.DACL()
++	if e != nil {
++		return "", e
++	}
++	mask := windows.ACCESS_MASK(windows.FILE_EXECUTE)
++	if mode == "script" {
++		mask = windows.ACCESS_MASK(windows.FILE_READ_DATA)
++	} else if mode != "executable" {
++		return "", errors.New("unknown target mode")
++	}
++	if managementSID != sidText {
++		mask |= windows.ACCESS_MASK(windows.WRITE_DAC | windows.WRITE_OWNER | windows.DELETE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA)
++	}
++	ace := windows.EXPLICIT_ACCESS{AccessPermissions: mask, AccessMode: windows.DENY_ACCESS, Inheritance: windows.NO_INHERITANCE,
++		Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(sid)}}
++	entries := []windows.EXPLICIT_ACCESS{ace}
++	if managementSID != sidText {
++		manager, e := windows.StringToSid(managementSID)
++		if e != nil {
++			return "", e
++		}
++		entries = append(entries, windows.EXPLICIT_ACCESS{AccessPermissions: windows.ACCESS_MASK(windows.FILE_READ_DATA | windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL | windows.WRITE_DAC | windows.WRITE_OWNER), AccessMode: windows.GRANT_ACCESS, Inheritance: windows.NO_INHERITANCE,
++			Trustee: windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(manager)}})
++	}
++	acl, e := windows.ACLFromEntries(entries, old)
++	if e != nil {
++		return "", e
++	}
++	// Protecting a DACL makes formerly inherited ACEs explicit on the object.
++	// Normalize the planned descriptor to the native readback representation.
++	for i := uint32(0); i < uint32(acl.AceCount); i++ {
++		var item *windows.ACCESS_ALLOWED_ACE
++		if e = windows.GetAce(acl, i, &item); e != nil {
++			return "", e
++		}
++		item.Header.AceFlags &^= windows.INHERITED_ACE
++	}
++	abs, e := sd.ToAbsolute()
++	if e != nil {
++		return "", e
++	}
++	if managementSID != sidText {
++		manager, e := windows.StringToSid(managementSID)
++		if e != nil {
++			return "", e
++		}
++		if e = abs.SetOwner(manager, false); e != nil {
++			return "", e
++		}
++	}
++	if e = abs.SetDACL(acl, true, false); e != nil {
++		return "", e
++	}
++	if e = abs.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); e != nil {
++		return "", e
++	}
++	installed, e := abs.ToSelfRelative()
++	if e != nil {
++		return "", e
++	}
++	return installed.String(), nil
++}
++
++// OpenCurrentQuiescence reopens a protected BOOT_OBSERVED record. It then
++// retains native no-delete holds through the caller's actual outer transaction.
++func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
++	if e := ctx.Err(); e != nil {
++		return nil, e
++	}
++	if held == nil || !held.Held() || held.Root() != dataRoot || database != filepath.Join(dataRoot, "researchos.sqlite") || !validOperation(operationID) || !validDigest(planSHA256) {
++		return nil, errors.New("current quiescence held lease or binding invalid")
++	}
++	lease, e := held.MaintenanceIdentity()
++	if e != nil {
++		return nil, e
++	}
++	// Discovery is by fixed ProgramData inventory. We never accept a path from
++	// a caller or a JSON supplied capability.
++	p, e := discoverPlan(dataRoot, operationID, planSHA256)
++	if e != nil {
++		return nil, e
++	}
++	if e = ValidatePlan(p); e != nil {
++		return nil, e
++	}
++	if e = managedToken(p); e != nil {
++		return nil, e
++	}
++	if p.DataRoot.Path != dataRoot || p.Database.Path != database {
++		return nil, errors.New("current quiescence source mismatch")
++	}
++	holds, e := openPlanHolds(p)
++	if e != nil {
++		return nil, e
++	}
++	fail := func(e error) (*CurrentQuiescence, error) { return nil, errors.Join(e, closeHolds(holds)) }
++	r, e := readRecord(p)
++	if e != nil {
++		return fail(e)
++	}
++	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
++		return fail(errors.New("boundary not boot observed"))
++	}
++	if e = ValidateRestart(r.Pre, r.Post); e != nil {
++		return fail(e)
++	}
++	if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
++		return fail(e)
++	}
++	if e = checkNoOfficialProcess(p); e != nil {
++		return fail(e)
++	}
++	if e = checkFence(p, holds); e != nil {
++		return fail(e)
++	}
++	if e = checkAncestorControl(p, holds); e != nil {
++		return fail(e)
++	}
++	if e = checkHolds(holds); e != nil {
++		return fail(e)
++	}
++	if e = lease.Matches(held); e != nil {
++		return fail(e)
++	}
++	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
++	return q, nil
++}
++
++func discoverPlan(root, operation, sha string) (EntryFencePlan, error) {
++	var p EntryFencePlan
++	base := os.Getenv("ProgramData")
++	if base == "" {
++		return p, errors.New("ProgramData unavailable")
++	}
++	parent := filepath.Join(base, "ResearchOS", "RecoveryBoundary")
++	entries, e := os.ReadDir(parent)
++	if e != nil {
++		return p, e
++	}
++	if len(entries) > 128 {
++		return p, errors.New("boundary root inventory too large")
++	}
++	var found int
++	for _, entry := range entries {
++		if !entry.IsDir() || !validDigest(entry.Name()) {
++			return p, errors.New("unknown boundary root inventory")
++		}
++		path := filepath.Join(parent, entry.Name(), operation, "plan.json")
++		raw, e := os.ReadFile(path)
++		if errors.Is(e, os.ErrNotExist) {
++			continue
++		}
++		if e != nil || len(raw) > 256<<10 {
++			return p, errors.New("boundary plan unavailable")
++		}
++		var candidate EntryFencePlan
++		if e = json.Unmarshal(raw, &candidate); e != nil {
++			return p, e
++		}
++		if candidate.OperationID == operation && candidate.PlanSHA256 == sha && candidate.DataRoot.Path == root {
++			p = candidate
++			found++
++		}
++	}
++	if found != 1 {
++		return p, errors.New("exact boundary operation not found")
++	}
++	return p, nil
++}
++
++// ReadBoundaryPlan returns evidence for a C preflight. Its return value is
++// serializable data, never authority to enter a transaction.
++func ReadBoundaryPlan(dataRoot, operationID, boundaryPlanSHA256 string) (EntryFencePlan, string, error) {
++	var zero EntryFencePlan
++	if !filepath.IsAbs(dataRoot) || !validOperation(operationID) || !validDigest(boundaryPlanSHA256) {
++		return zero, "", errors.New("boundary selector invalid")
++	}
++	p, e := discoverPlan(dataRoot, operationID, boundaryPlanSHA256)
++	if e != nil {
++		return zero, "", e
++	}
++	if e = ValidatePlan(p); e != nil {
++		return zero, "", e
++	}
++	if e = checkManagedChain(p); e != nil {
++		return zero, "", e
++	}
++	if e = checkAcceptanceFiles(p); e != nil {
++		return zero, "", e
++	}
++	r, e := readRecord(p)
++	if e != nil {
++		return zero, "", e
++	}
++	state := r.Events[len(r.Events)-1].State
++	if state == "BOOT_OBSERVED" {
++		if e = ValidateRestart(r.Pre, r.Post); e != nil {
++			return zero, "", e
++		}
++		if e = checkCurrentBoot(r.Post, p.BusinessSID); e != nil {
++			return zero, "", e
++		}
++	}
++	return p, state, nil
++}
++
++func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
++	if e := ctx.Err(); e != nil {
++		return e
++	}
++	if q == nil || q.owner == nil {
++		return errors.New("current quiescence absent")
++	}
++	o := q.owner
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.closed || o.plan.DataRoot.Path != dataRoot || o.plan.Database.Path != database || o.plan.OperationID != operationID || o.plan.PlanSHA256 != planSHA256 {
++		return errors.New("current quiescence binding stale")
++	}
++	if e := managedToken(o.plan); e != nil {
++		return e
++	}
++	if e := o.lease.Matches(held); e != nil {
++		return e
++	}
++	if e := checkHolds(o.holds); e != nil {
++		return e
++	}
++	r, e := readRecord(o.plan)
++	if e != nil {
++		return e
++	}
++	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" || r.Post != o.post {
++		return errors.New("current quiescence state changed")
++	}
++	if e = ValidateRestart(r.Pre, r.Post); e != nil {
++		return e
++	}
++	if e = checkCurrentBoot(r.Post, o.plan.BusinessSID); e != nil {
++		return e
++	}
++	if e = checkNoOfficialProcess(o.plan); e != nil {
++		return e
++	}
++	if e = checkFence(o.plan, o.holds); e != nil {
++		return e
++	}
++	return checkAncestorControl(o.plan, o.holds)
++}
++
++func (q *CurrentQuiescence) Close() error {
++	if q == nil || q.owner == nil {
++		return errors.New("current quiescence absent")
++	}
++	o := q.owner
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.closed {
++		return errors.New("current quiescence already closed")
++	}
++	o.closed = true
++	err := closeHolds(o.holds)
++	o.holds = nil
++	return err
++}
++
++// MarkCDurable is called only after the outer SQL transaction has actually
++// returned. It reads the independently durable C journal; a caller bool or
++// returned SQL result is insufficient to advance the external fence record.
++func MarkCDurable(ctx context.Context, q *CurrentQuiescence, held *rt.DataRootLease, dataRoot, database, operationID, boundaryPlanSHA256, cPlanDigest string) error {
++	if q == nil || q.owner == nil {
++		return errors.New("current quiescence absent")
++	}
++	r, err := readRecord(q.owner.plan)
++	if err != nil {
++		return err
++	}
++	state := r.Events[len(r.Events)-1].State
++	if state == "BOOT_OBSERVED" {
++		if err = q.Check(ctx, held, dataRoot, database, operationID, boundaryPlanSHA256); err != nil {
++			return err
++		}
++	} else if state == "C_HELD" {
++		if err = ctx.Err(); err != nil {
++			return err
++		}
++		if err = managedToken(q.owner.plan); err != nil {
++			return err
++		}
++		q.owner.mu.Lock()
++		defer q.owner.mu.Unlock()
++		if q.owner.closed || q.owner.plan.DataRoot.Path != dataRoot || q.owner.plan.Database.Path != database || q.owner.plan.OperationID != operationID || q.owner.plan.PlanSHA256 != boundaryPlanSHA256 {
++			return errors.New("current quiescence binding stale")
++		}
++		if err = q.owner.lease.Matches(held); err != nil {
++			return err
++		}
++		if err = checkHolds(q.owner.holds); err != nil {
++			return err
++		}
++		if err = checkCurrentBoot(q.owner.post, q.owner.plan.BusinessSID); err != nil {
++			return err
++		}
++		if err = checkFence(q.owner.plan, q.owner.holds); err != nil {
++			return err
++		}
++		if err = checkAncestorControl(q.owner.plan, q.owner.holds); err != nil {
++			return err
++		}
++	} else {
++		return errors.New("boundary not awaiting C durable")
++	}
++	if !strings.HasPrefix(cPlanDigest, "sha256:") || !validDigest(strings.TrimPrefix(cPlanDigest, "sha256:")) {
++		return errors.New("C plan digest invalid")
++	}
++	_, status, err := qualificationmaintenancejournal.OpenOwnInspection(dataRoot, qualificationmaintenancejournal.QualificationNamespace, operationID, cPlanDigest)
++	if err != nil {
++		return err
++	}
++	if !status.Terminal || !status.Applied || status.State != "DURABLE" {
++		return errors.New("C journal is not durable")
++	}
++	if err = qualificationmaintenancejournal.CheckOrdinary(dataRoot); err != nil {
++		return err
++	}
++	r, err = readRecord(q.owner.plan)
++	if err != nil {
++		return err
++	}
++	if state == "BOOT_OBSERVED" {
++		if r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
++			return errors.New("boundary state changed before C durable")
++		}
++		if err = appendEvent(q.owner.plan, r.Events, "C_HELD"); err != nil {
++			return err
++		}
++		r, err = readRecord(q.owner.plan)
++		if err != nil {
++			return err
++		}
++	}
++	if r.Events[len(r.Events)-1].State != "C_HELD" {
++		return errors.New("boundary C held state changed")
++	}
++	return appendEvent(q.owner.plan, r.Events, "C_DURABLE")
++}
++
++func managedToken(p EntryFencePlan) error {
++	token := windows.GetCurrentProcessToken()
++	if !token.IsElevated() {
++		return errors.New("trusted management elevation required")
++	}
++	u, e := token.GetTokenUser()
++	if e != nil {
++		return e
++	}
++	if u.User.Sid.String() != p.ManagementSID || p.BusinessSID == p.ManagementSID {
++		return errors.New("management SID cannot be business owner")
++	}
++	return nil
++}
++
++func checkAcceptanceFiles(p EntryFencePlan) error {
++	dir, e := stateRoot(p)
++	if e != nil {
++		return e
++	}
++	items := []struct{ name, sha, kind string }{
++		{"source-accepted.json", p.SourceAcceptanceSHA256, "source"},
++		{"native-accepted.json", p.NativeAcceptanceSHA256, "native"},
++		{"backup-verified.json", p.BackupManifestSHA256, "online-backup"},
++		{"recovery-ready.json", p.RecoveryPackageSHA256, "management-recovery"},
++	}
++	for _, item := range items {
++		h, e := openNative(filepath.Join(dir, item.name), false, true)
++		if e != nil {
++			return e
++		}
++		if h.identity.SHA256 != item.sha {
++			windows.CloseHandle(h.handle)
++			return fmt.Errorf("acceptance digest mismatch: %s", item.name)
++		}
++		raw, readErr := os.ReadFile(filepath.Join(dir, item.name))
++		if readErr != nil || len(raw) > 16<<10 || digest(raw) != h.identity.SHA256 {
++			windows.CloseHandle(h.handle)
++			return fmt.Errorf("acceptance file changed: %s", item.name)
++		}
++		var proof BoundaryAttestation
++		if readErr = json.Unmarshal(raw, &proof); readErr != nil {
++			windows.CloseHandle(h.handle)
++			return readErr
++		}
++		if readErr = validateAttestation(p, item.kind, proof); readErr != nil {
++			windows.CloseHandle(h.handle)
++			return fmt.Errorf("%s: %w", item.name, readErr)
++		}
++		if e = windows.CloseHandle(h.handle); e != nil {
++			return e
++		}
++	}
++	return nil
++}
++
++func validateAttestation(p EntryFencePlan, kind string, proof BoundaryAttestation) error {
++	core, e := PlanCoreSHA256(p)
++	if e != nil || proof.Schema != "researchos.boundary-attestation.v1" || proof.Kind != kind || proof.Status != "ACCEPTED" || proof.OperationID != p.OperationID || proof.PlanCoreSHA256 != core || proof.Issuer == "" || proof.Issuer == p.ManagementSID || !validDigest(proof.EvidenceSHA256) || proof.RecordedUTC.IsZero() {
++		return errors.New("external acceptance report unqualified")
++	}
++	if kind == "online-backup" && (proof.BackupID == "" || !validDigest(proof.RestoreTestSHA256) || !validDigest(proof.CredentialProbeSHA256)) {
++		return errors.New("online backup has no restoration and credential proof")
++	}
++	return nil
++}
++
++func readFullRestartEvidence(p EntryFencePlan, pre BootWitness, now time.Time) (string, error) {
++	dir, e := stateRoot(p)
++	if e != nil {
++		return "", e
++	}
++	path := filepath.Join(dir, "full-restart-complete.json")
++	h, e := openNative(path, false, true)
++	if e != nil {
++		return "", e
++	}
++	defer windows.CloseHandle(h.handle)
++	raw, e := os.ReadFile(path)
++	if e != nil || len(raw) > 16<<10 || digest(raw) != h.identity.SHA256 {
++		return "", errors.New("FullRestart evidence changed during read")
++	}
++	var evidence struct {
++		Schema          string    `json:"schema"`
++		OperationID     string    `json:"operation_id"`
++		Method          string    `json:"method"`
++		ConfirmedByUser bool      `json:"confirmed_by_user"`
++		CompletedUTC    time.Time `json:"completed_utc"`
++	}
++	if e = json.Unmarshal(raw, &evidence); e != nil {
++		return "", e
++	}
++	if evidence.Schema != "researchos.full-restart-complete.v1" || evidence.OperationID != p.OperationID || evidence.Method != "FullRestart" || !evidence.ConfirmedByUser || evidence.CompletedUTC.Before(pre.UTC) || evidence.CompletedUTC.After(now) {
++		return "", errors.New("explicit FullRestart completion evidence invalid")
++	}
++	return h.identity.SHA256, nil
++}
++
++func fenceDigest(p EntryFencePlan) string {
++	var parts []string
++	for _, t := range p.Targets {
++		parts = append(parts, strings.ToLower(t.File.FinalUTF16)+"\x00"+t.File.FileID+"\x00"+t.InstalledSD)
++	}
++	sort.Strings(parts)
++	return digest([]byte(strings.Join(parts, "\n")))
++}
++
++func writeExclusiveJSON(path string, value any) error {
++	raw, e := json.Marshal(value)
++	if e != nil {
++		return e
++	}
++	if len(raw) > 256<<10 {
++		return errors.New("boundary record oversized")
++	}
++	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++	if e != nil {
++		return e
++	}
++	_, writeErr := f.Write(append(raw, '\n'))
++	if writeErr == nil {
++		writeErr = f.Sync()
++	}
++	return errors.Join(writeErr, f.Close())
++}
++
++func appendEvent(p EntryFencePlan, events []BoundaryEvent, state string) error {
++	if e := ValidateEvents(events, p.OperationID, p.PlanSHA256); e != nil && len(events) > 0 {
++		return e
++	}
++	previous, previousHash := "", ""
++	if len(events) > 0 {
++		previous = events[len(events)-1].State
++		previousHash = events[len(events)-1].SHA256
++	}
++	if !transition(previous, state) {
++		return errors.New("boundary phase transition invalid")
++	}
++	e := BoundaryEvent{Schema: EventSchema, Sequence: uint64(len(events) + 1), PreviousSHA256: previousHash, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, State: state, UTC: time.Now().UTC()}
++	e.SHA256 = digest([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s", e.Schema, e.Sequence, e.PreviousSHA256, e.OperationID, e.PlanSHA256, e.State, e.UTC.UTC().Format(time.RFC3339Nano))))
++	dir, err := stateRoot(p)
++	if err != nil {
++		return err
++	}
++	return writeExclusiveJSON(filepath.Join(dir, fmt.Sprintf("event-%02d.json", e.Sequence)), e)
++}
++
++func setTargetDescriptor(expected FileIdentity, desiredSD string) (outErr error) {
++	sd, e := windows.SecurityDescriptorFromString(desiredSD)
++	if e != nil {
++		return e
++	}
++	owner, _, e := sd.Owner()
++	if e != nil || owner == nil {
++		return errors.New("target owner descriptor missing")
++	}
++	dacl, _, e := sd.DACL()
++	if e != nil {
++		return e
++	}
++	control, _, e := sd.Control()
++	if e != nil {
++		return e
++	}
++	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
++	if control&windows.SE_DACL_PROTECTED != 0 {
++		flags = windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
++	}
++	hold, e := openNativeAccess(expected.Path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
++	if e != nil {
++		return e
++	}
++	defer func() { outErr = errors.Join(outErr, windows.CloseHandle(hold.handle)) }()
++	if !identityEqual(hold.identity, expected) {
++		return errors.New("target same-handle native identity or descriptor changed before mutation")
++	}
++	if e = windows.SetSecurityInfo(hold.handle, windows.SE_FILE_OBJECT, flags|windows.OWNER_SECURITY_INFORMATION, owner, nil, dacl, nil); e != nil {
++		return e
++	}
++	readback, e := windows.GetSecurityInfo(hold.handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
++	if e != nil {
++		return e
++	}
++	if readback.String() != desiredSD {
++		return errors.New("target descriptor same-handle readback mismatch")
++	}
++	v, id, e := nativeFileID(hold.handle)
++	if e != nil {
++		return e
++	}
++	final, e := finalPath(hold.handle)
++	if e != nil {
++		return e
++	}
++	if v != expected.Volume || id != expected.FileID || !strings.EqualFold(final, expected.FinalUTF16) {
++		return errors.New("target native identity changed during ACL mutation")
++	}
++	return nil
++}
++
++func checkNoOfficialProcess(p EntryFencePlan) error {
++	snapshot, e := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
++	if e != nil {
++		return e
++	}
++	defer windows.CloseHandle(snapshot)
++	var entry windows.ProcessEntry32
++	entry.Size = uint32(unsafe.Sizeof(entry))
++	if e = windows.Process32First(snapshot, &entry); e != nil {
++		return e
++	}
++	for {
++		name := windows.UTF16ToString(entry.ExeFile[:])
++		for _, t := range p.Targets {
++			if t.Mode != "executable" || !strings.EqualFold(name, filepath.Base(t.File.Path)) {
++				continue
++			}
++			proc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
++			if err != nil {
++				return fmt.Errorf("candidate official process inaccessible: %w", err)
++			}
++			buf := make([]uint16, 32768)
++			n := uint32(len(buf))
++			err = windows.QueryFullProcessImageName(proc, 0, &buf[0], &n)
++			closeErr := windows.CloseHandle(proc)
++			if err != nil || closeErr != nil {
++				return errors.Join(err, closeErr)
++			}
++			if strings.EqualFold(windows.UTF16ToString(buf[:n]), t.File.Path) {
++				return errors.New("official entry process remains live")
++			}
++		}
++		e = windows.Process32Next(snapshot, &entry)
++		if errors.Is(e, windows.ERROR_NO_MORE_FILES) {
++			break
++		}
++		if e != nil {
++			return e
++		}
++	}
++	return nil
++}
++
++func checkRestartRegistrations(p EntryFencePlan) error {
++	snapshot, e := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
++	if e != nil {
++		return e
++	}
++	defer windows.CloseHandle(snapshot)
++	var entry windows.ProcessEntry32
++	entry.Size = uint32(unsafe.Sizeof(entry))
++	if e = windows.Process32First(snapshot, &entry); e != nil {
++		return e
++	}
++	for {
++		name := windows.UTF16ToString(entry.ExeFile[:])
++		for _, t := range p.Targets {
++			if t.Mode != "executable" || !strings.EqualFold(name, filepath.Base(t.File.Path)) {
++				continue
++			}
++			proc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_VM_READ, false, entry.ProcessID)
++			if err != nil {
++				return fmt.Errorf("official restart candidate inaccessible: %w", err)
++			}
++			buf := make([]uint16, 32768)
++			n := uint32(len(buf))
++			err = windows.QueryFullProcessImageName(proc, 0, &buf[0], &n)
++			if err != nil {
++				windows.CloseHandle(proc)
++				return err
++			}
++			if strings.EqualFold(windows.UTF16ToString(buf[:n]), t.File.Path) {
++				args, _, registered, readErr := restartSettingsForProcess(proc)
++				if readErr != nil {
++					windows.CloseHandle(proc)
++					return readErr
++				}
++				if registered {
++					match := false
++					for _, sha := range t.RestartArgsSHA256 {
++						if sha == digest([]byte(args)) {
++							match = true
++							break
++						}
++					}
++					if !match {
++						windows.CloseHandle(proc)
++						return errors.New("runtime RestartApps argv outside frozen entry inventory")
++					}
++				}
++			}
++			if err = windows.CloseHandle(proc); err != nil {
++				return err
++			}
++		}
++		e = windows.Process32Next(snapshot, &entry)
++		if errors.Is(e, windows.ERROR_NO_MORE_FILES) {
++			break
++		}
++		if e != nil {
++			return e
++		}
++	}
++	return nil
++}
++
++// RunPhase is the fixed management helper state machine. The caller supplies
++// only the exact root/operation/plan selector, never SQL or a target path.
++func RunPhase(ctx context.Context, phase, dataRoot, operationID, planSHA256 string) (stateOut string, errOut error) {
++	if e := ctx.Err(); e != nil {
++		return "", e
++	}
++	if phase != "plan" && phase != "arm" && phase != "observe" && phase != "status" && phase != "disarm-request" {
++		return "", errors.New("unsupported boundary phase")
++	}
++	if !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot || !validOperation(operationID) || !validDigest(planSHA256) {
++		return "", errors.New("boundary selector invalid")
++	}
++	p, e := discoverPlan(dataRoot, operationID, planSHA256)
++	if e != nil {
++		return "", e
++	}
++	if e = ValidatePlan(p); e != nil {
++		return "", e
++	}
++	dir, e := stateRoot(p)
++	if e != nil {
++		return "", e
++	}
++	if e = checkManagedChain(p); e != nil {
++		return "", e
++	}
++	if e = checkAcceptanceFiles(p); e != nil {
++		return "", e
++	}
++	if phase == "plan" {
++		if e = managedToken(p); e != nil {
++			return "", e
++		}
++		entries, e := os.ReadDir(dir)
++		if e != nil {
++			return "", e
++		}
++		if len(entries) != 5 {
++			return "", errors.New("plan staging inventory not exact")
++		}
++		holds, e := openPlanHolds(p)
++		if e != nil {
++			return "", e
++		}
++		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
++		if e = checkAncestorControl(p, holds); e != nil {
++			return "", e
++		}
++		for _, t := range p.Targets {
++			expected, e := denyDescriptor(t.File.SecurityDescriptor, p.BusinessSID, p.ManagementSID, t.Mode)
++			if e != nil || expected != t.InstalledSD {
++				return "", errors.New("fence descriptor plan mismatch")
++			}
++		}
++		pre, e := witness(p, fenceDigest(p))
++		if e != nil {
++			return "", e
++		}
++		pre.BusinessEnabledSIDsSHA256, e = businessEnabledGroupDigest(p)
++		if e != nil {
++			return "", e
++		}
++		shape, e := captureOfficialBusinessToken(p, pre.BusinessEnabledSIDsSHA256)
++		if e != nil {
++			return "", e
++		}
++		pre.BusinessSessionID = shape.SessionID
++		pre.BusinessElevationType = shape.ElevationType
++		pre.BusinessIntegritySID = shape.IntegritySID
++		pre.BusinessLogonSID = shape.LogonSID
++		pre.BusinessPrivilegesSHA256 = shape.PrivilegesSHA256
++		pre.BusinessProcessPID = shape.ProcessID
++		pre.BusinessProcessCreatedUTC = shape.ProcessCreated
++		pre.BusinessProcessImageSHA256 = shape.ProcessImageSHA
++		if pre.UptimeMilliseconds < uint64(MaxPostUptime/time.Millisecond) {
++			return "", errors.New("pre uptime insufficient")
++		}
++		if e = writeExclusiveJSON(filepath.Join(dir, "pre.json"), pre); e != nil {
++			return "", e
++		}
++		if e = appendEvent(p, nil, "PREPARED"); e != nil {
++			return "", e
++		}
++		return "PREPARED", nil
++	}
++	r, e := readRecord(p)
++	if e != nil {
++		return "", e
++	}
++	state := r.Events[len(r.Events)-1].State
++	if phase == "status" {
++		return state, nil
++	}
++	if e = managedToken(p); e != nil {
++		return "", e
++	}
++	switch phase {
++	case "arm":
++		if state != "PREPARED" {
++			return "", errors.New("arm requires PREPARED")
++		}
++		if e = checkPreCurrent(r.Pre, p.BusinessSID); e != nil {
++			return "", e
++		}
++		if e = checkRestartRegistrations(p); e != nil {
++			return "", e
++		}
++		holds, e := openPlanHolds(p)
++		if e != nil {
++			return "", e
++		}
++		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
++		if e = checkAncestorControl(p, holds); e != nil {
++			return "", e
++		}
++		if e = preflightManagementRestore(p); e != nil {
++			return "", e
++		}
++		if e = appendEvent(p, r.Events, "APPLYING"); e != nil {
++			return "", e
++		}
++		for _, t := range p.Targets {
++			if e = setTargetDescriptor(t.File, t.InstalledSD); e != nil {
++				return "", e
++			}
++			h, e := openNativeAccess(t.File.Path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
++			if e != nil {
++				return "", e
++			}
++			ok := identityCoreEqual(t.File, h.identity) && h.identity.SecurityDescriptor == t.InstalledSD
++			closeErr := windows.CloseHandle(h.handle)
++			if closeErr != nil {
++				return "", closeErr
++			}
++			if !ok {
++				return "", errors.New("arm native readback mismatch")
++			}
++		}
++		r, e = readRecord(p)
++		if e != nil {
++			return "", e
++		}
++		if e = appendEvent(p, r.Events, "ARMED"); e != nil {
++			return "", e
++		}
++		return "ARMED", nil
++	case "observe":
++		if state != "ARMED" {
++			return "", errors.New("observe requires ARMED")
++		}
++		holds, e := openPlanHolds(p)
++		if e != nil {
++			return "", e
++		}
++		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
++		if e = checkFence(p, holds); e != nil {
++			return "", e
++		}
++		if e = checkAncestorControl(p, holds); e != nil {
++			return "", e
++		}
++		if e = checkNoOfficialProcess(p); e != nil {
++			return "", e
++		}
++		post, e := witness(p, fenceDigest(p))
++		if e != nil {
++			return "", e
++		}
++		currentBusiness, e := inspectExistingBusinessProcess(p, r.Pre.BusinessEnabledSIDsSHA256, r.Pre)
++		if e != nil {
++			return "", e
++		}
++		post.BusinessEnabledSIDsSHA256 = currentBusiness.GroupsSHA256
++		post.BusinessSessionID = currentBusiness.SessionID
++		post.BusinessElevationType = currentBusiness.ElevationType
++		post.BusinessIntegritySID = currentBusiness.IntegritySID
++		post.BusinessLogonSID = currentBusiness.LogonSID
++		post.BusinessPrivilegesSHA256 = currentBusiness.PrivilegesSHA256
++		post.BusinessProcessPID = currentBusiness.ProcessID
++		post.BusinessProcessCreatedUTC = currentBusiness.ProcessCreated
++		post.BusinessProcessImageSHA256 = currentBusiness.ProcessImageSHA
++		post.FullRestartEvidenceSHA256, e = readFullRestartEvidence(p, r.Pre, post.UTC)
++		if e != nil {
++			return "", e
++		}
++		if e = ValidateRestart(r.Pre, post); e != nil {
++			return "", e
++		}
++		if e = writeExclusiveJSON(filepath.Join(dir, "post.json"), post); e != nil {
++			return "", e
++		}
++		if e = appendEvent(p, r.Events, "BOOT_OBSERVED"); e != nil {
++			return "", e
++		}
++		return "BOOT_OBSERVED", nil
++	case "disarm-request":
++		if state == "PREPARED" || state == "APPLYING" || state == "ARMED" || state == "BOOT_OBSERVED" {
++			// The only abort path is a proven pre-BEGIN path under the same
++			// exclusive root lock used by C. Any journal, even malformed or
++			// terminal, requires exact C recovery rather than a no-effect claim.
++			lease, leaseErr := rt.AcquireDataRootLease(p.DataRoot.Path)
++			if leaseErr != nil {
++				return "", leaseErr
++			}
++			defer func() { errOut = errors.Join(errOut, lease.Close()) }()
++			ownJournal := filepath.Join(p.DataRoot.Path, "host", qualificationmaintenancejournal.QualificationNamespace, p.OperationID)
++			if _, statErr := os.Lstat(ownJournal); statErr == nil {
++				return "", errors.New("C journal exists; pre-BEGIN abort forbidden")
++			} else if !errors.Is(statErr, os.ErrNotExist) {
++				return "", statErr
++			}
++			if e = qualificationmaintenancejournal.CheckOrdinary(p.DataRoot.Path); e != nil {
++				return "", e
++			}
++			if e = appendEvent(p, r.Events, "BOUNDARY_ABORTED"); e != nil {
++				return "", e
++			}
++			r, e = readRecord(p)
++			if e != nil {
++				return "", e
++			}
++			state = "BOUNDARY_ABORTED"
++		}
++		if state != "C_DURABLE" && state != "BOUNDARY_ABORTED" && state != "DISARMING" {
++			return "", errors.New("disarm requires durable C or explicit boundary abort")
++		}
++		if state == "C_DURABLE" {
++			if e = checkExactCDurable(p); e != nil {
++				return "", e
++			}
++		}
++		if state == "DISARMING" {
++			// A resumable partial restore is only legal if the earlier event
++			// records a durable C or explicit, non-success abort.
++			if len(r.Events) < 2 || (r.Events[len(r.Events)-2].State != "C_DURABLE" && r.Events[len(r.Events)-2].State != "BOUNDARY_ABORTED") {
++				return "", errors.New("disarm predecessor invalid")
++			}
++			if r.Events[len(r.Events)-2].State == "C_DURABLE" {
++				if e = checkExactCDurable(p); e != nil {
++					return "", e
++				}
++			}
++		}
++		holds, e := openPlanHolds(p)
++		if e != nil {
++			return "", e
++		}
++		defer func() { errOut = errors.Join(errOut, closeHolds(holds)) }()
++		if e = checkAncestorControl(p, holds); e != nil {
++			return "", e
++		}
++		byPath := map[string]FileIdentity{}
++		for _, h := range holds {
++			byPath[strings.ToLower(h.path)] = h.identity
++		}
++		for _, t := range p.Targets {
++			x := byPath[strings.ToLower(t.File.Path)]
++			if !identityCoreEqual(x, t.File) || (x.SecurityDescriptor != t.File.SecurityDescriptor && x.SecurityDescriptor != t.InstalledSD) {
++				return "", errors.New("disarm target differs from exact before/installed descriptor")
++			}
++		}
++		if state != "DISARMING" {
++			if e = appendEvent(p, r.Events, "DISARMING"); e != nil {
++				return "", e
++			}
++		}
++		for _, t := range p.Targets {
++			x := byPath[strings.ToLower(t.File.Path)]
++			if x.SecurityDescriptor == t.File.SecurityDescriptor {
++				continue
++			}
++			expected := t.File
++			expected.SecurityDescriptor = t.InstalledSD
++			if e = setTargetDescriptor(expected, t.File.SecurityDescriptor); e != nil {
++				return "", e
++			}
++			h, e := openNative(t.File.Path, false, true)
++			if e != nil {
++				return "", e
++			}
++			ok := identityEqual(t.File, h.identity)
++			closeErr := windows.CloseHandle(h.handle)
++			if closeErr != nil {
++				return "", closeErr
++			}
++			if !ok {
++				return "", errors.New("disarm exact descriptor readback mismatch")
++			}
++		}
++		r, e = readRecord(p)
++		if e != nil {
++			return "", e
++		}
++		if e = appendEvent(p, r.Events, "CLOSED"); e != nil {
++			return "", e
++		}
++		return "CLOSED", nil
++	}
++	return "", errors.New("unreachable boundary phase")
++}
++
++func checkExactCDurable(p EntryFencePlan) error {
++	path := filepath.Join(p.DataRoot.Path, "host", qualificationmaintenancejournal.QualificationNamespace, p.OperationID, "plan.json")
++	raw, e := os.ReadFile(path)
++	if e != nil || len(raw) > 256<<10 {
++		return errors.New("C journal plan unavailable")
++	}
++	var view struct {
++		PlanHash string `json:"plan_hash"`
++	}
++	if e = json.Unmarshal(raw, &view); e != nil {
++		return e
++	}
++	_, status, e := qualificationmaintenancejournal.OpenOwnInspection(p.DataRoot.Path, qualificationmaintenancejournal.QualificationNamespace, p.OperationID, view.PlanHash)
++	if e != nil {
++		return e
++	}
++	if status.State != "DURABLE" || !status.Terminal || !status.Applied {
++		return errors.New("exact C operation not durable")
++	}
++	return qualificationmaintenancejournal.CheckOrdinary(p.DataRoot.Path)
++}
+diff --git a/internal/recoveryboundary/boot_windows_test.go b/internal/recoveryboundary/boot_windows_test.go
+new file mode 100644
+index 00000000..30edee6c
+--- /dev/null
++++ b/internal/recoveryboundary/boot_windows_test.go
+@@ -0,0 +1,711 @@
++//go:build windows
++
++package recoveryboundary
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++	_ "modernc.org/sqlite"
++	rt "researchos.local/research-os/adapters/runtime"
++)
++
++func TestRestartWitnessStrictDecreaseAndWindow(t *testing.T) {
++	sha := strings.Repeat("a", 64)
++	pre := BootWitness{Schema: WitnessSchema, OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, HelperSHA256: sha, FenceSHA256: sha,
++		UTC: time.Date(2026, 10, 25, 7, 0, 0, 0, time.UTC), UptimeMilliseconds: 900000,
++		LastBootUTC: time.Date(2026, 10, 25, 6, 45, 0, 0, time.UTC), RestartApps: 1,
++		BusinessEnabledSIDsSHA256: sha, BusinessPrivilegesSHA256: sha, BusinessElevationType: 3, BusinessIntegritySID: "S-1-16-8192", BusinessLogonSID: "S-1-5-5-1-2",
++		BusinessProcessPID: 100, BusinessProcessCreatedUTC: time.Date(2026, 10, 25, 6, 50, 0, 0, time.UTC), BusinessProcessImageSHA256: sha}
++	post := pre
++	post.UTC = pre.UTC.Add(5 * time.Minute)
++	post.LastBootUTC = pre.UTC.Add(30 * time.Second)
++	post.UptimeMilliseconds = 270000
++	post.FullRestartEvidenceSHA256 = sha
++	post.BusinessSessionID = 9
++	post.BusinessLogonSID = "S-1-5-5-9-10"
++	post.BusinessProcessPID = 200
++	post.BusinessProcessCreatedUTC = post.LastBootUTC.Add(time.Minute)
++	if err := ValidateRestart(pre, post); err != nil {
++		t.Fatalf("valid bounded witness: %v", err)
++	}
++	cases := map[string]func(*BootWitness){
++		"same boot":            func(x *BootWitness) { x.LastBootUTC = pre.LastBootUTC },
++		"uptime equal":         func(x *BootWitness) { x.UptimeMilliseconds = pre.UptimeMilliseconds },
++		"uptime too long":      func(x *BootWitness) { x.UptimeMilliseconds = uint64(MaxPostUptime / time.Millisecond) },
++		"UTC expired":          func(x *BootWitness) { x.UTC = pre.UTC.Add(MaxElapsed + time.Second) },
++		"negative UTC":         func(x *BootWitness) { x.UTC = pre.UTC.Add(-time.Second) },
++		"plan drift":           func(x *BootWitness) { x.PlanSHA256 = strings.Repeat("b", 64) },
++		"boot after post":      func(x *BootWitness) { x.LastBootUTC = x.UTC.Add(time.Second) },
++		"unknown RestartApps":  func(x *BootWitness) { x.RestartApps = 2 },
++		"business group drift": func(x *BootWitness) { x.BusinessEnabledSIDsSHA256 = strings.Repeat("b", 64) },
++		"business IL drift":    func(x *BootWitness) { x.BusinessIntegritySID = "S-1-16-12288" },
++		"stale source process": func(x *BootWitness) { x.BusinessProcessCreatedUTC = pre.LastBootUTC },
++	}
++	for name, mutate := range cases {
++		t.Run(name, func(t *testing.T) {
++			x := post
++			mutate(&x)
++			if err := ValidateRestart(pre, x); err == nil {
++				t.Fatal("invalid witness accepted")
++			}
++		})
++	}
++}
++
++func TestBoundaryEventSequenceRejectsGapAndReplay(t *testing.T) {
++	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64)}
++	e := BoundaryEvent{Schema: EventSchema, Sequence: 1, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, State: "PREPARED", UTC: time.Now().UTC()}
++	e.SHA256 = digest([]byte(strings.Join([]string{e.Schema, "1", "", e.OperationID, e.PlanSHA256, e.State, e.UTC.Format(time.RFC3339Nano)}, "\x00")))
++	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err != nil {
++		t.Fatal(err)
++	}
++	if err := ValidateEvents([]BoundaryEvent{e, e}, p.OperationID, p.PlanSHA256); err == nil {
++		t.Fatal("replayed sequence accepted")
++	}
++	e.State = "ARMED"
++	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err == nil {
++		t.Fatal("phase skip accepted")
++	}
++}
++
++func TestAppendOnlyBoundaryCrashSequence(t *testing.T) {
++	base := t.TempDir()
++	t.Setenv("ProgramData", base)
++	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64), DataRoot: FileIdentity{Path: `C:\fixture`, FinalUTF16: `\\?\C:\fixture`, FileID: strings.Repeat("1", 32)}}
++	dir, err := stateRoot(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(dir, 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := appendEvent(p, nil, "PREPARED"); err != nil {
++		t.Fatal(err)
++	}
++	if err := appendEvent(p, nil, "PREPARED"); err == nil {
++		t.Fatal("duplicate create replaced historical event")
++	}
++	raw, err := os.ReadFile(filepath.Join(dir, "event-01.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var first BoundaryEvent
++	if err := json.Unmarshal(raw, &first); err != nil {
++		t.Fatal(err)
++	}
++	if err := appendEvent(p, []BoundaryEvent{first}, "ARMED"); err == nil {
++		t.Fatal("crash phase skip accepted")
++	}
++	if err := appendEvent(p, []BoundaryEvent{first}, "APPLYING"); err != nil {
++		t.Fatal(err)
++	}
++	secondRaw, err := os.ReadFile(filepath.Join(dir, "event-02.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var second BoundaryEvent
++	if err := json.Unmarshal(secondRaw, &second); err != nil {
++		t.Fatal(err)
++	}
++	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err != nil {
++		t.Fatal(err)
++	}
++	second.PreviousSHA256 = ""
++	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err == nil {
++		t.Fatal("broken predecessor accepted")
++	}
++}
++
++func TestOnlineBackupGateRequiresRestorationAndIndependentIssuer(t *testing.T) {
++	sha := strings.Repeat("a", 64)
++	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, ManagementSID: "S-1-5-21-1"}
++	core, err := PlanCoreSHA256(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	proof := BoundaryAttestation{Schema: "researchos.boundary-attestation.v1", Kind: "online-backup", Status: "ACCEPTED", OperationID: p.OperationID, PlanCoreSHA256: core, Issuer: "independent-review", EvidenceSHA256: sha, RecordedUTC: time.Now().UTC(), BackupID: "backup-1", RestoreTestSHA256: sha, CredentialProbeSHA256: sha}
++	if err := validateAttestation(p, "online-backup", proof); err != nil {
++		t.Fatal(err)
++	}
++	proof.RestoreTestSHA256 = ""
++	if err := validateAttestation(p, "online-backup", proof); err == nil {
++		t.Fatal("static backup claim passed without restore test")
++	}
++	proof.RestoreTestSHA256 = sha
++	proof.Issuer = p.ManagementSID
++	if err := validateAttestation(p, "online-backup", proof); err == nil {
++		t.Fatal("manager self acceptance passed")
++	}
++}
++
++func TestBoundaryPlanDigestBindsAttestationFilesWithoutCycle(t *testing.T) {
++	p := EntryFencePlan{Schema: PlanSchema, OperationID: "0123456789abcdef0123456789abcdef", SourceAcceptanceSHA256: strings.Repeat("1", 64), NativeAcceptanceSHA256: strings.Repeat("2", 64)}
++	core, err := PlanCoreSHA256(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	full, err := ComputePlanSHA256(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p.PlanSHA256 = full
++	p.SourceAcceptanceSHA256 = strings.Repeat("3", 64)
++	coreAfter, err := PlanCoreSHA256(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	fullAfter, err := ComputePlanSHA256(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if coreAfter != core || fullAfter == full {
++		t.Fatal("plan core/receipt digest separation broken")
++	}
++	if err := ValidatePlan(p); err == nil {
++		t.Fatal("modified attestation reference retained old plan hash")
++	}
++}
++
++func TestNativeHoldSurvivesGCAndBlocksReplacement(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "entry.exe")
++	if err := os.WriteFile(path, []byte("fixture-entry"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	h, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if h.identity.FileID == "" || h.identity.Volume == 0 || h.identity.FinalUTF16 == "" || h.identity.SecurityDescriptor == "" || h.identity.SHA256 != digest([]byte("fixture-entry")) {
++		t.Fatal("native identity incomplete")
++	}
++	runtime.GC()
++	runtime.GC()
++	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err == nil {
++		t.Fatal("rename succeeded while no-delete native hold live")
++	}
++	if err := checkHolds([]nativeHold{h}); err != nil {
++		t.Fatal(err)
++	}
++	if err := windows.CloseHandle(h.handle); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err != nil {
++		t.Fatalf("rename after release: %v", err)
++	}
++}
++
++func withFixtureSD(x FileIdentity, sd string) FileIdentity { x.SecurityDescriptor = sd; return x }
++
++func TestDisposableExecutableFenceReadbackAndRestore(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "boot-fixture.exe")
++	if err := os.WriteFile(path, []byte("fixture-only"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	before, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer windows.CloseHandle(before.handle)
++	u, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(), u.User.Sid.String(), "executable")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if installed == before.identity.SecurityDescriptor {
++		t.Fatal("fence did not change descriptor")
++	}
++	if err = setTargetDescriptor(before.identity, installed); err != nil {
++		t.Skipf("fixture WRITE_DAC unavailable: %v", err)
++	}
++	restoredInBody := false
++	defer func() {
++		if restoredInBody {
++			return
++		}
++		if err := setTargetDescriptor(withFixtureSD(before.identity, installed), before.identity.SecurityDescriptor); err != nil {
++			t.Errorf("fixture descriptor restore: %v", err)
++		}
++	}()
++	after, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !identityCoreEqual(before.identity, after.identity) || after.identity.SecurityDescriptor != installed {
++		t.Errorf("installed native identity/readback mismatch: core=%v expectedSD=%q actualSD=%q", identityCoreEqual(before.identity, after.identity), installed, after.identity.SecurityDescriptor)
++	}
++	if err := windows.CloseHandle(after.handle); err != nil {
++		t.Fatal(err)
++	}
++	w, err := windows.UTF16PtrFromString(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h, err := windows.CreateFile(w, windows.FILE_EXECUTE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
++	if err == nil {
++		windows.CloseHandle(h)
++		t.Fatal("business SID execute opened through fence")
++	}
++	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
++		t.Fatalf("execute rejection differs: %v", err)
++	}
++	if err = setTargetDescriptor(withFixtureSD(before.identity, installed), before.identity.SecurityDescriptor); err != nil {
++		t.Fatal(err)
++	}
++	restoredInBody = true
++	restored, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !identityEqual(before.identity, restored.identity) {
++		t.Error("original descriptor not restored exactly")
++	}
++	if err := windows.CloseHandle(restored.handle); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestDistinctManagerPlanTransfersOwnerAndDeniesFenceTamper(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "managed-entry.exe")
++	if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	h, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer windows.CloseHandle(h.handle)
++	u, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	manager := "S-1-5-32-544" // descriptor-construction fixture only; no privileged owner change
++	installed, err := denyDescriptor(h.identity.SecurityDescriptor, u.User.Sid.String(), manager, "executable")
++	if err != nil {
++		t.Fatal(err)
++	}
++	sd, err := windows.SecurityDescriptorFromString(installed)
++	if err != nil {
++		t.Fatal(err)
++	}
++	owner, _, err := sd.Owner()
++	if err != nil || owner.String() != manager {
++		t.Fatalf("management owner absent: %v %v", owner, err)
++	}
++	acl, _, err := sd.DACL()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var ace *windows.ACCESS_ALLOWED_ACE
++	if err = windows.GetAce(acl, 0, &ace); err != nil {
++		t.Fatal(err)
++	}
++	want := uint32(windows.FILE_EXECUTE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.DELETE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA)
++	if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE || uint32(ace.Mask)&want != want || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() != u.User.Sid.String() {
++		t.Fatal("exact business SID anti-tamper deny absent")
++	}
++}
++
++func TestManagedStateRejectsCustomBusinessGroupACE(t *testing.T) {
++	manager := "S-1-5-21-100-200-300-1001"
++	base := "O:" + manager + "D:P(A;OICI;FA;;;" + manager + ")"
++	sd, err := windows.SecurityDescriptorFromString(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = checkManagedDescriptor(sd, manager); err != nil {
++		t.Fatalf("private manager descriptor rejected: %v", err)
++	}
++	custom, err := windows.SecurityDescriptorFromString(base + "(A;OICI;FA;;;S-1-5-21-100-200-300-1002)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = checkManagedDescriptor(custom, manager); err == nil {
++		t.Fatal("custom business group full-control ACE accepted")
++	}
++	unprotected, err := windows.SecurityDescriptorFromString(strings.Replace(base, "D:P", "D:", 1))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = checkManagedDescriptor(unprotected, manager); err == nil {
++		t.Fatal("unprotected state DACL accepted")
++	}
++}
++
++func TestSameHandleDescriptorMutationRejectsStaleExpected(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "stale-entry.exe")
++	if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	h, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer windows.CloseHandle(h.handle)
++	u, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	installed, err := denyDescriptor(h.identity.SecurityDescriptor, u.User.Sid.String(), u.User.Sid.String(), "executable")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = setTargetDescriptor(h.identity, installed); err != nil {
++		t.Fatal(err)
++	}
++	if err = setTargetDescriptor(withFixtureSD(h.identity, installed), h.identity.SecurityDescriptor); err != nil {
++		t.Fatal(err)
++	}
++	if err = setTargetDescriptor(withFixtureSD(h.identity, installed), h.identity.SecurityDescriptor); err == nil {
++		t.Fatal("stale installed descriptor overwrote changed target")
++	}
++	fresh, err := openNative(path, false, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !identityEqual(h.identity, fresh.identity) {
++		t.Error("stale attempt changed restored target")
++	}
++	if err = windows.CloseHandle(fresh.handle); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPEExecutionProbe(t *testing.T) {
++	if os.Getenv("RESEARCHOS_BOOT6_PE_PROBE") != "1" {
++		t.Skip("helper process only")
++	}
++}
++
++func TestDisposableRealPEAndScriptFence(t *testing.T) {
++	dir := t.TempDir()
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	pe := filepath.Join(dir, "owned-entry.exe")
++	src, err := os.Open(exe)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer src.Close()
++	dst, err := os.OpenFile(pe, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = io.Copy(dst, src); err != nil {
++		dst.Close()
++		t.Fatal(err)
++	}
++	if err = dst.Close(); err != nil {
++		t.Fatal(err)
++	}
++	script := filepath.Join(dir, "owned-entry.ps1")
++	if err = os.WriteFile(script, []byte("Write-Output fixture-only\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	u, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, item := range []struct{ path, mode string }{{pe, "executable"}, {script, "script"}} {
++		var before nativeHold
++		if item.mode == "script" {
++			before, err = openNativeAccess(item.path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
++		} else {
++			before, err = openNative(item.path, false, true)
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(), u.User.Sid.String(), item.mode)
++		if err != nil {
++			windows.CloseHandle(before.handle)
++			t.Fatal(err)
++		}
++		if err = setTargetDescriptor(before.identity, installed); err != nil {
++			windows.CloseHandle(before.handle)
++			t.Skipf("fixture WRITE_DAC unavailable: %v", err)
++		}
++		func() {
++			defer func() {
++				var restoreErr error
++				if item.mode == "script" {
++					restoreErr = restoreFixtureViaHeldHandle(before)
++				} else {
++					restoreErr = setTargetDescriptor(withFixtureSD(before.identity, installed), before.identity.SecurityDescriptor)
++				}
++				if restoreErr != nil {
++					t.Errorf("restore owned %s: %v", item.mode, restoreErr)
++				}
++				windows.CloseHandle(before.handle)
++			}()
++			if item.mode == "executable" {
++				cmd := exec.Command(item.path, "-test.run=TestPEExecutionProbe")
++				cmd.Env = append(os.Environ(), "RESEARCHOS_BOOT6_PE_PROBE=1")
++				out, runErr := cmd.CombinedOutput()
++				if runErr == nil {
++					t.Errorf("real PE executed despite exact FILE_EXECUTE fence: %s", out)
++				} else if !errors.Is(runErr, windows.ERROR_ACCESS_DENIED) {
++					t.Errorf("real PE rejection was not ACCESS_DENIED: %v", runErr)
++				} else {
++					t.Logf("real PE CreateProcess denied: %v", runErr)
++				}
++				exerciseSQLiteWALUnderFence(t, dir)
++			} else {
++				w, err := windows.UTF16PtrFromString(item.path)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				h, openErr := windows.CreateFile(w, windows.FILE_READ_DATA, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
++				if openErr == nil {
++					windows.CloseHandle(h)
++					t.Error("script FILE_READ_DATA succeeded")
++				} else if !errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
++					t.Errorf("script read denial differs: %v", openErr)
++				} else {
++					t.Logf("script FILE_READ_DATA denied: %v", openErr)
++				}
++			}
++		}()
++	}
++}
++
++func restoreFixtureViaHeldHandle(h nativeHold) error {
++	sd, err := windows.SecurityDescriptorFromString(h.identity.SecurityDescriptor)
++	if err != nil {
++		return err
++	}
++	owner, _, err := sd.Owner()
++	if err != nil {
++		return err
++	}
++	dacl, _, err := sd.DACL()
++	if err != nil {
++		return err
++	}
++	control, _, err := sd.Control()
++	if err != nil {
++		return err
++	}
++	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.OWNER_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
++	if control&windows.SE_DACL_PROTECTED != 0 {
++		flags = windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.OWNER_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
++	}
++	return windows.SetSecurityInfo(h.handle, windows.SE_FILE_OBJECT, flags, owner, nil, dacl, nil)
++}
++
++func TestOwnProcessRestartRegistrationNativeArgv(t *testing.T) {
++	register := windows.NewLazySystemDLL("kernel32.dll").NewProc("RegisterApplicationRestart")
++	unregister := windows.NewLazySystemDLL("kernel32.dll").NewProc("UnregisterApplicationRestart")
++	arg := "--boot6-native-argv"
++	w, err := windows.UTF16PtrFromString(arg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	r, _, _ := register.Call(uintptr(unsafe.Pointer(w)), 0)
++	if uint32(r) != 0 {
++		t.Skipf("own process RestartApps registration unavailable: HRESULT %#x", uint32(r))
++	}
++	defer unregister.Call()
++	actual, flags, registered, err := restartSettingsForProcess(windows.CurrentProcess())
++	if err != nil || !registered || actual != arg || flags != 0 {
++		t.Fatalf("native restart registration argv: registered=%v args=%q flags=%#x err=%v", registered, actual, flags, err)
++	}
++	t.Logf("GetApplicationRestartSettings returned own exact argv %q flags %#x", actual, flags)
++}
++
++func exerciseSQLiteWALUnderFence(t *testing.T, parent string) {
++	t.Helper()
++	root := filepath.Join(parent, "data-root")
++	if err := os.Mkdir(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	lease, err := rt.AcquireDataRootLease(root)
++	if err != nil {
++		t.Fatalf("business root lease under fence: %v", err)
++	}
++	defer func() {
++		if err := lease.Close(); err != nil {
++			t.Errorf("business lease close: %v", err)
++		}
++	}()
++	if !lease.Held() {
++		t.Fatal("business root lease not held")
++	}
++	dbPath := filepath.Join(root, "researchos.sqlite")
++	db, err := sql.Open("sqlite", dbPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	var mode string
++	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode); err != nil || strings.ToLower(mode) != "wal" {
++		t.Fatalf("business WAL unavailable: %q %v", mode, err)
++	}
++	if _, err = db.Exec(`CREATE TABLE fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(`INSERT INTO fixture(value) VALUES ('fence-compatible')`); err != nil {
++		t.Fatal(err)
++	}
++	var got string
++	if err = db.QueryRow(`SELECT value FROM fixture WHERE id=1`).Scan(&got); err != nil || got != "fence-compatible" {
++		t.Fatalf("business SQLite read under fence: %q %v", got, err)
++	}
++	if _, err = os.Stat(dbPath + "-wal"); err != nil {
++		t.Fatalf("business WAL file missing while DB open: %v", err)
++	}
++	t.Log("business data-root lease held; SQLite read/write and WAL file remained usable under executable fence")
++}
++
++func TestOpaqueTokenZeroAndPhaseFailClosed(t *testing.T) {
++	var q CurrentQuiescence
++	if err := q.Check(context.Background(), nil, "", "", "", ""); err == nil {
++		t.Fatal("zero token checked")
++	}
++	if err := q.Close(); err == nil {
++		t.Fatal("zero token closed as valid")
++	}
++	if _, err := OpenCurrentQuiescence(context.Background(), nil, "", "", "", ""); err == nil {
++		t.Fatal("nil lease opened token")
++	}
++	if _, err := RunPhase(context.Background(), "server", "C:\\fixture", "0123456789abcdef0123456789abcdef", strings.Repeat("a", 64)); err == nil {
++		t.Fatal("ordinary server mode accepted")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := RunPhase(ctx, "status", "C:\\fixture", "0123456789abcdef0123456789abcdef", strings.Repeat("a", 64)); !errors.Is(err, context.Canceled) {
++		t.Fatalf("canceled phase: %v", err)
++	}
++}
++
++func TestRetainedOSAncestorEffectiveACE(t *testing.T) {
++	const rootSD = "O:SYG:SYD:(A;OICIIO;SDGXGWGR;;;AU)(A;;0x1301bf;;;AU)(A;;FA;;;SY)(A;OICIIO;GA;;;SY)(A;OICIIO;GA;;;BA)(A;;FA;;;BA)(A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)"
++	root := FileIdentity{Path: `D:\`, SecurityDescriptor: rootSD}
++	p := EntryFencePlan{BusinessSID: "S-1-5-21-1-2-3-1001", ManagementSID: "S-1-5-21-1-2-3-1002", Ancestors: []FileIdentity{root}}
++	holds := []nativeHold{{path: root.Path, identity: root}}
++	medium := map[string]bool{p.BusinessSID: true, "S-1-5-11": true, "S-1-5-32-545": true} // BA is deny-only in the observed Medium token.
++	if err := checkAncestorACL(p, holds, medium); err != nil {
++		t.Fatalf("retained D root with effective AU read/modify and deny-only BA: %v", err)
++	}
++	medium["S-1-5-32-544"] = true
++	if err := checkAncestorACL(p, holds, medium); err == nil {
++		t.Fatal("BA enabled token accepted BA FullControl ancestor")
++	}
++	delete(medium, "S-1-5-32-544")
++	bad := root
++	bad.SecurityDescriptor = "O:SYG:SYD:(A;;FA;;;SY)(A;;FA;;;AU)"
++	if err := checkAncestorACL(p, []nativeHold{{path: root.Path, identity: bad}}, medium); err == nil {
++		t.Fatal("business effective FullControl on OS root accepted")
++	}
++	bad.SecurityDescriptor = "O:SYG:SYD:(A;;FA;;;SY)(A;OICIIO;FA;;;AU)"
++	if err := checkAncestorACL(p, []nativeHold{{path: root.Path, identity: bad}}, medium); err != nil {
++		t.Fatalf("inherit-only business grant incorrectly treated as effective on root: %v", err)
++	}
++	product := FileIdentity{Path: `D:\product`, SecurityDescriptor: "O:SYG:SYD:(A;;FA;;;SY)(A;;0x40;;;AU)"}
++	p.Ancestors = []FileIdentity{product}
++	if err := checkAncestorACL(p, []nativeHold{{path: product.Path, identity: product}}, medium); err == nil {
++		t.Fatal("business FILE_DELETE_CHILD on product ancestor accepted")
++	}
++	product.SecurityDescriptor = "O:AUG:SYD:(A;;FA;;;SY)"
++	if err := checkAncestorACL(p, []nativeHold{{path: product.Path, identity: product}}, medium); err == nil {
++		t.Fatal("business-owned product ancestor accepted")
++	}
++}
++
++func TestLiveBusinessTokenGroupCapture(t *testing.T) {
++	token := windows.GetCurrentProcessToken()
++	user, err := token.GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	groups, err := token.GetTokenGroups()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var enabled []string
++	for _, group := range groups.AllGroups() {
++		if group.Attributes&windows.SE_GROUP_ENABLED != 0 && group.Attributes&(windows.SE_GROUP_USE_FOR_DENY_ONLY|windows.SE_GROUP_LOGON_ID|windows.SE_GROUP_INTEGRITY) == 0 {
++			enabled = append(enabled, group.Sid.String())
++		}
++	}
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := EntryFencePlan{BusinessSID: user.User.Sid.String(), BusinessGroupSIDs: enabled, Targets: []FenceTarget{{File: FileIdentity{Path: exe}, Mode: "executable"}}}
++	sha, err := businessEnabledGroupDigest(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = inspectLiveBusinessToken(p, sha); err != nil {
++		t.Fatalf("native business token group capture: %v", err)
++	}
++	p.BusinessGroupSIDs = []string{"S-1-5-32-544"}
++	sha, _ = businessEnabledGroupDigest(p)
++	if err := inspectLiveBusinessToken(p, sha); err == nil {
++		t.Fatal("frozen business group claim accepted without matching live token")
++	}
++}
++
++func TestBusinessTokenPermissionSemanticsAcrossRestart(t *testing.T) {
++	pre := BootWitness{BusinessSessionID: 3, BusinessElevationType: 3, BusinessIntegritySID: "S-1-16-8192", BusinessLogonSID: "S-1-5-5-1-2", BusinessPrivilegesSHA256: strings.Repeat("a", 64)}
++	current := businessTokenShape{SessionID: 9, ElevationType: 3, IntegritySID: pre.BusinessIntegritySID, LogonSID: "S-1-5-5-9-10", PrivilegesSHA256: pre.BusinessPrivilegesSHA256, GroupsSHA256: strings.Repeat("b", 64)}
++	if err := sameBusinessPermissionSemantics(pre, current, current.GroupsSHA256); err != nil {
++		t.Fatalf("fresh session/logon identity should keep same permission semantics: %v", err)
++	}
++	current.ElevationType = 2
++	if err := sameBusinessPermissionSemantics(pre, current, current.GroupsSHA256); err == nil {
++		t.Fatal("elevation change accepted")
++	}
++	current.ElevationType = pre.BusinessElevationType
++	current.ProcessID = 555
++	current.ProcessCreated = time.Date(2026, 10, 25, 7, 1, 0, 0, time.UTC)
++	current.ProcessImageSHA = strings.Repeat("c", 64)
++	post := BootWitness{BusinessEnabledSIDsSHA256: current.GroupsSHA256, BusinessSessionID: current.SessionID, BusinessLogonSID: current.LogonSID, BusinessProcessPID: current.ProcessID, BusinessProcessCreatedUTC: current.ProcessCreated, BusinessProcessImageSHA256: current.ProcessImageSHA}
++	if err := sameCurrentProcessWitness(post, current); err != nil {
++		t.Fatalf("current process witness did not bind exact source: %v", err)
++	}
++	current.ProcessID++
++	if err := sameCurrentProcessWitness(post, current); err == nil {
++		t.Fatal("replacement process accepted as same post witness")
++	}
++}
++
++func TestExistingBusinessExplorerTokenNativeProbe(t *testing.T) {
++	token := windows.GetCurrentProcessToken()
++	user, err := token.GetTokenUser()
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := EntryFencePlan{BusinessSID: user.User.Sid.String()}
++	shape, err := tokenSecurityShape(token, windows.GetCurrentProcessId(), p.BusinessSID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pre := BootWitness{BusinessSessionID: shape.SessionID, BusinessElevationType: shape.ElevationType, BusinessIntegritySID: shape.IntegritySID, BusinessLogonSID: shape.LogonSID, BusinessPrivilegesSHA256: shape.PrivilegesSHA256}
++	actual, err := inspectExistingBusinessProcess(p, shape.GroupsSHA256, pre)
++	if err != nil {
++		t.Fatalf("native Explorer TOKEN_QUERY boundary unavailable: %v", err)
++	}
++	t.Logf("native existing business Explorer token verified: current session=%d, elevation=%d, integrity=%s, logon SID present=%t", actual.SessionID, actual.ElevationType, actual.IntegritySID, actual.LogonSID != "")
++}
+diff --git a/ops/qualification_recovery_boundary/main_windows.go b/ops/qualification_recovery_boundary/main_windows.go
+new file mode 100644
+index 00000000..dc7d366f
+--- /dev/null
++++ b/ops/qualification_recovery_boundary/main_windows.go
+@@ -0,0 +1,65 @@
++//go:build windows
++
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"flag"
++	"fmt"
++	"os"
++
++	"researchos.local/research-os/internal/recoveryboundary"
++)
++
++type result struct {
++	Schema string `json:"schema"`
++	State  string `json:"state,omitempty"`
++	Error  string `json:"error,omitempty"`
++}
++
++func parse(args []string) (phase, root, operation, plan string, err error) {
++	if len(args) == 0 {
++		return "", "", "", "", errors.New("one fixed phase required")
++	}
++	phase = args[0]
++	if phase != "plan" && phase != "arm" && phase != "observe" && phase != "status" && phase != "disarm-request" {
++		return "", "", "", "", errors.New("unsupported phase")
++	}
++	f := flag.NewFlagSet(phase, flag.ContinueOnError)
++	f.SetOutput(os.Stderr)
++	f.StringVar(&root, "data-root", "", "frozen data root")
++	f.StringVar(&operation, "operation-id", "", "frozen operation")
++	f.StringVar(&plan, "plan-sha256", "", "frozen boundary plan digest")
++	if err = f.Parse(args[1:]); err != nil {
++		return
++	}
++	if len(f.Args()) != 0 || root == "" || operation == "" || plan == "" {
++		err = errors.New("exact data-root, operation-id and plan-sha256 required")
++	}
++	return
++}
++
++func run(ctx context.Context, args []string) (string, error) {
++	phase, root, operation, plan, err := parse(args)
++	if err != nil {
++		return "", err
++	}
++	return recoveryboundary.RunPhase(ctx, phase, root, operation, plan)
++}
++
++func main() {
++	state, err := run(context.Background(), os.Args[1:])
++	out := result{Schema: "researchos.recovery-boundary-helper-result.v1", State: state}
++	if err != nil {
++		out.Error = err.Error()
++	}
++	if e := json.NewEncoder(os.Stdout).Encode(out); e != nil {
++		fmt.Fprintln(os.Stderr, e)
++		os.Exit(2)
++	}
++	if err != nil {
++		os.Exit(1)
++	}
++}
+diff --git a/ops/qualification_recovery_boundary/main_nonwindows.go b/ops/qualification_recovery_boundary/main_nonwindows.go
+new file mode 100644
+index 00000000..1a8adf29
+--- /dev/null
++++ b/ops/qualification_recovery_boundary/main_nonwindows.go
+@@ -0,0 +1,16 @@
++//go:build !windows
++
++package main
++
++import (
++	"encoding/json"
++	"os"
++)
++
++func main() {
++	_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
++		"schema": "researchos.recovery-boundary-helper-result.v1",
++		"error":  "qualification recovery boundary is unsupported outside Windows",
++	})
++	os.Exit(1)
++}
+diff --git a/ops/qualification_recovery_boundary/main_windows_test.go b/ops/qualification_recovery_boundary/main_windows_test.go
+new file mode 100644
+index 00000000..b9a5e7f6
+--- /dev/null
++++ b/ops/qualification_recovery_boundary/main_windows_test.go
+@@ -0,0 +1,29 @@
++//go:build windows
++
++package main
++
++import (
++	"context"
++	"strings"
++	"testing"
++)
++
++func TestCLIOnlyFixedPhasesAndExactSelector(t *testing.T) {
++	sha := strings.Repeat("a", 64)
++	for _, args := range [][]string{
++		nil, {"server"}, {"arm", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha, "--sql", "delete"},
++		{"arm", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef"},
++		{"status", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha, "extra"},
++	} {
++		if _, _, _, _, err := parse(args); err == nil {
++			t.Fatalf("invalid selector accepted: %q", args)
++		}
++	}
++	phase, root, operation, plan, err := parse([]string{"status", "--data-root", "C:\\fixture", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha})
++	if err != nil || phase != "status" || root != "C:\\fixture" || operation != "0123456789abcdef0123456789abcdef" || plan != sha {
++		t.Fatalf("fixed status parse: %q %q %q %q %v", phase, root, operation, plan, err)
++	}
++	if _, err := run(context.Background(), []string{"plan", "--data-root", "relative", "--operation-id", "0123456789abcdef0123456789abcdef", "--plan-sha256", sha}); err == nil {
++		t.Fatal("relative root reached helper")
++	}
++}

@@ -1,0 +1,131 @@
+--- formal_case_index.after.py
++++ formal_case_index.before.py
+@@ -923,26 +923,9 @@
+     return SimpleNamespace(**namespace)
+ 
+ 
+-def _w09_profile(reader):
+-    """Load the reviewed profile from a fixed source path, never a receipt path."""
+-    from types import SimpleNamespace
+-    source = reader.path("execution/v2.4/formal_profile_w09.py")
+-    fixed_parent = reader.repo / "execution/v2.4"
+-    require(source.parent == fixed_parent and not source.is_symlink(), "PROFILE_SOURCE", str(source))
+-    raw_source = source.read_bytes()
+-    digest = hashlib.sha256(raw_source).hexdigest()
+-    require(source not in reader.read_hashes or reader.read_hashes[source] == digest,
+-            "INPUT_CHANGED_DURING_READ", str(source))
+-    reader.read_hashes[source] = digest
+-    namespace = {"__name__": "researchos_trusted_w09_profile", "__file__": str(source)}
+-    exec(compile(raw_source, str(source), "exec"), namespace)
+-    require(sha256(source) == digest, "INPUT_CHANGED_DURING_READ", str(source))
+-    return SimpleNamespace(**namespace)
+-
+-
+ def _registered_roots(reader, owner, task_id):
+     selected = {"review": [], "context": [], "issuance": []}
+-    require(task_id in {"W04", "W07", "W09"}, "UNSUPPORTED_PROTOCOL", task_id)
++    require(task_id in {"W04", "W07"}, "UNSUPPORTED_PROTOCOL", task_id)
+     protocol = task_id.lower()
+     schemas = {"researchos." + protocol + "." + name + ".v1": kind
+                for kind, name in (("review", "independent-review"), ("context", "current-context"),
+@@ -991,8 +974,6 @@
+ def _verify_owner(reader, owner, task_id, roots, plan_path):
+     if task_id == "W07":
+         return _w07_profile(reader).verify_owner(_profile_api(), reader, owner, roots, plan_path)
+-    if task_id == "W09":
+-        return _w09_profile(reader).verify_owner(_profile_api(), reader, owner, roots, plan_path)
+     require(task_id == "W04", "UNSUPPORTED_PROTOCOL", "No verified evidence profile is implemented for " + task_id)
+     context, _ = _currentness(reader, roots["context"])
+     require(not reader.read(roots["review"]).get("supersedes_review_refs"), "SUPERSESSION_NOT_SUPPORTED", task_id)
+@@ -1013,41 +994,6 @@
+     return context
+ 
+ 
+-def _owned_inventory(reader, relative, claims):
+-    """Pin every W09 owned raw member and its complete directory inventory."""
+-    text(relative, "owned directory")
+-    require(relative.startswith("execution/receipts/W09/") and
+-            all(part not in ("", ".", "..") for part in relative.split("/")),
+-            "OWNED_SCOPE", relative)
+-    root = reader.repo / relative
+-    require(root.is_dir() and not root.is_symlink() and not root.is_junction()
+-            and root.resolve(strict=True) == root, "OWNED_SCOPE", relative)
+-    observed = []
+-    for directory, dirs, files in os.walk(root, followlinks=False):
+-        for name in dirs:
+-            child = Path(directory) / name
+-            require(not child.is_symlink() and not child.is_junction(), "OWNED_ALIAS", str(child))
+-        for name in files:
+-            if name.endswith(".raw"):
+-                child = Path(directory) / name
+-                require(child.is_file() and not child.is_symlink() and not child.is_junction(),
+-                        "OWNED_ALIAS", str(child))
+-                observed.append(child.relative_to(reader.repo).as_posix())
+-    observed.sort()
+-    rows = sequence(claims, "owned inventory claims")
+-    wanted = [row["path"] for row in rows]
+-    require(len(wanted) == len(set(wanted)) and sorted(wanted) == observed,
+-            "OWNED_INVENTORY_CHANGED", relative)
+-    for row in rows:
+-        fields(row, ("path", "sha256", "bytes"), label="owned inventory member")
+-        path = reader.ref({"path": row["path"], "sha256": row["sha256"]},
+-                          "execution/receipts/W09/")
+-        require(type(row["bytes"]) is int and path.stat().st_size == row["bytes"],
+-                "OWNED_BYTES_CHANGED", row["path"])
+-    return {"kind": "owned_raw", "repo": str(reader.repo), "directory": relative,
+-            "members": claims, "paths_sha256": object_sha256(observed)}
+-
+-
+ def recheck_inputs(snapshot):
+     """CAS dependency check; no product commands or authoritative input writes."""
+     try:
+@@ -1057,11 +1003,7 @@
+         for inventory in snapshot.get("inventories", []):
+             repo = Path(inventory["repo"])
+             check_reader = Reader(repo)
+-            if inventory.get("kind") == "owned_raw":
+-                current = _owned_inventory(check_reader, inventory["directory"], inventory["members"])
+-                require(current == inventory, "OWNED_INVENTORY_CHANGED", inventory["directory"])
+-            else:
+-                coverage(check_reader, inventory["coverage"], [{"path": name} for name in inventory["paths"]])
++            coverage(check_reader, inventory["coverage"], [{"path": name} for name in inventory["paths"]])
+     except (InvalidEvidence, OSError, ValueError) as exc:
+         return {"status": "INVALID", "reason": str(exc)}
+     return {"status": "PASS"}
+@@ -1078,8 +1020,7 @@
+         reader = Reader(repo_root)
+         cases, tasks, parents, owned, planned = _catalog(reader, plan_path)
+         rows = _canonical_state(reader, state_path, planned)
+-        _w07_profile(reader)  # Trusted modules participate in every dependency/CAS snapshot.
+-        _w09_profile(reader)
++        _w07_profile(reader)  # Trusted module participates in every dependency/CAS snapshot.
+     except (InvalidEvidence, OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
+         result.update(integrity="INVALID", reasons=[{"code": getattr(exc, "code", "GLOBAL_INPUT_INVALID"), "detail": str(exc)}])
+         if reader is not None:
+@@ -1096,14 +1037,12 @@
+             owner["integrity"] = "NOT_RUN" if row.get("status", "NOT_STARTED") == "NOT_STARTED" else "PENDING_OWNER_ACCEPTANCE"
+         else:
+             try:
+-                require(task_id in {"W04", "W07", "W09"}, "UNSUPPORTED_PROTOCOL", "Evidence profile has not been independently implemented for " + task_id)
++                require(task_id in {"W04", "W07"}, "UNSUPPORTED_PROTOCOL", "Evidence profile has not been independently implemented for " + task_id)
+                 roots = _registered_roots(reader, row, task_id)
+                 context = _verify_owner(reader, row, task_id, roots, plan_path)
+                 owner.update(integrity="VALID_ACCEPTED", accepted_case_ids=list(owned[task_id]))
+                 result["dependency_snapshot"]["inventories"].append({"repo": str(reader.repo), "coverage": context["source_coverage"],
+                                                                       "paths": [ref["path"] for ref in context["version_vector"]["source_files"]]})
+-                if task_id == "W09":
+-                    result["dependency_snapshot"]["inventories"].extend(context["_verified_owned_inventories"])
+             except (InvalidEvidence, OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
+                 code = getattr(exc, "code", "OWNER_EVIDENCE_INVALID")
+                 owner["integrity"] = "NEEDS_REVALIDATION" if code in {"NEEDS_REVALIDATION", "TOOL_CHANGED", "SOURCE_COVERAGE"} else (
+@@ -1116,10 +1055,6 @@
+                                     "status": owner["integrity"], "reasons": owner["reasons"]})
+         result["accepted_case_ids"].extend(owner["accepted_case_ids"])
+     try:
+-        for inventory in result["dependency_snapshot"]["inventories"]:
+-            if inventory.get("kind") == "owned_raw":
+-                require(_owned_inventory(reader, inventory["directory"], inventory["members"]) == inventory,
+-                        "OWNED_INVENTORY_CHANGED", inventory["directory"])
+         reader.finish()
+     except (InvalidEvidence, OSError) as exc:
+         result.update(integrity="INVALID", accepted_case_ids=[], reasons=result["reasons"] + [{"code": "INPUT_CHANGED_DURING_READ", "detail": str(exc)}])

@@ -1,0 +1,457 @@
+//go:build windows
+
+package recoveryboundary
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	_ "modernc.org/sqlite"
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+func TestRestartWitnessStrictDecreaseAndWindow(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	pre := BootWitness{Schema: WitnessSchema, OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, HelperSHA256: sha, FenceSHA256: sha,
+		UTC: time.Date(2026, 10, 25, 7, 0, 0, 0, time.UTC), UptimeMilliseconds: 900000,
+		LastBootUTC: time.Date(2026, 10, 25, 6, 45, 0, 0, time.UTC), RestartApps: 1}
+	post := pre
+	post.UTC = pre.UTC.Add(5 * time.Minute)
+	post.LastBootUTC = pre.UTC.Add(30 * time.Second)
+	post.UptimeMilliseconds = 270000
+	post.FullRestartEvidenceSHA256 = sha
+	if err := ValidateRestart(pre, post); err != nil {
+		t.Fatalf("valid bounded witness: %v", err)
+	}
+	cases := map[string]func(*BootWitness){
+		"same boot":           func(x *BootWitness) { x.LastBootUTC = pre.LastBootUTC },
+		"uptime equal":        func(x *BootWitness) { x.UptimeMilliseconds = pre.UptimeMilliseconds },
+		"uptime too long":     func(x *BootWitness) { x.UptimeMilliseconds = uint64(MaxPostUptime / time.Millisecond) },
+		"UTC expired":         func(x *BootWitness) { x.UTC = pre.UTC.Add(MaxElapsed + time.Second) },
+		"negative UTC":        func(x *BootWitness) { x.UTC = pre.UTC.Add(-time.Second) },
+		"plan drift":          func(x *BootWitness) { x.PlanSHA256 = strings.Repeat("b", 64) },
+		"boot after post":     func(x *BootWitness) { x.LastBootUTC = x.UTC.Add(time.Second) },
+		"unknown RestartApps": func(x *BootWitness) { x.RestartApps = 2 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			x := post
+			mutate(&x)
+			if err := ValidateRestart(pre, x); err == nil {
+				t.Fatal("invalid witness accepted")
+			}
+		})
+	}
+}
+
+func TestBoundaryEventSequenceRejectsGapAndReplay(t *testing.T) {
+	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64)}
+	e := BoundaryEvent{Schema: EventSchema, Sequence: 1, OperationID: p.OperationID, PlanSHA256: p.PlanSHA256, State: "PREPARED", UTC: time.Now().UTC()}
+	e.SHA256 = digest([]byte(strings.Join([]string{e.Schema, "1", "", e.OperationID, e.PlanSHA256, e.State, e.UTC.Format(time.RFC3339Nano)}, "\x00")))
+	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateEvents([]BoundaryEvent{e, e}, p.OperationID, p.PlanSHA256); err == nil {
+		t.Fatal("replayed sequence accepted")
+	}
+	e.State = "ARMED"
+	if err := ValidateEvents([]BoundaryEvent{e}, p.OperationID, p.PlanSHA256); err == nil {
+		t.Fatal("phase skip accepted")
+	}
+}
+
+func TestAppendOnlyBoundaryCrashSequence(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ProgramData", base)
+	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: strings.Repeat("a", 64), DataRoot: FileIdentity{Path: `C:\fixture`, FinalUTF16: `\\?\C:\fixture`, FileID: strings.Repeat("1", 32)}}
+	dir, err := stateRoot(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendEvent(p, nil, "PREPARED"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendEvent(p, nil, "PREPARED"); err == nil {
+		t.Fatal("duplicate create replaced historical event")
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "event-01.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first BoundaryEvent
+	if err := json.Unmarshal(raw, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendEvent(p, []BoundaryEvent{first}, "ARMED"); err == nil {
+		t.Fatal("crash phase skip accepted")
+	}
+	if err := appendEvent(p, []BoundaryEvent{first}, "APPLYING"); err != nil {
+		t.Fatal(err)
+	}
+	secondRaw, err := os.ReadFile(filepath.Join(dir, "event-02.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second BoundaryEvent
+	if err := json.Unmarshal(secondRaw, &second); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err != nil {
+		t.Fatal(err)
+	}
+	second.PreviousSHA256 = ""
+	if err := ValidateEvents([]BoundaryEvent{first, second}, p.OperationID, p.PlanSHA256); err == nil {
+		t.Fatal("broken predecessor accepted")
+	}
+}
+
+func TestOnlineBackupGateRequiresRestorationAndIndependentIssuer(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	p := EntryFencePlan{OperationID: "0123456789abcdef0123456789abcdef", PlanSHA256: sha, ManagementSID: "S-1-5-21-1"}
+	core, err := PlanCoreSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := BoundaryAttestation{Schema: "researchos.boundary-attestation.v1", Kind: "online-backup", Status: "ACCEPTED", OperationID: p.OperationID, PlanCoreSHA256: core, Issuer: "independent-review", EvidenceSHA256: sha, RecordedUTC: time.Now().UTC(), BackupID: "backup-1", RestoreTestSHA256: sha, CredentialProbeSHA256: sha}
+	if err := validateAttestation(p, "online-backup", proof); err != nil {
+		t.Fatal(err)
+	}
+	proof.RestoreTestSHA256 = ""
+	if err := validateAttestation(p, "online-backup", proof); err == nil {
+		t.Fatal("static backup claim passed without restore test")
+	}
+	proof.RestoreTestSHA256 = sha
+	proof.Issuer = p.ManagementSID
+	if err := validateAttestation(p, "online-backup", proof); err == nil {
+		t.Fatal("manager self acceptance passed")
+	}
+}
+
+func TestBoundaryPlanDigestBindsAttestationFilesWithoutCycle(t *testing.T) {
+	p := EntryFencePlan{Schema: PlanSchema, OperationID: "0123456789abcdef0123456789abcdef", SourceAcceptanceSHA256: strings.Repeat("1", 64), NativeAcceptanceSHA256: strings.Repeat("2", 64)}
+	core, err := PlanCoreSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := ComputePlanSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.PlanSHA256 = full
+	p.SourceAcceptanceSHA256 = strings.Repeat("3", 64)
+	coreAfter, err := PlanCoreSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullAfter, err := ComputePlanSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coreAfter != core || fullAfter == full {
+		t.Fatal("plan core/receipt digest separation broken")
+	}
+	if err := ValidatePlan(p); err == nil {
+		t.Fatal("modified attestation reference retained old plan hash")
+	}
+}
+
+func TestNativeHoldSurvivesGCAndBlocksReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "entry.exe")
+	if err := os.WriteFile(path, []byte("fixture-entry"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := openNative(path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.identity.FileID == "" || h.identity.Volume == 0 || h.identity.FinalUTF16 == "" || h.identity.SecurityDescriptor == "" || h.identity.SHA256 != digest([]byte("fixture-entry")) {
+		t.Fatal("native identity incomplete")
+	}
+	runtime.GC()
+	runtime.GC()
+	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err == nil {
+		t.Fatal("rename succeeded while no-delete native hold live")
+	}
+	if err := checkHolds([]nativeHold{h}); err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(h.handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(dir, "replacement.exe")); err != nil {
+		t.Fatalf("rename after release: %v", err)
+	}
+}
+
+func TestDisposableExecutableFenceReadbackAndRestore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "boot-fixture.exe")
+	if err := os.WriteFile(path, []byte("fixture-only"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := openNative(path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(before.handle)
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), "executable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed == before.identity.SecurityDescriptor {
+		t.Fatal("fence did not change descriptor")
+	}
+	if err = setTargetDescriptor(path, installed); err != nil {
+		t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+	}
+	defer func() {
+		if err := setTargetDescriptor(path, before.identity.SecurityDescriptor); err != nil {
+			t.Errorf("fixture descriptor restore: %v", err)
+		}
+	}()
+	after, err := openNative(path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !identityCoreEqual(before.identity, after.identity) || after.identity.SecurityDescriptor != installed {
+		t.Errorf("installed native identity/readback mismatch: core=%v expectedSD=%q actualSD=%q", identityCoreEqual(before.identity, after.identity), installed, after.identity.SecurityDescriptor)
+	}
+	if err := windows.CloseHandle(after.handle); err != nil {
+		t.Fatal(err)
+	}
+	w, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(w, windows.FILE_EXECUTE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err == nil {
+		windows.CloseHandle(h)
+		t.Fatal("business SID execute opened through fence")
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("execute rejection differs: %v", err)
+	}
+	if err = setTargetDescriptor(path, before.identity.SecurityDescriptor); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := openNative(path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !identityEqual(before.identity, restored.identity) {
+		t.Error("original descriptor not restored exactly")
+	}
+	if err := windows.CloseHandle(restored.handle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDistinctManagerPlanTransfersOwnerAndDeniesFenceTamper(t *testing.T) {
+	path:=filepath.Join(t.TempDir(),"managed-entry.exe")
+	if err:=os.WriteFile(path,[]byte("fixture"),0600); err!=nil { t.Fatal(err) }
+	h,err:=openNative(path,false,true); if err!=nil { t.Fatal(err) }; defer windows.CloseHandle(h.handle)
+	u,err:=windows.GetCurrentProcessToken().GetTokenUser(); if err!=nil { t.Fatal(err) }
+	manager:="S-1-5-32-544" // descriptor-construction fixture only; no privileged owner change
+	installed,err:=denyDescriptor(h.identity.SecurityDescriptor,u.User.Sid.String(),manager,"executable"); if err!=nil { t.Fatal(err) }
+	sd,err:=windows.SecurityDescriptorFromString(installed); if err!=nil { t.Fatal(err) }
+	owner,_,err:=sd.Owner(); if err!=nil || owner.String()!=manager { t.Fatalf("management owner absent: %v %v",owner,err) }
+	acl,_,err:=sd.DACL(); if err!=nil { t.Fatal(err) }
+	var ace *windows.ACCESS_ALLOWED_ACE; if err=windows.GetAce(acl,0,&ace); err!=nil { t.Fatal(err) }
+	want:=uint32(windows.FILE_EXECUTE|windows.WRITE_DAC|windows.WRITE_OWNER|windows.DELETE|windows.FILE_WRITE_DATA|windows.FILE_APPEND_DATA)
+	if ace.Header.AceType!=windows.ACCESS_DENIED_ACE_TYPE || ace.Mask&want!=want || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()!=u.User.Sid.String() { t.Fatal("exact business SID anti-tamper deny absent") }
+}
+
+func TestPEExecutionProbe(t *testing.T) {
+	if os.Getenv("RESEARCHOS_BOOT6_PE_PROBE") != "1" {
+		t.Skip("helper process only")
+	}
+}
+
+func TestDisposableRealPEAndScriptFence(t *testing.T) {
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pe := filepath.Join(dir, "owned-entry.exe")
+	src, err := os.Open(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(pe, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.Copy(dst, src); err != nil {
+		dst.Close()
+		t.Fatal(err)
+	}
+	if err = dst.Close(); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "owned-entry.ps1")
+	if err = os.WriteFile(script, []byte("Write-Output fixture-only\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ path, mode string }{{pe, "executable"}, {script, "script"}} {
+		before, err := openNative(item.path, false, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installed, err := denyDescriptor(before.identity.SecurityDescriptor, u.User.Sid.String(),u.User.Sid.String(), item.mode)
+		if err != nil {
+			windows.CloseHandle(before.handle)
+			t.Fatal(err)
+		}
+		if err = setTargetDescriptor(item.path, installed); err != nil {
+			windows.CloseHandle(before.handle)
+			t.Skipf("fixture WRITE_DAC unavailable: %v", err)
+		}
+		func() {
+			defer func() {
+				if err := setTargetDescriptor(item.path, before.identity.SecurityDescriptor); err != nil {
+					t.Errorf("restore owned %s: %v", item.mode, err)
+				}
+				windows.CloseHandle(before.handle)
+			}()
+			if item.mode == "executable" {
+				cmd := exec.Command(item.path, "-test.run=TestPEExecutionProbe")
+				cmd.Env = append(os.Environ(), "RESEARCHOS_BOOT6_PE_PROBE=1")
+				out, runErr := cmd.CombinedOutput()
+				if runErr == nil {
+					t.Errorf("real PE executed despite exact FILE_EXECUTE fence: %s", out)
+				} else if !errors.Is(runErr, windows.ERROR_ACCESS_DENIED) {
+					t.Errorf("real PE rejection was not ACCESS_DENIED: %v", runErr)
+				} else {
+					t.Logf("real PE CreateProcess denied: %v", runErr)
+				}
+				exerciseSQLiteWALUnderFence(t, dir)
+			} else {
+				w, err := windows.UTF16PtrFromString(item.path)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				h, openErr := windows.CreateFile(w, windows.FILE_READ_DATA, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+				if openErr == nil {
+					windows.CloseHandle(h)
+					t.Error("script FILE_READ_DATA succeeded")
+				} else if !errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
+					t.Errorf("script read denial differs: %v", openErr)
+				} else {
+					t.Logf("script FILE_READ_DATA denied: %v", openErr)
+				}
+			}
+		}()
+	}
+}
+
+func TestOwnProcessRestartRegistrationNativeArgv(t *testing.T) {
+	register := windows.NewLazySystemDLL("kernel32.dll").NewProc("RegisterApplicationRestart")
+	unregister := windows.NewLazySystemDLL("kernel32.dll").NewProc("UnregisterApplicationRestart")
+	arg := "--boot6-native-argv"
+	w, err := windows.UTF16PtrFromString(arg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ := register.Call(uintptr(unsafe.Pointer(w)), 0)
+	if uint32(r) != 0 {
+		t.Skipf("own process RestartApps registration unavailable: HRESULT %#x", uint32(r))
+	}
+	defer unregister.Call()
+	actual, flags, registered, err := restartSettingsForProcess(windows.CurrentProcess())
+	if err != nil || !registered || actual != arg || flags != 0 {
+		t.Fatalf("native restart registration argv: registered=%v args=%q flags=%#x err=%v", registered, actual, flags, err)
+	}
+	t.Logf("GetApplicationRestartSettings returned own exact argv %q flags %#x", actual, flags)
+}
+
+func exerciseSQLiteWALUnderFence(t *testing.T, parent string) {
+	t.Helper()
+	root := filepath.Join(parent, "data-root")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := rt.AcquireDataRootLease(root)
+	if err != nil {
+		t.Fatalf("business root lease under fence: %v", err)
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			t.Errorf("business lease close: %v", err)
+		}
+	}()
+	if !lease.Held() {
+		t.Fatal("business root lease not held")
+	}
+	dbPath := filepath.Join(root, "researchos.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var mode string
+	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode); err != nil || strings.ToLower(mode) != "wal" {
+		t.Fatalf("business WAL unavailable: %q %v", mode, err)
+	}
+	if _, err = db.Exec(`CREATE TABLE fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO fixture(value) VALUES ('fence-compatible')`); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err = db.QueryRow(`SELECT value FROM fixture WHERE id=1`).Scan(&got); err != nil || got != "fence-compatible" {
+		t.Fatalf("business SQLite read under fence: %q %v", got, err)
+	}
+	if _, err = os.Stat(dbPath + "-wal"); err != nil {
+		t.Fatalf("business WAL file missing while DB open: %v", err)
+	}
+	t.Log("business data-root lease held; SQLite read/write and WAL file remained usable under executable fence")
+}
+
+func TestOpaqueTokenZeroAndPhaseFailClosed(t *testing.T) {
+	var q CurrentQuiescence
+	if err := q.Check(context.Background(), nil, "", "", "", ""); err == nil {
+		t.Fatal("zero token checked")
+	}
+	if err := q.Close(); err == nil {
+		t.Fatal("zero token closed as valid")
+	}
+	if _, err := OpenCurrentQuiescence(context.Background(), nil, "", "", "", ""); err == nil {
+		t.Fatal("nil lease opened token")
+	}
+	if _, err := RunPhase(context.Background(), "server", "C:\\fixture", "0123456789abcdef0123456789abcdef", strings.Repeat("a", 64)); err == nil {
+		t.Fatal("ordinary server mode accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := RunPhase(ctx, "status", "C:\\fixture", "0123456789abcdef0123456789abcdef", strings.Repeat("a", 64)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled phase: %v", err)
+	}
+}

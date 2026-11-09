@@ -1,0 +1,112 @@
+internal/domain\budget.go:270:func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, error) {
+internal/domain\durability.go:17:func effectAppend(tx *sql.Tx, project, run, key string, o Object) error {
+			return nil, e
+		}
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	if goal["status"] != "ACTIVE" || task["status"] != "RUNNING" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" || task["active_run_id"] != runID {
+		return nil, Fail(409, "STATE_CONFLICT", "run stopped or superseded")
+	}
+	expiry, e := time.Parse(time.RFC3339Nano, Str(run, "lease_expires_at"))
+	if e != nil || !expiry.After(time.Now()) {
+		return nil, Fail(409, "LEASE_EXPIRED", "expired lease cannot start effect")
+	}
+	if e = s.taskContextForRun(tx, project, run); e != nil {
+		return nil, e
+	}
+	ledger, e := load(tx, project, "BudgetLedgerEntry", Str(o, "reservation_id"))
+	if e != nil {
+		return nil, e
+	}
+	var lastCost string
+	if e = tx.QueryRow("SELECT json_extract(body,'$.operation') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? ORDER BY rowid DESC LIMIT 1", project, runID, key).Scan(&lastCost); e != nil {
+		return nil, e
+	}
+	if lastCost != "RESERVE" && lastCost != "UNKNOWN" {
+		return nil, Fail(409, "STATE_CONFLICT", "settled or released cost cannot authorize a new effect")
+	}
+	chain, _, e := runBudgetScopes(tx, project, runID)
+	if e != nil {
+		return nil, e
+	}
+	for _, policy := range chain {
+		if policy["mode"] != "CAPPED" {
+			continue
+		}
+		if ledger["money"] == nil {
+			if policy["enforcement"] == "STRICT" || policy["unknown_cost_action"] == "BLOCK" {
+				return nil, Fail(422, "GATE_FAILED", "current policy cannot bound prepared effect")
+			}
+			continue
+		}
+		if policy["enforcement"] == "STRICT" && ledger["cost_basis"] != "UPPER_BOUND" {
+			return nil, Fail(422, "GATE_FAILED", "current policy cannot bound prepared effect")
+		}
+		cap := policy["cap"].(map[string]any)
+		used, unknown, e := budgetExposure(tx, policy, Str(cap, "currency"))
+		if e != nil {
+			return nil, e
+		}
+		limit, _ := moneyAmount(cap)
+		if unknown && (policy["enforcement"] == "STRICT" || policy["unknown_cost_action"] == "BLOCK") || used.Cmp(limit) > 0 {
+			return nil, Fail(422, "GATE_FAILED", "tightened policy blocks unissued effect")
+		}
+	}
+	o["state"] = "STARTED"
+	o["epoch"] = run["lease_epoch"]
+	if e = effectAppend(tx, project, runID, key, o); e != nil {
+		return nil, e
+	}
+	return o, nil
+}
+
+// ObserveEffect is the trusted worker/provider reconciliation boundary, like
+// ObserveRuntime. No public HTTP endpoint accepts invented provider outcomes.
+func (s *Service) ObserveEffect(ctx context.Context, project, runID, key, state string, receipt Object) error {
+	if (state != "CONFIRMED" && state != "UNKNOWN" && state != "NOT_APPLIED") || len(receipt) == 0 {
+		return Fail(400, "INVALID_REQUEST", "trusted outcome and receipt required")
+	}
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if e = resourceWriteLock(tx); e != nil {
+		return e
+	}
+	o, e := latestEffect(tx, project, runID, key)
+	if e != nil {
+		return e
+	}
+	if o["state"] == state && Hash(o["receipt"]) == Hash(receipt) {
+		return nil
+	}
+	if o["state"] == "CONFIRMED" || o["state"] == "NOT_APPLIED" || o["state"] == "PREPARED" {
+		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
+	}
+	o["state"] = state
+	o["receipt"] = receipt
+	if e = effectAppend(tx, project, runID, key, o); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+// ResumeCheckpoint rebuilds current context after trusted process/effect
+// reconciliation. It retains Run identity and all provider keys, rotating only
+// the execution lease so old callbacks cannot change the resumed run.
+func (s *Service) ResumeCheckpoint(ctx context.Context, token, project, runID, key string, expectedRevision int64) (Object, error) {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	if e = resourceWriteLock(tx); e != nil {
+		return nil, e
+	}
+	p, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+	if e != nil {
+		return nil, e

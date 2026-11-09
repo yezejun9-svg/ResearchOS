@@ -1,0 +1,11 @@
+# CP436 combined Desktop/Core default resource package
+
+`manifest.json` is the concise index. `composition.json` pins every one of the 58 shipped files by path, byte count, hash, and source. `verification.json` records the read-only package check, Core `go version -m` CB VCS stamps, descriptor binding, and the protected verifier installation manifest. Full build inputs, command logs, and desktop fixture raw are at the C build receipt path in `manifest.json`; this D receipt stores only the unique summary and scripts.
+
+The source worktree remained clean at `cb3646d384dcaee1670f3ca4c4891cd0fd12a2c8`. Its whole committed tree equals integrated Main `c381cf0d8e8f3ae2bcd437a6e0866b38d7bd9ec0`. The unmodified Desktop build validator captured 6,444 actual inputs, digest `9cd0ac95555a63be58c2e00f93355cfb3c94f6046a017727bd46d9367f55419b`, with zero drift. The compiled Core control and verifier carry the clean CB VCS stamp. The package contains the CB Desktop and React artifacts, CB Core binaries, fixed Mu 8df assets, and 32 public schema/migration files matching both CB and Main Git blobs.
+
+The source-bound local Desktop suite exited 0 with 219/219 passing, including both offscreen Electron renderer roundtrips. The validator test passed from its package directory. `bound-verification.json` links the exact successful invocations and raw hashes. These are local fixture and build checks. This package has not been launched against the ordinary data root; Root owns that action and independent review. Actual first-use, installer release, parent, and formal acceptance are unclaimed; model and tool calls here are zero.
+
+Three prior diagnostic records remain intact: `stopped.json` for the initial validator cwd mistake; `cb-desktop-suite-cwd-corrected.stopped.json` for the incorrect app root environment, terminated after raw fixture failures; and `cb-desktop-suite-app-root.stopped.json` for the receipt parser's ASCII-only summary expectation. The third suite itself exited 0 and its immutable raw output reports `ℹ tests 219`, `ℹ pass 219`, `ℹ fail 0`. `finalize-local-pass.py` interpreted that raw without running the suite again. Failure counters and old packages were not edited.
+
+The sole generated `__pycache__` in this unique receipt remains because its cleanup deletion was rejected by automatic policy review. No alternate deletion was attempted.

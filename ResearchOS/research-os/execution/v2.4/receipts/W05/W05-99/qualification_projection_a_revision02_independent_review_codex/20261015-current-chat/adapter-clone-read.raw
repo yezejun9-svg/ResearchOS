@@ -1,0 +1,65 @@
+//go:build windows
+
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"researchos.local/research-os/internal/runtimepolicy"
+)
+
+func cloneQualificationBridgeManifest(t *testing.T, manifest map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var clone map[string]any
+	if err := decoder.Decode(&clone); err != nil {
+		t.Fatal(err)
+	}
+	return clone
+}
+
+func qualificationBridgeManifest(t *testing.T) (map[string]any, map[string][]byte) {
+	t.Helper()
+	bundle := []byte("frozen local worker fixture")
+	tools := []any{}
+	for _, name := range []string{"run_check", "read_file", "edit_file", "shell_command"} {
+		tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object"}}})
+	}
+	config := map[string]any{"api": "openai-completions", "model": "fixture-model", "provider": "local", "ref": "fixture-ref", "route": "route-a", "endpoint": "http://127.0.0.1:1234/v1/chat/completions", "max_output_tokens": json.Number("512"), "max_calls": json.Number("8"), "tools": tools}
+	configHash, err := runtimepolicy.Hash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := map[string]any{"entity_type": "Artifact", "id": "profile-a", "revision": json.Number("1")}
+	refHash, err := runtimepolicy.Hash(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := map[string]any{"backend": "mu-sdk-broker-v1", "model": "fixture-model", "bundle_hash": Hash(bundle), "argv": []any{"--preserve-symlinks-main", "--preserve-symlinks", "{bundle}", "{manifest}"}, "model_config": config, "model_qualification": map[string]any{"route": "route-a", "model_config_hash": configHash, "max_calls": json.Number("1")}}
+	manifest := map[string]any{"project_id": "p", "task_id": "t", "run_id": "r", "runtime_id": "rt", "dispatch_key": "d", "epoch": json.Number("1"), "admission": map[string]any{"qualification_bootstrap": true, "profile_ref": ref, "profile_hash": refHash, "permission": map[string]any{"purpose": "runtime_qualification", "plan_hash": "sha256:plan"}, "profile": profile}}
+	if err := runtimepolicy.Prepare(manifest, "runtime_qualification"); err != nil {
+		t.Fatal(err)
+	}
+	effective, err := runtimepolicy.Effective(manifest, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := json.Marshal(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest, map[string][]byte{"mu-worker.mjs": bundle, "worker.json": worker}
+}
+
+func TestQualificationProjectionAdapterBeforeLaunch(t *testing.T) {

@@ -1,0 +1,478 @@
+1://go:build windows
+3:package host_test
+5:import (
+6:	"context"
+7:	"database/sql"
+8:	"encoding/json"
+9:	"fmt"
+10:	"net/http"
+11:	"net/http/httptest"
+12:	"os"
+13:	"os/exec"
+14:	"path/filepath"
+15:	"runtime"
+16:	"strings"
+17:	"testing"
+18:	"time"
+20:	"researchos.local/research-os/adapters/local_workspace"
+21:	"researchos.local/research-os/internal/api"
+22:	"researchos.local/research-os/internal/domain"
+23:	"researchos.local/research-os/internal/host"
+24:	"researchos.local/research-os/internal/store"
+25:)
+27:func backupCLI(t *testing.T, binary, repo string, args ...string) ([]byte, error) {
+28:	t.Helper()
+29:	cmd := exec.Command(binary, args...)
+30:	cmd.Dir = repo
+31:	return cmd.CombinedOutput()
+32:}
+34:func backupTestRepo(t *testing.T) string {
+35:	t.Helper()
+36:	root, err := filepath.Abs(filepath.Join("..", ".."))
+37:	if err != nil {
+38:		t.Fatal(err)
+39:	}
+40:	return root
+41:}
+43:func backupTestHost(t *testing.T, db *sql.DB, dataRoot, repo string) *host.Host {
+44:	t.Helper()
+45:	h, err := host.New(host.Config{DB: db, Dir: filepath.Join(dataRoot, "host"),
+46:		ContractsDir:  filepath.Join(repo, "spec", "v2.0", "contracts"),
+47:		MigrationFile: filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"),
+48:		SchemaDir:     filepath.Join(repo, "internal", "api", "contracts")})
+49:	if err != nil {
+50:		t.Fatal(err)
+51:	}
+52:	return h
+53:}
+55:func backupHTTP(t *testing.T, svc *domain.Service, token, method, path string, body any, etag string, want int) (domain.Object, string) {
+56:	t.Helper()
+57:	var raw []byte
+58:	if body != nil {
+59:		raw = domain.Bytes(body)
+60:	}
+61:	request := httptest.NewRequest(method, path, strings.NewReader(string(raw)))
+62:	request.Header.Set("Authorization", "Bearer "+token)
+63:	if body != nil {
+64:		request.Header.Set("Content-Type", "application/json")
+65:	}
+66:	if method != http.MethodGet {
+67:		request.Header.Set("Idempotency-Key", domain.ID())
+68:	}
+69:	if etag != "" {
+70:		request.Header.Set("If-Match", etag)
+71:	}
+72:	response := httptest.NewRecorder()
+73:	svc.Handler().ServeHTTP(response, request)
+74:	if response.Code != want {
+75:		t.Fatalf("%s %s expected %d, got %d: %s", method, path, want, response.Code, response.Body.String())
+76:	}
+77:	var value domain.Object
+78:	if err := json.Unmarshal(response.Body.Bytes(), &value); err != nil {
+79:		t.Fatal(err)
+80:	}
+81:	return value, response.Header().Get("ETag")
+82:}
+84:// This smoke uses production Host registration, domain workspace/project/session
+85:// creation, and the compiled ops/backup CLI. The chooser callback supplies a
+86:// temporary test path; it is not evidence that a human clicked the Windows UI.
+87:func TestW1802ProductionBackupCLIWorkspaceContinuation(t *testing.T) {
+88:	ctx := context.Background()
+89:	repo := backupTestRepo(t)
+90:	root := t.TempDir()
+91:	sourceData := filepath.Join(root, "source-data")
+92:	workspace := filepath.Join(root, "chosen-workspace")
+93:	if err := os.MkdirAll(filepath.Join(workspace, "src"), 0700); err != nil {
+94:		t.Fatal(err)
+95:	}
+96:	if err := os.Mkdir(filepath.Join(workspace, "empty"), 0700); err != nil {
+97:		t.Fatal(err)
+98:	}
+99:	if err := os.WriteFile(filepath.Join(workspace, "src", "main.go"), []byte("package continued\n"), 0600); err != nil {
+100:		t.Fatal(err)
+101:	}
+102:	if err := os.MkdirAll(sourceData, 0700); err != nil {
+103:		t.Fatal(err)
+104:	}
+105:	db, err := store.Open(filepath.Join(sourceData, "researchos.sqlite"))
+106:	if err != nil {
+107:		t.Fatal(err)
+108:	}
+109:	if err := store.Bootstrap(ctx, db, filepath.Join(repo, "migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
+110:		t.Fatal(err)
+111:	}
+112:	svc, err := domain.New(db, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+113:	if err != nil {
+114:		t.Fatal(err)
+115:	}
+116:	h := backupTestHost(t, db, sourceData, repo)
+117:	owner, err := h.BootstrapOwner(ctx)
+118:	if err != nil {
+119:		t.Fatal(err)
+120:	}
+121:	credentialRef, err := h.ImportCredential("fixture-provider", "API_KEY", "synthetic-private-value", "")
+122:	if err != nil || h.CredentialStatus(credentialRef) != host.StatusAvailable {
+123:		t.Fatalf("source host credential fixture unavailable: %v", err)
+124:	}
+125:	frame, err := json.Marshal(map[string]any{"kind": host.KindWorkspaceChooseRequest,
+126:		"client_id": "backup-smoke-cli", "payload": map[string]any{"requested_path": workspace, "requested_access": host.AccessReadWrite}})
+127:	if err != nil {
+128:		t.Fatal(err)
+129:	}
+130:	reply, err := h.HandleNative(frame, true, func(string) (string, error) { return workspace, nil })
+131:	if err != nil {
+132:		t.Fatal(err)
+133:	}
+134:	var chosen struct {
+135:		Payload struct {
+136:			Ref string `json:"selection_ref"`
+137:		} `json:"payload"`
+138:	}
+139:	if err := json.Unmarshal(reply, &chosen); err != nil || chosen.Payload.Ref == "" {
+140:		t.Fatalf("native selection failed: %v", err)
+141:	}
+142:	doc, err := api.ClientProtocolDocument()
+143:	if err != nil {
+144:		t.Fatal(err)
+145:	}
+146:	principal := domain.Principal{ID: owner.PrincipalID, Roles: []string{"OWNER"}, CanCreateProject: true}
+147:	authority := localworkspace.NewAuthority(h)
+148:	registered, err := svc.RegisterWorkspace(ctx, principal, authority, doc, domain.RegisterWorkspaceInput{
+149:		SelectionRef: chosen.Payload.Ref, DisplayName: "continued workspace", RequestedAccess: host.AccessReadWrite,
+150:		ClientID: "backup-smoke-cli", CommandID: "backup-smoke-register"})
+151:	if err != nil {
+152:		t.Fatal(err)
+153:	}
+154:	ref := domain.Str(registered, "authorized_workspace_ref")
+155:	project, err := svc.BootstrapProject(ctx, principal, authority, doc, localworkspace.NewScanner(), domain.BootstrapProjectInput{
+156:		AuthorizedWorkspaceRef: ref, DisplayName: "continued project", ClientID: "backup-smoke-cli",
+157:		CommandID: "backup-smoke-project", MeasurementMode: "FIXTURE"})
+158:	if err != nil {
+159:		t.Fatal(err)
+160:	}
+161:	projectID := domain.Str(project, "project_id")
+162:	if projectID == "" || ref == "" {
+163:		t.Fatal("production project or authorized workspace identity missing")
+164:	}
+165:	projectPath := "/v1/projects/" + projectID
+166:	_, stateTag := backupHTTP(t, svc, owner.Session.Token, "GET", projectPath+"/state", nil, "", 200)
+167:	requirement, requirementTag := backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/requirements",
+168:		domain.Object{"requirement_key": "W18-BACKUP", "text": "continue the same work after restore", "basis": "USER_STATED",
+169:			"source_refs": domain.Empty(), "rationale": "fixture continuation", "supersedes_id": nil, "acceptance_check_ids": domain.Empty()}, stateTag, 201)
+170:	requirement, _ = backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/requirements/"+domain.Str(requirement, "id")+"/actions",
+171:		domain.Object{"action": "ACCEPT", "reason": "fixture continuation", "source_validation_refs": domain.Empty()}, requirementTag, 200)
+172:	_, stateTag = backupHTTP(t, svc, owner.Session.Token, "GET", projectPath+"/state", nil, "", 200)
+173:	contract := domain.Object{"contract_hash": domain.Digest([]byte("backup-smoke-contract")), "contract_revision": 1,
+174:		"checks": []any{domain.Object{"check_id": "backup-continue", "kind": "DETERMINISTIC", "required": true,
+175:			"expected": "same pending task", "command_key": "test.backup", "rubric_ref": nil, "qualification_id": nil, "not_applicable_reason": nil}},
+176:		"require_independent_verifier": true, "version_policy": "EXACT", "frozen_at": domain.Now()}
+177:	goal, goalTag := backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/goals",
+178:		domain.Object{"title": "continue backup task", "original_intent": "preserve next step", "scope": "PROJECT",
+179:			"requirement_refs": []any{domain.Ref(requirement, "Requirement")}, "problem_ids": []any{"backup-source"},
+180:			"deliverables": []any{"same pending task"}, "acceptance_contract": contract}, stateTag, 201)
+181:	goalID := domain.Str(goal, "id")
+182:	task, _ := backupHTTP(t, svc, owner.Session.Token, "POST", projectPath+"/tasks",
+183:		domain.Object{"goal_id": goalID, "title": "resume this exact task", "task_type": "fixture", "stage": "verification",
+184:			"dependency_task_ids": domain.Empty(), "requirement_refs": []any{domain.Ref(requirement, "Requirement")},
+185:			"input_refs": domain.Empty(), "acceptance_contract": contract, "origin_problem_id": "backup-source",
+186:			"candidate_id": "backup-candidate", "stop_policy": domain.Object{"wall_time_seconds": 60,
+187:				"max_attempts": 3, "max_parallel_runs": 1, "stop_conditions": []any{"no effective progress"}}}, goalTag, 201)
+188:	taskID := domain.Str(task, "id")
+189:	sessionID := "backup-smoke-session"
+190:	modelRef, buildID, title := "fixture-model-ref", "w1802-fixture-core-build", "Continued fixture session"
+191:	now := time.Now().UTC()
+192:	tx, err := db.BeginTx(ctx, nil)
+193:	if err != nil {
+194:		t.Fatal(err)
+195:	}
+196:	if err := domain.MapClientSession(ctx, tx, domain.ClientSession{ID: sessionID, ProjectID: projectID,
+197:		Revision: 1, CreatedAt: now, UpdatedAt: now, WriterEpoch: 1, WriterClientID: "backup-smoke-cli",
+198:		UpstreamSession: "backup-smoke-native", WorkspaceRef: &ref, GoalID: &goalID, TaskID: &taskID,
+199:		ModelConfigRef: &modelRef, CoreBuildID: &buildID, Title: &title,
+200:		Protocol: domain.ClientSessionProtocol}); err != nil {
+201:		t.Fatal(err)
+202:	}
+203:	if err := tx.Commit(); err != nil {
+204:		t.Fatal(err)
+205:	}
+206:	if err := db.Close(); err != nil {
+207:		t.Fatal(err)
+208:	}
+210:	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go.exe")
+211:	if selected := os.Getenv("RESEARCHOS_GO"); selected != "" {
+212:		goBinary = selected
+213:	}
+214:	backupBinary := filepath.Join(root, "backup.exe")
+215:	build := exec.Command(goBinary, "build", "-o", backupBinary, "./ops/backup")
+216:	build.Dir = repo
+217:	if output, err := build.CombinedOutput(); err != nil {
+218:		t.Fatalf("build production backup command: %v\n%s", err, output)
+219:	}
+220:	key := filepath.Join(root, "recovery.key")
+221:	if output, err := backupCLI(t, backupBinary, repo, "keygen", "--key-file", key); err != nil {
+222:		t.Fatalf("production keygen: %v\n%s", err, output)
+223:	}
+224:	backup := filepath.Join(root, "encrypted-backup")
+225:	if output, err := backupCLI(t, backupBinary, repo, "create", "--db", filepath.Join(sourceData, "researchos.sqlite"),
+226:		"--out", backup, "--key-file", key, "--root", repo); err != nil {
+227:		t.Fatalf("production backup: %v\n%s", err, output)
+228:	}
+229:	if raw, err := os.ReadFile(filepath.Join(backup, "manifest.json")); err != nil || strings.Contains(string(raw), workspace) || strings.Contains(string(raw), "package continued") {
+230:		t.Fatal("workspace path or content leaked to plaintext manifest")
+231:	}
+232:	// The ordinary library path must not silently drop an active workspace.
+233:	sourceCheck, err := store.Open(filepath.Join(sourceData, "researchos.sqlite"))
+234:	if err != nil {
+235:		t.Fatal(err)
+236:	}
+237:	checkService, err := domain.New(sourceCheck, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+238:	if err != nil {
+239:		sourceCheck.Close()
+240:		t.Fatal(err)
+241:	}
+242:	_, omitted := checkService.CreateBackup(ctx, filepath.Join(root, "invalid-omission"), []byte(strings.Repeat("k", 32)))
+243:	sourceCheck.Close()
+244:	if omitted == nil || !strings.Contains(omitted.Error(), "BACKUP_WORKSPACE_SOURCE_REQUIRED") {
+245:		t.Fatalf("active workspace was silently omitted: %v", omitted)
+246:	}
+247:	// The production command rejects a backup destination inside its source
+248:	// workspace and names the failed scope instead of recursing into itself.
+249:	if output, err := backupCLI(t, backupBinary, repo, "create", "--db", filepath.Join(sourceData, "researchos.sqlite"),
+250:		"--out", filepath.Join(workspace, "recursive-backup"), "--key-file", key, "--root", repo); err == nil || !strings.Contains(string(output), "BACKUP_WORKSPACE_RECURSION") {
+251:		t.Fatalf("recursive workspace backup did not fail closed: %v %s", err, output)
+252:	}
+253:	oversized := filepath.Join(workspace, "src", "oversized.bin")
+254:	file, err := os.OpenFile(oversized, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+255:	if err != nil {
+256:		t.Fatal(err)
+257:	}
+258:	if err := file.Truncate(domain.BackupWorkspaceMaxFileBytes + 1); err != nil {
+259:		file.Close()
+260:		t.Fatal(err)
+261:	}
+262:	if err := file.Close(); err != nil {
+263:		t.Fatal(err)
+264:	}
+265:	if output, err := backupCLI(t, backupBinary, repo, "create", "--db", filepath.Join(sourceData, "researchos.sqlite"),
+266:		"--out", filepath.Join(root, "invalid-limit"), "--key-file", key, "--root", repo); err == nil || !strings.Contains(string(output), "BACKUP_WORKSPACE_LIMIT") {
+267:		t.Fatalf("oversized workspace item was omitted: %v %s", err, output)
+268:	}
+269:	if err := os.Remove(oversized); err != nil {
+270:		t.Fatal(err)
+271:	}
+272:	if err := os.WriteFile(filepath.Join(workspace, "src", "main.go"), []byte("source changed after backup\n"), 0600); err != nil {
+273:		t.Fatal(err)
+274:	}
+275:	restoredRoot := filepath.Join(root, "restored-data")
+276:	if output, err := backupCLI(t, backupBinary, repo, "restore", "--as-data-root", "--backup", backup, "--out", restoredRoot,
+277:		"--key-file", key, "--root", repo); err != nil {
+278:		t.Fatalf("production restore: %v\n%s", err, output)
+279:	}
+280:	restoredFile := filepath.Join(domain.BackupWorkspaceDestination(restoredRoot, ref), "src", "main.go")
+281:	content, err := os.ReadFile(restoredFile)
+282:	if err != nil || string(content) != "package continued\n" {
+283:		t.Fatalf("restored workspace content changed: %v %q", err, content)
+284:	}
+285:	if info, err := os.Stat(filepath.Join(domain.BackupWorkspaceDestination(restoredRoot, ref), "empty")); err != nil || !info.IsDir() {
+286:		t.Fatalf("empty workspace directory lost: %v", err)
+287:	}
+288:	restoredDB, err := store.Open(filepath.Join(restoredRoot, "researchos.sqlite"))
+289:	if err != nil {
+290:		t.Fatal(err)
+291:	}
+292:	defer restoredDB.Close()
+293:	restoredHost := backupTestHost(t, restoredDB, restoredRoot, repo)
+294:	if len(restoredHost.Roots()) != 1 || restoredHost.Roots()[0].Ref != ref || restoredHost.Roots()[0].RealPath != domain.BackupWorkspaceDestination(restoredRoot, ref) {
+295:		t.Fatalf("new Host did not pin the same workspace ref: %+v", restoredHost.Roots())
+296:	}
+297:	if _, err := restoredHost.ResolveWorkspace(ref, "src/main.go", host.AccessReadWrite); err != nil {
+298:		t.Fatalf("restored Host could not authorize the same workspace: %v", err)
+299:	}
+300:	if restoredHost.CredentialStatus(credentialRef) != host.StatusMissing {
+301:		t.Fatal("old host credential vault was copied into new data root")
+302:	}
+303:	restoredService, err := domain.New(restoredDB, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+304:	if err != nil {
+305:		t.Fatal(err)
+306:	}
+307:	binding, err := restoredService.WorkspaceBindingFor(ctx, principal, localworkspace.NewAuthority(restoredHost), ref)
+308:	if err != nil || binding.RealPath != domain.BackupWorkspaceDestination(restoredRoot, ref) || binding.ProjectID == nil || *binding.ProjectID != projectID {
+309:		t.Fatalf("same project binding did not survive restore: %+v %v", binding, err)
+310:	}
+311:	var restoredProject, restoredWorkspace, restoredGoal, restoredTask string
+312:	if err := restoredDB.QueryRow(`SELECT project_id,workspace_ref,goal_id,task_id FROM client_sessions WHERE id=?`, sessionID).
+313:		Scan(&restoredProject, &restoredWorkspace, &restoredGoal, &restoredTask); err != nil ||
+314:		restoredProject != projectID || restoredWorkspace != ref || restoredGoal != goalID || restoredTask != taskID {
+315:		t.Fatalf("same session/Goal/Task not recovered: %q %q %q %q %v", restoredProject, restoredWorkspace, restoredGoal, restoredTask, err)
+316:	}
+317:	var taskStatus string
+318:	if err := restoredDB.QueryRow(`SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='Task' AND id=?`, projectID, taskID).Scan(&taskStatus); err != nil || taskStatus != "DRAFT" {
+319:		t.Fatalf("next Task state was reset: %s %v", taskStatus, err)
+320:	}
+321:	snapshotTx, err := restoredDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+322:	if err != nil {
+323:		t.Fatal(err)
+324:	}
+325:	snapshot, err := domain.BuildSessionSnapshot(ctx, snapshotTx, doc, projectID, sessionID)
+326:	snapshotTx.Rollback()
+327:	if err != nil || snapshot["session_id"] != sessionID || snapshot["workspace_ref"] != ref ||
+328:		snapshot["model_config_ref"] != modelRef || snapshot["core_build_id"] != buildID || snapshot["goal_id"] != goalID {
+329:		t.Fatalf("typed session snapshot incomplete after restore: %v %+v", err, snapshot)
+330:	}
+331:	// A restored data root must itself be a valid production backup source. The
+332:	// second backup lives outside both data roots, then restores into a third,
+333:	// empty location without consulting the original Host or workspace.
+334:	originalDB, err := os.ReadFile(filepath.Join(sourceData, "researchos.sqlite"))
+335:	if err != nil {
+336:		t.Fatal(err)
+337:	}
+338:	secondBackup := filepath.Join(root, "second-encrypted-backup")
+339:	if output, err := backupCLI(t, backupBinary, repo, "create", "--db", filepath.Join(restoredRoot, "researchos.sqlite"),
+340:		"--out", secondBackup, "--key-file", key, "--root", repo); err != nil {
+341:		t.Fatalf("production rebackup after restore: %v\n%s", err, output)
+342:	}
+343:	secondRoot := filepath.Join(root, "second-restored-data")
+344:	if output, err := backupCLI(t, backupBinary, repo, "restore", "--as-data-root", "--backup", secondBackup,
+345:		"--out", secondRoot, "--key-file", key, "--root", repo); err != nil {
+346:		t.Fatalf("production second restore: %v\n%s", err, output)
+347:	}
+348:	secondDB, err := store.Open(filepath.Join(secondRoot, "researchos.sqlite"))
+349:	if err != nil {
+350:		t.Fatal(err)
+351:	}
+352:	defer secondDB.Close()
+353:	secondHost := backupTestHost(t, secondDB, secondRoot, repo)
+354:	secondPath := domain.BackupWorkspaceDestination(secondRoot, ref)
+355:	if len(secondHost.Roots()) != 1 || secondHost.Roots()[0].Ref != ref || secondHost.Roots()[0].RealPath != secondPath ||
+356:		secondPath == binding.RealPath || secondPath == workspace {
+357:		t.Fatalf("second Host root did not move to a fresh pin: %+v", secondHost.Roots())
+358:	}
+359:	if _, err := secondHost.ResolveWorkspace(ref, "src/main.go", host.AccessReadWrite); err != nil {
+360:		t.Fatalf("second Host cannot use recovered root: %v", err)
+361:	}
+362:	secondContent, err := os.ReadFile(filepath.Join(secondPath, "src", "main.go"))
+363:	if err != nil || string(secondContent) != "package continued\n" {
+364:		t.Fatalf("second restore changed source bytes: %v %q", err, secondContent)
+365:	}
+366:	var secondProject, secondWorkspace, secondGoal, secondTask string
+367:	if err := secondDB.QueryRow(`SELECT project_id,workspace_ref,goal_id,task_id FROM client_sessions WHERE id=?`, sessionID).
+368:		Scan(&secondProject, &secondWorkspace, &secondGoal, &secondTask); err != nil ||
+369:		secondProject != projectID || secondWorkspace != ref || secondGoal != goalID || secondTask != taskID {
+370:		t.Fatalf("second restore lost session/Goal/Task identity: %q %q %q %q %v", secondProject, secondWorkspace, secondGoal, secondTask, err)
+371:	}
+372:	secondService, err := domain.New(secondDB, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+373:	if err != nil {
+374:		t.Fatal(err)
+375:	}
+376:	secondBinding, err := secondService.WorkspaceBindingFor(ctx, principal, localworkspace.NewAuthority(secondHost), ref)
+377:	if err != nil || secondBinding.RealPath != secondPath || secondBinding.ProjectID == nil || *secondBinding.ProjectID != projectID {
+378:		t.Fatalf("second restore binding points outside fresh root: %+v %v", secondBinding, err)
+379:	}
+380:	secondTx, err := secondDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+381:	if err != nil {
+382:		t.Fatal(err)
+383:	}
+384:	secondSnapshot, err := domain.BuildSessionSnapshot(ctx, secondTx, doc, projectID, sessionID)
+385:	secondTx.Rollback()
+386:	if err != nil || secondSnapshot["session_id"] != snapshot["session_id"] ||
+387:		secondSnapshot["goal_id"] != snapshot["goal_id"] || secondSnapshot["model_config_ref"] != snapshot["model_config_ref"] ||
+388:		secondSnapshot["core_build_id"] != snapshot["core_build_id"] || secondSnapshot["workspace_ref"] != ref {
+389:		t.Fatalf("second typed session snapshot changed: %v %+v", err, secondSnapshot)
+390:	}
+391:	stillOriginalDB, err := os.ReadFile(filepath.Join(sourceData, "researchos.sqlite"))
+392:	if err != nil || domain.Digest(stillOriginalDB) != domain.Digest(originalDB) {
+393:		t.Fatalf("rebackup changed original source DB: %v", err)
+394:	}
+395:	stillOriginalWorkspace, err := os.ReadFile(filepath.Join(workspace, "src", "main.go"))
+396:	if err != nil || string(stillOriginalWorkspace) != "source changed after backup\n" {
+397:		t.Fatalf("rebackup changed original source workspace: %v %q", err, stillOriginalWorkspace)
+398:	}
+399:	// A real second Host/domain registration under the data root is not the
+400:	// restored workspace path. Its matching pin must still be refused.
+401:	unrelatedPath := filepath.Join(restoredRoot, "unrelated-workspace")
+402:	if err := os.Mkdir(unrelatedPath, 0700); err != nil {
+403:		t.Fatal(err)
+404:	}
+405:	otherFrame, err := json.Marshal(map[string]any{"kind": host.KindWorkspaceChooseRequest,
+406:		"client_id": "backup-smoke-cli", "payload": map[string]any{"requested_path": unrelatedPath, "requested_access": host.AccessReadWrite}})
+407:	if err != nil {
+408:		t.Fatal(err)
+409:	}
+410:	otherReply, err := restoredHost.HandleNative(otherFrame, true, func(string) (string, error) { return unrelatedPath, nil })
+411:	if err != nil {
+412:		t.Fatal(err)
+413:	}
+414:	var otherChoice struct {
+415:		Payload struct {
+416:			Ref string `json:"selection_ref"`
+417:		} `json:"payload"`
+418:	}
+419:	if err := json.Unmarshal(otherReply, &otherChoice); err != nil || otherChoice.Payload.Ref == "" {
+420:		t.Fatalf("nonmatching Host path was not genuinely pinned: %v", err)
+421:	}
+422:	otherRegistered, err := restoredService.RegisterWorkspace(ctx, principal, localworkspace.NewAuthority(restoredHost), doc,
+423:		domain.RegisterWorkspaceInput{SelectionRef: otherChoice.Payload.Ref, DisplayName: "nonmatching data-root child",
+424:			RequestedAccess: host.AccessReadWrite, ClientID: "backup-smoke-cli", CommandID: "backup-smoke-other-register"})
+425:	if err != nil {
+426:		t.Fatal(err)
+427:	}
+428:	otherRef := domain.Str(otherRegistered, "authorized_workspace_ref")
+429:	otherBinding, err := restoredService.WorkspaceBindingFor(ctx, principal, localworkspace.NewAuthority(restoredHost), otherRef)
+430:	if err != nil {
+431:		t.Fatal(err)
+432:	}
+433:	if _, err := restoredHost.SnapshotWorkspace(ctx, *otherBinding, filepath.Join(root, "outside-backup"),
+434:		domain.BackupWorkspaceLimits{MaxFiles: 1, MaxDirs: 1, MaxBytes: 1024, MaxFileBytes: 1024}); err == nil || !strings.Contains(err.Error(), "BACKUP_WORKSPACE_RECURSION") {
+435:		t.Fatalf("nonmatching pinned data-root child gained backup exception: %v", err)
+436:	}
+437:	// A failed target pin publishes no active authorization to either the old
+438:	// path or the new one. The original backup remains available for recovery.
+439:	keyBytes, err := os.ReadFile(key)
+440:	if err != nil {
+441:		t.Fatal(err)
+442:	}
+443:	manifestRaw, err := os.ReadFile(filepath.Join(backup, "manifest.json"))
+444:	if err != nil {
+445:		t.Fatal(err)
+446:	}
+447:	var manifest domain.BackupManifest
+448:	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+449:		t.Fatal(err)
+450:	}
+451:	contracts, err := domain.LoadContracts(filepath.Join(repo, "spec", "v2.0", "contracts"))
+452:	if err != nil {
+453:		t.Fatal(err)
+454:	}
+455:	failedRoot := filepath.Join(root, "failed-pin-data")
+456:	_, err = domain.RestoreBackup(ctx, backup, failedRoot, domain.RestoreOptions{Key: keyBytes, Contracts: contracts,
+457:		SupportedMigrations: manifest.Migrations, DatabaseName: "researchos.sqlite",
+458:		WorkspaceTarget: func(context.Context, string, []domain.WorkspaceRestoreRequest) ([]domain.WorkspaceRestorePin, error) {
+459:			return nil, fmt.Errorf("fixture pin failure")
+460:		}})
+461:	if err == nil || !strings.Contains(err.Error(), "RESTORE_WORKSPACE_PIN_FAILED") {
+462:		t.Fatalf("failed pin was treated as successful restore: %v", err)
+463:	}
+464:	pending, err := store.Open(filepath.Join(failedRoot, "researchos.sqlite"))
+465:	if err != nil {
+466:		t.Fatal(err)
+467:	}
+468:	var pendingStatus, pendingPath string
+469:	err = pending.QueryRow(`SELECT json_extract(body,'$.status'),json_extract(body,'$.real_path') FROM domain_objects WHERE kind='WorkspaceBinding' AND id=?`, ref).Scan(&pendingStatus, &pendingPath)
+470:	pending.Close()
+471:	if err != nil || pendingStatus != "RESTORE_PENDING" || pendingPath != domain.BackupWorkspaceDestination(failedRoot, ref) {
+472:		t.Fatalf("failed restore retained write authorization: %s %s %v", pendingStatus, pendingPath, err)
+473:	}
+474:	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-CLI-WORKSPACE-CONTINUATION", "expected": true, "actual": true,
+475:		"status": "PASS", "evidence": domain.Object{"project_id": projectID, "session_id": sessionID, "workspace_ref": ref,
+476:			"goal_id": goalID, "task_id": taskID, "next_task_status": taskStatus, "typed_snapshot": true}}))
+477:	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-FAIL-CLOSED", "expected": true, "actual": true,
+478:		"status": "PASS", "evidence": domain.Object{"omission_rejected": true, "recursive_backup_rejected": true,
+479:			"oversize_rejected": true, "failed_pin_status": pendingStatus}}))
+480:	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-NEW-HOST-PIN", "expected": true, "actual": true,
+481:		"status": "PASS", "evidence": domain.Object{"root_ref": ref, "new_path": binding.RealPath,
+482:			"old_path_used": binding.RealPath == workspace, "old_credential_status": host.StatusMissing}}))
+483:	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-REBACKUP-ROUNDTRIP", "expected": true, "actual": true,
+484:		"status": "PASS", "evidence": domain.Object{"workspace_ref": ref, "project_id": projectID, "session_id": sessionID,
+485:			"goal_id": goalID, "task_id": taskID, "first_restored_path": binding.RealPath, "second_restored_path": secondPath,
+486:			"source_db_unchanged": true, "source_workspace_unchanged": true, "nonmatching_child_rejected": true}}))
+487:}

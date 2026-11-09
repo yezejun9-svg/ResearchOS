@@ -1,0 +1,31 @@
+--- a/wholego_cap_metadata.v3.proposed.py
++++ b/wholego_cap_metadata.v4.proposed.py
+@@ -101,13 +101,15 @@
+ 
+ 
+ def observed_windows_process(pid):
+-    """Query the live target PID and creation identity; the controller proves job ID."""
++    """Observe PID, creation and liveness at this query instant; controller proves job ID."""
+     require(os.name == "nt" and type(pid) is int and pid > 0, "WINDOWS_TARGET_PID_REQUIRED")
+     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+     class FILETIME(ctypes.Structure):
+         _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+     kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+     kernel.OpenProcess.restype = ctypes.c_void_p
++    kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
++    kernel.GetExitCodeProcess.restype = ctypes.c_int
+     handle = kernel.OpenProcess(0x1000, 0, pid)
+     require(bool(handle), "ROOT_RUNNER_PROCESS_NOT_LIVE")
+     try:
+@@ -119,6 +121,11 @@
+         ok_job = kernel.IsProcessInJob(ctypes.c_void_p(handle), None, ctypes.byref(member))
+         require(ok != 0 and ok_job != 0 and member.value == 1,
+                 "ROOT_RUNNER_PROCESS_NOT_IN_WINDOWS_JOB")
++        exit_code = ctypes.c_uint32()
++        ok_exit = kernel.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(exit_code))
++        require(ok_exit != 0 and exit_code.value == 259 and
++                exited.low == 0 and exited.high == 0,
++                "ROOT_RUNNER_PROCESS_ALREADY_EXITED_OR_UNOBSERVED")
+         return (created.high << 32) | created.low
+     finally:
+         kernel.CloseHandle(ctypes.c_void_p(handle))

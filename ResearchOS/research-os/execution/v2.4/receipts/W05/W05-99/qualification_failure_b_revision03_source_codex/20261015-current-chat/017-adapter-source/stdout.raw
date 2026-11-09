@@ -1,0 +1,419 @@
+1: //go:build windows
+2: 
+3: package runtime
+4: 
+5: import (
+6: 	"bytes"
+7: 	"encoding/json"
+8: 	"errors"
+9: 	"io"
+10: 	"os"
+11: 	"os/user"
+12: 	"path/filepath"
+13: 	"strings"
+14: 	"unsafe"
+15: 
+16: 	"golang.org/x/sys/windows"
+17: 	"researchos.local/research-os/internal/canonical"
+18: 	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+19: )
+20: 
+21: const qualificationRejectionFile = "qualification-rejection-00000000000000000003.json"
+22: 
+23: // These handles deny FILE_SHARE_DELETE while each pathname and its descendants
+24: // are inspected. Reparse points and a changed DACL fail closed; no caller path
+25: // is repaired or made private by the proof reader/writer.
+26: type qualificationPathGuard struct {
+27: 	handles []windows.Handle
+28: 	ids     []qualificationFileID
+29: 	current *windows.SID
+30: 	private bool
+31: }
+32: 
+33: type qualificationFileID struct {
+34: 	volume, high, low uint32
+35: }
+36: 
+37: func qualificationIdentity(h windows.Handle, directory bool) (qualificationFileID, error) {
+38: 	var info windows.ByHandleFileInformation
+39: 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+40: 		return qualificationFileID{}, err
+41: 	}
+42: 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+43: 		return qualificationFileID{}, errors.New("qualification source reparse or type mismatch")
+44: 	}
+45: 	return qualificationFileID{info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow}, nil
+46: }
+47: 
+48: type qualificationACLHeader struct {
+49: 	revision, reserved     byte
+50: 	size, count, reserved2 uint16
+51: }
+52: 
+53: func qualificationPrivateACL(h windows.Handle, current *windows.SID, protected bool) error {
+54: 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+55: 	if err != nil || sd == nil {
+56: 		return errors.New("qualification source security descriptor unavailable")
+57: 	}
+58: 	owner, _, err := sd.Owner()
+59: 	if err != nil || owner == nil || !owner.Equals(current) {
+60: 		return errors.New("qualification source owner differs")
+61: 	}
+62: 	control, _, err := sd.Control()
+63: 	if err != nil || protected && control&windows.SE_DACL_PROTECTED == 0 {
+64: 		return errors.New("qualification source DACL is not protected")
+65: 	}
+66: 	acl, _, err := sd.DACL()
+67: 	if err != nil || acl == nil {
+68: 		return errors.New("qualification source DACL unavailable")
+69: 	}
+70: 	header := (*qualificationACLHeader)(unsafe.Pointer(acl))
+71: 	if header.size < uint16(unsafe.Sizeof(qualificationACLHeader{})) || header.count == 0 || header.count > 32 {
+72: 		return errors.New("qualification source DACL shape invalid")
+73: 	}
+74: 	effectiveCurrent := false
+75: 	for i := uint16(0); i < header.count; i++ {
+76: 		var ace *windows.ACCESS_ALLOWED_ACE
+77: 		if err := windows.GetAce(acl, uint32(i), &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceSize < uint16(unsafe.Sizeof(windows.ACCESS_ALLOWED_ACE{})) {
+78: 			return errors.New("qualification source contains unsupported ACE")
+79: 		}
+80: 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+81: 		if !sid.IsValid() || !sid.Equals(current) {
+82: 			return errors.New("qualification source grants access to another principal")
+83: 		}
+84: 		// INHERIT_ONLY does not grant access on this object. The same SID may
+85: 		// inherit a second effective ACE on a child, but it cannot replace one.
+86: 		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
+87: 			const fileAllAccess = 0x001f01ff
+88: 			if uint32(ace.Mask)&fileAllAccess == fileAllAccess || uint32(ace.Mask)&windows.GENERIC_ALL != 0 {
+89: 				effectiveCurrent = true
+90: 			}
+91: 		}
+92: 	}
+93: 	if !effectiveCurrent {
+94: 		return errors.New("qualification source lacks current owner access")
+95: 	}
+96: 	return nil
+97: }
+98: 
+99: func qualificationGuardDirectory(directory string, protected bool) (*qualificationPathGuard, error) {
+100: 	if !filepath.IsAbs(directory) {
+101: 		return nil, errors.New("absolute qualification dispatch directory required")
+102: 	}
+103: 	currentUser, err := user.Current()
+104: 	if err != nil {
+105: 		return nil, err
+106: 	}
+107: 	current, err := windows.StringToSid(currentUser.Uid)
+108: 	if err != nil || current == nil {
+109: 		return nil, errors.New("current qualification SID unavailable")
+110: 	}
+111: 	g := &qualificationPathGuard{current: current, private: protected}
+112: 	paths := []string{}
+113: 	for path := filepath.Clean(directory); ; path = filepath.Dir(path) {
+114: 		paths = append(paths, path)
+115: 		if next := filepath.Dir(path); next == path {
+116: 			break
+117: 		}
+118: 	}
+119: 	for i := len(paths) - 1; i >= 0; i-- {
+120: 		name, err := windows.UTF16PtrFromString(paths[i])
+121: 		if err != nil {
+122: 			g.Close()
+123: 			return nil, err
+124: 		}
+125: 		h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+126: 		if err != nil {
+127: 			g.Close()
+128: 			return nil, err
+129: 		}
+130: 		id, err := qualificationIdentity(h, true)
+131: 		if err != nil {
+132: 			windows.CloseHandle(h)
+133: 			g.Close()
+134: 			return nil, err
+135: 		}
+136: 		g.handles = append(g.handles, h)
+137: 		g.ids = append(g.ids, id)
+138: 	}
+139: 	if err := qualificationPrivateACL(g.handles[len(g.handles)-1], current, protected); err != nil {
+140: 		g.Close()
+141: 		return nil, err
+142: 	}
+143: 	return g, nil
+144: }
+145: 
+146: func (g *qualificationPathGuard) Check() error {
+147: 	for i, h := range g.handles {
+148: 		id, err := qualificationIdentity(h, true)
+149: 		if err != nil || id != g.ids[i] {
+150: 			return errors.New("qualification directory identity changed")
+151: 		}
+152: 	}
+153: 	return qualificationPrivateACL(g.handles[len(g.handles)-1], g.current, g.private)
+154: }
+155: 
+156: func (g *qualificationPathGuard) Close() {
+157: 	for i := len(g.handles) - 1; i >= 0; i-- {
+158: 		windows.CloseHandle(g.handles[i])
+159: 	}
+160: }
+161: 
+162: type qualificationSourceFile struct {
+163: 	file *os.File
+164: 	id   qualificationFileID
+165: 	sid  *windows.SID
+166: }
+167: 
+168: func qualificationOpenSource(path string, current *windows.SID, create bool) (*qualificationSourceFile, error) {
+169: 	name, err := windows.UTF16PtrFromString(path)
+170: 	if err != nil {
+171: 		return nil, err
+172: 	}
+173: 	access, disposition := uint32(windows.GENERIC_READ|windows.READ_CONTROL), uint32(windows.OPEN_EXISTING)
+174: 	if create {
+175: 		access, disposition = windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.CREATE_NEW
+176: 	}
+177: 	h, err := windows.CreateFile(name, access, windows.FILE_SHARE_READ, nil, disposition, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_ATTRIBUTE_NORMAL, 0)
+178: 	if err != nil {
+179: 		return nil, err
+180: 	}
+181: 	id, idErr := qualificationIdentity(h, false)
+182: 	aclErr := qualificationPrivateACL(h, current, false)
+183: 	if idErr != nil || aclErr != nil {
+184: 		windows.CloseHandle(h)
+185: 		return nil, errors.Join(idErr, aclErr)
+186: 	}
+187: 	return &qualificationSourceFile{file: os.NewFile(uintptr(h), path), id: id, sid: current}, nil
+188: }
+189: 
+190: func (f *qualificationSourceFile) Check() error {
+191: 	id, err := qualificationIdentity(windows.Handle(f.file.Fd()), false)
+192: 	if err != nil || id != f.id {
+193: 		return errors.New("qualification source file identity changed")
+194: 	}
+195: 	return qualificationPrivateACL(windows.Handle(f.file.Fd()), f.sid, false)
+196: }
+197: 
+198: func (f *qualificationSourceFile) ReadBounded(limit int64) ([]byte, error) {
+199: 	if _, err := f.file.Seek(0, io.SeekStart); err != nil {
+200: 		return nil, err
+201: 	}
+202: 	raw, err := io.ReadAll(io.LimitReader(f.file, limit+1))
+203: 	if err != nil || int64(len(raw)) > limit {
+204: 		return nil, errors.New("bounded qualification source unavailable")
+205: 	}
+206: 	return raw, f.Check()
+207: }
+208: 
+209: // PersistQualificationRejection is a create-new durable host fact, not a
+210: // success flag. The domain gate holds its write reservation until this returns.
+211: func PersistQualificationRejection(directory string, raw []byte) error {
+212: 	return persistQualificationRejection(directory, raw, (*os.File).Write, (*os.File).Sync)
+213: }
+214: 
+215: func persistQualificationRejection(directory string, raw []byte, write func(*os.File, []byte) (int, error), sync func(*os.File) error) error {
+216: 	if len(raw) == 0 || len(raw) > 64*1024 {
+217: 		return errors.New("qualification rejection exceeds bound")
+218: 	}
+219: 	guard, err := qualificationGuardDirectory(directory, true)
+220: 	if err != nil {
+221: 		return err
+222: 	}
+223: 	defer guard.Close()
+224: 	path := filepath.Join(directory, qualificationRejectionFile)
+225: 	f, err := qualificationOpenSource(path, guard.current, true)
+226: 	if err != nil {
+227: 		return err
+228: 	}
+229: 	n, writeErr := write(f.file, raw)
+230: 	if writeErr == nil && n != len(raw) {
+231: 		writeErr = io.ErrShortWrite
+232: 	}
+233: 	err = errors.Join(writeErr, sync(f.file), f.Check(), guard.Check(), f.file.Close())
+234: 	if err != nil {
+235: 		return err
+236: 	}
+237: 	return nil
+238: }
+239: 
+240: // QualificationNativeFacts contains bounded source facts only. Callers must
+241: // still validate the domain subject and effect/transaction history.
+242: type QualificationNativeFacts struct {
+243: 	Directory      string
+244: 	Journal        BridgeJournal
+245: 	RawJournalHash string
+246: 	StdoutHash     string
+247: 	StderrHash     string
+248: 	Frames         []BridgeFrame
+249: 	FrameHashes    []string
+250: 	AuxAfterThird  bool
+251: 	Rejection      []byte
+252: }
+253: 
+254: func ReadQualificationNativeFacts(directory, manifestHash string) (QualificationNativeFacts, error) {
+255: 	var facts QualificationNativeFacts
+256: 	guard, err := qualificationGuardDirectory(directory, true)
+257: 	if err != nil {
+258: 		return facts, err
+259: 	}
+260: 	defer guard.Close()
+261: 	files := make(map[string]*qualificationSourceFile)
+262: 	defer func() {
+263: 		for _, f := range files {
+264: 			f.file.Close()
+265: 		}
+266: 	}()
+267: 	open := func(name string) (*qualificationSourceFile, error) {
+268: 		f, err := qualificationOpenSource(filepath.Join(directory, name), guard.current, false)
+269: 		if err == nil {
+270: 			files[name] = f
+271: 		}
+272: 		return f, err
+273: 	}
+274: 	journalFile, err := open("bridge.json")
+275: 	if err != nil {
+276: 		return facts, err
+277: 	}
+278: 	journalRaw, err := journalFile.ReadBounded(4 * 1024 * 1024)
+279: 	if err != nil {
+280: 		return facts, err
+281: 	}
+282: 	var expected BridgeJournal
+283: 	if err := json.Unmarshal(journalRaw, &expected); err != nil {
+284: 		return facts, err
+285: 	}
+286: 	stdoutFile, err := open("stdout.raw")
+287: 	if err != nil {
+288: 		return facts, err
+289: 	}
+290: 	stderrFile, err := open("stderr.raw")
+291: 	if err != nil {
+292: 		return facts, err
+293: 	}
+294: 	rejectionFile, err := open(qualificationRejectionFile)
+295: 	if err != nil {
+296: 		return facts, err
+297: 	}
+298: 	if expected.Checkpoint != nil {
+299: 		if _, err := open("checkpoint.sealed.json"); err != nil {
+300: 			return facts, err
+301: 		}
+302: 	}
+303: 	var artifactGuards []*qualificationPathGuard
+304: 	defer func() {
+305: 		for _, g := range artifactGuards {
+306: 			g.Close()
+307: 		}
+308: 	}()
+309: 	for _, artifact := range expected.Artifacts {
+310: 		if !filepath.IsLocal(artifact.Path) || artifact.Size < 0 || artifact.Size > 64*1024*1024 {
+311: 			return facts, errors.New("qualification output path invalid")
+312: 		}
+313: 		name := filepath.Join("output", artifact.Path)
+314: 		parent, err := qualificationGuardDirectory(filepath.Join(directory, filepath.Dir(name)), true)
+315: 		if err != nil {
+316: 			return facts, err
+317: 		}
+318: 		artifactGuards = append(artifactGuards, parent)
+319: 		if _, err := open(name); err != nil {
+320: 			return facts, err
+321: 		}
+322: 	}
+323: 	j, err := ReadBridgeTerminal(directory, manifestHash)
+324: 	if err != nil {
+325: 		return facts, err
+326: 	}
+327: 	if err := guard.Check(); err != nil {
+328: 		return facts, err
+329: 	}
+330: 	for _, g := range artifactGuards {
+331: 		if err := g.Check(); err != nil {
+332: 			return facts, err
+333: 		}
+334: 	}
+335: 	for _, f := range files {
+336: 		if err := f.Check(); err != nil {
+337: 			return facts, err
+338: 		}
+339: 	}
+340: 	if !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
+341: 		return facts, errors.New("native qualification closure incomplete")
+342: 	}
+343: 	if j.Identity.PID == 0 || j.Identity.Created <= 0 || j.Identity.Job == "" || j.Identity.SID == "" || j.Identity.Profile == "" || j.Identity.StagingDirectory == "" || j.Receipt.PID != j.Identity.PID || j.Receipt.Created != j.Identity.Created || j.Receipt.Job != j.Identity.Job || j.Receipt.SID != j.Identity.SID || j.Receipt.Profile != j.Identity.Profile {
+344: 		return facts, errors.New("native qualification process identity incomplete")
+345: 	}
+346: 	stdout, err := stdoutFile.ReadBounded(sandbox.MaxStreamBytes)
+347: 	if err != nil || len(stdout) > sandbox.MaxStreamBytes || Hash(stdout) != j.StdoutHash {
+348: 		return facts, errors.New("qualification stdout changed")
+349: 	}
+350: 	stderr, err := stderrFile.ReadBounded(sandbox.MaxStreamBytes)
+351: 	if err != nil || len(stderr) > sandbox.MaxStreamBytes || Hash(stderr) != j.StderrHash {
+352: 		return facts, errors.New("qualification stderr changed")
+353: 	}
+354: 	rejection, err := rejectionFile.ReadBounded(64 * 1024)
+355: 	if err != nil || len(rejection) == 0 || len(rejection) > 64*1024 {
+356: 		return facts, errors.New("immutable qualification rejection unavailable")
+357: 	}
+358: 	for _, line := range bytes.Split(stdout, []byte{'\n'}) {
+359: 		if len(line) == 0 {
+360: 			continue
+361: 		}
+362: 		if len(line) > 64*1024 {
+363: 			return facts, errors.New("qualification frame exceeds bound")
+364: 		}
+365: 		canonicalLine, err := canonical.JSON(line)
+366: 		if err != nil {
+367: 			return facts, err
+368: 		}
+369: 		var shape map[string]json.RawMessage
+370: 		if err = json.Unmarshal(canonicalLine, &shape); err != nil {
+371: 			return facts, err
+372: 		}
+373: 		if _, auxiliary := shape["version"]; auxiliary {
+374: 			if len(facts.Frames) >= 3 {
+375: 				facts.AuxAfterThird = true
+376: 			}
+377: 			continue
+378: 		}
+379: 		var frame BridgeFrame
+380: 		// Preserve the payload bytes consumed by Bridge. Normalizing the line
+381: 		// changes RawMessage whitespace and breaks first-gate byte lineage.
+382: 		if err = json.Unmarshal(line, &frame); err != nil {
+383: 			return facts, err
+384: 		}
+385: 		facts.Frames = append(facts.Frames, frame)
+386: 		facts.FrameHashes = append(facts.FrameHashes, Hash(line))
+387: 	}
+388: 	facts.Journal = j
+389: 	facts.Directory = directory
+390: 	facts.RawJournalHash = Hash(journalRaw)
+391: 	facts.StdoutHash = Hash(stdout)
+392: 	facts.StderrHash = Hash(stderr)
+393: 	facts.Rejection = rejection
+394: 	return facts, nil
+395: }
+396: 
+397: // ReadQualificationModelFact reopens the original Host fact under the same
+398: // owner, ACL, reparse, and bounded-read policy used for native gate facts.
+399: func ReadQualificationModelFact(directory, key string) ([]byte, error) {
+400: 	if key == "" {
+401: 		return nil, errors.New("qualification model key required")
+402: 	}
+403: 	guard, err := qualificationGuardDirectory(directory, true)
+404: 	if err != nil {
+405: 		return nil, err
+406: 	}
+407: 	defer guard.Close()
+408: 	name := "effect-" + strings.TrimPrefix(Hash([]byte(key)), "sha256:") + ".json"
+409: 	f, err := qualificationOpenSource(filepath.Join(directory, name), guard.current, false)
+410: 	if err != nil {
+411: 		return nil, err
+412: 	}
+413: 	defer f.file.Close()
+414: 	raw, err := f.ReadBounded(4*1024*1024 + 128*1024)
+415: 	if err != nil {
+416: 		return nil, err
+417: 	}
+418: 	return raw, guard.Check()
+419: }

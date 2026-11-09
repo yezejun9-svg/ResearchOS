@@ -1,0 +1,405 @@
+1:package domain
+3:import (
+4:	"context"
+5:	"database/sql"
+6:	"encoding/json"
+7:	"fmt"
+8:	"os"
+9:	"path/filepath"
+10:	"sort"
+11:	"strings"
+12:)
+14:// Workspace contents are bounded rather than silently omitted. These limits cover the
+15:// entire backup, not each workspace independently.
+16:const (
+17:	BackupWorkspaceMaxRoots     = 8
+18:	BackupWorkspaceMaxFiles     = 4096
+19:	BackupWorkspaceMaxDirs      = 4096
+20:	BackupWorkspaceMaxPathBytes = 4096
+21:	BackupWorkspaceMaxBytes     = 256 << 20
+22:	BackupWorkspaceMaxFileBytes = 16 << 20
+23:)
+25:type BackupWorkspaceLimits struct {
+26:	MaxFiles     int
+27:	MaxDirs      int
+28:	MaxBytes     int64
+29:	MaxFileBytes int64
+30:}
+32:type BackupWorkspaceFile struct {
+33:	Path string
+34:	Data []byte
+35:}
+37:type BackupWorkspaceSnapshot struct {
+38:	Directories []string
+39:	Files       []BackupWorkspaceFile
+40:}
+42:// WorkspaceBackupSource must verify an existing Host root binding, current pin,
+43:// revocation and OS ownership before reading any path. A database path alone is
+44:// never permission to read a workspace.
+45:type WorkspaceBackupSource interface {
+46:	SnapshotWorkspace(context.Context, WorkspaceBinding, string, BackupWorkspaceLimits) (BackupWorkspaceSnapshot, error)
+47:}
+49:type WorkspaceRestoreRequest struct {
+50:	AuthorizedRef string
+51:	RealPath      string
+52:	Access        string
+53:	PrincipalID   string
+54:}
+56:type WorkspaceRestorePin struct {
+57:	AuthorizedRef    string
+58:	RealPath         string
+59:	HostPrincipalRef string
+60:}
+62:// WorkspaceRestoreTarget runs only after the isolated restored data root has
+63:// been published. It must bind a fresh Host root to each requested final path.
+64:// The database remains RESTORE_PENDING until every pin has been verified.
+65:type WorkspaceRestoreTarget func(context.Context, string, []WorkspaceRestoreRequest) ([]WorkspaceRestorePin, error)
+67:type backupWorkspaceIndex struct {
+68:	Format string                `json:"format"`
+69:	Roots  []backupWorkspaceRoot `json:"roots"`
+70:}
+72:type backupWorkspaceRoot struct {
+73:	Ref         string                `json:"ref"`
+74:	SourcePath  string                `json:"source_path"`
+75:	Access      string                `json:"access"`
+76:	PrincipalID string                `json:"principal_id"`
+77:	Directories []string              `json:"directories"`
+78:	Files       []backupWorkspaceFile `json:"files"`
+79:}
+81:type backupWorkspaceFile struct {
+82:	Path string `json:"path"`
+83:	Blob string `json:"blob"`
+84:	Hash string `json:"hash"`
+85:	Size int    `json:"size"`
+86:}
+88:func (s *Service) CreateBackupWithWorkspaces(ctx context.Context, destination string, key []byte, source WorkspaceBackupSource) (BackupManifest, error) {
+89:	if source == nil {
+90:		return BackupManifest{}, fmt.Errorf("BACKUP_WORKSPACE_SOURCE_REQUIRED")
+91:	}
+92:	return s.createBackupPolicy(ctx, destination, key, nil, source)
+93:}
+95:func workspaceBackupBindings(db *sql.DB) ([]WorkspaceBinding, error) {
+96:	rows, err := db.Query(`SELECT body FROM domain_objects WHERE project='' AND kind=? ORDER BY id`, KindWorkspaceBinding)
+97:	if err != nil {
+98:		return nil, err
+99:	}
+100:	defer rows.Close()
+101:	bindings := []WorkspaceBinding{}
+102:	for rows.Next() {
+103:		var raw string
+104:		if err := rows.Scan(&raw); err != nil {
+105:			return nil, err
+106:		}
+107:		binding, err := decodeBinding(raw)
+108:		if err != nil {
+109:			return nil, err
+110:		}
+111:		if binding.Status == WorkspaceActive {
+112:			bindings = append(bindings, *binding)
+113:		} else if binding.Status != WorkspaceRevoked {
+114:			return nil, fmt.Errorf("BACKUP_WORKSPACE_STATUS_INVALID")
+115:		}
+116:	}
+117:	return bindings, rows.Err()
+118:}
+120:func backupWorkspaceBlobName(ref, rel string) string {
+121:	return "workspace-" + strings.TrimPrefix(Digest([]byte(ref+"\x00"+rel)), "sha256:") + ".bin"
+122:}
+124:func backupWorkspaceDirectory(destination, ref string) string {
+125:	return filepath.Join(destination, "workspaces", strings.TrimPrefix(Digest([]byte(ref)), "sha256:"))
+126:}
+128:func backupWorkspaceOverlaps(left, right string) bool {
+129:	a, ea := filepath.Abs(left)
+130:	b, eb := filepath.Abs(right)
+131:	if ea != nil || eb != nil {
+132:		return true
+133:	}
+134:	if strings.EqualFold(filepath.Clean(a), filepath.Clean(b)) {
+135:		return true
+136:	}
+137:	for _, pair := range [][2]string{{a, b}, {b, a}} {
+138:		rel, err := filepath.Rel(pair[0], pair[1])
+139:		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+140:			return true
+141:		}
+142:	}
+143:	return false
+144:}
+146:// BackupWorkspaceDestination is the one final location accepted by Host pinning.
+147:func BackupWorkspaceDestination(destination, ref string) string {
+148:	return backupWorkspaceDirectory(destination, ref)
+149:}
+151:func backupWorkspaceRelative(rel string) bool {
+152:	if rel == "" || len(rel) > BackupWorkspaceMaxPathBytes || strings.Contains(rel, "\\") || strings.Contains(rel, ":") || filepath.ToSlash(filepath.Clean(filepath.FromSlash(rel))) != rel {
+153:		return false
+154:	}
+155:	if !filepath.IsLocal(filepath.FromSlash(rel)) || rel == "." || strings.HasPrefix(rel, "../") {
+156:		return false
+157:	}
+158:	for _, part := range strings.Split(rel, "/") {
+159:		if part == "" || part == "." || part == ".." {
+160:			return false
+161:		}
+162:	}
+163:	return true
+164:}
+166:func backupWorkspaceFiles(ctx context.Context, db *sql.DB, source WorkspaceBackupSource, destination string) (map[string][]byte, int, error) {
+167:	bindings, err := workspaceBackupBindings(db)
+168:	if err != nil {
+169:		return nil, 0, err
+170:	}
+171:	if len(bindings) == 0 {
+172:		return nil, 0, nil
+173:	}
+174:	if source == nil {
+175:		return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_SOURCE_REQUIRED: %d active workspace(s)", len(bindings))
+176:	}
+177:	if len(bindings) > BackupWorkspaceMaxRoots {
+178:		return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_ROOT_LIMIT: %d", len(bindings))
+179:	}
+180:	files := map[string][]byte{}
+181:	index := backupWorkspaceIndex{Format: "RESEARCHOS_WORKSPACE_SNAPSHOT_V1", Roots: []backupWorkspaceRoot{}}
+182:	remainingFiles, remainingDirs, remainingBytes := BackupWorkspaceMaxFiles, BackupWorkspaceMaxDirs, int64(BackupWorkspaceMaxBytes)
+183:	for _, b := range bindings {
+184:		if err := ctx.Err(); err != nil {
+185:			return nil, 0, err
+186:		}
+187:		if b.AuthorizedRef == "" || b.RealPath == "" || b.PrincipalID == "" || b.Access != "READ_ONLY" && b.Access != "READ_WRITE" {
+188:			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_BINDING_INVALID")
+189:		}
+190:		snapshot, err := source.SnapshotWorkspace(ctx, b, destination, BackupWorkspaceLimits{MaxFiles: remainingFiles, MaxDirs: remainingDirs, MaxBytes: remainingBytes, MaxFileBytes: BackupWorkspaceMaxFileBytes})
+191:		if err != nil {
+192:			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_SNAPSHOT_FAILED %s: %w", b.AuthorizedRef, err)
+193:		}
+194:		if len(snapshot.Files) > remainingFiles || len(snapshot.Directories) > remainingDirs {
+195:			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_FILE_LIMIT %s", b.AuthorizedRef)
+196:		}
+197:		root := backupWorkspaceRoot{Ref: b.AuthorizedRef, SourcePath: b.RealPath, Access: b.Access, PrincipalID: b.PrincipalID,
+198:			Directories: append([]string{}, snapshot.Directories...), Files: []backupWorkspaceFile{}}
+199:		seen := map[string]bool{}
+200:		for _, dir := range root.Directories {
+201:			if !backupWorkspaceRelative(dir) || seen[dir] {
+202:				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_DIRECTORY_INVALID %s", b.AuthorizedRef)
+203:			}
+204:			seen[dir] = true
+205:		}
+206:		for _, file := range snapshot.Files {
+207:			if !backupWorkspaceRelative(file.Path) || seen[file.Path] || len(file.Data) > BackupWorkspaceMaxFileBytes || int64(len(file.Data)) > remainingBytes {
+208:				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_FILE_INVALID_OR_LIMIT %s %s", b.AuthorizedRef, file.Path)
+209:			}
+210:			seen[file.Path] = true
+211:			blob := backupWorkspaceBlobName(b.AuthorizedRef, file.Path)
+212:			if _, exists := files[blob]; exists {
+213:				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_BLOB_COLLISION")
+214:			}
+215:			files[blob] = file.Data
+216:			root.Files = append(root.Files, backupWorkspaceFile{Path: file.Path, Blob: blob, Hash: Digest(file.Data), Size: len(file.Data)})
+217:			remainingFiles--
+218:			remainingBytes -= int64(len(file.Data))
+219:		}
+220:		sort.Strings(root.Directories)
+221:		sort.Slice(root.Files, func(i, j int) bool { return root.Files[i].Path < root.Files[j].Path })
+222:		remainingDirs -= len(root.Directories)
+223:		index.Roots = append(index.Roots, root)
+224:	}
+225:	files["workspace-index.json"] = Bytes(index)
+226:	return files, len(index.Roots), nil
+227:}
+229:func backupDecodeWorkspaceIndex(files map[string][]byte) (backupWorkspaceIndex, error) {
+230:	var index backupWorkspaceIndex
+231:	if len(files["workspace-index.json"]) == 0 {
+232:		return index, nil
+233:	}
+234:	if err := json.Unmarshal(files["workspace-index.json"], &index); err != nil || index.Format != "RESEARCHOS_WORKSPACE_SNAPSHOT_V1" || len(index.Roots) > BackupWorkspaceMaxRoots {
+235:		return index, fmt.Errorf("RESTORE_WORKSPACE_INDEX_INVALID")
+236:	}
+237:	return index, nil
+238:}
+240:func backupWorkspaceRestorePaths(files map[string][]byte, backupDirectory, destination string) error {
+241:	index, err := backupDecodeWorkspaceIndex(files)
+242:	if err != nil {
+243:		return err
+244:	}
+245:	if len(index.Roots) == 0 {
+246:		return nil
+247:	}
+248:	if backupWorkspaceOverlaps(backupDirectory, destination) {
+249:		return fmt.Errorf("RESTORE_WORKSPACE_BACKUP_DIRECTORY_OVERLAP")
+250:	}
+251:	for _, root := range index.Roots {
+252:		if backupWorkspaceOverlaps(root.SourcePath, destination) || backupWorkspaceOverlaps(root.SourcePath, backupDirectory) {
+253:			return fmt.Errorf("RESTORE_WORKSPACE_SOURCE_DIRECTORY_OVERLAP")
+254:		}
+255:	}
+256:	return nil
+257:}
+259:func backupPrepareWorkspaces(ctx context.Context, db *sql.DB, files map[string][]byte, stage, destination string) ([]WorkspaceRestoreRequest, error) {
+260:	bindings, err := workspaceBackupBindings(db)
+261:	if err != nil {
+262:		return nil, err
+263:	}
+264:	index, err := backupDecodeWorkspaceIndex(files)
+265:	if err != nil {
+266:		return nil, err
+267:	}
+268:	if len(bindings) != len(index.Roots) {
+269:		return nil, fmt.Errorf("RESTORE_WORKSPACE_INVENTORY_MISMATCH")
+270:	}
+271:	byRef := map[string]WorkspaceBinding{}
+272:	for _, b := range bindings {
+273:		byRef[b.AuthorizedRef] = b
+274:	}
+275:	requests := []WorkspaceRestoreRequest{}
+276:	usedBlobs := map[string]bool{"workspace-index.json": true}
+277:	count, dirCount, total := 0, 0, int64(0)
+278:	for _, root := range index.Roots {
+279:		b, ok := byRef[root.Ref]
+280:		if !ok || b.RealPath != root.SourcePath || b.Access != root.Access || b.PrincipalID != root.PrincipalID || len(root.Files) > BackupWorkspaceMaxFiles || len(root.Directories) > BackupWorkspaceMaxDirs {
+281:			return nil, fmt.Errorf("RESTORE_WORKSPACE_BINDING_MISMATCH")
+282:		}
+283:		delete(byRef, root.Ref)
+284:		stageRoot := backupWorkspaceDirectory(stage, root.Ref)
+285:		if err := os.MkdirAll(stageRoot, 0700); err != nil {
+286:			return nil, err
+287:		}
+288:		seen := map[string]bool{}
+289:		for _, rel := range root.Directories {
+290:			if !backupWorkspaceRelative(rel) || seen[rel] {
+291:				return nil, fmt.Errorf("RESTORE_WORKSPACE_DIRECTORY_INVALID")
+292:			}
+293:			seen[rel] = true
+294:			dirCount++
+295:			if dirCount > BackupWorkspaceMaxDirs {
+296:				return nil, fmt.Errorf("RESTORE_WORKSPACE_DIRECTORY_LIMIT")
+297:			}
+298:			if err := os.MkdirAll(filepath.Join(stageRoot, filepath.FromSlash(rel)), 0700); err != nil {
+299:				return nil, err
+300:			}
+301:		}
+302:		for _, file := range root.Files {
+303:			if !backupWorkspaceRelative(file.Path) || seen[file.Path] || file.Blob != backupWorkspaceBlobName(root.Ref, file.Path) || usedBlobs[file.Blob] {
+304:				return nil, fmt.Errorf("RESTORE_WORKSPACE_FILE_INVALID")
+305:			}
+306:			seen[file.Path], usedBlobs[file.Blob] = true, true
+307:			raw, exists := files[file.Blob]
+308:			if !exists || len(raw) != file.Size || Digest(raw) != file.Hash || len(raw) > BackupWorkspaceMaxFileBytes {
+309:				return nil, fmt.Errorf("RESTORE_WORKSPACE_FILE_HASH")
+310:			}
+311:			count++
+312:			total += int64(len(raw))
+313:			if count > BackupWorkspaceMaxFiles || total > BackupWorkspaceMaxBytes {
+314:				return nil, fmt.Errorf("RESTORE_WORKSPACE_LIMIT")
+315:			}
+316:			path := filepath.Join(stageRoot, filepath.FromSlash(file.Path))
+317:			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+318:				return nil, err
+319:			}
+320:			if err := backupWrite(path, raw); err != nil {
+321:				return nil, err
+322:			}
+323:		}
+324:		requests = append(requests, WorkspaceRestoreRequest{AuthorizedRef: root.Ref,
+325:			RealPath: backupWorkspaceDirectory(destination, root.Ref), Access: root.Access, PrincipalID: root.PrincipalID})
+326:	}
+327:	for name := range files {
+328:		if strings.HasPrefix(name, "workspace-") && !usedBlobs[name] {
+329:			return nil, fmt.Errorf("RESTORE_WORKSPACE_UNREFERENCED_BLOB")
+330:		}
+331:	}
+332:	if len(byRef) != 0 {
+333:		return nil, fmt.Errorf("RESTORE_WORKSPACE_MISSING_ROOT")
+334:	}
+335:	if len(requests) == 0 {
+336:		return requests, nil
+337:	}
+338:	tx, err := db.BeginTx(ctx, nil)
+339:	if err != nil {
+340:		return nil, err
+341:	}
+342:	defer tx.Rollback()
+343:	svc := &Service{DB: db}
+344:	for _, request := range requests {
+345:		b := bFromMap(request.AuthorizedRef, bindings)
+346:		record := b.record()
+347:		record["real_path"] = request.RealPath
+348:		record["display_path"] = request.RealPath
+349:		record["status"] = "RESTORE_PENDING"
+350:		record["host_principal_ref"] = ""
+351:		record["revision"] = b.Revision + 1
+352:		if err := svc.putOpaque(ctx, tx, "", KindWorkspaceBinding, b.AuthorizedRef, record); err != nil {
+353:			return nil, err
+354:		}
+355:		if b.ProjectID != nil {
+356:			var raw string
+357:			if err := tx.QueryRowContext(ctx, `SELECT body FROM domain_objects WHERE project=? AND kind='Project' AND id=?`, *b.ProjectID, *b.ProjectID).Scan(&raw); err != nil {
+358:				return nil, fmt.Errorf("RESTORE_PROJECT_BINDING_MISSING: %w", err)
+359:			}
+360:			project, err := Decode([]byte(raw))
+361:			if err != nil {
+362:				return nil, err
+363:			}
+364:			if Str(project, "authorized_workspace_ref") == b.AuthorizedRef {
+365:				if Str(project, "real_path") != b.RealPath {
+366:					return nil, fmt.Errorf("RESTORE_PROJECT_SOURCE_PATH_MISMATCH")
+367:				}
+368:				revision, err := Num(project, "revision")
+369:				if err != nil {
+370:					return nil, err
+371:				}
+372:				project["real_path"] = request.RealPath
+373:				project["revision"] = revision + 1
+374:				if err := svc.putOpaque(ctx, tx, *b.ProjectID, "Project", *b.ProjectID, project); err != nil {
+375:					return nil, err
+376:				}
+377:			}
+378:		}
+379:	}
+380:	if err := tx.Commit(); err != nil {
+381:		return nil, err
+382:	}
+383:	return requests, nil
+384:}
+386:func bFromMap(ref string, bindings []WorkspaceBinding) WorkspaceBinding {
+387:	for _, b := range bindings {
+388:		if b.AuthorizedRef == ref {
+389:			return b
+390:		}
+391:	}
+392:	panic("verified workspace binding missing")
+393:}
+395:func backupActivateWorkspaces(ctx context.Context, db *sql.DB, requests []WorkspaceRestoreRequest, pins []WorkspaceRestorePin) error {
+396:	if len(requests) != len(pins) {
+397:		return fmt.Errorf("RESTORE_WORKSPACE_PIN_COUNT")
+398:	}
+399:	byRef := map[string]WorkspaceRestorePin{}
+400:	for _, pin := range pins {
+401:		if pin.AuthorizedRef == "" || pin.HostPrincipalRef == "" || byRef[pin.AuthorizedRef].AuthorizedRef != "" {
+402:			return fmt.Errorf("RESTORE_WORKSPACE_PIN_INVALID")
+403:		}
+404:		byRef[pin.AuthorizedRef] = pin
+405:	}
+406:	tx, err := db.BeginTx(ctx, nil)
+407:	if err != nil {
+408:		return err
+409:	}
+410:	defer tx.Rollback()
+411:	svc := &Service{DB: db}
+412:	for _, request := range requests {
+413:		pin, ok := byRef[request.AuthorizedRef]
+414:		if !ok || pin.RealPath != request.RealPath {
+415:			return fmt.Errorf("RESTORE_WORKSPACE_PIN_PATH_MISMATCH")
+416:		}
+417:		b, err := svc.binding(ctx, tx, request.AuthorizedRef)
+418:		if err != nil || b.Status != "RESTORE_PENDING" || b.RealPath != request.RealPath || b.Access != request.Access || b.PrincipalID != request.PrincipalID {
+419:			return fmt.Errorf("RESTORE_WORKSPACE_PENDING_MISMATCH")
+420:		}
+421:		record := b.record()
+422:		record["status"] = WorkspaceActive
+423:		record["host_principal_ref"] = pin.HostPrincipalRef
+424:		record["revision"] = b.Revision + 1
+425:		if err := svc.putOpaque(ctx, tx, "", KindWorkspaceBinding, b.AuthorizedRef, record); err != nil {
+426:			return err
+427:		}
+428:	}
+429:	return tx.Commit()
+430:}

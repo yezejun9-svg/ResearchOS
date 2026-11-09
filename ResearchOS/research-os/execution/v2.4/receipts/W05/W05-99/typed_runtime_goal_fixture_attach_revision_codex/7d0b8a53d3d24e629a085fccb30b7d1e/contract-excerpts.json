@@ -1,0 +1,3426 @@
+{
+  "schema": "researchos.readonly-contract-excerpts.v1",
+  "authority": "NONE",
+  "excerpts": [
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\ResearchOS_Implementation_Package_v2.4\\22_CLIENT_INTERFACE_DETAILS.md",
+        "sha256": "01b3d5eaeff08d8c5c496631a7334fbf50361b8da27b032f4efd9eba06bedd48",
+        "bytes": 29855
+      },
+      "ranges": [
+        {
+          "start_line": 114,
+          "end_line": 143,
+          "exact_lines": [
+            {
+              "line": 114,
+              "text": "`CommandResponse` 包含 method、protocol_version 和原 command_id。状态语义："
+            },
+            {
+              "line": 115,
+              "text": ""
+            },
+            {
+              "line": 116,
+              "text": "- ACKNOWLEDGED：请求已持久接收，result 为 PendingResult，后续通过同命令重放、会话事件和快照对账；不能显示完成。"
+            },
+            {
+              "line": 117,
+              "text": "- COMPLETED：本方法已经完成其操作，result 使用表中类型。`session.send` 的完成只代表合法入队；`goal.start` 的完成只代表 Goal 已按返回状态建立。"
+            },
+            {
+              "line": 118,
+              "text": "- REJECTED：result=null，error_code 与 error.code 相同，附脱敏错误、correlation_id 和明确恢复动作；不产生该命令的新业务副作用。"
+            },
+            {
+              "line": 119,
+              "text": ""
+            },
+            {
+              "line": 120,
+              "text": "幂等存储键包含主体和 command_id，存规范化完整请求 hash、接收/完成状态及响应。相同键相同请求重放原状态/结果；不同请求返回 COMMAND_ID_CONFLICT。旧 epoch 的已执行命令可以读取原回执，但不能再次执行；未执行的旧 epoch 请求拒绝。transport 断开或客户端超时不能自动把未知结果当失败后新建命令重试。"
+            },
+            {
+              "line": 121,
+              "text": ""
+            },
+            {
+              "line": 122,
+              "text": "本机凭据、网络认证头和瞬态 native 请求不进入普通请求 hash/journal。对 workspace.write 的大文本保存内容寻址引用并按同一原始字节校验；日志只记引用与 hash，不复制整个用户文件。"
+            },
+            {
+              "line": 123,
+              "text": ""
+            },
+            {
+              "line": 124,
+              "text": "## 5. 单写入者、取消、恢复和重放"
+            },
+            {
+              "line": 125,
+              "text": ""
+            },
+            {
+              "line": 126,
+              "text": "### 5.1 归属和 CAS"
+            },
+            {
+              "line": 127,
+              "text": ""
+            },
+            {
+              "line": 128,
+              "text": "session.send/control/handoff/workspace.write 必须带快照中的 expected_revision、writer_epoch；宿主在同一事务核对并写入命令意图。旧 revision 返回 STALE_REVISION，旧 epoch 返回 STALE_WRITER_EPOCH；客户端先刷新快照，显示变化，再决定重新提出请求，不能自动换新 revision 盲重试写入。"
+            },
+            {
+              "line": 129,
+              "text": ""
+            },
+            {
+              "line": 130,
+              "text": "`session.attach(request_write_owner=false)` 只读取/订阅，不取得或续期 writer。目标端“在此继续”和 CLI resume 的显式接管入口使用 `session.attach(request_write_owner=true)`：expected_revision 必须是刚读取的快照 revision，writer_epoch 必须为 null，因为请求者尚未取得写入 epoch；不能冒用源客户端的 epoch。返回的新快照才给出可供后续写命令使用的 epoch。"
+            },
+            {
+              "line": 131,
+              "text": ""
+            },
+            {
+              "line": 132,
+              "text": "宿主先检查普通项目/角色权限，再核验请求客户端与当前 writer 属于同一已鉴别 OS 本机主体。这个本机接管能力不授予远程 READER/手机或其他主体。普通权限不满足返回 FORBIDDEN；已可读但非同主体的接管返回 WRITER_BUSY。连接认证过期先重新鉴别 OS 身份，不能用旧 epoch 代替身份。"
+            },
+            {
+              "line": 133,
+              "text": ""
+            },
+            {
+              "line": 134,
+              "text": "显式接管按以下固定步骤执行："
+            },
+            {
+              "line": 135,
+              "text": ""
+            },
+            {
+              "line": 136,
+              "text": "1. 在事务内核对 expected_revision 和当前 owner，登记已有 command journal 中的唯一待交接意图。快照已变化返回 VERSION_CONFLICT；已有竞争交接返回 WRITER_BUSY。同一 command_id 重放原回执，不重复暂停或转移。"
+            },
+            {
+              "line": 137,
+              "text": "2. 无 writer 且无未决工具时可直接授予；请求者已是当前 writer 时只续租。同主体其他客户端仍持有有效 writer 时，宿主受理显式接管请求，返回 ACKNOWLEDGED，目标客户端继续只读。"
+            },
+            {
+              "line": 138,
+              "text": "3. 若源端正在运行，先暂停新派发，在安全点等待当前工具/子进程 settled 并持久保存检查点。保留原 Goal/Task、工作成果和未消费 follow-up 队列；接管自身不调用业务 CANCEL、不删除队列、不新开一个写入 Agent。"
+            },
+            {
+              "line": 139,
+              "text": "4. 对账完成后再次 CAS 核验当前输入、权限及交接意图，原子转移 owner，增加 epoch 和 session revision，然后发 CLIENT_HANDOFF 并返回 COMPLETED/AttachResult。目标端只有此后才可发写命令；要继续执行仍需显式 RESUME/发送指令，交接本身不自动恢复工作。"
+            },
+            {
+              "line": 140,
+              "text": "5. 并发输家、过期快照或中途发生影响交接的版本变化返回 WRITER_BUSY 或 VERSION_CONFLICT；不得自动替换 revision 重试。无法确认 settled 时不提交转移，保留可见的待处理/阻塞及原归属，不隐式取消来制造成功。"
+            },
+            {
+              "line": 141,
+              "text": "6. 等待期间用户主动 CANCEL 仍服从原控制权和停止链，其优先级高于接管/自动续跑。后续即使合法转移控制权，也不能复活 CANCELLED Run 或清除 resume_requires_explicit_user。"
+            },
+            {
+              "line": 142,
+              "text": ""
+            },
+            {
+              "line": 143,
+              "text": "lease 默认 90 秒、受信活客户端每 30 秒以 attach(true) 和当前快照续租，时间由宿主判定；同 owner 续租不改 epoch。续租遇到版本变化先刷新；只有仍确认自己是 owner 才能继续自动续租，不自动变成对别人的接管。其他客户端只读访问不会延长 writer lease。"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\ResearchOS_Implementation_Package_v2.4\\contracts\\client.protocol.schema.json",
+        "sha256": "8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b",
+        "bytes": 161794
+      },
+      "ranges": [
+        {
+          "start_line": 17,
+          "end_line": 70,
+          "exact_lines": [
+            {
+              "line": 17,
+              "text": "  \"x-method-contracts\": {"
+            },
+            {
+              "line": 18,
+              "text": "    \"host.status\": {"
+            },
+            {
+              "line": 19,
+              "text": "      \"payload\": \"EmptyPayload\","
+            },
+            {
+              "line": 20,
+              "text": "      \"result\": \"HostStatusResult\""
+            },
+            {
+              "line": 21,
+              "text": "    },"
+            },
+            {
+              "line": 22,
+              "text": "    \"host.configure\": {"
+            },
+            {
+              "line": 23,
+              "text": "      \"payload\": \"ConfigurePayload\","
+            },
+            {
+              "line": 24,
+              "text": "      \"result\": \"ConfigureResult\""
+            },
+            {
+              "line": 25,
+              "text": "    },"
+            },
+            {
+              "line": 26,
+              "text": "    \"project.bootstrap\": {"
+            },
+            {
+              "line": 27,
+              "text": "      \"payload\": \"BootstrapPayload\","
+            },
+            {
+              "line": 28,
+              "text": "      \"result\": \"BootstrapResult\""
+            },
+            {
+              "line": 29,
+              "text": "    },"
+            },
+            {
+              "line": 30,
+              "text": "    \"session.list\": {"
+            },
+            {
+              "line": 31,
+              "text": "      \"payload\": \"ListSessionsPayload\","
+            },
+            {
+              "line": 32,
+              "text": "      \"result\": \"SessionListResult\""
+            },
+            {
+              "line": 33,
+              "text": "    },"
+            },
+            {
+              "line": 34,
+              "text": "    \"session.create\": {"
+            },
+            {
+              "line": 35,
+              "text": "      \"payload\": \"CreateSessionPayload\","
+            },
+            {
+              "line": 36,
+              "text": "      \"result\": \"SessionSnapshot\""
+            },
+            {
+              "line": 37,
+              "text": "    },"
+            },
+            {
+              "line": 38,
+              "text": "    \"session.get\": {"
+            },
+            {
+              "line": 39,
+              "text": "      \"payload\": \"EmptyPayload\","
+            },
+            {
+              "line": 40,
+              "text": "      \"result\": \"SessionSnapshot\""
+            },
+            {
+              "line": 41,
+              "text": "    },"
+            },
+            {
+              "line": 42,
+              "text": "    \"session.attach\": {"
+            },
+            {
+              "line": 43,
+              "text": "      \"payload\": \"AttachPayload\","
+            },
+            {
+              "line": 44,
+              "text": "      \"result\": \"AttachResult\""
+            },
+            {
+              "line": 45,
+              "text": "    },"
+            },
+            {
+              "line": 46,
+              "text": "    \"session.send\": {"
+            },
+            {
+              "line": 47,
+              "text": "      \"payload\": \"SendMessagePayload\","
+            },
+            {
+              "line": 48,
+              "text": "      \"result\": \"SendMessageResult\""
+            },
+            {
+              "line": 49,
+              "text": "    },"
+            },
+            {
+              "line": 50,
+              "text": "    \"session.control\": {"
+            },
+            {
+              "line": 51,
+              "text": "      \"payload\": \"ControlPayload\","
+            },
+            {
+              "line": 52,
+              "text": "      \"result\": \"ControlResult\""
+            },
+            {
+              "line": 53,
+              "text": "    },"
+            },
+            {
+              "line": 54,
+              "text": "    \"session.events\": {"
+            },
+            {
+              "line": 55,
+              "text": "      \"payload\": \"ReadEventsPayload\","
+            },
+            {
+              "line": 56,
+              "text": "      \"result\": \"ReadEventsResult\""
+            },
+            {
+              "line": 57,
+              "text": "    },"
+            },
+            {
+              "line": 58,
+              "text": "    \"session.handoff\": {"
+            },
+            {
+              "line": 59,
+              "text": "      \"payload\": \"HandoffPayload\","
+            },
+            {
+              "line": 60,
+              "text": "      \"result\": \"HandoffResult\""
+            },
+            {
+              "line": 61,
+              "text": "    },"
+            },
+            {
+              "line": 62,
+              "text": "    \"goal.start\": {"
+            },
+            {
+              "line": 63,
+              "text": "      \"payload\": \"StartGoalPayload\","
+            },
+            {
+              "line": 64,
+              "text": "      \"result\": \"StartGoalResult\""
+            },
+            {
+              "line": 65,
+              "text": "    },"
+            },
+            {
+              "line": 66,
+              "text": "    \"provider.models\": {"
+            },
+            {
+              "line": 67,
+              "text": "      \"payload\": \"ListModelsPayload\","
+            },
+            {
+              "line": 68,
+              "text": "      \"result\": \"ListModelsResult\""
+            },
+            {
+              "line": 69,
+              "text": "    },"
+            },
+            {
+              "line": 70,
+              "text": "    \"provider.probe\": {"
+            }
+          ]
+        },
+        {
+          "start_line": 1471,
+          "end_line": 1493,
+          "exact_lines": [
+            {
+              "line": 1471,
+              "text": "    \"AttachResult\": {"
+            },
+            {
+              "line": 1472,
+              "text": "      \"type\": \"object\","
+            },
+            {
+              "line": 1473,
+              "text": "      \"properties\": {"
+            },
+            {
+              "line": 1474,
+              "text": "        \"snapshot\": {"
+            },
+            {
+              "line": 1475,
+              "text": "          \"$ref\": \"#/$defs/SessionSnapshot\""
+            },
+            {
+              "line": 1476,
+              "text": "        },"
+            },
+            {
+              "line": 1477,
+              "text": "        \"write_owner_acquired\": {"
+            },
+            {
+              "line": 1478,
+              "text": "          \"type\": \"boolean\""
+            },
+            {
+              "line": 1479,
+              "text": "        }"
+            },
+            {
+              "line": 1480,
+              "text": "      },"
+            },
+            {
+              "line": 1481,
+              "text": "      \"required\": ["
+            },
+            {
+              "line": 1482,
+              "text": "        \"snapshot\","
+            },
+            {
+              "line": 1483,
+              "text": "        \"write_owner_acquired\""
+            },
+            {
+              "line": 1484,
+              "text": "      ],"
+            },
+            {
+              "line": 1485,
+              "text": "      \"additionalProperties\": false"
+            },
+            {
+              "line": 1486,
+              "text": "    },"
+            },
+            {
+              "line": 1487,
+              "text": "    \"SendMessageResult\": {"
+            },
+            {
+              "line": 1488,
+              "text": "      \"type\": \"object\","
+            },
+            {
+              "line": 1489,
+              "text": "      \"properties\": {"
+            },
+            {
+              "line": 1490,
+              "text": "        \"message_id\": {"
+            },
+            {
+              "line": 1491,
+              "text": "          \"type\": \"string\","
+            },
+            {
+              "line": 1492,
+              "text": "          \"minLength\": 1"
+            },
+            {
+              "line": 1493,
+              "text": "        },"
+            }
+          ]
+        },
+        {
+          "start_line": 1683,
+          "end_line": 1715,
+          "exact_lines": [
+            {
+              "line": 1683,
+              "text": "    \"PendingResult\": {"
+            },
+            {
+              "line": 1684,
+              "text": "      \"type\": \"object\","
+            },
+            {
+              "line": 1685,
+              "text": "      \"properties\": {"
+            },
+            {
+              "line": 1686,
+              "text": "        \"accepted_at\": {"
+            },
+            {
+              "line": 1687,
+              "text": "          \"type\": \"string\","
+            },
+            {
+              "line": 1688,
+              "text": "          \"format\": \"date-time\""
+            },
+            {
+              "line": 1689,
+              "text": "        },"
+            },
+            {
+              "line": 1690,
+              "text": "        \"operation_id\": {"
+            },
+            {
+              "line": 1691,
+              "text": "          \"type\": \"string\","
+            },
+            {
+              "line": 1692,
+              "text": "          \"minLength\": 1"
+            },
+            {
+              "line": 1693,
+              "text": "        },"
+            },
+            {
+              "line": 1694,
+              "text": "        \"after_sequence\": {"
+            },
+            {
+              "line": 1695,
+              "text": "          \"type\": \"integer\","
+            },
+            {
+              "line": 1696,
+              "text": "          \"minimum\": 0"
+            },
+            {
+              "line": 1697,
+              "text": "        },"
+            },
+            {
+              "line": 1698,
+              "text": "        \"related_resource_ref\": {"
+            },
+            {
+              "line": 1699,
+              "text": "          \"anyOf\": ["
+            },
+            {
+              "line": 1700,
+              "text": "            {"
+            },
+            {
+              "line": 1701,
+              "text": "              \"$ref\": \"domain.schema.json#/$defs/VersionRef\""
+            },
+            {
+              "line": 1702,
+              "text": "            },"
+            },
+            {
+              "line": 1703,
+              "text": "            {"
+            },
+            {
+              "line": 1704,
+              "text": "              \"type\": \"null\""
+            },
+            {
+              "line": 1705,
+              "text": "            }"
+            },
+            {
+              "line": 1706,
+              "text": "          ]"
+            },
+            {
+              "line": 1707,
+              "text": "        }"
+            },
+            {
+              "line": 1708,
+              "text": "      },"
+            },
+            {
+              "line": 1709,
+              "text": "      \"required\": ["
+            },
+            {
+              "line": 1710,
+              "text": "        \"accepted_at\","
+            },
+            {
+              "line": 1711,
+              "text": "        \"operation_id\","
+            },
+            {
+              "line": 1712,
+              "text": "        \"after_sequence\","
+            },
+            {
+              "line": 1713,
+              "text": "        \"related_resource_ref\""
+            },
+            {
+              "line": 1714,
+              "text": "      ],"
+            },
+            {
+              "line": 1715,
+              "text": "      \"additionalProperties\": false"
+            }
+          ]
+        },
+        {
+          "start_line": 4774,
+          "end_line": 4788,
+          "exact_lines": [
+            {
+              "line": 4774,
+              "text": "        {"
+            },
+            {
+              "line": 4775,
+              "text": "          \"if\": {"
+            },
+            {
+              "line": 4776,
+              "text": "            \"properties\": {"
+            },
+            {
+              "line": 4777,
+              "text": "              \"status\": {"
+            },
+            {
+              "line": 4778,
+              "text": "                \"const\": \"ACKNOWLEDGED\""
+            },
+            {
+              "line": 4779,
+              "text": "              }"
+            },
+            {
+              "line": 4780,
+              "text": "            }"
+            },
+            {
+              "line": 4781,
+              "text": "          },"
+            },
+            {
+              "line": 4782,
+              "text": "          \"then\": {"
+            },
+            {
+              "line": 4783,
+              "text": "            \"properties\": {"
+            },
+            {
+              "line": 4784,
+              "text": "              \"result\": {"
+            },
+            {
+              "line": 4785,
+              "text": "                \"$ref\": \"#/$defs/PendingResult\""
+            },
+            {
+              "line": 4786,
+              "text": "              }"
+            },
+            {
+              "line": 4787,
+              "text": "            }"
+            },
+            {
+              "line": 4788,
+              "text": "          }"
+            }
+          ]
+        },
+        {
+          "start_line": 4928,
+          "end_line": 4948,
+          "exact_lines": [
+            {
+              "line": 4928,
+              "text": "        {"
+            },
+            {
+              "line": 4929,
+              "text": "          \"if\": {"
+            },
+            {
+              "line": 4930,
+              "text": "            \"properties\": {"
+            },
+            {
+              "line": 4931,
+              "text": "              \"method\": {"
+            },
+            {
+              "line": 4932,
+              "text": "                \"const\": \"session.attach\""
+            },
+            {
+              "line": 4933,
+              "text": "              },"
+            },
+            {
+              "line": 4934,
+              "text": "              \"status\": {"
+            },
+            {
+              "line": 4935,
+              "text": "                \"const\": \"COMPLETED\""
+            },
+            {
+              "line": 4936,
+              "text": "              }"
+            },
+            {
+              "line": 4937,
+              "text": "            },"
+            },
+            {
+              "line": 4938,
+              "text": "            \"required\": ["
+            },
+            {
+              "line": 4939,
+              "text": "              \"method\","
+            },
+            {
+              "line": 4940,
+              "text": "              \"status\""
+            },
+            {
+              "line": 4941,
+              "text": "            ]"
+            },
+            {
+              "line": 4942,
+              "text": "          },"
+            },
+            {
+              "line": 4943,
+              "text": "          \"then\": {"
+            },
+            {
+              "line": 4944,
+              "text": "            \"properties\": {"
+            },
+            {
+              "line": 4945,
+              "text": "              \"result\": {"
+            },
+            {
+              "line": 4946,
+              "text": "                \"$ref\": \"#/$defs/AttachResult\""
+            },
+            {
+              "line": 4947,
+              "text": "              }"
+            },
+            {
+              "line": 4948,
+              "text": "            }"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\client_protocol.go",
+        "sha256": "8eab2b524cbf436a11c48ac40b738c7f682d6c4e59cf58df9f3655fd2ed85bcf",
+        "bytes": 50304
+      },
+      "ranges": [
+        {
+          "start_line": 726,
+          "end_line": 772,
+          "exact_lines": [
+            {
+              "line": 726,
+              "text": "\t}"
+            },
+            {
+              "line": 727,
+              "text": "\toriginal, err := lookupClientCommandIdentity(ctx, tx, s.Doc, principal, env.originalRaw, env)"
+            },
+            {
+              "line": 728,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 729,
+              "text": "\t\treturn nil, false, err"
+            },
+            {
+              "line": 730,
+              "text": "\t}"
+            },
+            {
+              "line": 731,
+              "text": "\tif original != nil && !(deref(env.Method) == \"session.control\" && deref(original.Status) == \"ACKNOWLEDGED\") {"
+            },
+            {
+              "line": 732,
+              "text": "\t\treturn original, true, nil"
+            },
+            {
+              "line": 733,
+              "text": "\t}"
+            },
+            {
+              "line": 734,
+              "text": ""
+            },
+            {
+              "line": 735,
+              "text": "\tvar existingHash, body string"
+            },
+            {
+              "line": 736,
+              "text": "\trow := tx.QueryRowContext(ctx, `SELECT request_hash, body FROM idempotency WHERE principal=? AND project=? AND operation=? AND key=?`,"
+            },
+            {
+              "line": 737,
+              "text": "\t\tprincipal, deref(env.ProjectID), \"v2:\"+*env.Method, *env.CommandID)"
+            },
+            {
+              "line": 738,
+              "text": "\terr = row.Scan(&existingHash, &body)"
+            },
+            {
+              "line": 739,
+              "text": "\tswitch {"
+            },
+            {
+              "line": 740,
+              "text": "\tcase err == nil:"
+            },
+            {
+              "line": 741,
+              "text": "\t\tif existingHash != hash {"
+            },
+            {
+              "line": 742,
+              "text": "\t\t\treturn nil, false, ErrIdemConflict"
+            },
+            {
+              "line": 743,
+              "text": "\t\t}"
+            },
+            {
+              "line": 744,
+              "text": "\t\tvar r Response"
+            },
+            {
+              "line": 745,
+              "text": "\t\tif err := json.Unmarshal([]byte(body), &r); err != nil {"
+            },
+            {
+              "line": 746,
+              "text": "\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 747,
+              "text": "\t\t}"
+            },
+            {
+              "line": 748,
+              "text": "\t\tif deref(env.Method) == \"session.control\" && deref(r.Status) == \"ACKNOWLEDGED\" {"
+            },
+            {
+              "line": 749,
+              "text": "\t\t\tfinal, err := s.finalizeClientCancel(ctx, tx, env, principal, nil)"
+            },
+            {
+              "line": 750,
+              "text": "\t\t\tif err != nil {"
+            },
+            {
+              "line": 751,
+              "text": "\t\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 752,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 753,
+              "text": "\t\t\tif final != nil {"
+            },
+            {
+              "line": 754,
+              "text": "\t\t\t\tif s.Doc != nil {"
+            },
+            {
+              "line": 755,
+              "text": "\t\t\t\t\tvar generic map[string]any"
+            },
+            {
+              "line": 756,
+              "text": "\t\t\t\t\tif err = json.Unmarshal(Bytes(final), &generic); err != nil {"
+            },
+            {
+              "line": 757,
+              "text": "\t\t\t\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 758,
+              "text": "\t\t\t\t\t}"
+            },
+            {
+              "line": 759,
+              "text": "\t\t\t\t\tif err = s.Doc.ValidateDef(\"CommandResponse\", generic); err != nil {"
+            },
+            {
+              "line": 760,
+              "text": "\t\t\t\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 761,
+              "text": "\t\t\t\t\t}"
+            },
+            {
+              "line": 762,
+              "text": "\t\t\t\t\tif err = ValidateResultAgainstMethod(*env.Method, final, s.Doc); err != nil {"
+            },
+            {
+              "line": 763,
+              "text": "\t\t\t\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 764,
+              "text": "\t\t\t\t\t}"
+            },
+            {
+              "line": 765,
+              "text": "\t\t\t\t}"
+            },
+            {
+              "line": 766,
+              "text": "\t\t\t\tif _, err = tx.ExecContext(ctx, \"UPDATE idempotency SET body=? WHERE principal=? AND project=? AND operation=? AND key=? AND request_hash=?\", string(Bytes(final)), principal, deref(env.ProjectID), \"v2:\"+deref(env.Method), deref(env.CommandID), hash); err != nil {"
+            },
+            {
+              "line": 767,
+              "text": "\t\t\t\t\treturn nil, false, err"
+            },
+            {
+              "line": 768,
+              "text": "\t\t\t\t}"
+            },
+            {
+              "line": 769,
+              "text": "\t\t\t\treturn final, true, nil"
+            },
+            {
+              "line": 770,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 771,
+              "text": "\t\t}"
+            },
+            {
+              "line": 772,
+              "text": "\t\treturn &r, true, nil"
+            }
+          ]
+        },
+        {
+          "start_line": 906,
+          "end_line": 967,
+          "exact_lines": [
+            {
+              "line": 906,
+              "text": "\t// session.attach is dual-mode: reading a snapshot needs no writer claim, while"
+            },
+            {
+              "line": 907,
+              "text": "\t// request_write_owner is a write that must pass the full gate."
+            },
+            {
+              "line": 908,
+              "text": "\ttakeover := false"
+            },
+            {
+              "line": 909,
+              "text": "\tif *env.Method == \"session.attach\" {"
+            },
+            {
+              "line": 910,
+              "text": "\t\tvar p struct {"
+            },
+            {
+              "line": 911,
+              "text": "\t\t\tRequestWriteOwner bool `json:\"request_write_owner\"`"
+            },
+            {
+              "line": 912,
+              "text": "\t\t}"
+            },
+            {
+              "line": 913,
+              "text": "\t\tjson.Unmarshal(env.Payload, &p)"
+            },
+            {
+              "line": 914,
+              "text": "\t\ttakeover = p.RequestWriteOwner"
+            },
+            {
+              "line": 915,
+              "text": "\t}"
+            },
+            {
+              "line": 916,
+              "text": "\tif !writeMethods[*env.Method] && !takeover {"
+            },
+            {
+              "line": 917,
+              "text": "\t\treturn s.handleRead(ctx, tx, env, principal, reject)"
+            },
+            {
+              "line": 918,
+              "text": "\t}"
+            },
+            {
+              "line": 919,
+              "text": "\tif deref(env.SessionID) == \"\" {"
+            },
+            {
+              "line": 920,
+              "text": "\t\t// Host-level writes (configure, bootstrap, workspace registration) legitimately"
+            },
+            {
+              "line": 921,
+              "text": "\t\t// carry no session; they are gated by the project/OS identity checks in their own"
+            },
+            {
+              "line": 922,
+              "text": "\t\t// handler cards, not by a session row that does not exist yet."
+            },
+            {
+              "line": 923,
+              "text": "\t\tswitch *env.Method {"
+            },
+            {
+              "line": 924,
+              "text": "\t\tcase \"host.configure\", \"project.bootstrap\", \"workspace.register\":"
+            },
+            {
+              "line": 925,
+              "text": "\t\t\treturn s.handleWrite(ctx, tx, env, principal, nil, reject)"
+            },
+            {
+              "line": 926,
+              "text": "\t\tcase \"goal.start\":"
+            },
+            {
+              "line": 927,
+              "text": "\t\t\treturn s.startClientGoal(ctx, tx, env, principal, nil)"
+            },
+            {
+              "line": 928,
+              "text": "\t\t}"
+            },
+            {
+              "line": 929,
+              "text": "\t\treturn reject(0, nil, \"INVALID_REQUEST\", \"write command requires a session id\"), nil"
+            },
+            {
+              "line": 930,
+              "text": "\t}"
+            },
+            {
+              "line": 931,
+              "text": "\tsess, err := loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))"
+            },
+            {
+              "line": 932,
+              "text": "\tif err == sql.ErrNoRows {"
+            },
+            {
+              "line": 933,
+              "text": "\t\treturn reject(0, nil, \"NOT_FOUND\", \"unknown session for this project\"), nil"
+            },
+            {
+              "line": 934,
+              "text": "\t}"
+            },
+            {
+              "line": 935,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 936,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 937,
+              "text": "\t}"
+            },
+            {
+              "line": 938,
+              "text": "\tif sess.sealed || sess.archived {"
+            },
+            {
+              "line": 939,
+              "text": "\t\treturn reject(sess.revision, sess.epoch, \"SESSION_ARCHIVED\", \"session is sealed or archived\"), nil"
+            },
+            {
+              "line": 940,
+              "text": "\t}"
+            },
+            {
+              "line": 941,
+              "text": "\tif env.ExpectedRevision == nil || *env.ExpectedRevision != sess.revision {"
+            },
+            {
+              "line": 942,
+              "text": "\t\t// A stale snapshot answers with the live revision; the client must refresh, and the"
+            },
+            {
+              "line": 943,
+              "text": "\t\t// service never retries the command on its behalf."
+            },
+            {
+              "line": 944,
+              "text": "\t\treturn reject(sess.revision, sess.epoch, \"VERSION_CONFLICT\", \"expected_revision is not the current session revision\"), nil"
+            },
+            {
+              "line": 945,
+              "text": "\t}"
+            },
+            {
+              "line": 946,
+              "text": "\tif takeover {"
+            },
+            {
+              "line": 947,
+              "text": "\t\tif env.WriterEpoch != nil {"
+            },
+            {
+              "line": 948,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"INVALID_REQUEST\", \"a takeover request must not claim a writer epoch\"), nil"
+            },
+            {
+              "line": 949,
+              "text": "\t\t}"
+            },
+            {
+              "line": 950,
+              "text": "\t} else {"
+            },
+            {
+              "line": 951,
+              "text": "\t\tif env.WriterEpoch == nil {"
+            },
+            {
+              "line": 952,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"STALE_WRITER_EPOCH\", \"writer_epoch is required for a write\"), nil"
+            },
+            {
+              "line": 953,
+              "text": "\t\t}"
+            },
+            {
+              "line": 954,
+              "text": "\t\tif *env.WriterEpoch != sess.epoch {"
+            },
+            {
+              "line": 955,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"STALE_WRITER_EPOCH\", \"writer_epoch is not the current owner\"), nil"
+            },
+            {
+              "line": 956,
+              "text": "\t\t}"
+            },
+            {
+              "line": 957,
+              "text": "\t\tif sess.writerClientID != deref(env.ClientID) {"
+            },
+            {
+              "line": 958,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"WRITER_BUSY\", \"writer attribution belongs to another client\"), nil"
+            },
+            {
+              "line": 959,
+              "text": "\t\t}"
+            },
+            {
+              "line": 960,
+              "text": "\t}"
+            },
+            {
+              "line": 961,
+              "text": "\tif deref(env.Method) == \"session.send\" || deref(env.Method) == \"goal.start\" {"
+            },
+            {
+              "line": 962,
+              "text": "\t\tif err := s.validateSessionConfiguration(ctx, tx, principal, sess, false); err != nil {"
+            },
+            {
+              "line": 963,
+              "text": "\t\t\treturn clientFault(env, err)"
+            },
+            {
+              "line": 964,
+              "text": "\t\t}"
+            },
+            {
+              "line": 965,
+              "text": "\t}"
+            },
+            {
+              "line": 966,
+              "text": "\treturn s.handleWrite(ctx, tx, env, principal, sess, reject)"
+            },
+            {
+              "line": 967,
+              "text": "}"
+            }
+          ]
+        },
+        {
+          "start_line": 1036,
+          "end_line": 1081,
+          "exact_lines": [
+            {
+              "line": 1036,
+              "text": "\tcase \"session.get\", \"session.attach\":"
+            },
+            {
+              "line": 1037,
+              "text": "\t\tsess, err := loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))"
+            },
+            {
+              "line": 1038,
+              "text": "\t\tif err == sql.ErrNoRows {"
+            },
+            {
+              "line": 1039,
+              "text": "\t\t\treturn reject(0, nil, \"NOT_FOUND\", \"unknown session for this project\"), nil"
+            },
+            {
+              "line": 1040,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1041,
+              "text": "\t\tif err != nil {"
+            },
+            {
+              "line": 1042,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1043,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1044,
+              "text": "\t\tsnap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)"
+            },
+            {
+              "line": 1045,
+              "text": "\t\tif err != nil {"
+            },
+            {
+              "line": 1046,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1047,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1048,
+              "text": "\t\tif *env.Method == \"session.get\" {"
+            },
+            {
+              "line": 1049,
+              "text": "\t\t\treturn complete(sess.revision, snap), nil"
+            },
+            {
+              "line": 1050,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1051,
+              "text": "\t\tvar p struct {"
+            },
+            {
+              "line": 1052,
+              "text": "\t\t\tAfterSequence *int64 `json:\"after_sequence\"`"
+            },
+            {
+              "line": 1053,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1054,
+              "text": "\t\tjson.Unmarshal(env.Payload, &p)"
+            },
+            {
+              "line": 1055,
+              "text": "\t\tif after := derefI64(p.AfterSequence, 0); after > sess.watermark {"
+            },
+            {
+              "line": 1056,
+              "text": "\t\t\t// A cursor from the future cannot be served by the journal; the snapshot is the"
+            },
+            {
+              "line": 1057,
+              "text": "\t\t\t// recovery vehicle, so the client is told to restart from it."
+            },
+            {
+              "line": 1058,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"CURSOR_INVALID\", \"after_sequence exceeds the session watermark; recover from snapshot\"), nil"
+            },
+            {
+              "line": 1059,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1060,
+              "text": "\t\treturn complete(sess.revision, map[string]any{\"snapshot\": snap, \"write_owner_acquired\": false}), nil"
+            },
+            {
+              "line": 1061,
+              "text": "\tcase \"session.events\":"
+            },
+            {
+              "line": 1062,
+              "text": "\t\tsess, err := loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))"
+            },
+            {
+              "line": 1063,
+              "text": "\t\tif err == sql.ErrNoRows {"
+            },
+            {
+              "line": 1064,
+              "text": "\t\t\treturn reject(0, nil, \"NOT_FOUND\", \"unknown session for this project\"), nil"
+            },
+            {
+              "line": 1065,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1066,
+              "text": "\t\tif err != nil {"
+            },
+            {
+              "line": 1067,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1068,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1069,
+              "text": "\t\tvar p struct {"
+            },
+            {
+              "line": 1070,
+              "text": "\t\t\tAfterSequence *int64 `json:\"after_sequence\"`"
+            },
+            {
+              "line": 1071,
+              "text": "\t\t\tLimit         *int64 `json:\"limit\"`"
+            },
+            {
+              "line": 1072,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1073,
+              "text": "\t\tjson.Unmarshal(env.Payload, &p)"
+            },
+            {
+              "line": 1074,
+              "text": "\t\tpage, err := ReadSessionEvents(ctx, tx, sess.project, sess.sessionID, derefI64(p.AfterSequence, 0), derefI64(p.Limit, MaxEventPage))"
+            },
+            {
+              "line": 1075,
+              "text": "\t\tif err == ErrResyncRequired {"
+            },
+            {
+              "line": 1076,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"CURSOR_INVALID\", err.Error()), nil"
+            },
+            {
+              "line": 1077,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1078,
+              "text": "\t\tif err != nil {"
+            },
+            {
+              "line": 1079,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1080,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1081,
+              "text": "\t\tevents := make([]any, 0, len(page.Events))"
+            }
+          ]
+        },
+        {
+          "start_line": 1127,
+          "end_line": 1187,
+          "exact_lines": [
+            {
+              "line": 1127,
+              "text": "\tcase \"session.attach\":"
+            },
+            {
+              "line": 1128,
+              "text": "\t\tvar p struct {"
+            },
+            {
+              "line": 1129,
+              "text": "\t\t\tRequestWriteOwner bool `json:\"request_write_owner\"`"
+            },
+            {
+              "line": 1130,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1131,
+              "text": "\t\tjson.Unmarshal(env.Payload, &p)"
+            },
+            {
+              "line": 1132,
+              "text": "\t\tif !p.RequestWriteOwner {"
+            },
+            {
+              "line": 1133,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, \"INVALID_REQUEST\", \"attach without write ownership is a read path\"), nil"
+            },
+            {
+              "line": 1134,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1135,
+              "text": "\t\t// Reacquisition by the current client renews the writer lease through the"
+            },
+            {
+              "line": 1136,
+              "text": "\t\t// same CAS and epoch rotation as a handoff. Any queued old claim expires."
+            },
+            {
+              "line": 1137,
+              "text": "\t\tif sess.runID != \"\" {"
+            },
+            {
+              "line": 1138,
+              "text": "\t\t\tstatus, settled, err := runState(ctx, tx, sess.project, sess.runID)"
+            },
+            {
+              "line": 1139,
+              "text": "\t\t\tif err != nil {"
+            },
+            {
+              "line": 1140,
+              "text": "\t\t\t\treturn nil, err"
+            },
+            {
+              "line": 1141,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 1142,
+              "text": "\t\t\tif liveRunStatuses[status] && !settled {"
+            },
+            {
+              "line": 1143,
+              "text": "\t\t\t\treturn reject(sess.revision, sess.epoch, \"SESSION_BUSY\", \"previous runtime must settle before writer takeover\"), nil"
+            },
+            {
+              "line": 1144,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 1145,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1146,
+              "text": "\t\tprevEpoch, prevClient := sess.epoch, sess.writerClientID"
+            },
+            {
+              "line": 1147,
+              "text": "\t\tnewEpoch, err := HandoffEpoch(ctx, tx, sess.sessionID, sess.epoch, sess.revision)"
+            },
+            {
+              "line": 1148,
+              "text": "\t\tif err != nil {"
+            },
+            {
+              "line": 1149,
+              "text": "\t\t\tcode := \"WRITER_BUSY\""
+            },
+            {
+              "line": 1150,
+              "text": "\t\t\tif errors.Is(err, ErrStaleRevision) || errors.Is(err, ErrStaleEpoch) {"
+            },
+            {
+              "line": 1151,
+              "text": "\t\t\t\tcode = \"VERSION_CONFLICT\""
+            },
+            {
+              "line": 1152,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 1153,
+              "text": "\t\t\treturn reject(sess.revision, sess.epoch, code, err.Error()), nil"
+            },
+            {
+              "line": 1154,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1155,
+              "text": "\t\tnowT := time.Now().UTC()"
+            },
+            {
+              "line": 1156,
+              "text": "\t\tif s.Host.LeaseTTL <= 0 {"
+            },
+            {
+              "line": 1157,
+              "text": "\t\t\t// A handoff must publish a real writer lease; the TTL comes from host config,"
+            },
+            {
+              "line": 1158,
+              "text": "\t\t\t// and the service refuses to invent one."
+            },
+            {
+              "line": 1159,
+              "text": "\t\t\treturn nil, fmt.Errorf(\"HOST_LEASE_POLICY_MISSING\")"
+            },
+            {
+              "line": 1160,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1161,
+              "text": "\t\t// Writer attribution moves with the epoch inside this same transaction, so the old"
+            },
+            {
+              "line": 1162,
+              "text": "\t\t// client cannot slip a command in between the transfer and the journal row."
+            },
+            {
+              "line": 1163,
+              "text": "\t\tif _, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=? WHERE id=? AND writer_epoch=?`,"
+            },
+            {
+              "line": 1164,
+              "text": "\t\t\tderef(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), sess.sessionID, newEpoch); err != nil {"
+            },
+            {
+              "line": 1165,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1166,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1167,
+              "text": "\t\tsess.writerClientID = deref(env.ClientID)"
+            },
+            {
+              "line": 1168,
+              "text": "\t\tnow := nowT.Format(time.RFC3339Nano)"
+            },
+            {
+              "line": 1169,
+              "text": "\t\t// the transfer already advanced epoch and revision; the journal row is written under"
+            },
+            {
+              "line": 1170,
+              "text": "\t\t// the new ownership claim, so both CAS layers agree inside this one transaction"
+            },
+            {
+              "line": 1171,
+              "text": "\t\tsess.epoch = newEpoch"
+            },
+            {
+              "line": 1172,
+              "text": "\t\tsess.revision = sess.revision + 1"
+            },
+            {
+              "line": 1173,
+              "text": "\t\tif err := s.journal(ctx, tx, env, sess, \"CLIENT_HANDOFF\", map[string]any{"
+            },
+            {
+              "line": 1174,
+              "text": "\t\t\t\"previous_client_id\": prevClient,"
+            },
+            {
+              "line": 1175,
+              "text": "\t\t\t\"target_client_id\":   deref(env.ClientID),"
+            },
+            {
+              "line": 1176,
+              "text": "\t\t\t\"previous_epoch\":     prevEpoch,"
+            },
+            {
+              "line": 1177,
+              "text": "\t\t\t\"writer\": map[string]any{"
+            },
+            {
+              "line": 1178,
+              "text": "\t\t\t\t\"client_id\":  deref(env.ClientID),"
+            },
+            {
+              "line": 1179,
+              "text": "\t\t\t\t\"epoch\":      newEpoch,"
+            },
+            {
+              "line": 1180,
+              "text": "\t\t\t\t\"expires_at\": nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano),"
+            },
+            {
+              "line": 1181,
+              "text": "\t\t\t},"
+            },
+            {
+              "line": 1182,
+              "text": "\t\t\t\"effective_at\": now,"
+            },
+            {
+              "line": 1183,
+              "text": "\t\t}); err != nil {"
+            },
+            {
+              "line": 1184,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 1185,
+              "text": "\t\t}"
+            },
+            {
+              "line": 1186,
+              "text": "\t\treturn ack(sess.revision+1, map[string]any{\"accepted_at\": now, \"operation_id\": \"op-\" + deref(env.CommandID),"
+            },
+            {
+              "line": 1187,
+              "text": "\t\t\t\"after_sequence\": sess.watermark + 1, \"related_resource_ref\": nil}), nil"
+            }
+          ]
+        },
+        {
+          "start_line": 1239,
+          "end_line": 1262,
+          "exact_lines": [
+            {
+              "line": 1239,
+              "text": "func (s *ClientService) journal(ctx context.Context, tx *sql.Tx, env *Envelope, sess *clientSessionRow, kind string, payload map[string]any) error {"
+            },
+            {
+              "line": 1240,
+              "text": "\tbody, err := json.Marshal(payload)"
+            },
+            {
+              "line": 1241,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 1242,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 1243,
+              "text": "\t}"
+            },
+            {
+              "line": 1244,
+              "text": "\tseq := sess.watermark + 1"
+            },
+            {
+              "line": 1245,
+              "text": "\trunID := any(nil)"
+            },
+            {
+              "line": 1246,
+              "text": "\tif sess.runID != \"\" {"
+            },
+            {
+              "line": 1247,
+              "text": "\t\trunID = sess.runID"
+            },
+            {
+              "line": 1248,
+              "text": "\t}"
+            },
+            {
+              "line": 1249,
+              "text": "\tev := &SessionEvent{"
+            },
+            {
+              "line": 1250,
+              "text": "\t\t// (session, sequence) is the journal's natural key, so the id cannot collide across"
+            },
+            {
+              "line": 1251,
+              "text": "\t\t// principals that replay the same command text in different sessions."
+            },
+            {
+              "line": 1252,
+              "text": "\t\tEventID:   strptr(fmt.Sprintf(\"ev-%s-%d\", sess.sessionID, seq)),"
+            },
+            {
+              "line": 1253,
+              "text": "\t\tSessionID: strptr(sess.sessionID), Sequence: int64ptr(seq),"
+            },
+            {
+              "line": 1254,
+              "text": "\t\tCoreBuildID: strptr(s.Host.CoreBuildID), ProtocolVersion: strptr(ProtocolV2),"
+            },
+            {
+              "line": 1255,
+              "text": "\t\tCommandID: env.CommandID, DomainEventID: nil,"
+            },
+            {
+              "line": 1256,
+              "text": "\t\tKind: strptr(kind), Payload: body,"
+            },
+            {
+              "line": 1257,
+              "text": "\t}"
+            },
+            {
+              "line": 1258,
+              "text": "\tif rs, ok := runID.(string); ok {"
+            },
+            {
+              "line": 1259,
+              "text": "\t\tev.RunID = strptr(rs)"
+            },
+            {
+              "line": 1260,
+              "text": "\t}"
+            },
+            {
+              "line": 1261,
+              "text": "\treturn AppendSessionEvent(ctx, tx, s.Doc, sess.project, ev, sess.epoch, sess.revision)"
+            },
+            {
+              "line": 1262,
+              "text": "}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\v24_sessions.go",
+        "sha256": "fb19149d9686074fd2e57aa31ce5cceefe028d6f5e8e44a26f1cbace1626a0f2",
+        "bytes": 7640
+      },
+      "ranges": [
+        {
+          "start_line": 153,
+          "end_line": 177,
+          "exact_lines": [
+            {
+              "line": 153,
+              "text": "func HandoffEpoch(ctx context.Context, tx *sql.Tx, id string, fromEpoch int64, expectedRevision int64) (int64, error) {"
+            },
+            {
+              "line": 154,
+              "text": "\tvar curEpoch, rev int64"
+            },
+            {
+              "line": 155,
+              "text": "\tvar sealed sql.NullString"
+            },
+            {
+              "line": 156,
+              "text": "\tif err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed); err == sql.ErrNoRows {"
+            },
+            {
+              "line": 157,
+              "text": "\t\treturn 0, ErrUnknownSession"
+            },
+            {
+              "line": 158,
+              "text": "\t} else if err != nil {"
+            },
+            {
+              "line": 159,
+              "text": "\t\treturn 0, err"
+            },
+            {
+              "line": 160,
+              "text": "\t}"
+            },
+            {
+              "line": 161,
+              "text": "\tif sealed.Valid {"
+            },
+            {
+              "line": 162,
+              "text": "\t\treturn 0, ErrSealed"
+            },
+            {
+              "line": 163,
+              "text": "\t}"
+            },
+            {
+              "line": 164,
+              "text": "\tif rev != expectedRevision {"
+            },
+            {
+              "line": 165,
+              "text": "\t\treturn 0, ErrStaleRevision"
+            },
+            {
+              "line": 166,
+              "text": "\t}"
+            },
+            {
+              "line": 167,
+              "text": "\tres, err := tx.ExecContext(ctx, `UPDATE client_sessions"
+            },
+            {
+              "line": 168,
+              "text": "\t\tSET writer_epoch=writer_epoch+1, revision=revision+1, updated_at=?"
+            },
+            {
+              "line": 169,
+              "text": "\t\tWHERE id=? AND writer_epoch=? AND sealed_at IS NULL`,"
+            },
+            {
+              "line": 170,
+              "text": "\t\ttime.Now().UTC().Format(time.RFC3339Nano), id, fromEpoch)"
+            },
+            {
+              "line": 171,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 172,
+              "text": "\t\treturn 0, err"
+            },
+            {
+              "line": 173,
+              "text": "\t}"
+            },
+            {
+              "line": 174,
+              "text": "\tif n, _ := res.RowsAffected(); n != 1 {"
+            },
+            {
+              "line": 175,
+              "text": "\t\treturn 0, ErrStaleEpoch"
+            },
+            {
+              "line": 176,
+              "text": "\t}"
+            },
+            {
+              "line": 177,
+              "text": "\treturn fromEpoch + 1, nil"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\client_protocol_journal.go",
+        "sha256": "75aee5bbdb4f12afbc00cd6432c46d9d73bba6cb4f6f6ff3ad4d5023aa51ca19",
+        "bytes": 14354
+      },
+      "ranges": [
+        {
+          "start_line": 46,
+          "end_line": 138,
+          "exact_lines": [
+            {
+              "line": 46,
+              "text": ""
+            },
+            {
+              "line": 47,
+              "text": "// Only the runtime stream commit path uses this private watermark-only variant."
+            },
+            {
+              "line": 48,
+              "text": "func appendRuntimeMessageEvent(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, project string, ev *SessionEvent, epoch, expectedRevision int64) error {"
+            },
+            {
+              "line": 49,
+              "text": "\tif ev == nil || ev.Kind == nil || *ev.Kind != \"MESSAGE\" || ev.RunID == nil || *ev.RunID == \"\" {"
+            },
+            {
+              "line": 50,
+              "text": "\t\treturn fmt.Errorf(\"runtime MESSAGE identity required\")"
+            },
+            {
+              "line": 51,
+              "text": "\t}"
+            },
+            {
+              "line": 52,
+              "text": "\treturn appendSessionEvent(ctx, tx, doc, project, ev, epoch, expectedRevision, true)"
+            },
+            {
+              "line": 53,
+              "text": "}"
+            },
+            {
+              "line": 54,
+              "text": ""
+            },
+            {
+              "line": 55,
+              "text": "func appendSessionEvent(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, project string, ev *SessionEvent, epoch, expectedRevision int64, runtimeMessage bool) error {"
+            },
+            {
+              "line": 56,
+              "text": "\tif ev == nil || ev.SessionID == nil || ev.Kind == nil || ev.Sequence == nil {"
+            },
+            {
+              "line": 57,
+              "text": "\t\treturn fmt.Errorf(\"UNtyped_EVENT\")"
+            },
+            {
+              "line": 58,
+              "text": "\t}"
+            },
+            {
+              "line": 59,
+              "text": "\tif err := ValidateEventPayload(doc, ev); err != nil {"
+            },
+            {
+              "line": 60,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 61,
+              "text": "\t}"
+            },
+            {
+              "line": 62,
+              "text": "\tvar wm, curRev, curEpoch int64"
+            },
+            {
+              "line": 63,
+              "text": "\tvar sealed sql.NullString"
+            },
+            {
+              "line": 64,
+              "text": "\terr := tx.QueryRowContext(ctx,"
+            },
+            {
+              "line": 65,
+              "text": "\t\t`SELECT event_watermark, revision, writer_epoch, sealed_at FROM client_sessions WHERE id=? AND project_id=?`,"
+            },
+            {
+              "line": 66,
+              "text": "\t\t*ev.SessionID, project).Scan(&wm, &curRev, &curEpoch, &sealed)"
+            },
+            {
+              "line": 67,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 68,
+              "text": "\t\tif errors.Is(err, sql.ErrNoRows) {"
+            },
+            {
+              "line": 69,
+              "text": "\t\t\treturn ErrUnknownSession"
+            },
+            {
+              "line": 70,
+              "text": "\t\t}"
+            },
+            {
+              "line": 71,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 72,
+              "text": "\t}"
+            },
+            {
+              "line": 73,
+              "text": "\tif sealed.Valid {"
+            },
+            {
+              "line": 74,
+              "text": "\t\treturn ErrSealed"
+            },
+            {
+              "line": 75,
+              "text": "\t}"
+            },
+            {
+              "line": 76,
+              "text": "\t// Unified numbering rule: exactly watermark+1. Reuse (<=) and holes (>) are both"
+            },
+            {
+              "line": 77,
+              "text": "\t// rejected here instead of being repaired later."
+            },
+            {
+              "line": 78,
+              "text": "\tif want := wm + 1; *ev.Sequence != want {"
+            },
+            {
+              "line": 79,
+              "text": "\t\treturn fmt.Errorf(\"%w: got %d want %d\", ErrEventSequence, *ev.Sequence, want)"
+            },
+            {
+              "line": 80,
+              "text": "\t}"
+            },
+            {
+              "line": 81,
+              "text": "\tif *ev.Kind == \"MESSAGE\" {"
+            },
+            {
+              "line": 82,
+              "text": "\t\tvar p struct {"
+            },
+            {
+              "line": 83,
+              "text": "\t\t\tMessageID *string `json:\"message_id\"`"
+            },
+            {
+              "line": 84,
+              "text": "\t\t\tPhase     *string `json:\"phase\"`"
+            },
+            {
+              "line": 85,
+              "text": "\t\t}"
+            },
+            {
+              "line": 86,
+              "text": "\t\tif err := json.Unmarshal(ev.Payload, &p); err != nil {"
+            },
+            {
+              "line": 87,
+              "text": "\t\t\treturn err"
+            },
+            {
+              "line": 88,
+              "text": "\t\t}"
+            },
+            {
+              "line": 89,
+              "text": "\t\tif p.MessageID != nil && p.Phase != nil && *p.Phase != \"START\" {"
+            },
+            {
+              "line": 90,
+              "text": "\t\t\tvar n int"
+            },
+            {
+              "line": 91,
+              "text": "\t\t\tif err := tx.QueryRowContext(ctx,"
+            },
+            {
+              "line": 92,
+              "text": "\t\t\t\t`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=?"
+            },
+            {
+              "line": 93,
+              "text": "\t\t\t\t AND json_extract(body,'$.kind')='MESSAGE'"
+            },
+            {
+              "line": 94,
+              "text": "\t\t\t\t AND json_extract(body,'$.payload.message_id')=?"
+            },
+            {
+              "line": 95,
+              "text": "\t\t\t\t AND json_extract(body,'$.payload.phase')='START'`,"
+            },
+            {
+              "line": 96,
+              "text": "\t\t\t\tproject, *ev.SessionID, *p.MessageID).Scan(&n); err != nil {"
+            },
+            {
+              "line": 97,
+              "text": "\t\t\t\treturn err"
+            },
+            {
+              "line": 98,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 99,
+              "text": "\t\t\tif n == 0 {"
+            },
+            {
+              "line": 100,
+              "text": "\t\t\t\treturn ErrStreamWithoutStart"
+            },
+            {
+              "line": 101,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 102,
+              "text": "\t\t}"
+            },
+            {
+              "line": 103,
+              "text": "\t}"
+            },
+            {
+              "line": 104,
+              "text": "\tbody, err := json.Marshal(ev)"
+            },
+            {
+              "line": 105,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 106,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 107,
+              "text": "\t}"
+            },
+            {
+              "line": 108,
+              "text": "\t// Both mutations (journal row + watermark CAS) are one unit: a savepoint means a failed"
+            },
+            {
+              "line": 109,
+              "text": "\t// watermark compare leaves no orphan event even if the caller later commits."
+            },
+            {
+              "line": 110,
+              "text": "\tif _, err := tx.ExecContext(ctx, `SAVEPOINT client_event`); err != nil {"
+            },
+            {
+              "line": 111,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 112,
+              "text": "\t}"
+            },
+            {
+              "line": 113,
+              "text": "\tif err := appendEventRows(ctx, tx, project, ev, body, epoch, expectedRevision, runtimeMessage); err != nil {"
+            },
+            {
+              "line": 114,
+              "text": "\t\tif _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO client_event`); rbErr != nil {"
+            },
+            {
+              "line": 115,
+              "text": "\t\t\treturn errors.Join(err, rbErr)"
+            },
+            {
+              "line": 116,
+              "text": "\t\t}"
+            },
+            {
+              "line": 117,
+              "text": "\t\tif _, relErr := tx.ExecContext(ctx, `RELEASE client_event`); relErr != nil {"
+            },
+            {
+              "line": 118,
+              "text": "\t\t\treturn errors.Join(err, relErr)"
+            },
+            {
+              "line": 119,
+              "text": "\t\t}"
+            },
+            {
+              "line": 120,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 121,
+              "text": "\t}"
+            },
+            {
+              "line": 122,
+              "text": "\t_, err = tx.ExecContext(ctx, `RELEASE client_event`)"
+            },
+            {
+              "line": 123,
+              "text": "\treturn err"
+            },
+            {
+              "line": 124,
+              "text": "}"
+            },
+            {
+              "line": 125,
+              "text": ""
+            },
+            {
+              "line": 126,
+              "text": "func appendEventRows(ctx context.Context, tx *sql.Tx, project string, ev *SessionEvent, body []byte, epoch, expectedRevision int64, runtimeMessage bool) error {"
+            },
+            {
+              "line": 127,
+              "text": "\tvar next int64"
+            },
+            {
+              "line": 128,
+              "text": "\tif err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM outbox WHERE project=?`, project).Scan(&next); err != nil {"
+            },
+            {
+              "line": 129,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 130,
+              "text": "\t}"
+            },
+            {
+              "line": 131,
+              "text": "\tif _, err := tx.ExecContext(ctx, `INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)`,"
+            },
+            {
+              "line": 132,
+              "text": "\t\tproject, next, *ev.EventID, string(body)); err != nil {"
+            },
+            {
+              "line": 133,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 134,
+              "text": "\t}"
+            },
+            {
+              "line": 135,
+              "text": "\tif runtimeMessage {"
+            },
+            {
+              "line": 136,
+              "text": "\t\treturn advanceRuntimeMessageWatermark(ctx, tx, project, *ev.SessionID, epoch, expectedRevision, *ev.Sequence-1, *ev.Sequence)"
+            },
+            {
+              "line": 137,
+              "text": "\t}"
+            },
+            {
+              "line": 138,
+              "text": "\t// Watermark advance is the same forward-only, epoch-guarded CAS every other write uses."
+            }
+          ]
+        },
+        {
+          "start_line": 144,
+          "end_line": 201,
+          "exact_lines": [
+            {
+              "line": 144,
+              "text": "func ReadSessionEvents(ctx context.Context, tx *sql.Tx, project, sessionID string, afterSequence, limit int64) (*ClientEventPage, error) {"
+            },
+            {
+              "line": 145,
+              "text": "\tvar wm int64"
+            },
+            {
+              "line": 146,
+              "text": "\tif err := tx.QueryRowContext(ctx, `SELECT event_watermark FROM client_sessions WHERE id=? AND project_id=?`,"
+            },
+            {
+              "line": 147,
+              "text": "\t\tsessionID, project).Scan(&wm); err != nil {"
+            },
+            {
+              "line": 148,
+              "text": "\t\tif errors.Is(err, sql.ErrNoRows) {"
+            },
+            {
+              "line": 149,
+              "text": "\t\t\treturn nil, ErrUnknownSession"
+            },
+            {
+              "line": 150,
+              "text": "\t\t}"
+            },
+            {
+              "line": 151,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 152,
+              "text": "\t}"
+            },
+            {
+              "line": 153,
+              "text": "\tif afterSequence > wm {"
+            },
+            {
+              "line": 154,
+              "text": "\t\treturn nil, ErrResyncRequired"
+            },
+            {
+              "line": 155,
+              "text": "\t}"
+            },
+            {
+              "line": 156,
+              "text": "\tif limit <= 0 || limit > MaxEventPage {"
+            },
+            {
+              "line": 157,
+              "text": "\t\tlimit = MaxEventPage"
+            },
+            {
+              "line": 158,
+              "text": "\t}"
+            },
+            {
+              "line": 159,
+              "text": "\trows, err := tx.QueryContext(ctx,"
+            },
+            {
+              "line": 160,
+              "text": "\t\t`SELECT body FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=?"
+            },
+            {
+              "line": 161,
+              "text": "\t\t AND json_extract(body,'$.sequence') > ?"
+            },
+            {
+              "line": 162,
+              "text": "\t\t ORDER BY json_extract(body,'$.sequence') ASC LIMIT ?`,"
+            },
+            {
+              "line": 163,
+              "text": "\t\tproject, sessionID, afterSequence, limit+1)"
+            },
+            {
+              "line": 164,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 165,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 166,
+              "text": "\t}"
+            },
+            {
+              "line": 167,
+              "text": "\tdefer rows.Close()"
+            },
+            {
+              "line": 168,
+              "text": "\tpage := &ClientEventPage{Events: []SessionEvent{}, HighWatermark: wm}"
+            },
+            {
+              "line": 169,
+              "text": "\tvar got int64"
+            },
+            {
+              "line": 170,
+              "text": "\tvar last int64"
+            },
+            {
+              "line": 171,
+              "text": "\tfor rows.Next() {"
+            },
+            {
+              "line": 172,
+              "text": "\t\tvar raw string"
+            },
+            {
+              "line": 173,
+              "text": "\t\tif err := rows.Scan(&raw); err != nil {"
+            },
+            {
+              "line": 174,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 175,
+              "text": "\t\t}"
+            },
+            {
+              "line": 176,
+              "text": "\t\tgot++"
+            },
+            {
+              "line": 177,
+              "text": "\t\tif got > limit {"
+            },
+            {
+              "line": 178,
+              "text": "\t\t\tpage.HasMore = true"
+            },
+            {
+              "line": 179,
+              "text": "\t\t\tbreak"
+            },
+            {
+              "line": 180,
+              "text": "\t\t}"
+            },
+            {
+              "line": 181,
+              "text": "\t\tvar ev SessionEvent"
+            },
+            {
+              "line": 182,
+              "text": "\t\tif err := json.Unmarshal([]byte(raw), &ev); err != nil {"
+            },
+            {
+              "line": 183,
+              "text": "\t\t\treturn nil, err"
+            },
+            {
+              "line": 184,
+              "text": "\t\t}"
+            },
+            {
+              "line": 185,
+              "text": "\t\tif ev.Sequence == nil {"
+            },
+            {
+              "line": 186,
+              "text": "\t\t\treturn nil, fmt.Errorf(\"UNtyped_EVENT\")"
+            },
+            {
+              "line": 187,
+              "text": "\t\t}"
+            },
+            {
+              "line": 188,
+              "text": "\t\tlast = *ev.Sequence"
+            },
+            {
+              "line": 189,
+              "text": "\t\tpage.Events = append(page.Events, ev)"
+            },
+            {
+              "line": 190,
+              "text": "\t}"
+            },
+            {
+              "line": 191,
+              "text": "\tif err := rows.Err(); err != nil {"
+            },
+            {
+              "line": 192,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 193,
+              "text": "\t}"
+            },
+            {
+              "line": 194,
+              "text": "\t// With more rows pending the client continues from the last delivered sequence;"
+            },
+            {
+              "line": 195,
+              "text": "\t// otherwise it is caught up and next_sequence equals the watermark."
+            },
+            {
+              "line": 196,
+              "text": "\tif page.HasMore {"
+            },
+            {
+              "line": 197,
+              "text": "\t\tpage.NextSequence = last"
+            },
+            {
+              "line": 198,
+              "text": "\t} else {"
+            },
+            {
+              "line": 199,
+              "text": "\t\tpage.NextSequence = wm"
+            },
+            {
+              "line": 200,
+              "text": "\t}"
+            },
+            {
+              "line": 201,
+              "text": "\treturn page, nil"
+            }
+          ]
+        },
+        {
+          "start_line": 241,
+          "end_line": 351,
+          "exact_lines": [
+            {
+              "line": 241,
+              "text": "}"
+            },
+            {
+              "line": 242,
+              "text": ""
+            },
+            {
+              "line": 243,
+              "text": "var goalStatusMap = map[string]string{"
+            },
+            {
+              "line": 244,
+              "text": "\t\"DRAFT\": \"DRAFT\", \"ACTIVE\": \"ACTIVE\", \"PAUSED\": \"PAUSED\", \"VERIFYING\": \"VERIFYING\","
+            },
+            {
+              "line": 245,
+              "text": "\t\"ACCEPTED\": \"ACCEPTED\", \"BLOCKED\": \"BLOCKED\", \"CANCELLED\": \"CANCELLED\","
+            },
+            {
+              "line": 246,
+              "text": "\t\"NEEDS_REVALIDATION\": \"NEEDS_REVALIDATION\","
+            },
+            {
+              "line": 247,
+              "text": "}"
+            },
+            {
+              "line": 248,
+              "text": ""
+            },
+            {
+              "line": 249,
+              "text": "// BuildSessionSnapshot assembles the typed SessionSnapshot for one session from the"
+            },
+            {
+              "line": 250,
+              "text": "// authoritative index row plus the durable journal. Fields whose producing subsystem is"
+            },
+            {
+              "line": 251,
+              "text": "// a later card are emitted as schema-legal nulls/empties; a missing non-null source"
+            },
+            {
+              "line": 252,
+              "text": "// (workspace, model config, core build, native session) fails closed instead of"
+            },
+            {
+              "line": 253,
+              "text": "// fabricating a value."
+            },
+            {
+              "line": 254,
+              "text": "func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, project, sessionID string) (map[string]any, error) {"
+            },
+            {
+              "line": 255,
+              "text": "\tvar ("
+            },
+            {
+              "line": 256,
+              "text": "\t\trevision, wm, epoch                     int64"
+            },
+            {
+              "line": 257,
+              "text": "\t\tcreatedAt, updatedAt                    string"
+            },
+            {
+              "line": 258,
+              "text": "\t\twriterClient                            string"
+            },
+            {
+              "line": 259,
+              "text": "\t\tgoalID, taskID, runID                   sql.NullString"
+            },
+            {
+              "line": 260,
+              "text": "\t\tleaseExpires, workspaceRef, title       sql.NullString"
+            },
+            {
+              "line": 261,
+              "text": "\t\tmodelConfigRef, coreBuildID, archivedAt sql.NullString"
+            },
+            {
+              "line": 262,
+              "text": "\t\tresumeExplicit                          int"
+            },
+            {
+              "line": 263,
+              "text": "\t)"
+            },
+            {
+              "line": 264,
+              "text": "\terr := tx.QueryRowContext(ctx, `SELECT revision, event_watermark, writer_epoch, created_at, updated_at,"
+            },
+            {
+              "line": 265,
+              "text": "\t\tgoal_id, task_id, run_id, lease_expires_at, workspace_ref, title, model_config_ref, core_build_id,"
+            },
+            {
+              "line": 266,
+              "text": "\t\tarchived_at, resume_requires_explicit_user, writer_client_id, upstream_session_id"
+            },
+            {
+              "line": 267,
+              "text": "\t\tFROM client_sessions WHERE id=? AND project_id=?`, sessionID, project)."
+            },
+            {
+              "line": 268,
+              "text": "\t\tScan(&revision, &wm, &epoch, &createdAt, &updatedAt, &goalID, &taskID, &runID,"
+            },
+            {
+              "line": 269,
+              "text": "\t\t\t&leaseExpires, &workspaceRef, &title, &modelConfigRef, &coreBuildID,"
+            },
+            {
+              "line": 270,
+              "text": "\t\t\t&archivedAt, &resumeExplicit, &writerClient, new(sql.NullString))"
+            },
+            {
+              "line": 271,
+              "text": "\tif errors.Is(err, sql.ErrNoRows) {"
+            },
+            {
+              "line": 272,
+              "text": "\t\treturn nil, ErrUnknownSession"
+            },
+            {
+              "line": 273,
+              "text": "\t}"
+            },
+            {
+              "line": 274,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 275,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 276,
+              "text": "\t}"
+            },
+            {
+              "line": 277,
+              "text": "\tvar upstream string"
+            },
+            {
+              "line": 278,
+              "text": "\tif err := tx.QueryRowContext(ctx, `SELECT upstream_session_id FROM client_sessions WHERE id=?`, sessionID).Scan(&upstream); err != nil {"
+            },
+            {
+              "line": 279,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 280,
+              "text": "\t}"
+            },
+            {
+              "line": 281,
+              "text": "\tfor name, v := range map[string]string{\"workspace_ref\": workspaceRef.String, \"model_config_ref\": modelConfigRef.String,"
+            },
+            {
+              "line": 282,
+              "text": "\t\t\"core_build_id\": coreBuildID.String, \"native_session_ref\": upstream} {"
+            },
+            {
+              "line": 283,
+              "text": "\t\tif v == \"\" {"
+            },
+            {
+              "line": 284,
+              "text": "\t\t\treturn nil, fmt.Errorf(\"%w:%s\", ErrSnapshotIncomplete, name)"
+            },
+            {
+              "line": 285,
+              "text": "\t\t}"
+            },
+            {
+              "line": 286,
+              "text": "\t}"
+            },
+            {
+              "line": 287,
+              "text": "\ttranscript, err := replaySessionTranscript(ctx, tx, doc, project, sessionID)"
+            },
+            {
+              "line": 288,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 289,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 290,
+              "text": "\t}"
+            },
+            {
+              "line": 291,
+              "text": "\ttranscriptRef, err := snapshotTranscriptRef(ctx, tx, project, sessionID, transcript)"
+            },
+            {
+              "line": 292,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 293,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 294,
+              "text": "\t}"
+            },
+            {
+              "line": 295,
+              "text": "\tmessages := transcript.messages"
+            },
+            {
+              "line": 296,
+              "text": "\thasEarlier := len(messages) > MaxSnapshotMessages"
+            },
+            {
+              "line": 297,
+              "text": "\tstart := 0"
+            },
+            {
+              "line": 298,
+              "text": "\tif hasEarlier {"
+            },
+            {
+              "line": 299,
+              "text": "\t\tstart = len(messages) - MaxSnapshotMessages"
+            },
+            {
+              "line": 300,
+              "text": "\t\tmessages = messages[start:]"
+            },
+            {
+              "line": 301,
+              "text": "\t}"
+            },
+            {
+              "line": 302,
+              "text": "\tearliest := int64(0)"
+            },
+            {
+              "line": 303,
+              "text": "\tif len(messages) > 0 {"
+            },
+            {
+              "line": 304,
+              "text": "\t\tearliest, _ = Num(transcript.sequences[start].(Object), \"start_sequence\")"
+            },
+            {
+              "line": 305,
+              "text": "\t}"
+            },
+            {
+              "line": 306,
+              "text": "\twriter := any(nil)"
+            },
+            {
+              "line": 307,
+              "text": "\tif leaseExpires.Valid {"
+            },
+            {
+              "line": 308,
+              "text": "\t\twriter = map[string]any{\"client_id\": writerClient, \"epoch\": epoch, \"expires_at\": leaseExpires.String}"
+            },
+            {
+              "line": 309,
+              "text": "\t}"
+            },
+            {
+              "line": 310,
+              "text": "\tpermissions, err := snapshotPermissions(ctx, tx, doc, project, sessionID)"
+            },
+            {
+              "line": 311,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 312,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 313,
+              "text": "\t}"
+            },
+            {
+              "line": 314,
+              "text": "\tpending, err := clientPendingCommands(ctx, tx, project, sessionID)"
+            },
+            {
+              "line": 315,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 316,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 317,
+              "text": "\t}"
+            },
+            {
+              "line": 318,
+              "text": "\tsnap := map[string]any{"
+            },
+            {
+              "line": 319,
+              "text": "\t\t\"session_id\":                    sessionID,"
+            },
+            {
+              "line": 320,
+              "text": "\t\t\"project_id\":                    project,"
+            },
+            {
+              "line": 321,
+              "text": "\t\t\"workspace_ref\":                 workspaceRef.String,"
+            },
+            {
+              "line": 322,
+              "text": "\t\t\"native_session_ref\":            upstream,"
+            },
+            {
+              "line": 323,
+              "text": "\t\t\"core_build_id\":                 coreBuildID.String,"
+            },
+            {
+              "line": 324,
+              "text": "\t\t\"protocol_version\":              ProtocolV2,"
+            },
+            {
+              "line": 325,
+              "text": "\t\t\"revision\":                      revision,"
+            },
+            {
+              "line": 326,
+              "text": "\t\t\"title\":                         title.String,"
+            },
+            {
+              "line": 327,
+              "text": "\t\t\"archived_at\":                   nullable(archivedAt),"
+            },
+            {
+              "line": 328,
+              "text": "\t\t\"created_at\":                    createdAt,"
+            },
+            {
+              "line": 329,
+              "text": "\t\t\"updated_at\":                    updatedAt,"
+            },
+            {
+              "line": 330,
+              "text": "\t\t\"model_config_ref\":              modelConfigRef.String,"
+            },
+            {
+              "line": 331,
+              "text": "\t\t\"goal_id\":                       nullable(goalID),"
+            },
+            {
+              "line": 332,
+              "text": "\t\t\"active_run_id\":                 nullable(runID),"
+            },
+            {
+              "line": 333,
+              "text": "\t\t\"run_status\":                    mappedStatus(ctx, tx, runID, runStatusMap),"
+            },
+            {
+              "line": 334,
+              "text": "\t\t\"goal_status\":                   mappedStatus(ctx, tx, goalID, goalStatusMap),"
+            },
+            {
+              "line": 335,
+              "text": "\t\t\"writer\":                        writer,"
+            },
+            {
+              "line": 336,
+              "text": "\t\t\"event_sequence\":                wm,"
+            },
+            {
+              "line": 337,
+              "text": "\t\t\"earliest_event_sequence\":       earliest,"
+            },
+            {
+              "line": 338,
+              "text": "\t\t\"checkpoint_artifact_ref\":       nil,"
+            },
+            {
+              "line": 339,
+              "text": "\t\t\"pending_command_ids\":           pending,"
+            },
+            {
+              "line": 340,
+              "text": "\t\t\"pending_permissions\":           permissions,"
+            },
+            {
+              "line": 341,
+              "text": "\t\t\"resume_requires_explicit_user\": resumeExplicit == 1,"
+            },
+            {
+              "line": 342,
+              "text": "\t\t\"messages\":                      messages,"
+            },
+            {
+              "line": 343,
+              "text": "\t\t\"transcript_artifact_ref\":       transcriptRef,"
+            },
+            {
+              "line": 344,
+              "text": "\t\t\"has_earlier_messages\":          hasEarlier,"
+            },
+            {
+              "line": 345,
+              "text": "\t}"
+            },
+            {
+              "line": 346,
+              "text": "\tif doc != nil {"
+            },
+            {
+              "line": 347,
+              "text": "\t\tif err := doc.ValidateDef(\"SessionSnapshot\", normalizeNumbers(snap)); err != nil {"
+            },
+            {
+              "line": 348,
+              "text": "\t\t\treturn nil, fmt.Errorf(\"SNAPSHOT_SCHEMA:%v\", err)"
+            },
+            {
+              "line": 349,
+              "text": "\t\t}"
+            },
+            {
+              "line": 350,
+              "text": "\t}"
+            },
+            {
+              "line": 351,
+              "text": "\treturn snap, nil"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\client_protocol_sessions.go",
+        "sha256": "7fb40c79ba73d4605431e6f8b5aec5730fc32de5b4a7e8537cdfc603b6862ce3",
+        "bytes": 19629
+      },
+      "ranges": [
+        {
+          "start_line": 153,
+          "end_line": 189,
+          "exact_lines": [
+            {
+              "line": 153,
+              "text": "\t}"
+            },
+            {
+              "line": 154,
+              "text": "\tvar p struct {"
+            },
+            {
+              "line": 155,
+              "text": "\t\tWorkspace string `json:\"workspace_ref\"`"
+            },
+            {
+              "line": 156,
+              "text": "\t\tModel     string `json:\"model_config_ref\"`"
+            },
+            {
+              "line": 157,
+              "text": "\t\tTitle     string `json:\"title\"`"
+            },
+            {
+              "line": 158,
+              "text": "\t}"
+            },
+            {
+              "line": 159,
+              "text": "\tif err := json.Unmarshal(env.Payload, &p); err != nil {"
+            },
+            {
+              "line": 160,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 161,
+              "text": "\t}"
+            },
+            {
+              "line": 162,
+              "text": "\tsid, err := s.createBoundClientSession(ctx, tx, env, principal, p.Workspace, p.Model, p.Title)"
+            },
+            {
+              "line": 163,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 164,
+              "text": "\t\treturn clientFault(env, err)"
+            },
+            {
+              "line": 165,
+              "text": "\t}"
+            },
+            {
+              "line": 166,
+              "text": "\tsnap, err := BuildSessionSnapshot(ctx, tx, s.Doc, project, sid)"
+            },
+            {
+              "line": 167,
+              "text": "\tif err != nil {"
+            },
+            {
+              "line": 168,
+              "text": "\t\treturn nil, err"
+            },
+            {
+              "line": 169,
+              "text": "\t}"
+            },
+            {
+              "line": 170,
+              "text": "\treturn &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr(\"COMPLETED\"), SessionID: &sid, Revision: revPtr(1), Result: snap}, nil"
+            },
+            {
+              "line": 171,
+              "text": "}"
+            },
+            {
+              "line": 172,
+              "text": ""
+            },
+            {
+              "line": 173,
+              "text": "// Both session.create and a project-level goal.start mint the same durable"
+            },
+            {
+              "line": 174,
+              "text": "// mapped session. Their own successful idempotency receipts attribute creation;"
+            },
+            {
+              "line": 175,
+              "text": "// this helper never manufactures a session.create command or receipt."
+            },
+            {
+              "line": 176,
+              "text": "func (s *ClientService) createBoundClientSession(ctx context.Context, tx *sql.Tx, env *Envelope, principal, workspace, model, title string) (string, error) {"
+            },
+            {
+              "line": 177,
+              "text": "\tproject := deref(env.ProjectID)"
+            },
+            {
+              "line": 178,
+              "text": "\tif err := s.checkClientCreationBinding(ctx, tx, principal, project, workspace, model); err != nil {"
+            },
+            {
+              "line": 179,
+              "text": "\t\treturn \"\", err"
+            },
+            {
+              "line": 180,
+              "text": "\t}"
+            },
+            {
+              "line": 181,
+              "text": "\tif s.Host.LeaseTTL <= 0 || s.Host.CoreBuildID == \"\" {"
+            },
+            {
+              "line": 182,
+              "text": "\t\treturn \"\", Fail(503, \"HOST_UNAVAILABLE\", \"host session policy unavailable\")"
+            },
+            {
+              "line": 183,
+              "text": "\t}"
+            },
+            {
+              "line": 184,
+              "text": "\tnow := time.Now().UTC()"
+            },
+            {
+              "line": 185,
+              "text": "\texpires := now.Add(s.Host.LeaseTTL)"
+            },
+            {
+              "line": 186,
+              "text": "\tsid, native := ID(), ID()"
+            },
+            {
+              "line": 187,
+              "text": "\tif err := MapClientSession(ctx, tx, ClientSession{ID: sid, ProjectID: project, Revision: 1, WriterEpoch: 1, WriterClientID: deref(env.ClientID), CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: &expires, UpstreamSession: native, WorkspaceRef: &workspace, ModelConfigRef: &model, Title: &title, CoreBuildID: &s.Host.CoreBuildID, Protocol: ProtocolV2}); err != nil {"
+            },
+            {
+              "line": 188,
+              "text": "\t\treturn \"\", err"
+            },
+            {
+              "line": 189,
+              "text": "\t}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\runtime_tool_integration_windows_test.go",
+        "sha256": "2cc071afca77ddb68eb171c785395d6ec4bfa58a744c80f54a2aaf9dc4fb9c1b",
+        "bytes": 12211
+      },
+      "ranges": [
+        {
+          "start_line": 31,
+          "end_line": 43,
+          "exact_lines": [
+            {
+              "line": 31,
+              "text": "func muClientCall(t *testing.T, f *fixture, service *ClientService, env *Envelope) *Response {"
+            },
+            {
+              "line": 32,
+              "text": "\tt.Helper()"
+            },
+            {
+              "line": 33,
+              "text": "\tenv = handlerDecode(t, env)"
+            },
+            {
+              "line": 34,
+              "text": "\tvar reply *Response"
+            },
+            {
+              "line": 35,
+              "text": "\tsourceTx(t, f.db, func(tx *sql.Tx) error {"
+            },
+            {
+              "line": 36,
+              "text": "\t\tvar err error"
+            },
+            {
+              "line": 37,
+              "text": "\t\treply, _, err = service.Execute(context.Background(), tx, env, f.owner)"
+            },
+            {
+              "line": 38,
+              "text": "\t\treturn err"
+            },
+            {
+              "line": 39,
+              "text": "\t})"
+            },
+            {
+              "line": 40,
+              "text": "\tif deref(reply.Status) != \"COMPLETED\" {"
+            },
+            {
+              "line": 41,
+              "text": "\t\tt.Fatalf(\"typed command %s: %s\", deref(env.Method), Bytes(reply))"
+            },
+            {
+              "line": 42,
+              "text": "\t}"
+            },
+            {
+              "line": 43,
+              "text": "\treturn reply"
+            }
+          ]
+        },
+        {
+          "start_line": 148,
+          "end_line": 154,
+          "exact_lines": [
+            {
+              "line": 148,
+              "text": "\tservice := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: \"mu-tool-fixture\", LeaseTTL: time.Minute}}"
+            },
+            {
+              "line": 149,
+              "text": "\tenv := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"mu-client\"), ProjectID: &f.project, Method: strptr(\"session.create\"), Payload: Bytes(Object{\"workspace_ref\": binding.AuthorizedRef, \"model_config_ref\": modelRoute.ModelConfig[\"ref\"], \"title\": \"tool turn\"})}"
+            },
+            {
+              "line": 150,
+              "text": "\tcreated := muClientCall(t, f, service, env)"
+            },
+            {
+              "line": 151,
+              "text": "\tattachTypedRuntimeFixture(t, f, service, created, \"mu-client\")"
+            },
+            {
+              "line": 152,
+              "text": "\tenv = &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"mu-client\"), ProjectID: &f.project, SessionID: created.SessionID, Method: strptr(\"session.send\"), ExpectedRevision: revPtr(1), WriterEpoch: revPtr(1), Payload: Bytes(Object{\"text\": \"读取 evidence.txt 并报告内容\", \"attachment_artifact_ids\": Empty(), \"delivery\": \"NORMAL\"})}"
+            },
+            {
+              "line": 153,
+              "text": "\tmuClientCall(t, f, service, env)"
+            },
+            {
+              "line": 154,
+              "text": "\tif err = c.Scan(context.Background()); err != nil {"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\runtime_permission_windows_test.go",
+        "sha256": "7a7b74c268093a0f33304800c6723c5fa7f1689dfdab6a2407b9cb9eab887d15",
+        "bytes": 18858
+      },
+      "ranges": [
+        {
+          "start_line": 187,
+          "end_line": 193,
+          "exact_lines": [
+            {
+              "line": 187,
+              "text": "\tservice := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority, WorkspaceAuthority: permissionWorkspaceFixture{workspace}, WorkspaceFiles: &clientWorkspacePort{}, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: \"permission-fixture\", LeaseTTL: time.Minute}}"
+            },
+            {
+              "line": 188,
+              "text": "\tenv := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"permission-client\"), ProjectID: &f.project, Method: strptr(\"session.create\"), Payload: Bytes(Object{\"workspace_ref\": binding.AuthorizedRef, \"model_config_ref\": modelRoute.ModelConfig[\"ref\"], \"title\": \"permission turn\"})}"
+            },
+            {
+              "line": 189,
+              "text": "\tcreated := muClientCall(t, f, service, env)"
+            },
+            {
+              "line": 190,
+              "text": "\tattachTypedRuntimeFixture(t, f, service, created, \"permission-client\")"
+            },
+            {
+              "line": 191,
+              "text": "\tsessionID := deref(created.SessionID)"
+            },
+            {
+              "line": 192,
+              "text": "\tenv = &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"permission-client\"), ProjectID: &f.project, SessionID: created.SessionID, Method: strptr(\"session.send\"), ExpectedRevision: revPtr(1), WriterEpoch: revPtr(1), Payload: Bytes(Object{\"text\": \"Write draft.txt\", \"attachment_artifact_ids\": Empty(), \"delivery\": \"NORMAL\"})}"
+            },
+            {
+              "line": 193,
+              "text": "\tmuClientCall(t, f, service, env)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-typed-q3-83b95f35e9bd4f81ad0c6682895a6ac1\\internal\\domain\\runtime_session_events_windows_test.go",
+        "sha256": "f2359edd55bb648b26287d9b672f7d48ab01358965f073a99444bd0ab651f30f",
+        "bytes": 25115
+      },
+      "ranges": [
+        {
+          "start_line": 477,
+          "end_line": 499,
+          "exact_lines": [
+            {
+              "line": 477,
+              "text": "\t\t\tsvc := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: \"event-fixture\", LeaseTTL: time.Minute}}"
+            },
+            {
+              "line": 478,
+              "text": "\t\t\tcreated := muClientCall(t, f, svc, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"event-client\"), ProjectID: &f.project, Method: strptr(\"session.create\"), Payload: Bytes(Object{\"workspace_ref\": binding.AuthorizedRef, \"model_config_ref\": modelRoute.ModelConfig[\"ref\"], \"title\": \"events\"})})"
+            },
+            {
+              "line": 479,
+              "text": "\t\t\tattachTypedRuntimeFixture(t, f, svc, created, \"event-client\")"
+            },
+            {
+              "line": 480,
+              "text": "\t\t\tsid := deref(created.SessionID)"
+            },
+            {
+              "line": 481,
+              "text": "\t\t\tif rollback {"
+            },
+            {
+              "line": 482,
+              "text": "\t\t\t\tif _, err = f.db.Exec(\"CREATE TRIGGER reject_fixture_start BEFORE INSERT ON outbox WHEN json_extract(NEW.body,'$.kind')='TOOL_STARTED' BEGIN SELECT RAISE(ABORT,'fixture tool event failure'); END\"); err != nil {"
+            },
+            {
+              "line": 483,
+              "text": "\t\t\t\t\tt.Fatal(err)"
+            },
+            {
+              "line": 484,
+              "text": "\t\t\t\t}"
+            },
+            {
+              "line": 485,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 486,
+              "text": "\t\t\tc.config.RunTool = func(_ context.Context, req RuntimeToolRequest) (Object, error) {"
+            },
+            {
+              "line": 487,
+              "text": "\t\t\t\tphysical.Add(1)"
+            },
+            {
+              "line": 488,
+              "text": "\t\t\t\tstarts := runtimeEventRows(t, r, sid, \"TOOL_STARTED\")"
+            },
+            {
+              "line": 489,
+              "text": "\t\t\t\tresults := runtimeEventRows(t, r, sid, \"TOOL_RESULT\")"
+            },
+            {
+              "line": 490,
+              "text": "\t\t\t\tif len(starts) != 1 || len(results) != 0 {"
+            },
+            {
+              "line": 491,
+              "text": "\t\t\t\t\tt.Error(\"physical tool entered without committed logical start\")"
+            },
+            {
+              "line": 492,
+              "text": "\t\t\t\t}"
+            },
+            {
+              "line": 493,
+              "text": "\t\t\t\tif req.Name != \"read\" || req.WorkspacePath != workspace {"
+            },
+            {
+              "line": 494,
+              "text": "\t\t\t\t\treturn nil, fmt.Errorf(\"wrong real tool binding\")"
+            },
+            {
+              "line": 495,
+              "text": "\t\t\t\t}"
+            },
+            {
+              "line": 496,
+              "text": "\t\t\t\treturn Object{\"content\": []any{Object{\"type\": \"text\", \"text\": \"fixture file\"}}, \"details\": Object{}}, nil"
+            },
+            {
+              "line": 497,
+              "text": "\t\t\t}"
+            },
+            {
+              "line": 498,
+              "text": "\t\t\tmuClientCall(t, f, svc, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr(\"event-client\"), ProjectID: &f.project, SessionID: created.SessionID, Method: strptr(\"session.send\"), ExpectedRevision: revPtr(1), WriterEpoch: revPtr(1), Payload: Bytes(Object{\"text\": \"read evidence.txt\", \"attachment_artifact_ids\": Empty(), \"delivery\": \"NORMAL\"})})"
+            },
+            {
+              "line": 499,
+              "text": "\t\t\tif err = c.Scan(context.Background()); err != nil {"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source_ref": {
+        "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\typed_runtime_goal_fixture_jsonl_digest_revision_codex\\794a6ecddad942d69e6f8fb19bcc2e49\\candidate-root\\internal\\domain\\runtime_typed_client_fixture_windows_test.go",
+        "sha256": "3a976a38a53ec0e9a4a884c43c52a32e7396bbcab37eef7be1dd47949aab7654",
+        "bytes": 25741
+      },
+      "ranges": [
+        {
+          "start_line": 566,
+          "end_line": 576,
+          "exact_lines": [
+            {
+              "line": 566,
+              "text": "func attachTypedRuntimeFixture(t *testing.T, f *fixture, service *ClientService, created *Response, client string) {"
+            },
+            {
+              "line": 567,
+              "text": "\tt.Helper()"
+            },
+            {
+              "line": 568,
+              "text": "\tif created.SessionID == nil || created.Revision == nil {"
+            },
+            {
+              "line": 569,
+              "text": "\t\tt.Fatal(\"typed fixture creation lacks Session identity\")"
+            },
+            {
+              "line": 570,
+              "text": "\t}"
+            },
+            {
+              "line": 571,
+              "text": "\treply := muClientCall(t, f, service, &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, SessionID: created.SessionID, ExpectedRevision: created.Revision, Method: strptr(\"session.attach\"), Payload: Bytes(Object{\"after_sequence\": 0, \"request_write_owner\": true})})"
+            },
+            {
+              "line": 572,
+              "text": "\tif reply.SessionID == nil || *reply.SessionID != *created.SessionID || reply.Revision == nil || *reply.Revision != *created.Revision {"
+            },
+            {
+              "line": 573,
+              "text": "\t\tt.Fatal(\"same-owner attach changed typed fixture Session or revision\")"
+            },
+            {
+              "line": 574,
+              "text": "\t}"
+            },
+            {
+              "line": 575,
+              "text": "}"
+            },
+            {
+              "line": 576,
+              "text": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

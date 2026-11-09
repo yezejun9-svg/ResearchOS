@@ -1,0 +1,379 @@
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index 0627895..6f12ec5 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -8,7 +8,6 @@ import { workspaceProjectPath } from './startup.js'
+ import { composerSubmitKey, appendPrompt } from './activity.js'
+ import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
+ import { HarnessRunProgress, HarnessPermissionNotice } from './components/harness-run-progress.jsx'
+-import { projectHarnessReceipt } from './harness-progress.js'
+ 
+ const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
+ const labels = { USER: '浣?, ASSISTANT: 'Agent', SYSTEM: '绯荤粺' }
+@@ -409,15 +408,14 @@ export function NativeWorkbench(props) {
+     setHarness(value)
+   }
+   return <><div className="button-row composer-context"><label>Harness <select aria-label="Harness" value={harness} disabled={guard.busy} onChange={event => choose(event.target.value)}><option value="codex">Codex CLI 路 鍙浠诲姟</option><option value="mu">Mu 路 鍘熸湁妯″瀷浼氳瘽</option></select></label><small>鍚?Harness 鐨勭櫥褰曘€佹ā鍨嬩笌鑳藉姏鍒嗗埆鏍稿锛涜崏绋垮湪鏈〉淇濈暀銆?/small></div>
+-    {harness === 'codex' ? <NativeHarnessWorkbench key={props.projectId} {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
++    {harness === 'codex' ? <NativeHarnessWorkbench {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
+       <NativeMuWorkbench {...props} draft={muDraft} setDraft={setMuDraft} onGuardChange={setGuard}/>}</>
+ }
+ 
+ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, setDraft, onGuardChange }) {
+   const [state, setState] = useState({ loading: true, busy: false, tasks: [], task: null, events: [], capabilities: null, pending: null })
+   const [workspaces, setWorkspaces] = useState([]), [workspace, setWorkspace] = useState('')
+-  const [hostError, setHostError] = useState(null)
+-  const [acknowledgedProject, setAcknowledgedProject] = useState(null)
++  const [hostError, setHostError] = useState(null), [notice, setNotice] = useState('')
+   const [online, setOnline] = useState(navigator.onLine)
+   const controller = useRef(null), composer = useRef(null)
+   const draftVersion = useRef(0), draftScope = useRef({ projectId, workspace })
+@@ -469,42 +467,28 @@ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, s
+     if (!canSend) return
+     const control = controller.current, submittedVersion = draftVersion.current
+     if (!control) return
+-    setAcknowledgedProject(null)
++    setNotice('')
+     if (await control.submit({ workspace_ref: workspace, prompt: draft })) {
+       if (controller.current !== control) return
+       if (draftVersion.current === submittedVersion) setDraft('')
+-      setAcknowledgedProject(projectId)
++      setNotice('浠诲姟宸叉帴鏀讹紝绛夊緟鐪熷疄杩愯鍥炴墽銆?)
+     }
+   }
+-  const receipt = projectHarnessReceipt(state, acknowledgedProject === projectId)
+-  const suggestions = ['姊崇悊椤圭洰鐩綍涓庡叆鍙?, '闃呰 README 骞舵杩伴」鐩?, '鏌ョ湅鐜版湁娴嬭瘯璇存槑']
+-  return <>
+-    <header className="page-heading workbench-heading codex-heading"><div><span className="workbench-eyebrow">PROJECT / READ ONLY</span><h1>{profile?.name || '椤圭洰宸ヤ綔鍙?}</h1></div><button disabled={disabled} onClick={() => controller.current?.load()}>鍒锋柊浠诲姟</button></header>
+-    <Failure error={hostError}/>
+-    {!online && <p className="connection-banner" role="status">褰撳墠绂荤嚎銆傚彲鏌ョ湅宸茶鍙栦换鍔★紱鎭㈠杩炴帴鍚庢牳瀵圭姸鎬併€傛柊鐨勪换鍔℃殏涓嶅彲鎻愪氦銆?/p>}
+-    <WorkbenchLayout variant="assistant" hasSession={!!task} historyExpanded={false} historyHint={state.tasks.length ? state.tasks.length + ' 涓凡璁板綍浠诲姟' : '鏌ョ湅宸茶褰曚换鍔?}
+-      sessionTools={<div className="codex-workspace-row"><label>宸ヤ綔鍖?select aria-label="Codex 宸ヤ綔鍖? value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">閫夋嫨宸叉巿鏉冪洰褰?/option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <small>璇蜂粠椤圭洰鍏ュ彛閫夋嫨骞舵巿鏉冨伐浣滃尯銆?/small>}</div>}
+-      sessions={<Panel title="Codex 浠诲姟"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('褰撳墠鑽夌浼氫繚鐣欏湪杈撳叆妗嗐€傚垏鎹㈡煡鐪嬫浠诲姟锛?)) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '姝ｅ湪璇诲彇宸茶褰曚换鍔♀€? : '鏆傛棤宸茶褰曚换鍔°€?}</p>}</Panel>}
+-      conversation={<div className="session-center"><Panel className="conversation-canvas" title="瀵硅瘽" aside={task && <span className="tag">{harnessStatusLabel(task.status)}</span>}>
+-        <div className="conversation-transcript" aria-label="Codex 浠诲姟璁板綍">
+-          {task ? <><article className="conversation-message role-user"><h3>浣?/h3><div className="message-text">{task.prompt}</div></article>
+-            {assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}
+-            {task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}</> :
+-            !receipt && <div className="conversation-welcome codex-welcome"><span className="workbench-eyebrow">START WITH THIS PROJECT</span><h2>浠庨」鐩紑濮嬫彁闂€?/h2><p>閫夋嫨宸叉巿鏉冨伐浣滃尯锛屽彂閫佷竴娆″彧璇讳换鍔°€?/p><div className="conversation-starters">{suggestions.map(text => <button type="button" key={text} onClick={() => { editDraft(appendPrompt(draft, text)); composer.current?.focus() }}>{text}</button>)}</div></div>}
+-          {receipt && <div className={'codex-receipt codex-receipt-' + receipt.kind.toLowerCase()} role="status"><strong>{receipt.summary}</strong>{receipt.message && <p>{receipt.message}</p>}{receipt.readError && <p>鏈€杩戜竴娆＄姸鎬佽鍙栧け璐ワ紱涓婃柟涓哄凡璇诲彇鐨?Task 鐘舵€侊紝璇峰埛鏂版牳瀵广€?/p>}
+-            {(receipt.code || receipt.taskId || receipt.requestId || state.error) && <details><summary>鎶€鏈洖鎵?/summary>{receipt.code && <p>浠ｇ爜锛歿receipt.code}</p>}{receipt.taskId && <p>Task锛歿receipt.taskId} 路 淇锛歿receipt.revision}{receipt.runId ? ' 路 Run锛? + receipt.runId + ' 路 epoch锛? + receipt.epoch : ' 路 灏氭棤 Run'}</p>}{receipt.requestId && <p>鍘熻姹傦細{receipt.requestId} 路 {receipt.pendingKind} 路 {receipt.pendingState}</p>}{state.error && <p>璇诲彇閿欒锛歿state.error.message}</p>}</details>}
+-          </div>}
+-          {state.pending && <div className="codex-reconcile"><span>鍘焮state.pending.kind === 'cancel' ? '鍙栨秷' : '鎻愪氦'}璇锋眰寰呮牳瀵癸紝璇峰嬁閲嶅鍙戦€併€?/span><button type="button" disabled={disabled} onClick={() => controller.current?.reconcile()}>鍙牳瀵瑰師璇锋眰</button></div>}
+-        </div>
+-        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>workspace-read 路 ephemeral</span></div><textarea ref={composer} aria-label="Codex 浠诲姟杈撳叆" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="杈撳叆涓€娆″彧璇讳换鍔★紝渚嬪锛氭鏌ラ」鐩粨鏋勫苟瑙ｉ噴涓昏鍏ュ彛銆? required/><div className="composer-controls"><small>Enter 鍙戦€?路 Shift+Enter 鎹㈣</small><button className="primary" type="submit" disabled={!canSend}>鎻愪氦鍙浠诲姟</button></div></form>
++  return <><header className="page-heading workbench-heading"><div><span className="workbench-eyebrow">RESEARCH / WORKSPACE</span><h1>{profile?.name || '椤圭洰宸ヤ綔鍙?}</h1><p>閫氳繃鏈満 Codex 鎵ц涓€娆″彧璇讳复鏃朵换鍔★紝鏌ョ湅鐪熷疄鎵ц鍥炴墽銆?/p></div><button disabled={disabled} onClick={() => controller.current.load()}>鍒锋柊浠诲姟</button></header>
++    <Failure error={hostError}/><Failure error={state.error}/>
++    {!online && <p className="connection-banner" role="status">褰撳墠绂荤嚎銆備繚鐣欏凡璇讳换鍔★紱鎭㈠杩炴帴鍚庢牳瀵圭姸鎬侊紝涓嶄細閲嶆柊鎻愪氦銆?/p>}
++    {state.pending && <div className="state-notice" role="status"><p>鍘焮state.pending.kind === 'cancel' ? '鍙栨秷' : '鎻愪氦'}璇锋眰闇€鏍稿锛歿state.pending.request_id}銆備笉浼氳嚜鍔ㄩ噸鍙戞垨鍒涘缓鏂颁换鍔°€?/p><button disabled={disabled} onClick={() => controller.current.reconcile()}>鍙鏍稿鍘熻姹?/button></div>}
++    <WorkbenchLayout hasSession={!!task} sessions={<Panel title="Codex 浠诲姟"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('褰撳墠鑽夌浼氫繚鐣欏湪杈撳叆妗嗐€傚垏鎹㈡煡鐪嬫浠诲姟锛?)) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '姝ｅ湪璇诲彇鐪熷疄浠诲姟鈥? : '灏氭棤浠诲姟銆傞€夋嫨鎺堟潈宸ヤ綔鍖哄悗杈撳叆鐩爣銆?}</p>}<label>宸ヤ綔鍖?select aria-label="Codex 宸ヤ綔鍖? value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">閫夋嫨宸叉巿鏉冪洰褰?/option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <p>璇峰厛浠庨」鐩叆鍙ｉ€夋嫨骞舵巿鏉冨伐浣滃尯锛涗笉闇€瑕?provider 妯″瀷閰嶇疆銆?/p>}</Panel>}
++      conversation={<div className="session-center"><Panel className="conversation-canvas" title="Codex 路 鍙浠诲姟" aside={<span className="tag">{task ? harnessStatusLabel(task.status) : '绛夊緟杈撳叆'}</span>}>
++        <div className="button-row session-run-controls"><button disabled={disabled || !!state.pending || !task || task.terminal || !hasHarnessCapability(capabilities, 'cancel')} onClick={() => controller.current.cancel()}>鍙栨秷褰撳墠浠诲姟</button><button disabled title="褰撳墠 Harness 涓嶆敮鎸佹殏鍋?>鏆傚仠</button><button disabled title="褰撳墠 Harness 涓嶆敮鎸佹仮澶嶆墽琛?>鎭㈠鎵ц</button></div>
++        <HarnessRunProgress task={task} events={state.events}/>
++        <div className="conversation-transcript" aria-label="Codex 浠诲姟璁板綍">{task ? <><article className="conversation-message role-user"><h3>浣?/h3><div className="message-text">{task.prompt}</div></article>{assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}{task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}{task.failure && <p role="status">{task.failure.code}锛歿task.failure.message}</p>}<p className="small-muted">Task {task.task_ref.task_id} 路 淇 {task.task_revision}{task.run ? ` 路 Run ${task.run.run_id} 路 epoch ${task.run.epoch}` : ' 路 灏氭棤 Run'}銆傛墽琛岀姸鎬佷笉浠ｈ〃涓氬姟楠屾敹銆?/p></> : <ConversationWelcome setDraft={editDraft} composer={composer}/>}</div>
++        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>妯″瀷鐢?Codex 閰嶇疆鍐冲畾</span><span>workspace-read 路 ephemeral</span></div><textarea ref={composer} aria-label="Codex 浠诲姟杈撳叆" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="杈撳叆涓€娆″彧璇讳换鍔★紝渚嬪锛氭鏌ラ」鐩粨鏋勫苟瑙ｉ噴涓昏鍏ュ彛銆? required/><div className="composer-controls"><small>Enter 鍙戦€?路 Shift+Enter 鎹㈣</small><button className="primary" type="submit" disabled={!canSend}>鎻愪氦鍙浠诲姟</button></div>{notice && <p role="status">{notice}</p>}</form>
+       </Panel></div>}
+-      context={<>{task && <><HarnessRunProgress task={task} events={state.events}/>{!task.terminal && task.status !== 'CANCEL_REQUESTED' && hasHarnessCapability(capabilities, 'cancel') && <div className="codex-run-controls"><button disabled={disabled || !!state.pending} onClick={() => controller.current?.cancel()}>鍙栨秷褰撳墠浠诲姟</button></div>}</>}
+-        <ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/>
+-        <Panel className="codex-capabilities" title="Codex 鐘舵€佷笌鑳藉姏">{capabilities ? <><p>鍙浠诲姟 路 鎵ц {capabilities.verification.execution} 路 鑼冨洿 {capabilities.verification.workspace_read_scope} 路 鍙栨秷 {capabilities.verification.cancellation}</p><HarnessPermissionNotice capabilities={capabilities}/><details><summary>瀹夎銆佺櫥褰曚笌鑳藉姏璇︽儏</summary><p>瀹夎锛歿capabilities.installation.present ? capabilities.installation.version || '宸插彂鐜? : '鏈彂鐜?} 路 鐧诲綍锛歿({ UNPROBED: '鏈帰娴?, LOGGED_IN: '宸茬櫥褰?, LOGGED_OUT: '鏈櫥褰?, ERROR: '鎺㈡祴澶辫触' })[capabilities.authentication.state]}</p><p>骞冲彴绛栫暐绠＄悊锛涘彧璇昏竟鐣寋capabilities.security_scope.enforcement_verified ? '鐢?Host 鏍囪楠岃瘉' : '鏈獙璇?}銆傛簮鐮佸疄鐜颁笌瀹為檯鎵ц楠岃瘉鍒嗗埆璁板綍銆?/p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '婧愮爜宸插疄鐜? : '涓嶆敮鎸?}</span></div>)}</div></details></> : <p>{state.loading ? '姝ｅ湪璇诲彇 Host 鑳藉姏鈥? : '鑳藉姏灏氭湭璇诲彇锛涙搷浣滀繚鎸佺鐢ㄣ€?}</p>}</Panel>
+-        <details className="inspector-disclosure"><summary>鏂囦欢銆佷骇鐗╀笌鎺堟潈</summary><p>姝?Harness 棣栫増鏈彁渚涙枃浠跺垪琛ㄣ€乨iff銆佹枃浠朵骇鐗┿€侀檮浠舵垨閫愬伐鍏锋巿鏉冭兘鍔涳紝鐩稿叧鎿嶄綔涓嶅彲鐢ㄣ€?/p></details>
+-      </>}/>
++      context={<><Panel title="Codex 鐘舵€佷笌鑳藉姏">{capabilities ? <><p>瀹夎锛歿capabilities.installation.present ? capabilities.installation.version || '宸插彂鐜? : '鏈彂鐜?} 路 鐧诲綍锛歿({ UNPROBED: '鏈帰娴?, LOGGED_IN: '宸茬櫥褰?, LOGGED_OUT: '鏈櫥褰?, ERROR: '鎺㈡祴澶辫触' })[capabilities.authentication.state]}</p><p>鎵ц楠岃瘉锛歿capabilities.verification.execution} 路 鍙鑼冨洿楠岃瘉锛歿capabilities.verification.workspace_read_scope} 路 鍙栨秷楠岃瘉锛歿capabilities.verification.cancellation}</p><p>骞冲彴绛栫暐绠＄悊锛涘彧璇昏竟鐣寋capabilities.security_scope.enforcement_verified ? '宸茬敱 Host 鏍囪楠岃瘉' : '鏈獙璇?}銆傜櫥褰曚笌鎵ц楠岃瘉鍒嗗埆璁板綍銆?/p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '宸插疄鐜? : '涓嶆敮鎸?}</span></div>)}</div><HarnessPermissionNotice capabilities={capabilities}/></> : <p>{state.loading ? '姝ｅ湪璇诲彇 Host 鑳藉姏鈥? : '鑳藉姏灏氭湭璇诲彇锛涙搷浣滀繚鎸佺鐢ㄣ€?}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>鏂囦欢銆佷骇鐗╀笌鎺堟潈</summary><p>姝?Harness 棣栫増鏈彁渚涙枃浠跺垪琛ㄣ€乨iff銆佹枃浠朵骇鐗┿€侀檮浠舵垨閫愬伐鍏锋巿鏉冭兘鍔涳紝鐩稿叧鎿嶄綔涓嶅彲鐢ㄣ€?/p><button disabled>璇诲彇鏂囦欢宸紓</button><button disabled>鍐欏叆鏂囦欢</button><button disabled>鎵瑰噯宸ュ叿</button></details></>}/>
+   </>
+ }
++
+ function NativeMuWorkbench({ projectId, profile, api, navigate, shared, onRefresh, draft, setDraft, onGuardChange }) {
+   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
+   const [busy, setBusy] = useState('')
+diff --git a/apps/web/src/workbench.css b/apps/web/src/workbench.css
+index e20df96..c4ad209 100644
+--- a/apps/web/src/workbench.css
++++ b/apps/web/src/workbench.css
+@@ -34,83 +34,3 @@ body:has(.workbench-route){min-width:0}
+ .harness-permission-notice details{margin-top:8px}.harness-permission-notice summary{cursor:pointer}.harness-permission-notice code{display:block;overflow-wrap:anywhere;margin-top:5px}
+ @media(max-width:767px){.harness-progress-heading{display:block}.harness-progress-heading small{display:block;margin-top:3px}.harness-progress-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 10px}}
+ @media(max-width:390px){.harness-run-progress{padding:12px}.harness-progress-stages{grid-template-columns:minmax(0,1fr);gap:10px}}
+-
+-/* Codex is one conversation with a compact, always available project context. */
+-.workbench-route:has(.workbench-layout-assistant) .main-area{max-width:none;padding-top:18px}
+-.workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context{margin:0 0 14px}
+-.workbench-layout-assistant{grid-template-columns:minmax(0,1fr) minmax(250px,288px);gap:24px}
+-.workbench-layout-assistant .workbench-main-column{min-width:0}
+-.workbench-layout-assistant .codex-workspace-row{display:flex;align-items:end;gap:14px;padding:0 0 14px}
+-.workbench-layout-assistant .codex-workspace-row label{min-width:0;flex:1;max-width:460px}
+-.workbench-layout-assistant .codex-workspace-row select{width:100%;min-width:0}
+-.workbench-layout-assistant .codex-workspace-row small{flex:1;line-height:1.5}
+-.workbench-layout-assistant .workbench-sessions-disclosure{margin-bottom:12px}
+-.workbench-layout-assistant .workbench-sessions-disclosure>summary{padding-bottom:6px}
+-.workbench-layout-assistant .workbench-session-pane .panel{padding:2px 0 12px}
+-.workbench-layout-assistant .workbench-conversation-pane>.session-center>.panel.conversation-canvas{min-height:min(640px,calc(100dvh - 280px));padding:0}
+-.workbench-layout-assistant .conversation-canvas>.section-heading{margin-bottom:4px}
+-.workbench-layout-assistant .conversation-transcript{flex:1;min-height:0;max-height:min(50dvh,520px);margin:0 0 12px;padding:0 4px 0 0;overflow-y:auto;overflow-x:hidden}
+-.workbench-layout-assistant .codex-welcome{min-height:0;padding:38px 0 22px}
+-.workbench-layout-assistant .codex-welcome h2{font-size:clamp(23px,2.6vw,32px);line-height:1.25;margin:6px 0}
+-.workbench-layout-assistant .codex-welcome p{font-size:13px;color:var(--muted)}
+-.workbench-layout-assistant .codex-welcome .conversation-starters{margin-top:18px}
+-.workbench-layout-assistant .conversation-message{padding:10px 0}
+-.workbench-layout-assistant .session-composer{position:static;margin:0;padding:12px 14px;box-shadow:0 12px 36px #0000000b}
+-.workbench-layout-assistant .session-composer textarea{min-height:68px;max-height:180px}
+-.workbench-layout-assistant .session-composer .composer-context{font-size:11px}
+-.workbench-layout-assistant .session-composer .composer-context>span{max-width:none}
+-.workbench-layout-assistant .session-composer .composer-context>span:last-child{margin-left:auto}
+-.workbench-layout-assistant .codex-receipt{border-left:2px solid var(--accent);background:var(--surface);padding:12px 14px;margin:12px 0;border-radius:0 9px 9px 0;overflow-wrap:anywhere}
+-.workbench-layout-assistant .codex-receipt-failed,.workbench-layout-assistant .codex-receipt-blocked{border-left-color:var(--danger)}
+-.workbench-layout-assistant .codex-receipt-unknown,.workbench-layout-assistant .codex-receipt-pending,.workbench-layout-assistant .codex-receipt-read_error{border-left-color:var(--warning)}
+-.workbench-layout-assistant .codex-receipt strong{font-size:13px}
+-.workbench-layout-assistant .codex-receipt p{font-size:12px;white-space:pre-wrap;margin-top:6px}
+-.workbench-layout-assistant .codex-receipt details{font-size:11px;color:var(--muted);margin-top:8px}
+-.workbench-layout-assistant .codex-reconcile{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;font-size:12px;color:var(--warning)}
+-.workbench-layout-assistant .codex-reconcile button{min-height:34px;font-size:12px}
+-.workbench-layout-assistant .workbench-context-pane{display:block;border-left:1px solid var(--border);border-top:0;padding:0 0 0 20px}
+-.workbench-layout-assistant .harness-run-progress{margin:0 0 10px}
+-.workbench-layout-assistant .harness-progress-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+-.workbench-layout-assistant .codex-run-controls{margin-bottom:12px}
+-.workbench-layout-assistant .codex-run-controls button{min-height:32px;font-size:12px}
+-.workbench-layout-assistant .codex-capabilities{margin-top:16px}
+-.workbench-layout-assistant .codex-capabilities>p,.workbench-layout-assistant .codex-capabilities details p{font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+-.workbench-layout-assistant .codex-capabilities>details{margin-top:12px}
+-.workbench-layout-assistant .codex-capabilities summary,.workbench-layout-assistant .inspector-disclosure summary{cursor:pointer;font-size:12px;color:var(--muted)}
+-.workbench-layout-assistant .codex-capabilities .record-row{min-height:32px;padding:6px 2px}
+-.workbench-layout-assistant .inspector-disclosure{font-size:12px}
+-.workbench-layout-assistant .inspector-disclosure p{font-size:12px;padding:8px 0}
+-.workbench-route:has(.workbench-layout-assistant) .codex-heading{margin-bottom:10px;align-items:end}
+-.workbench-route:has(.workbench-layout-assistant) .codex-heading h1{font-size:clamp(18px,2vw,23px);line-height:1.2;overflow-wrap:anywhere}
+-@media(max-width:1050px){.workbench-layout-assistant{grid-template-columns:minmax(0,1fr)}.workbench-layout-assistant .workbench-context-pane{border-left:0;border-top:1px solid var(--border);padding:18px 0 0}}
+-@media(max-width:767px){
+-  .workbench-route:has(.workbench-layout-assistant) .main-area{padding:12px 16px calc(14px + env(safe-area-inset-bottom))}
+-  .workbench-route:has(.workbench-layout-assistant) .codex-heading{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+-  .workbench-route:has(.workbench-layout-assistant) .codex-heading h1{font-size:17px;line-height:1.25}
+-  .workbench-route:has(.workbench-layout-assistant) .codex-heading button{min-height:40px;min-width:58px;padding:4px 7px;margin:0;flex:none}
+-  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context{margin-bottom:8px}
+-  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context label{width:100%;flex-direction:row;align-items:center;gap:10px}
+-  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context select{flex:1;min-width:0;min-height:44px}
+-  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context small{display:none}
+-  .workbench-layout-assistant .codex-workspace-row{display:block;padding-bottom:8px}
+-  .workbench-layout-assistant .codex-workspace-row label{max-width:none;gap:2px}
+-  .workbench-layout-assistant .codex-workspace-row select{min-height:44px}
+-  .workbench-layout-assistant .codex-workspace-row small{display:block;margin-top:4px}
+-  .workbench-layout-assistant .workbench-sessions-disclosure{margin-bottom:8px}
+-  .workbench-layout-assistant .workbench-sessions-disclosure>summary{min-height:40px;padding:0 2px}
+-  .workbench-layout-assistant .workbench-conversation-pane>.session-center>.panel.conversation-canvas{min-height:0}
+-  .workbench-layout-assistant .conversation-canvas>.section-heading{min-height:25px;margin:0 0 4px}
+-  .workbench-layout-assistant .conversation-transcript{min-height:0;max-height:35dvh;margin-bottom:8px}
+-  .workbench-layout-assistant .codex-welcome{padding:8px 0}
+-  .workbench-layout-assistant .codex-welcome h2{font-size:21px;margin:4px 0}
+-  .workbench-layout-assistant .codex-welcome p{font-size:12px}
+-  .workbench-layout-assistant .codex-welcome .conversation-starters{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:6px;margin-top:9px;padding-bottom:3px}
+-  .workbench-layout-assistant .codex-welcome .conversation-starters button{flex:none;min-height:36px;padding:5px 9px;font-size:11px}
+-  .workbench-layout-assistant .session-composer{margin:0;padding:10px 12px}
+-  .workbench-layout-assistant .session-composer textarea{min-height:62px;max-height:28dvh;padding:5px 0}
+-  .workbench-layout-assistant .session-composer .composer-context>span:last-child{display:none}
+-  .workbench-layout-assistant .composer-controls{flex-direction:row;align-items:center}
+-  .workbench-layout-assistant .composer-controls small{font-size:10px}
+-  .workbench-layout-assistant .composer-controls .primary{min-height:40px;min-width:95px}
+-  .workbench-layout-assistant .workbench-context-pane{margin-top:16px}
+-}
+diff --git a/apps/web/src/components/workbench-layout.jsx b/apps/web/src/components/workbench-layout.jsx
+index 5e12d31..aae28f7 100644
+--- a/apps/web/src/components/workbench-layout.jsx
++++ b/apps/web/src/components/workbench-layout.jsx
+@@ -1,13 +1,12 @@
+ import React, { useEffect, useState } from 'react'
+ 
+-export function WorkbenchLayout({ sessions, conversation, context, hasSession, variant = '', sessionTools = null, historyExpanded, historyHint }) {
+-  const [expanded, setExpanded] = useState(historyExpanded ?? !hasSession)
+-  useEffect(() => setExpanded(historyExpanded ?? !hasSession), [hasSession, historyExpanded])
+-  return <div className={`workbench-layout ${variant ? `workbench-layout-${variant}` : ''}`}>
++export function WorkbenchLayout({ sessions, conversation, context, hasSession }) {
++  const [expanded, setExpanded] = useState(!hasSession)
++  useEffect(() => setExpanded(!hasSession), [hasSession])
++  return <div className="workbench-layout">
+     <div className="workbench-main-column">
+-      {sessionTools}
+       <details className="workbench-sessions-disclosure" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+-        <summary><span>{variant === 'assistant' ? '浠诲姟鍘嗗彶' : '椤圭洰浼氳瘽'}</span><small>{historyHint ?? (hasSession ? '鍒囨崲 / 鏂板缓' : '閫夋嫨涓€涓細璇濓紝寮€濮嬪崗浣?)}</small></summary>
++        <summary><span>椤圭洰浼氳瘽</span><small>{hasSession ? '鍒囨崲 / 鏂板缓' : '閫夋嫨涓€涓細璇濓紝寮€濮嬪崗浣?}</small></summary>
+         <aside className="workbench-session-pane" aria-label="椤圭洰浼氳瘽">{sessions}</aside>
+       </details>
+       <section className="workbench-conversation-pane" aria-label="褰撳墠鐮旂┒浼氳瘽">{conversation}</section>
+diff --git a/apps/web/src/harness-progress.js b/apps/web/src/harness-progress.js
+index 83925e0..d399a24 100644
+--- a/apps/web/src/harness-progress.js
++++ b/apps/web/src/harness-progress.js
+@@ -11,35 +11,6 @@ const terminalText = {
+ const sameRun = (left, right) => !!left && !!right &&
+   left.run_id === right.run_id && left.epoch === right.epoch
+ 
+-// The Host Task is the receipt. An accepted submit ACK only confirms that a
+-// request was recorded; it must never override a later Task or read failure.
+-export function projectHarnessReceipt({ task = null, pending = null, error = null } = {}, acknowledged = false) {
+-  const failure = task?.failure
+-  const message = typeof failure?.message === 'string' ? failure.message : ''
+-  const preparationFailed = /preparation failed before model launch|鍑嗗闃舵澶辫触.{0,20}妯″瀷鏈惎鍔?i.test(message)
+-  const summaries = {
+-    QUEUED: '浠诲姟宸茶褰曪紝绛夊緟鍚姩銆?,
+-    STARTING: '浠诲姟姝ｅ湪鍚姩銆?,
+-    RUNNING: '浠诲姟姝ｅ湪鎵ц銆?,
+-    CANCEL_REQUESTED: '宸茶姹傚彇娑堬紝绛夊緟鍘熶换鍔＄‘璁ゅ仠姝€?,
+-    COMPLETED: '浠诲姟鎵ц宸茬粨鏉燂紱缁撴灉浠嶉渶鏍稿銆?,
+-    FAILED: preparationFailed ? '鍑嗗闃舵澶辫触锛屾ā鍨嬫湭鍚姩锛涙病鏈夎嚜鍔ㄩ噸璇曘€? : '浠诲姟鎵ц澶辫触锛涜鏌ョ湅 Host 杩斿洖鐨勫師鍥犮€?,
+-    CANCELLED: '浠诲姟宸插彇娑堛€?,
+-    BLOCKED: '浠诲姟宸查樆姝紱璇锋煡鐪嬪師鍥犮€?,
+-    UNKNOWN: '浠诲姟缁撴灉鏈煡锛涜鏍稿鍘熻姹傦紝閬垮厤閲嶅鎻愪氦銆?,
+-  }
+-  if (task) return { kind: task.status, summary: summaries[task.status] || '浠诲姟鐘舵€佸緟鏍稿銆?,
+-    message, code: failure?.code || null, taskId: task.task_ref?.task_id || null,
+-    revision: task.task_revision || null, runId: task.run?.run_id || null, epoch: task.run?.epoch || null,
+-    readError: error?.message || null }
+-  if (pending) return { kind: 'PENDING', summary: '鍘熻姹傜粨鏋滃緟鏍稿锛涜鏍稿鍘熻姹傦紝閬垮厤閲嶅鎻愪氦銆?,
+-    requestId: pending.request_id || null, pendingKind: pending.kind || null, pendingState: pending.state || null }
+-  if (error) return { kind: 'READ_ERROR', summary: acknowledged ? '璇锋眰宸叉帴鏀讹紝浣嗗綋鍓嶄换鍔¤鍙栧け璐ワ紱璇峰埛鏂版牳瀵广€? : '浠诲姟鐘舵€佽鍙栧け璐ワ紱璇峰埛鏂版牳瀵广€?,
+-    message: error.message || String(error), code: error.code || null }
+-  if (acknowledged) return { kind: 'ACKNOWLEDGED', summary: '璇锋眰宸叉帴鏀讹紝姝ｅ湪璇诲彇褰撳墠浠诲姟銆? }
+-  return null
+-}
+-
+ export function projectHarnessProgress(task, events = []) {
+   if (!task) return { empty: true, stages: [], observedToolCount: 0 }
+   const run = task.run
+diff --git a/tests/ui/desktop/harness-workbench.test.mjs b/tests/ui/desktop/harness-workbench.test.mjs
+index 3c43ccd..154414e 100644
+--- a/tests/ui/desktop/harness-workbench.test.mjs
++++ b/tests/ui/desktop/harness-workbench.test.mjs
+@@ -4,7 +4,6 @@ import fs from 'node:fs'
+ import vm from 'node:vm'
+ import { decimal, canSubmitHarness, hasHarnessCapability, applyHarnessPage, cancelIntent, createHarnessController, harnessStatusLabel } from '../../../apps/web/src/harness.js'
+ import { composerSubmitKey, harnessActivityRows } from '../../../apps/web/src/activity.js'
+-import { projectHarnessReceipt } from '../../../apps/web/src/harness-progress.js'
+ 
+ const ref = { project_id: 'fixture-project', task_id: 'fixture-task' }
+ const task = (extra = {}) => ({ task_ref: ref, request_id: 'fixture-request', harness_id: 'codex', workspace_ref: 'fixture-workspace', prompt: 'Inspect only', scope: 'workspace-read', ephemeral: true, status: 'QUEUED', terminal: false, task_revision: '1', run: null, created_at: '2026-11-04T00:00:00Z', updated_at: '2026-11-04T00:00:00Z', result: null, failure: null, ...extra })
+@@ -65,40 +64,6 @@ test('accepted submission remains accepted if the immediate snapshot read discon
+   await control.load()
+   assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
+   assert.match(control.getSnapshot().error.message, /disconnected/)
+-  assert.match(projectHarnessReceipt(control.getSnapshot(), true).summary, /宸叉帴鏀?*璇诲彇澶辫触/)
+-})
+-test('accepted ACK followed by an immediate failed Task renders the Host failure without replay', async () => {
+-  let submits = 0
+-  const failure = { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' }
+-  const control = createHarnessController(bridge({
+-    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+-    get: async () => ok(task({ status: 'FAILED', terminal: true, failure })),
+-  }), ref.project_id)
+-  await control.load()
+-  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
+-  const view = projectHarnessReceipt(control.getSnapshot(), true)
+-  assert.equal(view.kind, 'FAILED')
+-  assert.match(view.summary, /鍑嗗闃舵澶辫触/)
+-  assert.equal(view.message, failure.message)
+-  assert.equal(submits, 1)
+-  control.dispose()
+-})
+-test('a later failed Task replaces the queued receipt without resubmitting', async () => {
+-  let reads = 0, submits = 0
+-  const control = createHarnessController(bridge({
+-    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+-    get: async () => ok(++reads === 1 ? task() : task({ status: 'FAILED', terminal: true, failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host execution unavailable' } })),
+-    events: async () => ok({ task_ref: ref, events: [], next_cursor: '0', has_more: false, end: false, reset: false, snapshot: null }),
+-  }), ref.project_id)
+-  await control.load()
+-  await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' })
+-  assert.equal(projectHarnessReceipt(control.getSnapshot(), true).kind, 'QUEUED')
+-  await control.tick()
+-  const view = projectHarnessReceipt(control.getSnapshot(), true)
+-  assert.equal(view.kind, 'FAILED')
+-  assert.doesNotMatch(view.summary, /鍑嗗闃舵澶辫触/)
+-  assert.equal(submits, 1)
+-  control.dispose()
+ })
+ test('Run epoch changes preserve Task history and explicit reset adopts authoritative state', () => {
+   let state = { task: task(), events: [], cursor: '9007199254740992', end: false }
+@@ -156,18 +121,18 @@ const cleanupSource = /return \(\) => \{ stopped = true; draftVersion[^\n]*/.exe
+ assert.ok(sendSource && editSource && textareaSource && scopeSource && cleanupSource, 'actual draft handlers and view cleanup must be isolated')
+ function pendingDraftSend() {
+   let resolve, currentDraft = 'submitted text'
+-  const acknowledgements = [], submissions = []
++  const notices = [], submissions = []
+   const accepted = new Promise(done => { resolve = done })
+   const control = { submit: value => { submissions.push(value); return accepted }, dispose() {} }
+   const context = vm.createContext({ canSend: true, draft: 'submitted text', workspace: 'fixture-workspace', projectId: ref.project_id,
+     draftVersion: { current: 0 }, draftScope: { current: { projectId: ref.project_id, workspace: 'fixture-workspace' } },
+     controller: { current: control }, control, setDraft: value => { currentDraft = typeof value === 'function' ? value(currentDraft) : value },
+-    setAcknowledgedProject: value => acknowledgements.push(value), stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
++    setNotice: value => notices.push(value), stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
+   context.editDraft = vm.runInContext('(' + editSource + ')', context)
+   const send = vm.runInContext('(' + sendSource + ')', context)
+   const onChange = vm.runInContext('(' + textareaSource + ')', context)
+   const pending = send({ preventDefault() {} })
+-  return { context, pending, resolve, acknowledgements, submissions, value: () => currentDraft,
++  return { context, pending, resolve, notices, submissions, value: () => currentDraft,
+     edit: text => onChange({ target: { value: text } }),
+     scope: workspace => { context.workspace = workspace; vm.runInContext(scopeSource, context) },
+     cleanup: () => vm.runInContext('(' + cleanupSource + ')', context)() }
+@@ -194,7 +159,7 @@ test('actual send keeps draft after view cleanup while its promise is pending',
+   run.resolve(true); await run.pending
+   assert.equal(run.value(), 'submitted text')
+   assert.equal(run.context.controller.current, null)
+-  assert.deepEqual(run.acknowledgements, [null], 'unmounted view cannot publish the late success receipt')
++  assert.equal(run.notices.length, 1, 'unmounted view cannot publish the late success notice')
+ })
+ test('actual scope generations preserve draft after workspace changes away and back', async () => {
+   const run = pendingDraftSend()
+@@ -208,5 +173,5 @@ test('actual send cannot clear a draft owned by a replacement controller', async
+   run.context.controller.current = { submit() { throw Error('unexpected resubmit') } }
+   run.resolve(true); await run.pending
+   assert.equal(run.value(), 'submitted text')
+-  assert.deepEqual(run.acknowledgements, [null])
++  assert.equal(run.notices.length, 1)
+ })
+diff --git a/tests/ui/harness-progress.test.mjs b/tests/ui/harness-progress.test.mjs
+index f7eb53e..9a4b679 100644
+--- a/tests/ui/harness-progress.test.mjs
++++ b/tests/ui/harness-progress.test.mjs
+@@ -1,6 +1,6 @@
+ import test from 'node:test'
+ import assert from 'node:assert/strict'
+-import { projectHarnessProgress, projectHarnessReceipt } from '../../apps/web/src/harness-progress.js'
++import { projectHarnessProgress } from '../../apps/web/src/harness-progress.js'
+ import { harnessSubmissionBlockers } from '../../apps/web/src/harness.js'
+ 
+ const ref = { project_id: 'p', task_id: 't' }
+@@ -59,37 +59,3 @@ test('read-only permission blockers explain current reasons and retain raw codes
+   assert.deepEqual(harnessSubmissionBlockers({ can_submit: true, reason_codes: [] }), [])
+   assert.match(harnessSubmissionBlockers({ can_submit: false, reason_codes: [] })[0].message, /灏氭湭纭/)
+ })
+-
+-test('receipt follows the authoritative Task after ACK, including terminal and cancel states', () => {
+-  for (const status of ['FAILED', 'COMPLETED', 'CANCELLED', 'BLOCKED', 'UNKNOWN', 'CANCEL_REQUESTED']) {
+-    const view = projectHarnessReceipt({ task: task(status) }, true)
+-    assert.equal(view.kind, status)
+-    assert.doesNotMatch(view.summary, /绛夊緟鐪熷疄杩愯鍥炴墽/)
+-  }
+-  assert.match(projectHarnessReceipt({ task: task('UNKNOWN') }, true).summary, /鏍稿鍘熻姹?)
+-  assert.match(projectHarnessReceipt({ task: task('CANCEL_REQUESTED') }, true).summary, /绛夊緟鍘熶换鍔?)
+-})
+-
+-test('preparation wording requires the actual Host message, not an error code alone', () => {
+-  const generic = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host unavailable' } } }, true)
+-  assert.doesNotMatch(generic.summary, /妯″瀷鏈惎鍔?)
+-  assert.equal(generic.message, 'Host unavailable')
+-  const explicit = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' } } }, true)
+-  assert.match(explicit.summary, /妯″瀷鏈惎鍔?)
+-  assert.equal(explicit.code, 'HARNESS_UNAVAILABLE')
+-})
+-
+-test('pending original request and accepted read error retain distinct, reconcilable receipts', () => {
+-  const pending = projectHarnessReceipt({ pending: { request_id: 'original', kind: 'submit', state: 'UNKNOWN' } }, false)
+-  assert.equal(pending.kind, 'PENDING')
+-  assert.equal(pending.requestId, 'original')
+-  assert.match(pending.summary, /閬垮厤閲嶅鎻愪氦/)
+-  const readError = projectHarnessReceipt({ error: new Error('read disconnected') }, true)
+-  assert.equal(readError.kind, 'READ_ERROR')
+-  assert.match(readError.summary, /宸叉帴鏀?*璇诲彇澶辫触/)
+-  assert.equal(readError.message, 'read disconnected')
+-  const lastKnown = projectHarnessReceipt({ task: task('QUEUED'), error: new Error('refresh disconnected') }, true)
+-  assert.equal(lastKnown.kind, 'QUEUED')
+-  assert.equal(lastKnown.readError, 'refresh disconnected')
+-  assert.equal(projectHarnessReceipt({}), null)
+-})

@@ -1,0 +1,100 @@
+{
+  "original_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\f08_driver18_root_producer_preparation_codex\\fe7a07dcb98a4f2aacb2f73d4ff60780\\driver18_root_producer.proposed.py",
+    "sha256": "12cc3272edc3a24b9771418f0c1ab9f1ba9c732e9dc6a632fdaa490cbb0e44da",
+    "bytes": 38082
+  },
+  "candidate_ref": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\f08_driver18_root_producer_revision_preparation_codex\\dcfcd2f9a20e4962af5fa8278efa1ab0\\driver18_root_producer.v2.proposed.py",
+    "sha256": "802ba9d5c814ad1d08a34ab6d0b3c7f13aa03912bf017318a7159bde28738437",
+    "bytes": 48929
+  },
+  "edits": [
+    {
+      "label": "R01_leaf_guard",
+      "before": "def leaf(text):\n",
+      "after": "def leaf(text,checked=False):\n    need(checked,'PREALLOCATION_REQUIRED')\n"
+    },
+    {
+      "label": "new_contract_functions",
+      "before": "def immutable_manifest(out,extra=()):\n",
+      "after": "def disjoint(a,b):\n    a=str(safe(str(a))).casefold();b=str(safe(str(b))).casefold()\n    return a!=b and not a.startswith(b+'\\\\') and not b.startswith(a+'\\\\')\n\ndef receipt_input_trees(values):\n    \"\"\"Protect original receipt parents; never follow arbitrary JSON as executable code.\"\"\"\n    trees=set()\n    def visit(v):\n        if isinstance(v,dict):\n            if set(v)=={'path','sha256','bytes'}:\n                verify(v);p=safe(str(Path(v['path'])))\n                if p.is_relative_to(RECEIPTS):trees.add(p.parent)\n            else:\n                for x in v.values():visit(x)\n        elif isinstance(v,list):\n            for x in v:visit(x)\n    visit(values)\n    return trees\n\ndef allocation_check(text,values,s=None,metadata=True):\n    p=safe(text)\n    if metadata:\n        parent=RECEIPTS/'f08_driver18_root_producer_executor_codex'\n        need(p.parent==parent and len(p.name)==32 and all(c in '0123456789abcdef' for c in p.name),'DEDICATED_NEW_METADATA_UUID')\n    need(p.parent.is_dir() and not os.path.lexists(p),'FRESH_OUTPUT_BEFORE_ANY_WRITE')\n    protected=receipt_input_trees(values)\n    if s is not None:\n        protected.update(safe(s[k]) for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root'])\n    need(all(disjoint(p,q) for q in protected),'OUTPUT_OVERLAPS_ORIGINAL_INPUT_OR_PHASE_TREE')\n    return p\n\ndef preallocate(action,data,inp,text):\n    allowed={'resources','stage-code','scope','draft','register','seal-registration','grant','launch-request','capture-action','seal-outer','seal-prepare'}\n    need(action in allowed and isinstance(data,dict),'KNOWN_ACTION_BEFORE_ALLOCATION')\n    binding=data['producer_output_binding']\n    need(binding=={'schema':'researchos.driver18-producer-output-binding.v1','owner':'codex:/root','action':action,'metadata_output_root':text},'EXPLICIT_ROOT_OUTPUT_BINDING')\n    s=None;extra=[]\n    if action=='scope':\n        g=gate();r=g.Reader();b=module(BINDER,'driver18_preallocation_binder');s=b.build_scope(g,r,inp)\n    elif action in {'register','seal-registration'}:\n        g,r,s,sref,d,index,mfref,before,desired=reviewed(data['draft_ref'],data['registration_review_ref']);extra=[sref,d,index,mfref]\n    elif action not in {'resources','stage-code'}:\n        g,r,s=load(data['scope_ref'])\n        if action in {'launch-request','capture-action','seal-outer','seal-prepare'}:\n            g.verify_authority(r,s,data['scope_ref'],r.doc(data['grant_ref']))\n        extra=list(r.refs.values())\n    elif action=='resources':need(data['schema']=='researchos.driver18-root-resource-input.v1','RESOURCE_INPUT')\n    else:need(data['schema']=='researchos.driver18-stage-code-input.v1','STAGED_SOURCE_INPUT')\n    values=[inp,data,extra,GATE,BINDER,pin(Path(__file__).resolve())]\n    if s is not None:values.append(s)\n    return allocation_check(text,values,s)\n\ndef exact_resource_catalog(res):\n    \"\"\"Reject aliases before emission; frozen consumers compare literal REF dictionaries.\"\"\"\n    rows=res['files'];need(type(rows)is list and rows,'NONEMPTY_EXACT_RESOURCE_ROWS')\n    for row in rows:\n        need(row==pin(safe(row['path'])),'RESOURCE_REF_NOT_ACTUAL_CANONICAL_PIN')\n    need(len({str(safe(row['path'])).casefold() for row in rows})==len(rows),'RESOURCE_CASEFOLD_COLLISION')\n    need(all(item in rows for item in [res['python'],res['go'],*res['compiler_images']]),'TOOLS_REQUIRE_EXACT_FILES_DICTIONARY')\n    need(res['python']==pin(Path(sys.executable).resolve()),'RESOURCE_ACTUAL_CURRENT_PYTHON_PIN')\n    for row in res['offline_modcache_copies']:need(row['ref'] in rows,'OFFLINE_REQUIRE_EXACT_FILES_DICTIONARY')\n    goroot=safe(res['GOROOT']);need(goroot.is_dir() and res['GOROOT']==str(goroot),'EXACT_GOROOT_DIRECTORY')\n    need(safe(res['go']['path'])==goroot/'bin/go.exe','GOROOT_GO_PAIR')\n    return res\n\ndef original_capture_closure(g,r,s,sref,gref,refs):\n    \"\"\"Requires real external Root capture plus nonauthor pairing review, never manufactures either.\"\"\"\n    need(isinstance(refs,dict) and set(refs)=={'bundle_ref','manifest_ref','pair_review_ref','pair_review_manifest_ref'},'FATAL_OPEN_ORIGINAL_CAPTURE_CLOSURE')\n    a=s['actual_Root_registration'];identity=action_identity(s,sref,gref,a['phase'])\n    root=g.safe(a['original_tool_capture_root']);reviewpath=g.safe(a['original_tool_capture_review_path'])\n    need(root.is_relative_to(RECEIPTS) and not root==RECEIPTS and a['run_uuid'] in root.name,'ROOT_CAPTURE_NAMESPACE')\n    need(g.safe(refs['bundle_ref']['path']).parent==root and g.safe(refs['manifest_ref']['path']).parent==root and g.safe(refs['pair_review_ref']['path'])==reviewpath,'CAPTURE_EXACT_PATH_BINDING')\n    need(g.safe(refs['pair_review_manifest_ref']['path']).parent==reviewpath.parent and disjoint(root,reviewpath.parent),'INDEPENDENT_CAPTURE_REVIEW_NAMESPACE')\n    bundle=r.doc(refs['bundle_ref']);review=r.doc(refs['pair_review_ref'])\n    need(bundle['schema']=='researchos.driver18-original-host-tool-capture.v1' and bundle['actor']=='codex:/root' and bundle['scope_ref']==sref and bundle['grant_ref']==gref and bundle['command_identity']==identity,'ORIGINAL_CAPTURE_BINDING')\n    need(review['schema']=='researchos.driver18-original-tool-pair-independent-review.v1' and review['reviewer'] in g.REVIEWERS and review['reviewer'] not in {'codex:/root','codex:/root/command_queue_impl'} and review['non_author'] is True,'NONAUTHOR_CAPTURE_REVIEW')\n    need(review['decision']=='ORIGINAL_HOST_TOOL_INPUT_RESPONSE_PAIR_VERIFIED' and review['requested_changes']==[] and review['original_host_event_association_verified'] is True and review['actual_candidate_execution'] is False,'FATAL_OPEN_HOST_EVENT_ASSOCIATION')\n    for k,v in [('capture_bundle_ref',refs['bundle_ref']),('capture_manifest_ref',refs['manifest_ref']),('scope_ref',sref),('grant_ref',gref),('command_identity',identity),('host_capture_ref',bundle['host_capture_ref']),('events',bundle['events'])]:need(review[k]==v,'CAPTURE_REVIEW_'+k)\n    def sealed(mref,required,parent):\n        mf=r.doc(mref);rows=mf['files'];need(type(rows)is list and rows,'CAPTURE_MANIFEST_NOT_EMPTY');seen={}\n        for row in rows:\n            p=g.safe(row['path']);need(p.is_relative_to(parent) and str(p).casefold() not in seen,'CAPTURE_MEMBER_BOUNDARY');r.verify(row);seen[str(p).casefold()]=row\n        for row in required:need(seen.get(str(g.safe(row['path'])).casefold())==row,'CAPTURE_REQUIRED_MEMBER')\n    events=bundle['events'];need(type(events)is list and len(events)==2,'EXACT_INITIAL_TERMINAL_CAPTURE')\n    required=[refs['bundle_ref'],bundle['host_capture_ref']];actions=[]\n    for i,event in enumerate(events):\n        need(set(event)=={'tool_name','request_event_locator','response_event_locator','input_ref','response_ref','action_ref'},'ORIGINAL_EVENT_FIELDS')\n        act=r.doc(event['action_ref']);need(event['tool_name']==['exec_command','write_stdin'][i],'TOOL_PAIR_ORDER')\n        for k in ['tool_name','request_event_locator','response_event_locator','input_ref','response_ref']:need(act[k]==event[k],'RAW_EVENT_ACTION_'+k)\n        need(act['schema']=='researchos.driver18-original-tool-action.v1' and act['actor']=='codex:/root' and act['command_identity']==identity,'CAPTURE_ACTION_COMMAND')\n        for k in ['request_event_locator','response_event_locator']:need(type(event[k])is str and event[k],'CAPTURE_EVENT_LOCATOR')\n        required.extend([event['input_ref'],event['response_ref'],event['action_ref']]);actions.append(act)\n    need(actions[0]['initial_action_ref'] is None and actions[1]['initial_action_ref']==events[0]['action_ref'],'ORIGINAL_INITIAL_REF')\n    initial=r.doc(events[0]['response_ref']);terminal_input=r.doc(events[1]['input_ref']);terminal=r.doc(events[1]['response_ref'])\n    need(type(initial.get('session_id'))is int and initial.get('exit_code') is None and terminal_input['session_id']==initial['session_id'] and terminal_input.get('chars','')=='' and type(terminal.get('exit_code'))is int,'EXACT_ORIGINAL_SESSION_PAIR')\n    if 'session_id' in terminal:need(terminal['session_id']==initial['session_id'],'TERMINAL_SESSION_CONTRADICTION')\n    need(len({x[k] for x in events for k in ['request_event_locator','response_event_locator']})==4,'DISTINCT_EVENT_LOCATORS')\n    sealed(refs['manifest_ref'],required,root)\n    sealed(refs['pair_review_manifest_ref'],[refs['pair_review_ref']],reviewpath.parent)\n    r.unchanged();return bundle\n\n\ndef immutable_manifest(out,extra=()):\n"
+    },
+    {
+      "label": "R02_runtime_exact",
+      "before": "    res=r.doc(s['resource_catalog_ref']);rows=res['files']\n",
+      "after": "    res=exact_resource_catalog(r.doc(s['resource_catalog_ref']));rows=res['files']\n"
+    },
+    {
+      "label": "R02_runtime_literal",
+      "before": "        need(key in allowed and g.same_ref(allowed[key],ref),'METADATA_CODE_NOT_PREPINNED')\n    need(g.same_ref(pin(Path(sys.executable).resolve()),res['python']),'ACTUAL_PYTHON')\n",
+      "after": "        need(key in allowed and allowed[key]==pin(g.safe(ref['path']).resolve()),'METADATA_CODE_NOT_PREPINNED')\n    need(pin(Path(sys.executable).resolve())==res['python'],'ACTUAL_PYTHON')\n"
+    },
+    {
+      "label": "R02_catalog_before_save",
+      "before": "    for item in x['provenance_refs']:r.verify(item)\n    r.unchanged();return save(out/'resource-catalog.json'",
+      "after": "    for item in x['provenance_refs']:r.verify(item)\n    exact_resource_catalog(x)\n    r.unchanged();return save(out/'resource-catalog.json'"
+    },
+    {
+      "label": "R02_scope_and_R03_future_paths",
+      "before": "    ref=save(out/'scope.proposed.json',s);g.scope(r,ref);r.unchanged();return ref\n",
+      "after": "    for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']:\n        need(s[k]==str(g.safe(s[k])),'EXACT_CONSUMER_ROOT_STRING_'+k)\n    exact_resource_catalog(r.doc(s['resource_catalog_ref']))\n    a=s['actual_Root_registration']\n    capture=g.safe(a['original_tool_capture_root']);reviewpath=g.safe(a['original_tool_capture_review_path'])\n    need(capture.is_relative_to(RECEIPTS) and a['run_uuid'] in capture.name and disjoint(capture,reviewpath.parent),'FUTURE_CAPTURE_REVIEW_PATHS')\n    need(all(disjoint(capture,g.safe(s[k])) and disjoint(reviewpath.parent,g.safe(s[k])) for k in ['work_root','prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']),'CAPTURE_PHASE_OVERLAP')\n    ref=save(out/'scope.proposed.json',s);g.scope(r,ref);r.unchanged();return ref\n"
+    },
+    {
+      "label": "R01_registration_allocation",
+      "before": "    g,r,s,sref,d,index,mfref,before,desired=reviewed(dref,regref);a=s['actual_Root_registration'];out=leaf(a['registration_output_root'])\n",
+      "after": "    g,r,s,sref,d,index,mfref,before,desired=reviewed(dref,regref);a=s['actual_Root_registration']\n    planned=allocation_check(a['registration_output_root'],[s],s,metadata=False)\n    need(planned.is_relative_to(g.safe(a['registration_namespace'])),'EXACT_REGISTRATION_OUTPUT_BOUNDARY')\n    out=leaf(str(planned),True)\n"
+    },
+    {
+      "label": "R01_grant_before_allocations",
+      "before": "    pf=leaf(preflight);auth=safe(authroot);need(auth.parent.is_dir() and not os.path.lexists(auth) and auth.is_relative_to(RECEIPTS) and a['run_uuid'] in auth.name and a['run_uuid'] in pf.name and not (auth.is_relative_to(pf) or pf.is_relative_to(auth)),'FRESH_DISJOINT_AUTH')\n    for k in ['prepare_output_root','execute_output_root','prepare_launcher_output_root','execute_launcher_output_root']:\n        q=g.safe(s[k]);need(not (auth==q or auth.is_relative_to(q) or q.is_relative_to(auth)),'AUTH_EXECUTION_OVERLAP')\n    proof=None if prepared_proof_ref is None else r.doc(prepared_proof_ref)\n    if a['phase']=='execute':need(proof is not None,'REAL_PREPARE_REQUIRED');g.prepared_evidence(r,s,proof)\n    else:need(proof is None,'NO_FUTURE_PREPARE_FACT')\n",
+      "after": "    proof=None if prepared_proof_ref is None else r.doc(prepared_proof_ref)\n    if a['phase']=='execute':need(proof is not None,'REAL_PREPARE_REQUIRED');g.prepared_evidence(r,s,proof)\n    else:need(proof is None,'NO_FUTURE_PREPARE_FACT')\n    inputs=[sref,s,bundleref,bundle,prepared_proof_ref,proof,list(r.refs.values()),pin(Path(__file__).resolve())]\n    pfpath=allocation_check(preflight,inputs,s,metadata=False);auth=allocation_check(authroot,inputs,s,metadata=False)\n    need(pfpath.parent==RECEIPTS/'f08_driver18_root_grant_preflight_codex' and auth.parent==RECEIPTS/'f08_driver18_root_authorization_codex' and pfpath.name==auth.name==a['run_uuid'] and disjoint(pfpath,auth),'DEDICATED_FRESH_GRANT_OUTPUTS')\n    live4(desired);r.unchanged();pf=leaf(str(pfpath),True)\n"
+    },
+    {
+      "label": "R03_capture_interface",
+      "before": "def capture_action(sref,gref,kind,inputref,responseref,request_locator,response_locator,initialref,out):\n",
+      "after": "def capture_action(sref,gref,kind,inputref,responseref,request_locator,response_locator,initialref,out,capture_refs,actionref):\n"
+    },
+    {
+      "label": "R03_capture_origin_gate",
+      "before": "    inp=r.doc(inputref);response=r.doc(responseref)\n",
+      "after": "    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)\n    event=next((x for x in bundle['events'] if x['action_ref']==actionref),None)\n    need(event is not None and event['tool_name']==kind and event['input_ref']==inputref and event['response_ref']==responseref and event['request_event_locator']==request_locator and event['response_event_locator']==response_locator,'CAPTURE_EXACT_ORIGINAL_EVENT')\n    need(r.doc(actionref)['initial_action_ref']==initialref,'CAPTURE_ORIGINAL_INITIAL_REF')\n    inp=r.doc(inputref);response=r.doc(responseref)\n"
+    },
+    {
+      "label": "R03_preserve_original_action_refs",
+      "before": "    return save(out/'tool-action.json',{'schema':'researchos.driver18-original-tool-action.v1','actor':'codex:/root','tool_name':kind,'input_ref':iref,'response_ref':rref,'initial_action_ref':initialref,'command_identity':identity,'request_event_locator':request_locator,'response_event_locator':response_locator})\n",
+      "after": "    write(out/'tool-action.original.json',r.verify(actionref))\n    save(out/'capture-provenance.json',{'original_capture_closure':capture_refs,'original_action_ref':actionref,'copied_raw_refs':[iref,rref],'qualification':'EXTERNAL_ORIGINAL_PAIR_REVIEW_REQUIRED_NO_SELF_AUTHENTICATION'})\n    r.unchanged();return actionref\n"
+    },
+    {
+      "label": "R03_seal_outer_grant_and_capture",
+      "before": "def seal_outer(sref,gref,initialref,terminalref,out):\n    g,r,s=load(sref);phase=s['actual_Root_registration']['phase'];identity=action_identity(s,sref,gref,phase);ia=r.doc(initialref);ta=r.doc(terminalref);first=r.doc(ia['response_ref']);last=r.doc(ta['response_ref'])\n",
+      "after": "def seal_outer(sref,gref,initialref,terminalref,out,capture_refs):\n    g,r,s=load(sref);g.verify_authority(r,s,sref,r.doc(gref))\n    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)\n    need([x['action_ref'] for x in bundle['events']]==[initialref,terminalref],'OUTER_EXACT_ORIGINAL_CAPTURE_PAIR')\n    phase=s['actual_Root_registration']['phase'];identity=action_identity(s,sref,gref,phase);ia=r.doc(initialref);ta=r.doc(terminalref);first=r.doc(ia['response_ref']);last=r.doc(ta['response_ref'])\n"
+    },
+    {
+      "label": "R03_outer_preserve_capture_chain",
+      "before": "    cref=save(out/'outer-completion.json',completion)\n",
+      "after": "    completion['original_capture_closure']=capture_refs\n    cref=save(out/'outer-completion.json',completion)\n"
+    },
+    {
+      "label": "R03_seal_prepare_required_capture",
+      "before": "    proof={'prepare_scope_ref':sref,'prepare_grant_ref':gref,'outer_completion_ref':outerref}\n",
+      "after": "    outer=r.doc(outerref);capture_refs=outer['original_capture_closure']\n    bundle=original_capture_closure(g,r,s,sref,gref,capture_refs)\n    original=r.doc(outer['outer_invocation_ref'])\n    need([x['action_ref'] for x in bundle['events']]==[original['tool_initial_action_ref'],outer['terminal_tool_action_ref']],'PREPARE_CAPTURE_PAIR')\n    proof={'prepare_scope_ref':sref,'prepare_grant_ref':gref,'outer_completion_ref':outerref}\n"
+    },
+    {
+      "label": "R01_entry_preallocation",
+      "before": "        inp=parse(x.input_ref.encode());data=parse(verify(inp));out=leaf(x.output_root)\n",
+      "after": "        inp=parse(x.input_ref.encode());data=parse(verify(inp))\n        planned=preallocate(action,data,inp,x.output_root);out=leaf(str(planned),True)\n"
+    },
+    {
+      "label": "R03_entry_capture_parameters",
+      "before": "data['response_event_locator'],data['initial_action_ref'],out)\n",
+      "after": "data['response_event_locator'],data['initial_action_ref'],out,data['original_capture_closure'],data['original_action_ref'])\n"
+    },
+    {
+      "label": "R03_entry_outer_parameter",
+      "before": "data['initial_action_ref'],data['terminal_action_ref'],out)\n",
+      "after": "data['initial_action_ref'],data['terminal_action_ref'],out,data['original_capture_closure'])\n"
+    }
+  ],
+  "inverse_byte_equal": true
+}

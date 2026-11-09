@@ -1,0 +1,162 @@
+199:func TestClientQueueBackupAllPhasesAndPendingControl(t *testing.T) {
+200-	f, svc, client, sid := queueBackupFixture(t)
+201-	if _, err := f.db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','ACTIVE') WHERE kind='WorkspaceBinding'`); err != nil {
+202-		t.Fatal(err)
+203-	}
+204-	phases := []string{"ENQUEUED", "SENDING", "SDK_ACCEPTED", "CONSUMED", "DROP_REQUESTED", "DROPPED", "UNKNOWN"}
+205-	for i := 2; i < len(phases); i++ {
+206-		reply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.send", Object{"text": "phase fixture", "attachment_artifact_ids": Empty(), "delivery": "STEER"}))
+207-		if deref(reply.Status) != "COMPLETED" {
+208-			t.Fatal(string(Bytes(reply)))
+209-		}
+210-	}
+211-	sourceTx(t, f.db, func(tx *sql.Tx) error {
+212-		for i, phase := range phases {
+213-			var generation, command string
+214-			if err := tx.QueryRow(`SELECT generation,command_id FROM client_command_queue WHERE queue_sequence=?`, i+1).Scan(&generation, &command); err != nil {
+215-				return err
+216-			}
+217-			if phase == "ENQUEUED" {
+218-				continue
+219-			}
+220-			receipt := ID()
+221-			if err := appendClientReceipt(tx, f.project, generation, command, "FIXTURE_PHASE", receipt, Object{"phase": phase}, nil); err != nil {
+222-				return err
+223-			}
+224-			if _, err := tx.Exec(`UPDATE client_command_queue SET state=?,last_receipt_id=? WHERE command_id=?`, phase, receipt, command); err != nil {
+225-				return err
+226-			}
+227-		}
+228-		return nil
+229-	})
+230-	var goal string
+231-	f.db.QueryRow(`SELECT goal_id FROM client_sessions WHERE id=?`, sid).Scan(&goal)
+232-	control := queueClientEnvelope(t, f, client, sid, "session.control", Object{"action": "CANCEL", "target_id": goal, "reason": "state fixture unresolved inputs"})
+233-	reply, _ := goalCommand(t, f, svc, control)
+234-	if deref(reply.Status) != "ACKNOWLEDGED" {
+235-		t.Fatal(string(Bytes(reply)))
+236-	}
+237-	drain, err := f.s.RuntimeDrainSnapshot(context.Background())
+238-	if err != nil || drain.UnresolvedCommands < 2 {
+239-		t.Fatalf("pending noRun drain disappeared %+v %v", drain, err)
+240-	}
+241-	if _, err := f.db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','REVOKED') WHERE kind='WorkspaceBinding'`); err != nil {
+242-		t.Fatal(err)
+243-	}
+244-	key := backupTestKey(t)
+245-	backup, _ := backupTestCreate(t, f.s, key)
+246-	dest := filepath.Join(t.TempDir(), "restore")
+247-	if _, err = RestoreBackup(context.Background(), backup, dest, backupOpt(t, f.s, key)); err != nil {
+248-		t.Fatal(err)
+249-	}
+250-	db, err := store.Open(filepath.Join(dest, "state.sqlite"))
+251-	if err != nil {
+252-		t.Fatal(err)
+253-	}
+254-	defer db.Close()
+255-	var consumed, dropped, unknown, pending int
+256-	db.QueryRow(`SELECT count(*) FROM client_command_queue WHERE state='CONSUMED'`).Scan(&consumed)
+257-	db.QueryRow(`SELECT count(*) FROM client_command_queue WHERE state='DROPPED'`).Scan(&dropped)
+258-	db.QueryRow(`SELECT count(*) FROM client_command_queue WHERE state='UNKNOWN'`).Scan(&unknown)
+259-	db.QueryRow(`SELECT count(*) FROM client_control_requests WHERE state='RECONCILING'`).Scan(&pending)
+260-	if consumed != 1 || dropped != 2 || unknown != 4 || pending != 1 {
+261-		t.Fatalf("restore terminal history consumed=%d dropped=%d unknown=%d controls=%d", consumed, dropped, unknown, pending)
+262-	}
+263-	if err = validateBackupQueue(db); err != nil {
+264-		t.Fatal(err)
+265-	}
+266-}
+267-func TestClientQueueBackupRequiresMatchingPortableSidecar(t *testing.T) {
+268-	for _, mode := range []string{"missing", "disagreement"} {
+269-		t.Run(mode, func(t *testing.T) {
+270-			f, _, _, _ := queueBackupFixture(t)
+271-			key := backupTestKey(t)
+272-			backup, manifest := backupTestCreate(t, f.s, key)
+273-			kept := []BackupFile{}
+274-			for _, entry := range manifest.Files {
+275-				if entry.Name != "command-queue.json" {
+276-					kept = append(kept, entry)
+277-					continue
+278-				}
+279-				if mode == "disagreement" {
+280-					plain := Bytes(Object{"format": "RESEARCHOS_COMMAND_QUEUE_V1", "client_command_queue": Empty()})
+281-					cipher, err := backupCipher(key)
+282-					if err != nil {
+283-						t.Fatal(err)
+284-					}
+285-					raw, err := backupEncrypt(cipher, manifest.ID, entry.Name, plain)
+286-					if err != nil {
+287-						t.Fatal(err)
+288-					}
+289-					if err = os.WriteFile(filepath.Join(backup, entry.Name+".enc"), raw, 0600); err != nil {
+290-						t.Fatal(err)
+291-					}
+292-					entry.Hash = Digest(plain)
+293-					entry.Size = len(plain)
+294-					kept = append(kept, entry)
+295-				}
+296-			}
+297-			manifest.Files = kept
+298-			manifest.MAC = backupMAC(manifest, key)
+299-			if err := os.WriteFile(filepath.Join(backup, "manifest.json"), Bytes(manifest), 0600); err != nil {
+300-				t.Fatal(err)
+301-			}
+302-			if _, err := RestoreBackup(context.Background(), backup, filepath.Join(t.TempDir(), "restore"), backupOpt(t, f.s, key)); err == nil {
+303-				t.Fatal("authenticated but incomplete/disagreeing queue sidecar accepted")
+304-			}
+305-		})
+306-	}
+307-}
+308-func TestClientQueueFreshInstallRollsBackMissingAdditiveSchema(t *testing.T) {
+309-	for _, mode := range []string{"missing", "corrupt"} {
+310-		t.Run(mode, func(t *testing.T) {
+311-			root := t.TempDir()
+312-			migrationDir := filepath.Join(root, "migrations")
+313-			if err := os.Mkdir(migrationDir, 0700); err != nil {
+314-				t.Fatal(err)
+315-			}
+316-			entries, err := os.ReadDir("../../migrations/sqlite")
+317-			if err != nil {
+318-				t.Fatal(err)
+319-			}
+320-			for _, entry := range entries {
+321-				if entry.IsDir() || entry.Name() == "next_v24_sessions.sql" {
+322-					continue
+323-				}
+324-				raw, err := os.ReadFile(filepath.Join("../../migrations/sqlite", entry.Name()))
+325-				if err != nil {
+326-					t.Fatal(err)
+327-				}
+328-				if err = os.WriteFile(filepath.Join(migrationDir, entry.Name()), raw, 0600); err != nil {
+329-					t.Fatal(err)
+330-				}
+331-			}
+332-			if mode == "corrupt" {
+333-				if err = os.WriteFile(filepath.Join(migrationDir, "next_v24_sessions.sql"), []byte("CREATE TABLE partial_schema(id TEXT); invalid SQL;"), 0600); err != nil {
+334-					t.Fatal(err)
+335-				}
+336-			}
+337-			db, err := store.Open(filepath.Join(root, "state.sqlite"))
+338-			if err != nil {
+339-				t.Fatal(err)
+340-			}
+341-			defer db.Close()
+342-			if err = store.Bootstrap(context.Background(), db, filepath.Join(migrationDir, "0001_bootstrap.sql")); err != nil {
+343-				t.Fatal(err)
+344-			}
+345-			if _, err = New(db, "../../spec/v2.0/contracts", filepath.Join(migrationDir, "0002_domain.sql")); err == nil {
+346-				t.Fatal("missing/corrupt additive schema accepted")
+347-			}
+348-			var version, tables int
+349-			if err = db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
+350-				t.Fatal(err)
+351-			}
+352-			if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('client_command_queue','client_queue_fences','partial_schema')`).Scan(&tables); err != nil {
+353-				t.Fatal(err)
+354-			}
+355-			if version != 1 || tables != 0 {
+356-				t.Fatalf("partially installed numbered/additive migration: version=%d tables=%d", version, tables)
+357-			}
+358-		})
+359-	}
+360-}

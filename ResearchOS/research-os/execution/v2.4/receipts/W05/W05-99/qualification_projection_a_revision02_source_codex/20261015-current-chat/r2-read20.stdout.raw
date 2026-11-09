@@ -1,0 +1,19 @@
+158: 	tool := func(name string) Object { return Object{"type": "function", "function": Object{"name": name, "parameters": Object{"type": "object"}}} }
+159: 	config["max_calls"] = 8
+160: 	config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
+161: 	f := contextFixture(t)
+162: 	req := f.requirement()
+163: 	registration := f.expect(201, "POST", f.path("/runtimes"), ID(), f.stateTag(), Object{"name": "projection first-dispatch fixture", "adapter": "codex-cli", "adapter_revision": runtimeBridgeRevision, "capabilities": []any{"start", "context_rebuild"}, "platform": "windows-amd64", "measurement_mode": "FIXTURE", "credential_ref": nil})
+164: 	profileBody := Object{"runtime_id": registration["id"], "technical_hash": runtimeTechnicalHash(registration), "adapter": registration["adapter"], "adapter_revision": runtimeBridgeRevision, "platform": "windows-amd64", "build_hash": Digest(binary), "sandbox": runtimeSandboxProfile, "credential_revision": "none", "backend": runtimeMuBackend, "model": config["model"], "model_config": config, "command_id": "native-fixture", "argv": []any{"--preserve-symlinks-main", "--preserve-symlinks", "{bundle}", "{manifest}"}, "effect_routes": []any{Object{"id": config["route"], "capability": "MODEL", "credential_revision": "test-v1", "upper_bound": dollars("1")}}, "permissions": Object{"network": "none", "environment": "staging-only", "capabilities": Empty(), "process_limit": 1, "memory_mib": 256}, "timeout_seconds": 60, "outputs": []any{"result.json"}, "bundle_hash": Digest(bundleRaw), "model_qualification": Object{"route": config["route"], "model_config_hash": Hash(config), "max_calls": 1}}
+165: 	profile := f.artifact(profileBody, Empty())
+166: 	contract := clientTurnContract()
+167: 	goal := f.expect(201, "POST", f.path("/goals"), ID(), f.stateTag(), Object{"title": "projection qualification", "original_intent": "verify broker projection", "scope": "PROJECT", "requirement_refs": []any{Ref(req, "Requirement")}, "problem_ids": []any{"runtime"}, "deliverables": []any{"receipt"}, "acceptance_contract": contract})
+168: 	goal = f.expect(200, "POST", f.path("/goals/"+Str(goal, "id")+"/actions"), ID(), testTag(goal), Object{"action": "ACTIVATE", "reason": "approved fixture"})
+169: 	task := f.expect(201, "POST", f.path("/tasks"), ID(), testTag(goal), Object{"goal_id": goal["id"], "title": "projection qualification", "task_type": "runtime_qualification", "stage": "verification", "dependency_task_ids": Empty(), "requirement_refs": []any{Ref(req, "Requirement")}, "input_refs": []any{Ref(profile, "Artifact")}, "acceptance_contract": contract, "origin_problem_id": "runtime", "candidate_id": "runtime", "stop_policy": Object{"wall_time_seconds": 60, "max_attempts": 1, "max_parallel_runs": 1, "stop_conditions": []any{"no progress"}})
+170: 	f.bundle(task)
+171: 	task = f.read("tasks", Str(task, "id"))
+172: 	executor, scheduler := ID(), ID()
+173: 	for _, p := range []Principal{{ID: executor, Roles: []string{"EXECUTOR"}, Grants: []Grant{{ProjectID: f.project, TaskID: Str(task, "id")}}}, {ID: scheduler, Roles: []string{"SCHEDULER"}, Grants: []Grant{{ProjectID: f.project}}}} {
+174: 		if err := f.s.ProvisionPrincipal(context.Background(), p); err != nil {
+175: 			t.Fatal(err)
+176: 		}

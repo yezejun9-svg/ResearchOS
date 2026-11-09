@@ -1,0 +1,50 @@
+--- baseline/internal/host/client_configuration.go
++++ snapshot/internal/host/client_configuration.go
+@@ -0,0 +1,47 @@
++package host
++
++import (
++	"context"
++	"errors"
++	"os"
++
++	"researchos.local/research-os/internal/domain"
++)
++
++// ConfigurationMetadata deliberately uses record metadata only. It does not
++// call CredentialUsable, openCredentialForProvider, unprotect, or the database.
++func (h *Host) ConfigurationMetadata(ctx context.Context, principal, provider string, ref *string) (domain.ClientConfigurationMetadata, error) {
++	var result domain.ClientConfigurationMetadata
++	if e := ctx.Err(); e != nil {
++		return result, e
++	}
++	if h == nil || h.dir == "" || !verifiableKind(h.identity.Kind) || h.identity.Ref == "" || h.state == nil || h.state.PrincipalRef != h.identity.Ref || h.boundPrincipal() != principal || h.state.HostInstanceID != h.InstanceID() {
++		return result, domain.Fail(403, "FORBIDDEN", "local host principal binding unavailable")
++	}
++	result.OwnerHost, result.Principal = h.InstanceID(), principal
++	if ref == nil {
++		return result, nil
++	}
++	if h.vault == nil {
++		return result, domain.Fail(503, "HOST_UNAVAILABLE", "credential metadata unavailable")
++	}
++	result.Credential = &domain.ClientCredentialMetadata{Ref: *ref, Provider: provider, Status: StatusMissing, CheckedAt: h.nowUTC().Format("2006-01-02T15:04:05.999999999Z07:00")}
++	r, e := h.vault.record(*ref)
++	if e != nil {
++		if errors.Is(e, os.ErrNotExist) || errors.Is(e, ErrUnknownCredential) {
++			return result, nil
++		}
++		return domain.ClientConfigurationMetadata{}, domain.Fail(503, "HOST_UNAVAILABLE", "credential metadata cannot be read")
++	}
++	if r.Ref != *ref || r.Provider != provider || (r.Kind != "API_KEY" && r.Kind != "OAUTH_TOKEN") {
++		return result, domain.Fail(403, "CREDENTIAL_MISSING", "credential metadata does not match provider")
++	}
++	result.Credential.Kind = r.Kind
++	result.Credential.Status = StatusAvailable
++	if r.Revoked {
++		result.Credential.Status = StatusRevoked
++	}
++	return result, nil
++}
++
++var _ domain.ClientConfigurationAuthority = (*Host)(nil)

@@ -1,0 +1,12 @@
+import hashlib,json
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=Path('D:/作品集/ResearchOS/research-os');D=HERE/'product-v1-native-preparation-integration';p=D/'plan.unextended.json';out=D/'plan.json';assert not out.exists()
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+assert sha(p)=='f6fb6ea2ecf1c0b885596609348a4a8e2ac630cb6fa37010d062a98373ffdec3';plan=json.loads(p.read_bytes());base='execution/product-v1/receipts/single-harness-20261104/native-preparation-wiring/frozen-source-final/'
+pr=base+'product-v1-native-preparation-wiring-prereview-20261105/prereview.json';cr=base+'product-v1-native-preparation-test01-correction-review-20261105/correction-report.json';events=[]
+for row in json.loads((ROOT/pr).read_bytes())['findings']:events.append(dict(origin_key=row['origin_key'],classification='RESOLVED_SOURCE_FINDING_PRIOR_REVISION_RETAINED',detail=row['detail']+' Final reviewed source/actualtest02 resolves this finding; preserve history.'))
+events+=json.loads((ROOT/cr).read_bytes())['diagnostic_events'];events.append(dict(origin_key='root-preparation-test-registration:manifest-schema-preflight',classification='ROOT_REGISTRATION_PREFLIGHT',attempts=2,detail='Initial overlay preparer expected manifest.files instead of the author paths map; it stopped before output/scope creation. The dependent registration was then attempted and rejected missing overlay before scope/child creation. Original helper retained; new derivative handles exact paths map. Test01 later ran once and remained FAILED; test02 new scope passed. No Native/model or uncertain operation was replayed.'))
+plan['diagnostic_events']+=events
+for ref in (pr,cr):plan['evidence_pins'][ref]=sha(ROOT/ref)
+plan['next']='All reviewed RPC/B3/preparation source slices are integrated; first-synthetic route remains default-closed. Helper build01 succeeded separately; bind its exact hash and Root syntheticS path via reviewed build-only linker/packaging support before a fresh current-source Desktop. Do not launch Native/model until exact new conditional qualification/Task scope and build identity are registered. CurrentDesktop11 actualvisual evidence belongs to older c3 source only. Preserve failed test01, counters, old Task/echo2/2, UNKNOWN and pending reservations; generalproject/release/journey acceptance remains open.'
+out.write_bytes((json.dumps(plan,ensure_ascii=False,indent=2)+'\n').encode('utf8'));print(json.dumps(dict(plan=str(out),sha256=sha(out),diagnostic_events=len(plan['diagnostic_events']))))

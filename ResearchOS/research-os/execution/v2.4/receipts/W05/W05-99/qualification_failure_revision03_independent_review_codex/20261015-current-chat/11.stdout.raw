@@ -1,0 +1,599 @@
+FILE adapters/runtime/bridge_windows.go
+70: 	// Only explicit immutable inputs cross into the task sandbox. Credentials,
+71: 	// authority paths and the host manifest never enter this map.
+72: 	Inputs       map[string][]byte
+73: 	BeforeResume func(sandbox.Identity) error
+74: }
+75: 
+76: type BridgeJournal struct {
+77: 	PauseProtocol      string           `json:"pause_protocol,omitempty"`
+78: 	PauseRequested     bool             `json:"pause_requested,omitempty"`
+79: 	PauseID            string           `json:"pause_id,omitempty"`
+80: 	QueueBinding       json.RawMessage  `json:"queue_binding,omitempty"`
+81: 	Checkpoint         *PauseCheckpoint `json:"checkpoint,omitempty"`
+82: 	CheckpointSeal     *CheckpointSeal  `json:"checkpoint_seal,omitempty"`
+83: 	Version            int              `json:"version"`
+84: 	Manifest           json.RawMessage  `json:"manifest"`
+85: 	ManifestHash       string           `json:"manifest_hash"`
+86: 	DispatchKey        string           `json:"dispatch_key"`
+87: 	Worker             string           `json:"worker"`
+88: 	Revision           string           `json:"adapter_revision"`
+89: 	Identity           sandbox.Identity `json:"identity"`
+90: 	State              string           `json:"state"`
+91: 	Reason             string           `json:"reason"`
+92: 	Started            string           `json:"started"`
+93: 	Ended              string           `json:"ended"`
+94: 	Sequence           int64            `json:"observation_sequence"`
+95: 	Frames             int64            `json:"frames"`
+96: 	Acknowledged       int64            `json:"acknowledged"`
+97: 	ContextReady       bool             `json:"context_ready"`
+98: 	CheckpointSequence int64            `json:"checkpoint_sequence"`
+99: 	Paused             bool             `json:"paused"`
+100: 	InputHash          string           `json:"input_hash"`
+101: 	ProtocolComplete   bool             `json:"protocol_complete"`
+102: 	Cancelled          bool             `json:"cancelled"`
+103: 	Receipt            sandbox.Receipt  `json:"sandbox_receipt"`
+104: 	Artifacts          []Artifact       `json:"artifacts"`
+105: 	StdoutHash         string           `json:"stdout_hash"`
+106: 	StderrHash         string           `json:"stderr_hash"`
+107: 	QueueRequired      bool             `json:"queue_required"`
+108: 	QueueSealed        bool             `json:"queue_sealed"`
+109: 	QueueAbortObserved bool             `json:"queue_abort_observed"`
+110: 	QueueCancelIdle    bool             `json:"queue_cancel_idle"`
+111: 	QueueIdle          bool             `json:"queue_idle"`
+112: 	QueueInitSequence  int64            `json:"queue_init_sequence"`
+113: 	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
+114: }
+115: 
+116: type Bridge struct {
+117: 	mu                                        sync.Mutex
+118: 	directory                                 string
+119: 	lock                                      *os.File
+120: 	process                                   *sandbox.Process
+121: 	cancel                                    context.CancelFunc
+122: 	journal                                   BridgeJournal
+123: 	frames                                    chan BridgeFrame
+124: 	done                                      chan struct{}
+125: 	deadline                                  time.Time
+126: 	wallDeadline                              time.Time
+127: 	pending                                   []byte
+128: 	stdout, stderr                            *os.File
+129: 	streamOffsets                             map[string]int64
+130: 	err                                       error
+131: 	writeMu                                   sync.Mutex
+132: 	modelInitDelivered                        bool
+133: 	modelStreams                              []*ModelStream
+134: 	modelObservations                         chan ModelStreamObservation
+135: 	modelChanged                              chan struct{}
+136: 	modelDataRecords, modelObservationRecords int
+137: }
+138: 
+FILE internal/host/runtime_verifier_replacement_windows.go
+97: func replacementID(s string) bool {
+98: 	b, e := hex.DecodeString(s)
+99: 	return e == nil && len(b) == 16 && strings.ToLower(s) == s
+100: }
+101: func replacementDigest(s string) bool {
+102: 	b, e := hex.DecodeString(strings.TrimPrefix(s, "sha256:"))
+103: 	return strings.HasPrefix(s, "sha256:") && e == nil && len(b) == 32 && strings.ToLower(s) == s
+104: }
+105: func replacementPath(p string) error {
+106: 	if !filepath.IsAbs(p) || filepath.Clean(p) != p || len(filepath.VolumeName(p)) != 2 || strings.Contains(p[2:], ":") {
+107: 		return errors.New("canonical absolute local path required")
+108: 	}
+109: 	return nil
+110: }
+111: func replacementACL(path string, dir, private bool) error {
+112: 	sid, e := currentSIDString()
+113: 	if e != nil {
+114: 		return e
+115: 	}
+116: 	sd, e := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+117: 	if e != nil {
+118: 		return e
+119: 	}
+120: 	owner, _, e := sd.Owner()
+121: 	if e != nil || owner == nil || owner.String() != sid {
+122: 		return errors.New("current SID owner required")
+123: 	}
+124: 	if !private {
+125: 		return nil
+126: 	}
+127: 	control, _, e := sd.Control()
+128: 	if e != nil || control&windows.SE_DACL_PROTECTED == 0 {
+129: 		return errors.New("protected private DACL required")
+130: 	}
+131: 	acl, _, e := sd.DACL()
+132: 	if e != nil || acl == nil || acl.AceCount != 1 {
+133: 		return errors.New("single private ACE required")
+134: 	}
+135: 	var ace *windows.ACCESS_ALLOWED_ACE
+136: 	if windows.GetAce(acl, 0, &ace) != nil {
+137: 		return errors.New("private ACE unavailable")
+138: 	}
+139: 	flags := byte(0)
+140: 	if dir {
+141: 		flags = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
+142: 	}
+143: 	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != flags || ace.Mask != 0x001f01ff || (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() != sid {
+144: 		return errors.New("private ACE differs")
+145: 	}
+146: 	return nil
+147: }
+148: func replacementIdentity(path string, dir bool) (replacementFileID, error) {
+149: 	var out replacementFileID
+150: 	if e := replacementPath(path); e != nil {
+151: 		return out, e
+152: 	}
+153: 	p, e := windows.UTF16PtrFromString(path)
+154: 	if e != nil {
+155: 		return out, e
+156: 	}
+157: 	h, e := windows.CreateFile(p, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+158: 	if e != nil {
+159: 		return out, e
+160: 	}
+161: 	defer windows.CloseHandle(h)
+162: 	var i windows.ByHandleFileInformation
+163: 	if e = windows.GetFileInformationByHandle(h, &i); e != nil {
+164: 		return out, e
+165: 	}
+166: 	if i.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (i.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != dir || (!dir && i.NumberOfLinks != 1) {
+167: 		return out, errors.New("reparse, alias or wrong file type")
+168: 	}
+169: 	return replacementFileID{i.VolumeSerialNumber, i.FileIndexHigh, i.FileIndexLow}, nil
+170: }
+171: func replacementRead(path string, limit int64) ([]byte, error) {
+172: 	if _, e := replacementIdentity(path, false); e != nil {
+173: 		return nil, e
+174: 	}
+175: 	guards, e := guardWriteDirectories(filepath.Dir(path))
+176: 	if e != nil {
+177: 		return nil, e
+178: 	}
+179: 	defer closeWriteGuards(guards)
+180: 	wide, e := windows.UTF16PtrFromString(path)
+181: 	if e != nil {
+182: 		return nil, e
+183: 	}
+184: 	h, e := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+185: 	if e != nil {
+186: 		return nil, e
+187: 	}
+188: 	f := os.NewFile(uintptr(h), path)
+189: 	defer f.Close()
+190: 	var info windows.ByHandleFileInformation
+191: 	if e = windows.GetFileInformationByHandle(h, &info); e != nil {
+192: 		return nil, e
+193: 	}
+194: 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 || info.NumberOfLinks != 1 {
+195: 		return nil, errors.New("managed handle redirected or aliased")
+196: 	}
+197: 	if e = replacementACL(path, false, true); e != nil {
+198: 		return nil, e
+199: 	}
+200: 	stat, e := f.Stat()
+201: 	if e != nil {
+202: 		return nil, e
+203: 	}
+204: 	if stat.Size() < 1 || stat.Size() > limit {
+205: 		return nil, errors.New("bounded managed file required")
+206: 	}
+207: 	raw, e := io.ReadAll(io.LimitReader(f, limit+1))
+208: 	if e != nil {
+209: 		return nil, e
+210: 	}
+211: 	if int64(len(raw)) > limit {
+212: 		return nil, errors.New("managed read exceeded bound")
+213: 	}
+214: 	return raw, nil
+215: }
+216: 
+217: var replacementCensusSQL = [4]string{
+218: 	`SELECT count(*) FROM domain_objects WHERE kind='Run' AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`,
+219: 	`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`,
+220: 	`SELECT count(*) FROM runtime_dispatches WHERE state IN ('PREPARED','STARTED','UNKNOWN')`,
+221: 	`SELECT count(*) FROM idempotency i LEFT JOIN domain_objects r ON r.project=i.project AND r.kind='Run' AND r.id=json_extract(i.body,'$.run_ref.id') WHERE i.operation='host:managed-runtime-qualification' AND (r.id IS NULL OR coalesce(json_extract(r.body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED') OR EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=i.project AND d.run=r.id AND d.state IN ('PREPARED','STARTED','UNKNOWN')) OR EXISTS(SELECT 1 FROM resource_effects x WHERE x.project=i.project AND x.run=r.id AND x.sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(x.body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')))`,
+222: }
+223: 
+224: func replacementSnapshot(ctx context.Context, root string) (replacementPlan, error) {
+528: func replacementLoadPlan(path, digest string) (replacementPlan, []byte, error) {
+529: 	var p replacementPlan
+530: 	raw, e := replacementRead(path, 256<<10)
+531: 	if e != nil {
+532: 		return p, nil, e
+533: 	}
+534: 	if !replacementDigest(digest) || domain.Digest(raw) != digest {
+535: 		return p, nil, errors.New("plan raw digest differs")
+536: 	}
+537: 	if e = decodeRuntimeManaged(raw, &p); e != nil {
+538: 		return p, nil, e
+539: 	}
+540: 	if e = replacementPlanValid(p); e != nil {
+541: 		return p, nil, e
+542: 	}
+543: 	return p, raw, nil
+544: }
+545: func replacementPlanValid(p replacementPlan) error {
+546: 	if p.Schema != replacementPlanSchema || !replacementID(p.OperationID) || (p.RollbackOf != "" && (!replacementID(p.RollbackOf) || p.RollbackOf == p.OperationID)) || p.SchemaVersion != 24 || p.Census != [4]int{} || replacementPath(p.DataRoot) != nil || p.HostPath != filepath.Join(p.DataRoot, "host") || p.DBPath != filepath.Join(p.DataRoot, "researchos.sqlite") {
+547: 		return errors.New("invalid replacement plan")
+548: 	}
+549: 	if p.HistorySequence == 0 || (p.HistorySequence == 1 && (p.PredecessorOperation != "" || p.PredecessorPlanSHA256 != "" || p.PredecessorTerminalHash != "")) || (p.HistorySequence > 1 && (!replacementID(p.PredecessorOperation) || p.PredecessorOperation == p.OperationID || !replacementDigest(p.PredecessorPlanSHA256) || !replacementDigest(p.PredecessorTerminalHash))) {
+550: 		return errors.New("invalid causal history binding")
+551: 	}
+552: 	if _, e := time.Parse(time.RFC3339Nano, p.CreatedAt); e != nil {
+553: 		return e
+554: 	}
+555: 	var old, new runtimeVerifierRegistration
+556: 	if decodeRuntimeManaged(p.OldBytes, &old) != nil || decodeRuntimeManaged(p.NewBytes, &new) != nil || domain.Digest(p.OldBytes) != p.OldSHA256 || domain.Digest(p.NewBytes) != p.NewSHA256 || domain.Hash(old) != p.OldHash || domain.Hash(new) != p.NewHash || old.InstallHash != p.OldInstallationHash || new.InstallHash != p.NewInstallationHash || domain.Hash(p.Installation) != p.NewInstallationHash || domain.Hash(old.Installation) != old.InstallHash || domain.Hash(new.Installation) != new.InstallHash {
+557: 		return errors.New("plan record linkage invalid")
+558: 	}
+559: 	if old.OwnerHost != p.HostID || old.OwnerPrincipal != p.Owner || old.ServiceRoot != p.Root || old.Schema != "researchos.runtime-verifier-registration.v1" || p.OldSHA256 == p.NewSHA256 {
+560: 		return errors.New("plan authority invalid")
+561: 	}
+562: 	expected := old
+563: 	expected.Installation = p.Installation
+564: 	expected.InstallHash = domain.Hash(p.Installation)
+565: 	raw, e := json.MarshalIndent(expected, "", "  ")
+566: 	if e != nil || !bytes.Equal(raw, p.NewBytes) {
+567: 		return errors.New("candidate bytes invalid")
+568: 	}
+569: 	ni, oi := p.Installation, old.Installation
+570: 	ni.Executable, ni.ExecutableHash, ni.SourceCommit = oi.Executable, oi.ExecutableHash, oi.SourceCommit
+571: 	if domain.Hash(ni) != domain.Hash(oi) {
+572: 		return errors.New("forbidden installation mutation")
+573: 	}
+574: 	return nil
+575: }
+576: func replacementSameSnapshot(a, b replacementPlan) bool {
+577: 	return a.DataRoot == b.DataRoot && a.HostPath == b.HostPath && a.DBPath == b.DBPath && a.FileIDs == b.FileIDs && a.PrincipalRef == b.PrincipalRef && a.HostID == b.HostID && a.Owner == b.Owner && a.Root == b.Root && a.StateSHA256 == b.StateSHA256 && a.LineageHash == b.LineageHash && a.SchemaVersion == b.SchemaVersion && a.Census == b.Census
+578: }
+579: 
+580: // RuntimeVerifierReplacement owns the same native lease as normal control. It
+582: func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplacementInput) (out RuntimeVerifierReplacementResult, err error) {
+583: 	out = RuntimeVerifierReplacementResult{Schema: replacementSchema, Action: in.Action, OperationID: in.OperationID, State: "REJECTED", Outcome: "NOT_APPLIED"}
+584: 	if in.Action == "recover" {
+585: 		out.Outcome = "UNKNOWN"
+586: 	}
+587: 	defer func() {
+588: 		if err != nil && out.ErrorCode == "" {
+589: 			out.ErrorCode = "REPLACEMENT_REJECTED"
+590: 		}
+591: 		if err != nil && out.Outcome == "UNKNOWN" {
+592: 			out.ErrorCode = "REPLACEMENT_RECOVERY_REQUIRED"
+593: 		}
+594: 	}()
+595: 	if replacementPath(in.DataRoot) != nil {
+596: 		return out, errors.New("canonical data root required")
+597: 	}
+598: 	for i, p := range []string{in.DataRoot, filepath.Join(in.DataRoot, "host"), filepath.Join(in.DataRoot, "researchos.sqlite"), filepath.Join(in.DataRoot, "host", stateFile), filepath.Join(in.DataRoot, "host", "runtime-verifier-installation.json")} {
+599: 		if _, e := replacementIdentity(p, i < 2); e != nil {
+600: 			return out, e
+601: 		}
+602: 	}
+603: 	guards, e := guardWriteDirectories(filepath.Join(in.DataRoot, "host"))
+604: 	if e != nil {
+605: 		return out, e
+606: 	}
+607: 	defer closeWriteGuards(guards)
+608: 	dbPath, e := windows.UTF16PtrFromString(filepath.Join(in.DataRoot, "researchos.sqlite"))
+609: 	if e != nil {
+610: 		return out, e
+611: 	}
+612: 	dbGuard, e := windows.CreateFile(dbPath, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+613: 	if e != nil {
+614: 		return out, e
+615: 	}
+616: 	defer windows.CloseHandle(dbGuard)
+617: 	lease, e := rt.AcquireDataRootLease(in.DataRoot)
+618: 	if e != nil {
+619: 		return out, e
+620: 	}
+621: 	defer lease.Close()
+622: 	if in.Action == "preflight" {
+623: 		if !replacementID(in.OperationID) || !replacementDigest(in.ExpectRecordSHA256) || !replacementDigest(in.ExpectManifestSHA256) || replacementPath(in.Out) != nil {
+624: 			return out, errors.New("invalid preflight arguments")
+625: 		}
+626: 		if _, e = os.Lstat(in.Out); !os.IsNotExist(e) {
+627: 			return out, errors.New("plan output must not exist")
+628: 		}
+629: 		// Never create a preflight artifact inside the product root.
+630: 		rel, e := filepath.Rel(in.DataRoot, in.Out)
+631: 		if e != nil || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+632: 			return out, errors.New("plan output must be outside product data")
+633: 		}
+634: 		if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
+635: 			return out, e
+636: 		}
+637: 		if _, e = os.Lstat(filepath.Join(in.DataRoot, "host", replacementJournal, in.OperationID)); !os.IsNotExist(e) {
+638: 			return out, errors.New("operation ID already exists")
+639: 		}
+640: 		p, e := replacementCandidate(ctx, in)
+641: 		out.ReadonlyCensus = p.Census
+650: 		if e != nil {
+651: 			return out, e
+652: 		}
+653: 		defer closeWriteGuards(og)
+654: 		if e = replacementWrite(filepath.Dir(in.Out), filepath.Base(in.Out), raw); e != nil {
+655: 			return out, e
+656: 		}
+657: 		return replacementResult(in.Action, p, domain.Digest(raw), "PREFLIGHT", "NOT_APPLIED"), nil
+658: 	}
+659: 	if in.Action != "commit" && in.Action != "recover" {
+660: 		return out, errors.New("unknown replacement action")
+661: 	}
+662: 	p, raw, e := replacementLoadPlan(in.Plan, in.ExpectPlanSHA256)
+663: 	if e != nil {
+664: 		return out, e
+665: 	}
+666: 	if p.DataRoot != in.DataRoot {
+667: 		return out, errors.New("plan root differs")
+668: 	}
+669: 	out = replacementResult(in.Action, p, in.ExpectPlanSHA256, "REJECTED", "NOT_APPLIED")
+670: 	if _, existing := os.Lstat(filepath.Join(p.HostPath, replacementJournal, p.OperationID)); in.Action == "recover" || existing == nil {
+671: 		out.Outcome = "UNKNOWN"
+672: 	}
+673: 	if in.Action == "recover" && (in.OperationID != p.OperationID || (in.RecoveryAction != "inspect" && in.RecoveryAction != "complete" && in.RecoveryAction != "abort")) {
+674: 		return out, errors.New("invalid recovery arguments")
+675: 	}
+676: 	snapshot, e := replacementSnapshot(ctx, in.DataRoot)
+677: 	out.ReadonlyCensus = snapshot.Census
+678: 	if e != nil {
+679: 		return out, e
+680: 	}
+681: 	if !replacementSameSnapshot(p, snapshot) {
+682: 		return out, errors.New("identity or readonly snapshot drift")
+683: 	}
+684: 	if in.Action == "recover" {
+685: 		out.Outcome = "UNKNOWN"
+686: 		return replacementRecover(in, p, raw)
+687: 	}
+688: 	dir := filepath.Join(p.HostPath, replacementJournal, p.OperationID)
+689: 	if _, e = os.Lstat(dir); e == nil {
+690: 		in.RecoveryAction = "inspect"
+691: 		result, err := replacementRecover(in, p, raw)
+692: 		if err == nil && result.State != "COMMITTED" {
+693: 			return result, errors.New("existing operation requires explicit recover")
+694: 		}
+695: 		return result, err
+696: 	} else if !os.IsNotExist(e) {
+697: 		return out, e
+698: 	}
+699: 	if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
+700: 		return out, e
+701: 	}
+702: 	fresh, e := replacementCandidate(ctx, RuntimeVerifierReplacementInput{DataRoot: p.DataRoot, OperationID: p.OperationID, Manifest: p.Manifest, ExpectRecordSHA256: p.OldSHA256, ExpectManifestSHA256: p.ManifestSHA256, RollbackOf: p.RollbackOf})
+703: 	if e != nil {
+704: 		return out, e
+705: 	}
+706: 	if !replacementSameSnapshot(p, fresh) || !replacementSameHistory(p, fresh) || !bytes.Equal(fresh.NewBytes, p.NewBytes) || fresh.OldSHA256 != p.OldSHA256 {
+707: 		return out, errors.New("stale plan")
+708: 	}
+709: 	out.Outcome = "UNKNOWN"
+FILE internal/host/runtime_verifier_replacement_journal_windows.go
+43: func replacementSameHistory(a, b replacementPlan) bool {
+44: 	return a.HistorySequence == b.HistorySequence && a.PredecessorOperation == b.PredecessorOperation && a.PredecessorPlanSHA256 == b.PredecessorPlanSHA256 && a.PredecessorTerminalHash == b.PredecessorTerminalHash
+45: }
+46: func replacementExtendsHead(p replacementPlan, h replacementHistoryHead) bool {
+47: 	return p.HistorySequence == h.Sequence+1 && p.PredecessorOperation == h.OperationID && p.PredecessorPlanSHA256 == h.PlanSHA256 && p.PredecessorTerminalHash == h.TerminalHash && (h.Sequence == 0 || p.OldSHA256 == h.RecordSHA256)
+48: }
+49: 
+50: // Supply the protected descriptor to the native create itself. A process death
+51: // between mkdir and a later SetNamedSecurityInfo must not strand recovery with
+52: // an inherited (rather than protected) operation directory.
+53: func replacementMkdirPrivate(path string) error {
+151: func replacementReadJournal(dir string, p replacementPlan, raw []byte) (replacementJournalView, error) {
+152: 	v := replacementJournalView{Files: map[string][]byte{}}
+153: 	if _, e := replacementIdentity(dir, true); e != nil {
+154: 		return v, e
+155: 	}
+156: 	if e := replacementACL(dir, true, true); e != nil {
+157: 		return v, e
+158: 	}
+159: 	guards, e := guardWriteDirectories(dir)
+160: 	if e != nil {
+161: 		return v, e
+162: 	}
+163: 	defer closeWriteGuards(guards)
+164: 	entries, e := os.ReadDir(dir)
+165: 	if e != nil {
+166: 		return v, e
+167: 	}
+168: 	if len(entries) > 12 {
+169: 		return v, errors.New("journal entry bound exceeded")
+170: 	}
+171: 	for _, entry := range entries {
+172: 		name := entry.Name()
+173: 		if entry.IsDir() {
+174: 			return v, errors.New("journal contains directory")
+175: 		}
+176: 		data, e := replacementRead(filepath.Join(dir, name), 256<<10)
+177: 		if e != nil {
+178: 			return v, e
+179: 		}
+180: 		v.Files[name] = data
+181: 		switch name {
+182: 		case "plan.json":
+183: 			if !bytes.Equal(data, raw) {
+184: 				return v, errors.New("same ID with different plan")
+185: 			}
+186: 		case "old-registration.bin":
+187: 			if !bytes.Equal(data, p.OldBytes) {
+188: 				return v, errors.New("old snapshot differs")
+189: 			}
+190: 		case "new-registration.bin", "stage.bin":
+191: 			if !bytes.Equal(data, p.NewBytes) {
+192: 				return v, errors.New("new snapshot differs")
+193: 			}
+194: 		case "actual-backup.bin": // Preserve third-party bytes; observation classifies them UNKNOWN.
+195: 		default:
+196: 			var event replacementEvent
+197: 			if decodeRuntimeManaged(data, &event) != nil || name != fmt.Sprintf("%04d-%s.json", len(v.Events)+1, strings.ToLower(event.State)) {
+198: 				return v, errors.New("unknown/orphan journal file")
+199: 			}
+200: 			want := event.Hash
+201: 			event.Hash = ""
+202: 			if want != domain.Hash(event) || event.Schema != replacementSchema || event.Sequence != len(v.Events)+1 || event.OperationID != p.OperationID || event.PlanSHA256 != domain.Digest(raw) || event.OldSHA256 != p.OldSHA256 || event.NewSHA256 != p.NewSHA256 {
+203: 				return v, errors.New("event linkage corrupt")
+204: 			}
+205: 			previous, state := "", ""
+206: 			if len(v.Events) > 0 {
+207: 				last := v.Events[len(v.Events)-1]
+208: 				previous, state = last.Hash, last.State
+209: 				// Audit clocks can change precision or move backwards. Sequence,
+210: 				// previous hash and transition are the only ordering authority.
+211: 			}
+212: 			if event.Previous != previous || !replacementTransition(state, event.State) {
+213: 				return v, errors.New("event chain invalid")
+214: 			}
+215: 			if _, e = time.Parse(time.RFC3339Nano, event.At); e != nil {
+216: 				return v, e
+217: 			}
+218: 			event.Hash = want
+219: 			v.Events = append(v.Events, event)
+220: 		}
+221: 	}
+222: 	if len(v.Events) > 0 {
+223: 		for _, name := range []string{"plan.json", "old-registration.bin", "new-registration.bin"} {
+224: 			if _, ok := v.Files[name]; !ok {
+225: 				return v, errors.New("journal snapshot missing")
+226: 			}
+227: 		}
+228: 	}
+229: 	return v, nil
+230: }
+231: func replacementTransition(old, new string) bool {
+232: 	switch old {
+233: 	case "":
+234: 		return new == "PREPARED" || new == "ABORTED"
+235: 	case "PREPARED":
+236: 		return new == "PUBLISHING" || new == "ABORTED"
+237: 	case "PUBLISHING":
+238: 		return new == "COMMITTED" || new == "ABORTED"
+239: 	}
+240: 	return false
+439: // RuntimeVerifierReplacementStartupGate is read-only and must run while the
+440: // caller holds its existing lease, before store.Open or any migration.
+441: func RuntimeVerifierReplacementStartupGate(lease *rt.DataRootLease) error {
+442: 	if lease == nil || !lease.Held() {
+443: 		return errors.New("replacement startup gate requires data-root lease")
+444: 	}
+445: 	return replacementCheckHistoryCurrent(lease.Root())
+446: }
+447: func replacementCheckHistoryCurrent(dataRoot string) error {
+448: 	head, e := replacementReadHistory(dataRoot, "")
+449: 	if e != nil {
+450: 		return e
+451: 	}
+452: 	if head.Sequence == 0 {
+453: 		return nil
+454: 	}
+455: 	raw, e := replacementRead(filepath.Join(dataRoot, "host", "runtime-verifier-installation.json"), 64<<10)
+456: 	if e != nil {
+457: 		return e
+458: 	}
+459: 	if domain.Digest(raw) != head.RecordSHA256 {
+460: 		return errors.New("latest replacement registration drift")
+461: 	}
+462: 	return nil
+463: }
+464: 
+465: // Every new plan binds the previous immutable terminal, including ABORTED
+466: // operations. No wall clock, directory enumeration order, or byte-hash cycle is
+467: // used to infer causality. Unbound older draft plans remain intact and fail
+468: // closed; this maintenance command does not silently rewrite/migrate history.
+469: func replacementReadHistory(dataRoot, excludeOperation string) (head replacementHistoryHead, err error) {
+470: 	root := filepath.Join(dataRoot, "host", replacementJournal)
+471: 	if _, e := os.Lstat(root); os.IsNotExist(e) {
+472: 		return head, nil
+473: 	} else if e != nil {
+474: 		return head, e
+475: 	}
+476: 	if _, e := replacementIdentity(root, true); e != nil {
+477: 		return head, e
+478: 	}
+479: 	if e := replacementACL(root, true, true); e != nil {
+480: 		return head, e
+481: 	}
+482: 	guards, e := guardWriteDirectories(root)
+483: 	if e != nil {
+484: 		return head, e
+485: 	}
+486: 	defer closeWriteGuards(guards)
+487: 	entries, e := os.ReadDir(root)
+488: 	if e != nil {
+489: 		return head, e
+490: 	}
+491: 	type terminal struct {
+492: 		P          replacementPlan
+493: 		E          replacementEvent
+494: 		PlanSHA256 string
+495: 	}
+496: 	var all []terminal
+497: 	for _, entry := range entries {
+498: 		if !entry.IsDir() || !replacementID(entry.Name()) {
+499: 			return head, errors.New("replacement journal malformed; explicit recover required")
+500: 		}
+501: 		if entry.Name() == excludeOperation {
+502: 			continue
+503: 		}
+504: 		dir := filepath.Join(root, entry.Name())
+505: 		raw, e := replacementRead(filepath.Join(dir, "plan.json"), 256<<10)
+506: 		if e != nil {
+507: 			return head, fmt.Errorf("replacement unfinished; explicit recover required: %w", e)
+508: 		}
+509: 		var p replacementPlan
+510: 		if decodeRuntimeManaged(raw, &p) != nil || replacementPlanValid(p) != nil || p.OperationID != entry.Name() || p.DataRoot != dataRoot {
+511: 			return head, errors.New("replacement plan invalid; explicit recover required")
+512: 		}
+513: 		v, e := replacementReadJournal(dir, p, raw)
+514: 		if e != nil {
+515: 			return head, e
+516: 		}
+517: 		if len(v.Events) == 0 {
+518: 			return head, errors.New("replacement unfinished; explicit recover required")
+519: 		}
+520: 		last := v.Events[len(v.Events)-1]
+521: 		switch last.State {
+522: 		case "COMMITTED":
+523: 			if !bytes.Equal(v.Files["actual-backup.bin"], p.OldBytes) || v.Files["stage.bin"] != nil {
+524: 				return head, errors.New("committed backup/stage invalid")
+525: 			}
+526: 		case "ABORTED":
+527: 			if v.Files["actual-backup.bin"] != nil {
+528: 				return head, errors.New("aborted journal has publication evidence")
+529: 			}
+530: 		default:
+531: 			return head, errors.New("replacement unfinished; use --runtime-verifier-replacement recover")
+532: 		}
+533: 		all = append(all, terminal{p, last, domain.Digest(raw)})
+534: 	}
+535: 	if len(all) == 0 {
+536: 		return head, nil
+537: 	}
+538: 	sort.Slice(all, func(i, j int) bool { return all[i].P.HistorySequence < all[j].P.HistorySequence })
+539: 	for _, t := range all {
+540: 		if !replacementExtendsHead(t.P, head) {
+541: 			return head, errors.New("causal history fork, cycle, missing predecessor or digest drift")
+542: 		}
+543: 		record := t.P.OldSHA256
+544: 		if t.E.State == "COMMITTED" {
+545: 			record = t.P.NewSHA256
+546: 		}
+547: 		head = replacementHistoryHead{Sequence: t.P.HistorySequence, OperationID: t.P.OperationID, PlanSHA256: t.PlanSHA256, TerminalHash: t.E.Hash, RecordSHA256: record}
+548: 	}
+549: 	return head, nil
+550: }
+adapters/runtime/data_root_windows.go:24:func AcquireDataRootLease(directory string) (*DataRootLease, error) {
+adapters/runtime/data_root_windows.go:81:func (l *DataRootLease) ReturnBorrow() error {
+internal/domain/runtime_coordinator_windows.go:139:		e = lease.Borrow(root)
+internal/domain/runtime_coordinator_windows.go:149:			_ = lease.ReturnBorrow()
+internal/domain/runtime_coordinator_windows.go:204:	return c.borrowed.ReturnBorrow()
+internal/recoveryauthority/migration_windows.go:45:    if n.lease,e=rt.AcquireDataRootLease(b.Root); e!=nil { return zero,"",e }
+internal/recoveryauthority/migration_windows.go:46:    if e=n.lease.Borrow(b.Root); e!=nil { _=n.lease.Close(); n.lease=nil; return zero,"",e }
+internal/recoveryauthority/native_windows.go:124:    if n.lease!=nil { errs=append(errs,n.lease.ReturnBorrow()); errs=append(errs,n.lease.Close()); n.lease=nil }; return errors.Join(errs...)
+internal/recoveryauthority/native_windows.go:207:    if n.lease,e=rt.AcquireDataRootLease(g.Root); e!=nil { return zero,"",e }
+internal/recoveryauthority/native_windows.go:208:    if e=n.lease.Borrow(g.Root); e!=nil { _=n.lease.Close(); n.lease=nil; return zero,"",e }
+
+
+RG_EXIT 0

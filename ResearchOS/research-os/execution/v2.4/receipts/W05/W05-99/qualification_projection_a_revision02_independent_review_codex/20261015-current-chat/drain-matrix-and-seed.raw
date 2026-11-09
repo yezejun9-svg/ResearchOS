@@ -1,0 +1,232 @@
+106: 		t.Fatal("lease remained after DB and owner close", e)
+107: 	}
+108: 	l.Close()
+109: 	t.Log("single borrower; busy scan/startup drain refusal; recovery completes before quiesce; abort keeps Serve alive; coordinator close retains DB owner lock")
+110: }
+111: 
+112: // Disposable source fixture synthesizes durable record shapes; it makes no
+113: // native acceptance claim. Actual Host/private-pipe coverage is separate.
+114: func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, string) {
+115: 	return desktopExitFixtureTools(t, false)
+116: }
+117: func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoordinator, string, string) {
+118: 	return desktopExitFixtureSeed(t, oldTools, nil)
+119: }
+120: func desktopExitFixtureSeed(t *testing.T, oldTools bool, seed func(Object) Object) (*fixture, *RuntimeCoordinator, string, string) {
+121: 	t.Helper()
+122: 	f, c, r, executor := confirmationFixture(t)
+123: 	ctx := context.Background()
+124: 	var finishSeed func() capturedInitialDispatch
+125: 	if seed != nil {
+126: 		finishSeed = captureInitialDispatch(t, f.db)
+127: 	}
+128: 	run, _, e := c.beginManagedLocalQualification(ctx, f.token, r, executor)
+129: 	if e != nil {
+130: 		t.Fatal(e)
+131: 	}
+132: 	var captured capturedInitialDispatch
+133: 	if finishSeed != nil {
+134: 		captured = finishSeed()
+135: 	}
+136: 	runID := Str(run, "id")
+137: 	key := r.TaskID + ":" + runID + ":1:model:1"
+138: 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+139: 		task, e := load(tx, f.project, "Task", r.TaskID)
+140: 		if e != nil {
+141: 			return e
+142: 		}
+143: 		var dispatch Object
+144: 		var manifest Object
+145: 		if finishSeed != nil {
+146: 			manifest = captured.manifest
+147: 		} else {
+148: 			dispatch, e = runtimeDispatch(tx, f.project, runID, 1)
+149: 			if e != nil {
+150: 				return e
+151: 			}
+152: 			manifest = dispatch["manifest"].(map[string]any)
+153: 		}
+154: 		admission := manifest["admission"].(map[string]any)
+155: 		profile := admission["profile"].(map[string]any)
+156: 		config := profile["model_config"].(map[string]any)
+157: 		goal, e := load(tx, f.project, "Goal", Str(task, "goal_id"))
+158: 		if e != nil {
+159: 			return e
+160: 		}
+161: 		request := Object{"route": config["route"], "capability": "MODEL", "credential_revision": "none", "payload": Object{"body": Object{"model": config["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}}}}
+162: 		if oldTools {
+163: 			request["payload"].(map[string]any)["body"].(map[string]any)["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+164: 		}
+165: 		cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": "UNKNOWN", "money": nil, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UNKNOWN", "occurred_at": run["created_at"]}
+166: 		var effect Object
+167: 		if finishSeed != nil {
+168: 			// The invalid dispatch cannot authorize normal effect preparation. Build
+169: 			// the same append-only fixture stages before its first durable INSERT.
+170: 			ledger, err := f.s.appendBudget(tx, f.project, cost)
+171: 			if err != nil {
+172: 				return err
+173: 			}
+174: 			effect = Object{"project_id": f.project, "goal_id": goal["id"], "task_id": task["id"], "run_id": runID, "key": key, "request_hash": Hash([]any{request, cost}), "payload": request, "reservation_id": ledger["id"], "state": "PREPARED", "epoch": run["lease_epoch"], "context_bundle_id": task["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "receipt": nil}
+175: 			if err := effectAppend(tx, f.project, runID, key, effect); err != nil {
+176: 				return err
+177: 			}
+178: 			effect["state"] = "STARTED"
+179: 			if err := effectAppend(tx, f.project, runID, key, effect); err != nil {
+180: 				return err
+181: 			}
+182: 		} else {
+183: 			effect, e = c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
+184: 			if e != nil {
+185: 				return e
+186: 			}
+187: 			effect, e = c.service.beginEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key)
+188: 			if e != nil {
+189: 				return e
+190: 			}
+191: 		}
+192: 		raw := []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+193: 		receipt := Object{"key": key, "epoch": 1, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": Object{"status": 200, "content_type": "text/event-stream", "body": string(raw)}}
+194: 		effect["state"], effect["receipt"] = "CONFIRMED", receipt
+195: 		if e = effectAppend(tx, f.project, runID, key, effect); e != nil {
+196: 			return e
+197: 		}
+198: 		if finishSeed != nil {
+199: 			stored := seed(qualificationProjectionClone(t, manifest))
+200: 			if e = captured.insert(tx, stored); e != nil {
+201: 				return e
+202: 			}
+203: 			dispatch = Object{"dispatch_key": captured.key, "manifest_hash": Hash(stored)}
+204: 		}
+205: 		identity := Object{"pid": 12345, "created": 123, "image": "fixture"}
+206: 		observation := Object{"state": "SETTLED", "children_stopped": true, "queue_empty": true, "streams_drained": true, "cleanup_complete": true, "ended": Now(), "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "worker": "fixture-worker", "identity": identity, "observation_sequence": 1, "spec": Object{"profile_hash": admission["profile_hash"], "run_id": runID, "task_id": task["id"], "epoch": 1}}
+207: 		if _, e = tx.Exec(`UPDATE runtime_dispatches SET state='OBSERVED',worker='fixture-worker',journal_locator=dispatch_key,identity=?,observation_sequence=1,observation_hash=? WHERE project=? AND run=?`, Bytes(identity), Hash(observation), f.project, runID); e != nil {
+208: 			return e
+209: 		}
+210: 		if _, e = tx.Exec(`INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,1,?,?,?)`, f.project, runID, Hash(observation), Bytes(observation), Now()); e != nil {
+211: 			return e
+212: 		}
+213: 		run["status"], run["children_stopped"], run["queue_empty"], run["ended_at"], run["runtime_settled_at"] = "SETTLED", true, true, Now(), Now()
+214: 		if e = bump(run); e != nil {
+215: 			return e
+216: 		}
+217: 		if e = f.s.put(tx, "Run", run); e != nil {
+218: 			return e
+219: 		}
+220: 		return f.s.releaseQualificationReservation(tx, f.project, run)
+221: 	})
+222: 	return f, c, runID, key
+223: }
+224: func TestDesktopExitCompletedLocalUnknownPreservesReleaseGate(t *testing.T) {
+225: 	f, c, _, _ := desktopExitFixture(t)
+226: 	ctx := context.Background()
+227: 	var before string
+228: 	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before)
+229: 	strict, e := c.QuiesceForRelease(ctx)
+230: 	if e == nil || strict.Reservations != 1 {
+231: 		t.Fatalf("release did not retain unknown: %+v %v", strict, e)
+232: 	}
+233: 	if e = f.s.completedLocalUnknownCosts(ctx); e != nil {
+234: 		t.Fatal(e)
+235: 	}
+236: 	safe, e := c.QuiesceForDesktopExit(ctx)
+237: 	if e != nil || safe.Reservations != 1 || c.ClientIntakeOpen() {
+238: 		t.Fatalf("safe exit %+v %v", safe, e)
+239: 	}
+240: 	var after string
+241: 	f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after)
+242: 	if before != after {
+243: 		t.Fatal("UNKNOWN rewritten by exit")
+244: 	}
+245: 	c.ResumeAfterReleaseAbort()
+246: 	if !c.ClientIntakeOpen() {
+247: 		t.Fatal("ordinary abort did not restore intake")
+248: 	}
+249: }
+250: 
+251: func TestQualificationProjectionUnknownCostRejectsOldTools(t *testing.T) {
+252: 	f, _, _, _ := desktopExitFixtureTools(t, true)
+253: 	var before string
+254: 	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before); err != nil {
+255: 		t.Fatal(err)
+256: 	}
+257: 	err := f.s.completedLocalUnknownCosts(context.Background())
+258: 	if err == nil || !strings.Contains(err.Error(), "tool schemas") {
+259: 		t.Fatalf("old coding tools accepted or wrong guard: %v", err)
+260: 	}
+261: 	var after string
+262: 	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after); err != nil {
+263: 		t.Fatal(err)
+264: 	}
+265: 	if before != after {
+266: 		t.Fatal("UNKNOWN ledger changed after rejection")
+267: 	}
+268: }
+269: 
+270: func TestQualificationProjectionUnknownCostFullMatrix(t *testing.T) {
+271: 	check := func(t *testing.T, seed func(Object) Object, mutation string) {
+272: 		t.Helper()
+273: 		wantReject := mutation != ""
+274: 		f, _, runID, _ := desktopExitFixtureSeed(t, false, seed)
+275: 		var ledgerBefore, effectsBefore string
+276: 		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); err != nil {
+277: 			t.Fatal(err)
+278: 		}
+279: 		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsBefore); err != nil {
+280: 			t.Fatal(err)
+281: 		}
+282: 		tx, err := f.db.Begin()
+283: 		if err != nil {
+284: 			t.Fatal(err)
+285: 		}
+286: 		var raw string
+287: 		if err := tx.QueryRow("SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.operation')='UNKNOWN' ORDER BY rowid DESC LIMIT 1", runID).Scan(&raw); err != nil {
+288: 			tx.Rollback()
+289: 			t.Fatal(err)
+290: 		}
+291: 		ledger, err := Decode([]byte(raw))
+292: 		if err != nil {
+293: 			tx.Rollback()
+294: 			t.Fatal(err)
+295: 		}
+296: 		err = f.s.completedLocalUnknownCost(tx, f.project, ledger)
+297: 		if wantReject {
+298: 			t.Logf("entry=completedLocalUnknownCost rejection=%v", err)
+299: 		}
+300: 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+301: 			t.Fatal(rollbackErr)
+302: 		}
+303: 		if wantReject && err == nil || !wantReject && err != nil {
+304: 			t.Fatalf("completedLocalUnknownCost reject=%t: %v", wantReject, err)
+305: 		}
+306: 		if wantReject {
+307: 			cause := "qualification projection"
+308: 			if mutation == "authority.profile_ref" || mutation == "authority.profile_hash" || mutation == "authority.profile.model_config" || mutation == "authority.model_qualification.route" || mutation == "authority.model_qualification.model_config_hash" {
+309: 				cause = "frozen profile binding"
+310: 			} else if mutation == "authority.model_qualification.max_calls" {
+311: 				cause = "profile bytes"
+312: 			}
+313: 			if !strings.Contains(err.Error(), cause) {
+314: 				t.Fatalf("%s rejected for unrelated cause: %v", mutation, err)
+315: 			}
+316: 		}
+317: 		var ledgerAfter, effectsAfter string
+318: 		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); err != nil {
+319: 			t.Fatal(err)
+320: 		}
+321: 		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsAfter); err != nil {
+322: 			t.Fatal(err)
+323: 		}
+324: 		if ledgerBefore != ledgerAfter || effectsBefore != effectsAfter {
+325: 			t.Fatal("UNKNOWN cost entry changed original ledger or effect history")
+326: 		}
+327: 	}
+328: 	t.Run("unmodified_seed", func(t *testing.T) {
+329: 		check(t, func(manifest Object) Object { return qualificationProjectionClone(t, manifest) }, "")
+330: 	})
+331: 	for _, mutation := range qualificationProjectionMutations() {
+332: 		t.Run(mutation.name, func(t *testing.T) {
+333: 			check(t, func(manifest Object) Object { return qualificationProjectionMutant(t, manifest, mutation) }, mutation.name)
+334: 		})
+335: 	}
+336: }
+337: func TestDesktopExitUnknownIncompleteRefused(t *testing.T) {

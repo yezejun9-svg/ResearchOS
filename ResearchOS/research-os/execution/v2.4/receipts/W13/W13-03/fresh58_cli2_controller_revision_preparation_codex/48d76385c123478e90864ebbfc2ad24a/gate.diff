@@ -1,0 +1,46 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\fresh58_cli2_controller_preparation_codex\86d71652d03649879b13e03a974456d9\authorization_gate.current58.proposed.py
++++ authorization_gate.current58.v2.proposed.py
+@@ -207,6 +207,11 @@
+         require(item['sha256'] == cat[relative]['sha256'] and item['bytes'] == cat[relative]['bytes'],
+                 'Current58 source set/catalogue differs')
+     require(set(closure['source_paths']).issubset(seen), 'Desktop15 absent from actual58 source set')
++    source_scope = reader.doc(closure['scope_ref'])
++    require(len(source_scope['shared38_paths']) == 38 and len(source_scope['cli8_paths']) == 8 and
++            len(closure['source_paths']) == 15, 'Original source-set cardinalities')
++    expected_paths = set(source_scope['shared38_paths'] + source_scope['cli8_paths'] + closure['source_paths'])
++    require(len(expected_paths) == 58 and seen == expected_paths, 'Exact original38 plus CLI8 plus Desktop15 union')
+     forward_ref = authority['forward_head_audit_ref']
+     mf_ref = authority['forward_head_manifest_ref']
+     mf = reader.doc(mf_ref)
+@@ -232,12 +237,27 @@
+     inv = sealed(audit['invocation_ref'])
+     intent = sealed(audit['intent_ref'])
+     verified = sealed(audit['verified_ref'])
+-    reader.verify(audit['request_ref'])
++    request = reader.doc(audit['request_ref'])
+     require(inv['actual_exit'] == 0 and inv['wrapper_error'] is None and inv['automatic_retry'] is False,
+             'Forward registration did not complete')
+-    require([verified['checkpoint'],verified['ownership'],verified['failure_origins']] == audit['after'] and
+-            verified['intent_ref'] == audit['intent_ref'] and
+-            audit['after'][0] <= cp['revision'] and audit['after'][1] <= ow['revision'],
++    before, after = audit['before'], audit['after']
++    require(all(type(t) is list and len(t) == 3 and all(type(x) is int for x in t)
++                for t in [before, after, request['before_tuple'], request['after_tuple']]),
++            'Forward tuples require exactly three actual integers')
++    require(request['schema'] == 'researchos.desktop58-forward-head-request.v1' and
++            request['actor'] == 'codex:/root' and request['before_tuple'] == before and request['after_tuple'] == after and
++            request['head_before'] == PARENT and request['head_after'] == SOURCE and
++            intent['actor'] == 'codex:/root' and intent['Main_head'] == SOURCE, 'Forward request/audit/intent origin pairing')
++    transition = intent['transition']
++    require(type(transition) is dict and set(transition) == {'checkpoint','ownership','failures'} and
++            all(type(transition[k]) is list and len(transition[k]) == 2 and
++                all(type(x) is int for x in transition[k]) and transition[k] == [before[i],after[i]]
++                for i,k in enumerate(['checkpoint','ownership','failures'])), 'Forward intent exact tuple transition')
++    current = [cp['revision'],ow['revision'],len(cp['failure_counters'])]
++    require(all(type(x) is int for x in current) and all(after[i] <= current[i] for i in range(3)) and
++            [verified['checkpoint'],verified['ownership'],verified['failure_origins']] == after and
++            all(type(verified[k]) is int for k in ['checkpoint','ownership','failure_origins']) and
++            verified['intent_ref'] == audit['intent_ref'],
+             'Forward registered tuple does not precede current authorization')
+     require(all(x in authority['sealed_integration_refs'] for x in [closure_ref,forward_ref,mf_ref]),
+             'Current58 source closure/forward chain not bound by authority')

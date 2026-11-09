@@ -1,0 +1,9 @@
+# Conditional Native controller candidate, revision 2
+
+C-only tooling preparation; **not run or registered**. The previous `product-v1-native-conditional-controller-prep-01` archive remains byte-for-byte frozen as review evidence. This revision changes only the runner for Astra's two source findings and adds pure test source. The Native PowerShell helper and null-pinned scope template are byte-identical to revision 1.
+
+The runner derives one Windows-canonical fixed `qualification-中文-root-01/S` path with `path.resolve` and uses it as the workspace, exact helper-result path and Main/display binding reference. The fixed-location, Root preparation receipts, no-reparse checks and exact public Main binding remain in force. B3's two possible source additions have hashes derived from its frozen constant UTF-8 strings plus LF; those scope pins are required before fresh GUI-root creation or Electron launch, and the same validated values are used for the final exact inventory check.
+
+`pure-preflight.test.mjs` calls the actual exported runner predicates. It covers canonical successful Native reply vs another S, exact Main/display binding, missing/malformed/wrong B3 pins before a simulated launch/submit callback, and raw template null/status plus the preflight call order. The test has not been executed; Root must register and run it in a fresh supervised pure-test scope. Node syntax and PowerShell parse are the only local checks in this preparation.
+
+All Source3/Host PREPARED intent/build/Core/launcher/Job/selector pins remain null in the template. Independent review, fresh Source3 build, original Root Job registration, and post-stop receipt review are still required before any actual Task or Native invocation. Runner success is a narrow canary observation pending those reviews, with formal/product increments zero.

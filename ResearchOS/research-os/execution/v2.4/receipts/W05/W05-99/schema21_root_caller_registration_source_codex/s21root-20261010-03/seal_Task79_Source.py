@@ -1,0 +1,33 @@
+from __future__ import annotations
+import ast,hashlib,json,types
+from pathlib import Path
+Q=Path(__file__).resolve().parent
+def pin(p):
+    r=Path(p).read_bytes();return dict(path=str(p),sha256=hashlib.sha256(r).hexdigest(),bytes=len(r))
+def save(n,v):
+    p=Q/n
+    with p.open('xb') as f:f.write((json.dumps(v,ensure_ascii=False,indent=2)+'\n').encode('utf-8'))
+    return pin(p)
+def main():
+    b=json.loads((Q/'source-inputs.basis.json').read_bytes());inv=json.loads((Q/'Task79-exact-inverse.json').read_bytes());inputs=json.loads((Q/'source-inputs.json').read_bytes());c=json.loads((Q/'root-calling-contract.source.json').read_bytes());baseh=json.loads(Path(b['base_hdf_ref']['path']).read_bytes())
+    source=(Q/'old21_root.source.py').read_bytes();caller=pin(Q/'old21_root.source.py');assert caller==inv['candidate_ref']==c['caller_ref']==c['registrar_ref'];old,new=bytes.fromhex(inv['old_hex']),bytes.fromhex(inv['new_hex']);assert source.count(new)==1;restored=source.replace(new,old);assert restored==Path(b['base_caller_ref']['path']).read_bytes()
+    before=ast.parse(restored);after=ast.parse(source);bm={n.name:ast.dump(n,include_attributes=False) for n in before.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))};am={n.name:ast.dump(n,include_attributes=False) for n in after.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))};changed=sorted(k for k in bm if bm[k]!=am[k]);assert changed==['validate_peer_delivery'];assert bm['failure_rows']==am['failure_rows'] and bm['projection']==am['projection'] and bm['original_capture_rows']==am['original_capture_rows']
+    report=save('Task79-Source-implementation-and-limits.json',dict(schema='researchos.old21-caller-Task79-Source-implementation.v1',caller_ref=caller,base_ref=b['base_caller_ref'],only_changed_functions=changed,full_inverse_restores_Source02=True,inverse_ref=pin(Q/'Task79-exact-inverse.json'),prior_multi_layer_inverse_ref=b['base_inverse_ref'],controls_ref=pin(Q/'Task79-time-delta-controls.json'),ten_Source_delta_controls_only=True,old39_59_853_14782_not_reexecuted=True,counter_Source_guards_and_all_legacy_pins_unchanged=True,actual_Task76_observation_ref=b['actual_Task76_observation_ref'],actual_Task76_raw_ref=b['actual_Task76_raw_ref'],observation_is_Root_witness=False,Root_issuer_gate_NOT_EXECUTED=True,Root_original1091_unchanged_external=True,new_original_failures=[],old_original_failure_refs=b['original_failure_refs'],old_failed_guard_status=b['old_failed_guard_status'],Main_Canon_Source01_Source02_writes=0,live_Canon_reads=0,Go_Native_SQL_TP_model_actual_calls=0,actual_RootScope_ref=None,actual_runtime_manifest_ref=None,actual_runtime_qualification_ref=None,actual_programme_qualification_ref=None,actual_grant=False,execution_grant=False,formal_acceptance=False,parent_acceptance=False,Source_self_acceptance=False,Root_seal_full_return_capture='Complete external original seal call+return must be captured by Root after this script returns; unavailable before HDF sealing'))
+    gr=b['references'][2];gm=types.ModuleType('Task79_seal_guard');gm.__file__=gr['path'];exec(compile(Path(gr['path']).read_bytes(),gm.__file__,'exec'),gm.__dict__);guard=gm.Guard();closed=False
+    try:
+        refs=inputs['references']+[pin(p) for p in Q.iterdir() if p.is_file() and p.name not in ('HDF.json','MF.json','Source-final.guard.closed.json')];seen=set()
+        for r in refs:
+            key=str(Path(r['path']).resolve(strict=True)).casefold()
+            if key in seen:continue
+            seen.add(key);guard.read(r['path'],r)
+        closure=save('Source-final.guard.closed.json',guard.close());closed=True
+        members=[pin(p) for p in sorted(Q.iterdir(),key=lambda p:p.name) if p.is_file() and p.name not in ('HDF.json','MF.json')]
+        mref=save('MF.json',dict(schema='researchos.old21-caller-Source-manifest.v1',source_author='codex:/root/backup_regression_resources',members=members,member_count=len(members),immutable=True,exclusions=['HDF.json self-reference','MF.json own digest','Root future external seal full call+return evidence occurs after return']))
+        h=save('HDF.json',dict(schema='researchos.old21-root-caller-source-handoff.v1',status='SOURCE_ONLY_PENDING_NONAUTHOR_REVIEW_AND_ROOT_BINDING',source_author='codex:/root/backup_regression_resources',source_thread_id='01a11cee-bf59-7a01-be0e-9f799f9b1084',root_parent_thread_id='01a11007-5233-7ca1-b71f-9e9e5ce84c98',builder_source_author='codex:/root/native_temp_independent_review',manifest_ref=mref,caller_ref=caller,registrar_ref=caller,contract_ref=pin(Q/'root-calling-contract.source.json'),source_inputs_ref=pin(Q/'source-inputs.json'),base_Source_hdf_ref=b['base_hdf_ref'],base_Source_mf_ref=b['base_mf_ref'],base_Caller_ref=b['base_caller_ref'],prior_complete_inverse_ref=b['base_inverse_ref'],inverse_ref=pin(Q/'Task79-exact-inverse.json'),diff_ref=pin(Q/'candidate.diff'),controls_ref=pin(Q/'Task79-time-delta-controls.json'),controls10_Source_only=True,controls_guard_ref=pin(Q/'Task79-time-delta-controls.guard.closed.json'),implementation_ref=report,actual_Source_toolpairs_ref=pin(Q/'Source-actual-toolpairs.index.json'),Source_final_guard_ref=closure,successful_Source_guards_closed=True,retained_handles_count=0,live_Canon_handles=0,original_failure_refs=b['original_failure_refs'],Root_original1091_preserved_external=True,old_failed_guard_status=b['old_failed_guard_status'],new_original_failures=[],builder_source_hdf_ref=baseh['builder_source_hdf_ref'],builder_source_mf_ref=baseh['builder_source_mf_ref'],known_builder_Source_review_refs=b['known_builder_Source_review_refs'],current_before_archive_refs=b['current_before_archive_refs'],actual_Task76_observation_ref=b['actual_Task76_observation_ref'],actual_Task76_raw_ref=b['actual_Task76_raw_ref'],legacy_Task68_raw_ref=b['legacy_Task68_raw_ref'],Source_only=True,actual_RootScope_ref=None,actual_current4=None,actual_runtime_manifest_ref=None,actual_runtime_qualification_ref=None,actual_build_hostpair_ref=None,actual_programme_qualification_ref=None,actual_grant=False,execution_grant=False,formal_acceptance=False,parent_acceptance=False,source_self_acceptance=False,STOP_after_source_seal=True))
+        print(json.dumps(dict(HDF_ref=h,MF_ref=mref,caller_ref=caller,contract_ref=pin(Q/'root-calling-contract.source.json'),Source_guard_ref=closure,member_count=len(members),new_original_failures=[],actual_grant=False,formal_acceptance=False,STOP=True),ensure_ascii=False))
+    finally:
+        if not closed and any(not s.closed for s,_,_ in guard.held):save('Task79-seal-attempt-failure.guard.closed.json',guard.close())
+if __name__=='__main__':
+    try:main()
+    except BaseException:print('ROOT_PYTHON_EXIT=1');raise
+    print('ROOT_PYTHON_EXIT=0')

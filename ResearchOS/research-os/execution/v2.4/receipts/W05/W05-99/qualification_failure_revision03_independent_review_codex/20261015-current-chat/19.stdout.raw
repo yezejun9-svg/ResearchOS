@@ -1,0 +1,500 @@
+FILE internal/domain/backup_configuration_upgrade.go
+170: 	}
+171: 	return tx.Commit()
+172: }
+173: 
+174: func upgradeConfigurationLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+175: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+176: 	if e := upgradePaths(&opt); e != nil {
+177: 		return report, e
+178: 	}
+179: 	sourceRelease, _, e := upgradeConfigurationRelease(opt.SourceRoot, 22)
+180: 	if e != nil {
+181: 		return report, e
+182: 	}
+183: 	targetRelease, sqls, e := upgradeConfigurationRelease(opt.TargetRoot, 23)
+184: 	if e != nil {
+185: 		return report, e
+186: 	}
+187: 	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+188: 	if e != nil {
+189: 		return report, e
+190: 	}
+191: 	expectedSourceSchema, expectedTargetSchema, e := upgradeConfigurationTemplate(ctx, sqls, contracts)
+FILE internal/domain/backup_queue_upgrade.go
+30: }
+31: 
+32: // Same-host continuity reads only directory metadata. It does not copy a
+33: // workspace, grant access, or replace the existing host authority/pin store.
+34: func upgradeQueueWorkspaceIdentity(db *sql.DB, opt LocalUpgradeOptions) (Object, error) {
+35: 	bindings, e := workspaceBackupBindings(db)
+36: 	if e != nil {
+37: 		return nil, e
+38: 	}
+39: 	manifest := Object{}
+40: 	for _, b := range bindings {
+41: 		path, e := upgradeExistingPath(b.RealPath)
+42: 		if e != nil {
+43: 			return nil, e
+44: 		}
+45: 		if !strings.EqualFold(filepath.Clean(path), filepath.Clean(b.RealPath)) {
+46: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_ALIAS")
+47: 		}
+48: 		info, e := os.Stat(path)
+49: 		if e != nil || !info.IsDir() {
+50: 			return nil, fmt.Errorf("UPGRADE_WORKSPACE_DIRECTORY")
+51: 		}
+316: 	g.operationalHash = digest
+317: 	return nil
+318: }
+319: 
+320: func upgradeQueueLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+321: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+322: 	if e := upgradePaths(&opt); e != nil {
+323: 		return report, e
+324: 	}
+325: 	sourceRelease, _, e := upgradeQueueRelease(opt.SourceRoot, 21)
+326: 	if e != nil {
+327: 		return report, e
+328: 	}
+329: 	targetRelease, sqls, e := upgradeQueueRelease(opt.TargetRoot, 22)
+330: 	if e != nil {
+331: 		return report, e
+332: 	}
+333: 	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+334: 	if e != nil {
+335: 		return report, e
+336: 	}
+337: 	expectedSourceSchema, expectedTargetSchema, e := upgradeQueueTemplate(ctx, sqls, contracts)
+FILE internal/domain/backup_upgrade.go
+116: func upgradeInside(parent, child string) bool {
+117: 	rel, e := filepath.Rel(parent, child)
+118: 	return e == nil && (rel == "." || filepath.IsLocal(rel))
+119: }
+120: func upgradePaths(opt *LocalUpgradeOptions) error {
+121: 	for _, p := range []*string{&opt.Source, &opt.KeyFile, &opt.SourceRoot, &opt.TargetRoot, &opt.SourceProgram, &opt.TargetProgram} {
+122: 		v, e := upgradePath(*p, true)
+123: 		if e != nil {
+124: 			return e
+125: 		}
+126: 		*p = v
+127: 	}
+128: 	for _, p := range []*string{&opt.Snapshot, &opt.Destination} {
+129: 		v, e := upgradePath(*p, false)
+130: 		if e != nil {
+131: 			return e
+132: 		}
+133: 		*p = v
+134: 	}
+135: 	dirs := []string{filepath.Dir(opt.Source), filepath.Dir(opt.KeyFile), opt.Snapshot, opt.Destination}
+136: 	for i, a := range dirs {
+137: 		for _, b := range dirs[i+1:] {
+241: 	after, e := backupSchema(db)
+242: 	return before, after, e
+243: }
+244: 
+245: func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+246: 	if opt.Plan == PreparedAbandonmentSchemaUpgradePlan {
+247: 		return upgradePreparedAbandonmentLocal(ctx, opt, verifier)
+248: 	}
+249: 	if opt.Plan == ConfigurationSchemaUpgradePlan {
+250: 		return upgradeConfigurationLocal(ctx, opt, verifier)
+251: 	}
+252: 	if opt.Plan == QueueSchemaUpgradePlan {
+253: 		return upgradeQueueLocal(ctx, opt, verifier)
+254: 	}
+255: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+256: 	targetVersion := 14
+257: 	switch opt.Plan {
+258: 	case LocalUpgradePlan:
+259: 	case FinalSchemaUpgradePlan:
+260: 		targetVersion = 20
+261: 	default:
+262: 		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+FILE internal/host/runtime_verifier_replacement_windows.go
+45: 	PlanSHA256       string `json:"plan_sha256"`
+46: 	OldRecordSHA256  string `json:"old_record_sha256"`
+47: 	NewRecordSHA256  string `json:"new_record_sha256"`
+48: 	RegistrationHash string `json:"registration_hash"`
+49: 	InstallationHash string `json:"installation_hash"`
+50: 	ReadonlyCensus   [4]int `json:"readonly_census"`
+51: }
+52: 
+53: type replacementFileID struct {
+54: 	Volume    uint32
+55: 	IndexHigh uint32
+56: 	IndexLow  uint32
+57: }
+58: type replacementPlan struct {
+59: 	Schema                  string                      `json:"schema"`
+60: 	HistorySequence         uint64                      `json:"history_sequence"`
+61: 	PredecessorOperation    string                      `json:"predecessor_operation,omitempty"`
+62: 	PredecessorPlanSHA256   string                      `json:"predecessor_plan_sha256,omitempty"`
+63: 	PredecessorTerminalHash string                      `json:"predecessor_terminal_hash,omitempty"`
+64: 	OperationID             string                      `json:"operation_id"`
+65: 	CreatedAt               string                      `json:"created_at"`
+66: 	DataRoot                string                      `json:"data_root"`
+77: 	Census                  [4]int                      `json:"readonly_census"`
+78: 	OldBytes                []byte                      `json:"old_record_bytes"`
+79: 	OldSHA256               string                      `json:"old_record_sha256"`
+80: 	OldHash                 string                      `json:"old_registration_hash"`
+81: 	OldInstallationHash     string                      `json:"old_installation_hash"`
+82: 	Manifest                string                      `json:"manifest"`
+83: 	ManifestSHA256          string                      `json:"manifest_sha256"`
+84: 	Installation            RuntimeVerifierInstallation `json:"installation"`
+85: 	NewBytes                []byte                      `json:"new_record_bytes"`
+86: 	NewSHA256               string                      `json:"new_record_sha256"`
+87: 	NewHash                 string                      `json:"registration_hash"`
+88: 	NewInstallationHash     string                      `json:"installation_hash"`
+89: 	RollbackOf              string                      `json:"rollback_of,omitempty"`
+90: }
+91: 
+92: // Seams are package-private and are never wired from argv or environment. Tests
+93: // use them for external rename and real child-process termination boundaries.
+94: var replacementBoundary = func(string) {}
+95: var replacementReplace = callReplaceFile
+96: 
+97: func replacementID(s string) bool {
+98: 	b, e := hex.DecodeString(s)
+99: 	return e == nil && len(b) == 16 && strings.ToLower(s) == s
+100: }
+101: func replacementDigest(s string) bool {
+102: 	b, e := hex.DecodeString(strings.TrimPrefix(s, "sha256:"))
+103: 	return strings.HasPrefix(s, "sha256:") && e == nil && len(b) == 32 && strings.ToLower(s) == s
+104: }
+105: func replacementPath(p string) error {
+480: 	}
+481: 	if old.Schema != "researchos.runtime-verifier-registration.v1" || old.OwnerHost != p.HostID || old.OwnerPrincipal != p.Owner || old.ServiceRoot != p.Root || old.InstallHash != domain.Hash(old.Installation) {
+482: 		return p, errors.New("registered identity/hash mismatch")
+483: 	}
+484: 	p.OldHash, p.OldInstallationHash = domain.Hash(old), old.InstallHash
+485: 	raw, e := replacementRead(p.Manifest, 64<<10)
+486: 	if e != nil {
+487: 		return p, e
+488: 	}
+489: 	p.ManifestSHA256 = domain.Digest(raw)
+490: 	if p.ManifestSHA256 != in.ExpectManifestSHA256 {
+491: 		return p, errors.New("manifest raw digest changed")
+492: 	}
+493: 	p.Installation, e = LoadRuntimeVerifierInstallation(p.Manifest)
+494: 	if e != nil {
+495: 		return p, e
+496: 	}
+497: 	var decoded RuntimeVerifierInstallation
+498: 	if decodeRuntimeManaged(raw, &decoded) != nil || domain.Hash(decoded) != domain.Hash(p.Installation) {
+499: 		return p, errors.New("manifest raced validation")
+500: 	}
+501: 	image, e := replacementRead(p.Installation.Executable, 128<<20)
+515: 	p.NewBytes, e = json.MarshalIndent(old, "", "  ")
+516: 	if e != nil {
+517: 		return p, e
+518: 	}
+519: 	p.NewSHA256, p.NewHash, p.NewInstallationHash = domain.Digest(p.NewBytes), domain.Hash(old), old.InstallHash
+520: 	if p.RollbackOf != "" {
+521: 		if e = replacementValidateReverse(p); e != nil {
+522: 			return p, e
+523: 		}
+524: 	}
+525: 	return p, nil
+526: }
+527: 
+528: func replacementLoadPlan(path, digest string) (replacementPlan, []byte, error) {
+529: 	var p replacementPlan
+530: 	raw, e := replacementRead(path, 256<<10)
+531: 	if e != nil {
+532: 		return p, nil, e
+533: 	}
+534: 	if !replacementDigest(digest) || domain.Digest(raw) != digest {
+535: 		return p, nil, errors.New("plan raw digest differs")
+536: 	}
+552: 	if _, e := time.Parse(time.RFC3339Nano, p.CreatedAt); e != nil {
+553: 		return e
+554: 	}
+555: 	var old, new runtimeVerifierRegistration
+556: 	if decodeRuntimeManaged(p.OldBytes, &old) != nil || decodeRuntimeManaged(p.NewBytes, &new) != nil || domain.Digest(p.OldBytes) != p.OldSHA256 || domain.Digest(p.NewBytes) != p.NewSHA256 || domain.Hash(old) != p.OldHash || domain.Hash(new) != p.NewHash || old.InstallHash != p.OldInstallationHash || new.InstallHash != p.NewInstallationHash || domain.Hash(p.Installation) != p.NewInstallationHash || domain.Hash(old.Installation) != old.InstallHash || domain.Hash(new.Installation) != new.InstallHash {
+557: 		return errors.New("plan record linkage invalid")
+558: 	}
+559: 	if old.OwnerHost != p.HostID || old.OwnerPrincipal != p.Owner || old.ServiceRoot != p.Root || old.Schema != "researchos.runtime-verifier-registration.v1" || p.OldSHA256 == p.NewSHA256 {
+560: 		return errors.New("plan authority invalid")
+561: 	}
+562: 	expected := old
+563: 	expected.Installation = p.Installation
+564: 	expected.InstallHash = domain.Hash(p.Installation)
+565: 	raw, e := json.MarshalIndent(expected, "", "  ")
+566: 	if e != nil || !bytes.Equal(raw, p.NewBytes) {
+567: 		return errors.New("candidate bytes invalid")
+568: 	}
+569: 	ni, oi := p.Installation, old.Installation
+570: 	ni.Executable, ni.ExecutableHash, ni.SourceCommit = oi.Executable, oi.ExecutableHash, oi.SourceCommit
+571: 	if domain.Hash(ni) != domain.Hash(oi) {
+572: 		return errors.New("forbidden installation mutation")
+573: 	}
+752: 	current, e := readGuardedBytes(handle)
+753: 	if e != nil || !bytes.Equal(current, p.OldBytes) {
+754: 		return out, errors.New("final raw CAS failed")
+755: 	}
+756: 	if e = replacementAppend(dir, p, raw, "PUBLISHING"); e != nil {
+757: 		return out, e
+758: 	}
+759: 	replacementBoundary("publishing")
+760: 	if e = replacementReplace(target, filepath.Join(dir, "stage.bin"), filepath.Join(dir, "actual-backup.bin")); e != nil {
+761: 		return out, e
+762: 	}
+763: 	if e = handle.Close(); e != nil {
+764: 		return out, e
+765: 	}
+766: 	replacementBoundary("replaced")
+767: 	if e = replacementApplied(p, dir); e != nil {
+768: 		return out, e
+769: 	}
+770: 	replacementBoundary("before-committed")
+771: 	if e = replacementAppend(dir, p, raw, "COMMITTED"); e != nil {
+772: 		return out, e
+773: 	}
+781: 	return replacementResult(in.Action, p, in.ExpectPlanSHA256, "COMMITTED", "APPLIED"), nil
+782: }
+783: 
+784: func replacementResult(action string, p replacementPlan, digest, state, outcome string) RuntimeVerifierReplacementResult {
+785: 	return RuntimeVerifierReplacementResult{Schema: replacementSchema, Action: action, OperationID: p.OperationID, State: state, Outcome: outcome, PlanSHA256: digest, OldRecordSHA256: p.OldSHA256, NewRecordSHA256: p.NewSHA256, RegistrationHash: p.NewHash, InstallationHash: p.NewInstallationHash, ReadonlyCensus: p.Census}
+786: }
+FILE internal/host/runtime_verifier_replacement_journal_windows.go
+232: 	switch old {
+233: 	case "":
+234: 		return new == "PREPARED" || new == "ABORTED"
+235: 	case "PREPARED":
+236: 		return new == "PUBLISHING" || new == "ABORTED"
+237: 	case "PUBLISHING":
+238: 		return new == "COMMITTED" || new == "ABORTED"
+239: 	}
+240: 	return false
+241: }
+242: func replacementAppend(dir string, p replacementPlan, raw []byte, state string) error {
+243: 	v, e := replacementReadJournal(dir, p, raw)
+244: 	if e != nil {
+245: 		return e
+246: 	}
+247: 	prior, last := "", ""
+248: 	if len(v.Events) > 0 {
+249: 		ev := v.Events[len(v.Events)-1]
+250: 		prior, last = ev.Hash, ev.State
+251: 	}
+252: 	if !replacementTransition(last, state) {
+253: 		return errors.New("invalid journal transition")
+254: 	}
+304: 	install, e := LoadRuntimeVerifierInstallation(p.Manifest)
+305: 	if e != nil {
+306: 		return e
+307: 	}
+308: 	if domain.Hash(install) != p.NewInstallationHash {
+309: 		return errors.New("installation changed")
+310: 	}
+311: 	_, e = replacementRead(install.Executable, 128<<20)
+312: 	return e
+313: }
+314: 
+315: func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, raw []byte) (RuntimeVerifierReplacementResult, error) {
+316: 	out := replacementResult(in.Action, p, domain.Digest(raw), "UNKNOWN", "UNKNOWN")
+317: 	dir := filepath.Join(p.HostPath, replacementJournal, p.OperationID)
+318: 	guards, e := guardWriteDirectories(dir)
+319: 	if e != nil {
+320: 		return out, e
+321: 	}
+322: 	defer closeWriteGuards(guards)
+323: 	v, e := replacementReadJournal(dir, p, raw)
+324: 	if e != nil {
+325: 		return out, e
+358: 		}
+359: 		out.State, out.Outcome = "ABORTED", "NOT_APPLIED"
+360: 		return out, nil
+361: 	}
+362: 	if applied && state == "PUBLISHING" {
+363: 		if e = replacementInstallationValid(p); e != nil {
+364: 			return out, e
+365: 		}
+366: 		if in.RecoveryAction == "abort" {
+367: 			return out, errors.New("published operation cannot abort")
+368: 		}
+369: 		if in.RecoveryAction == "complete" {
+370: 			if e = replacementApplied(p, dir); e != nil {
+371: 				return out, e
+372: 			}
+373: 			if e = replacementAppend(dir, p, raw, "COMMITTED"); e != nil {
+374: 				return out, e
+375: 			}
+376: 			if e = replacementApplied(p, dir); e != nil {
+377: 				return out, e
+378: 			}
+379: 			if e = replacementCheckHistoryCurrent(p.DataRoot); e != nil {
+381: 			}
+382: 			out.State, out.Outcome = "COMMITTED", "APPLIED"
+383: 			return out, nil
+384: 		}
+385: 		out.State = "PUBLISHING"
+386: 		return out, nil
+387: 	}
+388: 	if !unapplied {
+389: 		return out, errors.New("replacement evidence ambiguous; no replay or rollback")
+390: 	}
+391: 	out.State, out.Outcome = "UNAPPLIED", "NOT_APPLIED"
+392: 	if in.RecoveryAction == "complete" {
+393: 		return out, errors.New("complete never replays ReplaceFile")
+394: 	}
+395: 	if in.RecoveryAction == "abort" {
+396: 		// Also provides recovery from death immediately after operation mkdir.
+397: 		for _, v := range []struct {
+398: 			name string
+399: 			data []byte
+400: 		}{{"plan.json", raw}, {"old-registration.bin", p.OldBytes}, {"new-registration.bin", p.NewBytes}} {
+401: 			if e = replacementWrite(dir, v.name, v.data); e != nil {
+402: 				return out, e
+RECEIPT 13.recipe.json
+{
+  "id": "13",
+  "purpose": "Read historical source binding and public proof collection manifests",
+  "cwd": ".",
+  "python": "from pathlib import Path\nimport json,hashlib\np=Path('execution/v2.4/receipts/W05/W05-99'); b=p/'historical_qualification_public_provenance_codex/20261015-current-chat'; r3=p/'qualification_failure_revision03_architecture_codex/20261015-current-chat'; frozen=json.loads((r3/'frozen-inputs.json').read_text(encoding='utf-8')); result=[]\nfor x in frozen['historical_sources']+frozen['pinned_inputs']+frozen['additional_input_refs']:\n q=Path(x['path']); raw=q.read_bytes(); result.append({'path':str(q),'expected':x['sha256'],'actual':hashlib.sha256(raw).hexdigest(),'match':hashlib.sha256(raw).hexdigest()==x['sha256']})\nout=p/'qualification_failure_revision03_independent_review_codex/20261015-current-chat'; (out/'historical-input-verification.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8'); print('HISTORICAL CHECKS',len(result),'BAD',[x for x in result if not x['match']])\nfor q in [b/'semantics01/COLLECTION-manifest.json',b/'verifier-authority-inputs01/COLLECTION-manifest.json',b/'attempt02/COLLECTION-manifest.json',p/'historical_mu_bundle_provenance_review_codex/20261015-current-chat/evidence-manifest.json']:\n print('FILE '+str(q)); print(q.read_text(encoding='utf-8'))\nfor d in [b/'semantics01',b/'verifier-authority-inputs01',b/'attempt02']:\n print('FILES '+str(d)); print([x.name for x in d.iterdir()])"
+}
+
+RECEIPT 14.recipe.json
+{
+  "id": "14",
+  "purpose": "Verify public collection members and read exact worker source binding evidence",
+  "cwd": ".",
+  "python": "from pathlib import Path\nimport json,hashlib\np=Path('execution/v2.4/receipts/W05/W05-99'); b=p/'historical_qualification_public_provenance_codex/20261015-current-chat'; out=p/'qualification_failure_revision03_independent_review_codex/20261015-current-chat'; checks=[]\nfor name in ['attempt02','semantics01','verifier-authority-inputs01']:\n manifest=json.loads((b/name/'COLLECTION-manifest.json').read_text(encoding='utf-8'))\n for x in manifest['files']:\n  q=Path(x['path']); raw=q.read_bytes(); checks.append({'path':str(q),'sha256':hashlib.sha256(raw).hexdigest(),'match':hashlib.sha256(raw).hexdigest()==x['sha256'] and len(raw)==x['bytes']})\n(out/'public-collection-verification.json').write_text(json.dumps(checks,ensure_ascii=False,indent=2),encoding='utf-8'); print('PUBLIC INPUT MATCHES',len(checks),all(x['match'] for x in checks))\nfor rel in ['attempt02/01-core-build-chain.json','attempt02/02-current-core-to-historical-identity.json','semantics01/01-extra-compiled-source-bindings.json','semantics01/02-public-bridge-structural-metadata.json','verifier-authority-inputs01/02-historical-response-and-state-inputs.json']:\n print('FILE '+rel); print((b/rel).read_text(encoding='utf-8'))"
+}
+
+RECEIPT historical-input-verification.json
+[
+  {
+    "path": "internal\\host\\runtime_qualification_windows.go",
+    "expected": "5b3ef9203b204215345c20240dcda3ae84c2c40d71a1e2a8bb03df7b16257d8b",
+    "actual": "5b3ef9203b204215345c20240dcda3ae84c2c40d71a1e2a8bb03df7b16257d8b",
+    "match": true
+  },
+  {
+    "path": "internal\\host\\runtime_verifier_process_windows.go",
+    "expected": "934a317d887bc5539c25657706a2c5b1d94957733e09b753e97a5ed4d7ac9aad",
+    "actual": "934a317d887bc5539c25657706a2c5b1d94957733e09b753e97a5ed4d7ac9aad",
+    "match": true
+  },
+  {
+    "path": "internal\\host\\desktop_management_windows.go",
+    "expected": "ceadc33520229494eccef4b0738fbb5bbb83a4e0dbe5a182184832dae84b65e5",
+    "actual": "ceadc33520229494eccef4b0738fbb5bbb83a4e0dbe5a182184832dae84b65e5",
+    "match": true
+  },
+  {
+    "path": "internal\\domain\\runtime_qualification_execution_windows.go",
+    "expected": "2ff8cac53ab3757b8116b32ab0bf09293e2c2f6eb22c3d54412eb39ca36261af",
+    "actual": "2ff8cac53ab3757b8116b32ab0bf09293e2c2f6eb22c3d54412eb39ca36261af",
+    "match": true
+  },
+  {
+    "path": "internal\\domain\\runtime_coordinator_windows.go",
+    "expected": "349dd354fdb43194533f2415457992cc7f76461d877f45f7dd162fd3ab335735",
+    "actual": "349dd354fdb43194533f2415457992cc7f76461d877f45f7dd162fd3ab335735",
+    "match": true
+  },
+  {
+    "path": "internal\\domain\\runtime_command_queue_windows.go",
+    "expected": "62da6c5d748359b3f7a2b9eecbf774551678ae88540e3009156e5fd7c01369c3",
+    "actual": "62da6c5d748359b3f7a2b9eecbf774551678ae88540e3009156e5fd7c01369c3",
+    "match": true
+  },
+  {
+    "path": "internal\\domain\\runtime_broker_windows.go",
+    "expected": "12d143c24e359b473938d77ee58662fe43941edb5f08f03c31adf4f9cef2fc20",
+    "actual": "12d143c24e359b473938d77ee58662fe43941edb5f08f03c31adf4f9cef2fc20",
+    "match": true
+  },
+  {
+    "path": "internal\\domain\\durability.go",
+    "expected": "eb0c9b1762c5485148da6fb4fe5d5504ec08c76f9ce6edc93b6d07b6da3ee4d2",
+    "actual": "eb0c9b1762c5485148da6fb4fe5d5504ec08c76f9ce6edc93b6d07b6da3ee4d2",
+    "match": true
+  },
+  {
+    "path": "adapters\\runtime\\bridge_windows.go",
+    "expected": "70a1cd8b448b8bbd8a23d22f4d4f2e9b1349d8293c9fe37d17b0aaa8d42764e2",
+    "actual": "70a1cd8b448b8bbd8a23d22f4d4f2e9b1349d8293c9fe37d17b0aaa8d42764e2",
+    "match": true
+  },
+  {
+    "path": "ops\\experiment_sandbox\\sandbox_windows.go",
+    "expected": "9eaeccc5a592a814d68546576a6de8d30d7e64a2109d23602fc6d113987ab44f",
+    "actual": "9eaeccc5a592a814d68546576a6de8d30d7e64a2109d23602fc6d113987ab44f",
+    "match": true
+  },
+  {
+    "path": "ops\\experiment_sandbox\\async_windows.go",
+    "expected": "f1c95a088eaaf5e2b18f15ffd2c077f42cd9b4d315b6453885b14af5bfdd6e5c",
+    "actual": "f1c95a088eaaf5e2b18f15ffd2c077f42cd9b4d315b6453885b14af5bfdd6e5c",
+    "match": true
+  },
+  {
+    "path": "spec\\v2.0\\03_DATA_CONTRACTS.md",
+    "expected": "3e22b967c8809caf9bafaf958530f3abb0446c6dd4a8e3b83880e5d85840c469",
+    "actual": "3e22b967c8809caf9bafaf958530f3abb0446c6dd4a8e3b83880e5d85840c469",
+    "match": true
+  },
+  {
+    "path": "spec\\v2.0\\02_TECHNICAL_DESIGN.md",
+    "expected": "2c33a3623b5e7c3d7a533b7f1f8669539eeff5c97a28b20697645e764e487f6d",
+    "actual": "2c33a3623b5e7c3d7a533b7f1f8669539eeff5c97a28b20697645e764e487f6d",
+    "match": true
+  },
+  {
+    "path": "spec\\v2.0\\04_API_CONTRACTS.md",
+    "expected": "91230e5d7894288aa16d8b92ca3c6f302728acd801536c15c57274e828755875",
+    "actual": "91230e5d7894288aa16d8b92ca3c6f302728acd801536c15c57274e828755875",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\qualification_failure_revision02_architecture_codex\\20261015-current-chat\\FINAL-manifest.json",
+    "expected": "24cad12c2ff5bcb9df20c9749c384a8cb67b5459a30a168e316b8d8e209ae3d6",
+    "actual": "24cad12c2ff5bcb9df20c9749c384a8cb67b5459a30a168e316b8d8e209ae3d6",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\qualification_failure_revision02_independent_review_codex\\20261015-current-chat\\FINAL-manifest.json",
+    "expected": "42acdbcd1121edd010699df1f609d56c2e7e1ccf495a06dcacb60ed7108126bd",
+    "actual": "42acdbcd1121edd010699df1f609d56c2e7e1ccf495a06dcacb60ed7108126bd",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\qualification_failure_revision02_independent_review_codex\\20261015-current-chat\\C-minimal-addendum.json",
+    "expected": "e5708228666960423078796f14c50714eec92d9761df24dc616867d188002361",
+    "actual": "e5708228666960423078796f14c50714eec92d9761df24dc616867d188002361",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\qualification_failure_revision02_independent_review_codex\\20261015-current-chat\\STOP-alternative-proof-prerequisites.json",
+    "expected": "009c83ebf257583a95cdda58c75811f8b47bb0906c8af2cc4815022024c445ec",
+    "actual": "009c83ebf257583a95cdda58c75811f8b47bb0906c8af2cc4815022024c445ec",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\historical_qualification_public_provenance_codex\\20261015-current-chat\\semantics01\\COLLECTION-manifest.json",
+    "expected": "65f8dc740f745f0d836ad886222c6e52ec980a60edcc86bf363873f547ded258",
+    "actual": "65f8dc740f745f0d836ad886222c6e52ec980a60edcc86bf363873f547ded258",
+    "match": true
+  },
+  {
+    "path": "execution\\v2.4\\receipts\\W05\\W05-99\\historical_qualification_public_provenance_codex\\20261015-current-chat\\verifier-authority-inputs01\\COLLECTION-manifest.json",
+    "expected": "29872605ae6a972dbcbbfaf77b675859b4f8c975ee270b9ae974ae38ed36c558",
+    "actual": "29872605ae6a972dbcbbfaf77b675859b4f8c975ee270b9ae974ae38ed36c558",
+    "match": true
+  },
+  {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\verifier_replacement_package_codex\\20261015-current-chat\\runtime-verifier-build.stderr",
+    "expected": "4514ddf56550118e96ba0aa58ab9e31e0f3fafb269c5e1114fb4ac4b5848eace",
+    "actual": "4514ddf56550118e96ba0aa58ab9e31e0f3fafb269c5e1114fb4ac4b5848eace",
+    "match": true
+  },
+  {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\verifier_replacement_package_codex\\20261015-current-chat\\compiler-module-inputs.before.json",
+    "expected": "3c73f1007cb88dbd2727811006a7172ba2845d8ba3d23f8cee764c3cb723b30d",
+    "actual": "3c73f1007cb88dbd2727811006a7172ba2845d8ba3d23f8cee764c3cb723b30d",
+    "match": true
+  }
+]

@@ -1,0 +1,93 @@
+--- original/windows_debug_job_tree.py
++++ candidate/windows_debug_job_tree.py
+@@ -107,6 +107,8 @@
+ 
+     processes = {}
+     generations = []
++    debug['process_generations'] = generations  # Live partial observations, including failures.
++    debug['pending_failure_event'] = None
+     cleanup = result['job_cleanup']
+     started = time.monotonic()
+     capture_deadline = None
+@@ -338,6 +340,7 @@
+                 raise ctypes.WinError(error)
+             status = 0x00010002
+             event_fact = {'code':int(event.code), 'pid':int(event.pid), 'tid':int(event.tid)}
++            event_owned = event.pid in processes and not processes[event.pid]['exit_continued']
+             raw = bytes(event.u)
+             event_file = struct.unpack_from('<Q', raw, 0)[0] if event.code in (3, 6) else 0
+             try:
+@@ -353,6 +356,7 @@
+                     require(in_job(ph, job, ctypes.byref(membership)))
+                     if not membership.value:
+                         raise RuntimeError('Debug child not a member of the actual exclusive Job')
++                    event_owned = True  # Actual IsProcessInJob succeeded while event is held.
+                     retained_process = HANDLE()
+                     require(duplicate(current(), ph, current(), ctypes.byref(retained_process), 0, False, 2))
+                     handles.append(retained_process.value)
+@@ -412,15 +416,42 @@
+                 try:
+                     if event_file and event_file != 0xFFFFFFFFFFFFFFFF:
+                         require(close(HANDLE(event_file)))
++                except BaseException as exc:
++                    record_error(exc)
+                 finally:
+-                    # Always release the received notification, even after capture failure.
+-                    require(continue_debug(event.pid, event.tid, status))
+-                    if event.code == 5 and event.pid in processes:
+-                        processes[event.pid]['exit_continued'] = True
+-                    if len(debug['events']) < 131072:
+-                        debug['events'].append(event_fact)
+-                    else:
++                    if len(debug['events']) >= 131072:
+                         record_error(RuntimeError('Debug event bound exceeded'))
++                    failed = result['error'] is not None or result['timed_out']
++                    may_continue = not failed
++                    if failed:
++                        pending = dict(event_fact, continuation_status=status, owned_event=event_owned)
++                        debug['pending_failure_event'] = pending
++                        # Never release an unqualified image/module before killing its owned Job.
++                        try:
++                            if not assigned:
++                                raise RuntimeError('Failed event has no assigned exclusive Job')
++                            cleanup['termination_code_requested'] = 0xE0000308
++                            cleanup['termination_requested'] = True
++                            cleanup['termination_succeeded'] = bool(terminate_job(job, 0xE0000308))
++                            require(cleanup['termination_succeeded'])
++                            event_fact['job_terminated_before_continue'] = True
++                            may_continue = event_owned
++                        except BaseException as exc:
++                            record_error(exc)
++                    try:
++                        if may_continue:
++                            require(continue_debug(event.pid, event.tid, status))
++                            event_fact['continued'] = True
++                            debug['pending_failure_event'] = None
++                            if event.code == 5 and event.pid in processes:
++                                processes[event.pid]['exit_continued'] = True
++                        else:
++                            event_fact['continued'] = False
++                    except BaseException as exc:
++                        record_error(exc)
++                    finally:
++                        if len(debug['events']) < 131072:
++                            debug['events'].append(event_fact)
+ 
+         def observe():
+             state = wait(process, 0)
+@@ -535,6 +566,15 @@
+                         cleanup['unassigned_suspended_child_termination_requested'] = True
+                         cleanup['unassigned_suspended_child_termination_succeeded'] = bool(terminate_process(process, requested))
+                         require(cleanup['unassigned_suspended_child_termination_succeeded'])
++                    pending = debug['pending_failure_event']
++                    if pending is not None:
++                        if not assigned or not cleanup.get('termination_succeeded') or not pending['owned_event']:
++                            raise RuntimeError('Held failed debug event cannot be safely continued')
++                        require(continue_debug(pending['pid'], pending['tid'], pending['continuation_status']))
++                        pending['cleanup_continued_after_job_termination'] = True
++                        if pending['code'] == 5 and pending['pid'] in processes:
++                            processes[pending['pid']]['exit_continued'] = True
++                        debug['pending_failure_event'] = None
+                     deadline = time.monotonic() + 5.0
+                     while not observe() and time.monotonic() < deadline:
+                         pump(20, cleanup_mode=True)

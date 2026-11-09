@@ -1,0 +1,127 @@
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1001: func historicalQualificationRefs(tx *sql.Tx, project, kind, id string, revision int64) ([]any, error) {
+1002: 	rows, err := tx.Query(`SELECT field,target_project,target_kind,target_id,target_revision FROM domain_refs
+1003: 		WHERE project=? AND kind=? AND id=? AND revision=?
+1004: 		ORDER BY field,target_project,target_kind,target_id,target_revision`, project, kind, id, revision)
+1005: 	if err != nil {
+1006: 		return nil, err
+1007: 	}
+1008: 	defer rows.Close()
+1009: 	var out []any
+1010: 	for rows.Next() {
+1011: 		var field, targetProject, targetKind, targetID string
+1012: 		var targetRevision int64
+1013: 		if err = rows.Scan(&field, &targetProject, &targetKind, &targetID, &targetRevision); err != nil {
+1014: 			return nil, err
+1015: 		}
+1016: 		out = append(out, []any{field, targetProject, targetKind, targetID, targetRevision})
+1017: 	}
+1018: 	return out, rows.Err()
+1019: }
+1020: 
+1021: func historicalRefValue(object Object, path string) any {
+1022: 	var current any = object
+1023: 	for _, component := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+1024: 		switch x := current.(type) {
+1025: 		case map[string]any:
+1026: 			current = x[component]
+1027: 		case []any:
+1028: 			i, e := strconv.Atoi(component)
+1029: 			if e != nil || i < 0 || i >= len(x) {
+1030: 				return nil
+1031: 			}
+1032: 			current = x[i]
+1033: 		default:
+1034: 			return nil
+1035: 		}
+1036: 	}
+1037: 	return current
+1038: }
+1039: 
+1040: func historicalQualificationRefRevisionMatches(tx *sql.Tx, project, kind string, object Object, oldRows, newRows []any) (bool, error) {
+1041: 	if len(oldRows) != len(newRows) {
+1042: 		return false, nil
+1043: 	}
+1044: 	for i, entry := range newRows {
+1045: 		current, ok := entry.([]any)
+1046: 		if !ok || len(current) != 5 {
+1047: 			return false, nil
+1048: 		}
+1049: 		prior, ok := oldRows[i].([]any)
+1050: 		if !ok || len(prior) != 5 {
+1051: 			return false, nil
+1052: 		}
+1053: 		for j := 0; j < 4; j++ {
+1054: 			if current[j] != prior[j] {
+1055: 				return false, nil
+1056: 			}
+1057: 		}
+1058: 		field, ok := current[0].(string)
+1059: 		if !ok || !strings.HasPrefix(field, "/") {
+1060: 			return false, nil
+1061: 		}
+1062: 		targetKind, _ := current[2].(string)
+1063: 		targetID, _ := current[3].(string)
+1064: 		targetRevision, ok := current[4].(int64)
+1065: 		if !ok {
+1066: 			return false, nil
+1067: 		}
+1068: 		value := historicalRefValue(object, field)
+1069: 		if ref, ok := value.(map[string]any); ok {
+1070: 			rev, e := Num(Object(ref), "revision")
+1071: 			if e != nil || ref["entity_type"] != targetKind || ref["id"] != targetID || rev != targetRevision {
+1072: 				return false, nil
+1073: 			}
+1074: 			continue
+1075: 		}
+1076: 		parts := strings.Split(strings.TrimPrefix(field, "/"), "/")
+1077: 		if len(parts) == 0 || relationKind(kind, parts[0]) != targetKind {
+1078: 			return false, nil
+1079: 		}
+1080: 		textValue, _ := value.(string)
+1081: 		contained := textValue == targetID
+1082: 		if list, ok := value.([]any); ok {
+1083: 			contained = false
+1084: 			for _, v := range list {
+1085: 				if v == targetID {
+1086: 					contained = true
+1087: 					break
+1088: 				}
+1089: 			}
+1090: 		}
+1091: 		if !contained {
+1092: 			return false, nil
+1093: 		}
+1094: 		var currentRevision int64
+1095: 		if e := tx.QueryRow(`SELECT revision FROM domain_objects WHERE project=? AND kind=? AND id=?`,
+1096: 			project, targetKind, targetID).Scan(&currentRevision); e != nil {
+1097: 			return false, e
+1098: 		}
+1099: 		if currentRevision != targetRevision {
+1100: 			return false, nil
+1101: 		}
+1102: 	}
+1103: 	return true, nil
+1104: }
+1105: 
+
+FILE internal/domain/qualification_failure_maintenance_windows.go
+1155: 			if actualRevision != rev || body != string(Bytes(entry.object)) {
+1156: 				return false, nil
+1157: 			}
+1158: 			wantHash := ""
+1159: 			if entry.kind == "Artifact" {
+1160: 				wantHash = Str(entry.object, "content_hash")
+1161: 			}
+1162: 			if entry.kind == "EventEnvelope" {
+1163: 				wantHash = Str(entry.object, "receipt_hash")
+1164: 			}
+1165: 			if contentHash.Valid != (wantHash != "") || contentHash.Valid && contentHash.String != wantHash ||
+1166: 				table == "domain_objects" && (immutable == 1) != (entry.kind == "EventEnvelope") {
+1167: 				return false, nil
+1168: 			}
+085b4711afe0c1288448b174eef24ecd5af0551b:migrations/sqlite/0002_domain.sql:39:CREATE TRIGGER IF NOT EXISTS objects_immutable BEFORE UPDATE ON domain_objects WHEN OLD.immutable=1 BEGIN SELECT RAISE(ABORT,'immutable receipt'); END;
+085b4711afe0c1288448b174eef24ecd5af0551b:migrations/sqlite/0002_domain.sql:40:CREATE TRIGGER IF NOT EXISTS artifact_immutable BEFORE UPDATE ON domain_objects WHEN OLD.kind='Artifact' AND (NEW.content_hash IS NOT OLD.content_hash OR json_extract(NEW.body,'$.storage_key') IS NOT json_extract(OLD.body,'$.storage_key') OR json_extract(NEW.body,'$.access_class') IS NOT json_extract(OLD.body,'$.access_class')) BEGIN SELECT RAISE(ABORT,'sealed content'); END;
+085b4711afe0c1288448b174eef24ecd5af0551b:migrations/sqlite/0002_domain.sql:43:CREATE TRIGGER IF NOT EXISTS artifact_metadata_immutable BEFORE UPDATE ON domain_objects WHEN OLD.kind='Artifact' AND json_remove(NEW.body,'$.revision','$.updated_at','$.validity') != json_remove(OLD.body,'$.revision','$.updated_at','$.validity') BEGIN SELECT RAISE(ABORT,'sealed metadata'); END;
+085b4711afe0c1288448b174eef24ecd5af0551b:migrations/sqlite/0024_prepared_run_abandonment.sql:33:CREATE TRIGGER runtime_prepared_abandoned_run_immutable BEFORE UPDATE ON domain_objects

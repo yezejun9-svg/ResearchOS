@@ -1,0 +1,32 @@
+--- baseline/internal/domain/backup_host_configuration.go
++++ snapshot/internal/domain/backup_host_configuration.go
+@@ -236,13 +236,28 @@
+ 		if e = ValidateResultAgainstMethod(method, &response, doc); e != nil {
+ 			return e
+ 		}
++		req, known, e := readClientCommandEnvelope(doc, Str(journal[0], "headers"))
++		if e != nil {
++			return e
++		}
++		if known {
++			if req.hash != identity["request_hash"] || req.hash != journal[0]["request_hash"] || deref(req.env.CommandID) != command || deref(req.env.Method) != method || deref(req.env.ProjectID) != identity["project"] {
++				return fmt.Errorf("BACKUP_CONFIGURATION_ORIGINAL_REQUEST")
++			}
++			if _, e = decodeClientIdentityResponse(doc, req, raw); e != nil {
++				return e
++			}
++			if e = validateClientDerivedSession(context.Background(), tx, principal, req, &response); e != nil {
++				return e
++			}
++		}
+ 		if method == "host.status" && deref(response.Status) == "COMPLETED" && response.Result["authenticated_principal_ref"] != principal {
+ 			return fmt.Errorf("BACKUP_CONFIGURATION_RESPONSE_PRINCIPAL")
+ 		}
+ 		if method == "host.configure" && deref(response.Status) == "COMPLETED" && !configured[Hash([]string{principal, command})] {
+ 			return fmt.Errorf("BACKUP_CONFIGURATION_RESULT_WITHOUT_HISTORY")
+ 		}
+-		if response.SessionID != nil {
++		if response.SessionID != nil && !(known && deref(response.Status) == "REJECTED") {
+ 			var n int
+ 			if e = tx.QueryRow(`SELECT count(*) FROM client_sessions WHERE id=? AND project_id=?`, *response.SessionID, identity["project"]).Scan(&n); e != nil || n != 1 {
+ 				return fmt.Errorf("BACKUP_CONFIGURATION_RESPONSE_SESSION")

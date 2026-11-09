@@ -1,0 +1,91 @@
+14:func queueBackupFixture(t *testing.T) (*fixture, *ClientService, string, string) {
+15-	f, svc, client, sid := queueClientFixture(t)
+16-	for _, mode := range []string{"STEER", "FOLLOW_UP"} {
+17-		reply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.send", Object{"text": "snapshot may predate a later send", "attachment_artifact_ids": Empty(), "delivery": mode}))
+18-		if deref(reply.Status) != "COMPLETED" {
+19-			t.Fatal(string(Bytes(reply)))
+20-		}
+21-	}
+22-	// Revocation is legitimate pre-backup workspace state; this fixture tests
+23-	// queue evidence independently from the already-covered filesystem remap.
+24-	if _, err := f.db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','REVOKED') WHERE kind='WorkspaceBinding'`); err != nil {
+25-		t.Fatal(err)
+26-	}
+27-	return f, svc, client, sid
+28-}
+29-func TestClientQueueBackupRestorePreservesHistoryAndFencesNoRun(t *testing.T) {
+30-	f, _, _, sid := queueBackupFixture(t)
+31-	key := backupTestKey(t)
+32-	backup, manifest := backupTestCreate(t, f.s, key)
+33-	if manifest.Inventory["command_queue_digest"] == nil {
+34-		t.Fatal("queue not inventoried")
+35-	}
+36-	_, files, err := readBackup(backup, key)
+37-	if err != nil || files["command-queue.json"] == nil {
+38-		t.Fatal("portable queue sidecar absent", err)
+39-	}
+40-	destination := filepath.Join(t.TempDir(), "restore")
+41-	report, err := RestoreBackup(context.Background(), backup, destination, backupOpt(t, f.s, key))
+42-	if err != nil {
+43-		t.Fatal(err)
+44-	}
+45-	if report.Status != "RESTORED_RECONCILIATION_REQUIRED" {
+46-		t.Fatal(report.Status)
+47-	}
+48-	db, err := store.Open(filepath.Join(destination, "state.sqlite"))
+49-	if err != nil {
+50-		t.Fatal(err)
+51-	}
+52-	defer db.Close()
+53-	var unknown, receipts, runs int
+54-	db.QueryRow(`SELECT count(*) FROM client_command_queue WHERE state='UNKNOWN'`).Scan(&unknown)
+55-	db.QueryRow(`SELECT count(*) FROM client_control_receipts WHERE kind='RESTORE_UNKNOWN'`).Scan(&receipts)
+56-	db.QueryRow(`SELECT count(*) FROM domain_objects WHERE kind='Run'`).Scan(&runs)
+57-	if unknown != 2 || receipts != 2 || runs != 0 {
+58-		t.Fatalf("unknown=%d receipt=%d invented Run=%d", unknown, receipts, runs)
+59-	}
+60-	var fence string
+61-	var restored, explicit int
+62-	db.QueryRow(`SELECT state,restore_fenced FROM client_queue_fences WHERE session_id=?`, sid).Scan(&fence, &restored)
+63-	db.QueryRow(`SELECT resume_requires_explicit_user FROM client_sessions WHERE id=?`, sid).Scan(&explicit)
+64-	if fence != "RECONCILING" || restored != 1 || explicit != 1 {
+65-		t.Fatalf("fence=%s restored=%d explicit=%d", fence, restored, explicit)
+66-	}
+67-	restoredService := &Service{DB: db, Contracts: f.s.Contracts}
+68-	again := filepath.Join(t.TempDir(), "rebackup")
+69-	if _, err = restoredService.CreateBackup(context.Background(), again, key); err != nil {
+70-		t.Fatal(err)
+71-	}
+72-	if _, err = RestoreBackup(context.Background(), again, filepath.Join(t.TempDir(), "restore-again"), backupOpt(t, restoredService, key)); err != nil {
+73-		t.Fatal(err)
+74-	}
+75-}
+76-func TestClientQueueBackupCorruptionFailsClosed(t *testing.T) {
+77-	for _, kind := range []string{"content", "receipt", "foreign-session", "watermark", "orphan", "missing-table", "receipt-chain", "foreign-goal"} {
+78-		t.Run(kind, func(t *testing.T) {
+79-			f, _, _, _ := queueBackupFixture(t)
+80-			switch kind {
+81-			case "missing-table":
+82-				if _, err := f.db.Exec(`DROP TABLE client_control_requests`); err != nil {
+83-					t.Fatal(err)
+84-				}
+85-			case "foreign-goal":
+86-				f.db.Exec(`UPDATE client_command_queue SET goal_id='foreign'`)
+87-			case "receipt-chain":
+88-				sourceTx(t, f.db, func(tx *sql.Tx) error {
+89-					var generation, command string
+90-					tx.QueryRow(`SELECT generation,command_id FROM client_command_queue LIMIT 1`).Scan(&generation, &command)
+91-					return appendClientReceipt(tx, f.project, generation, command, "TEST", ID(), Object{"phase": "unknown"}, "missing-prior")
+92-				})
+93-			case "content":
+94-				f.db.Exec(`UPDATE client_command_queue SET content='{}'`)
+95-			case "receipt":
+96-				sourceTx(t, f.db, func(tx *sql.Tx) error {
+97-					var generation string
+98-					tx.QueryRow(`SELECT generation FROM client_queue_fences`).Scan(&generation)
+99-					_, err := tx.Exec(`INSERT INTO client_control_receipts(receipt_id,project,generation,kind,body,body_hash,created_at) VALUES(?,?,?,'TEST','{}','bad',?)`, ID(), f.project, generation, Now())
+100-					return err
+101-				})
+102-			case "foreign-session":
+103-				f.db.Exec(`UPDATE client_queue_fences SET session_id='foreign'`)
+104-			case "watermark":

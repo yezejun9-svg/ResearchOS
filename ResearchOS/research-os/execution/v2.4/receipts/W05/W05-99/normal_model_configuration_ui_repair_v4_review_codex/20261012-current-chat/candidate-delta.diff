@@ -1,0 +1,194 @@
+diff --git a/apps/desktop/main/lib/ipc.js b/apps/desktop/main/lib/ipc.js
+index b95fd514..17d12489 100644
+--- a/apps/desktop/main/lib/ipc.js
++++ b/apps/desktop/main/lib/ipc.js
+@@ -57,9 +57,19 @@ async function callCore(deps, client, method, body) {
+ //
+ // The credential is never invented: deps.credential (or RESEARCHOS_HOST_CREDENTIAL) supplies a bearer the host
+ // issued, and its absence is reported as CREDENTIAL_ABSENT rather than as a completed action.
+-async function callV2(deps, method, payload) {
++async function callV2Internal(deps, method, payload, localOrigin) {
+   const started = await host.ensureCore(deps);
+   if (!started.discovery) return { ok: false, reason: started.health, method };
++  // Local-only receipt metadata. This is derived from native discovery, never
++  // from a protocol response or a renderer-supplied request field.
++  const nativeOrigin = discovery => {
++    const key=JSON.stringify([native.hostInstanceId(deps.fsImpl,discovery),discovery.data_dir]);
++    return {key,ref:require('node:crypto').createHash('sha256').update(key).digest('hex')};
++  };
++  if (method === 'host.status') {
++    try { localOrigin.ref=nativeOrigin(started.discovery).ref; }
++    catch { return {ok:false,reason:'HOST_IDENTITY_UNAVAILABLE',method,dispatch_state:'NOT_SENT'}; }
++  }
+   const state = deps.sessionState || {};
+   const exact = await import('./wire-values.mjs');
+   let payloadKey;
+@@ -72,12 +82,12 @@ async function callV2(deps, method, payload) {
+   const pending = barrier();
+   const replay = pending && pending.method === method && pending.payloadKey === payloadKey;
+   const write = v2.WRITE_METHODS.includes(method) || method === 'host.configure' || (method === 'session.attach' && payload?.request_write_owner === true);
+-  if (pending && write && !replay) return {ok:false,reason:'COMMAND_PENDING',method,protocol_status:'ACKNOWLEDGED'};
++  if (pending && write && !replay) return {ok:false,reason:'COMMAND_PENDING',method,protocol_status:'ACKNOWLEDGED',dispatch_state:'NOT_SENT'};
+   // The command belongs to a logical native host, not its current port/PID.
+   // A replay against another data root or instance must stay unresolved.
+   let hostKey;
+   if (write) {
+-    try { hostKey=JSON.stringify([native.hostInstanceId(deps.fsImpl,started.discovery),started.discovery.data_dir]); }
++    try { const bound=nativeOrigin(started.discovery);hostKey=bound.key;localOrigin.ref=replay ? pending.hostOriginRef : bound.ref; }
+     catch { return {ok:false,reason:'HOST_IDENTITY_UNAVAILABLE',method,...(pending?{}:{dispatch_state:'NOT_SENT'})}; }
+     if (replay && pending.hostKey !== hostKey) return {ok:false,reason:'HOST_CHANGED_PENDING',method,protocol_status:'ACKNOWLEDGED'};
+   }
+@@ -92,7 +102,7 @@ async function callV2(deps, method, payload) {
+   if (write) {
+     const latest=host.readDiscovery(deps.fsImpl,deps.discoveryFile);
+     let latestKey;
+-    try { if (latest.ok) latestKey=JSON.stringify([native.hostInstanceId(deps.fsImpl,latest.discovery),latest.discovery.data_dir]); }
++    try { if (latest.ok) latestKey=nativeOrigin(latest.discovery).key; }
+     catch { /* A replacement discovery cannot inherit this command. */ }
+     if (latestKey !== hostKey) return {ok:false,reason:replay?'HOST_CHANGED_PENDING':'HOST_CHANGED_BEFORE_SEND',method,...(replay?{protocol_status:'ACKNOWLEDGED'}:{dispatch_state:'NOT_SENT'})};
+   }
+@@ -114,7 +124,7 @@ async function callV2(deps, method, payload) {
+   if (typeof deps.v2Transport !== 'function') return {ok:false,reason:'VALIDATOR_UNAVAILABLE',method,...(replay?{}:{dispatch_state:'NOT_SENT'})};
+   const sequence = (callV2.sequences ||= new WeakMap());
+   const ticket = (sequence.get(state) || 0) + 1; sequence.set(state,ticket);
+-  const operation = replay ? pending : {method,payloadKey,commandId:identity.commandId,write,hostKey,original,possiblySent:false,
++  const operation = replay ? pending : {method,payloadKey,commandId:identity.commandId,write,hostKey,hostOriginRef:localOrigin.ref,original,possiblySent:false,
+     request:{...req,headers:{'Content-Type':'application/json'}},acknowledged:false};
+   operation.inFlight=true;operations.set(identity.commandId,operation);
+   let reply;
+@@ -145,7 +155,8 @@ async function callV2(deps, method, payload) {
+   operations.delete(identity.commandId);
+   if (barrier()) state.pendingOperation=barrier(); else delete state.pendingOperation;
+   if (body.status==='REJECTED') return {ok:false,completed:false,method,protocol_status:body.status,kind:body.status,error_code:body.error_code,error:body.error,reason:body.error_code};
+-  if (sequence.get(state)!==ticket || !tupleUnchanged) return {ok:false,reason:'STALE_RESPONSE',method};
++  if (sequence.get(state)!==ticket || !tupleUnchanged) return {ok:false,reason:'STALE_RESPONSE',method,
++    ...(method==='host.configure'?{local_terminal_result:body.result}:{})};
+   const value=body.result;
+   const snapshot = value?.snapshot || (['session.get','session.create','session.update'].includes(method) ? value : null);
+   // A later GET cannot complete an earlier acknowledged attach/write command.
+@@ -160,6 +171,13 @@ async function callV2(deps, method, payload) {
+     result:value,revision:body.revision,requests:[method]};
+ }
+ 
++async function callV2(deps, method, payload) {
++  const localOrigin={ref:null};
++  const reply=await callV2Internal(deps,method,payload,localOrigin);
++  if (method !== 'host.status' && method !== 'host.configure') return reply;
++  return {...reply,local_host_origin:localOrigin.ref};
++}
++
+ function registerDesktopReview(ipcMain, deps) {
+   ipcMain.handle('ros:desktop:context', async () => {
+     if (deps.contextStore && deps.sessionState.projectId && deps.sessionState.sessionId && !deps.contextVerified) {
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index 284136f7..b679773a 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -6,6 +6,8 @@ import { SessionContinuation } from './session-continuation.jsx'
+ const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
+ const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
+ const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
++const sameConfiguration = (value, request) => !!value?.model_config_ref &&
++  ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
+ // The shell owns the command lifetime. This observable renderer snapshot holds
+ // only the public payload and terminal result across route unmounts.
+ const modelConfigurationPending = new Map()
+@@ -49,8 +51,10 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured
+     const selected = await window.researchos.desktop.selectProject(projectId)
+     if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
+     if (!live.current) throw new Error('页面已切换')
+-    const value = unwrap(await window.researchos.v2['host.status']({}))
++    const reply = await window.researchos.v2['host.status']({})
++    const value = { ...unwrap(reply), localHostOrigin: reply?.local_host_origin }
+     if (!Number.isSafeInteger(value?.config_revision) || value.config_revision < 0) throw new Error('主机未返回有效的配置修订')
++    if (!/^[a-f0-9]{64}$/.test(value.localHostOrigin || '')) throw new Error('主机未返回可信的本地身份')
+     if (!live.current) throw new Error('页面已切换')
+     setHost(value)
+     return value
+@@ -62,32 +66,29 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured
+     entry.reconciling = (async () => {
+       if (!live.current || modelPending(projectId) !== entry) return
+       const reply = entry.outcome
+-      if (reply?.ok && settled(reply)) {
+-        const saved = unwrap(reply)
+-        if (saved?.config_revision !== entry.payload.config_revision || !saved?.model_config_ref) throw new Error('主机配置回执缺少修订或模型引用')
+-        const refreshed = await readHost()
+-        if (!refreshed.model_configurations?.some(item => item.model_config_ref === saved.model_config_ref)) throw new Error('配置已返回成功，但主机状态尚未列出该模型，请刷新核对')
++      if (reply?.dispatch_state === 'NOT_SENT') {
++        // This attempt never reached HTTP. It has no original-host effect to
++        // reconcile, even if another project's command owns the shell barrier.
++        updateModelPending(projectId, null)
++        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reply?.reason || '本地请求未发送'))
++        return
++      }
++      const refreshed = await readHost()
++      if (!entry.origin || refreshed.localHostOrigin !== entry.origin || reply?.local_host_origin !== entry.origin) {
++        throw new Error('主机已切换；原配置只能在原主机核对，当前主机不可证明保存结果')
++      }
++      if ((reply?.ok && settled(reply)) || reply?.reason === 'STALE_RESPONSE') {
++        const saved = reply?.reason === 'STALE_RESPONSE' ? reply.local_terminal_result : unwrap(reply)
++        if (!sameConfiguration(saved, entry.payload)) throw new Error('原配置回执缺少完整的配置身份；请核对原主机状态')
++        if (!refreshed.model_configurations?.some(item => sameConfiguration(item, entry.payload) && item.model_config_ref === saved.model_config_ref)) {
++          throw new Error('原主机状态尚未列出同一配置；请刷新核对')
++        }
+         if (!live.current || modelPending(projectId) !== entry) return
+         updateModelPending(projectId, null)
+         onConfigured?.(refreshed, saved)
+         setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+       } else {
+         const reason = reply?.reason || reply?.error_code
+-        if (reason === 'STALE_RESPONSE') {
+-          // The shell completed the original command but discarded the old
+-          // component's presentation ticket. Only an exact host record proves
+-          // that this configuration was saved; ambiguity remains locked.
+-          const refreshed = await readHost()
+-          const saved = refreshed.model_configurations?.find(item => item.config_revision === entry.payload.config_revision &&
+-            item.provider_id === entry.payload.provider_id && item.base_url === entry.payload.base_url &&
+-            item.model_id === entry.payload.model_id && item.credential_ref === entry.payload.credential_ref && item.model_config_ref)
+-          if (!saved) throw new Error('原配置命令已结束，但主机状态未能证明保存结果；请核对主机状态')
+-          if (!live.current || modelPending(projectId) !== entry) return
+-          updateModelPending(projectId, null)
+-          onConfigured?.(refreshed, saved)
+-          setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+-          return
+-        }
+         if (!live.current || modelPending(projectId) !== entry) return
+         updateModelPending(projectId, null)
+         setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reason || '主机拒绝配置'))
+@@ -113,18 +114,19 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured
+         credential_ref: form.credential_ref.trim() || null,
+       }
+       if (!live.current) return
+-      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, outcome: null })
++      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, origin: current.localHostOrigin, outcome: null })
+       const reply = await window.researchos.v2['host.configure'](request)
+       const entry = modelPending(projectId)
+       if (entry?.payload !== request) return
+       if (reply?.ok && !settled(reply)) {
++        if (reply.local_host_origin && reply.local_host_origin !== entry.origin) updateModelPending(projectId, { ...entry, origin: reply.local_host_origin })
+         if (live.current) setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
+         return
+       }
+       // Only a trusted shell terminal response or pre-HTTP fact ends this
+       // intent. Every other failure remains an uncertain replay.
+       if (settled(reply) || reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (!remembered && reply?.reason === 'COMMAND_PENDING')) {
+-        const terminal = { ...entry, outcome: reply }
++        const terminal = { ...entry, origin: reply?.local_host_origin || null, outcome: reply }
+         updateModelPending(projectId, terminal)
+         if (live.current) await reconcile(terminal)
+       } else if (live.current) unwrap(reply)
+diff --git a/tests/ui/desktop/http-wire-boundary.test.mjs b/tests/ui/desktop/http-wire-boundary.test.mjs
+index 83c153c3..24224e14 100644
+--- a/tests/ui/desktop/http-wire-boundary.test.mjs
++++ b/tests/ui/desktop/http-wire-boundary.test.mjs
+@@ -246,6 +246,10 @@ const more={
+  'model-config/credential-loss-after-ack-keeps-original':async()=>{const p=pair('host.configure','ACKNOWLEDGED');const h=await harness(()=>({body:p.response}),{state:{projectId:'fixture_project',sessionId:null,expectedRevision:null,writerEpoch:null}});try{const ack=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(ack.protocol_status,'ACKNOWLEDGED');h.deps.credentialFor=async()=>{throw Error('unavailable')};const retry=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(retry.reason,'CREDENTIAL_UNAVAILABLE');assert.notEqual(retry.dispatch_state,'NOT_SENT');const changed=await ipc.callV2(h.deps,'host.configure',{...p.request.payload,model_id:'different-model'});assert.equal(changed.reason,'COMMAND_PENDING');assert.equal(h.observations.http.length,1);}finally{await h.close();}},
+  'model-config/host-switch-keeps-origin-barrier':async()=>{const p=pair('host.configure');let mode='ACKNOWLEDGED',hostId='host-aaaaaaaaaaaa',dataDir='fixture-data-root',pid=1234;const h=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.configure',mode).response;response.command_id=env.command_id;response.session_id=env.session_id;if(mode==='COMPLETED')Object.assign(response.result,env.payload);return {body:response};},{state:{projectId:'fixture_project',sessionId:null,expectedRevision:null,writerEpoch:null}});h.deps.fsImpl.readFileSync=()=>JSON.stringify({url:h.url,pid,data_dir:dataDir,host_instance_id:hostId});try{const ack=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(ack.protocol_status,'ACKNOWLEDGED');hostId='host-bbbbbbbbbbbb';dataDir='other-data-root';const wrong=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(wrong.reason,'HOST_CHANGED_PENDING');assert.equal(h.observations.http.length,1);const changed=await ipc.callV2(h.deps,'host.configure',{...p.request.payload,model_id:'different-model'});assert.equal(changed.reason,'COMMAND_PENDING');hostId='host-aaaaaaaaaaaa';dataDir='fixture-data-root';pid=9999;mode='COMPLETED';const done=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(done.completed,true);assert.equal(h.observations.http.length,2);assert.deepEqual(JSON.parse(h.observations.http[0].raw),JSON.parse(h.observations.http[1].raw));}finally{await h.close();}},
+  'model-config/host-switch-during-credential-before-send':async()=>{const p=pair('host.configure');const h=await harness(()=>{throw Error('must not dispatch')},{state:{projectId:'fixture_project',sessionId:null,expectedRevision:null,writerEpoch:null}});let hostId='host-aaaaaaaaaaaa';h.deps.fsImpl.readFileSync=()=>JSON.stringify({url:h.url,pid:1234,data_dir:'fixture-data-root',host_instance_id:hostId});h.deps.credentialFor=async()=>{hostId='host-bbbbbbbbbbbb';return 'public-fixture-only'};try{const result=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(result.reason,'HOST_CHANGED_BEFORE_SEND');assert.equal(result.dispatch_state,'NOT_SENT');assert.equal(h.observations.http.length,0);}finally{await h.close();}},
++ 'model-config/origin-is-native-not-remote':async()=>{const h=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.status').response;response.command_id=env.command_id;response.result.host_instance_id='host-ffffffffffff';return {body:response};});try{const status=await ipc.callV2(h.deps,'host.status',{});assert.equal(status.completed,true);assert.equal(status.result.host_instance_id,'host-ffffffffffff');const expected=crypto.createHash('sha256').update(JSON.stringify(['host-aaaaaaaaaaaa','fixture-data-root'])).digest('hex');assert.equal(status.local_host_origin,expected);}finally{await h.close();}},
++ 'model-config/completed-keeps-origin-after-host-switch':async()=>{const p=pair('host.configure');let release,arrived;const ready=new Promise(resolve=>arrived=resolve);const a=await harness(async raw=>{const env=JSON.parse(raw);arrived();await new Promise(resolve=>release=resolve);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);assert.equal(env.method,'host.status');const response=pair('host.status').response;response.command_id=env.command_id;return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const completion=ipc.callV2(a.deps,'host.configure',p.request.payload);await ready;discovery={url:b.url,pid:2,data_dir:'root-B',host_instance_id:'host-bbbbbbbbbbbb'};release();const done=await completion;const status=await ipc.callV2(a.deps,'host.status',{});assert.equal(done.completed,true);assert.notEqual(done.local_host_origin,status.local_host_origin);assert.equal(done.result.model_config_ref,p.response.result.model_config_ref);assert.equal(a.observations.http.length,1);assert.equal(b.observations.http.length,1);}finally{if(release)release();await a.close();await b.close();}},
++ 'model-config/stale-keeps-terminal-result-and-origin':async()=>{const p=pair('host.configure');let release,arrived;const ready=new Promise(resolve=>arrived=resolve);const a=await harness(async raw=>{const env=JSON.parse(raw);arrived();await new Promise(resolve=>release=resolve);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);assert.equal(env.method,'host.status');const response=pair('host.status').response;response.command_id=env.command_id;return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const completion=ipc.callV2(a.deps,'host.configure',p.request.payload);await ready;discovery={url:b.url,pid:2,data_dir:'root-B',host_instance_id:'host-bbbbbbbbbbbb'};const statusPromise=ipc.callV2(a.deps,'host.status',{});while((ipc.callV2.sequences.get(a.deps.sessionState)||0)<2)await new Promise(resolve=>setTimeout(resolve,10));release();const status=await statusPromise;const stale=await completion;assert.equal(stale.reason,'STALE_RESPONSE');assert.equal(stale.local_terminal_result.model_config_ref,p.response.result.model_config_ref);assert.deepEqual(stale.local_terminal_result.provider_id,p.request.payload.provider_id);assert.notEqual(stale.local_host_origin,status.local_host_origin);assert.equal(a.observations.http.length,1);assert.equal(b.observations.http.length,1);}finally{if(release)release();await a.close();await b.close();}},
++ 'model-config/same-logical-host-new-url-replays':async()=>{const p=pair('host.configure');const a=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.configure','ACKNOWLEDGED').response;response.command_id=env.command_id;return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const ack=await ipc.callV2(a.deps,'host.configure',p.request.payload);assert.equal(ack.protocol_status,'ACKNOWLEDGED');discovery={url:b.url,pid:999,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};const done=await ipc.callV2(a.deps,'host.configure',p.request.payload);assert.equal(done.completed,true);assert.equal(done.local_host_origin,ack.local_host_origin);assert.deepEqual(JSON.parse(a.observations.http[0].raw),JSON.parse(b.observations.http[0].raw));}finally{await a.close();await b.close();}},
+  'prebuilder/scoped-configure':async()=>{const p=pair('host.configure');Object.assign(p.request,{project_id:'fixture_project',session_id:'fixture_session',expected_revision:7,writer_epoch:2});p.response.session_id=p.request.session_id;p.response.revision=8;const r=await invoke('host.configure',{body:p.response},p.request);assert.equal(r.result.completed,true);assert.equal(r.state.expectedRevision,7);},
+  'prebuilder/partial-scope':async()=>{const p=pair('host.configure');Object.assign(p.request,{project_id:'fixture_project',session_id:'fixture_session',expected_revision:null,writer_epoch:2});const r=await invoke('host.configure',{body:p.response},p.request);assert.equal(r.result.reason,'CONFIGURATION_SCOPE_INCOMPLETE');assert.equal(r.observations.http.length,0);},
+  'prebuilder/project-goal':async()=>{const p=pair('goal.start');const r=await invoke('goal.start',{body:p.response},p.request);assert.equal(r.result.completed,true);assert.equal(r.state.sessionId,null);},

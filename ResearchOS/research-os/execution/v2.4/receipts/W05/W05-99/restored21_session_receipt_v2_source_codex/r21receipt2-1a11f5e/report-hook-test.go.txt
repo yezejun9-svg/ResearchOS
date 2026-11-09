@@ -1,0 +1,31 @@
+
+// These pure report-hook controls share the existing public-success parent;
+// they add no test2json parent/leaf and perform no fixture database operations.
+func restored21ReportHookControls(t *testing.T) {
+ t.Helper()
+ digest := Digest([]byte("PUBLIC_REPORT_HOOK_FIXTURE"))
+ valid := Object{"source_schema_hash":digest,"session_schema_hash":digest,"before_rows_hash":digest,"after_rows_hash":digest,"numbered_ledger_unchanged":true,"old_typed_rows_unchanged":true,"client_sessions_created_empty":true,"restore_fence_preserved":true,"restored_barriers_refreshed":false,"external_actions_dispatched":0}
+ for _, name := range []string{"wrong-plan","wrong-format","missing-field","extra-field","wrong-type","wrong-hash","nonzero-actions"} {
+  evidence:=Object{};for key,value:=range valid{evidence[key]=value}
+  purpose:=Object{"plan":Object{"id":Restored21SessionUpgradePlan},"scope":"PUBLIC_REPORT_HOOK_FIXTURE"}
+  policy:=&backupPolicy{format:localUpgradeFormat,purpose:purpose,restored21SessionEvidence:evidence}
+  switch name {
+  case "wrong-plan":purpose["plan"]=Object{"id":QueueSchemaUpgradePlan}
+  case "wrong-format":policy.format="RESEARCHOS_BACKUP_V1"
+  case "missing-field":delete(evidence,"before_rows_hash")
+  case "extra-field":evidence["unapproved_field"]=true
+  case "wrong-type":evidence["old_typed_rows_unchanged"]="true"
+  case "wrong-hash":evidence["source_schema_hash"]="sha256:wrong"
+  case "nonzero-actions":evidence["external_actions_dispatched"]=1
+  }
+  purposeBefore:=Bytes(purpose);recovery:=Object{"existing":true};before:=Bytes(recovery)
+  err:=upgradeRestored21PublishEvidence(policy,recovery)
+  expected:="RESTORE_RESTORED21_REPORT_EVIDENCE_INVALID";if name=="wrong-plan" || name=="wrong-format"{expected="RESTORE_RESTORED21_REPORT_POLICY_MISMATCH"}
+  if err==nil || err.Error()!=expected || !bytes.Equal(before,Bytes(recovery)) || !bytes.Equal(purposeBefore,Bytes(purpose)){t.Fatalf("invalid report hook changed authenticated purpose or recovery: %s %v",name,err)}
+ }
+ oldPurpose:=Object{"plan":Object{"id":QueueSchemaUpgradePlan}};recovery:=Object{"existing":true};before:=Bytes(recovery)
+ if err:=upgradeRestored21PublishEvidence(&backupPolicy{format:localUpgradeFormat,purpose:oldPurpose},recovery);err!=nil || !bytes.Equal(before,Bytes(recovery)){t.Fatal("old-plan nil hook changed report",err)}
+ purpose:=Object{"plan":Object{"id":Restored21SessionUpgradePlan}};purposeBefore:=Bytes(purpose)
+ if err:=upgradeRestored21PublishEvidence(&backupPolicy{format:localUpgradeFormat,purpose:purpose,restored21SessionEvidence:valid},recovery);err!=nil{t.Fatal(err)}
+ if !bytes.Equal(Bytes(valid),Bytes(recovery["restored21_session_initialization"])) || !bytes.Equal(purposeBefore,Bytes(purpose)){t.Fatal("valid hook changed purpose or evidence")}
+}

@@ -1,0 +1,496 @@
+//go:build windows
+
+package ownedcorestop
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+)
+
+func TestCompiledGrantStrictCanonicalAndActionBoundary(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	sid := "S-1-5-21-fixture"
+	data := `C:\fixture\data`
+	db := filepath.Join(data, "researchos.sqlite")
+	out := `C:\fixture\operation`
+	now := time.Now().UTC().Truncate(time.Second)
+	g := operationGrant{Schema: grantSchema, GrantKind: "PREFLIGHT_ONLY", OperationID: strings.Repeat("b", 32), IssuedAt: now.Format(time.RFC3339Nano), NotBefore: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(20 * time.Minute).Format(time.RFC3339Nano), Purpose: "EXACT_RETAINED_CORE_CRASH_STOP", TrustedOperatorSID: sid, DataRoot: grantFileIdentity{data, 1, 2}, Database: grantFileIdentity{db, 1, 3}, OperationDir: grantFileIdentity{out, 1, 4}, Native: grantNativeIdentity{PID: 10, Created100NS: "123", SID: sid, ImagePath: `C:\fixture\core.exe`, ImageSHA256: sha, ImageVolume: 1, ImageIndex: 5, ParentPID: 9, ParentCreated100NS: "100", ParentSID: sid, ParentImagePath: `C:\fixture\desktop.exe`, ParentImageSHA256: sha, ParentImageVolume: 1, ParentImageIndex: 6}, Host: host.OwnedCoreStopPublicIdentity{DataRoot: data, Database: db, DatabaseVolume: 1, DatabaseIndex: 3, SID: sid, PrincipalRef: "fixture", HostID: "fixture", OwnerID: "fixture", OwnerRoot: "fixture", HostStateSHA256: sha, SchemaVersion: 24}, Subject: store.OwnedStopSubject{Project: "fixture", Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest}, RequiredProofKinds: append([]string{}, proofKinds...), RulesetVersion: "strict-closure-v1", SchemaSHA256: sha, AllowedActions: []string{"preflight", "inspect"}, TerminateCount: 0, Proposal: grantDocument{`C:\fixture\proposal.json`, sha}, PreflightScope: grantDocument{`C:\fixture\scope.json`, sha}, PreflightReview: grantDocument{`C:\fixture\review.json`, sha}, HistoricalManifest: grantDocument{`C:\fixture\historical.json`, sha}}
+	raw, err := json.Marshal(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = canonicalMapJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.digest != digest(raw) {
+		t.Fatal("compiled grant digest differs")
+	}
+	if _, err = parsed.checkAction("commit", true); err == nil {
+		t.Fatal("preflight grant allowed commit")
+	}
+	parsed.expires = time.Now().Add(-time.Second)
+	if _, err = parsed.checkAction("preflight", true); err == nil {
+		t.Fatal("expired preflight allowed action")
+	}
+	if _, err = parsed.checkAction("inspect", false); err != nil {
+		t.Fatalf("expired read-only inspect denied: %v", err)
+	}
+	for _, bad := range []string{"", base64.StdEncoding.EncodeToString([]byte(`{"schema":"a","schema":"b"}`)), base64.StdEncoding.EncodeToString(raw) + "\n"} {
+		if _, err = parseCompiledOperationGrant(bad); err == nil {
+			t.Fatalf("malformed grant accepted: %q", bad)
+		}
+	}
+	var unknown map[string]any
+	if err = json.Unmarshal(raw, &unknown); err != nil {
+		t.Fatal(err)
+	}
+	unknown["wildcard"] = true
+	unknownRaw, err := json.Marshal(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownRaw, err = canonicalMapJSON(unknownRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(unknownRaw)); err == nil {
+		t.Fatal("unknown grant field accepted")
+	}
+	g.Proposal.SHA256 = strings.Repeat("0", 64)
+	zeroRaw, err := json.Marshal(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroRaw, err = canonicalMapJSON(zeroRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = parseCompiledOperationGrant(base64.StdEncoding.EncodeToString(zeroRaw)); err == nil {
+		t.Fatal("zero digest accepted")
+	}
+}
+
+func TestOwnedCoreStopMissingHistoricalProofNeverEligible(t *testing.T) {
+	plan := Plan{OperationID: strings.Repeat("a", 32), Input: Input{SourceRepository: t.TempDir()}}
+	_, missing := validateHistoricalEvidence(plan)
+	if len(missing) < len(proofKinds) {
+		t.Fatalf("missing F01/native/effect proofs were accepted: %v", missing)
+	}
+	for _, ref := range []EvidenceRef{{Kind: "f01_ready", Path: filepath.Join(t.TempDir(), "forged.json"), SHA256: strings.Repeat("a", 64)}} {
+		plan.Input.Evidence = append(plan.Input.Evidence, ref)
+	}
+	_, missing = validateHistoricalEvidence(plan)
+	if len(missing) == 0 {
+		t.Fatal("caller-selected evidence outside independent namespace accepted")
+	}
+}
+
+func TestOwnedCoreStopCallerReviewCannotOmitExactScope(t *testing.T) {
+	plan := Plan{Input: Input{SourceRepository: t.TempDir(), PlanReviewPath: filepath.Join(t.TempDir(), "review.json")}}
+	if err := validatePlanReview(plan, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("non-independent review path accepted")
+	}
+}
+
+func TestNativeExitProofRequiresExplicitNumericCapturePerClass(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	for _, kind := range []string{"worker_native_exit", "verifier_native_exit"} {
+		for _, tc := range []struct {
+			name  string
+			field string
+			value any
+			omit  bool
+			want  bool
+		}{
+			{"explicit exit zero", "native_exit_code", 0, false, true},
+			{"explicit exit nonzero", "native_exit_code", 137, false, true},
+			{"missing exit", "native_exit_code", nil, true, false},
+			{"null exit", "native_exit_code", nil, false, false},
+			{"negative exit", "native_exit_code", -1, false, false},
+			{"overflow exit", "native_exit_code", int64(1) << 32, false, false},
+			{"fractional exit", "native_exit_code", 0.5, false, false},
+			{"explicit wait zero", "native_wait_result", 0, false, true},
+			{"missing wait", "native_wait_result", nil, true, false},
+			{"null wait", "native_wait_result", nil, false, false},
+			{"nonzero wait", "native_wait_result", 258, false, false},
+			{"negative wait", "native_wait_result", -1, false, false},
+			{"overflow wait", "native_wait_result", int64(1) << 32, false, false},
+			{"fractional wait", "native_wait_result", 0.5, false, false},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				fields := map[string]any{
+					"kind": kind, "native_pid": 8, "native_created_ns": 123,
+					"native_wait_api": "WaitForSingleObject", "native_wait_result": 0,
+					"native_exit_api": "GetExitCodeProcess", "native_exit_code": 0,
+					"native_handle_record_sha256": sha,
+				}
+				if tc.omit {
+					delete(fields, tc.field)
+				} else {
+					fields[tc.field] = tc.value
+				}
+				raw, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var proof historicalEvidence
+				err = decodeCanonicalAuthority(raw, &proof)
+				got := err == nil && nativeExitEvidenceComplete(proof, 9)
+				if got != tc.want {
+					t.Fatalf("native proof %s accepted=%v want=%v decode=%v: %s", tc.name, got, tc.want, err, raw)
+				}
+			})
+		}
+	}
+}
+//go:build windows
+
+package ownedcorestop
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"researchos.local/research-os/internal/store"
+	"researchos.local/research-os/ops/supervisor"
+)
+
+func TestOwnedCoreStopFrozenSubjectRejectsOtherWork(t *testing.T) {
+	in := Input{Schema: InputSchema, OperationID: strings.Repeat("a", 32), SourceRepository: filepath.Join(t.TempDir(), "source"), DataRoot: filepath.Join(t.TempDir(), "data"), CorePID: 1,
+		Subject: store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"}}
+	if err := validateInput(in); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []store.OwnedStopSubject{
+		{Run: "another", Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"},
+		{Run: OldRun, Epoch: 2, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"},
+		{Run: OldRun, Epoch: 1, DispatchKey: "another", RequestKey: OldRequest, Project: "fixture"},
+		{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: "another", Project: "fixture"},
+	} {
+		in.Subject = bad
+		if err := validateInput(in); err == nil {
+			t.Fatalf("other work accepted: %+v", bad)
+		}
+	}
+}
+
+func TestOwnedCoreStopPostflightRealLeaseBlocksLogicalDrift(t *testing.T) {
+	fixture := os.Getenv("RESEARCHOS_OWNED_STOP_FIXTURE_EXE")
+	if fixture == "" {
+		t.Fatal("new owned fixture exe required")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "data")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, "researchos.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA journal_mode=WAL;CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	markers := filepath.Join(base, "markers")
+	if err = os.Mkdir(markers, 0700); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(markers, "ready")
+	cmd := exec.Command(fixture, "--root", root, "--ready", ready, "--attempt", filepath.Join(markers, "never-attempt"), "--attempted", filepath.Join(markers, "never-attempted"))
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	found := false
+	for deadline := time.Now().Add(6 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if _, e := os.Stat(ready); e == nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("fixture ready missing")
+	}
+	baseline, err := store.ReadOwnedStopCensus(context.Background(), dbPath)
+	if err != nil || baseline.Rows != 1 {
+		t.Fatalf("committed baseline: %+v %v", baseline, err)
+	}
+	id, err := supervisor.ObserveOwnedCoreReadOnly(uint32(cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := supervisor.OpenOwnedCoreRetained(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	exit, err := h.TerminateOnceAndWait(5 * time.Second)
+	if err != nil || !exit.ExitObserved || exit.TerminateCalls != 1 {
+		t.Fatalf("native fixture exit: %+v %v", exit, err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO stop_fixture_rows VALUES('poststop-drift',x'ff')`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "postflight")
+	if err = createPrivateOutput(out, root); err != nil {
+		t.Fatal(err)
+	}
+	plan := Plan{OperationID: strings.Repeat("c", 32), OutputDir: out, Input: Input{DataRoot: root}, Baseline: baseline}
+	plan.Host.Database = dbPath
+	result, err := finishAfterNativeExit(context.Background(), plan, strings.Repeat("d", 64), exit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "STOP_OBSERVED_MAINTENANCE_BLOCKED" || result.Postflight == nil || result.Postflight.Rows != 2 || *result.Postflight == baseline {
+		t.Fatalf("poststop logical drift escaped maintenance block: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(out, "POSTFLIGHT.json")); err != nil {
+		t.Fatalf("durable blocked receipt missing: %v", err)
+	}
+}
+
+func TestOwnedCoreStopInvalidPreflightNeverCreatesOutput(t *testing.T) {
+	base := t.TempDir()
+	out := filepath.Join(base, "new-output")
+	in := Input{Schema: InputSchema, OperationID: strings.Repeat("b", 32), SourceRepository: base, DataRoot: filepath.Join(base, "data"), CorePID: 1,
+		Subject: store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: "wrong", Project: "fixture"}}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputPath := filepath.Join(base, "input.json")
+	if err := os.WriteFile(inputPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Preflight(context.Background(), inputPath, in.OperationID, out); err == nil {
+		t.Fatal("wrong historical subject passed preflight")
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("invalid preflight created output: %v", err)
+	}
+}
+
+func TestCommitSignalBoundaryHonorsCallerCancellationAndEarlierDeadline(t *testing.T) {
+	now := time.Now()
+	g := operationGrant{AllowedActions: []string{"commit"}, notBefore: now.Add(-time.Minute), expires: now.Add(time.Minute)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := checkCommitSignalBoundary(ctx, g); err != context.Canceled {
+		t.Fatalf("canceled caller reached intent: %v", err)
+	}
+	ctx, cancel = context.WithDeadline(context.Background(), now.Add(-time.Second))
+	defer cancel()
+	if err := checkCommitSignalBoundary(ctx, g); err != context.DeadlineExceeded {
+		t.Fatalf("earlier caller deadline reached intent: %v", err)
+	}
+	if err := checkCommitSignalBoundary(context.Background(), g); err != nil {
+		t.Fatalf("valid caller/grant denied: %v", err)
+	}
+}
+//go:build windows
+
+package ownedcorestop
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+	"researchos.local/research-os/ops/supervisor"
+)
+
+func TestOwnedCoreStopJournalExclusiveAndPrivate(t *testing.T) {
+	base := t.TempDir()
+	dataRoot := filepath.Join(base, "data")
+	if err := os.Mkdir(dataRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "new-output")
+	if err := createPrivateOutput(out, dataRoot); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := writeOwnedJournal(out, "BEGIN.json", struct {
+		Schema string `json:"schema"`
+	}{"test.v1"})
+	if err != nil || !validSHA(hash) {
+		t.Fatalf("private exclusive journal failed: %s %v", hash, err)
+	}
+	if _, err := writeOwnedJournal(out, "BEGIN.json", map[string]string{"schema": "replay"}); err == nil {
+		t.Fatal("immutable journal was overwritten")
+	}
+	raw, err := readOwnedJournal(out, "BEGIN.json", 128)
+	if err != nil || digest(raw) != hash {
+		t.Fatalf("journal read/hash mismatch: %v", err)
+	}
+}
+
+func TestHeldAuthorityAndOperationLockDenyReplacement(t *testing.T) {
+	base := t.TempDir()
+	data := filepath.Join(base, "data")
+	if err := os.Mkdir(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "operation")
+	if err := createPrivateOutput(out, data); err != nil {
+		t.Fatal(err)
+	}
+	h, err := openHeldFile(out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := nativeFileIdentity(h.info, out)
+	h.Close()
+	g := operationGrant{DataRoot: grantFileIdentity{Path: data}, OperationDir: id}
+	lock, err := acquireOperationLock(g, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := acquireOperationLock(g, false); err == nil {
+		second.Close()
+		t.Fatal("parallel operation acquired exclusive lock")
+	}
+	if _, err := writeOwnedJournal(out, "authority.json", map[string]string{"role": "fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := openHeldFile(filepath.Join(out, "authority.json"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, e := os.OpenFile(filepath.Join(out, "authority.json"), os.O_WRONLY, 0); e == nil {
+		f.Close()
+		t.Fatal("held authority file allowed write sharing")
+	}
+	if err := os.Rename(out, filepath.Join(base, "replacement")); err == nil {
+		t.Fatal("held ancestor directory renamed")
+	}
+	doc.Close()
+	lock.Close()
+	replay, err := acquireOperationLock(g, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay.Close()
+}
+
+func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
+	base := t.TempDir()
+	dataRoot := filepath.Join(base, "data")
+	if err := os.Mkdir(dataRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "new-output")
+	if err := createPrivateOutput(out, dataRoot); err != nil {
+		t.Fatal(err)
+	}
+	subject := store.OwnedStopSubject{Run: OldRun, Epoch: 1, DispatchKey: OldDispatch, RequestKey: OldRequest, Project: "fixture"}
+	sid := "fixture-sid"
+	op := strings.Repeat("a", 32)
+	plan := Plan{
+		Schema: PlanSchema, OperationID: op, SourceBaseCommit: SourceBaseCommit,
+		OutputDir: out, BackupPath: filepath.Join(out, "backup.sqlite"),
+		InputSHA256: strings.Repeat("b", 64), BackupSHA256: strings.Repeat("c", 64),
+		Input:       Input{Schema: InputSchema, OperationID: op, SourceRepository: base, DataRoot: dataRoot, CorePID: 1, Subject: subject},
+		Native:      supervisor.OwnedCoreNativeIdentity{PID: 1, SID: sid, ParentSID: sid},
+		Host:        host.OwnedCoreStopPublicIdentity{DataRoot: dataRoot, SID: sid, SchemaVersion: 24},
+		Baseline:    store.OwnedStopCensus{SHA256: strings.Repeat("d", 64), QuickCheck: "ok"},
+		Eligibility: "STOP_UNAVAILABLE",
+	}
+	planSHA, err := writeOwnedJournal(out, "plan.json", plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantSHA := strings.Repeat("e", 64)
+	g := operationGrant{OperationID: op, OperationDir: grantFileIdentity{Path: out}, digest: grantSHA}
+	if _, err := writeOwnedJournal(out, "STOP_ATTEMPT.json", stopAttemptRecord{Schema: "researchos.owned-core-stop-attempt.v1", OperationID: op, GrantSHA256: grantSHA, PlanSHA256: planSHA}); err != nil {
+		t.Fatal(err)
+	}
+	check := func(state string) {
+		t.Helper()
+		docs := &heldDocuments{}
+		got, err := readExistingStopOutcome(docs, g, plan, planSHA)
+		docs.Close()
+		if err != nil || got.State != state || got.PlanSHA256 != planSHA {
+			t.Fatalf("inspect %s: %+v %v", state, got, err)
+		}
+	}
+	check("UNKNOWN") // before BEGIN
+	if _, err := writeOwnedJournal(out, "BEGIN.json", ownedBeginRecord{Schema: "researchos.owned-core-stop-begin.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA}); err != nil {
+		t.Fatal(err)
+	}
+	check("UNKNOWN") // after BEGIN, before termination intent
+	if _, err := writeOwnedJournal(out, "TERMINATE_INTENT.json", ownedIntentRecord{Schema: "researchos.owned-core-stop-terminate-intent.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: plan.Native}); err != nil {
+		t.Fatal(err)
+	}
+	check("UNKNOWN") // before/after native call without durable wait proof
+	boundaryGrant := operationGrant{AllowedActions: []string{"commit"}, notBefore: time.Now().Add(-time.Minute), expires: time.Now().Add(time.Minute)}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := checkCommitSignalBoundary(canceled, boundaryGrant); err != context.Canceled {
+		t.Fatalf("cancellation after durable intent was ignored: %v", err)
+	}
+	check("UNKNOWN") // consumed intent remains, including after cancellation
+	boundaryGrant.expires = time.Now().Add(-time.Second)
+	if err := checkCommitSignalBoundary(context.Background(), boundaryGrant); err == nil {
+		t.Fatal("grant expiry after durable intent was ignored")
+	}
+	check("UNKNOWN") // expired grant cannot refund consumed intent
+	nativeExit := supervisor.OwnedCoreNativeExit{TerminateCalls: 1, ExitObserved: true, ExitCode: supervisor.OwnedCoreMaintenanceExitCode}
+	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{Schema: "researchos.owned-core-stop-native-exit.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: nativeExit}); err != nil {
+		t.Fatal(err)
+	}
+	check("UNKNOWN") // after exit, before immutable terminal
+	final := stopResult(plan, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "lease unavailable")
+	final.StopGrantSHA256 = grantSHA
+	final.Native = &nativeExit
+	if _, err := writeOwnedJournal(out, "POSTFLIGHT.json", final); err != nil {
+		t.Fatal(err)
+	}
+	check(final.State)
+	check(final.State) // repeat inspection is identical and observation only
+	if err := os.WriteFile(filepath.Join(out, "POSTFLIGHT.json"), []byte("{\"schema\":\"forged\"}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	docs := &heldDocuments{}
+	_, err = readExistingStopOutcome(docs, g, plan, planSHA)
+	docs.Close()
+	if err == nil {
+		t.Fatal("corrupt terminal receipt silently fell back to earlier journal")
+	}
+}

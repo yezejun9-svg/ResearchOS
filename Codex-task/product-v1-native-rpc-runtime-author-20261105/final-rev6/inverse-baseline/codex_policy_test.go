@@ -1,0 +1,98 @@
+//go:build windows
+
+package runtime
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestCodexRequestedPolicyIdentityAndArguments(t *testing.T) {
+	args := codexRequestedArguments(`C:\owned cwd`, `D:\source "quoted"`)
+	configs := map[string]int{}
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			if i+1 >= len(args) {
+				t.Fatal("dangling config flag")
+			}
+			configs[args[i+1]]++
+			i++
+		}
+	}
+	keys := map[string]int{}
+	for config, count := range configs {
+		key := strings.SplitN(config, "=", 2)[0]
+		keys[key] += count
+		if strings.Contains(key, ".windows.sandbox") || key == "sandbox_mode" || key == "sandbox" {
+			t.Fatalf("conflicting or profile-scoped sandbox selection %q", config)
+		}
+	}
+	if keys["windows.sandbox"] != 1 || configs[`windows.sandbox="mxc"`] != 1 || keys["default_permissions"] != 1 {
+		t.Fatalf("global MXC and selected profile must be unique: %v", configs)
+	}
+	for _, arg := range args {
+		if arg == "--sandbox" || arg == "--dangerously-bypass-approvals-and-sandbox" {
+			t.Fatal("conflicting sandbox command flag", args)
+		}
+	}
+	for _, value := range []string{
+		`default_permissions="researchos-readonly"`,
+		`windows.sandbox="mxc"`,
+		`permissions.researchos-readonly.filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="read"}}`,
+		`permissions.researchos-readonly.network.enabled=false`,
+		`approval_policy="never"`,
+	} {
+		if configs[value] != 1 {
+			t.Fatalf("missing or duplicate requested policy %q: %v", value, configs)
+		}
+	}
+	if len(args) < 7 || args[5] != "-C" || args[6] != `C:\owned cwd` ||
+		!strings.Contains(strings.Join(args, "\n"), `D:\\source \"quoted\"`) {
+		t.Fatal("source or owned cwd binding changed", args)
+	}
+	identity := CodexRequestedPolicyIdentity("sha256:" + strings.Repeat("a", 64))
+	if identity.Revision != CodexNativePolicyRevision || identity.WindowsSandbox != "mxc" ||
+		identity.PermissionProfile != "researchos-readonly" || !strings.HasPrefix(identity.RequestedConfigSHA256, "sha256:") ||
+		identity != CodexRequestedPolicyIdentity(identity.BinarySHA256) {
+		t.Fatal("unstable canonical requested policy identity", identity)
+	}
+}
+
+func TestCodexReadinessFailClosed(t *testing.T) {
+	hash := "sha256:" + strings.Repeat("a", 64)
+	identity := CodexRequestedPolicyIdentity(hash)
+	d := CodexDescriptor{Present: true, ExecutableHash: hash, AuthState: "LOGGED_IN", ConfigurationControlled: true}
+	ready := CodexReadiness{State: "READY", PolicyIdentity: identity}
+	if got := EvaluateCodexReadiness(d, ready, identity); got.State != "READY" {
+		t.Fatal(got)
+	}
+	for _, tc := range []struct {
+		name       string
+		descriptor CodexDescriptor
+		snapshot   CodexReadiness
+		reason     string
+	}{
+		{"unverified", d, CodexReadiness{State: "UNVERIFIED", PolicyIdentity: identity}, "PERMISSION_PROFILE_UNVERIFIED"},
+		{"missing", CodexDescriptor{}, ready, "NOT_INSTALLED"},
+		{"config", CodexDescriptor{Present: true, ExecutableHash: hash, AuthState: "LOGGED_IN"}, ready, "CONFIG_INHERITANCE_UNVERIFIED"},
+		{"auth", CodexDescriptor{Present: true, ExecutableHash: hash, ConfigurationControlled: true}, ready, "AUTH_METADATA_REQUIRED"},
+		{"unavailable", d, CodexReadiness{State: "UNAVAILABLE", Reason: "PERMISSION_PROFILE_UNAVAILABLE", PolicyIdentity: identity}, "PERMISSION_PROFILE_UNAVAILABLE"},
+		{"contradictory_ready", d, CodexReadiness{State: "READY", Reason: "PERMISSION_PROFILE_UNAVAILABLE", PolicyIdentity: identity}, "PERMISSION_PROFILE_UNAVAILABLE"},
+		{"descriptor_reason", CodexDescriptor{Present: true, ExecutableHash: hash, AuthState: "LOGGED_IN", ConfigurationControlled: true, UnavailableReason: "UNSUPPORTED_NATIVE_CLI_VERSION"}, ready, "UNSUPPORTED_NATIVE_CLI_VERSION"},
+		{"identity", d, CodexReadiness{State: "READY", PolicyIdentity: CodexRequestedPolicyIdentity("sha256:" + strings.Repeat("b", 64))}, "CODEX_POLICY_IDENTITY_MISMATCH"},
+		{"mode_mutation", d, func() CodexReadiness { x := ready; x.PolicyIdentity.WindowsSandbox = "none"; return x }(), "CODEX_POLICY_IDENTITY_MISMATCH"},
+		{"template_mutation", d, func() CodexReadiness { x := ready; x.PolicyIdentity.RequestedConfigSHA256 = "sha256:changed"; return x }(), "CODEX_POLICY_IDENTITY_MISMATCH"},
+		{"revision_mutation", d, func() CodexReadiness { x := ready; x.PolicyIdentity.Revision = "old"; return x }(), "CODEX_POLICY_IDENTITY_MISMATCH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EvaluateCodexReadiness(tc.descriptor, tc.snapshot, identity)
+			if got.State == "READY" || got.Reason != tc.reason {
+				t.Fatalf("gate mismatch: %+v", got)
+			}
+		})
+	}
+	driver, err := NewCodexCLI(CodexCLIOptions{Executable: `C:\fake.exe`, Descriptor: d})
+	if err != nil || driver.ReadinessSnapshot().State != "UNVERIFIED" {
+		t.Fatal("production constructor minted readiness", err)
+	}
+}

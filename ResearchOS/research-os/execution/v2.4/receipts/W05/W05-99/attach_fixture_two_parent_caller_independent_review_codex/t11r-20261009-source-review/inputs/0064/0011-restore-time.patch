@@ -1,0 +1,188 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\session_attach_restore_revision_codex\1a11e02f790732395c39325fbb4668d\candidate-root\internal\domain\client_protocol.go
++++ candidate-root/internal/domain/client_protocol.go
+@@ -1275,6 +1275,31 @@
+ }
+ 
+ 
++// clientAttachRestoreTime compares instants in UTC, never RFC3339Nano text.
++// A malformed timestamp has unknown order and cannot be ignored as an old fact.
++func clientAttachRestoreTime(value string) (time.Time, bool) {
++	parsed, err := time.Parse(time.RFC3339Nano, value)
++	if err != nil || parsed.IsZero() {
++		return time.Time{}, false
++	}
++	return parsed.UTC(), true
++}
++
++type clientAttachObservationOrder struct {
++	latest time.Time
++	seen, valid bool
++}
++
++func (order *clientAttachObservationOrder) add(observed time.Time, valid bool) {
++	if !order.seen || observed.After(order.latest) {
++		order.latest, order.seen, order.valid = observed, true, valid
++	} else if observed.Equal(order.latest) {
++		// Equal instants do not establish an ordering between conflicting facts.
++		// Every fact at the latest instant must be settled and correctly bound.
++		order.valid = order.valid && valid
++	}
++}
++
+ // clientAttachRestoreState reads durable restore evidence before any writer write.
+ // renew is false until the current session generation has a real post-restore
+ // CLIENT_HANDOFF, preceded by a matching fresh settled observation.
+@@ -1282,16 +1307,37 @@
+ 	if sess.runID == "" {
+ 		return true, true, nil
+ 	}
+-	var barrier sql.NullString
+-	if err = tx.QueryRowContext(ctx, "SELECT max(restored_at) FROM backup_restore_barriers WHERE project=? AND run=?", sess.project, sess.runID).Scan(&barrier); err != nil {
++	barriers, err := tx.QueryContext(ctx, "SELECT restored_at FROM backup_restore_barriers WHERE project=? AND run=?", sess.project, sess.runID)
++	if err != nil {
+ 		return false, false, err
+ 	}
+-	if !barrier.Valid {
++	var restored time.Time
++	hasBarrier := false
++	for barriers.Next() {
++		var raw string
++		if err = barriers.Scan(&raw); err != nil {
++			barriers.Close()
++			return false, false, err
++		}
++		at, valid := clientAttachRestoreTime(raw)
++		if !valid {
++			barriers.Close()
++			return false, false, nil
++		}
++		if !hasBarrier || at.After(restored) {
++			restored = at
++		}
++		hasBarrier = true
++	}
++	if err = barriers.Err(); err != nil {
++		barriers.Close()
++		return false, false, err
++	}
++	if err = barriers.Close(); err != nil {
++		return false, false, err
++	}
++	if !hasBarrier {
+ 		return true, true, nil
+-	}
+-	restored, parseErr := time.Parse(time.RFC3339Nano, barrier.String)
+-	if parseErr != nil {
+-		return false, false, nil
+ 	}
+ 	run, err := load(tx, sess.project, "Run", sess.runID)
+ 	if err != nil {
+@@ -1301,32 +1347,31 @@
+ 	if epochErr != nil || epoch < 1 || run["children_stopped"] != true || run["queue_empty"] != true {
+ 		return false, false, nil
+ 	}
+-	rows, err := tx.QueryContext(ctx, "SELECT body,observed_at,receipt_hash FROM runtime_observations WHERE project=? AND run=? AND epoch=? ORDER BY observed_at DESC,receipt_hash DESC", sess.project, sess.runID, epoch)
++	rows, err := tx.QueryContext(ctx, "SELECT body,observed_at,receipt_hash FROM runtime_observations WHERE project=? AND run=? AND epoch=?", sess.project, sess.runID, epoch)
+ 	if err != nil {
+ 		return false, false, err
+ 	}
+ 	var firstFresh time.Time
+-	latest := true
++	var order clientAttachObservationOrder
+ 	for rows.Next() {
+ 		var raw, timestamp, receipt string
+ 		if err = rows.Scan(&raw, &timestamp, &receipt); err != nil {
+ 			rows.Close()
+ 			return false, false, err
+ 		}
+-		observed, timeErr := time.Parse(time.RFC3339Nano, timestamp)
++		observed, timeValid := clientAttachRestoreTime(timestamp)
++		if !timeValid {
++			rows.Close()
++			return false, false, nil
++		}
+ 		observation, decodeErr := Decode([]byte(raw))
+ 		spec, _ := observation["spec"].(map[string]any)
+ 		observedEpoch, identityErr := Num(spec, "epoch")
+-		valid := timeErr == nil && observed.After(restored) && decodeErr == nil &&
++		valid := observed.After(restored) && decodeErr == nil &&
+ 			receipt == Hash(observation) && identityErr == nil && observedEpoch == epoch &&
+ 			Str(spec, "run_id") == sess.runID && Str(spec, "task_id") == Str(run, "task_id") &&
+ 			observation["children_stopped"] == true && observation["queue_empty"] == true
+-		// A later partial observation must not be hidden by an older settled one.
+-		if latest && !valid {
+-			rows.Close()
+-			return false, false, nil
+-		}
+-		latest = false
++		order.add(observed, valid)
+ 		if valid && (firstFresh.IsZero() || observed.Before(firstFresh)) {
+ 			firstFresh = observed
+ 		}
+@@ -1338,45 +1383,54 @@
+ 	if err = rows.Close(); err != nil {
+ 		return false, false, err
+ 	}
+-	if firstFresh.IsZero() {
++	if !order.seen || !order.valid || firstFresh.IsZero() {
+ 		return false, false, nil
+ 	}
+-	events, err := tx.QueryContext(ctx, "SELECT body FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF' ORDER BY json_extract(body,'$.sequence') DESC", sess.project, sess.sessionID, sess.runID)
++	events, err := tx.QueryContext(ctx, "SELECT body FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'", sess.project, sess.sessionID, sess.runID)
+ 	if err != nil {
+ 		return false, false, err
+ 	}
+ 	defer events.Close()
++	recovered := false
+ 	for events.Next() {
+ 		var raw string
+ 		if err = events.Scan(&raw); err != nil {
+ 			return false, false, err
+ 		}
+ 		var event SessionEvent
+-		if json.Unmarshal([]byte(raw), &event) != nil || event.Sequence == nil ||
++		if json.Unmarshal([]byte(raw), &event) != nil {
++			return false, false, nil
++		}
++		payload, decodeErr := Decode(event.Payload)
++		writer, _ := payload["writer"].(map[string]any)
++		effective, timeValid := clientAttachRestoreTime(Str(payload, "effective_at"))
++		expires, expiryValid := clientAttachRestoreTime(Str(writer, "expires_at"))
++		if decodeErr != nil || !timeValid || !expiryValid || !expires.After(effective) {
++			return false, false, nil
++		}
++		if event.Sequence == nil ||
+ 			*event.Sequence < 1 || *event.Sequence > sess.watermark || deref(event.CommandID) == "" ||
+ 			deref(event.SessionID) != sess.sessionID || deref(event.RunID) != sess.runID ||
+ 			deref(event.Kind) != "CLIENT_HANDOFF" || deref(event.ProtocolVersion) != ProtocolV2 {
+ 			continue
+ 		}
+-		payload, decodeErr := Decode(event.Payload)
+-		writer, _ := payload["writer"].(map[string]any)
+ 		writerEpoch, writerErr := Num(writer, "epoch")
+ 		previousEpoch, previousErr := Num(payload, "previous_epoch")
+-		effective, timeErr := time.Parse(time.RFC3339Nano, Str(payload, "effective_at"))
+-		expires, expiryErr := time.Parse(time.RFC3339Nano, Str(writer, "expires_at"))
+-		if decodeErr == nil && writerErr == nil && previousErr == nil && timeErr == nil && expiryErr == nil &&
++		if writerErr == nil && previousErr == nil &&
+ 			writerEpoch == sess.epoch && previousEpoch == sess.epoch-1 &&
+ 			Str(payload, "target_client_id") == sess.writerClientID && Str(writer, "client_id") == sess.writerClientID &&
+ 			effective.After(restored) && !effective.Before(firstFresh) && expires.After(effective) {
+-			return true, true, nil
++			// Scan the remaining related rows too: unknown timestamps cannot
++			// be hidden by an earlier matching generation.
++			recovered = true
+ 		}
+ 	}
+ 	if err = events.Err(); err != nil {
+ 		return false, false, err
+ 	}
+-	// Fresh runtime evidence exists, but the restored session still needs one
+-	// real handoff through the existing epoch/CAS/journal transaction.
+-	return false, true, nil
++	// Fresh runtime evidence without a proven generation still goes through
++	// the existing epoch/CAS/journal transaction; this helper never writes.
++	return recovered, true, nil
+ }
+ 
+ // journal appends one typed event for the command's session inside the same transaction as

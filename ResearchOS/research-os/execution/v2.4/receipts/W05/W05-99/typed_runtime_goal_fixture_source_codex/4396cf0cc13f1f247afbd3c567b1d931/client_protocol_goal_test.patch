@@ -1,0 +1,47 @@
+--- D:/作品集/ResearchOS/research-os/.local/worktrees/codex-w0599-native-harness43-d74319468b584322b516e3b8b3aee4f2/internal/domain/client_protocol_goal_test.go
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/typed_runtime_goal_fixture_source_codex/4396cf0cc13f1f247afbd3c567b1d931/candidate-root/internal/domain/client_protocol_goal_test.go
+@@ -12,6 +12,7 @@
+ )
+ 
+ type goalClientPort struct {
++	principal, project string
+ 	workspace, model string
+ 	resolveErr       error
+ 	admitErr         error
+@@ -28,6 +29,27 @@
+ }
+ func (p goalClientPort) AdmitTurn(context.Context, *sql.Tx, string, string, Object) error {
+ 	return p.admitErr
++}
++
++// Synthetic Goal unit port: validate only this fixture's original Goal-created
++// Session binding. It grants no native runtime/profile qualification or model IO.
++func (p goalClientPort) ValidateLegacySession(ctx context.Context, tx *sql.Tx, principal, project, sid, model string) error {
++	if tx == nil || principal == "" || sid == "" || principal != p.principal || project != p.project || model != p.model {
++	 return Fail(503, "MODEL_UNAVAILABLE", "synthetic Goal model scope differs")
++	}
++	creator, err := clientSessionCreationPrincipal(ctx, tx, project, sid)
++	if err != nil || creator != principal {
++	 return Fail(503, "MODEL_UNAVAILABLE", "synthetic Goal creator unavailable")
++	}
++	var workspace, actualModel string
++	if err = tx.QueryRowContext(ctx, "SELECT workspace_ref,model_config_ref FROM client_sessions WHERE id=? AND project_id=?", sid, project).Scan(&workspace, &actualModel); err != nil || workspace != p.workspace || actualModel != model {
++	 return Fail(503, "MODEL_UNAVAILABLE", "synthetic Goal Session binding differs")
++	}
++	var original int
++	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM idempotency WHERE principal=? AND project=? AND operation='v2:goal.start' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.session_id') IS NULL AND json_extract(body,'$.result.snapshot.session_id')=? AND json_extract(body,'$.result.snapshot.workspace_ref')=? AND json_extract(body,'$.result.snapshot.model_config_ref')=?", principal, project, sid, workspace, model).Scan(&original); err != nil || original != 1 {
++	 return Fail(503, "MODEL_UNAVAILABLE", "synthetic Goal original creation differs")
++	}
++	return nil
+ }
+ 
+ func goalFixture(t *testing.T) (*fixture, *ClientService, string) {
+@@ -39,7 +61,7 @@
+ 	if _, err := f.db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, KindWorkspaceBinding, workspace, string(Bytes(b))); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	svc := &ClientService{Doc: clientHistoryDoc(t), Domain: f.s, SessionRuntime: goalClientPort{workspace: workspace, model: "goal-model", admitErr: Fail(503, "RESOURCE_UNAVAILABLE", "fixture runtime unqualified")}, Host: ClientHostInfo{CoreBuildID: "goal-fixture-core", LeaseTTL: time.Minute}}
++	svc := &ClientService{Doc: clientHistoryDoc(t), Domain: f.s, SessionRuntime: goalClientPort{principal: f.owner, project: f.project, workspace: workspace, model: "goal-model", admitErr: Fail(503, "RESOURCE_UNAVAILABLE", "fixture runtime unqualified")}, Host: ClientHostInfo{CoreBuildID: "goal-fixture-core", LeaseTTL: time.Minute}}
+ 	return f, svc, client
+ }
+ 

@@ -1,0 +1,9 @@
+# Read-only post-stop qualification verifier, revision 2
+
+C-only tooling preparation. The blocked `product-v1-native-conditional-poststop-verifier-prep-01` remains unchanged. This revision fixes the three independently identified Source2 wire/lineage compatibility defects. It has **not** read a live qualification receipt or run an App, Native helper, CLI, model or verifier entrypoint.
+
+The original f13 outer scope and the inner real-flow scope are separately hash pinned. The f13 RESULT must prove the outer scope stopped with active-zero, no force/retry/drift, then its exact argv and input pins must point to the inner scope and approved controller prep02. The runner result must bind the inner scope's hash and its real Task/Run/epoch. Only then may the verifier derive and open the one receipt path under the fixed qualification root. The template leaves all actual scope, Host boot, capture and intent pins null.
+
+The Source2 plan and transcript use lowercase JSON wire keys. Prelaunch `case_results` and `finding_codes`, and successful final `finding_codes`, may be JSON null as emitted by Go nil slices; missing/wrong/nonempty values still fail. The final seven cases, positive source read, denied operations, immutable intent/capture context, original and qualification Jobs, raw stream hashes and cleanup remain strict. This is finite observation, never a READY grant or product/formal acceptance.
+
+`pure-verifier.test.mjs` has six groups using exported predicates from the real verifier: outer/inner binding; original f13 stop gate before a simulated receipt read; lowercase plan; ordered transcript; nil-slice and finite-case semantics; qualification Job/PID/stream integrity. Source syntax was checked only. Root must register a fresh supervised pure-test scope to execute it; the test imports the verifier module without entering its CLI path and performs no live receipt read.

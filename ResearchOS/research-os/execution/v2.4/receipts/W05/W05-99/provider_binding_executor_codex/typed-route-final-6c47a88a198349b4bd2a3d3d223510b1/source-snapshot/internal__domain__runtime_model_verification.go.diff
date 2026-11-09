@@ -1,0 +1,318 @@
+--- authorized-before/internal/domain/runtime_model_verification.go
++++ author-attempt3/internal/domain/runtime_model_verification.go
+@@ -196,6 +196,203 @@
+ 	return ref, profile, technical, nil
+ }
+ 
++// Follow the original persisted relationship revision, never today's head.
++func providerHistoricalRelation(tx *sql.Tx, project, kind string, owner Object, field, targetKind, targetID string) (Object, error) {
++	revision, err := Num(owner, "revision")
++	if err != nil {
++		return nil, historyInvalid("provider historical relation owner")
++	}
++	rows, err := tx.Query(`SELECT r.target_project,r.target_kind,r.target_id,r.target_revision,v.body FROM domain_refs r JOIN domain_versions v ON v.project=r.target_project AND v.kind=r.target_kind AND v.id=r.target_id AND v.revision=r.target_revision WHERE r.project=? AND r.kind=? AND r.id=? AND r.revision=? AND r.field=?`, project, kind, owner["id"], revision, field)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var result Object
++	for rows.Next() {
++		var p, k, id, raw string
++		var rev int64
++		if err = rows.Scan(&p, &k, &id, &rev, &raw); err != nil {
++			return nil, err
++		}
++		v, e := Decode([]byte(raw))
++		allowedProject := p == project || (p == "" && targetKind == "BudgetPolicy")
++		if e != nil || result != nil || !allowedProject || k != targetKind || id != targetID || Str(v, "project_id") != p || v["id"] != id || Hash(v["revision"]) != Hash(rev) {
++			return nil, historyInvalid("provider historical relation identity")
++		}
++		result = v
++	}
++	if err = rows.Err(); err != nil {
++		return nil, err
++	}
++	if result == nil {
++		return nil, historyInvalid("provider historical relation missing")
++	}
++	return result, nil
++}
++
++func providerOriginalReservation(tx *sql.Tx, project string, run Object, id string) (Object, error) {
++	var raw, digest, historicalRaw, historicalDigest string
++	var revision, immutable int64
++	err := tx.QueryRow(`SELECT o.body,o.revision,o.content_hash,o.immutable,v.body,v.content_hash FROM domain_objects o JOIN domain_versions v ON v.project=o.project AND v.kind=o.kind AND v.id=o.id AND v.revision=o.revision WHERE o.project=? AND o.kind='BudgetLedgerEntry' AND o.id=?`, project, id).Scan(&raw, &revision, &digest, &immutable, &historicalRaw, &historicalDigest)
++	if err != nil {
++		return nil, historyInvalid("provider original reservation unavailable")
++	}
++	ledger, err := Decode([]byte(raw))
++	historical, he := Decode([]byte(historicalRaw))
++	if err != nil || he != nil || immutable != 1 || revision != 1 || ledger["project_id"] != project || ledger["id"] != id || Hash(ledger["revision"]) != Hash(revision) || ledger["receipt_hash"] != digest || Receipt(ledger) != digest || historicalDigest != digest || Hash(historical) != Hash(ledger) {
++		return nil, historyInvalid("provider original reservation immutable identity")
++	}
++	boundRun, err := providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/run_id", "Run", Str(run, "id"))
++	if err != nil {
++		return nil, err
++	}
++	for _, field := range []string{"id", "task_id", "runtime_id", "lease_epoch", "created_at", "executor_principal_id"} {
++		if Hash(boundRun[field]) != Hash(run[field]) {
++			return nil, historyInvalid("provider reservation original Run")
++		}
++	}
++	task, err := providerHistoricalRelation(tx, project, "Run", boundRun, "/task_id", "Task", Str(run, "task_id"))
++	if err != nil {
++		return nil, err
++	}
++	goal, err := providerHistoricalRelation(tx, project, "Task", task, "/goal_id", "Goal", Str(task, "goal_id"))
++	if err != nil {
++		return nil, err
++	}
++	if ledger["policy_id"] != goal["budget_policy_id"] || ledger["run_id"] != run["id"] {
++		return nil, historyInvalid("provider reservation original budget policy")
++	}
++	if _, err = providerHistoricalRelation(tx, project, "Goal", goal, "/budget_policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
++		return nil, err
++	}
++	if _, err = providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
++		return nil, err
++	}
++	return ledger, nil
++}
++
++// Every original MODEL reservation must still have its own PREPARED chain.
++// This also finds erased/aliased effects when no request marker survives.
++func providerReconcileReservations(tx *sql.Tx, project, runID string, prepared map[string][]Object) error {
++	rows, err := tx.Query(`SELECT project,id,body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND (?='' OR project=?) AND (?='' OR json_extract(body,'$.run_id')=?) AND json_extract(body,'$.operation')='RESERVE' AND instr(json_extract(body,'$.provider_request_id'),':model:')>0 AND substr(json_extract(body,'$.provider_event_id'),1,8)='prepare/'`, project, project, runID, runID)
++	if err != nil {
++		return err
++	}
++	items := []Object{}
++	for rows.Next() {
++		var p, id, raw string
++		if err = rows.Scan(&p, &id, &raw); err != nil {
++			rows.Close()
++			return err
++		}
++		v, e := Decode([]byte(raw))
++		if e != nil || v["project_id"] != p || v["id"] != id {
++			rows.Close()
++			return historyInvalid("provider original MODEL reservation identity")
++		}
++		items = append(items, v)
++	}
++	err = rows.Err()
++	rows.Close()
++	if err != nil {
++		return err
++	}
++	for _, ledger := range items {
++		p, r, key := Str(ledger, "project_id"), Str(ledger, "run_id"), Str(ledger, "provider_request_id")
++		parts := strings.Split(key, ":")
++		var epoch, ordinal int64
++		if len(parts) != 5 || parts[1] != r || parts[3] != "model" {
++			return historyInvalid("provider original MODEL reservation key")
++		}
++		if _, err = fmt.Sscan(parts[2], &epoch); err != nil || epoch < 1 || parts[2] != fmt.Sprint(epoch) {
++			return historyInvalid("provider original MODEL reservation epoch")
++		}
++		if _, err = fmt.Sscan(parts[4], &ordinal); err != nil || ordinal < 1 || parts[4] != fmt.Sprint(ordinal) {
++			return historyInvalid("provider original MODEL reservation ordinal")
++		}
++		run, e := providerOriginalRun(tx, p, r, Object{"task_id": parts[0], "epoch": epoch})
++		if e != nil {
++			return e
++		}
++		_, profile, _, e := providerOriginalProfile(tx, p, run)
++		if e != nil {
++			return e
++		}
++		config, _ := profile["model_config"].(map[string]any)
++		policy, e := providerPolicy(config)
++		if e != nil {
++			return e
++		}
++		if !policy {
++			// Individual effects still need positive nonpolicy admission.
++			// Missing bindings cannot justify an erased original MODEL hold.
++			if profile == nil {
++				return historyInvalid("provider original MODEL reservation provenance")
++			}
++			continue
++		}
++		if _, e = providerOriginalReservation(tx, p, run, Str(ledger, "id")); e != nil {
++			return e
++		}
++		facts := prepared[p+"/"+r+"/"+key]
++		if len(facts) != 1 || facts[0]["state"] != "PREPARED" || facts[0]["reservation_id"] != ledger["id"] {
++			return historyInvalid("provider unmatched original MODEL reservation")
++		}
++	}
++	return nil
++}
++
++func providerTypedEffectProof(tx *sql.Tx, project string, run, profile, effect Object) (string, error) {
++	ledger, err := providerOriginalReservation(tx, project, run, Str(effect, "reservation_id"))
++	if err != nil {
++		return "", err
++	}
++	key := Str(effect, "key")
++	if ledger["provider_request_id"] != key {
++		return "", historyInvalid("provider reservation original effect key")
++	}
++	request, _ := effect["payload"].(map[string]any)
++	capability := Str(request, "capability")
++	if capability != "MODEL" && capability != "TOOL" {
++		return "", historyInvalid("provider original typed capability")
++	}
++	prefix := fmt.Sprintf("%s:%s:%v:%s:", run["task_id"], run["id"], run["lease_epoch"], strings.ToLower(capability))
++	var ordinal int64
++	if !strings.HasPrefix(key, prefix) {
++		return "", historyInvalid("provider original typed key")
++	}
++	if _, err = fmt.Sscan(strings.TrimPrefix(key, prefix), &ordinal); err != nil || ordinal < 1 || key != prefix+fmt.Sprint(ordinal) {
++		return "", historyInvalid("provider original typed ordinal")
++	}
++	found := 0
++	var bound any
++	for _, v := range Arr(profile, "effect_routes") {
++		route, _ := v.(map[string]any)
++		if route["id"] == request["route"] && route["capability"] == capability && route["credential_revision"] == request["credential_revision"] {
++			found++
++			bound = route["upper_bound"]
++		}
++	}
++	if found != 1 || bound == nil {
++		return "", historyInvalid("provider ambiguous original typed route")
++	}
++	cost := Object{}
++	for _, field := range []string{"policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"} {
++		v, ok := ledger[field]
++		if !ok {
++			return "", historyInvalid("provider original cost field missing")
++		}
++		cost[field] = v
++	}
++	if cost["operation"] != "RESERVE" || cost["cost_basis"] != "UPPER_BOUND" || cost["provider_event_id"] != "prepare/"+key || cost["reservation_id"] != nil || cost["occurred_at"] != run["created_at"] || Hash(cost["money"]) != Hash(bound) || effect["request_hash"] != Hash([]any{request, cost}) {
++		return "", historyInvalid("provider original request and complete cost")
++	}
++	if capability == "TOOL" && (!modelExactKeys(request, "route", "capability", "credential_revision", "payload") || request["provider_transport"] != nil) {
++		return "", historyInvalid("provider original TOOL request")
++	}
++	return capability, nil
++}
++
+ // Every original MODEL is classified before examining removable transport or
+ // dispatch markers. Successful empty inventory requires proven nonpolicy.
+ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Object, error) {
+@@ -209,6 +406,7 @@
+ 		body              Object
+ 	}
+ 	all := []record{}
++	prepared := map[string][]Object{}
+ 	for rows.Next() {
+ 		var p, r, key, raw string
+ 		var seq int64
+@@ -221,11 +419,22 @@
+ 			rows.Close()
+ 			return nil, e
+ 		}
++		if v["project_id"] != p || v["run_id"] != r || v["key"] != key || Hash(v["sequence"]) != Hash(seq) || seq < 1 {
++			rows.Close()
++			return nil, historyInvalid("provider effect SQL identity")
++		}
++		if seq == 1 {
++			group := p + "/" + r + "/" + key
++			prepared[group] = append(prepared[group], v)
++		}
+ 		all = append(all, record{p, r, key, seq, v})
+ 	}
+ 	err = rows.Err()
+ 	rows.Close()
+ 	if err != nil {
++		return nil, err
++	}
++	if err = providerReconcileReservations(tx, project, runID, prepared); err != nil {
+ 		return nil, err
+ 	}
+ 	transports := map[string]Object{}
+@@ -253,13 +462,9 @@
+ 		key := record.key
+ 		modelKey := fmt.Sprintf("%s:%s:%v:model:", run["task_id"], record.run, run["lease_epoch"])
+ 		modelEffect := request["capability"] == "MODEL" || strings.HasPrefix(key, modelKey) || request["provider_transport"] != nil
+-		// A modified capability/key cannot hide a request still using the
+-		// immutable MODEL route. Ordinary TOOL routes keep their own gates.
+-		for _, value := range Arr(frozen, "effect_routes") {
+-			route, _ := value.(map[string]any)
+-			modelEffect = modelEffect || (route["id"] == request["route"] && route["capability"] == "MODEL")
+-		}
+-		if !modelEffect {
++		// On a policy Run even a claimed TOOL needs original reservation
++		// proof. Route IDs are intentionally shared across capabilities.
++		if !modelEffect && !policy {
+ 			continue
+ 		}
+ 		d, err := runtimeDispatch(tx, record.project, record.run, e["epoch"])
+@@ -289,6 +494,36 @@
+ 		if !policy {
+ 			if request["provider_transport"] != nil {
+ 				return nil, historyInvalid("provider transport without original policy")
++			}
++			continue
++		}
++		capability, err := providerTypedEffectProof(tx, record.project, run, p, e)
++		if err != nil {
++			return nil, err
++		}
++		seq, err := Num(e, "sequence")
++		if err != nil {
++			return nil, err
++		}
++		group := record.project + "/" + record.run + "/" + key
++		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
++			return nil, historyInvalid("provider effect sequence or identity")
++		}
++		sequences[group] = seq
++		if seq == 1 {
++			if e["state"] != "PREPARED" {
++				return nil, historyInvalid("provider missing PREPARED")
++			}
++			originals[group] = e
++		} else {
++			old := originals[group]
++			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
++				return nil, historyInvalid("provider history rebound")
++			}
++		}
++		if capability == "TOOL" {
++			if e["state"] != "PREPARED" && e["state"] != "STARTED" && e["state"] != "UNKNOWN" && e["state"] != "NOT_APPLIED" && e["state"] != "CONFIRMED" {
++				return nil, historyInvalid("provider invalid effect state")
+ 			}
+ 			continue
+ 		}
+@@ -329,26 +564,6 @@
+ 		cost := Object{"policy_id": ledger["policy_id"], "run_id": record.run, "operation": "RESERVE", "money": bound, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": run["created_at"]}
+ 		if e["request_hash"] != Hash([]any{request, cost}) || ledger["run_id"] != record.run || ledger["provider_request_id"] != key || ledger["operation"] != "RESERVE" || ledger["cost_basis"] != "UPPER_BOUND" || Hash(ledger["money"]) != Hash(bound) {
+ 			return nil, historyInvalid("provider original request and budget hash")
+-		}
+-		seq, err := Num(e, "sequence")
+-		if err != nil {
+-			return nil, err
+-		}
+-		group := record.project + "/" + record.run + "/" + key
+-		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
+-			return nil, historyInvalid("provider effect sequence or identity")
+-		}
+-		sequences[group] = seq
+-		if seq == 1 {
+-			if e["state"] != "PREPARED" {
+-				return nil, historyInvalid("provider missing PREPARED")
+-			}
+-			originals[group] = e
+-		} else {
+-			old := originals[group]
+-			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
+-				return nil, historyInvalid("provider history rebound")
+-			}
+ 		}
+ 		transports[key] = transport
+ 		switch e["state"] {

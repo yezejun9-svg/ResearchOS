@@ -1,0 +1,640 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"strings"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+func validateRuntimeToolArguments(config, payload Object) error {
+	args, ok := payload["arguments"].(map[string]any)
+	if len(payload) != 2 || !ok {
+		return Fail(400, "INVALID_REQUEST", "tool request requires only name and arguments")
+	}
+	name := Str(payload, "name")
+	if name != "read" && name != "write" && name != "edit" && name != "run_check" {
+		return Fail(403, "FORBIDDEN", "tool is not implemented by this host")
+	}
+	var schema any
+	for _, item := range Arr(config, "tools") {
+		tool, _ := item.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		if fn["name"] == name {
+			if schema != nil {
+				return Fail(403, "FORBIDDEN", "duplicate frozen tool definition")
+			}
+			schema = fn["parameters"]
+		}
+	}
+	if schema == nil {
+		return Fail(403, "FORBIDDEN", "tool absent from frozen model schema")
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.UseLoader(localOnly{})
+	compiler.AssertFormat()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	const location = "https://researchos.local/runtime-tool.json"
+	if e := compiler.AddResource(location, schema); e != nil {
+		return Fail(403, "FORBIDDEN", "invalid frozen tool schema")
+	}
+	doc, e := compiler.Compile(location)
+	if e != nil {
+		return Fail(403, "FORBIDDEN", "frozen tool schema cannot be compiled locally")
+	}
+	if doc.Validate(args) != nil {
+		return Fail(400, "INVALID_REQUEST", "arguments do not match the frozen tool schema")
+	}
+	return nil
+}
+
+func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, route RuntimeCoordinatorRoute, task, dispatch Object, frame rt.BridgeFrame, payload Object) (RuntimeToolRequest, error) {
+	var request RuntimeToolRequest
+	profile := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)["profile"].(map[string]any)
+	config, _ := profile["model_config"].(map[string]any)
+	if task["task_type"] != "mu_turn" || c.config.WorkspaceAuthority == nil {
+		return request, Fail(403, "FORBIDDEN", "tools require a current authenticated session workspace")
+	}
+	if e := validateRuntimeToolArguments(config, payload); e != nil {
+		return request, e
+	}
+	policy, ok := profile["tool_policy"].(map[string]any)
+	if !ok {
+		return request, Fail(403, "FORBIDDEN", "frozen tool policy required")
+	}
+	limit, e := Num(policy, "max_calls")
+	if e != nil || limit < 1 || limit > 32 {
+		return request, Fail(403, "FORBIDDEN", "bounded tool calls required")
+	}
+	var calls int64
+	runID := Str(dispatch["manifest"].(map[string]any), "run_id")
+	if e = tx.QueryRow(`SELECT count(DISTINCT effect_key) FROM resource_effects WHERE project=? AND run=? AND effect_key<>? AND json_extract(body,'$.payload.capability')='TOOL'`, route.ProjectID, runID, frame.Key).Scan(&calls); e != nil {
+		return request, e
+	}
+	if calls >= limit {
+		return request, Fail(403, "FORBIDDEN", "frozen tool call limit exhausted")
+	}
+	var sessionID, workspace, model string
+	if e = tx.QueryRow(`SELECT s.id,s.workspace_ref,s.model_config_ref FROM client_sessions s WHERE s.project_id=? AND s.task_id=? AND s.run_id=? AND s.archived_at IS NULL AND s.sealed_at IS NULL`, route.ProjectID, task["id"], runID).Scan(&sessionID, &workspace, &model); e != nil {
+		return request, Fail(403, "FORBIDDEN", "tool session provenance unavailable")
+	}
+	principal, e := clientSessionCreationPrincipal(ctx, tx, route.ProjectID, sessionID)
+	if e != nil {
+		return request, Fail(403, "FORBIDDEN", "tool session provenance unavailable")
+	}
+	if model != Str(config, "ref") {
+		return request, Fail(403, "FORBIDDEN", "session model changed")
+	}
+	if _, e = clientPrincipal(ctx, tx, principal, route.ProjectID, true); e != nil {
+		return request, e
+	}
+	if e = c.ValidateBinding(ctx, tx, principal, route.ProjectID, workspace, model); e != nil {
+		return request, e
+	}
+	if e = c.validateCodingWorkspace(ctx, tx, principal, route.ProjectID, sessionID, workspace, profile); e != nil {
+		return request, e
+	}
+	binding, e := c.service.binding(ctx, tx, workspace)
+	if e != nil {
+		return request, e
+	}
+	request = RuntimeToolRequest{WorkspacePath: binding.RealPath, Access: binding.Access, Name: Str(payload, "name"), Arguments: payload["arguments"].(map[string]any), Policy: policy,
+		IntentKey: "runtime-tool/" + Hash(Object{"project_id": route.ProjectID, "run_id": runID, "effect_key": frame.Key})}
+	return request, nil
+}
+
+func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+	unknown := func(reason string) (Object, error) {
+		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {
+			return nil, e
+		}
+		return nil, Fail(409, "STATE_CONFLICT", "tool outcome UNKNOWN; automatic retry prohibited")
+	}
+	notApplied := func(reason string) (Object, error) {
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "HOST_TOOL_NOT_APPLIED", reason)
+	}
+	tx, run, current, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+	if e != nil {
+		return notApplied("tool authority ended before host dispatch")
+	}
+	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+	var request RuntimeToolRequest
+	if e == nil {
+		request, e = c.runtimeToolGate(ctx, tx, route, task, current, frame, payload)
+	}
+	tx.Rollback()
+	if e != nil {
+		return notApplied("tool binding ended before host dispatch")
+	}
+	permissionGranted := false
+	selected, selectionErr := permissionSelection(request.Policy, request.Name)
+	if selectionErr != nil {
+		return notApplied("frozen confirmation policy is invalid")
+	}
+	if selected {
+		key, waiter, err := c.createToolPermission(ctx, route, runID, lease, epoch, frame, payload, request)
+		if err != nil {
+			return notApplied("frozen tool permission could not be requested")
+		}
+		if !c.waitToolPermission(ctx, route, key, waiter) {
+			c.closeToolPermission(context.Background(), route, key, waiter)
+			return notApplied("original tool permission was denied, expired or revoked")
+		}
+		permissionGranted = true
+	}
+	// Physical publication rechecks the original run and lease after acquiring
+	// its file guards. The child cannot supply or replace this callback.
+	request.Revalidate = func(checkCtx context.Context) error {
+		checkTx, checkRun, checkDispatch, err := c.dispatchGate(checkCtx, route, runID, lease, epoch)
+		if err != nil {
+			return err
+		}
+		defer checkTx.Rollback()
+		checkTask, err := load(checkTx, route.ProjectID, "Task", Str(checkRun, "task_id"))
+		if err != nil {
+//go:build windows
+
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"golang.org/x/sys/windows"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"researchos.local/research-os/internal/canonical"
+	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+)
+
+const BridgeRevision = "windows-appcontainer-v1"
+const PauseProtocol = "RESEARCHOS_PAUSE_V1"
+const PauseCheckpointFilename = "pause-checkpoint.json"
+const MaxPauseCheckpointBytes = 12 * 1024 * 1024
+
+type PauseCheckpoint struct {
+	QueueCut          int64           `json:"queue_cut"`
+	CommandLedgerHash string          `json:"command_ledger_hash"`
+	SDKWatermarks     json.RawMessage `json:"sdk_watermarks"`
+	SDKSessionID      string          `json:"sdk_session_id"`
+	Version           string          `json:"version"`
+	PauseID           string          `json:"pause_id"`
+	Binding           json.RawMessage `json:"binding"`
+	ContentHash       string          `json:"content_hash"`
+	Bytes             int64           `json:"bytes"`
+	InputHash         string          `json:"input_hash"`
+	ModelCalls        int64           `json:"model_calls"`
+	ToolCalls         int64           `json:"tool_calls"`
+}
+type CheckpointSeal struct {
+	CheckpointUsePrincipal   string          `json:"checkpoint_use_principal"`
+	Type                     string          `json:"type"`
+	Version                  string          `json:"version"`
+	PauseID                  string          `json:"pause_id"`
+	Binding                  json.RawMessage `json:"binding"`
+	Sequence                 int64           `json:"checkpoint_sequence"`
+	ContentHash              string          `json:"content_hash"`
+	CheckpointArtifactID     string          `json:"checkpoint_artifact_id"`
+	CheckpointUseReceiptHash string          `json:"checkpoint_use_receipt_hash"`
+	JournalCheckpointHash    string          `json:"journal_checkpoint_hash"`
+}
+
+type BridgeFrame struct {
+	Sequence   int64           `json:"sequence"`
+	Type       string          `json:"type"`
+	Key        string          `json:"key,omitempty"`
+	Route      string          `json:"route,omitempty"`
+	Capability string          `json:"capability,omitempty"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	Path       string          `json:"path,omitempty"`
+}
+
+type BridgeRequest struct {
+	WorkerID     string
+	Manifest     json.RawMessage
+	ManifestHash string
+	Executable   string
+	// Only explicit immutable inputs cross into the task sandbox. Credentials,
+	// authority paths and the host manifest never enter this map.
+	Inputs       map[string][]byte
+	BeforeResume func(sandbox.Identity) error
+}
+
+type BridgeJournal struct {
+	PauseProtocol      string           `json:"pause_protocol,omitempty"`
+	PauseRequested     bool             `json:"pause_requested,omitempty"`
+	PauseID            string           `json:"pause_id,omitempty"`
+	QueueBinding       json.RawMessage  `json:"queue_binding,omitempty"`
+	Checkpoint         *PauseCheckpoint `json:"checkpoint,omitempty"`
+	CheckpointSeal     *CheckpointSeal  `json:"checkpoint_seal,omitempty"`
+	Version            int              `json:"version"`
+	Manifest           json.RawMessage  `json:"manifest"`
+	ManifestHash       string           `json:"manifest_hash"`
+	DispatchKey        string           `json:"dispatch_key"`
+	Worker             string           `json:"worker"`
+	Revision           string           `json:"adapter_revision"`
+	Identity           sandbox.Identity `json:"identity"`
+	State              string           `json:"state"`
+	Reason             string           `json:"reason"`
+	Started            string           `json:"started"`
+	Ended              string           `json:"ended"`
+	Sequence           int64            `json:"observation_sequence"`
+	Frames             int64            `json:"frames"`
+	Acknowledged       int64            `json:"acknowledged"`
+	ContextReady       bool             `json:"context_ready"`
+	CheckpointSequence int64            `json:"checkpoint_sequence"`
+	Paused             bool             `json:"paused"`
+	InputHash          string           `json:"input_hash"`
+	ProtocolComplete   bool             `json:"protocol_complete"`
+	Cancelled          bool             `json:"cancelled"`
+	Receipt            sandbox.Receipt  `json:"sandbox_receipt"`
+	Artifacts          []Artifact       `json:"artifacts"`
+	StdoutHash         string           `json:"stdout_hash"`
+	StderrHash         string           `json:"stderr_hash"`
+	QueueRequired      bool             `json:"queue_required"`
+	QueueSealed        bool             `json:"queue_sealed"`
+	QueueAbortObserved bool             `json:"queue_abort_observed"`
+	QueueCancelIdle    bool             `json:"queue_cancel_idle"`
+	QueueIdle          bool             `json:"queue_idle"`
+	QueueInitSequence  int64            `json:"queue_init_sequence"`
+	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
+}
+
+type Bridge struct {
+	mu                                        sync.Mutex
+	directory                                 string
+	lock                                      *os.File
+	process                                   *sandbox.Process
+	cancel                                    context.CancelFunc
+	journal                                   BridgeJournal
+	frames                                    chan BridgeFrame
+	done                                      chan struct{}
+	deadline                                  time.Time
+	wallDeadline                              time.Time
+	pending                                   []byte
+	stdout, stderr                            *os.File
+	streamOffsets                             map[string]int64
+	err                                       error
+	writeMu                                   sync.Mutex
+	modelInitDelivered                        bool
+	modelStreams                              []*ModelStream
+	modelObservations                         chan ModelStreamObservation
+	modelChanged                              chan struct{}
+	modelDataRecords, modelObservationRecords int
+}
+
+func bridgeMap(raw []byte) (map[string]any, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var m map[string]any
+	err := d.Decode(&m)
+	if err == nil && m == nil {
+		err = errors.New("object required")
+	}
+	return m, err
+}
+func bridgeString(m map[string]any, key string) string { s, _ := m[key].(string); return s }
+func bridgeNumber(m map[string]any, key string) int64 {
+	n, _ := m[key].(json.Number)
+	v, _ := n.Int64()
+	return v
+}
+func canonicalHash(raw []byte) (string, error) {
+	b, e := canonical.JSON(raw)
+	if e != nil {
+		return "", e
+	}
+	return Hash(b), nil
+}
+
+// LockDataRoot is held for the complete control coordinator lifetime. It uses
+// an OS-exclusive non-inherited handle, not the SQLite connection count.
+func LockDataRoot(directory string) (*os.File, error) {
+	abs, e := filepath.Abs(directory)
+	if e != nil {
+		return nil, e
+	}
+	if e = os.MkdirAll(abs, 0700); e != nil {
+		return nil, e
+	}
+	actual, e := filepath.EvalSymlinks(abs)
+	if e != nil || !strings.EqualFold(filepath.Clean(abs), filepath.Clean(actual)) {
+		return nil, errors.New("canonical non-reparse data root required")
+	}
+	return lockFile(filepath.Join(actual, "coordinator.lock"))
+}
+
+func (w *Bridge) persist() error {
+	w.journal.Sequence++
+	return save(filepath.Join(w.directory, "bridge.json"), w.journal)
+}
+
+func StartBridge(ctx context.Context, directory string, request BridgeRequest) (*Bridge, error) {
+		return Fail(422, "GATE_FAILED", "verified admission snapshot required")
+	}
+	if e := validateRuntimeDispatchProfile(profile); e != nil {
+		return e
+	}
+	manifest := Object{"version": 1, "project_id": project, "run_id": run["id"], "task_id": task["id"], "epoch": run["lease_epoch"], "runtime_id": run["runtime_id"], "executor_principal_id": run["executor_principal_id"], "contract_hash": task["acceptance_contract"].(map[string]any)["contract_hash"], "input_refs": run["input_refs"], "context_bundle_id": run["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "admission": admission}
+	key := ID()
+	manifest["dispatch_key"] = key
+	if e := runtimepolicy.Prepare(manifest, Str(task, "task_type")); e != nil {
+		return Fail(422, "GATE_FAILED", "qualification projection: "+e.Error())
+	}
+	_, e := tx.Exec("INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED',?,?)", project, run["id"], run["lease_epoch"], key, string(Bytes(manifest)), Hash(manifest), Now(), Now())
+	return e
+}
+
+func runtimeDispatch(tx *sql.Tx, project, run string, epoch any) (Object, error) {
+	var key, manifest, digest, state, worker, locator, identity, observation, reason string
+	var sequence int64
+	e := tx.QueryRow("SELECT dispatch_key,manifest,manifest_hash,state,worker,journal_locator,identity,observation_sequence,observation_hash,reason FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?", project, run, epoch).Scan(&key, &manifest, &digest, &state, &worker, &locator, &identity, &sequence, &observation, &reason)
+	if e != nil {
+		return nil, e
+	}
+	m, e := Decode([]byte(manifest))
+	if e != nil || Hash(m) != digest || m["dispatch_key"] != key || m["run_id"] != run || m["project_id"] != project || Hash(m["epoch"]) != Hash(epoch) {
+		return nil, Fail(422, "GATE_FAILED", "immutable dispatch manifest mismatch")
+	}
+	id, e := Decode([]byte(identity))
+	if e != nil {
+		return nil, e
+	}
+	return Object{"dispatch_key": key, "manifest": m, "manifest_hash": digest, "state": state, "worker": worker, "journal_locator": locator, "identity": id, "observation_sequence": sequence, "observation_hash": observation, "reason": reason}, nil
+}
+
+// currentDispatchAdmission rechecks authority without granting a fresh launch.
+func (s *Service) currentDispatchAdmission(tx *sql.Tx, project string, task, run, dispatch Object, operation string) (Object, error) {
+	manifest := dispatch["manifest"].(map[string]any)
+	if manifest["task_id"] != task["id"] || manifest["runtime_id"] != run["runtime_id"] || manifest["executor_principal_id"] != run["executor_principal_id"] || Hash(manifest["epoch"]) != Hash(run["lease_epoch"]) || manifest["context_bundle_id"] != run["context_bundle_id"] || Hash(manifest["input_refs"]) != Hash(run["input_refs"]) || manifest["contract_hash"] != task["acceptance_contract"].(map[string]any)["contract_hash"] {
+		return nil, Fail(412, "STALE_INPUT", "dispatch no longer binds current Run")
+	}
+	if !runtimeExecutorAllowed(tx, Str(run, "executor_principal_id"), project, Str(task, "id")) {
+		return nil, Fail(403, "FORBIDDEN", "executor dispatch role or grant revoked")
+	}
+	runtime, e := load(tx, project, "RuntimeRegistration", Str(run, "runtime_id"))
+	if e != nil {
+		return nil, e
+	}
+	prior := manifest["admission"].(map[string]any)
+	var admission Object
+	if prior["qualification_bootstrap"] == true {
+		admission, e = s.bootstrapRuntimeAdmission(tx, project, task, run, runtime)
+	} else {
+		admission, e = s.currentRuntimeAdmission(tx, project, task, runtime, Arr(prior, "requested_capabilities"), operation)
+	}
+	if e != nil {
+		return nil, e
+	}
+	// Runtime health/lifecycle revisions are not a technical identity. Every
+	// profile, permission, qualification proof and expiry fact remains exact.
+	for _, key := range []string{"mode", "profile_hash", "profile", "technical_hash", "qualification_ids", "qualification_evidence", "permission", "credential_revision", "expires_at", "requested_capabilities", "qualification_bootstrap"} {
+		if Hash(prior[key]) != Hash(admission[key]) {
+			return nil, Fail(412, "STALE_INPUT", "dispatch authority snapshot changed")
+		}
+	}
+	if e = s.taskContextForRun(tx, project, run); e != nil {
+		return nil, e
+
+// ObserveRuntime is only called by the trusted worker bridge. There is no HTTP write endpoint.
+// An old epoch observation is retained for reconciliation but cannot change current Run state.
+func (s *Service) ObserveRuntime(ctx context.Context, project, runID string, epoch int64, observation Object) error {
+	return s.observeRuntime(ctx, project, runID, epoch, observation, false)
+}
+func (s *Service) observeRuntime(ctx context.Context, project, runID string, epoch int64, observation Object, coordinator bool) error {
+	if epoch < 1 {
+		return Fail(400, "INVALID_REQUEST", "invalid epoch")
+	}
+	spec, _ := observation["spec"].(map[string]any)
+	n, e := Num(spec, "epoch")
+	if e != nil || n != epoch || spec["run_id"] != runID {
+		return Fail(422, "GATE_FAILED", "observation identity mismatch")
+	}
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	r, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return e
+	}
+	if spec["task_id"] != r["task_id"] {
+		return Fail(422, "GATE_FAILED", "observation task mismatch")
+	}
+	dispatch, de := runtimeDispatch(tx, project, runID, epoch)
+	if de != nil && de != sql.ErrNoRows {
+		return de
+	}
+	if de == nil {
+		if !coordinator {
+			return Fail(403, "FORBIDDEN", "native dispatch observation requires bound coordinator")
+		}
+		sequence, se := Num(observation, "observation_sequence")
+		prior, _ := Num(dispatch, "observation_sequence")
+		if se != nil || sequence < 1 || observation["dispatch_key"] != dispatch["dispatch_key"] || observation["manifest_hash"] != dispatch["manifest_hash"] || observation["worker"] != dispatch["worker"] || Hash(observation["identity"]) != Hash(dispatch["identity"]) || len(dispatch["identity"].(map[string]any)) == 0 || sequence < prior || (sequence == prior && Hash(observation) != dispatch["observation_hash"]) {
+			return Fail(422, "GATE_FAILED", "observation differs from durable native dispatch identity")
+		}
+		if observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Str(observation, "ended") == "" {
+			return Fail(422, "GATE_FAILED", "observation is not a drained terminal fact")
+		}
+		if _, e = tx.Exec("UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,updated_at=? WHERE project=? AND run=? AND epoch=?", sequence, Hash(observation), Now(), project, runID, epoch); e != nil {
+			return e
+		}
+	}
+	_, e = tx.Exec("INSERT OR IGNORE INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)", project, runID, epoch, Hash(observation), string(Bytes(observation)), Now())
+	if e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+func runtimeObservation(tx *sql.Tx, project string, r Object) (Object, error) {
+	var raw string
+	e := tx.QueryRow("SELECT body FROM runtime_observations WHERE project=? AND run=? AND epoch=? ORDER BY observed_at DESC LIMIT 1", project, r["id"], r["lease_epoch"]).Scan(&raw)
+	if e != nil {
+		return nil, Fail(422, "GATE_FAILED", "trusted runtime observation required")
+	}
+	return Decode([]byte(raw))
+}
+func currentRun(tx *sql.Tx, p Principal, project, id string) (Object, error) {
+	r, e := load(tx, project, "Run", id)
+	if e != nil {
+		return nil, e
+	}
+	if !p.Allowed(project, Str(r, "task_id"), id, false) {
+		return nil, Fail(404, "NOT_FOUND", "run unavailable")
+	}
+	return r, nil
+}
+func runTerminal(r Object) bool {
+	return r["status"] == "SETTLED" || r["status"] == "FAILED" || r["status"] == "CANCELLED"
+}
+func runtimeLease(tx *sql.Tx, p Principal, project string, r, b Object) error {
+	epoch, e := Num(b, "lease_epoch")
+	current, _ := Num(r, "lease_epoch")
+	expires, te := time.Parse(time.RFC3339Nano, Str(r, "lease_expires_at"))
+	if p.ID != r["executor_principal_id"] || e != nil || epoch != current || Digest([]byte(Str(b, "lease_token"))) != r["lease_token_hash"] || te != nil || !time.Now().Before(expires) {
+		return Fail(409, "LEASE_EXPIRED", "run lease no longer current")
+	}
+	task, e := load(tx, project, "Task", Str(r, "task_id"))
+	if e != nil || task["active_run_id"] != r["id"] {
+		return Fail(409, "LEASE_EXPIRED", "run no longer owns task")
+	}
+	return nil
+}
+func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, b Object, op, cid string) (Object, string, int, error) {
+	return s.runtimeOperationMode(tx, p, project, id, b, op, cid, false)
+}
+
+// recoveryFacts is only set by local journal ingestion after exact epoch and
+// native proof checks. It never bypasses a lease for execution or heartbeat.
+func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id string, b Object, op, cid string, recoveryFacts bool) (Object, string, int, error) {
+	if recoveryFacts && op != "reportRun" && op != "acknowledgeRunCancellation" {
+		return nil, "", 0, Fail(403, "FORBIDDEN", "recovery can import terminal facts only")
+	}
+	if op == "registerRuntime" {
+		r := Merge(Base(project), b)
+		Merge(r, Object{"status": "REGISTERED", "qualification_ids": Empty(), "health_checked_at": nil, "supports_resume": false, "resume_evidence_ref": nil})
+		return r, "RuntimeRegistration", 201, s.put(tx, "RuntimeRegistration", r)
+	}
+	if op == "qualifyRuntime" {
+		r, e := s.qualifyRuntime(tx, p, project, id, b)
+		return r, "RuntimeRegistration", 200, e
+	}
+	r, e := currentRun(tx, p, project, id)
+	if e != nil {
+		return nil, "", 0, e
+	}
+	if op != "cancelRun" && op != "reconcileRun" && !recoveryFacts {
+		if e = runtimeLease(tx, p, project, r, b); e != nil {
+			return nil, "", 0, e
+		}
+	}
+	if runTerminal(r) {
+		return nil, "", 0, Fail(409, "STATE_CONFLICT", "run already terminal")
+	}
+	switch op {
+	case "heartbeatRun":
+		if e = s.currentDispatchedRun(tx, project, r, "heartbeat"); e != nil {
+			return nil, "", 0, e
+		}
+		if r["status"] == "CANCEL_REQUESTED" || r["status"] == "RECONCILING" || r["status"] == "LOST" {
+			return nil, "", 0, Fail(409, "STATE_CONFLICT", "run requires reconciliation")
+		}
+		if old := Str(r, "external_run_id"); old != "" && old != Str(b, "external_run_id") {
+			return nil, "", 0, Fail(409, "STATE_CONFLICT", "external identity changed")
+		}
+		if checkpoint := Str(b, "checkpoint_artifact_id"); checkpoint != "" {
+			if _, _, err := s.artifactUse(tx, project, r, checkpoint, false); err != nil {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "heartbeat checkpoint has no current run contribution")
+			}
+		}
+		r["heartbeat_at"] = Now()
+		r["lease_expires_at"] = time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339Nano)
+		r["external_run_id"] = b["external_run_id"]
+		// A fresh session can heartbeat before producing its next checkpoint.
+		// Null reports no new checkpoint; it cannot erase the durable recovery point.
+		if Str(b, "checkpoint_artifact_id") != "" {
+			r["checkpoint_artifact_id"] = b["checkpoint_artifact_id"]
+		}
+		r["status"] = "RUNNING"
+		if r["started_at"] == nil {
+			r["started_at"] = Now()
+		}
+	case "cancelRun":
+		if e = fenceClientTask(tx, project, Str(r, "task_id")); e != nil {
+			return nil, "", 0, e
+		}
+		r["status"] = "CANCEL_REQUESTED"
+		r["cancel_requested_at"] = Now()
+	case "reportRun":
+		if e = clientQueueSettled(tx, project, id); e != nil {
+			return nil, "", 0, e
+		}
+		if e = s.currentDispatchedRun(tx, project, r, "report"); e != nil {
+			return nil, "", 0, e
+		}
+		o, err := runtimeObservation(tx, project, r)
+		if err != nil {
+			return nil, "", 0, err
+		}
+		protocol, _ := o["protocol"].(map[string]any)
+		if o["state"] != "SETTLED" && o["state"] != "FAILED" || o["children_stopped"] != true || o["queue_empty"] != true || Str(o, "ended") == "" || Hash(o["exit_code"]) != Hash(b["exit_code"]) {
+			return nil, "", 0, Fail(422, "GATE_FAILED", "settled process tree and complete receipt required")
+		}
+		if r["status"] == "CANCEL_REQUESTED" {
+			return nil, "", 0, Fail(409, "STATE_CONFLICT", "cancellation requires acknowledgement")
+		}
+		manifest := map[string]int{}
+		for _, v := range Arr(o, "artifacts") {
+			item, ok := v.(map[string]any)
+			if !ok {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "invalid trusted output manifest")
+			}
+			manifest[Hash([]any{item["content_hash"], item["byte_size"]})]++
+		}
+		if len(Arr(b, "result_artifact_ids")) != len(Arr(o, "artifacts")) {
+			return nil, "", 0, Fail(422, "GATE_FAILED", "results must exactly match trusted output manifest")
+		}
+		seen := map[string]bool{}
+		for _, v := range Arr(b, "result_artifact_ids") {
+			artifactID := v.(string)
+			a, _, err := s.artifactUse(tx, project, r, artifactID, true)
+			if err != nil || seen[artifactID] {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "result must be a unique artifact sealed by this run")
+			}
+			seen[artifactID] = true
+			key := Hash([]any{a["content_hash"], a["byte_size"]})
+			if manifest[key] == 0 {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "result is absent from trusted output manifest")
+			}
+			manifest[key]--
+		}
+		if checkpoint := Str(b, "checkpoint_artifact_id"); checkpoint != "" {
+			_, _, err := s.artifactUse(tx, project, r, checkpoint, false)
+			if err != nil {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "checkpoint must be sealed by this run")
+			}
+		}
+		status := "FAILED"
+		if o["state"] == "SETTLED" && protocol["settled"] == true && len(Arr(o, "artifacts")) > 0 {
+			status = "SETTLED"
+		}
+		Merge(r, Object{"status": status, "execution_report": b["execution_report"], "exit_code": b["exit_code"], "result_artifact_ids": b["result_artifact_ids"], "checkpoint_artifact_id": b["checkpoint_artifact_id"], "runtime_settled_at": Now(), "children_stopped": true, "queue_empty": true, "ended_at": Now()})
+		task, err := load(tx, project, "Task", Str(r, "task_id"))
+		if err != nil {
+			return nil, "", 0, err
+		}
+		if task["active_run_id"] != id {
+			return nil, "", 0, Fail(409, "STATE_CONFLICT", "run no longer owns task")
+		}
+		if status == "SETTLED" {
+			if e = bump(task); e != nil {
+				return nil, "", 0, e
+			}
+			task["status"] = "EXECUTION_REPORTED"
+			task["output_artifact_ids"] = b["result_artifact_ids"]
+			if e = s.put(tx, "Task", task); e != nil {
+				return nil, "", 0, e
+			}
+			if e = s.event(tx, project, "Task", task, p.ID, cid, "TASK_CHANGED"); e != nil {
+				return nil, "", 0, e
+			}
+		}
+		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
+			return nil, "", 0, e
+		}
+		if e = s.releaseCompletedRuntimeLocalLaunch(tx, project, r); e != nil {

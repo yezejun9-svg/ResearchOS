@@ -1,0 +1,507 @@
+internal/domain/runtime_coordinator_windows.go:670:	var qualificationRejection *qualificationPreEffectRejection
+internal/domain/runtime_coordinator_windows.go-671-	if errors.As(protocolError, &qualificationRejection) {
+internal/domain/runtime_coordinator_windows.go-672-		cancelBroker()
+internal/domain/runtime_coordinator_windows.go-673-		cancel()
+internal/domain/runtime_coordinator_windows.go-674-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-675-		select {
+internal/domain/runtime_coordinator_windows.go-676-		case heartbeatFailure := <-heartbeatError:
+internal/domain/runtime_coordinator_windows.go-677-			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "heartbeat changed before qualification closure")
+internal/domain/runtime_coordinator_windows.go-678-			return errors.Join(protocolError, heartbeatFailure)
+internal/domain/runtime_coordinator_windows.go-679-		default:
+internal/domain/runtime_coordinator_windows.go-680-		}
+internal/domain/runtime_coordinator_windows.go:681:		if e := c.closeOnlineQualificationFailure(context.Background(), route, runID, epoch, locator, bridge, qualificationRejection, drain); e != nil {
+internal/domain/runtime_coordinator_windows.go-682-			c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "qualification failure proof incomplete")
+internal/domain/runtime_coordinator_windows.go-683-			return errors.Join(protocolError, e)
+internal/domain/runtime_coordinator_windows.go-684-		}
+internal/domain/runtime_coordinator_windows.go-685-		return protocolError
+internal/domain/runtime_coordinator_windows.go-686-	}
+internal/domain/runtime_coordinator_windows.go-687-	if protocolError != nil {
+internal/domain/runtime_coordinator_windows.go-688-		cancel()
+internal/domain/runtime_coordinator_windows.go-689-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-690-		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "protocol not reconciled")
+internal/domain/runtime_coordinator_windows.go-691-		return protocolError
+internal/domain/runtime_coordinator_windows.go-692-	}
+internal/domain/runtime_coordinator_windows.go-693-	tx, e = c.service.DB.BeginTx(ctx, nil)
+internal/domain/runtime_coordinator_windows.go-694-	if e == nil {
+internal/domain/runtime_coordinator_windows.go-695-		e = effectsReconciled(tx, route.ProjectID, runID)
+internal/domain/runtime_coordinator_windows.go-696-		tx.Rollback()
+internal/domain/runtime_coordinator_windows.go-697-	}
+internal/domain/runtime_coordinator_windows.go-698-	if e != nil {
+internal/domain/runtime_coordinator_windows.go-699-		cancel()
+internal/domain/runtime_coordinator_windows.go-700-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-701-		c.markUnknown(context.Background(), route.ProjectID, runID, epoch, "effect reconciliation incomplete")
+internal/domain/runtime_coordinator_windows.go-702-		return e
+internal/domain/runtime_coordinator_windows.go-703-	}
+internal/domain/runtime_coordinator_windows.go-704-	j, e := bridge.Finalize(true)
+internal/domain/runtime_coordinator_windows.go-705-	if e != nil {
+internal/domain/runtime_coordinator_windows.go-706-		cancel()
+internal/domain/runtime_coordinator_windows.go-707-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-708-		return e
+internal/domain/runtime_coordinator_windows.go-709-	}
+internal/domain/runtime_coordinator_windows.go-710-	c.boundary("terminal_durable", run)
+internal/domain/runtime_coordinator_windows.go-711-	if e = c.ingestObservation(ctx, route.ProjectID, runID, epoch, j); e != nil {
+internal/domain/runtime_coordinator_windows.go-712-		cancel()
+internal/domain/runtime_coordinator_windows.go-713-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-714-		return e
+internal/domain/runtime_coordinator_windows.go-715-	}
+internal/domain/runtime_coordinator_windows.go-716-	if j.State == "CANCELLED" {
+internal/domain/runtime_coordinator_windows.go-717-		cancel()
+internal/domain/runtime_coordinator_windows.go-718-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-719-		return c.recoverTerminal(ctx, route.ProjectID, runID, epoch, directory, j)
+internal/domain/runtime_coordinator_windows.go-720-	}
+internal/domain/runtime_coordinator_windows.go-721-	if j.State != "SETTLED" && j.State != "FAILED" && j.State != "PAUSED" {
+internal/domain/runtime_coordinator_windows.go-722-		cancel()
+internal/domain/runtime_coordinator_windows.go-723-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-724-		return Fail(409, "STATE_CONFLICT", "worker failed or cancelled")
+internal/domain/runtime_coordinator_windows.go-725-	}
+internal/domain/runtime_coordinator_windows.go-726-	observation, e := j.Observation()
+internal/domain/runtime_coordinator_windows.go-727-	if e != nil {
+internal/domain/runtime_coordinator_windows.go-728-		cancel()
+internal/domain/runtime_coordinator_windows.go-729-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-730-		return e
+internal/domain/runtime_coordinator_windows.go-731-	}
+internal/domain/runtime_coordinator_windows.go-732-	if _, e = c.sealOutput(ctx, route, runID, locator+"-host-log", Bytes(observation), j, "LOG"); e != nil {
+internal/domain/runtime_coordinator_windows.go-733-		cancel()
+internal/domain/runtime_coordinator_windows.go-734-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-735-		return e
+internal/domain/runtime_coordinator_windows.go-736-	}
+internal/domain/runtime_coordinator_windows.go-737-	if j.State == "PAUSED" {
+internal/domain/runtime_coordinator_windows.go-738-		cancel()
+internal/domain/runtime_coordinator_windows.go-739-		<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-740-		return nil
+internal/domain/runtime_coordinator_windows.go-741-	}
+internal/domain/runtime_coordinator_windows.go-742-	ids := Empty()
+internal/domain/runtime_coordinator_windows.go-743-	for i, artifact := range j.Artifacts {
+internal/domain/runtime_coordinator_windows.go-744-		raw, e := os.ReadFile(filepath.Join(directory, "output", artifact.Path))
+internal/domain/runtime_coordinator_windows.go-745-		if e != nil {
+internal/domain/runtime_coordinator_windows.go-746-			cancel()
+internal/domain/runtime_coordinator_windows.go-747-			<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-748-			return e
+internal/domain/runtime_coordinator_windows.go-749-		}
+internal/domain/runtime_coordinator_windows.go-750-		if Digest(raw) != artifact.Hash || int64(len(raw)) != artifact.Size {
+internal/domain/runtime_coordinator_windows.go-751-			cancel()
+internal/domain/runtime_coordinator_windows.go-752-			<-heartbeatDone
+internal/domain/runtime_coordinator_windows.go-753-			return errors.New("output changed after terminal observation")
+internal/domain/runtime_coordinator_windows.go-754-		}
+internal/domain/runtime_coordinator_windows.go-755-		a, e := c.sealOutput(ctx, route, runID, locator+"-"+strconv.Itoa(i), raw, j, "REPORT")
+internal/domain/runtime_coordinator_windows.go-756-		if e != nil {
+--
+internal/domain/runtime_qualification_failure_windows.go:23:type qualificationPreEffectRejection struct {
+internal/domain/runtime_qualification_failure_windows.go-24-	receipt Object
+internal/domain/runtime_qualification_failure_windows.go-25-	digest  string
+internal/domain/runtime_qualification_failure_windows.go-26-	cause   error
+internal/domain/runtime_qualification_failure_windows.go-27-}
+internal/domain/runtime_qualification_failure_windows.go-28-
+internal/domain/runtime_qualification_failure_windows.go-29-type qualificationBrokerDrain struct {
+internal/domain/runtime_qualification_failure_windows.go-30-	accepted      int
+internal/domain/runtime_qualification_failure_windows.go-31-	completed     int
+internal/domain/runtime_qualification_failure_windows.go-32-	pending       int
+internal/domain/runtime_qualification_failure_windows.go-33-	closed        bool
+internal/domain/runtime_qualification_failure_windows.go-34-	disqualified  bool
+internal/domain/runtime_qualification_failure_windows.go-35-	rejectedSeq   int64
+internal/domain/runtime_qualification_failure_windows.go-36-	frameHashes   map[int64]string
+internal/domain/runtime_qualification_failure_windows.go-37-	completionSet map[int64]string
+internal/domain/runtime_qualification_failure_windows.go-38-}
+internal/domain/runtime_qualification_failure_windows.go-39-
+internal/domain/runtime_qualification_failure_windows.go:40:type qualificationBrokerRegistry struct {
+internal/domain/runtime_qualification_failure_windows.go-41-	mu           sync.Mutex
+internal/domain/runtime_qualification_failure_windows.go-42-	closed       bool
+internal/domain/runtime_qualification_failure_windows.go-43-	disqualified bool
+internal/domain/runtime_qualification_failure_windows.go-44-	rejectedSeq  int64
+internal/domain/runtime_qualification_failure_windows.go-45-	admitted     map[int64]string
+internal/domain/runtime_qualification_failure_windows.go-46-	completed    map[int64]string
+internal/domain/runtime_qualification_failure_windows.go-47-}
+internal/domain/runtime_qualification_failure_windows.go-48-
+internal/domain/runtime_qualification_failure_windows.go:49:func newQualificationBrokerRegistry() *qualificationBrokerRegistry {
+internal/domain/runtime_qualification_failure_windows.go:50:	return &qualificationBrokerRegistry{admitted: map[int64]string{}, completed: map[int64]string{}}
+internal/domain/runtime_qualification_failure_windows.go-51-}
+internal/domain/runtime_qualification_failure_windows.go-52-
+internal/domain/runtime_qualification_failure_windows.go:53:func (r *qualificationBrokerRegistry) admit(frame rt.BridgeFrame) bool {
+internal/domain/runtime_qualification_failure_windows.go-54-	r.mu.Lock()
+internal/domain/runtime_qualification_failure_windows.go-55-	defer r.mu.Unlock()
+internal/domain/runtime_qualification_failure_windows.go-56-	if r.closed || r.admitted[frame.Sequence] != "" {
+internal/domain/runtime_qualification_failure_windows.go-57-		r.disqualified = true
+internal/domain/runtime_qualification_failure_windows.go-58-		return false
+internal/domain/runtime_qualification_failure_windows.go-59-	}
+internal/domain/runtime_qualification_failure_windows.go-60-	r.admitted[frame.Sequence] = Hash(frame)
+internal/domain/runtime_qualification_failure_windows.go-61-	return true
+internal/domain/runtime_qualification_failure_windows.go-62-}
+internal/domain/runtime_qualification_failure_windows.go-63-
+internal/domain/runtime_qualification_failure_windows.go:64:func (r *qualificationBrokerRegistry) complete(sequence int64, digest string) bool {
+internal/domain/runtime_qualification_failure_windows.go-65-	r.mu.Lock()
+internal/domain/runtime_qualification_failure_windows.go-66-	defer r.mu.Unlock()
+internal/domain/runtime_qualification_failure_windows.go-67-	if r.admitted[sequence] == "" || r.completed[sequence] != "" {
+internal/domain/runtime_qualification_failure_windows.go-68-		r.disqualified = true
+internal/domain/runtime_qualification_failure_windows.go-69-		return false
+internal/domain/runtime_qualification_failure_windows.go-70-	}
+internal/domain/runtime_qualification_failure_windows.go-71-	r.completed[sequence] = digest
+internal/domain/runtime_qualification_failure_windows.go-72-	return true
+internal/domain/runtime_qualification_failure_windows.go-73-}
+internal/domain/runtime_qualification_failure_windows.go-74-
+internal/domain/runtime_qualification_failure_windows.go:75:func (r *qualificationBrokerRegistry) close(rejectedSeq int64) {
+internal/domain/runtime_qualification_failure_windows.go-76-	r.mu.Lock()
+internal/domain/runtime_qualification_failure_windows.go-77-	r.closed = true
+internal/domain/runtime_qualification_failure_windows.go-78-	if rejectedSeq > 0 && r.rejectedSeq == 0 {
+internal/domain/runtime_qualification_failure_windows.go-79-		r.rejectedSeq = rejectedSeq
+internal/domain/runtime_qualification_failure_windows.go-80-	}
+internal/domain/runtime_qualification_failure_windows.go-81-	r.mu.Unlock()
+internal/domain/runtime_qualification_failure_windows.go-82-}
+internal/domain/runtime_qualification_failure_windows.go-83-
+internal/domain/runtime_qualification_failure_windows.go:84:func (r *qualificationBrokerRegistry) disqualify() {
+internal/domain/runtime_qualification_failure_windows.go-85-	r.mu.Lock()
+internal/domain/runtime_qualification_failure_windows.go-86-	r.disqualified = true
+internal/domain/runtime_qualification_failure_windows.go-87-	r.mu.Unlock()
+internal/domain/runtime_qualification_failure_windows.go-88-}
+internal/domain/runtime_qualification_failure_windows.go-89-
+internal/domain/runtime_qualification_failure_windows.go:90:func (r *qualificationBrokerRegistry) snapshot() qualificationBrokerDrain {
+internal/domain/runtime_qualification_failure_windows.go-91-	r.mu.Lock()
+internal/domain/runtime_qualification_failure_windows.go-92-	defer r.mu.Unlock()
+internal/domain/runtime_qualification_failure_windows.go-93-	t := qualificationBrokerDrain{accepted: len(r.admitted), completed: len(r.completed), pending: len(r.admitted) - len(r.completed), closed: r.closed, disqualified: r.disqualified, rejectedSeq: r.rejectedSeq, frameHashes: map[int64]string{}, completionSet: map[int64]string{}}
+internal/domain/runtime_qualification_failure_windows.go-94-	for k, v := range r.admitted {
+internal/domain/runtime_qualification_failure_windows.go-95-		t.frameHashes[k] = v
+internal/domain/runtime_qualification_failure_windows.go-96-	}
+internal/domain/runtime_qualification_failure_windows.go-97-	for k, v := range r.completed {
+internal/domain/runtime_qualification_failure_windows.go-98-		t.completionSet[k] = v
+internal/domain/runtime_qualification_failure_windows.go-99-	}
+internal/domain/runtime_qualification_failure_windows.go-100-	return t
+internal/domain/runtime_qualification_failure_windows.go-101-}
+internal/domain/runtime_qualification_failure_windows.go-102-
+internal/domain/runtime_qualification_failure_windows.go:103:func (q *qualificationPreEffectRejection) Error() string {
+internal/domain/runtime_qualification_failure_windows.go-104-	if q == nil || q.cause == nil {
+internal/domain/runtime_qualification_failure_windows.go-105-		return "qualification first-gate rejection unavailable"
+internal/domain/runtime_qualification_failure_windows.go-106-	}
+internal/domain/runtime_qualification_failure_windows.go-107-	return q.cause.Error()
+internal/domain/runtime_qualification_failure_windows.go-108-}
+internal/domain/runtime_qualification_failure_windows.go-109-
+internal/domain/runtime_qualification_failure_windows.go-110-func qualificationDenialUnavailable(reason string) error {
+internal/domain/runtime_qualification_failure_windows.go-111-	return Fail(409, "GATE_FAILED", "qualification failure proof unavailable: "+reason)
+internal/domain/runtime_qualification_failure_windows.go-112-}
+internal/domain/runtime_qualification_failure_windows.go-113-
+internal/domain/runtime_qualification_failure_windows.go:114:func (c *RuntimeCoordinator) qualificationFirstGateRejectionTx(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, bridge *rt.Bridge, frame rt.BridgeFrame, payload Object) (*qualificationPreEffectRejection, error) {
+internal/domain/runtime_qualification_failure_windows.go-115-	directory := ""
+internal/domain/runtime_qualification_failure_windows.go-116-	if bridge != nil {
+internal/domain/runtime_qualification_failure_windows.go-117-		directory = bridge.Directory()
+internal/domain/runtime_qualification_failure_windows.go-118-	}
+internal/domain/runtime_qualification_failure_windows.go-119-	return c.qualificationFirstGateRejectionForDirectoryTx(tx, route, run, dispatch, directory, frame, payload)
+internal/domain/runtime_qualification_failure_windows.go-120-}
+internal/domain/runtime_qualification_failure_windows.go-121-
+internal/domain/runtime_qualification_failure_windows.go:122:func (c *RuntimeCoordinator) qualificationFirstGateRejectionForDirectoryTx(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, directory string, frame rt.BridgeFrame, payload Object) (*qualificationPreEffectRejection, error) {
+internal/domain/runtime_qualification_failure_windows.go-123-	if frame.Type != "effect.request" || frame.Capability != "TOOL" {
+internal/domain/runtime_qualification_failure_windows.go-124-		return nil, nil
+internal/domain/runtime_qualification_failure_windows.go-125-	}
+internal/domain/runtime_qualification_failure_windows.go-126-	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+internal/domain/runtime_qualification_failure_windows.go-127-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-128-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-129-	}
+internal/domain/runtime_qualification_failure_windows.go-130-	if task["task_type"] != "runtime_qualification" {
+internal/domain/runtime_qualification_failure_windows.go-131-		return nil, nil
+internal/domain/runtime_qualification_failure_windows.go-132-	}
+internal/domain/runtime_qualification_failure_windows.go-133-	if frame.Sequence != 3 || c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil || frame.Route == "" || len(frame.Payload) == 0 {
+internal/domain/runtime_qualification_failure_windows.go-134-		return nil, qualificationDenialUnavailable("frame identity invalid")
+internal/domain/runtime_qualification_failure_windows.go-135-	}
+internal/domain/runtime_qualification_failure_windows.go-136-	manifest, ok := dispatch["manifest"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-137-	if !ok {
+internal/domain/runtime_qualification_failure_windows.go-138-		return nil, qualificationDenialUnavailable("dispatch manifest missing")
+internal/domain/runtime_qualification_failure_windows.go-139-	}
+internal/domain/runtime_qualification_failure_windows.go-140-	admission, ok := manifest["admission"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-141-	if !ok || admission["qualification_bootstrap"] != true || admission["mode"] == nil {
+internal/domain/runtime_qualification_failure_windows.go-142-		return nil, qualificationDenialUnavailable("qualification admission missing")
+internal/domain/runtime_qualification_failure_windows.go-143-	}
+internal/domain/runtime_qualification_failure_windows.go-144-	profile, ok := admission["profile"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-145-	if !ok || Hash(admission["profile_ref"]) != admission["profile_hash"] {
+internal/domain/runtime_qualification_failure_windows.go-146-		return nil, qualificationDenialUnavailable("profile binding invalid")
+internal/domain/runtime_qualification_failure_windows.go-147-	}
+internal/domain/runtime_qualification_failure_windows.go-148-	epoch, err := Num(run, "lease_epoch")
+internal/domain/runtime_qualification_failure_windows.go-149-	if err != nil || epoch < 1 || manifest["project_id"] != route.ProjectID || manifest["run_id"] != run["id"] || manifest["task_id"] != task["id"] || manifest["runtime_id"] != route.RuntimeID || Hash(manifest["epoch"]) != Hash(epoch) || manifest["dispatch_key"] != dispatch["dispatch_key"] || Hash(manifest) != dispatch["manifest_hash"] {
+internal/domain/runtime_qualification_failure_windows.go-150-		return nil, qualificationDenialUnavailable("run and dispatch differ")
+internal/domain/runtime_qualification_failure_windows.go-151-	}
+internal/domain/runtime_qualification_failure_windows.go-152-	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+internal/domain/runtime_qualification_failure_windows.go-153-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-154-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-155-	}
+internal/domain/runtime_qualification_failure_windows.go-156-	var markerCount int
+internal/domain/runtime_qualification_failure_windows.go-157-	err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND profile_hash=? AND owner_root=?`, route.ProjectID, task["id"], run["id"], route.RuntimeID, epoch, planHash, admission["profile_hash"], root).Scan(&markerCount)
+internal/domain/runtime_qualification_failure_windows.go-158-	if err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || Hash(plan["model_qualification"]) != Hash(profile["model_qualification"]) || runtimeTechnicalHashMust(tx, route.ProjectID, route.RuntimeID) != admission["technical_hash"] {
+internal/domain/runtime_qualification_failure_windows.go-159-		return nil, qualificationDenialUnavailable("qualification marker or plan changed")
+internal/domain/runtime_qualification_failure_windows.go-160-	}
+internal/domain/runtime_qualification_failure_windows.go-161-	var author string
+internal/domain/runtime_qualification_failure_windows.go-162-	if err = tx.QueryRow(`SELECT author FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?`, route.ProjectID, task["id"], route.RuntimeID).Scan(&author); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-163-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-164-	}
+internal/domain/runtime_qualification_failure_windows.go-165-	currentRoot, err := currentAuthorityRoot(tx, author)
+internal/domain/runtime_qualification_failure_windows.go-166-	if err != nil || currentRoot != root {
+internal/domain/runtime_qualification_failure_windows.go-167-		return nil, qualificationDenialUnavailable("qualification author changed")
+internal/domain/runtime_qualification_failure_windows.go-168-	}
+internal/domain/runtime_qualification_failure_windows.go-169-	modelConfig, ok := profile["model_config"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-170-	permission, permitted := plan["model_qualification"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-171-	if !ok || !permitted || frame.Route != Str(modelConfig, "route") || frame.Route != Str(permission, "route") || profile["backend"] != runtimeMuBackend {
+internal/domain/runtime_qualification_failure_windows.go-172-		return nil, qualificationDenialUnavailable("known model route changed")
+internal/domain/runtime_qualification_failure_windows.go-173-	}
+internal/domain/runtime_qualification_failure_windows.go-174-	if err = validateRuntimeToolArguments(modelConfig, payload); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-175-		return nil, qualificationDenialUnavailable("tool payload invalid")
+internal/domain/runtime_qualification_failure_windows.go-176-	}
+internal/domain/runtime_qualification_failure_windows.go-177-	known := false
+internal/domain/runtime_qualification_failure_windows.go-178-	for _, provider := range c.runtimeProviders() {
+internal/domain/runtime_qualification_failure_windows.go-179-		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != "runtime_qualification" || provider.Capability != "MODEL" || provider.MeasurementMode != admission["mode"] || provider.CredentialRevision != profile["credential_revision"] || Hash(provider.ModelConfig) != Hash(modelConfig) || provider.Endpoint != Str(modelConfig, "endpoint") || !c.liveModelCredentialBound(provider, profile) {
+internal/domain/runtime_qualification_failure_windows.go-180-			continue
+internal/domain/runtime_qualification_failure_windows.go-181-		}
+internal/domain/runtime_qualification_failure_windows.go-182-		for _, entry := range Arr(profile, "effect_routes") {
+internal/domain/runtime_qualification_failure_windows.go-183-			p, ok := entry.(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-184-			if ok && p["id"] == provider.ID && p["capability"] == "MODEL" && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+internal/domain/runtime_qualification_failure_windows.go-185-				known = true
+internal/domain/runtime_qualification_failure_windows.go-186-			}
+internal/domain/runtime_qualification_failure_windows.go-187-		}
+internal/domain/runtime_qualification_failure_windows.go-188-	}
+internal/domain/runtime_qualification_failure_windows.go-189-	if !known {
+internal/domain/runtime_qualification_failure_windows.go-190-		return nil, qualificationDenialUnavailable("route unknown or no longer frozen")
+internal/domain/runtime_qualification_failure_windows.go-191-	}
+internal/domain/runtime_qualification_failure_windows.go-192-	var effects, ledger, distinct int
+internal/domain/runtime_qualification_failure_windows.go-193-	var modelKey string
+internal/domain/runtime_qualification_failure_windows.go-194-	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),coalesce(min(effect_key),'') FROM resource_effects WHERE project=? AND run=?`, route.ProjectID, run["id"]).Scan(&distinct, &modelKey); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-195-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-196-	}
+internal/domain/runtime_qualification_failure_windows.go-197-	if err = tx.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND effect_key=?`, route.ProjectID, run["id"], frame.Key).Scan(&effects); err != nil {
+--
+internal/domain/runtime_qualification_failure_windows.go:237:	return &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: cause}, nil
+internal/domain/runtime_qualification_failure_windows.go-238-}
+internal/domain/runtime_qualification_failure_windows.go-239-
+internal/domain/runtime_qualification_failure_windows.go-240-func runtimeTechnicalHashMust(tx *sql.Tx, project, runtimeID string) string {
+internal/domain/runtime_qualification_failure_windows.go-241-	runtime, err := load(tx, project, "RuntimeRegistration", runtimeID)
+internal/domain/runtime_qualification_failure_windows.go-242-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-243-		return ""
+internal/domain/runtime_qualification_failure_windows.go-244-	}
+internal/domain/runtime_qualification_failure_windows.go-245-	return runtimeTechnicalHash(runtime)
+internal/domain/runtime_qualification_failure_windows.go-246-}
+internal/domain/runtime_qualification_failure_windows.go-247-
+internal/domain/runtime_qualification_failure_windows.go-248-type verifiedQualificationFailure struct {
+internal/domain/runtime_qualification_failure_windows.go-249-	subject      qualificationFailureSubject
+internal/domain/runtime_qualification_failure_windows.go:250:	denial       *qualificationPreEffectRejection
+internal/domain/runtime_qualification_failure_windows.go-251-	drain        qualificationBrokerDrain
+internal/domain/runtime_qualification_failure_windows.go-252-	native       rt.QualificationNativeFacts
+internal/domain/runtime_qualification_failure_windows.go-253-	observation  Object
+internal/domain/runtime_qualification_failure_windows.go-254-	run          Object
+internal/domain/runtime_qualification_failure_windows.go-255-	task         Object
+internal/domain/runtime_qualification_failure_windows.go-256-	dispatch     Object
+internal/domain/runtime_qualification_failure_windows.go-257-	profileRef   Object
+internal/domain/runtime_qualification_failure_windows.go-258-	ownerRoot    string
+internal/domain/runtime_qualification_failure_windows.go-259-	modelBinding Object
+internal/domain/runtime_qualification_failure_windows.go-260-}
+internal/domain/runtime_qualification_failure_windows.go-261-
+internal/domain/runtime_qualification_failure_windows.go-262-// qualificationModelBindingTx binds the exact three-row effect history to the
+internal/domain/runtime_qualification_failure_windows.go-263-// original durable Host response. The second frame's decoded payload hash is
+internal/domain/runtime_qualification_failure_windows.go-264-// provided at capture time and sealed in the proof for later consumers.
+internal/domain/runtime_qualification_failure_windows.go-265-func qualificationModelBindingTx(tx *sql.Tx, project, run string, epoch int64, dispatch Object, directory, key, route, payloadHash string) (Object, error) {
+internal/domain/runtime_qualification_failure_windows.go-266-	bad := func() (Object, error) {
+internal/domain/runtime_qualification_failure_windows.go-267-		return nil, qualificationDenialUnavailable("original MODEL request or Host receipt differs")
+internal/domain/runtime_qualification_failure_windows.go-268-	}
+internal/domain/runtime_qualification_failure_windows.go-269-	if tx == nil || key == "" || route == "" || payloadHash == "" || !filepath.IsAbs(directory) || filepath.Base(directory) != Str(dispatch, "dispatch_key") || filepath.Base(filepath.Dir(directory)) != "runtime-dispatches" {
+internal/domain/runtime_qualification_failure_windows.go-270-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-271-	}
+internal/domain/runtime_qualification_failure_windows.go-272-	raw, err := rt.ReadQualificationModelFact(directory, key)
+internal/domain/runtime_qualification_failure_windows.go-273-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-274-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-275-	}
+internal/domain/runtime_qualification_failure_windows.go-276-	fact, err := Decode(raw)
+internal/domain/runtime_qualification_failure_windows.go-277-	if err != nil || Hash(fact["version"]) != Hash(1) || fact["project_id"] != project || fact["run_id"] != run || Hash(fact["epoch"]) != Hash(epoch) || fact["dispatch_key"] != dispatch["dispatch_key"] || fact["manifest_hash"] != dispatch["manifest_hash"] || fact["effect_key"] != key {
+internal/domain/runtime_qualification_failure_windows.go-278-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-279-	}
+internal/domain/runtime_qualification_failure_windows.go-280-	rows, err := tx.Query(`SELECT sequence,body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence`, project, run, key)
+internal/domain/runtime_qualification_failure_windows.go-281-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-282-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-283-	}
+internal/domain/runtime_qualification_failure_windows.go-284-	var effects []Object
+internal/domain/runtime_qualification_failure_windows.go-285-	for rows.Next() {
+internal/domain/runtime_qualification_failure_windows.go-286-		var sequence int64
+internal/domain/runtime_qualification_failure_windows.go-287-		var body string
+internal/domain/runtime_qualification_failure_windows.go-288-		if err = rows.Scan(&sequence, &body); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-289-			rows.Close()
+internal/domain/runtime_qualification_failure_windows.go-290-			return nil, err
+internal/domain/runtime_qualification_failure_windows.go-291-		}
+internal/domain/runtime_qualification_failure_windows.go-292-		row, decodeErr := Decode([]byte(body))
+internal/domain/runtime_qualification_failure_windows.go-293-		if decodeErr != nil || sequence != int64(len(effects)+1) || Hash(row["sequence"]) != Hash(sequence) {
+internal/domain/runtime_qualification_failure_windows.go-294-			rows.Close()
+internal/domain/runtime_qualification_failure_windows.go-295-			return bad()
+internal/domain/runtime_qualification_failure_windows.go-296-		}
+internal/domain/runtime_qualification_failure_windows.go-297-		effects = append(effects, row)
+internal/domain/runtime_qualification_failure_windows.go-298-	}
+internal/domain/runtime_qualification_failure_windows.go-299-	err = rows.Err()
+internal/domain/runtime_qualification_failure_windows.go-300-	rows.Close()
+internal/domain/runtime_qualification_failure_windows.go-301-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-302-		return nil, err
+internal/domain/runtime_qualification_failure_windows.go-303-	}
+internal/domain/runtime_qualification_failure_windows.go-304-	if len(effects) != 3 || effects[0]["state"] != "PREPARED" || effects[1]["state"] != "STARTED" || effects[2]["state"] != "CONFIRMED" || effects[0]["receipt"] != nil || effects[1]["receipt"] != nil {
+internal/domain/runtime_qualification_failure_windows.go-305-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-306-	}
+internal/domain/runtime_qualification_failure_windows.go-307-	request, ok := effects[0]["payload"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-308-	manifest, manifestOK := dispatch["manifest"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-309-	admission, admissionOK := manifest["admission"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-310-	profile, profileOK := admission["profile"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-311-	modelConfig, configOK := profile["model_config"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-312-	if !ok || !manifestOK || !admissionOK || !profileOK || !configOK || modelConfig["route"] != route || request["capability"] != "MODEL" || request["route"] != route || request["credential_revision"] != profile["credential_revision"] || Hash(request["payload"]) != payloadHash {
+internal/domain/runtime_qualification_failure_windows.go-313-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-314-	}
+internal/domain/runtime_qualification_failure_windows.go-315-	for _, row := range effects {
+internal/domain/runtime_qualification_failure_windows.go-316-		if row["project_id"] != project || row["run_id"] != run || row["key"] != key || Hash(row["epoch"]) != Hash(epoch) || row["request_hash"] != fact["request_hash"] || row["reservation_id"] != fact["reservation_id"] || Hash(row["payload"]) != Hash(effects[0]["payload"]) || row["task_id"] != effects[0]["task_id"] || row["goal_id"] != effects[0]["goal_id"] {
+internal/domain/runtime_qualification_failure_windows.go-317-			return bad()
+internal/domain/runtime_qualification_failure_windows.go-318-		}
+internal/domain/runtime_qualification_failure_windows.go-319-	}
+internal/domain/runtime_qualification_failure_windows.go-320-	receipt, ok := fact["receipt"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-321-	if !ok || Hash(effects[2]["receipt"]) != Hash(receipt) || receipt["key"] != key || receipt["run_id"] != run || Hash(receipt["epoch"]) != Hash(epoch) || receipt["state"] != "CONFIRMED" || receipt["model_transport"] != true || receipt["actual_cost"] != nil {
+internal/domain/runtime_qualification_failure_windows.go-322-		return bad()
+internal/domain/runtime_qualification_failure_windows.go-323-	}
+internal/domain/runtime_qualification_failure_windows.go-324-	result, ok := receipt["payload"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-325-	if !ok || Hash(result["status"]) != Hash(200) || result["content_type"] != "text/event-stream" {
+--
+internal/domain/runtime_qualification_failure_windows.go:459:func (c *RuntimeCoordinator) verifyOnlineQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, runID string, epoch int64, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain, native rt.QualificationNativeFacts) (verifiedQualificationFailure, error) {
+internal/domain/runtime_qualification_failure_windows.go-460-	var proof verifiedQualificationFailure
+internal/domain/runtime_qualification_failure_windows.go-461-	bad := func(reason string) (verifiedQualificationFailure, error) {
+internal/domain/runtime_qualification_failure_windows.go-462-		return proof, qualificationDenialUnavailable(reason)
+internal/domain/runtime_qualification_failure_windows.go-463-	}
+internal/domain/runtime_qualification_failure_windows.go-464-	if denial == nil || denial.digest == "" || denial.receipt == nil || denial.receipt["kind"] != onlineQualificationDenial || Hash(denial.receipt) != denial.digest || !drain.closed || drain.disqualified || drain.pending != 0 || drain.accepted != drain.completed || drain.rejectedSeq != 3 || drain.accepted != 2 || len(drain.frameHashes) != 2 || len(drain.completionSet) != 2 {
+internal/domain/runtime_qualification_failure_windows.go-465-		return bad("private rejection or broker drain incomplete")
+internal/domain/runtime_qualification_failure_windows.go-466-	}
+internal/domain/runtime_qualification_failure_windows.go-467-	if drain.frameHashes[2] == "" || drain.frameHashes[3] == "" || drain.completionSet[2] == "" || drain.completionSet[3] == "" {
+internal/domain/runtime_qualification_failure_windows.go-468-		return bad("broker completion census incomplete")
+internal/domain/runtime_qualification_failure_windows.go-469-	}
+internal/domain/runtime_qualification_failure_windows.go-470-	decoded, err := Decode(native.Rejection)
+internal/domain/runtime_qualification_failure_windows.go-471-	if err != nil || Hash(decoded) != denial.digest || string(Bytes(decoded)) != string(Bytes(denial.receipt)) {
+internal/domain/runtime_qualification_failure_windows.go-472-		return bad("immutable rejection differs")
+internal/domain/runtime_qualification_failure_windows.go-473-	}
+internal/domain/runtime_qualification_failure_windows.go-474-	j := native.Journal
+internal/domain/runtime_qualification_failure_windows.go-475-	if len(native.Frames) != 3 || len(native.FrameHashes) != 3 || j.Frames != 3 || j.Acknowledged != 2 || !j.Cancelled || j.QueueRequired || j.QueueInitSequence != 0 || len(j.CommandReceipts) != 0 || j.Checkpoint != nil || j.CheckpointSequence != 0 || j.Paused || j.ProtocolComplete || native.AuxAfterThird || (j.State != "FAILED" && j.State != "UNKNOWN") || j.Reason != "qualification first dispatch gate denied TOOL" {
+internal/domain/runtime_qualification_failure_windows.go-476-		return bad("raw native frame or cancellation closure differs")
+internal/domain/runtime_qualification_failure_windows.go-477-	}
+internal/domain/runtime_qualification_failure_windows.go-478-	f1, f2, f3 := native.Frames[0], native.Frames[1], native.Frames[2]
+internal/domain/runtime_qualification_failure_windows.go-479-	if f1.Sequence != 1 || f1.Type != "context.ready" || f2.Sequence != 2 || f2.Type != "effect.request" || f2.Capability != "MODEL" || f3.Sequence != 3 || f3.Type != "effect.request" || f3.Capability != "TOOL" || f2.Key == "" || f3.Key == "" || f2.Key == f3.Key || Hash(f2) != drain.frameHashes[2] || Hash(f3) != drain.frameHashes[3] || Hash(f3) != denial.receipt["frame_hash"] || Digest(f3.Payload) != denial.receipt["raw_payload_hash"] {
+internal/domain/runtime_qualification_failure_windows.go-480-		return bad("exact three-frame lineage differs")
+internal/domain/runtime_qualification_failure_windows.go-481-	}
+internal/domain/runtime_qualification_failure_windows.go-482-	if native.StdoutHash != j.StdoutHash || native.StderrHash != j.StderrHash || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
+internal/domain/runtime_qualification_failure_windows.go-483-		return bad("native source closure incomplete")
+internal/domain/runtime_qualification_failure_windows.go-484-	}
+internal/domain/runtime_qualification_failure_windows.go-485-	run, err := load(tx, route.ProjectID, "Run", runID)
+internal/domain/runtime_qualification_failure_windows.go-486-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-487-		return proof, err
+internal/domain/runtime_qualification_failure_windows.go-488-	}
+internal/domain/runtime_qualification_failure_windows.go-489-	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+internal/domain/runtime_qualification_failure_windows.go-490-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-491-		return proof, err
+internal/domain/runtime_qualification_failure_windows.go-492-	}
+internal/domain/runtime_qualification_failure_windows.go-493-	dispatch, err := runtimeDispatch(tx, route.ProjectID, runID, epoch)
+internal/domain/runtime_qualification_failure_windows.go-494-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-495-		return proof, err
+internal/domain/runtime_qualification_failure_windows.go-496-	}
+internal/domain/runtime_qualification_failure_windows.go-497-	manifest := dispatch["manifest"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-498-	admission := manifest["admission"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-499-	profile := admission["profile"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-500-	modelConfig, configOK := profile["model_config"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-501-	if !configOK || runTerminal(run) || run["status"] != "RUNNING" || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID || Hash(run["lease_epoch"]) != Hash(epoch) || dispatch["state"] != "STARTED" || dispatch["journal_locator"] != dispatch["dispatch_key"] || j.DispatchKey != dispatch["dispatch_key"] || j.ManifestHash != dispatch["manifest_hash"] || j.Worker != dispatch["worker"] || Hash(runtimeNativeIdentity(j.Identity)) != Hash(dispatch["identity"]) || admission["qualification_bootstrap"] != true || admission["mode"] != "LIVE" || Hash(admission["profile_ref"]) != admission["profile_hash"] || f2.Route != Str(modelConfig, "route") || f3.Route != f2.Route || run["checkpoint_artifact_id"] != nil {
+internal/domain/runtime_qualification_failure_windows.go-502-		return bad("current qualification subject differs")
+internal/domain/runtime_qualification_failure_windows.go-503-	}
+internal/domain/runtime_qualification_failure_windows.go-504-	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+internal/domain/runtime_qualification_failure_windows.go-505-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-506-		return proof, err
+internal/domain/runtime_qualification_failure_windows.go-507-	}
+internal/domain/runtime_qualification_failure_windows.go-508-	var markerCount int
+internal/domain/runtime_qualification_failure_windows.go-509-	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND profile_hash=? AND owner_root=?`, route.ProjectID, task["id"], runID, route.RuntimeID, epoch, planHash, admission["profile_hash"], root).Scan(&markerCount); err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || denial.receipt["plan_hash"] != planHash {
+internal/domain/runtime_qualification_failure_windows.go-510-		return bad("qualification marker changed")
+internal/domain/runtime_qualification_failure_windows.go-511-	}
+internal/domain/runtime_qualification_failure_windows.go-512-	for field, actual := range map[string]any{"project_id": route.ProjectID, "task_id": task["id"], "run_id": runID, "runtime_id": route.RuntimeID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "frame_key": f3.Key, "frame_route": f3.Route} {
+internal/domain/runtime_qualification_failure_windows.go-513-		if Hash(denial.receipt[field]) != Hash(actual) {
+internal/domain/runtime_qualification_failure_windows.go-514-			return bad("rejection subject changed: " + field)
+internal/domain/runtime_qualification_failure_windows.go-515-		}
+internal/domain/runtime_qualification_failure_windows.go-516-	}
+internal/domain/runtime_qualification_failure_windows.go-517-	var queueCount int
+internal/domain/runtime_qualification_failure_windows.go-518-	if err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=?`, route.ProjectID, runID).Scan(&queueCount); err != nil || queueCount != 0 {
+internal/domain/runtime_qualification_failure_windows.go-519-		return bad("qualification has client queue state")
+internal/domain/runtime_qualification_failure_windows.go-520-	}
+internal/domain/runtime_qualification_failure_windows.go-521-	var effects, rejected, unknown int
+internal/domain/runtime_qualification_failure_windows.go-522-	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END),sum(CASE WHEN json_extract(body,'$.state') IN ('UNKNOWN','NOT_APPLIED') THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, f3.Key, route.ProjectID, runID).Scan(&effects, &rejected, &unknown); err != nil || effects != 1 || rejected != 0 || unknown != 0 {
+internal/domain/runtime_qualification_failure_windows.go-523-		return bad("effect history differs from sole confirmed MODEL")
+internal/domain/runtime_qualification_failure_windows.go-524-	}
+internal/domain/runtime_qualification_failure_windows.go-525-	effect, err := latestEffect(tx, route.ProjectID, runID, f2.Key)
+internal/domain/runtime_qualification_failure_windows.go-526-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-527-		return proof, err
+internal/domain/runtime_qualification_failure_windows.go-528-	}
+internal/domain/runtime_qualification_failure_windows.go-529-	request, _ := effect["payload"].(map[string]any)
+internal/domain/runtime_qualification_failure_windows.go-530-	modelPayload, payloadErr := Decode(f2.Payload)
+internal/domain/runtime_qualification_failure_windows.go-531-	if payloadErr != nil || effect["state"] != "CONFIRMED" || request["capability"] != "MODEL" || request["route"] != f2.Route || Hash(request["payload"]) != Hash(modelPayload) || effect["receipt"] == nil || effect["key"] != f2.Key || effect["epoch"] != nil && Hash(effect["epoch"]) != Hash(epoch) {
+internal/domain/runtime_qualification_failure_windows.go-532-		return bad("MODEL effect receipt or request differs")
+internal/domain/runtime_qualification_failure_windows.go-533-	}
+internal/domain/runtime_qualification_failure_windows.go-534-	modelBinding, err := qualificationModelBindingTx(tx, route.ProjectID, runID, epoch, dispatch, native.Directory, f2.Key, f2.Route, Hash(modelPayload))
+--
+internal/domain/runtime_qualification_failure_windows.go:564:func (c *RuntimeCoordinator) closeOnlineQualificationFailure(ctx context.Context, route RuntimeCoordinatorRoute, runID string, epoch int64, locator string, bridge *rt.Bridge, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain) error {
+internal/domain/runtime_qualification_failure_windows.go-565-	if denial == nil || bridge == nil || locator == "" || !strings.EqualFold(filepath.Clean(bridge.Directory()), filepath.Clean(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator))) {
+internal/domain/runtime_qualification_failure_windows.go-566-		return qualificationDenialUnavailable("native dispatch directory differs")
+internal/domain/runtime_qualification_failure_windows.go-567-	}
+internal/domain/runtime_qualification_failure_windows.go-568-	native, err := rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+internal/domain/runtime_qualification_failure_windows.go-569-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-570-		return err
+internal/domain/runtime_qualification_failure_windows.go-571-	}
+internal/domain/runtime_qualification_failure_windows.go-572-	decodedRejection, decodeErr := Decode(native.Rejection)
+internal/domain/runtime_qualification_failure_windows.go-573-	if decodeErr != nil || Hash(decodedRejection) != denial.digest || string(Bytes(decodedRejection)) != string(Bytes(denial.receipt)) {
+internal/domain/runtime_qualification_failure_windows.go-574-		return qualificationDenialUnavailable("immutable rejection differs on replay")
+internal/domain/runtime_qualification_failure_windows.go-575-	}
+internal/domain/runtime_qualification_failure_windows.go-576-	// A repeated request can observe the already committed terminal marker.
+internal/domain/runtime_qualification_failure_windows.go-577-	// The private consumer, not the caller's denial flag, proves that replay.
+internal/domain/runtime_qualification_failure_windows.go-578-	replayTx, err := c.service.DB.BeginTx(ctx, nil)
+internal/domain/runtime_qualification_failure_windows.go-579-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-580-		return err
+internal/domain/runtime_qualification_failure_windows.go-581-	}
+internal/domain/runtime_qualification_failure_windows.go-582-	priorClosure, priorErr := c.service.validatedQualificationFailureTx(replayTx, route.ProjectID, Str(denial.receipt, "task_id"), runID, epoch)
+internal/domain/runtime_qualification_failure_windows.go-583-	if priorErr == nil && priorClosure.subject() == (qualificationFailureSubject{project: route.ProjectID, task: Str(denial.receipt, "task_id"), run: runID, epoch: epoch}) {
+internal/domain/runtime_qualification_failure_windows.go-584-		key := qualificationClosureKey(priorClosure.subject(), denial.digest)
+internal/domain/runtime_qualification_failure_windows.go-585-		var priorRaw string
+internal/domain/runtime_qualification_failure_windows.go-586-		if readErr := replayTx.QueryRow(`SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND key=?`, route.ProjectID, key).Scan(&priorRaw); readErr == nil {
+internal/domain/runtime_qualification_failure_windows.go-587-			marker, markerErr := Decode([]byte(priorRaw))
+internal/domain/runtime_qualification_failure_windows.go-588-			if markerErr == nil && marker["denial_digest"] == denial.digest && Hash(marker["proof_ref"]) == Hash(priorClosure.proofRef()) {
+internal/domain/runtime_qualification_failure_windows.go-589-				replayTx.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-590-				return nil
+internal/domain/runtime_qualification_failure_windows.go-591-			}
+internal/domain/runtime_qualification_failure_windows.go-592-		}
+internal/domain/runtime_qualification_failure_windows.go-593-	}
+internal/domain/runtime_qualification_failure_windows.go-594-	replayTx.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-595-	preflight, err := c.service.DB.BeginTx(ctx, nil)
+internal/domain/runtime_qualification_failure_windows.go-596-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-597-		return err
+internal/domain/runtime_qualification_failure_windows.go-598-	}
+internal/domain/runtime_qualification_failure_windows.go-599-	if err = resourceWriteLock(preflight); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-600-		preflight.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-601-		return err
+internal/domain/runtime_qualification_failure_windows.go-602-	}
+internal/domain/runtime_qualification_failure_windows.go-603-	verified, err := c.verifyOnlineQualificationFailureTx(preflight, route, runID, epoch, denial, drain, native)
+internal/domain/runtime_qualification_failure_windows.go-604-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-605-		preflight.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-606-		return err
+internal/domain/runtime_qualification_failure_windows.go-607-	}
+internal/domain/runtime_qualification_failure_windows.go-608-	plan, err := c.planQualificationFailureTx(preflight, route, verified)
+internal/domain/runtime_qualification_failure_windows.go-609-	preflight.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-610-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-611-		return err
+internal/domain/runtime_qualification_failure_windows.go-612-	}
+internal/domain/runtime_qualification_failure_windows.go-613-	c.boundary("qualification_plan_frozen", plan.core)
+internal/domain/runtime_qualification_failure_windows.go-614-	// Re-read the immutable native files after planning. No in-memory journal or
+internal/domain/runtime_qualification_failure_windows.go-615-	// caller-supplied flag can stand in for the source bytes at the write gate.
+internal/domain/runtime_qualification_failure_windows.go-616-	native, err = rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+internal/domain/runtime_qualification_failure_windows.go-617-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-618-		return err
+internal/domain/runtime_qualification_failure_windows.go-619-	}
+internal/domain/runtime_qualification_failure_windows.go-620-	tx, err := c.service.DB.BeginTx(ctx, nil)
+internal/domain/runtime_qualification_failure_windows.go-621-	if err != nil {
+internal/domain/runtime_qualification_failure_windows.go-622-		return err
+internal/domain/runtime_qualification_failure_windows.go-623-	}
+internal/domain/runtime_qualification_failure_windows.go-624-	defer tx.Rollback()
+internal/domain/runtime_qualification_failure_windows.go-625-	if err = resourceWriteLock(tx); err != nil {
+internal/domain/runtime_qualification_failure_windows.go-626-		return err
+internal/domain/runtime_qualification_failure_windows.go-627-	}
+internal/domain/runtime_qualification_failure_windows.go-628-	var priorRaw string
+internal/domain/runtime_qualification_failure_windows.go-629-	prior := tx.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-failure-closure' AND key=?`, plan.author.ID, route.ProjectID, plan.key).Scan(&priorRaw)
+internal/domain/runtime_qualification_failure_windows.go-630-	if prior == nil {
+internal/domain/runtime_qualification_failure_windows.go-631-		closure, checkErr := c.service.validatedQualificationFailureTx(tx, route.ProjectID, verified.subject.task, runID, epoch)
+internal/domain/runtime_qualification_failure_windows.go-632-		if checkErr == nil && Hash(closure.proofRef()) == Hash(plan.marker["proof_ref"]) {
+internal/domain/runtime_qualification_failure_windows.go-633-			return nil
+internal/domain/runtime_qualification_failure_windows.go-634-		}
+internal/domain/runtime_qualification_failure_windows.go-635-		return qualificationDenialUnavailable("conflicting completed closure marker")
+internal/domain/runtime_qualification_failure_windows.go-636-	}
+internal/domain/runtime_qualification_failure_windows.go-637-	if prior != sql.ErrNoRows {
+internal/domain/runtime_qualification_failure_windows.go-638-		return prior
+internal/domain/runtime_qualification_failure_windows.go-639-	}

@@ -1,0 +1,149 @@
+{
+  "schema": "researchos.mu-m0-independent-review/1",
+  "verdict": "REQUEST_CHANGES",
+  "scope": "SOURCE_BOUND_CANDIDATE_ONLY",
+  "candidate": "7ec619a16a932ae02daa7c2e6132d266528a1da8",
+  "base": "8dfebe36508ac0c2508735bb866756dab9283e74",
+  "at": "2026-10-12T13:53:52.704187+00:00",
+  "source_unchanged": true,
+  "source_worktree_clean": true,
+  "author_manifest_bindings": 24,
+  "compiled_input_count": 2123,
+  "findings": [
+    {
+      "id": "M0-R1",
+      "priority": "P1",
+      "title": "Pause during async context preparation still dispatches a new provider request",
+      "path": "packages/agent/src/agent-loop.ts",
+      "line": 323,
+      "related_lines": [
+        478,
+        482,
+        487,
+        490
+      ],
+      "test": "pause during async transform does not start a new provider request",
+      "actual": "Provider calls 1 after pause request arrived inside transformContext; expected 0.",
+      "impact": "A new provider request may begin after pause even though no in-flight model stream needed settling.",
+      "fix": "Fence at the actual streamFunction dispatch after awaited transform, conversion and API-key preparation, while preserving the stopped request context."
+    },
+    {
+      "id": "M0-R2",
+      "priority": "P1",
+      "title": "Deferred CustomMessage is flushed into an unfinished tool batch and makes resume fail",
+      "path": "packages/coding-agent/src/core/agent-session.ts",
+      "line": 1534,
+      "related_lines": [
+        1564,
+        2065
+      ],
+      "test": "session pause keeps deferred custom message out of incomplete tool batch",
+      "actual": "Public sendCustomMessage(triggerTurn:false) while tool one runs; pause checkpoint pendingCustom=0 with assistant/toolResult/custom; resume sets error Resumable tool batch has unexpected trailing message, effects remain [one]. Unpaused control executes [one,two].",
+      "impact": "An ordinary deferred context message prevents the remaining tool from ever running.",
+      "fix": "Keep pending custom and bash messages deferred until the whole assistant tool batch has settled; snapshot their full pending state and restore it passively."
+    },
+    {
+      "id": "M0-R3",
+      "priority": "P1",
+      "title": "Checkpoint loses whole-batch termination and next-action state",
+      "path": "packages/agent/src/agent-loop.ts",
+      "line": 218,
+      "related_paths": [
+        "packages/agent/src/agent.ts:438",
+        "packages/agent/src/agent-loop.ts:198"
+      ],
+      "tests": [
+        "resume preserves completed non-terminating result when remaining result terminates",
+        "pause after fully terminating tool batch does not add model work on resume"
+      ],
+      "actual": "Completed false + remaining true: calls=1 instead of 2. Fully terminated paused batch: calls=2 instead of 1. Both unpaused controls pass.",
+      "impact": "Resume either omits required continuation or starts unwanted model work; transcript result IDs alone are insufficient scheduling state.",
+      "fix": "Checkpoint full batch aggregate and pending continuation/finish decision. Resume must evaluate original whole batch and respect already-completed terminal decisions, without rerunning completed effects."
+    },
+    {
+      "id": "M0-R4",
+      "priority": "P1",
+      "title": "Resumed tool batch skips prepareNextTurn before its next model request",
+      "path": "packages/agent/src/agent-loop.ts",
+      "line": 211,
+      "related_lines": [
+        246,
+        255
+      ],
+      "test": "resume remaining tools invokes prepareNextTurn before the next model",
+      "actual": "After resumed remaining tool: model calls=2 but prepareNextTurn=0 rather than 1; unpaused control invokes preparation once.",
+      "impact": "Required context/model/tool refresh is skipped; AgentSession uses this hook for compaction and prompt/tool-loadout preparation.",
+      "fix": "Carry completedTurn into the next runLoop transition so preparation occurs exactly once before the next request, including after restore."
+    },
+    {
+      "id": "M0-R5",
+      "priority": "P2",
+      "title": "Restore accepts a consumed watermark beyond the next sequence",
+      "path": "packages/agent/src/agent.ts",
+      "line": 519,
+      "related_lines": [
+        527
+      ],
+      "test": "restore rejects watermark greater than next sequence even with empty pending queue",
+      "actual": "lastConsumedSequence=99, nextSequence=1, empty pending queue is accepted.",
+      "impact": "Later enqueue/drain can reuse lower sequence numbers and move the consumed watermark backwards, breaking the checkpoint consumption invariant.",
+      "fix": "Validate both consumed watermarks are strictly below nextSequence even when pending is empty; retain cross-queue pending uniqueness checks."
+    }
+  ],
+  "verification": {
+    "author_candidate_tests": {
+      "total": 12,
+      "passed": 12,
+      "evidence": "tests.raw.txt"
+    },
+    "author_worker_tests": {
+      "total": 2,
+      "passed": 2,
+      "evidence": "tests-02.raw.txt"
+    },
+    "independent_tests": {
+      "total": 9,
+      "passed": 3,
+      "failed": 6,
+      "evidence": "tests-02.raw.txt"
+    },
+    "independent_controls": "Unpaused termination/prepareNextTurn controls and unpaused real AgentSession CustomMessage path passed.",
+    "positive_coverage": [
+      "both full CustomMessage queues and consumption watermarks",
+      "restore zero synthetic model/tool work",
+      "full session header/entries/leaf",
+      "bounded hash/session/epoch/input restore rejection",
+      "retry and overflow recovery counters retained",
+      "model stream settlement",
+      "sequential missing-ID resume",
+      "parallel batch settlement",
+      "CANCEL supersedes pending pause",
+      "checkpoint ACK before turn.paused; duplicate/out-of-order/cross-run/epoch/input rejection; UNKNOWN effects/cost rejection"
+    ],
+    "author_only_not_rerun": [
+      "40 original Agent tests",
+      "targeted tsgo",
+      "scoped Biome"
+    ],
+    "historical_failures": "Author broad and targeted initial typecheck failures and initial Git identity failure retained; no history rewrite."
+  },
+  "execution": {
+    "actual_provider_calls": 0,
+    "actual_model_calls": 0,
+    "external_tool_calls": 0,
+    "gui_calls": 0,
+    "phone_calls": 0,
+    "formal_increment": 0,
+    "parent_acceptance": false,
+    "production_integration": false,
+    "source_writes": false,
+    "installed_sdk_writes": false,
+    "canon_writes": false
+  },
+  "review_harness_errors": [
+    "Initial read commands used shorthand current instead of 20261012-current-chat and failed without mutation.",
+    "Initial python prepare.py used default locale decoding and failed parsing author UTF-8 JSON before writing; python -X utf8 succeeded."
+  ],
+  "review_harness_note": "Independent session fixture exercises public AgentSession APIs with synthetic tools injected into public Agent state; no production tool adapters. Failed assertions are desired invariants and are retained as review findings, not changed to pass.",
+  "identity_note": "Candidate author is command-scoped Codex <codex@localhost>; differs from ResearchOS local identity, transparently retained and not itself used to reject source."
+}

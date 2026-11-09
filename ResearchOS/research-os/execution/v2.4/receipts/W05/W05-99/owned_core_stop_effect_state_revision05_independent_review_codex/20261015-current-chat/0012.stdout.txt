@@ -1,0 +1,600 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"math"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"modernc.org/sqlite"
+)
+
+// OwnedStopCensus is a hash of the exact sqlite_master rows and every user or
+// SQLite-owned table row. Each cell has a type and length delimiter; BLOBs are
+// hashed as bytes. A row count is included for review, not as a substitute.
+type OwnedStopCensus struct {
+	SHA256       string `json:"sha256"`
+	SchemaSHA256 string `json:"schema_sha256"`
+	Tables       int    `json:"tables"`
+	Rows         int64  `json:"rows"`
+	QuickCheck   string `json:"quick_check"`
+}
+
+type ownedStopQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+var ownedStopIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func ownedStopURI(path, mode string) string {
+	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
+	q := u.Query()
+	q.Set("mode", mode)
+	q.Set("_busy_timeout", "1500")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func ownedStopFrame(h hash.Hash, kind byte, raw []byte) {
+	_, _ = h.Write([]byte{kind})
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(raw)))
+	_, _ = h.Write(n[:])
+	_, _ = h.Write(raw)
+}
+func ownedStopCell(h hash.Hash, v any) error {
+	switch x := v.(type) {
+	case nil:
+		ownedStopFrame(h, 'N', nil)
+	case []byte:
+		ownedStopFrame(h, 'B', x)
+	case string:
+		ownedStopFrame(h, 'S', []byte(x))
+	case int64:
+		ownedStopFrame(h, 'I', []byte(fmt.Sprintf("%d", x)))
+	case float64:
+		ownedStopFrame(h, 'F', []byte(fmt.Sprintf("%016x", math.Float64bits(x))))
+	case bool:
+		if x {
+			ownedStopFrame(h, 'T', nil)
+		} else {
+			ownedStopFrame(h, 'f', nil)
+		}
+	case time.Time:
+		ownedStopFrame(h, 'D', []byte(x.UTC().Format(time.RFC3339Nano)))
+	default:
+		return fmt.Errorf("unsupported SQLite cell type %T", v)
+	}
+	return nil
+}
+
+// Fixed statement forms are constructed only from identifiers returned by
+// sqlite_master and PRAGMA table_info. The connection is never returned.
+func ownedStopCensus(ctx context.Context, q ownedStopQueryer) (OwnedStopCensus, error) {
+	var out OwnedStopCensus
+	if err := q.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&out.QuickCheck); err != nil || out.QuickCheck != "ok" {
+		return out, fmt.Errorf("quick_check: %s: %w", out.QuickCheck, err)
+	}
+	schema := sha256.New()
+	all := sha256.New()
+	rows, err := q.QueryContext(ctx, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql")
+	if err != nil {
+		return out, err
+	}
+	tables := []string{}
+	for rows.Next() {
+		var typ, name, tbl string
+		var sqlText sql.NullString
+		if err = rows.Scan(&typ, &name, &tbl, &sqlText); err != nil {
+			break
+		}
+		for _, s := range []string{typ, name, tbl} {
+			ownedStopFrame(schema, 'S', []byte(s))
+		}
+		if sqlText.Valid {
+			ownedStopFrame(schema, 'S', []byte(sqlText.String))
+		} else {
+			ownedStopFrame(schema, 'N', nil)
+		}
+		if typ == "table" {
+			tables = append(tables, name)
+		}
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	out.SchemaSHA256 = hex.EncodeToString(schema.Sum(nil))
+	ownedStopFrame(all, 'H', schema.Sum(nil))
+	for _, table := range tables {
+		if !ownedStopIdentifier.MatchString(table) {
+			return out, errors.New("noncanonical SQLite table identifier")
+		}
+		colRows, e := q.QueryContext(ctx, "PRAGMA table_info(\""+table+"\")")
+		if e != nil {
+			return out, e
+		}
+		type key struct {
+			name  string
+			order int
+		}
+		var keys []key
+		for colRows.Next() {
+			var cid, notnull, pk int
+			var name, typ string
+			var defaultValue sql.NullString
+			if e = colRows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); e != nil {
+				break
+			}
+			if !ownedStopIdentifier.MatchString(name) {
+				e = errors.New("noncanonical SQLite column identifier")
+				break
+			}
+			if pk > 0 {
+				keys = append(keys, key{name, pk})
+			}
+		}
+		if e == nil {
+			e = colRows.Err()
+		}
+		colRows.Close()
+		if e != nil {
+			return out, e
+		}
+		order := "rowid"
+		if len(keys) > 0 {
+			sort.Slice(keys, func(i, j int) bool { return keys[i].order < keys[j].order })
+			parts := make([]string, len(keys))
+			for i, k := range keys {
+				parts[i] = "\"" + k.name + "\""
+			}
+			order = strings.Join(parts, ",")
+		}
+		ownedStopFrame(all, 'T', []byte(table))
+		data, e := q.QueryContext(ctx, "SELECT * FROM \""+table+"\" ORDER BY "+order)
+		if e != nil {
+			return out, e
+		}
+		columns, e := data.Columns()
+		if e != nil {
+			data.Close()
+			return out, e
+		}
+		for data.Next() {
+			values := make([]any, len(columns))
+			ptrs := make([]any, len(columns))
+			for i := range values {
+				ptrs[i] = &values[i]
+			}
+			if e = data.Scan(ptrs...); e != nil {
+				break
+			}
+			ownedStopFrame(all, 'R', nil)
+			for _, v := range values {
+				if e = ownedStopCell(all, v); e != nil {
+					break
+				}
+			}
+			if e != nil {
+				break
+			}
+			out.Rows++
+		}
+		if e == nil {
+			e = data.Err()
+		}
+		data.Close()
+		if e != nil {
+			return out, e
+		}
+		out.Tables++
+	}
+	out.SHA256 = hex.EncodeToString(all.Sum(nil))
+	return out, nil
+}
+
+// OnlineOwnedStopBackup creates a new destination outside the source root and
+// uses the pinned native online-backup API. It returns only hashes and counts.
+func OnlineOwnedStopBackup(ctx context.Context, source, destination string) (OwnedStopCensus, string, error) {
+	if !filepath.IsAbs(source) || !filepath.IsAbs(destination) || filepath.Clean(destination) != destination {
+		return OwnedStopCensus{}, "", errors.New("canonical backup paths required")
+	}
+	rel, e := filepath.Rel(filepath.Dir(source), destination)
+	if e != nil || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..") {
+		return OwnedStopCensus{}, "", errors.New("backup destination must be outside data root")
+	}
+	if _, err := os.Stat(source); err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	if err = f.Close(); err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	src, err := sql.Open("sqlite", ownedStopURI(source, "rw"))
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	defer src.Close()
+	src.SetMaxOpenConns(1)
+	conn, err := src.Conn(ctx)
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	defer conn.Close()
+	destURI := ownedStopURI(destination, "rw")
+	err = conn.Raw(func(driverConn any) error {
+		maker, ok := driverConn.(interface {
+			NewBackup(string) (*sqlite.Backup, error)
+		})
+		if !ok {
+			return errors.New("pinned native backup unavailable")
+		}
+		backup, e := maker.NewBackup(destURI)
+		if e != nil {
+			return e
+		}
+		var stepErr error
+		complete := false
+		for steps := 0; steps < 100000; steps++ {
+			if e = ctx.Err(); e != nil {
+				stepErr = e
+				break
+			}
+			var more bool
+			more, e = backup.Step(128)
+			if e != nil {
+				stepErr = e
+				break
+			}
+			if !more {
+				complete = true
+				break
+			}
+		}
+		if !complete && stepErr == nil {
+			stepErr = errors.New("online backup step limit")
+		}
+		return errors.Join(stepErr, backup.Finish())
+	})
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	closed, err := os.OpenFile(destination, os.O_RDWR, 0)
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	if err = closed.Sync(); err != nil {
+		closed.Close()
+		return OwnedStopCensus{}, "", err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, closed)
+	closeErr := closed.Close()
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	if closeErr != nil {
+		return OwnedStopCensus{}, "", closeErr
+	}
+	ro, err := sql.Open("sqlite", ownedStopURI(destination, "ro"))
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	defer ro.Close()
+	ro.SetMaxOpenConns(1)
+	census, err := ownedStopCensus(ctx, ro)
+	return census, hex.EncodeToString(h.Sum(nil)), err
+}
+
+// ReadOwnedStopBackup rereads a closed backup as a read-only database. It is
+// used when committing a reviewed plan; it never refreshes the backup.
+func ReadOwnedStopBackup(ctx context.Context, path string) (OwnedStopCensus, string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return OwnedStopCensus{}, "", errors.New("canonical backup path required")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	closeErr := f.Close()
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	if closeErr != nil {
+		return OwnedStopCensus{}, "", closeErr
+	}
+	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
+	if err != nil {
+		return OwnedStopCensus{}, "", err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	census, err := ownedStopCensus(ctx, db)
+	return census, hex.EncodeToString(h.Sum(nil)), err
+}
+
+func ReadOwnedStopCensus(ctx context.Context, path string) (OwnedStopCensus, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return OwnedStopCensus{}, errors.New("canonical existing SQLite path required")
+	}
+	db, err := sql.Open("sqlite", ownedStopURI(path, "ro"))
+	if err != nil {
+		return OwnedStopCensus{}, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return ownedStopCensus(ctx, db)
+}
+//go:build windows
+
+// The fixture is a separate executable and is never linked into the stop CLI.
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"golang.org/x/sys/windows"
+	_ "modernc.org/sqlite"
+	rt "researchos.local/research-os/adapters/runtime"
+	"researchos.local/research-os/internal/auth"
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+	"researchos.local/research-os/ops/supervisor"
+)
+
+type nativeFile struct {
+	Path   string `json:"path"`
+	Volume uint32 `json:"volume"`
+	Index  uint64 `json:"index"`
+}
+
+func fileID(path string, dir bool) (nativeFile, error) {
+	w, e := windows.UTF16PtrFromString(path)
+	if e != nil {
+		return nativeFile{}, e
+	}
+	h, e := windows.CreateFile(w, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if e != nil {
+		return nativeFile{}, e
+	}
+	defer windows.CloseHandle(h)
+	var i windows.ByHandleFileInformation
+	if e = windows.GetFileInformationByHandle(h, &i); e != nil {
+		return nativeFile{}, e
+	}
+	if i.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (i.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != dir {
+		return nativeFile{}, fmt.Errorf("reparse or type mismatch: %s", path)
+	}
+	return nativeFile{path, i.VolumeSerialNumber, uint64(i.FileIndexHigh)<<32 | uint64(i.FileIndexLow)}, nil
+}
+func private(path string, dir bool) error {
+	token := windows.GetCurrentProcessToken()
+	u, e := token.GetTokenUser()
+	if e != nil {
+		return e
+	}
+	sid := u.User.Sid.String()
+	ace := "(A;;FA;;;" + sid + ")"
+	if dir {
+		ace = "(A;OICI;FA;;;" + sid + ")"
+	}
+	sd, e := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + ace)
+	if e != nil {
+		return e
+	}
+	acl, _, e := sd.DACL()
+	if e != nil {
+		return e
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+}
+func setup(root, out string) error {
+	if root == "" || out == "" || filepath.IsAbs(root) == false || filepath.IsAbs(out) == false {
+		return fmt.Errorf("new absolute fixture root/opdir required")
+	}
+	for _, path := range []string{root, filepath.Join(root, "host"), out} {
+		if e := os.Mkdir(path, 0700); e != nil {
+			return e
+		}
+	}
+	if e := private(filepath.Join(root, "host"), true); e != nil {
+		return e
+	}
+	if e := private(out, true); e != nil {
+		return e
+	}
+	a, e := auth.Current()
+	if e != nil {
+		return e
+	}
+	state := map[string]any{"version": 1, "principal_ref": a.Ref, "principal_id": "owner-fixture", "host_instance_id": "host-fixture", "bootstrap_at": "", "created_owner": false, "bootstrap_iterations": 0, "active_credential_hash": ""}
+	raw, e := json.Marshal(state)
+	if e != nil {
+		return e
+	}
+	statePath := filepath.Join(root, "host", "host_state.json")
+	if e = os.WriteFile(statePath, raw, 0600); e != nil {
+		return e
+	}
+	if e = private(statePath, false); e != nil {
+		return e
+	}
+	db, e := sql.Open("sqlite", filepath.Join(root, "researchos.sqlite"))
+	if e != nil {
+		return e
+	}
+	defer db.Close()
+	if _, e = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL`); e != nil {
+		return e
+	}
+	files, e := filepath.Glob(filepath.Join("migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
+	if e != nil || len(files) != 24 {
+		return fmt.Errorf("schema24 migration inventory: %d %v", len(files), e)
+	}
+	sort.Strings(files)
+	for i, file := range files {
+		raw, e := os.ReadFile(file)
+		if e != nil {
+			return e
+		}
+		if _, e = db.Exec(string(raw)); e != nil {
+			return fmt.Errorf("migration %s: %w", file, e)
+		}
+		if _, e = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); e != nil {
+			return e
+		}
+	}
+	for _, stmt := range []string{
+		`INSERT INTO auth_principals(id,roles,revoked) VALUES('owner-fixture','["OWNER"]',0)`,
+		`INSERT INTO orchestration_identity(principal,root) VALUES('owner-fixture','root-fixture')`,
+		`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('fixture-project','Run','f3dcb996b2e43cf52cba874be7abfc70',1,'{"status":"RUNNING"}')`,
+		`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70',1,'705b11ec99044fef19e85f57e2d2b712','{}','fixture-hash','UNKNOWN','fixture-time','fixture-time')`,
+		`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES('fixture-project','f3dcb996b2e43cf52cba874be7abfc70','old-model',1,'{"state":"CONFIRMED","payload":{"capability":"MODEL"}}')`,
+		`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES('fixture-principal','fixture-project','host:managed-runtime-qualification','bc269e772ada7e1bce54439fd080550c','fixture-hash',202,x'00','{}','fixture-time')`,
+		`CREATE TABLE stop_fixture_rows(id TEXT PRIMARY KEY,payload BLOB)`,
+	} {
+		if _, e = db.Exec(stmt); e != nil {
+			return fmt.Errorf("fixture statement: %w", e)
+		}
+	}
+	return nil
+}
+func describe(root, out string, pid uint32) error {
+	n, e := supervisor.ObserveOwnedCoreReadOnly(pid)
+	if e != nil {
+		return e
+	}
+	h, e := host.ReadOwnedCoreStopPublicIdentity(context.Background(), root)
+	if e != nil {
+		return e
+	}
+	c, e := store.ReadOwnedStopCensus(context.Background(), h.Database)
+	if e != nil {
+		return e
+	}
+	r, e := fileID(root, true)
+	if e != nil {
+		return e
+	}
+	d, e := fileID(h.Database, false)
+	if e != nil {
+		return e
+	}
+	o, e := fileID(out, true)
+	if e != nil {
+		return e
+	}
+	return json.NewEncoder(os.Stdout).Encode(struct {
+		Native       supervisor.OwnedCoreNativeIdentity `json:"native"`
+		Host         host.OwnedCoreStopPublicIdentity   `json:"host"`
+		Census       store.OwnedStopCensus              `json:"census"`
+		DataRoot     nativeFile                         `json:"data_root"`
+		Database     nativeFile                         `json:"database"`
+		OperationDir nativeFile                         `json:"operation_dir"`
+	}{n, h, c, r, d, o})
+}
+
+func main() {
+	mode := flag.String("mode", "run", "setup|describe|run")
+	root := flag.String("root", "", "new owned fixture data root")
+	out := flag.String("out", "", "pre-created private operation directory")
+	pid := flag.Uint("pid", 0, "new owned Core fixture PID")
+	ready := flag.String("ready", "", "ready marker outside product")
+	attempt := flag.String("attempt", "", "attempt trigger")
+	attempted := flag.String("attempted", "", "attempted marker")
+	flag.Parse()
+	if *mode == "setup" {
+		if e := setup(*root, *out); e != nil {
+			fmt.Fprintln(os.Stderr, e)
+			os.Exit(2)
+		}
+		return
+	}
+	if *mode == "describe" {
+		if e := describe(*root, *out, uint32(*pid)); e != nil {
+			fmt.Fprintln(os.Stderr, e)
+			os.Exit(2)
+		}
+		return
+	}
+	if *root == "" || *ready == "" || *attempt == "" || *attempted == "" {
+		fmt.Fprintln(os.Stderr, "all fixture paths required")
+		os.Exit(2)
+	}
+	lease, err := rt.AcquireDataRootLease(*root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	defer lease.Close()
+	db, err := sql.Open("sqlite", filepath.Join(*root, "researchos.sqlite"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout=10000`); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; INSERT INTO stop_fixture_rows VALUES('committed',x'0001ff')`); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err = os.WriteFile(*ready, []byte("READY\n"), 0600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if _, err = os.Stat(*attempt); err == nil {
+			break
+		}
+	}
+	if _, err = os.Stat(*attempt); err != nil {
+		return
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(context.Background(), "BEGIN DEFERRED"); err != nil {
+		return
+	}
+	if err = os.WriteFile(*attempted, []byte("ATTEMPTED\n"), 0600); err != nil {
+		return
+	}
+	_, _ = conn.ExecContext(context.Background(), `INSERT INTO stop_fixture_rows VALUES('inflight',x'02')`)
+	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+}

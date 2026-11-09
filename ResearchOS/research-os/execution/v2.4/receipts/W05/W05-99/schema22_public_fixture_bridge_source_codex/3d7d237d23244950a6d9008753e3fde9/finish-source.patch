@@ -1,0 +1,57 @@
+*** Begin Patch
+*** Update File: D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/schema22_public_fixture_bridge_source_codex/3d7d237d23244950a6d9008753e3fde9/historical22-overlay/internal/domain/configuration_historical22_bridge_test.go
+@@
+     for rel, expected := range inputs.Files {
+@@
+         }
+     }
++    // The executable must be built outside this release root. Only the two
++    // reviewed test overlay inputs may accompany the 502 historical files.
++    seen := map[string]bool{}
++    err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
++        if walkErr != nil { return walkErr }
++        if info.IsDir() { return nil }
++        rel, relErr := filepath.Rel(root, path)
++        if relErr != nil { return relErr }
++        rel = filepath.ToSlash(rel)
++        if info.Mode()&os.ModeSymlink != 0 { return fmt.Errorf("historical source symlink refused") }
++        _, original := inputs.Files[rel]
++        if !original && rel != "internal/domain/configuration_historical22_bridge_test.go" && rel != "internal/domain/schema22_bridge_inputs.json" {
++            return fmt.Errorf("unexpected historical source member: %s", rel)
++        }
++        seen[rel] = true
++        return nil
++    })
++    if err != nil || len(seen) != 504 { t.Fatal("historical source file inventory mismatch") }
+ }
+*** End Patch
+*** Begin Patch
+*** Update File: D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/schema22_public_fixture_bridge_source_codex/3d7d237d23244950a6d9008753e3fde9/candidate-root/internal/domain/backup_historical22_bridge_test.go
+@@
+         decoded, decodeErr := DecodeEnvelope(Bytes(command.Envelope))
+         if decodeErr != nil || deref(decoded.ProjectID) != result.Project { t.Fatal("historical22 public request binding mismatch") }
++        if i > 0 && deref(decoded.SessionID) != result.Session { t.Fatal("historical22 public session binding mismatch") }
+@@
+         if err = ValidateResultAgainstMethod(method, command.Response, doc); err != nil { t.Fatal(err) }
+     }
++    snapshot, ok := result.Commands[0].Response.Result["snapshot"].(map[string]any)
++    if !ok || Str(snapshot, "session_id") != result.Session { t.Fatal("historical22 goal session mismatch") }
+@@
+     versions, err := backupMigrations(db)
+     if err != nil || Hash(versions) != Hash(upgradeVersions(22)) { t.Fatal("historical22 reopened version mismatch") }
++    for _, command := range result.Commands {
++        decoded, decodeErr := DecodeEnvelope(Bytes(command.Envelope))
++        if decodeErr != nil { t.Fatal(decodeErr) }
++        wantHash, hashErr := decoded.ContentHash()
++        if hashErr != nil { t.Fatal(hashErr) }
++        var storedHash string
++        var storedBody []byte
++        if err = db.QueryRow(`SELECT request_hash,body FROM idempotency WHERE principal=? AND project=? AND operation=? AND key=?`, request.Owner, result.Project, "v2:"+deref(decoded.Method), deref(decoded.CommandID)).Scan(&storedHash, &storedBody); err != nil {
++            t.Fatal("historical22 public response has no original idempotency row")
++        }
++        var storedResponse Response
++        if err = json.Unmarshal(storedBody, &storedResponse); err != nil || storedHash != wantHash || Hash(storedResponse) != Hash(command.Response) {
++            t.Fatal("historical22 public response differs from original idempotency row")
++        }
++    }
+*** End Patch

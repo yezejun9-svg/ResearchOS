@@ -1,0 +1,132 @@
+{
+  "schema": "researchos.independent-controller-observer-findings.v1",
+  "decision": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "CTRL-R01",
+      "priority": 1,
+      "title": "未确认子树已停止时仍清空 canonical active lease",
+      "source": "controller.py",
+      "lines": [
+        92,
+        108
+      ],
+      "trigger": "assert_native_closed rejects result with active_processes_last_observed=1, job_idle_confirmed=false, handles_closed=false; finally still calls close_canonical_lease when activated",
+      "actual": "work_in_progress.mu_sdk_active_run_uuid=null and ownership state FAILED_EXECUTION_CLOSED",
+      "impact": "下一次activate只检查active UUID为空，可以在旧子树尚未证实停止时接纳另一trial",
+      "requested": "只有实际primary exit、Job idle和句柄关闭等终结证据满足时才释放lease；未确认终结保留active UUID并记RECONCILIATION_REQUIRED/FAILED_CLEANUP_UNCONFIRMED，Root处理后另行解除",
+      "control": "NEGATIVE_UNCONFIRMED_LIVE_CHILD",
+      "limitation": "synthetic in-memory result and filesystem; not a claim actual native cleanup failed"
+    },
+    {
+      "id": "CTRL-R02",
+      "priority": 1,
+      "title": "检查后两次replace会覆盖并发canonical变更",
+      "source": "controller.py",
+      "lines": [
+        104,
+        105
+      ],
+      "also_lines": [
+        85,
+        87
+      ],
+      "trigger": "after final raw equality check, concurrent writer changes checkpoint while ownership replacement occurs",
+      "actual": "independent memory scheduler inserts revision350/new field; controller then writes revision342/old field",
+      "impact": "静默丢弃其他已发生的canonical更新；两文件部分写入也不构成原子事务",
+      "requested": "使用项目认可的独占canonical writer/lock与revision CAS，覆盖读取、最终检查和整个两文件更新；或撤出controller canonical写路径，由Root真实串行事务接口完成，部分结果必须原文记录并阻止继续",
+      "control": "NEGATIVE_CONCURRENT_CHECKPOINT_AFTER_CHECK_BEFORE_REPLACE",
+      "limitation": "deterministic in-memory schedule establishes code behavior under concurrency; not evidence of actual current canonical data loss"
+    },
+    {
+      "id": "CTRL-R03",
+      "priority": 1,
+      "title": "pinned返回未经pin校验的第二遍raw",
+      "source": "controller.py",
+      "lines": [
+        25,
+        33
+      ],
+      "trigger": "file changes between pin(path) comparison and path.read_bytes returned to caller",
+      "actual": "pinned accepts reviewed hash but returns changed raw; module compiles returned raw",
+      "impact": "真正加载的runner/observer或authority JSON字节可以与审查pin不一致",
+      "requested": "一次读取raw，对这同一buffer检查完整pin并返回这同一buffer；使用已校验buffer解析/编译，保留canonical/reparse校验",
+      "control": "NEGATIVE_PIN_DOUBLE_READ",
+      "limitation": "synthetic changing-reader counterexample; did not mutate any candidate source"
+    },
+    {
+      "id": "CTRL-R04",
+      "priority": 2,
+      "title": "public_environment不是闭集且在审查前完整写入intent",
+      "source": "controller.py",
+      "lines": [
+        130,
+        164
+      ],
+      "also_lines": [
+        193,
+        217
+      ],
+      "trigger": "seed.public_environment contains an extra variable omitted by runner.cli_environment allowlist",
+      "actual": "basis excludes extra while controller serializes original whole dict and forwards it to CreateProcess environment",
+      "impact": "未经basis绑定的变量被实际进程消费；若上游误传敏感变量，审查后再拒绝也不能撤回已写原文",
+      "requested": "在任何intent写入/模块加载/子进程之前构造并验证精确公共环境闭集，写出、复核、观察和传入进程使用同一dictionary；不能只比较同一个engine.cli_environment两次",
+      "control": "NEGATIVE_ENV_BASIS_OMITS_EXTRA; FRAME_UNBOUND_EXTRA_ENV_EXPECT_REJECT; OBSERVER_PROJECTION_IGNORES_EXTRA_ENV",
+      "limitation": "used only synthetic dummy extra value; no real environment values or secrets read",
+      "also_observer_lines": [
+        125,
+        155,
+        319,
+        325
+      ]
+    },
+    {
+      "id": "CTRL-R05",
+      "priority": 2,
+      "title": "同步before_resume期间没有独立绝对deadline终止器",
+      "source": "owned_job_hooks.py",
+      "lines": [
+        18,
+        29
+      ],
+      "also_source": "controller.py",
+      "also_lines": [
+        165,
+        217
+      ],
+      "trigger": "canonical filesystem/observer callback stalls after Job assignment",
+      "actual": "base's timeout check is after callback returns; controller deadline guard also runs after observer",
+      "impact": "300秒deadline不能在回调未返回时使Job关闭，活性heartbeat线程可继续刷新，悬挂runner和lease超出边界",
+      "requested": "由独立受控owner/watchdog按固定绝对deadline终止Job，覆盖assignment后的callback和运行阶段；终止原文与callback异常保留",
+      "control": "POSITIVE_HOOK_ORDER_ASSIGN_CALLBACK_DEADLINE_RESUME (ordering evidence shows gap)",
+      "limitation": "static ordering finding; no waiting/native process test performed"
+    },
+    {
+      "id": "CTRL-R06",
+      "priority": 1,
+      "title": "实际Job程序的argv/cwd和phase_worker字节未绑定审查范围",
+      "source": "mu_sdk_job_observer.proposed.py",
+      "lines": [
+        294,
+        331
+      ],
+      "also_lines": [
+        158,
+        168
+      ],
+      "also_source": "controller.py",
+      "controller_lines": [
+        160,
+        164,
+        190,
+        217
+      ],
+      "trigger": "保持同一已审查run_owned函数帧、相同PID/handles/flags/deadline/environment，仅改真实frame的argv或cwd；或更换未纳入review tuple的phase_worker文件",
+      "actual": "独立frame替身在foreign argv和foreign cwd下仍通过callback guard；Root controller仅临时记录phase_worker当前pin，CreateProcess参数仍为path，observer不验证此pin或命令",
+      "impact": "Job/PID/assignment事实正确也不足以证明启动的是本次被审查的SDK phase worker；可能对无关进程签发当前SDK admission review",
+      "requested": "source review加入phase_worker/Python/执行依赖closure，真实callback校验loc.argv/cwd为确切审查向量且进程创建前后的worker字节与固定pin匹配；将实际加载/执行buffer绑定不可变源，不能依赖后补self-reported intent",
+      "control": "FRAME_FOREIGN_ARGV_EXPECT_REJECT; FRAME_FOREIGN_CWD_EXPECT_REJECT",
+      "limitation": "纯code-object/frame/locals替身验证分支，不伪称真实Windows callback；真实开发probe仍OPEN"
+    }
+  ]
+}

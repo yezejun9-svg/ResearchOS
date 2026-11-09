@@ -1,0 +1,111 @@
+33:func goalFixture(t *testing.T) (*fixture, *ClientService, string) {
+34-	t.Helper()
+35-	f := contextFixture(t)
+36-	workspace := "goal-workspace-" + ID()
+37-	client := "goal-client"
+38-	b := WorkspaceBinding{AuthorizedRef: workspace, DisplayName: "goal fixture", DisplayPath: "fixture", RealPath: t.TempDir(), Access: "READ_ONLY", ProjectID: &f.project, Revision: 1, Status: WorkspaceActive, PrincipalID: f.owner, ClientID: client, HostPrincipalRef: "fixture-local-user", CreatedAt: Now()}
+39-	if _, err := f.db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, KindWorkspaceBinding, workspace, string(Bytes(b))); err != nil {
+40-		t.Fatal(err)
+41-	}
+42-	svc := &ClientService{Doc: clientHistoryDoc(t), Domain: f.s, SessionRuntime: goalClientPort{workspace: workspace, model: "goal-model", admitErr: Fail(503, "RESOURCE_UNAVAILABLE", "fixture runtime unqualified")}, Host: ClientHostInfo{CoreBuildID: "goal-fixture-core", LeaseTTL: time.Minute}}
+43-	return f, svc, client
+44-}
+45-
+46-func goalEnvelope(f *fixture, client, text string, draft bool) *Envelope {
+47-	return &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: &client, ProjectID: &f.project, Method: strptr("goal.start"), Payload: Bytes(Object{"objective": text, "contract_artifact_ids": Empty(), "start_as_draft": draft})}
+48-}
+49-
+50-func goalCommand(t *testing.T, f *fixture, svc *ClientService, env *Envelope) (*Response, bool) {
+51-	t.Helper()
+52-	decoded, err := DecodeEnvelope(Bytes(env))
+53-	if err != nil {
+54-		t.Fatal(err)
+55-	}
+56-	var reply *Response
+57-	var replay bool
+58-	sourceTx(t, f.db, func(tx *sql.Tx) error {
+59-		var err error
+60-		reply, replay, err = svc.Execute(context.Background(), tx, decoded, f.owner)
+61-		return err
+62-	})
+63-	return reply, replay
+64-}
+65-
+66-func goalCounts(t *testing.T, f *fixture) (int, int, int, int) {
+67-	t.Helper()
+68-	counts := [4]int{}
+69-	for i, kind := range []string{"Requirement", "Goal", "Task", "Run"} {
+70-		if err := f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind=?", f.project, kind).Scan(&counts[i]); err != nil {
+71-			t.Fatal(err)
+72-		}
+73-	}
+74-	return counts[0], counts[1], counts[2], counts[3]
+75-}
+76-
+77-func TestClientGoalProjectDraftIsRealSessionWithoutTask(t *testing.T) {
+78-	f, svc, client := goalFixture(t)
+79-	env := goalEnvelope(f, client, "保存这个明确目标", true)
+80-	reply, replay := goalCommand(t, f, svc, env)
+81-	if replay || deref(reply.Status) != "COMPLETED" || reply.SessionID != nil {
+82-		t.Fatalf("project-level Goal did not create a typed Goal result: %s", Bytes(reply))
+83-	}
+84-	result := reply.Result
+85-	snap := result["snapshot"].(map[string]any)
+86-	if result["goal_status"] != "DRAFT" || snap["goal_id"] != result["goal_id"] || snap["workspace_ref"] == "" || snap["model_config_ref"] != "goal-model" || snap["native_session_ref"] == "" {
+87-		t.Fatalf("draft result or native session missing: %s", Bytes(reply))
+88-	}
+89-	if _, g, task, run := goalCounts(t, f); g != 1 || task != 0 || run != 0 {
+90-		t.Fatalf("draft dispatched work: goals=%d tasks=%d runs=%d", g, task, run)
+91-	}
+92-	var fake int
+93-	if err := f.db.QueryRow("SELECT count(*) FROM idempotency WHERE operation='v2:session.create'").Scan(&fake); err != nil || fake != 0 {
+94-		t.Fatalf("goal made a fake session.create receipt: %d %v", fake, err)
+95-	}
+96-	repeated, isReplay := goalCommand(t, f, svc, env)
+97-	if !isReplay || Hash(repeated) != Hash(reply) {
+98-		t.Fatalf("same command did not replay exact identity: %s", Bytes(repeated))
+99-	}
+100-	var principal string
+101-	sourceTx(t, f.db, func(tx *sql.Tx) error {
+102-		var err error
+103-		principal, err = clientSessionCreationPrincipal(context.Background(), tx, f.project, Str(snap, "session_id"))
+104-		return err
+105-	})
+106-	if principal != f.owner {
+107-		t.Fatalf("goal session creator mismatch: %s", principal)
+108-	}
+109-}
+110-
+111-func TestClientGoalNonDraftKeepsFiniteIndependentContractAndBlockedAdmission(t *testing.T) {
+112-	f, svc, client := goalFixture(t)
+113-	reply, _ := goalCommand(t, f, svc, goalEnvelope(f, client, "解释这项用户目标", false))
+114-	if deref(reply.Status) != "COMPLETED" {
+115-		t.Fatalf("goal creation refused: %s", Bytes(reply))
+116-	}
+117-	result := reply.Result
+118-	goal := f.read("goals", Str(result, "goal_id"))
+119-	contract := goal["acceptance_contract"].(map[string]any)
+120-	if goal["status"] != "ACTIVE" || contract["require_independent_verifier"] != true || contract["version_policy"] != "EXACT" || Arr(contract, "checks")[0].(map[string]any)["check_id"] != "mu-turn-output" {
+121-		t.Fatalf("finite contract became business acceptance: %s", Bytes(goal))
+122-	}
+123-	_, _, taskCount, runCount := goalCounts(t, f)
+124-	if taskCount != 1 || runCount != 0 {
+125-		t.Fatalf("blocked qualification pretended to run: tasks=%d runs=%d", taskCount, runCount)
+126-	}
+127-	task := f.read("tasks", Arr(goal, "task_ids")[0].(string))
+128-	progress := f.read("no-progress-records", Str(task, "no_progress_record_id"))
+129-	if task["status"] != "BLOCKED" || progress["candidate_id"] == "" || progress["origin_problem_id"] != Arr(goal, "problem_ids")[0] {
+130-		t.Fatalf("Task lost original Goal or blocked state: %s", Bytes(task))
+131-	}
+132-	second, _ := goalCommand(t, f, svc, goalEnvelope(f, client, "解释这项用户目标", false))
+133-	if deref(second.Status) != "REJECTED" {
+134-		t.Fatalf("new command reset same Goal budget: %s", Bytes(second))
+135-	}
+136-	if _, goals, tasks, runs := goalCounts(t, f); goals != 1 || tasks != 1 || runs != 0 {
+137-		t.Fatalf("duplicate Goal committed state: %d %d %d", goals, tasks, runs)
+138-	}
+139-}
+140-
+141-func TestClientGoalResolverFailureAndChangedReplayAreAtomic(t *testing.T) {
+142-	f, svc, client := goalFixture(t)
+143-	port := svc.SessionRuntime.(goalClientPort)

@@ -1,0 +1,366 @@
+FILE internal/domain/client_protocol.go SHA256 3dc3fde08b8d5a50cf43c5dcd1c4fd839f11f7118c1da8854635f688da87fc5f LINES 351-435
+351: // ContentHash is the canonical (RFC8785-flavoured: sorted keys, no extra space)
+352: // digest of the envelope; idempotency binds command_id to this hash.
+353: func (e *Envelope) ContentHash() (string, error) {
+354: 	var generic map[string]any
+355: 	if err := json.Unmarshal([]byte(mustMarshal(e.extra)), &generic); err != nil {
+356: 		return "", err
+357: 	}
+358: 	return "sha256:" + canonicalHash(generic), nil
+359: }
+360: 
+361: func mustMarshal(m map[string]json.RawMessage) string {
+362: 	keys := make([]string, 0, len(m))
+363: 	for k := range m {
+364: 		keys = append(keys, k)
+365: 	}
+366: 	sort.Strings(keys)
+367: 	var sb strings.Builder
+368: 	sb.WriteByte('{')
+369: 	for i, k := range keys {
+370: 		if i > 0 {
+371: 			sb.WriteByte(',')
+372: 		}
+373: 		kb, _ := json.Marshal(k)
+374: 		sb.Write(kb)
+375: 		sb.WriteByte(':')
+376: 		sb.Write(compactJSON(m[k]))
+377: 	}
+378: 	sb.WriteByte('}')
+379: 	return sb.String()
+380: }
+381: 
+382: func compactJSON(raw json.RawMessage) json.RawMessage {
+383: 	var v any
+384: 	if json.Unmarshal(raw, &v) != nil {
+385: 		return raw
+386: 	}
+387: 	b, err := json.Marshal(v)
+388: 	if err != nil {
+389: 		return raw
+390: 	}
+391: 	return b
+392: }
+393: 
+394: func canonicalHash(v any) string {
+395: 	b := canonicalBytes(v)
+396: 	sum := sha256.Sum256(b)
+397: 	return hex.EncodeToString(sum[:])
+398: }
+399: 
+400: func canonicalBytes(v any) []byte {
+401: 	switch t := v.(type) {
+402: 	case map[string]any:
+403: 		keys := make([]string, 0, len(t))
+404: 		for k := range t {
+405: 			keys = append(keys, k)
+406: 		}
+407: 		sort.Strings(keys)
+408: 		var sb strings.Builder
+409: 		sb.WriteByte('{')
+410: 		for i, k := range keys {
+411: 			if i > 0 {
+412: 				sb.WriteByte(',')
+413: 			}
+414: 			kb, _ := json.Marshal(k)
+415: 			sb.Write(kb)
+416: 			sb.WriteByte(':')
+417: 			sb.Write(canonicalBytes(t[k]))
+418: 		}
+419: 		sb.WriteByte('}')
+420: 		return []byte(sb.String())
+421: 	case []any:
+422: 		var sb strings.Builder
+423: 		sb.WriteByte('[')
+424: 		for i, x := range t {
+425: 			if i > 0 {
+426: 				sb.WriteByte(',')
+427: 			}
+428: 			sb.Write(canonicalBytes(x))
+429: 		}
+430: 		sb.WriteByte(']')
+431: 		return []byte(sb.String())
+432: 	default:
+433: 		b, _ := json.Marshal(t)
+434: 		return b
+435: 	}
+
+FILE internal/domain/client_protocol.go SHA256 3dc3fde08b8d5a50cf43c5dcd1c4fd839f11f7118c1da8854635f688da87fc5f LINES 695-825
+695: func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, bool, error) {
+696: 	if s.Doc != nil {
+697: 		var request any
+698: 		raw, err := json.Marshal(env)
+699: 		if err != nil {
+700: 			return nil, false, err
+701: 		}
+702: 		if err = json.Unmarshal(raw, &request); err != nil {
+703: 			return nil, false, err
+704: 		}
+705: 		if err = s.Doc.ValidateDefInput("CommandEnvelope", request); err != nil {
+706: 			return NewTypedRejection(env, "INVALID_REQUEST", "command violates the published request schema"), false, nil
+707: 		}
+708: 	}
+709: 	hash, err := env.ContentHash()
+710: 	if err != nil {
+711: 		return nil, false, err
+712: 	}
+713: 	var existingHash, body string
+714: 	row := tx.QueryRowContext(ctx, `SELECT request_hash, body FROM idempotency WHERE principal=? AND project=? AND operation=? AND key=?`,
+715: 		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID)
+716: 	err = row.Scan(&existingHash, &body)
+717: 	switch {
+718: 	case err == nil:
+719: 		if existingHash != hash {
+720: 			return nil, false, ErrIdemConflict
+721: 		}
+722: 		var r Response
+723: 		if err := json.Unmarshal([]byte(body), &r); err != nil {
+724: 			return nil, false, err
+725: 		}
+726: 		if deref(env.Method) == "session.control" && deref(r.Status) == "ACKNOWLEDGED" {
+727: 			final, err := s.finalizeClientCancel(ctx, tx, env, principal, nil)
+728: 			if err != nil {
+729: 				return nil, false, err
+730: 			}
+731: 			if final != nil {
+732: 				if s.Doc != nil {
+733: 					var generic map[string]any
+734: 					if err = json.Unmarshal(Bytes(final), &generic); err != nil {
+735: 						return nil, false, err
+736: 					}
+737: 					if err = s.Doc.ValidateDef("CommandResponse", generic); err != nil {
+738: 						return nil, false, err
+739: 					}
+740: 					if err = ValidateResultAgainstMethod(*env.Method, final, s.Doc); err != nil {
+741: 						return nil, false, err
+742: 					}
+743: 				}
+744: 				if _, err = tx.ExecContext(ctx, "UPDATE idempotency SET body=? WHERE principal=? AND project=? AND operation=? AND key=? AND request_hash=?", string(Bytes(final)), principal, deref(env.ProjectID), "v2:"+deref(env.Method), deref(env.CommandID), hash); err != nil {
+745: 					return nil, false, err
+746: 				}
+747: 				return final, true, nil
+748: 			}
+749: 		}
+750: 		return &r, true, nil
+751: 	case err != sql.ErrNoRows:
+752: 		return nil, false, err
+753: 	}
+754: 	// A typed rejection is committed for idempotency, but must not preserve any
+755: 	// intermediate business writes made before a handler discovers the refusal.
+756: 	if _, err = tx.ExecContext(ctx, "SAVEPOINT client_command"); err != nil {
+757: 		return nil, false, err
+758: 	}
+759: 	res, err := s.dispatch(ctx, tx, env, principal)
+760: 	if err != nil {
+761: 		return nil, false, err
+762: 	}
+763: 	if res != nil && (deref(res.Status) == "REJECTED" || deref(res.Status) == "NOT_IMPLEMENTED") {
+764: 		if _, err = tx.ExecContext(ctx, "ROLLBACK TO client_command"); err != nil {
+765: 			return nil, false, err
+766: 		}
+767: 	}
+768: 	if _, err = tx.ExecContext(ctx, "RELEASE client_command"); err != nil {
+769: 		return nil, false, err
+770: 	}
+771: 	if res.ProtocolVersion == nil || *res.ProtocolVersion != ProtocolV2 {
+772: 		return nil, false, fmt.Errorf("RESPONSE_PROTOCOL")
+773: 	}
+774: 	// Our own output is validated against the published schema in read direction, so a
+775: 	// handler can never emit a shape the contract forbids (credential material included).
+776: 	if s.Doc != nil {
+777: 		raw, _ := json.Marshal(res)
+778: 		var generic map[string]any
+779: 		if err := json.Unmarshal(raw, &generic); err != nil {
+780: 			return nil, false, err
+781: 		}
+782: 		if err := s.Doc.ValidateDef("CommandResponse", generic); err != nil {
+783: 			return nil, false, fmt.Errorf("%w: %v", ErrResponseSchema, err)
+784: 		}
+785: 		if err := ValidateResultAgainstMethod(*env.Method, res, s.Doc); err != nil {
+786: 			return nil, false, err
+787: 		}
+788: 	}
+789: 	rb, _ := json.Marshal(res)
+790: 	if deref(env.Method) == "session.control" {
+791: 		if _, err = tx.ExecContext(ctx, "UPDATE client_control_requests SET original_response=coalesce(original_response,?) WHERE principal=? AND project=? AND command_id=?", string(rb), principal, deref(env.ProjectID), deref(env.CommandID)); err != nil {
+792: 			return nil, false, err
+793: 		}
+794: 	}
+795: 	if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+796: 		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID, hash, 0, string(rb), "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+797: 		return nil, false, err
+798: 	}
+799: 	return res, false, nil
+800: }
+801: 
+802: func deref(s *string) string {
+803: 	if s == nil {
+804: 		return ""
+805: 	}
+806: 	return *s
+807: }
+808: 
+809: // dispatch authenticates, then applies the session/project/revision/epoch gate to every
+810: // write method before any handler runs.
+811: func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, error) {
+812: 	reject := func(rev int64, epoch any, code, msg string) *Response {
+813: 		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
+814: 			Status: strptr("REJECTED"), SessionID: env.SessionID, Revision: revPtr(rev),
+815: 			ErrorCode: strptr(code),
+816: 			Error: &ProtocolError{Code: code, Message: msg, Retryable: retryableCodes[code],
+817: 				Recovery: recoveryByCode[code], CurrentRevision: revAny(rev), CurrentWriterEpoch: epoch,
+818: 				ResourceRequestID: nil, RetryAfterMs: nil, CorrelationID: deref(env.CommandID)}}
+819: 	}
+820: 	if principal == "" {
+821: 		return reject(0, nil, "UNAUTHENTICATED", "no authenticated OS principal on this connection"), nil
+822: 	}
+823: 	if !methodsV2[*env.Method] {
+824: 		return reject(0, nil, "UNSUPPORTED_METHOD", "method is not part of researchos-client/2"), nil
+825: 	}
+
+FILE internal/domain/backup_command_queue_test.go SHA256 8aaacf735f566374bd7ae9280812c8f00b68040c02bad7ed8d8f9f693499bfdb LINES 118-187
+118: func TestClientQueueFreshNumberedSchema(t *testing.T) {
+119: 	f := setup(t)
+120: 	_, sqls, err := upgradeConfigurationRelease("../..", 23)
+121: 	if err != nil || len(sqls) != 24 {
+122: 		t.Fatalf("exact installed schema23 release: %d %v", len(sqls), err)
+123: 	}
+124: 	want := len(sqls) - 1 // The final entry is the separately pinned additive SQL.
+125: 	rows, err := f.db.Query(`SELECT version FROM schema_migrations ORDER BY version`)
+126: 	if err != nil {
+127: 		t.Fatal(err)
+128: 	}
+129: 	count := 0
+130: 	for rows.Next() {
+131: 		count++
+132: 		var applied int
+133: 		if err = rows.Scan(&applied); err != nil || applied != count {
+134: 			rows.Close()
+135: 			t.Fatalf("noncontiguous installed migration %d: %d %v", count, applied, err)
+136: 		}
+137: 	}
+138: 	if err = rows.Err(); err != nil || count != want {
+139: 		rows.Close()
+140: 		t.Fatalf("installed migration count=%d want=%d %v", count, want, err)
+141: 	}
+142: 	rows.Close()
+143: 	var version int
+144: 	if err := f.db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil || version != want {
+145: 		t.Fatalf("migration=%d %v", version, err)
+146: 	}
+147: 	for _, table := range clientQueueTables {
+148: 		var n int
+149: 		if err := f.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
+150: 			t.Fatalf("fresh table %s %d %v", table, n, err)
+151: 		}
+152: 	}
+153: 	if raw, err := os.ReadFile("../../migrations/sqlite/0022_client_command_queue.sql"); err != nil || len(raw) == 0 {
+154: 		t.Fatal("numbered SQL absent", err)
+155: 	}
+156: 	configurationEvidenceSnapshot(t, f.db, "fresh-current23")
+157: }
+158: 
+159: func TestClientQueueHistorical22NumberedSchema(t *testing.T) {
+160: 	root := queueUpgradeReleaseFixture(t, 22)
+161: 	_, sqls, err := upgradeQueueRelease(root, 22)
+162: 	if err != nil || len(sqls) != 23 {
+163: 		t.Fatalf("exact historical schema22 release: %d %v", len(sqls), err)
+164: 	}
+165: 	db, err := store.Open(filepath.Join(t.TempDir(), "numbered22.sqlite"))
+166: 	if err != nil {
+167: 		t.Fatal(err)
+168: 	}
+169: 	defer db.Close()
+170: 	// Only fixed numbered001..022 are applied. This is not a matching startup
+171: 	// release: it intentionally lacks the separately installed session/fence.
+172: 	for i, raw := range sqls[:22] {
+173: 		if _, err = db.Exec(string(raw)); err != nil {
+174: 			t.Fatal(err)
+175: 		}
+176: 		if _, err = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); err != nil {
+177: 			t.Fatal(err)
+178: 		}
+179: 	}
+180: 	var version, count int
+181: 	if err = db.QueryRow(`SELECT max(version),count(*) FROM schema_migrations`).Scan(&version, &count); err != nil || version != 22 || count != 22 {
+182: 		t.Fatalf("historical migration=%d count=%d %v", version, count, err)
+183: 	}
+184: 	for _, table := range clientQueueTables {
+185: 		var n int
+186: 		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
+187: 			t.Fatalf("fresh table %s %d %v", table, n, err)
+
+FILE internal/domain/backup_configuration_upgrade_test.go SHA256 3a5d84660916f9661b7e1c8f832489f9961ee50179cba024dbc5e7fe85c210fa LINES 19-54
+19: func configurationMigrationFiles(t *testing.T) []string {
+20: 	t.Helper()
+21: 	files, err := filepath.Glob("../../migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql")
+22: 	if err != nil || len(files) != 23 {
+23: 		t.Fatalf("actual migration inputs: %d %v", len(files), err)
+24: 	}
+25: 	return files
+26: }
+27: 
+28: func configurationUpgradeReleaseFixture(t *testing.T, n int) string {
+29: 	t.Helper()
+30: 	root := queueUpgradeReleaseFixture(t, 22)
+31: 	paths := []string{"internal/api/contracts/client.protocol.schema.json", "internal/api/contracts/domain.schema.json"}
+32: 	if n == 23 {
+33: 		paths = append(paths, "migrations/sqlite/0023_host_model_configuration.sql")
+34: 	}
+35: 	for _, path := range paths {
+36: 		raw, e := os.ReadFile(filepath.Join("../..", path))
+37: 		if e != nil {
+38: 			t.Fatal(e)
+39: 		}
+40: 		dest := filepath.Join(root, path)
+41: 		if e = os.MkdirAll(filepath.Dir(dest), 0700); e != nil {
+42: 			t.Fatal(e)
+43: 		}
+44: 		if e = os.WriteFile(dest, raw, 0600); e != nil {
+45: 			t.Fatal(e)
+46: 		}
+47: 	}
+48: 	if _, _, e := upgradeConfigurationRelease(root, n); e != nil {
+49: 		t.Fatal(e)
+50: 	}
+51: 	return root
+52: }
+53: func configurationUpgradeFixture(t *testing.T) (LocalUpgradeOptions, *fixture) {
+54: 	t.Helper()
+
+FILE internal/domain/client_configuration_test.go SHA256 7d939e76f6c39d9b09465fa7a5628721fd9e55d276de91c53ed04bf17aa09ef2 LINES 268-302
+268: 	t.Run("actual_Service_New", func(t *testing.T) {
+269: 		db, _ := configurationDB(t, 1, false)
+270: 		if _, e := New(db, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql"); e != nil {
+271: 			t.Fatal(e)
+272: 		}
+273: 		var version int
+274: 		if e := db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&version); e != nil || version != 23 {
+275: 			t.Fatalf("%d %v", version, e)
+276: 		}
+277: 		if configurationCount(t, db, "client_sessions") != 0 || configurationCount(t, db, "host_model_configurations") != 0 {
+278: 			t.Fatal("fresh state")
+279: 		}
+280: 	})
+281: }
+282: 
+283: func TestClientConfigurationConstructorRollbackAndPrebackup(t *testing.T) {
+284: 	for _, missing := range []bool{true, false} {
+285: 		t.Run(fmt.Sprintf("missing_additive_%t", missing), func(t *testing.T) {
+286: 			db, _ := configurationDB(t, 22, false)
+287: 			dir := t.TempDir()
+288: 			files, e := filepath.Glob("../../migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql")
+289: 			if e != nil {
+290: 				t.Fatal(e)
+291: 			}
+292: 			for _, p := range files {
+293: 				b, e := os.ReadFile(p)
+294: 				if e != nil {
+295: 					t.Fatal(e)
+296: 				}
+297: 				if e = os.WriteFile(filepath.Join(dir, filepath.Base(p)), b, 0600); e != nil {
+298: 					t.Fatal(e)
+299: 				}
+300: 			}
+301: 			if !missing {
+302: 				if e = os.WriteFile(filepath.Join(dir, "next_v24_sessions.sql"), []byte("THIS IS INVALID SQL;"), 0600); e != nil {

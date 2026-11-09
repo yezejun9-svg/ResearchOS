@@ -1,0 +1,721 @@
+100: 	return t
+101: }
+102: 
+103: func (q *qualificationPreEffectRejection) Error() string {
+104: 	if q == nil || q.cause == nil {
+105: 		return "qualification first-gate rejection unavailable"
+106: 	}
+107: 	return q.cause.Error()
+108: }
+109: 
+110: func qualificationDenialUnavailable(reason string) error {
+111: 	return Fail(409, "GATE_FAILED", "qualification failure proof unavailable: "+reason)
+112: }
+113: 
+114: func (c *RuntimeCoordinator) qualificationFirstGateRejectionTx(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, bridge *rt.Bridge, frame rt.BridgeFrame, payload Object) (*qualificationPreEffectRejection, error) {
+115: 	if frame.Type != "effect.request" || frame.Capability != "TOOL" {
+116: 		return nil, nil
+117: 	}
+118: 	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+119: 	if err != nil {
+120: 		return nil, err
+121: 	}
+122: 	if task["task_type"] != "runtime_qualification" {
+123: 		return nil, nil
+124: 	}
+125: 	if frame.Sequence != 3 || c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil || frame.Route == "" || len(frame.Payload) == 0 {
+126: 		return nil, qualificationDenialUnavailable("frame identity invalid")
+127: 	}
+128: 	manifest, ok := dispatch["manifest"].(map[string]any)
+129: 	if !ok {
+130: 		return nil, qualificationDenialUnavailable("dispatch manifest missing")
+131: 	}
+132: 	admission, ok := manifest["admission"].(map[string]any)
+133: 	if !ok || admission["qualification_bootstrap"] != true || admission["mode"] == nil {
+134: 		return nil, qualificationDenialUnavailable("qualification admission missing")
+135: 	}
+136: 	profile, ok := admission["profile"].(map[string]any)
+137: 	if !ok || Hash(admission["profile_ref"]) != admission["profile_hash"] {
+138: 		return nil, qualificationDenialUnavailable("profile binding invalid")
+139: 	}
+140: 	epoch, err := Num(run, "lease_epoch")
+141: 	if err != nil || epoch < 1 || manifest["project_id"] != route.ProjectID || manifest["run_id"] != run["id"] || manifest["task_id"] != task["id"] || manifest["runtime_id"] != route.RuntimeID || Hash(manifest["epoch"]) != Hash(epoch) || manifest["dispatch_key"] != dispatch["dispatch_key"] || Hash(manifest) != dispatch["manifest_hash"] {
+142: 		return nil, qualificationDenialUnavailable("run and dispatch differ")
+143: 	}
+144: 	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+145: 	if err != nil {
+146: 		return nil, err
+147: 	}
+148: 	var markerCount int
+149: 	err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=?`, route.ProjectID, task["id"], run["id"], route.RuntimeID, epoch).Scan(&markerCount)
+150: 	if err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || Hash(plan["model_qualification"]) != Hash(profile["model_qualification"]) || runtimeTechnicalHashMust(tx, route.ProjectID, route.RuntimeID) != admission["technical_hash"] {
+151: 		return nil, qualificationDenialUnavailable("qualification marker or plan changed")
+152: 	}
+153: 	var author string
+154: 	if err = tx.QueryRow(`SELECT author FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?`, route.ProjectID, task["id"], route.RuntimeID).Scan(&author); err != nil {
+155: 		return nil, err
+156: 	}
+157: 	currentRoot, err := currentAuthorityRoot(tx, author)
+158: 	if err != nil || currentRoot != root {
+159: 		return nil, qualificationDenialUnavailable("qualification author changed")
+160: 	}
+161: 	modelConfig, ok := profile["model_config"].(map[string]any)
+162: 	permission, permitted := plan["model_qualification"].(map[string]any)
+163: 	if !ok || !permitted || frame.Route != Str(modelConfig, "route") || frame.Route != Str(permission, "route") || profile["backend"] != runtimeMuBackend {
+164: 		return nil, qualificationDenialUnavailable("known model route changed")
+165: 	}
+166: 	if err = validateRuntimeToolArguments(modelConfig, payload); err != nil {
+167: 		return nil, qualificationDenialUnavailable("tool payload invalid")
+168: 	}
+169: 	known := false
+170: 	for _, provider := range c.runtimeProviders() {
+171: 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != "runtime_qualification" || provider.Capability != "MODEL" || provider.MeasurementMode != admission["mode"] || provider.CredentialRevision != profile["credential_revision"] || Hash(provider.ModelConfig) != Hash(modelConfig) || provider.Endpoint != Str(modelConfig, "endpoint") || !c.liveModelCredentialBound(provider, profile) {
+172: 			continue
+173: 		}
+174: 		for _, entry := range Arr(profile, "effect_routes") {
+175: 			p, ok := entry.(map[string]any)
+176: 			if ok && p["id"] == provider.ID && p["capability"] == "MODEL" && p["credential_revision"] == provider.CredentialRevision && Hash(p["upper_bound"]) == Hash(provider.UpperBound) {
+177: 				known = true
+178: 			}
+179: 		}
+180: 	}
+181: 	if !known {
+182: 		return nil, qualificationDenialUnavailable("route unknown or no longer frozen")
+183: 	}
+184: 	var effects, ledger, distinct int
+185: 	var modelKey string
+186: 	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),coalesce(min(effect_key),'') FROM resource_effects WHERE project=? AND run=?`, route.ProjectID, run["id"]).Scan(&distinct, &modelKey); err != nil {
+187: 		return nil, err
+188: 	}
+189: 	if err = tx.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND effect_key=?`, route.ProjectID, run["id"], frame.Key).Scan(&effects); err != nil {
+190: 		return nil, err
+191: 	}
+192: 	if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=?`, route.ProjectID, frame.Key).Scan(&ledger); err != nil {
+193: 		return nil, err
+194: 	}
+195: 	if effects != 0 || ledger != 0 || distinct != 1 || modelKey == "" || modelKey == frame.Key {
+196: 		return nil, qualificationDenialUnavailable("effect or ledger history exists")
+197: 	}
+198: 	model, err := latestEffect(tx, route.ProjectID, Str(run, "id"), modelKey)
+199: 	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+200: 		return nil, qualificationDenialUnavailable("sole MODEL effect is not confirmed")
+201: 	}
+202: 	modelRequest, _ := model["payload"].(map[string]any)
+203: 	if modelRequest["capability"] != "MODEL" || modelRequest["route"] != frame.Route {
+204: 		return nil, qualificationDenialUnavailable("earlier effect is not known MODEL")
+205: 	}
+206: 	var ledgerRows int
+207: 	var ledgerRaw string
+208: 	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, route.ProjectID, run["id"]).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+209: 		return nil, qualificationDenialUnavailable("monetary history differs")
+210: 	}
+211: 	ledgerBody, err := Decode([]byte(ledgerRaw))
+212: 	if err != nil || ledgerBody["operation"] != "UNKNOWN" || ledgerBody["money"] != nil || ledgerBody["cost_basis"] != "UNKNOWN" || ledgerBody["provider_request_id"] != modelKey {
+213: 		return nil, qualificationDenialUnavailable("known MODEL has no original unknown-cost ledger")
+214: 	}
+215: 	cause := Fail(503, "RESOURCE_UNAVAILABLE", "qualification grants no unplanned effect authority")
+216: 	receipt := Object{
+217: 		"schema": "researchos.qualification-pre-effect-rejection.v1", "kind": onlineQualificationDenial,
+218: 		"project_id": route.ProjectID, "task_id": task["id"], "run_id": run["id"], "runtime_id": route.RuntimeID, "epoch": epoch,
+219: 		"dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "task_hash": qualificationTaskHash(task), "plan_hash": planHash,
+220: 		"profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"],
+221: 		"frame_sequence": frame.Sequence, "frame_type": frame.Type, "frame_capability": frame.Capability, "frame_route": frame.Route, "frame_key": frame.Key,
+222: 		"frame_hash": Hash(frame), "raw_payload_hash": Digest(frame.Payload), "payload_hash": Hash(payload),
+223: 		"stage": "BEFORE_PREPARE_EFFECT_TX", "outcome": "NO_EFFECT", "rule": "QUALIFICATION_MODEL_ONLY_V1",
+224: 		"observed_at": Now(), "first_cause": cause.Error(), "zero_stage_snapshot_hash": Hash(Object{"effect_rows": effects, "ledger_rows": ledger}),
+225: 	}
+226: 	if err = rt.PersistQualificationRejection(bridge.Directory(), Bytes(receipt)); err != nil {
+227: 		return nil, fmt.Errorf("qualification rejection persistence: %w", err)
+228: 	}
+229: 	return &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: cause}, nil
+230: }
+231: 
+232: func runtimeTechnicalHashMust(tx *sql.Tx, project, runtimeID string) string {
+233: 	runtime, err := load(tx, project, "RuntimeRegistration", runtimeID)
+234: 	if err != nil {
+235: 		return ""
+236: 	}
+237: 	return runtimeTechnicalHash(runtime)
+238: }
+239: 
+240: type verifiedQualificationFailure struct {
+241: 	subject     qualificationFailureSubject
+242: 	denial      *qualificationPreEffectRejection
+243: 	drain       qualificationBrokerDrain
+244: 	native      rt.QualificationNativeFacts
+245: 	observation Object
+246: 	run         Object
+247: 	task        Object
+248: 	dispatch    Object
+249: 	profileRef  Object
+250: 	ownerRoot   string
+251: }
+252: 
+253: type qualificationFailurePlan struct {
+254: 	core          Object
+255: 	proof         Object
+256: 	proofBytes    []byte
+257: 	proofArtifact Object
+258: 	link          Object
+259: 	run           Object
+260: 	state         Object
+261: 	event         Object
+262: 	observation   Object
+263: 	marker        Object
+264: 	uploadKey     string
+265: 	expiresAt     string
+266: 	observedAt    string
+267: 	sequence      int64
+268: 	dispatchSeq   int64
+269: 	author        Principal
+270: 	ownerRoot     string
+271: 	key           string
+272: 	requestHash   string
+273: }
+274: 
+275: func qualificationClosureKey(subject qualificationFailureSubject, digest string) string {
+276: 	return subject.run + "/" + strconv.FormatInt(subject.epoch, 10) + "/" + strings.TrimPrefix(digest, "sha256:")
+277: }
+278: 
+279: func cloneQualificationObject(source Object) (Object, error) { return Decode(Bytes(source)) }
+280: 
+281: func (c *RuntimeCoordinator) planQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, verified verifiedQualificationFailure) (qualificationFailurePlan, error) {
+282: 	var plan qualificationFailurePlan
+283: 	p, err := resourcePrincipal(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, "SCHEDULER")
+284: 	if err != nil {
+285: 		return plan, err
+286: 	}
+287: 	root, err := currentAuthorityRoot(tx, p.ID)
+288: 	if err != nil || root != verified.ownerRoot {
+289: 		return plan, qualificationDenialUnavailable("Host author root changed")
+290: 	}
+291: 	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, root)
+292: 	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(route.ProjectID, "", "", false) {
+293: 		return plan, qualificationDenialUnavailable("current Owner root unavailable")
+294: 	}
+295: 	state, err := singleton(tx, route.ProjectID, "ProjectState")
+296: 	if err != nil {
+297: 		return plan, err
+298: 	}
+299: 	stateCopy, err := cloneQualificationObject(state)
+300: 	if err != nil {
+301: 		return plan, err
+302: 	}
+303: 	runCopy, err := cloneQualificationObject(verified.run)
+304: 	if err != nil {
+305: 		return plan, err
+306: 	}
+307: 	observation, err := cloneQualificationObject(verified.observation)
+308: 	if err != nil {
+309: 		return plan, err
+310: 	}
+311: 	seq, err := Num(state, "event_sequence")
+312: 	if err != nil {
+313: 		return plan, err
+314: 	}
+315: 	var outboxSeq int64
+316: 	if err = tx.QueryRow(`SELECT coalesce(max(sequence),0) FROM outbox WHERE project=?`, route.ProjectID).Scan(&outboxSeq); err != nil {
+317: 		return plan, err
+318: 	}
+319: 	if outboxSeq > seq {
+320: 		seq = outboxSeq
+321: 	}
+322: 	if seq == 1<<63-1 {
+323: 		return plan, qualificationDenialUnavailable("event sequence exhausted")
+324: 	}
+325: 	seq++
+326: 	dispatchSeq, _ := Num(verified.dispatch, "observation_sequence")
+327: 	if verified.native.Journal.Sequence > dispatchSeq {
+328: 		dispatchSeq = verified.native.Journal.Sequence
+329: 	}
+330: 	if dispatchSeq == 1<<63-1 {
+331: 		return plan, qualificationDenialUnavailable("dispatch sequence exhausted")
+332: 	}
+333: 	dispatchSeq++
+334: 	observedAt := Now()
+335: 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+336: 	qf := observation["qualification_failure"].(map[string]any)
+337: 	qf["closure_observed_at"] = observedAt
+338: 	key := qualificationClosureKey(verified.subject, verified.denial.digest)
+339: 	uploadKey, artifactID, linkID, eventID, correlationID := ID(), ID(), ID(), ID(), ID()
+340: 	core := Object{"schema": "researchos.qualification-failure-plan-core.v1", "subject": Object{"project_id": route.ProjectID, "task_id": verified.subject.task, "run_id": verified.subject.run, "epoch": verified.subject.epoch}, "denial_digest": verified.denial.digest, "before_run_hash": Hash(verified.run), "before_state_hash": Hash(state), "before_dispatch_hash": Hash(verified.dispatch), "before_dispatch": verified.dispatch, "observation_hash": Hash(observation), "author": p.ID, "owner_root": root, "profile_ref": verified.profileRef, "upload_key": uploadKey, "artifact_id": artifactID, "impact_link_id": linkID, "event_id": eventID, "correlation_id": correlationID, "observed_at": observedAt, "expires_at": expiresAt, "event_sequence": seq, "dispatch_observation_sequence": dispatchSeq}
+341: 	proof := Object{"schema": "researchos.qualification-failure-proof.v1", "kind": onlineQualificationDenial, "plan_hash": Hash(core), "plan_core": core, "subject": core["subject"], "author": p.ID, "owner_root": root, "observed_at": observedAt, "rejection": verified.denial.receipt, "rejection_digest": verified.denial.digest, "model_effect_key": verified.native.Frames[1].Key, "model_route": verified.native.Frames[1].Route, "rejected_effect_key": verified.native.Frames[2].Key, "native": Object{"journal_hash": verified.native.RawJournalHash, "stdout_hash": verified.native.StdoutHash, "stderr_hash": verified.native.StderrHash, "ended": verified.native.Journal.Ended, "cancelled": verified.native.Journal.Cancelled, "timed_out": verified.native.Journal.Receipt.TimedOut, "exit_code": verified.native.Journal.Receipt.ExitCode, "frames": verified.native.Journal.Frames, "acknowledged": verified.native.Journal.Acknowledged}, "broker": Object{"accepted": verified.drain.accepted, "completed": verified.drain.completed, "pending": verified.drain.pending, "rejected_sequence": verified.drain.rejectedSeq, "frame_hashes": Object{"2": verified.drain.frameHashes[2], "3": verified.drain.frameHashes[3]}}, "derived_observation": observation, "limits": "specific Host first-gate TOOL dispatch only; no universal OS NO_EFFECT claim"}
+342: 	proofBytes := Bytes(proof)
+343: 	if len(proofBytes) == 0 || len(proofBytes) > 64*1024 {
+344: 		return plan, qualificationDenialUnavailable("bounded proof bytes unavailable")
+345: 	}
+346: 	artifact := Object{"id": artifactID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "media_type": "application/json", "content_hash": Digest(proofBytes), "storage_key": uploadKey, "byte_size": len(proofBytes), "input_refs": []any{verified.profileRef}, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": observedAt}
+347: 	link := Object{"id": linkID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "from_ref": Ref(artifact, "Artifact"), "to_ref": verified.profileRef, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty(), "status": "ACTIVE"}
+348: 	runRev, err := Num(runCopy, "revision")
+349: 	if err != nil || runRev == 1<<63-1 {
+350: 		return plan, qualificationDenialUnavailable("Run revision unavailable")
+351: 	}
+352: 	runCopy["revision"] = runRev + 1
+353: 	runCopy["updated_at"] = observedAt
+354: 	runCopy["status"] = "FAILED"
+355: 	runCopy["execution_report"] = "Host qualification first-gate TOOL denial; proof " + Digest(proofBytes) + "; native ended " + verified.native.Journal.Ended
+356: 	runCopy["exit_code"] = verified.native.Journal.Receipt.ExitCode
+357: 	runCopy["runtime_settled_at"] = observedAt
+358: 	runCopy["children_stopped"] = true
+359: 	runCopy["queue_empty"] = true
+360: 	runCopy["ended_at"] = observedAt
+361: 	stateRev, err := Num(stateCopy, "revision")
+362: 	if err != nil || stateRev == 1<<63-1 {
+363: 		return plan, qualificationDenialUnavailable("ProjectState revision unavailable")
+364: 	}
+365: 	stateCopy["revision"] = stateRev + 1
+366: 	stateCopy["updated_at"] = observedAt
+367: 	stateCopy["event_sequence"] = seq
+368: 	event := Object{"id": eventID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "sequence": seq, "event_type": "RUN_CHANGED", "aggregate_ref": Ref(runCopy, "Run"), "actor_id": p.ID, "correlation_id": correlationID, "causation_id": nil, "event_data_artifact_ref": nil}
+369: 	event["receipt_hash"] = Receipt(event)
+370: 	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": runCopy, "project_state": stateCopy, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": dispatchSeq, "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+371: 	requestHash := Digest(Bytes(Object{"core": core, "proof": proof}))
+372: 	marker := Object{"schema": "researchos.qualification-failure-closure.v1", "kind": onlineQualificationDenial, "key": key, "subject": core["subject"], "author": p.ID, "owner_root": root, "plan_hash": Hash(core), "plan_file_sha256": requestHash, "denial_digest": verified.denial.digest, "proof_ref": Ref(artifact, "Artifact"), "observation_hash": Hash(observation), "terminal_run_ref": Ref(runCopy, "Run"), "outcome_hash": outcomeHash}
+373: 	plan = qualificationFailurePlan{core: core, proof: proof, proofBytes: proofBytes, proofArtifact: artifact, link: link, run: runCopy, state: stateCopy, event: event, observation: observation, marker: marker, uploadKey: uploadKey, expiresAt: expiresAt, observedAt: observedAt, sequence: seq, dispatchSeq: dispatchSeq, author: p, ownerRoot: root, key: key, requestHash: requestHash}
+374: 	return plan, nil
+375: }
+376: 
+377: func (c *RuntimeCoordinator) verifyOnlineQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, runID string, epoch int64, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain, native rt.QualificationNativeFacts) (verifiedQualificationFailure, error) {
+378: 	var proof verifiedQualificationFailure
+379: 	bad := func(reason string) (verifiedQualificationFailure, error) {
+380: 		return proof, qualificationDenialUnavailable(reason)
+381: 	}
+382: 	if denial == nil || denial.digest == "" || denial.receipt == nil || denial.receipt["kind"] != onlineQualificationDenial || Hash(denial.receipt) != denial.digest || !drain.closed || drain.disqualified || drain.pending != 0 || drain.accepted != drain.completed || drain.rejectedSeq != 3 || drain.accepted != 2 || len(drain.frameHashes) != 2 || len(drain.completionSet) != 2 {
+383: 		return bad("private rejection or broker drain incomplete")
+384: 	}
+385: 	if drain.frameHashes[2] == "" || drain.frameHashes[3] == "" || drain.completionSet[2] == "" || drain.completionSet[3] == "" {
+386: 		return bad("broker completion census incomplete")
+387: 	}
+388: 	decoded, err := Decode(native.Rejection)
+389: 	if err != nil || Hash(decoded) != denial.digest || string(Bytes(decoded)) != string(Bytes(denial.receipt)) {
+390: 		return bad("immutable rejection differs")
+391: 	}
+392: 	j := native.Journal
+393: 	if len(native.Frames) != 3 || len(native.FrameHashes) != 3 || j.Frames != 3 || j.Acknowledged != 2 || !j.Cancelled || j.QueueRequired || j.QueueInitSequence != 0 || len(j.CommandReceipts) != 0 || j.Checkpoint != nil || j.CheckpointSequence != 0 || j.Paused || j.ProtocolComplete || native.AuxAfterThird || (j.State != "FAILED" && j.State != "UNKNOWN") || j.Reason != "qualification first dispatch gate denied TOOL" {
+394: 		return bad("raw native frame or cancellation closure differs")
+395: 	}
+396: 	f1, f2, f3 := native.Frames[0], native.Frames[1], native.Frames[2]
+397: 	if f1.Sequence != 1 || f1.Type != "context.ready" || f2.Sequence != 2 || f2.Type != "effect.request" || f2.Capability != "MODEL" || f3.Sequence != 3 || f3.Type != "effect.request" || f3.Capability != "TOOL" || f2.Key == "" || f3.Key == "" || f2.Key == f3.Key || Hash(f2) != drain.frameHashes[2] || Hash(f3) != drain.frameHashes[3] || Hash(f3) != denial.receipt["frame_hash"] || Digest(f3.Payload) != denial.receipt["raw_payload_hash"] {
+398: 		return bad("exact three-frame lineage differs")
+399: 	}
+400: 	if native.StdoutHash != j.StdoutHash || native.StderrHash != j.StderrHash || !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
+401: 		return bad("native source closure incomplete")
+402: 	}
+403: 	run, err := load(tx, route.ProjectID, "Run", runID)
+404: 	if err != nil {
+405: 		return proof, err
+406: 	}
+407: 	task, err := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+408: 	if err != nil {
+409: 		return proof, err
+410: 	}
+411: 	dispatch, err := runtimeDispatch(tx, route.ProjectID, runID, epoch)
+412: 	if err != nil {
+413: 		return proof, err
+414: 	}
+415: 	manifest := dispatch["manifest"].(map[string]any)
+416: 	admission := manifest["admission"].(map[string]any)
+417: 	profile := admission["profile"].(map[string]any)
+418: 	modelConfig, configOK := profile["model_config"].(map[string]any)
+419: 	if !configOK || runTerminal(run) || run["status"] != "RUNNING" || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID || Hash(run["lease_epoch"]) != Hash(epoch) || dispatch["state"] != "STARTED" || dispatch["journal_locator"] != dispatch["dispatch_key"] || j.DispatchKey != dispatch["dispatch_key"] || j.ManifestHash != dispatch["manifest_hash"] || j.Worker != dispatch["worker"] || Hash(runtimeNativeIdentity(j.Identity)) != Hash(dispatch["identity"]) || admission["qualification_bootstrap"] != true || admission["mode"] != "LIVE" || Hash(admission["profile_ref"]) != admission["profile_hash"] || f2.Route != Str(modelConfig, "route") || f3.Route != f2.Route || run["checkpoint_artifact_id"] != nil {
+420: 		return bad("current qualification subject differs")
+421: 	}
+422: 	plan, planHash, root, err := qualificationPlan(tx, route.ProjectID, Str(task, "id"), route.RuntimeID)
+423: 	if err != nil {
+424: 		return proof, err
+425: 	}
+426: 	var markerCount int
+427: 	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND profile_hash=? AND owner_root=?`, route.ProjectID, task["id"], runID, route.RuntimeID, epoch, planHash, admission["profile_hash"], root).Scan(&markerCount); err != nil || markerCount != 1 || plan["task_hash"] != qualificationTaskHash(task) || Hash(plan["profile_ref"]) != admission["profile_hash"] || denial.receipt["plan_hash"] != planHash {
+428: 		return bad("qualification marker changed")
+429: 	}
+430: 	for field, actual := range map[string]any{"project_id": route.ProjectID, "task_id": task["id"], "run_id": runID, "runtime_id": route.RuntimeID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"], "frame_key": f3.Key, "frame_route": f3.Route} {
+431: 		if Hash(denial.receipt[field]) != Hash(actual) {
+432: 			return bad("rejection subject changed: " + field)
+433: 		}
+434: 	}
+435: 	var queueCount int
+436: 	if err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=?`, route.ProjectID, runID).Scan(&queueCount); err != nil || queueCount != 0 {
+437: 		return bad("qualification has client queue state")
+438: 	}
+439: 	var effects, rejected, unknown int
+440: 	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END),sum(CASE WHEN json_extract(body,'$.state') IN ('UNKNOWN','NOT_APPLIED') THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, f3.Key, route.ProjectID, runID).Scan(&effects, &rejected, &unknown); err != nil || effects != 1 || rejected != 0 || unknown != 0 {
+441: 		return bad("effect history differs from sole confirmed MODEL")
+442: 	}
+443: 	effect, err := latestEffect(tx, route.ProjectID, runID, f2.Key)
+444: 	if err != nil {
+445: 		return proof, err
+446: 	}
+447: 	request, _ := effect["payload"].(map[string]any)
+448: 	modelPayload, payloadErr := Decode(f2.Payload)
+449: 	if payloadErr != nil || effect["state"] != "CONFIRMED" || request["capability"] != "MODEL" || request["route"] != f2.Route || Hash(request["payload"]) != Hash(modelPayload) || effect["receipt"] == nil || effect["key"] != f2.Key || effect["epoch"] != nil && Hash(effect["epoch"]) != Hash(epoch) {
+450: 		return bad("MODEL effect receipt or request differs")
+451: 	}
+452: 	var ledgerRows int
+453: 	var ledgerRaw string
+454: 	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, route.ProjectID, runID).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+455: 		return bad("monetary ledger census differs")
+456: 	}
+457: 	ledger, err := Decode([]byte(ledgerRaw))
+458: 	if err != nil || ledger["provider_request_id"] != f2.Key || ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["cost_basis"] != "UNKNOWN" {
+459: 		return bad("original MODEL unknown cost changed")
+460: 	}
+461: 	rawObservation, err := j.Observation()
+462: 	if err != nil {
+463: 		return proof, err
+464: 	}
+465: 	observation := Object(rawObservation)
+466: 	observation["state"] = "FAILED"
+467: 	observation["queue_empty"] = true
+468: 	observation["protocol"] = Object{"settled": false, "frames": int64(3), "acknowledged": int64(2), "verified_rejected": int64(1)}
+469: 	observation["qualification_failure"] = Object{"kind": onlineQualificationDenial, "denial_digest": denial.digest, "raw_bridge_hash": native.RawJournalHash, "raw_stdout_hash": native.StdoutHash, "raw_stderr_hash": native.StderrHash, "frame_hashes": []any{Hash(f1), Hash(f2), Hash(f3)}, "broker_accepted": drain.accepted, "broker_completed": drain.completed, "broker_pending": drain.pending, "original_cause": denial.receipt["first_cause"], "raw_cancelled": j.Cancelled, "raw_timed_out": j.Receipt.TimedOut, "raw_exit_code": j.Receipt.ExitCode, "native_ended": j.Ended, "closure_observed_at": Now()}
+470: 	profileRef, refOK := admission["profile_ref"].(map[string]any)
+471: 	if !refOK {
+472: 		return bad("profile reference missing")
+473: 	}
+474: 	proof = verifiedQualificationFailure{subject: qualificationFailureSubject{project: route.ProjectID, task: Str(task, "id"), run: runID, epoch: epoch}, denial: denial, drain: drain, native: native, observation: observation, run: run, task: task, dispatch: dispatch, profileRef: Object(profileRef), ownerRoot: root}
+475: 	return proof, nil
+476: }
+477: 
+478: func (c *RuntimeCoordinator) closeOnlineQualificationFailure(ctx context.Context, route RuntimeCoordinatorRoute, runID string, epoch int64, locator string, bridge *rt.Bridge, denial *qualificationPreEffectRejection, drain qualificationBrokerDrain) error {
+479: 	if denial == nil || bridge == nil || locator == "" || !strings.EqualFold(filepath.Clean(bridge.Directory()), filepath.Clean(filepath.Join(c.config.DataRoot, "runtime-dispatches", locator))) {
+480: 		return qualificationDenialUnavailable("native dispatch directory differs")
+481: 	}
+482: 	native, err := rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+483: 	if err != nil {
+484: 		return err
+485: 	}
+486: 	decodedRejection, decodeErr := Decode(native.Rejection)
+487: 	if decodeErr != nil || Hash(decodedRejection) != denial.digest || string(Bytes(decodedRejection)) != string(Bytes(denial.receipt)) {
+488: 		return qualificationDenialUnavailable("immutable rejection differs on replay")
+489: 	}
+490: 	// A repeated request can observe the already committed terminal marker.
+491: 	// The private consumer, not the caller's denial flag, proves that replay.
+492: 	replayTx, err := c.service.DB.BeginTx(ctx, nil)
+493: 	if err != nil {
+494: 		return err
+495: 	}
+496: 	priorClosure, priorErr := c.service.validatedQualificationFailureTx(replayTx, route.ProjectID, Str(denial.receipt, "task_id"), runID, epoch)
+497: 	if priorErr == nil && priorClosure.subject() == (qualificationFailureSubject{project: route.ProjectID, task: Str(denial.receipt, "task_id"), run: runID, epoch: epoch}) {
+498: 		key := qualificationClosureKey(priorClosure.subject(), denial.digest)
+499: 		var priorRaw string
+500: 		if readErr := replayTx.QueryRow(`SELECT body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND key=?`, route.ProjectID, key).Scan(&priorRaw); readErr == nil {
+501: 			marker, markerErr := Decode([]byte(priorRaw))
+502: 			if markerErr == nil && marker["denial_digest"] == denial.digest && Hash(marker["proof_ref"]) == Hash(priorClosure.proofRef()) {
+503: 				replayTx.Rollback()
+504: 				return nil
+505: 			}
+506: 		}
+507: 	}
+508: 	replayTx.Rollback()
+509: 	preflight, err := c.service.DB.BeginTx(ctx, nil)
+510: 	if err != nil {
+511: 		return err
+512: 	}
+513: 	if err = resourceWriteLock(preflight); err != nil {
+514: 		preflight.Rollback()
+515: 		return err
+516: 	}
+517: 	verified, err := c.verifyOnlineQualificationFailureTx(preflight, route, runID, epoch, denial, drain, native)
+518: 	if err != nil {
+519: 		preflight.Rollback()
+520: 		return err
+521: 	}
+522: 	plan, err := c.planQualificationFailureTx(preflight, route, verified)
+523: 	preflight.Rollback()
+524: 	if err != nil {
+525: 		return err
+526: 	}
+527: 	c.boundary("qualification_plan_frozen", plan.core)
+528: 	// Re-read the immutable native files after planning. No in-memory journal or
+529: 	// caller-supplied flag can stand in for the source bytes at the write gate.
+530: 	native, err = rt.ReadQualificationNativeFacts(bridge.Directory(), Str(denial.receipt, "manifest_hash"))
+531: 	if err != nil {
+532: 		return err
+533: 	}
+534: 	tx, err := c.service.DB.BeginTx(ctx, nil)
+535: 	if err != nil {
+536: 		return err
+537: 	}
+538: 	defer tx.Rollback()
+539: 	if err = resourceWriteLock(tx); err != nil {
+540: 		return err
+541: 	}
+542: 	var priorRaw string
+543: 	prior := tx.QueryRow(`SELECT body FROM idempotency WHERE principal=? AND project=? AND operation='host:qualification-failure-closure' AND key=?`, plan.author.ID, route.ProjectID, plan.key).Scan(&priorRaw)
+544: 	if prior == nil {
+545: 		closure, checkErr := c.service.validatedQualificationFailureTx(tx, route.ProjectID, verified.subject.task, runID, epoch)
+546: 		if checkErr == nil && Hash(closure.proofRef()) == Hash(plan.marker["proof_ref"]) {
+547: 			return nil
+548: 		}
+549: 		return qualificationDenialUnavailable("conflicting completed closure marker")
+550: 	}
+551: 	if prior != sql.ErrNoRows {
+552: 		return prior
+553: 	}
+554: 	current, err := c.verifyOnlineQualificationFailureTx(tx, route, runID, epoch, denial, drain, native)
+555: 	if err != nil {
+556: 		return err
+557: 	}
+558: 	qf := current.observation["qualification_failure"].(map[string]any)
+559: 	qf["closure_observed_at"] = plan.observedAt
+560: 	if Hash(current.run) != plan.core["before_run_hash"] || Hash(current.dispatch) != plan.core["before_dispatch_hash"] || Hash(current.observation) != Hash(plan.observation) || Hash(current.profileRef) != Hash(verified.profileRef) || current.ownerRoot != plan.ownerRoot {
+561: 		return qualificationDenialUnavailable("planned qualification facts changed")
+562: 	}
+563: 	state, err := singleton(tx, route.ProjectID, "ProjectState")
+564: 	if err != nil || Hash(state) != plan.core["before_state_hash"] {
+565: 		return qualificationDenialUnavailable("ProjectState changed before closure")
+566: 	}
+567: 	if err = c.service.applyQualificationFailureTx(tx, current, plan); err != nil {
+568: 		return err
+569: 	}
+570: 	if err = tx.Commit(); err != nil {
+571: 		return err
+572: 	}
+573: 	return nil
+574: }
+575: 
+576: func (s *Service) applyQualificationFailureTx(tx *sql.Tx, verified verifiedQualificationFailure, plan qualificationFailurePlan) error {
+577: 	project := verified.subject.project
+578: 	decodedProof, decodeErr := Decode(plan.proofBytes)
+579: 	if decodeErr != nil || verified.denial == nil || plan.author.ID == "" || plan.key != qualificationClosureKey(verified.subject, verified.denial.digest) || plan.marker["kind"] != onlineQualificationDenial || Hash(plan.proof) != Hash(decodedProof) || Digest(plan.proofBytes) != plan.proofArtifact["content_hash"] || Hash(plan.core) != plan.proof["plan_hash"] || plan.requestHash != Digest(Bytes(Object{"core": plan.core, "proof": plan.proof})) {
+580: 		return qualificationDenialUnavailable("frozen closure plan invalid")
+581: 	}
+582: 	p, err := clientAuthenticatedPrincipal(context.Background(), tx, plan.author.ID)
+583: 	if err != nil || !p.HasRole("SCHEDULER") || !p.Allowed(project, "", "", false) {
+584: 		return qualificationDenialUnavailable("Host scheduler no longer authenticated")
+585: 	}
+586: 	root, err := currentAuthorityRoot(tx, p.ID)
+587: 	if err != nil || root != verified.ownerRoot || root != plan.ownerRoot {
+588: 		return qualificationDenialUnavailable("Host Owner-root binding changed")
+589: 	}
+590: 	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, root)
+591: 	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(project, "", "", false) {
+592: 		return qualificationDenialUnavailable("Owner root revoked")
+593: 	}
+594: 	ref, err := version(tx, project, verified.profileRef)
+595: 	if err != nil || ref["access_class"] != "PROJECT" || ref["validity"] != "CURRENT" || ref["sealed_at"] == nil || s.effective(tx, project, verified.profileRef) != nil {
+596: 		return qualificationDenialUnavailable("profile input no longer effective")
+597: 	}
+598: 	if len(plan.proofBytes) == 0 || len(plan.proofBytes) > 64*1024 || plan.proofArtifact["run_id"] != nil || plan.proofArtifact["produced_by"] != p.ID || plan.proofArtifact["input_refs"] == nil {
+599: 		return qualificationDenialUnavailable("proof artifact source invalid")
+600: 	}
+601: 	var reused int
+602: 	if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.content_hash')=?`, project, plan.proofArtifact["content_hash"]).Scan(&reused); err != nil || reused != 0 {
+603: 		return qualificationDenialUnavailable("proof content already has an Artifact")
+604: 	}
+605: 	expires, err := time.Parse(time.RFC3339Nano, plan.expiresAt)
+606: 	if err != nil || !expires.After(time.Now()) {
+607: 		return qualificationDenialUnavailable("planned upload expired")
+608: 	}
+609: 	if _, err = tx.Exec(`INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,?,?,?,?,?,0)`, plan.uploadKey, project, p.ID, plan.proofBytes, Digest(plan.proofBytes), plan.expiresAt); err != nil {
+610: 		return err
+611: 	}
+612: 	if err = s.put(tx, "Artifact", plan.proofArtifact); err != nil {
+613: 		return err
+614: 	}
+615: 	if _, err = tx.Exec(`UPDATE uploaded_content SET sealed=1 WHERE storage_key=? AND project=? AND principal=? AND sealed=0`, plan.uploadKey, project, p.ID); err != nil {
+616: 		return err
+617: 	}
+618: 	if err = s.put(tx, "ImpactLink", plan.link); err != nil {
+619: 		return err
+620: 	}
+621: 	if _, err = tx.Exec(`INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)`, project, verified.subject.run, verified.subject.epoch, Hash(plan.observation), string(Bytes(plan.observation)), plan.observedAt); err != nil {
+622: 		return err
+623: 	}
+624: 	result, err := tx.Exec(`UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,reason=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state='STARTED' AND observation_sequence=? AND dispatch_key=? AND manifest_hash=?`, plan.dispatchSeq, Hash(plan.observation), "qualification first-gate denial "+verified.denial.digest, plan.observedAt, project, verified.subject.run, verified.subject.epoch, verified.dispatch["observation_sequence"], verified.dispatch["dispatch_key"], verified.dispatch["manifest_hash"])
+625: 	if err != nil {
+626: 		return err
+627: 	}
+628: 	if rows, rowErr := result.RowsAffected(); rowErr != nil || rows != 1 {
+629: 		return qualificationDenialUnavailable("dispatch terminal CAS failed")
+630: 	}
+631: 	if err = s.put(tx, "Run", plan.run); err != nil {
+632: 		return err
+633: 	}
+634: 	if err = s.put(tx, "ProjectState", plan.state); err != nil {
+635: 		return err
+636: 	}
+637: 	if err = s.put(tx, "EventEnvelope", plan.event); err != nil {
+638: 		return err
+639: 	}
+640: 	if _, err = tx.Exec(`INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)`, project, plan.sequence, plan.event["id"], string(Bytes(plan.event))); err != nil {
+641: 		return err
+642: 	}
+643: 	if _, err = tx.Exec(`INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)`, project, plan.event["id"], plan.state["revision"], string(Bytes(plan.state))); err != nil {
+644: 		return err
+645: 	}
+646: 	if _, err = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-failure-closure',?,?,200,?,'{}',?)`, p.ID, project, plan.key, plan.requestHash, string(Bytes(plan.marker)), plan.observedAt); err != nil {
+647: 		return err
+648: 	}
+649: 	return nil
+650: }
+651: 
+652: type qualificationFailureSubject struct {
+653: 	project string
+654: 	task    string
+655: 	run     string
+656: 	epoch   int64
+657: }
+658: 
+659: type qualificationFailureClosure struct {
+660: 	subjectValue qualificationFailureSubject
+661: 	proofValue   Object
+662: 	seal         string
+663: }
+664: 
+665: func (c qualificationFailureClosure) proofRef() Object                     { return c.proofValue }
+666: func (c qualificationFailureClosure) subject() qualificationFailureSubject { return c.subjectValue }
+667: 
+668: func (s *Service) validatedQualificationFailureTx(tx *sql.Tx, project, taskID, runID string, epoch int64) (qualificationFailureClosure, error) {
+669: 	var zero qualificationFailureClosure
+670: 	unavailable := func() (qualificationFailureClosure, error) {
+671: 		return zero, errors.New("QUALIFICATION_FAILURE_PROOF_UNAVAILABLE")
+672: 	}
+673: 	if tx == nil || project == "" || taskID == "" || runID == "" || epoch < 1 {
+674: 		return unavailable()
+675: 	}
+676: 	rows, err := tx.Query(`SELECT principal,key,request_hash,body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND json_extract(body,'$.subject.task_id')=? AND json_extract(body,'$.subject.run_id')=? AND json_extract(body,'$.subject.epoch')=?`, project, taskID, runID, epoch)
+677: 	if err != nil {
+678: 		return zero, err
+679: 	}
+680: 	type stored struct{ author, key, requestHash, raw string }
+681: 	var markers []stored
+682: 	for rows.Next() {
+683: 		var current stored
+684: 		if err = rows.Scan(&current.author, &current.key, &current.requestHash, &current.raw); err != nil {
+685: 			rows.Close()
+686: 			return zero, err
+687: 		}
+688: 		markers = append(markers, current)
+689: 	}
+690: 	err = rows.Err()
+691: 	rows.Close()
+692: 	if err != nil {
+693: 		return zero, err
+694: 	}
+695: 	if len(markers) != 1 {
+696: 		return unavailable()
+697: 	}
+698: 	storedMarker := markers[0]
+699: 	marker, err := Decode([]byte(storedMarker.raw))
+700: 	if err != nil || marker["schema"] != "researchos.qualification-failure-closure.v1" || marker["kind"] != onlineQualificationDenial || marker["author"] != storedMarker.author || marker["key"] != storedMarker.key || marker["plan_file_sha256"] != storedMarker.requestHash || Str(marker, "denial_digest") == "" {
+701: 		return unavailable()
+702: 	}
+703: 	subject, ok := marker["subject"].(map[string]any)
+704: 	if !ok || subject["project_id"] != project || subject["task_id"] != taskID || subject["run_id"] != runID || Hash(subject["epoch"]) != Hash(epoch) || storedMarker.key != qualificationClosureKey(qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, Str(marker, "denial_digest")) {
+705: 		return unavailable()
+706: 	}
+707: 	principal, err := clientAuthenticatedPrincipal(context.Background(), tx, storedMarker.author)
+708: 	if err != nil || !principal.HasRole("SCHEDULER") || !principal.Allowed(project, "", "", false) {
+709: 		return unavailable()
+710: 	}
+711: 	ownerRoot, err := currentAuthorityRoot(tx, principal.ID)
+712: 	if err != nil || ownerRoot == "" || marker["owner_root"] != ownerRoot {
+713: 		return unavailable()
+714: 	}
+715: 	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, ownerRoot)
+716: 	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(project, "", "", false) {
+717: 		return unavailable()
+718: 	}
+719: 	run, err := load(tx, project, "Run", runID)
+720: 	if err != nil || run["status"] != "FAILED" || run["task_id"] != taskID || Hash(run["lease_epoch"]) != Hash(epoch) || run["children_stopped"] != true || run["queue_empty"] != true || Hash(Ref(run, "Run")) != Hash(marker["terminal_run_ref"]) {
+721: 		return unavailable()
+722: 	}
+723: 	task, err := load(tx, project, "Task", taskID)
+724: 	if err != nil || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID {
+725: 		return unavailable()
+726: 	}
+727: 	plan, planHash, planRoot, err := qualificationPlan(tx, project, taskID, Str(run, "runtime_id"))
+728: 	if err != nil || planRoot != ownerRoot || plan["task_hash"] != qualificationTaskHash(task) {
+729: 		return unavailable()
+730: 	}
+731: 	var markerCount int
+732: 	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND owner_root=?`, project, taskID, runID, run["runtime_id"], epoch, planHash, ownerRoot).Scan(&markerCount); err != nil || markerCount != 1 {
+733: 		return unavailable()
+734: 	}
+735: 	ref, ok := marker["proof_ref"].(map[string]any)
+736: 	if !ok || ref["entity_type"] != "Artifact" {
+737: 		return unavailable()
+738: 	}
+739: 	artifact, err := version(tx, project, ref)
+740: 	if err != nil || artifact["kind"] != "MANIFEST" || artifact["evidence_kind"] != "GENERATED" || artifact["measurement_mode"] != "LIVE" || artifact["run_id"] != nil || artifact["access_class"] != "PROJECT" || artifact["produced_by"] != principal.ID || artifact["sealed_at"] == nil || artifact["validity"] != "CURRENT" || artifact["media_type"] != "application/json" || Hash(Ref(artifact, "Artifact")) != Hash(ref) || len(Arr(artifact, "input_refs")) != 1 || Hash(Arr(artifact, "input_refs")[0]) != Hash(plan["profile_ref"]) || len(Arr(artifact, "source_refs")) != 0 {
+741: 		return unavailable()
+742: 	}
+743: 	profileRef, profileOK := plan["profile_ref"].(map[string]any)
+744: 	if !profileOK || s.effective(tx, project, Object(profileRef)) != nil {
+745: 		return unavailable()
+746: 	}
+747: 	var raw []byte
+748: 	var uploadHash, uploadPrincipal string
+749: 	var sealed int
+750: 	if err = tx.QueryRow(`SELECT bytes,content_hash,principal,sealed FROM uploaded_content WHERE project=? AND storage_key=?`, project, artifact["storage_key"]).Scan(&raw, &uploadHash, &uploadPrincipal, &sealed); err != nil || sealed != 1 || uploadPrincipal != principal.ID || uploadHash != Digest(raw) || artifact["content_hash"] != uploadHash || Hash(artifact["byte_size"]) != Hash(len(raw)) || len(raw) == 0 || len(raw) > 64*1024 {
+751: 		return unavailable()
+752: 	}
+753: 	proof, err := Decode(raw)
+754: 	if err != nil || proof["schema"] != "researchos.qualification-failure-proof.v1" || proof["kind"] != onlineQualificationDenial || proof["author"] != principal.ID || proof["owner_root"] != ownerRoot || Hash(proof["subject"]) != Hash(subject) || proof["rejection_digest"] != marker["denial_digest"] {
+755: 		return unavailable()
+756: 	}
+757: 	core, ok := proof["plan_core"].(map[string]any)
+758: 	if !ok || Hash(core) != proof["plan_hash"] || proof["plan_hash"] != marker["plan_hash"] || marker["plan_file_sha256"] != Digest(Bytes(Object{"core": core, "proof": proof})) || core["author"] != principal.ID || core["owner_root"] != ownerRoot || Hash(core["subject"]) != Hash(subject) || core["upload_key"] != artifact["storage_key"] || core["artifact_id"] != artifact["id"] || core["before_dispatch_hash"] != Hash(core["before_dispatch"]) || core["observation_hash"] != marker["observation_hash"] || core["observed_at"] != proof["observed_at"] || run["runtime_settled_at"] != core["observed_at"] || run["ended_at"] != core["observed_at"] {
+759: 		return unavailable()
+760: 	}
+761: 	rejection, ok := proof["rejection"].(map[string]any)
+762: 	if !ok || rejection["schema"] != "researchos.qualification-pre-effect-rejection.v1" || rejection["kind"] != onlineQualificationDenial || rejection["stage"] != "BEFORE_PREPARE_EFFECT_TX" || rejection["outcome"] != "NO_EFFECT" || rejection["rule"] != "QUALIFICATION_MODEL_ONLY_V1" || Hash(rejection) != marker["denial_digest"] || rejection["frame_key"] != proof["rejected_effect_key"] || rejection["frame_route"] != proof["model_route"] || rejection["frame_sequence"] == nil || Hash(rejection["frame_sequence"]) != Hash(3) || rejection["plan_hash"] != planHash || rejection["project_id"] != project || rejection["task_id"] != taskID || rejection["run_id"] != runID || Hash(rejection["epoch"]) != Hash(epoch) {
+763: 		return unavailable()
+764: 	}
+765: 	observation, ok := proof["derived_observation"].(map[string]any)
+766: 	protocol, protocolOK := observation["protocol"].(map[string]any)
+767: 	qf, qfOK := observation["qualification_failure"].(map[string]any)
+768: 	if !ok || !protocolOK || !qfOK || observation["state"] != "FAILED" || observation["queue_empty"] != true || observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Hash(protocol["frames"]) != Hash(3) || Hash(protocol["acknowledged"]) != Hash(2) || Hash(protocol["verified_rejected"]) != Hash(1) || qf["denial_digest"] != marker["denial_digest"] || qf["raw_stdout_hash"] == "" || qf["raw_bridge_hash"] == "" || Hash(observation) != marker["observation_hash"] || Hash(run["exit_code"]) != Hash(observation["exit_code"]) {
+769: 		return unavailable()
+770: 	}
+771: 	native, nativeOK := proof["native"].(map[string]any)
+772: 	broker, brokerOK := proof["broker"].(map[string]any)
+773: 	if !nativeOK || !brokerOK || native["journal_hash"] != qf["raw_bridge_hash"] || native["stdout_hash"] != qf["raw_stdout_hash"] || native["stderr_hash"] != qf["raw_stderr_hash"] || native["ended"] != qf["native_ended"] || Hash(native["exit_code"]) != Hash(run["exit_code"]) || Hash(native["frames"]) != Hash(3) || Hash(native["acknowledged"]) != Hash(2) || native["cancelled"] != true || Hash(broker["accepted"]) != Hash(2) || Hash(broker["completed"]) != Hash(2) || Hash(broker["pending"]) != Hash(0) || Hash(broker["rejected_sequence"]) != Hash(3) {
+774: 		return unavailable()
+775: 	}
+776: 	var observedRaw string
+777: 	if err = tx.QueryRow(`SELECT body FROM runtime_observations WHERE project=? AND run=? AND epoch=? AND receipt_hash=?`, project, runID, epoch, marker["observation_hash"]).Scan(&observedRaw); err != nil || observedRaw != string(Bytes(observation)) {
+778: 		return unavailable()
+779: 	}
+780: 	dispatch, err := runtimeDispatch(tx, project, runID, epoch)
+781: 	if err != nil || dispatch["state"] != "OBSERVED" || dispatch["observation_hash"] != marker["observation_hash"] || Hash(dispatch["observation_sequence"]) != Hash(core["dispatch_observation_sequence"]) || dispatch["manifest_hash"] != rejection["manifest_hash"] || dispatch["dispatch_key"] != rejection["dispatch_key"] {
+782: 		return unavailable()
+783: 	}
+784: 	beforeDispatch, _ := core["before_dispatch"].(map[string]any)
+785: 	if beforeDispatch == nil || beforeDispatch["dispatch_key"] != dispatch["dispatch_key"] || beforeDispatch["manifest_hash"] != dispatch["manifest_hash"] || Hash(beforeDispatch["manifest"]) != Hash(dispatch["manifest"]) || beforeDispatch["worker"] != dispatch["worker"] || Hash(beforeDispatch["identity"]) != Hash(dispatch["identity"]) {
+786: 		return unavailable()
+787: 	}
+788: 	var effectCount, rejectCount int
+789: 	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, proof["rejected_effect_key"], project, runID).Scan(&effectCount, &rejectCount); err != nil || effectCount != 1 || rejectCount != 0 {
+790: 		return unavailable()
+791: 	}
+792: 	model, err := latestEffect(tx, project, runID, Str(proof, "model_effect_key"))
+793: 	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+794: 		return unavailable()
+795: 	}
+796: 	var ledgerRaw string
+797: 	var ledgerCount int
+798: 	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, project, runID).Scan(&ledgerCount, &ledgerRaw); err != nil || ledgerCount != 1 {
+799: 		return unavailable()
+800: 	}
+801: 	ledger, err := Decode([]byte(ledgerRaw))
+802: 	if err != nil || ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["provider_request_id"] != proof["model_effect_key"] {
+803: 		return unavailable()
+804: 	}
+805: 	link, err := load(tx, project, "ImpactLink", Str(core, "impact_link_id"))
+806: 	event, eventErr := load(tx, project, "EventEnvelope", Str(core, "event_id"))
+807: 	var snapshotRaw, outboxRaw string
+808: 	if err != nil || eventErr != nil || link["relation"] != "DERIVED_FROM" || Hash(link["from_ref"]) != Hash(ref) || Hash(link["to_ref"]) != Hash(plan["profile_ref"]) || event["event_type"] != "RUN_CHANGED" || event["actor_id"] != principal.ID || event["correlation_id"] != core["correlation_id"] || Hash(event["aggregate_ref"]) != Hash(Ref(run, "Run")) || tx.QueryRow(`SELECT body FROM event_state_snapshots WHERE project=? AND event_id=?`, project, event["id"]).Scan(&snapshotRaw) != nil || tx.QueryRow(`SELECT body FROM outbox WHERE project=? AND sequence=? AND id=?`, project, core["event_sequence"], event["id"]).Scan(&outboxRaw) != nil || outboxRaw != string(Bytes(event)) {
+809: 		return unavailable()
+810: 	}
+811: 	state, err := Decode([]byte(snapshotRaw))
+812: 	if err != nil || Hash(state["event_sequence"]) != Hash(core["event_sequence"]) {
+813: 		return unavailable()
+814: 	}
+815: 	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": run, "project_state": state, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": core["dispatch_observation_sequence"], "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+816: 	if outcomeHash != marker["outcome_hash"] {
+817: 		return unavailable()
+818: 	}
+819: 	return qualificationFailureClosure{subjectValue: qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, proofValue: Object(ref), seal: Hash(marker)}, nil
+820: }

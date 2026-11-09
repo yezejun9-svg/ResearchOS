@@ -1,0 +1,598 @@
+internal/host\backup_windows.go:17:func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+internal/host\backup_other.go:12:func (h *Host) SnapshotWorkspace(context.Context, domain.WorkspaceBinding, string, domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+internal/host\host.go:107:func New(cfg Config) (*Host, error) {
+
+SOURCE internal/host/host.go
+107: func New(cfg Config) (*Host, error) {
+108: 	if cfg.DB == nil || cfg.Dir == "" || cfg.ContractsDir == "" || cfg.MigrationFile == "" || cfg.SchemaDir == "" {
+109: 		return nil, fmt.Errorf("%w: db, dir, contracts, migration and schema are required", ErrBadState)
+110: 	}
+111: 	if cfg.ReadOnlyModelVaultDir != "" {
+112: 		if cfg.ReadOnlyModelCredentialRef == "" || cfg.ReadOnlyModelProvider == "" ||
+113: 			filepath.Base(cfg.Dir) != "host" ||
+114:             ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+115: 			return nil, ErrUnknownCredential
+116: 		}
+117: 	} else if cfg.ReadOnlyModelCredentialRef != "" || cfg.ReadOnlyModelProvider != "" {
+118: 		return nil, ErrUnknownCredential
+119: 	}
+120: 	ttl := cfg.SessionTTL
+121: 	if ttl <= 0 || ttl > MaxSessionTTL {
+122: 		ttl = DefaultSessionTTL
+123: 	}
+124: 	now := cfg.Now
+125: 	if now == nil {
+126: 		now = func() time.Time { return time.Now().UTC() }
+127: 	}
+128: 	id, err := auth.Current()
+129: 	if err != nil {
+130: 		return nil, err
+131: 	}
+132: 	if !verifiableKind(id.Kind) {
+133: 		return nil, fmt.Errorf("%w: host identity kind %s is not a verifiable local principal", ErrHostIdentity, id.Kind)
+134: 	}
+135: 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+136: 		return nil, err
+137: 	}
+138: 	if cfg.ReadOnlyModelVaultDir != "" &&
+139: 		ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+140: 		return nil, ErrUnknownCredential
+141: 	}
+142: 	if err := privateDir(cfg.Dir); err != nil {
+143: 		return nil, fmt.Errorf("private host directory refused: %w", err)
+144: 	}
+145: 	doc, err := loadSchema(cfg.SchemaDir)
+146: 	if err != nil {
+147: 		return nil, err
+148: 	}
+149: 	svc, err := domain.NewCurrentMu(cfg.DB, cfg.ContractsDir, cfg.MigrationFile)
+150: 	if err != nil {
+151: 		return nil, err
+152: 	}
+153: 	h := &Host{db: cfg.DB, domain: svc, dir: cfg.Dir, ttl: ttl, identity: id, now: now, doc: doc}
+154: 	h.peerLookup = cfg.PeerIdentityResolver
+155: 	if h.peerLookup == nil {
+156: 		h.peerLookup = auth.ProcessIdentity
+157: 	}
+158: 	h.protocolVersion = cfg.ProtocolVersion
+159: 	if h.protocolVersion == "" {
+160: 		h.protocolVersion = nativeProtocolVersion
+161: 	}
+162: 	if cfg.ReadOnlyModelVaultDir != "" {
+163: 		if h.vault, err = openVaultReadOnly(cfg.ReadOnlyModelVaultDir,
+164: 			cfg.ReadOnlyModelCredentialRef, cfg.ReadOnlyModelProvider); err != nil {
+165: 			return nil, err
+166: 		}
+167: 	} else if h.vault, err = openVault(cfg.Dir); err != nil {
+168: 		return nil, err
+169: 	}
+170: 	if h.roots, err = openRootRegistry(cfg.Dir); err != nil {
+171: 		return nil, err
+172: 	}
+173: 	if h.selections, err = openSelectionStore(cfg.Dir); err != nil {
+174: 		return nil, err
+175: 	}
+176: 	if h.state, err = loadHostState(cfg.Dir); err != nil {
+177: 		return nil, err
+178: 	}
+179: 	return h, nil
+180: }
+181: 
+182: // verifiableKind accepts WINDOWS_SID today; the POSIX path must be re-qualified before it is
+183: // trusted as a local principal, so anything else fails closed.
+184: func verifiableKind(kind string) bool { return kind == "WINDOWS_SID" }
+185: 
+186: // Identity exposes the verified OS principal reference (never the raw SID).
+187: func (h *Host) Identity() auth.Identity { return h.identity }
+188: 
+189: // InstanceID is a stable local host identifier for handshake responses; it is derived from
+190: // the private directory path plus the principal reference, so it changes if either does.
+191: func (h *Host) InstanceID() string {
+192: 	sum := sha256.Sum256([]byte(h.dir + "|" + h.identity.Ref))
+193: 	return "host-" + hex.EncodeToString(sum[:6])
+194: }
+195: 
+196: // writePrivate stores a file with 0600 plus the current-user-only DACL and a durable rename,
+197: // so a crash cannot leave a half-written credential or root registry.
+198: func writePrivate(dir, name string, payload any) error {
+199: 	raw, err := json.MarshalIndent(payload, "", "  ")
+200: 	if err != nil {
+201: 		return err
+202: 	}
+203: 	tmp, err := os.CreateTemp(dir, name+".tmp-")
+204: 	if err != nil {
+205: 		return err
+206: 	}
+207: 	defer os.Remove(tmp.Name())
+208: 	if err := tmp.Chmod(0o600); err != nil {
+209: 		tmp.Close()
+210: 		return err
+211: 	}
+212: 	if _, err := tmp.Write(raw); err != nil {
+213: 		tmp.Close()
+214: 		return err
+215: 	}
+216: 	if err := tmp.Sync(); err != nil {
+217: 		tmp.Close()
+218: 		return err
+219: 	}
+220: 	if err := tmp.Close(); err != nil {
+221: 		return err
+222: 	}
+223: 	if err := privateFile(tmp.Name()); err != nil {
+224: 		return err
+225: 	}
+226: 	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+227: }
+228: 
+229: func readPrivate(dir, name string, into any) error {
+230: 	raw, err := os.ReadFile(filepath.Join(dir, name))
+231: 	if err != nil {
+232: 		if errors.Is(err, os.ErrNotExist) {
+233: 			return nil
+234: 		}
+235: 		return err
+236: 	}
+237: 	return json.Unmarshal(raw, into)
+238: }
+SOURCE internal/store/sqlite.go
+1: package store
+2: 
+3: import (
+4: 	"context"
+5: 	"database/sql"
+6: 	"fmt"
+7: 	"net/url"
+8: 	"os"
+9: 	"path/filepath"
+10: 	"time"
+11: 
+12: 	_ "modernc.org/sqlite"
+13: )
+14: 
+15: // Open initializes the single local authoritative database connection.
+16: func Open(path string) (*sql.DB, error) {
+17: 	abs, err := filepath.Abs(path)
+18: 	if err != nil {
+19: 		return nil, err
+20: 	}
+21: 	if err := os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
+22: 		return nil, err
+23: 	}
+24: 	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(abs)}
+25: 	q := u.Query()
+26: 	q.Set("_foreign_keys", "1")
+27: 	q.Set("_journal_mode", "WAL")
+28: 	q.Set("_synchronous", "FULL")
+29: 	q.Set("_busy_timeout", "5000")
+30: 	u.RawQuery = q.Encode()
+31: 	db, err := sql.Open("sqlite", u.String())
+32: 	if err != nil {
+33: 		return nil, err
+34: 	}
+35: 	db.SetMaxOpenConns(1)
+36: 	db.SetMaxIdleConns(1)
+37: 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+38: 	defer cancel()
+39: 	if err := db.PingContext(ctx); err != nil {
+40: 		db.Close()
+41: 		return nil, err
+42: 	}
+43: 	if err := Ready(ctx, db); err != nil {
+44: 		db.Close()
+45: 		return nil, err
+46: 	}
+47: 	return db, nil
+48: }
+49: 
+50: // Ready checks the live connection settings, rather than treating a file as readiness.
+51: func Ready(ctx context.Context, db *sql.DB) error {
+52: 	for pragma, want := range map[string]string{
+53: 		"foreign_keys": "1", "journal_mode": "wal", "synchronous": "2", "busy_timeout": "5000",
+54: 	} {
+55: 		var got string
+56: 		if err := db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+57: 			return fmt.Errorf("%s: %w", pragma, err)
+58: 		}
+59: 		if got != want {
+60: 			return fmt.Errorf("%s=%s, want %s", pragma, got, want)
+61: 		}
+62: 	}
+63: 	var integrity string
+64: 	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&integrity); err != nil {
+65: 		return err
+66: 	}
+67: 	if integrity != "ok" {
+68: 		return fmt.Errorf("sqlite quick_check: %s", integrity)
+69: 	}
+70: 	return nil
+71: }
+72: 
+73: // Bootstrap records only the empty storage baseline; W03 owns business tables.
+74: func Bootstrap(ctx context.Context, db *sql.DB, migrationFile string) error {
+75: 	sqlText, err := os.ReadFile(migrationFile)
+76: 	if err != nil {
+77: 		return err
+78: 	}
+79: 	tx, err := db.BeginTx(ctx, nil)
+80: 	if err != nil {
+81: 		return err
+82: 	}
+83: 	defer tx.Rollback()
+84: 	if _, err := tx.ExecContext(ctx, string(sqlText)); err != nil {
+85: 		return err
+86: 	}
+87: 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)`); err != nil {
+88: 		return err
+89: 	}
+90: 	return tx.Commit()
+91: }
+SOURCE internal/host/backup_windows.go
+1: package host
+2: 
+3: import (
+4: 	"context"
+5: 	"fmt"
+6: 	"io"
+7: 	"os"
+8: 	"path/filepath"
+9: 	"strings"
+10: 
+11: 	"researchos.local/research-os/internal/domain"
+12: )
+13: 
+14: // SnapshotWorkspace exports only a currently pinned, non-revoked root that the
+15: // current OS principal originally authorized. It rejects, rather than skips,
+16: // links, special files and any item outside the explicit resource bounds.
+17: func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBinding, destination string, limits domain.BackupWorkspaceLimits) (domain.BackupWorkspaceSnapshot, error) {
+18: 	var out domain.BackupWorkspaceSnapshot
+19: 	if _, err := h.reverify(); err != nil {
+20: 		return out, err
+21: 	}
+22: 	if h.boundPrincipal() == "" || h.boundPrincipal() != binding.PrincipalID || binding.Status != domain.WorkspaceActive {
+23: 		return out, fmt.Errorf("BACKUP_WORKSPACE_OWNER_DENIED")
+24: 	}
+25: 	if limits.MaxFiles < 0 || limits.MaxDirs < 0 || limits.MaxBytes < 0 || limits.MaxFileBytes < 1 || limits.MaxFileBytes > domain.BackupWorkspaceMaxFileBytes {
+26: 		return out, fmt.Errorf("BACKUP_WORKSPACE_LIMIT_INVALID")
+27: 	}
+28: 	var pinned *RootBinding
+29: 	for _, root := range h.roots.List() {
+30: 		if root.Revoked || !strings.EqualFold(filepath.Clean(root.RealPath), filepath.Clean(binding.RealPath)) {
+31: 			continue
+32: 		}
+33: 		if binding.Access == AccessReadWrite && root.Access != AccessReadWrite {
+34: 			return out, fmt.Errorf("BACKUP_WORKSPACE_ACCESS_MISMATCH")
+35: 		}
+36: 		if pinned != nil {
+37: 			return out, fmt.Errorf("BACKUP_WORKSPACE_AMBIGUOUS_ROOT")
+38: 		}
+39: 		pinned = root
+40: 	}
+41: 	if pinned == nil {
+42: 		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_NOT_PINNED")
+43: 	}
+44: 	// A restored workspace lives under its new data root by design. Allow only
+45: 	// that exact, currently pinned ref and path; every other data-root overlap
+46: 	// remains recursive/unsafe, as does any backup output inside the workspace.
+47: 	dataRoot := filepath.Dir(h.dir)
+48: 	if backupPathsOverlap(binding.RealPath, destination) ||
+49: 		(backupPathsOverlap(binding.RealPath, dataRoot) && !backupRestoredWorkspacePath(dataRoot, binding.AuthorizedRef, pinned)) {
+50: 		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
+51: 	}
+52: 	vol, id, _, err := fileIdentity(pinned.RealPath)
+53: 	if err != nil || vol != pinned.VolumeID || id != pinned.FileID {
+54: 		return out, fmt.Errorf("BACKUP_WORKSPACE_PIN_CHANGED")
+55: 	}
+56: 	if reparse, err := chainHasReparsePoint(pinned.RealPath); err != nil || reparse {
+57: 		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_REPARSE")
+58: 	}
+59: 	root, err := os.OpenRoot(pinned.RealPath)
+60: 	if err != nil {
+61: 		return out, err
+62: 	}
+63: 	defer root.Close()
+64: 	out.Directories = []string{}
+65: 	out.Files = []domain.BackupWorkspaceFile{}
+66: 	var total int64
+67: 	err = filepath.WalkDir(pinned.RealPath, func(path string, entry os.DirEntry, walkErr error) error {
+68: 		if walkErr != nil {
+69: 			return walkErr
+70: 		}
+71: 		if err := ctx.Err(); err != nil {
+72: 			return err
+73: 		}
+74: 		if path == pinned.RealPath {
+75: 			return nil
+76: 		}
+77: 		rel, err := filepath.Rel(pinned.RealPath, path)
+78: 		if err != nil {
+79: 			return err
+80: 		}
+81: 		rel = filepath.ToSlash(rel)
+82: 		if len(rel) > domain.BackupWorkspaceMaxPathBytes || CheckRelativePath(rel) != nil || rel != NormalizeRelative(rel) {
+83: 			return fmt.Errorf("BACKUP_WORKSPACE_PATH_INVALID: %s", rel)
+84: 		}
+85: 		if _, err := h.roots.Resolve(pinned.Ref, rel, AccessReadOnly); err != nil {
+86: 			return fmt.Errorf("BACKUP_WORKSPACE_PATH_CHANGED %s: %w", rel, err)
+87: 		}
+88: 		if reparse, err := chainHasReparsePoint(path); err != nil || reparse {
+89: 			return fmt.Errorf("BACKUP_WORKSPACE_REPARSE: %s", rel)
+90: 		}
+91: 		info, err := entry.Info()
+92: 		if err != nil {
+93: 			return err
+94: 		}
+95: 		if info.IsDir() {
+96: 			if len(out.Directories) >= limits.MaxDirs {
+97: 				return fmt.Errorf("BACKUP_WORKSPACE_DIRECTORY_LIMIT: unbacked item %s", rel)
+98: 			}
+99: 			out.Directories = append(out.Directories, rel)
+100: 			return nil
+101: 		}
+102: 		if !info.Mode().IsRegular() {
+103: 			return fmt.Errorf("BACKUP_WORKSPACE_SPECIAL_FILE: %s", rel)
+104: 		}
+105: 		if len(out.Files) >= limits.MaxFiles || info.Size() > limits.MaxFileBytes || info.Size() > limits.MaxBytes-total {
+106: 			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+107: 		}
+108: 		if err := runtimeToolPlainPath(root, rel, false); err != nil {
+109: 			return err
+110: 		}
+111: 		file, err := root.Open(rel)
+112: 		if err != nil {
+113: 			return err
+114: 		}
+115: 		before, err := file.Stat()
+116: 		if err != nil {
+117: 			file.Close()
+118: 			return err
+119: 		}
+120: 		data, readErr := io.ReadAll(io.LimitReader(file, limits.MaxFileBytes+1))
+121: 		after, statErr := file.Stat()
+122: 		closeErr := file.Close()
+123: 		if readErr != nil || statErr != nil || closeErr != nil {
+124: 			return fmt.Errorf("BACKUP_WORKSPACE_READ_FAILED: %s", rel)
+125: 		}
+126: 		current, err := root.Lstat(rel)
+127: 		if err != nil || !current.Mode().IsRegular() || !os.SameFile(before, after) || !os.SameFile(after, current) ||
+128: 			before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != after.Size() {
+129: 			return fmt.Errorf("BACKUP_WORKSPACE_FILE_CHANGED: %s", rel)
+130: 		}
+131: 		if len(data) > int(limits.MaxFileBytes) || int64(len(data)) > limits.MaxBytes-total {
+132: 			return fmt.Errorf("BACKUP_WORKSPACE_LIMIT: unbacked item %s", rel)
+133: 		}
+134: 		total += int64(len(data))
+135: 		out.Files = append(out.Files, domain.BackupWorkspaceFile{Path: rel, Data: data})
+136: 		return nil
+137: 	})
+138: 	if err != nil {
+139: 		return domain.BackupWorkspaceSnapshot{}, err
+140: 	}
+141: 	return out, nil
+142: }
+143: 
+144: func backupRestoredWorkspacePath(dataRoot, authorizedRef string, pinned *RootBinding) bool {
+SOURCE internal/domain/backup_command_queue.go
+1: package domain
+2: 
+3: import (
+4: 	"database/sql"
+5: 	"encoding/json"
+6: 	"fmt"
+7: 	"sort"
+8: )
+9: 
+10: var clientQueueTables = []string{"client_queue_fences", "client_command_queue", "client_control_requests", "client_control_receipts"}
+11: 
+12: func backupQueueState(db *sql.DB) (Object, error) {
+13: 	var version int
+14: 	if err := db.QueryRow(`SELECT coalesce(max(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+15: 		return nil, err
+16: 	}
+17: 	if version < 22 {
+18: 		return nil, nil
+19: 	}
+20: 	state := Object{"format": "RESEARCHOS_COMMAND_QUEUE_V1"}
+21: 	for _, table := range clientQueueTables {
+22: 		rows, err := db.Query(`SELECT * FROM ` + table)
+23: 		if err != nil {
+24: 			return nil, err
+25: 		}
+26: 		cols, err := rows.Columns()
+27: 		if err != nil {
+28: 			rows.Close()
+29: 			return nil, err
+30: 		}
+31: 		entries := []Object{}
+32: 		for rows.Next() {
+33: 			values := make([]any, len(cols))
+34: 			ptrs := make([]any, len(cols))
+35: 			for i := range values {
+36: 				ptrs[i] = &values[i]
+37: 			}
+38: 			if err = rows.Scan(ptrs...); err != nil {
+39: 				rows.Close()
+40: 				return nil, err
+41: 			}
+42: 			entry := Object{}
+43: 			for i, col := range cols {
+44: 				entry[col] = values[i]
+45: 			}
+46: 			entries = append(entries, entry)
+47: 		}
+48: 		err = rows.Err()
+49: 		rows.Close()
+50: 		if err != nil {
+51: 			return nil, err
+52: 		}
+53: 		sort.Slice(entries, func(i, j int) bool { return Hash(entries[i]) < Hash(entries[j]) })
+54: 		state[table] = entries
+55: 	}
+56: 	return state, nil
+57: }
+58: 
+59: func validateBackupQueue(db *sql.DB) error {
+60: 	state, err := backupQueueState(db)
+61: 	if err != nil || state == nil {
+62: 		return err
+63: 	}
+64: 	for _, query := range []string{
+65: 		`SELECT count(*) FROM client_queue_fences f LEFT JOIN client_sessions s ON s.project_id=f.project AND s.id=f.session_id LEFT JOIN domain_objects t ON t.project=f.project AND t.kind='Task' AND t.id=f.task_id WHERE s.id IS NULL OR t.id IS NULL OR f.accepted_through<0 OR f.sealed_through<0 OR f.sealed_through>f.accepted_through OR (f.state='SEALED' AND f.sealed_through<>f.accepted_through)`,
+66: 		`SELECT count(*) FROM client_queue_fences f WHERE f.run_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM domain_objects r WHERE r.project=f.project AND r.kind='Run' AND r.id=f.run_id AND json_extract(r.body,'$.task_id')=f.task_id AND json_extract(r.body,'$.lease_epoch')=f.runtime_epoch)`,
+67: 		`SELECT count(*) FROM client_command_queue q LEFT JOIN client_queue_fences f ON f.generation=q.generation LEFT JOIN domain_objects t ON t.project=q.project AND t.kind='Task' AND t.id=q.task_id WHERE f.generation IS NULL OR f.project<>q.project OR f.task_id<>q.task_id OR f.session_id<>q.session_id OR json_extract(t.body,'$.goal_id') IS NOT q.goal_id OR t.id IS NULL OR q.queue_sequence<1 OR q.queue_sequence>f.accepted_through OR q.accepted_writer_epoch<1`,
+68: 		`SELECT count(*) FROM client_queue_fences f WHERE f.accepted_through<>(SELECT count(*) FROM client_command_queue q WHERE q.generation=f.generation)`,
+69: 		`SELECT count(*) FROM client_command_queue q WHERE (q.state<>'ENQUEUED' AND q.last_receipt_id IS NULL) OR (q.last_receipt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM client_control_receipts r WHERE r.receipt_id=q.last_receipt_id AND r.project=q.project AND r.generation=q.generation AND r.command_id=q.command_id))`,
+70: 		`SELECT count(*) FROM client_control_receipts r WHERE NOT EXISTS(SELECT 1 FROM client_queue_fences f WHERE f.project=r.project AND f.generation=r.generation) OR (r.previous_receipt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM client_control_receipts p WHERE p.receipt_id=r.previous_receipt_id AND p.project=r.project AND p.generation=r.generation AND p.command_id=r.command_id AND p.receipt_id<>r.receipt_id))`,
+71: 		`SELECT count(*) FROM client_control_requests c WHERE NOT EXISTS(SELECT 1 FROM client_sessions s WHERE s.id=c.session_id AND s.project_id=c.project) OR NOT json_valid(c.task_ids) OR json_array_length(c.task_ids)=0 OR (c.state='CONFIRMED' AND c.final_response IS NULL)`,
+72: 	} {
+73: 		var n int
+74: 		if err = db.QueryRow(query).Scan(&n); err != nil {
+75: 			return err
+76: 		}
+77: 		if n != 0 {
+78: 			return fmt.Errorf("BACKUP_QUEUE_BINDING: %d invalid rows", n)
+79: 		}
+80: 	}
+81: 	for _, query := range []string{
+82: 		`SELECT count(*) FROM client_command_queue q WHERE NOT EXISTS(SELECT 1 FROM idempotency i WHERE i.principal=q.principal AND i.project=q.project AND i.operation='v2:session.send' AND i.key=q.command_id AND i.request_hash=q.request_hash)`,
+83: 		`SELECT count(*) FROM client_control_requests c WHERE NOT EXISTS(SELECT 1 FROM idempotency i WHERE i.principal=c.principal AND i.project=c.project AND i.operation='v2:session.control' AND i.key=c.command_id AND i.request_hash=c.request_hash) OR c.original_response IS NULL`,
+84: 		`SELECT count(*) FROM client_queue_fences f WHERE f.process_identity IS NOT NULL AND NOT EXISTS(SELECT 1 FROM runtime_dispatches d WHERE d.project=f.project AND d.run=f.run_id AND d.epoch=f.runtime_epoch AND d.dispatch_key=f.dispatch_key AND d.manifest_hash=f.manifest_hash AND d.identity=f.process_identity)`} {
+85: 		var n int
+86: 		if err = db.QueryRow(query).Scan(&n); err != nil {
+87: 			return err
+88: 		}
+89: 		if n != 0 {
+90: 			return fmt.Errorf("BACKUP_QUEUE_REQUEST_OR_PROCESS_BINDING")
+91: 		}
+92: 	}
+93: 	for _, row := range state["client_command_queue"].([]Object) {
+94: 		if Digest([]byte(Str(row, "content"))) != row["content_hash"] {
+95: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT_HASH")
+96: 		}
+97: 		var content Object
+98: 		if json.Unmarshal([]byte(Str(row, "content")), &content) != nil || len(content) != 2 {
+99: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT")
+100: 		}
+101: 
+102: 		text, ok := content["text"].(string)
+103: 		attachments, valid := content["attachments"].([]any)
+104: 		if !ok || !valid || text == "" || len(Str(row, "content")) > 32*1024 {
+105: 			return fmt.Errorf("BACKUP_QUEUE_CONTENT_SHAPE")
+106: 		}
+107: 		for _, value := range attachments {
+108: 			a, ok := value.(map[string]any)
+109: 			if !ok || len(a) != 3 {
+110: 				return fmt.Errorf("BACKUP_QUEUE_ATTACHMENT")
+SOURCE internal/domain/backup_workspace.go
+80: 
+81: type backupWorkspaceFile struct {
+82: 	Path string `json:"path"`
+83: 	Blob string `json:"blob"`
+84: 	Hash string `json:"hash"`
+85: 	Size int    `json:"size"`
+86: }
+87: 
+88: func (s *Service) CreateBackupWithWorkspaces(ctx context.Context, destination string, key []byte, source WorkspaceBackupSource) (BackupManifest, error) {
+89: 	if source == nil {
+90: 		return BackupManifest{}, fmt.Errorf("BACKUP_WORKSPACE_SOURCE_REQUIRED")
+91: 	}
+92: 	return s.createBackupPolicy(ctx, destination, key, nil, source)
+93: }
+94: 
+95: func workspaceBackupBindings(db *sql.DB) ([]WorkspaceBinding, error) {
+96: 	rows, err := db.Query(`SELECT body FROM domain_objects WHERE project='' AND kind=? ORDER BY id`, KindWorkspaceBinding)
+97: 	if err != nil {
+98: 		return nil, err
+99: 	}
+100: 	defer rows.Close()
+101: 	bindings := []WorkspaceBinding{}
+102: 	for rows.Next() {
+103: 		var raw string
+104: 		if err := rows.Scan(&raw); err != nil {
+105: 			return nil, err
+106: 		}
+107: 		binding, err := decodeBinding(raw)
+108: 		if err != nil {
+109: 			return nil, err
+110: 		}
+111: 		if binding.Status == WorkspaceActive {
+112: 			bindings = append(bindings, *binding)
+113: 		} else if binding.Status != WorkspaceRevoked {
+114: 			return nil, fmt.Errorf("BACKUP_WORKSPACE_STATUS_INVALID")
+115: 		}
+116: 	}
+117: 	return bindings, rows.Err()
+118: }
+119: 
+120: func backupWorkspaceBlobName(ref, rel string) string {
+160: 			return false
+161: 		}
+162: 	}
+163: 	return true
+164: }
+165: 
+166: func backupWorkspaceFiles(ctx context.Context, db *sql.DB, source WorkspaceBackupSource, destination string) (map[string][]byte, int, error) {
+167: 	bindings, err := workspaceBackupBindings(db)
+168: 	if err != nil {
+169: 		return nil, 0, err
+170: 	}
+171: 	if len(bindings) == 0 {
+172: 		return nil, 0, nil
+173: 	}
+174: 	if source == nil {
+175: 		return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_SOURCE_REQUIRED: %d active workspace(s)", len(bindings))
+176: 	}
+177: 	if len(bindings) > BackupWorkspaceMaxRoots {
+178: 		return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_ROOT_LIMIT: %d", len(bindings))
+179: 	}
+180: 	files := map[string][]byte{}
+181: 	index := backupWorkspaceIndex{Format: "RESEARCHOS_WORKSPACE_SNAPSHOT_V1", Roots: []backupWorkspaceRoot{}}
+182: 	remainingFiles, remainingDirs, remainingBytes := BackupWorkspaceMaxFiles, BackupWorkspaceMaxDirs, int64(BackupWorkspaceMaxBytes)
+183: 	for _, b := range bindings {
+184: 		if err := ctx.Err(); err != nil {
+185: 			return nil, 0, err
+186: 		}
+187: 		if b.AuthorizedRef == "" || b.RealPath == "" || b.PrincipalID == "" || b.Access != "READ_ONLY" && b.Access != "READ_WRITE" {
+188: 			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_BINDING_INVALID")
+189: 		}
+190: 		snapshot, err := source.SnapshotWorkspace(ctx, b, destination, BackupWorkspaceLimits{MaxFiles: remainingFiles, MaxDirs: remainingDirs, MaxBytes: remainingBytes, MaxFileBytes: BackupWorkspaceMaxFileBytes})
+191: 		if err != nil {
+192: 			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_SNAPSHOT_FAILED %s: %w", b.AuthorizedRef, err)
+193: 		}
+194: 		if len(snapshot.Files) > remainingFiles || len(snapshot.Directories) > remainingDirs {
+195: 			return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_FILE_LIMIT %s", b.AuthorizedRef)
+196: 		}
+197: 		root := backupWorkspaceRoot{Ref: b.AuthorizedRef, SourcePath: b.RealPath, Access: b.Access, PrincipalID: b.PrincipalID,
+198: 			Directories: append([]string{}, snapshot.Directories...), Files: []backupWorkspaceFile{}}
+199: 		seen := map[string]bool{}
+200: 		for _, dir := range root.Directories {
+201: 			if !backupWorkspaceRelative(dir) || seen[dir] {
+202: 				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_DIRECTORY_INVALID %s", b.AuthorizedRef)
+203: 			}
+204: 			seen[dir] = true
+205: 		}
+206: 		for _, file := range snapshot.Files {
+207: 			if !backupWorkspaceRelative(file.Path) || seen[file.Path] || len(file.Data) > BackupWorkspaceMaxFileBytes || int64(len(file.Data)) > remainingBytes {
+208: 				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_FILE_INVALID_OR_LIMIT %s %s", b.AuthorizedRef, file.Path)
+209: 			}
+210: 			seen[file.Path] = true
+211: 			blob := backupWorkspaceBlobName(b.AuthorizedRef, file.Path)
+212: 			if _, exists := files[blob]; exists {
+213: 				return nil, 0, fmt.Errorf("BACKUP_WORKSPACE_BLOB_COLLISION")
+214: 			}
+215: 			files[blob] = file.Data
+216: 			root.Files = append(root.Files, backupWorkspaceFile{Path: file.Path, Blob: blob, Hash: Digest(file.Data), Size: len(file.Data)})
+217: 			remainingFiles--
+218: 			remainingBytes -= int64(len(file.Data))
+219: 		}
+220: 		sort.Strings(root.Directories)
+221: 		sort.Slice(root.Files, func(i, j int) bool { return root.Files[i].Path < root.Files[j].Path })
+222: 		remainingDirs -= len(root.Directories)
+223: 		index.Roots = append(index.Roots, root)
+224: 	}
+225: 	files["workspace-index.json"] = Bytes(index)
+226: 	return files, len(index.Roots), nil
+227: }
+228: 
+229: func backupDecodeWorkspaceIndex(files map[string][]byte) (backupWorkspaceIndex, error) {
+{"index": {"path": "execution/v2.4/receipts/W05/W05-99/online_backup_source_resource_map_codex/20261015-current-chat/phase02/source-input-index.json", "sha256": "8de04b9053693b168d3956117783de3d2306cf5ff2df86879ed3859fe1957cae", "bytes": 5554}}

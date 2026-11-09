@@ -1,0 +1,90 @@
+558:func checkAncestorControl(p EntryFencePlan, holds []nativeHold) error {
+559-	protected := map[string]bool{}
+560-	for _, a := range p.Ancestors {
+561-		protected[strings.ToLower(a.Path)] = true
+562-	}
+563-	protected[strings.ToLower(p.DataRoot.Path)] = true
+564-	for _, group := range p.BusinessGroupSIDs {
+565-		if _, e := windows.StringToSid(group); e != nil {
+566-			return e
+567-		}
+568-	}
+569-	for _, h := range holds {
+570-		if !protected[strings.ToLower(h.path)] {
+571-			continue
+572-		}
+573-		sd, e := windows.SecurityDescriptorFromString(h.identity.SecurityDescriptor)
+574-		if e != nil {
+575-			return e
+576-		}
+577-		owner, _, e := sd.Owner()
+578-		if e != nil || owner == nil || (owner.String() != p.ManagementSID && owner.String() != "S-1-5-18") {
+579-			return fmt.Errorf("ancestor owner can revoke boundary: %s", h.path)
+580-		}
+581-		acl, _, e := sd.DACL()
+582-		if e != nil || acl == nil {
+583-			return fmt.Errorf("ancestor DACL unavailable: %s", h.path)
+584-		}
+585-		for i := uint32(0); i < uint32(acl.AceCount); i++ {
+586-			var ace *windows.ACCESS_ALLOWED_ACE
+587-			if e = windows.GetAce(acl, i, &ace); e != nil {
+588-				return e
+589-			}
+590-			if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
+591-				continue
+592-			}
+593-			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+594-				return fmt.Errorf("ancestor ACL ACE unsupported: %s", h.path)
+595-			}
+596-			trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+597-			if trustee == p.ManagementSID || trustee == "S-1-5-18" {
+598-				continue
+599-			}
+600-			forbidden := uint32(0x40 | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_ALL) // FILE_DELETE_CHILD
+601-			if filepath.Dir(h.path) != h.path {
+602-				forbidden |= windows.DELETE
+603-			}
+604-			if uint32(ace.Mask)&forbidden != 0 {
+605-				return fmt.Errorf("business group can replace ancestor: %s", h.path)
+606-			}
+607-		}
+608-	}
+609-	return nil
+610-}
+611-
+612-func preflightManagementRestore(p EntryFencePlan) error {
+613-	for _, t := range p.Targets {
+614-		h, e := openNativeAccess(t.File.Path, false, true, windows.WRITE_DAC|windows.WRITE_OWNER)
+615-		if e != nil {
+616-			return fmt.Errorf("management cannot open target for reversible ACL operation: %w", e)
+617-		}
+618-		matched := identityEqual(h.identity, t.File)
+619-		closeErr := windows.CloseHandle(h.handle)
+620-		if closeErr != nil {
+621-			return closeErr
+622-		}
+623-		if !matched {
+25:R07/R09 验证了冻结完整 file-ancestor-metadata.json SHA f4c58e80940d0dc81ce9c0bac70a1131030238c27cfe7e9347e749ac33d71cc5，并查看具体 D 根/作品集/C home 完整 SDDL。compact 只是定位摘要，不作为完整 AccessCheck。当前 token 是 Medium、Administrators deny-only，不能执行下述管理部署。
+26:
+27:D:\\ 的 owner 是 SYSTEM；AU 的有效 mask 0x001301bf 包含 DELETE，但不含 0x40 DELETE_CHILD、0x40000 WRITE_DAC、0x80000 WRITE_OWNER。其 inherit-only ACE 不能当成本对象有效授权。因此本 proposal **不要求修改 D:\\ ACL**，也不要求修改 C:\\、C:\\Users 的合法 OS owner/ACL。FILE_DELETE_CHILD 和文件执行/脚本读取的定义来自 [Microsoft 文件权限常量](https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants)。
+28:
+29:仍须保护以下精确路径分支：D:\\作品集 → ResearchOS → research-os，再分别到实际 Electron 链、repo main.js 链与 .local/live/current-chat-normal-desktop-first-use-20261012/data 链；C:\\Users\\yqyyds → .codex → researchos-resource-cache → 两个已冻结包 → 各必经目标。不是递归锁整棵目录：计划逐个列出选中祖先和目标的 exact native ID、原 SD、拟装 SD、继承标记及恢复策略；不涉及无关兄弟树的递归 ACE 改动。
+30:
+31:D:\\作品集、ResearchOS 和 repo 本身当前可被 operator 删除/改名，且 operator 是 owner。只保护更深层不能阻止整个祖先移动。需要在这些选中目录自身关闭普通主体的 DELETE、WRITE_DAC/WRITE_OWNER 及用于替换/reparse 的写权限，并处理 owner 隐式权限；AU 广泛写权不能只按当前 operator 过滤后忽略其他非可信主体。可保留普通读取、遍历与不影响固定路径的权利，但最小 native fixture 若无法证明允许 directory add/write 安全，采用明确的临时禁止创建/改目录策略，并把影响写入部署差量，不谎称零影响。
+32:
+33:这项保守目录限制不得机械地施加给业务 data 根及 DB/WAL/lock：原 Core 在线期间和 C_HELD 的必要写入必须持续合法。对需要可写的非空 data 目录，应在已阻止删除子项/改名/改 owner/DACL、固定关键文件身份的前提下，用 native fixture 证明所保留的创建权限不能替换受保护命名空间或设置 reparse；无法证明则该实际计划拒绝。不得为让测试通过暂时移除 fence，不得把不同 OS SID 的管理员执行结果冒充原业务主体。Source 要同时测试 namespace 攻击拒绝与真实 SQLite/lease 工作的正例。
+34:
+35:C:\\Users\\yqyyds 是 SYSTEM owner，但授予 operator FullControl。至少需要对该目录自身取消普通 operator 的 DELETE、DELETE_CHILD、WRITE_DAC、WRITE_OWNER 及经实际测试判定可改其路径身份的写权；后续 .codex/cache/package 链同理，operator-owned 对象另处理 owner。home 级非继承 DELETE_CHILD 限制会影响删除其直接子项；目录写限制可能影响创建新文件/子目录；.codex/cache 的更新、替换会暂时受限。这是实质 shared scope，**必须未来逐项明确授权**。当前没有该授权；不能悄悄施加。
+36:
+37:优先将需要保护的 operator-owned 精确对象临时设为不同 SID 的可信恢复管理员所有，保存原 owner/group/DACL/SACL可读部分/保护与继承控制位及 binary SD。合法 SYSTEM/TrustedInstaller owner 保留。OWNER RIGHTS 是可选替代，仅在相同 Win11/NTFS 真实夹具证明后采用；此报告不把它当现成能力。对象 owner 的隐式 WRITE_DAC 由 [Microsoft 官方 owner 文档](https://github.com/MicrosoftDocs/win32/blob/docs/desktop-src/SecAuthZ/owner-of-a-new-object.md)说明。
+38:
+{
+  "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\qualification_official_entry_resource_map_codex\\20261015-current-chat\\file-ancestor-metadata.json",
+  "expected": "f4c58e80940d0dc81ce9c0bac70a1131030238c27cfe7e9347e749ac33d71cc5",
+  "actual": "F4C58E80940D0DC81CE9C0BAC70A1131030238C27CFE7E9347E749AC33D71CC5"
+}
+{
+  "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\resume_cp528_codex\\20261025-current-chat\\040-boot-ancestor-mutable-source.snapshot.txt",
+  "expected": "9a07a6e386a2da3e2717385ade81ce253a49ccae6f76b551c7703780c328e8b4",
+  "actual": "9A07A6E386A2DA3E2717385ADE81CE253A49CCAE6F76B551C7703780C328E8B4"
+}

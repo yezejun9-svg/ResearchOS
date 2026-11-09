@@ -1,0 +1,240 @@
+			tx.Rollback()
+			return nil, e
+		}
+	}
+	intent, e = c.service.beginEffectTx(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, runID, frame.Key)
+	if e != nil {
+		tx.Rollback()
+		return nil, e
+	}
+	if e = c.projectSessionEffects(tx, route.ProjectID, run, nil); e != nil {
+		tx.Rollback()
+		return nil, e
+	}
+	if e = tx.Commit(); e != nil {
+		return nil, e
+	}
+	c.boundary("effect_started", intent)
+	if provider.Capability == "TOOL" {
+		return c.brokerTool(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
+	if provider.Capability == "MODEL" {
+		return c.brokerModel(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
+	if provider.Capability == "SOURCE" {
+		return c.brokerResearchSource(ctx, route, provider, runID, lease, epoch, frame, payload, intent)
+	}
+	if provider.Capability == "EXPERIMENT" {
+		return c.brokerResearchExperiment(ctx, route, runID, lease, epoch, frame, payload, intent)
+	}
+	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
+	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", frame.Key)
+	if provider.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
+	}
+	// No shared proxy credentials, redirects or automatic semantic retry.
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("provider redirect denied") }}
+	defer client.CloseIdleConnections()
+	response, e := client.Do(req)
+	if e == nil {
+		c.boundary("provider_responded", intent)
+	}
+	unknown := func(reason string) (Object, error) {
+		c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason})
+		return nil, Fail(409, "STATE_CONFLICT", "provider outcome UNKNOWN; query provider before recovery")
+	}
+	if e != nil {
+		return unknown("provider transport ended without receipt")
+	}
+	raw, e := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
+	response.Body.Close()
+	if e != nil || len(raw) > 64*1024 || response.StatusCode < 200 || response.StatusCode >= 300 {
+		return unknown("provider returned no bounded successful receipt")
+	}
+	for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
+		if secret != "" && bytes.Contains(raw, []byte(secret)) {
+			return unknown("provider response contained a host credential")
+		}
+	}
+	receipt, e := Decode(raw)
+	if e != nil || receipt["key"] != frame.Key || Hash(receipt["epoch"]) != Hash(epoch) || receipt["run_id"] != runID || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+		return unknown("provider receipt binding invalid")
+	}
+	actual, ok := receipt["actual_cost"].(map[string]any)
+	if !ok || c.service.Contracts.Validate("Money", actual) != nil {
+		return unknown("provider actual cost missing")
+	}
+	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+		return unknown("provider receipt persistence failed")
+	}
+	c.boundary("effect_receipt_durable", intent)
+	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+		return nil, e
+	}
+	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
+}
+
+// This is the last MODEL authority gate before prepareEffectTx writes the
+// first durable effect. Keeping all three checks together lets a fixture prove
+// that a rejected projection cannot create a reservation or provider request.
+func validateModelEffectBeforePrepare(tx *sql.Tx, project, runID string, task Object, manifest map[string]any, effectKey string, payload Object) error {
+	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if err != nil {
+		return err
+	}
+	if _, err = validateRuntimeModelRequest(effective, payload); err != nil {
+=== recovery ===
+	tx, e := c.service.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if e = resourceWriteLock(tx); e != nil {
+		return e
+	}
+	dispatch, e := runtimeDispatch(tx, project, run, fact["epoch"])
+	if e != nil {
+		return e
+	}
+	if fact["dispatch_key"] != dispatch["dispatch_key"] || fact["manifest_hash"] != dispatch["manifest_hash"] {
+		return Fail(422, "GATE_FAILED", "effect receipt dispatch mismatch")
+	}
+	intent, e := latestEffect(tx, project, run, key)
+	if e != nil {
+		return e
+	}
+	if intent["request_hash"] != fact["request_hash"] || intent["reservation_id"] != fact["reservation_id"] || Hash(intent["epoch"]) != Hash(fact["epoch"]) {
+		return Fail(422, "GATE_FAILED", "effect receipt epoch or intent mismatch")
+	}
+	receipt, ok := fact["receipt"].(map[string]any)
+	if !ok {
+		return errors.New("trusted effect receipt required")
+	}
+	if receipt["key"] != key || receipt["run_id"] != run || Hash(receipt["epoch"]) != Hash(fact["epoch"]) || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+		return Fail(422, "GATE_FAILED", "effect receipt identity or outcome mismatch")
+	}
+	request, _ := intent["payload"].(map[string]any)
+	if request["capability"] == "MODEL" || request["capability"] == "TOOL" {
+		result, valid := receipt["payload"].(map[string]any)
+		if !valid {
+			return Fail(422, "GATE_FAILED", "host effect result missing")
+		}
+		wantHash := Digest(Bytes(result))
+		if request["capability"] == "MODEL" && receipt["state"] == "CONFIRMED" {
+			raw := []byte(Str(result, "body"))
+			if receipt["model_transport"] != true || receipt["actual_cost"] != nil || result["content_type"] != "text/event-stream" || Hash(result["status"]) != Hash(200) || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+				return Fail(422, "GATE_FAILED", "model transport receipt invalid")
+			}
+			wantHash = Digest(raw)
+		}
+		if wantHash != fact["provider_response_hash"] || wantHash != receipt["receipt_id"] {
+			return Fail(422, "GATE_FAILED", "host effect response hash mismatch")
+		}
+		if receipt["state"] == "NOT_APPLIED" {
+			money, _ := receipt["actual_cost"].(map[string]any)
+			amount, err := moneyAmount(money)
+			if result["dispatched"] != false || result["witness"] != "HOST_PRE_EFFECT_REFUSAL" || err != nil || amount.Sign() != 0 {
+				return Fail(422, "GATE_FAILED", "known unissued effect witness required")
+			}
+		} else if request["capability"] == "TOOL" {
+			payload, _ := request["payload"].(map[string]any)
+			if receipt["host_tool"] != payload["name"] {
+				return Fail(422, "GATE_FAILED", "host tool receipt name mismatch")
+			}
+		}
+	}
+	if evidence := fact["host_tool_evidence"]; evidence != nil && (request["capability"] != "TOOL" || len(Bytes(evidence)) > 4*1024*1024 || fact["host_tool_evidence_hash"] != Hash(evidence)) {
+		return Fail(422, "GATE_FAILED", "host tool evidence hash or bound mismatch")
+	}
+	if intent["state"] == receipt["state"] && Hash(intent["receipt"]) == Hash(receipt) {
+		current, err := load(tx, project, "Run", run)
+		if err != nil {
+			return err
+		}
+		if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if intent["state"] != "STARTED" && intent["state"] != "UNKNOWN" {
+		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
+	}
+	if request["capability"] == "MODEL" && receipt["model_transport"] == true && receipt["actual_cost"] == nil && receipt["state"] == "CONFIRMED" {
+		result, ok := receipt["payload"].(map[string]any)
+		if !ok || Digest([]byte(Str(result, "body"))) != fact["provider_response_hash"] {
+			return Fail(422, "GATE_FAILED", "model response hash mismatch")
+		}
+		intent["state"], intent["receipt"] = receipt["state"], receipt
+		if e = effectAppend(tx, project, run, key, intent); e != nil {
+			return e
+		}
+		current, err := load(tx, project, "Run", run)
+		if err != nil {
+			return err
+		}
+		if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+			return err
+		}
+=== firstgate tail ===
+	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),coalesce(min(effect_key),'') FROM resource_effects WHERE project=? AND run=?`, route.ProjectID, run["id"]).Scan(&distinct, &modelKey); err != nil {
+		return nil, err
+	}
+	if err = tx.QueryRow(`SELECT count(*) FROM resource_effects WHERE project=? AND run=? AND effect_key=?`, route.ProjectID, run["id"], frame.Key).Scan(&effects); err != nil {
+		return nil, err
+	}
+	if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=?`, route.ProjectID, frame.Key).Scan(&ledger); err != nil {
+		return nil, err
+	}
+	if effects != 0 || ledger != 0 || distinct != 1 || modelKey == "" || modelKey == frame.Key {
+		return nil, qualificationDenialUnavailable("effect or ledger history exists")
+	}
+	model, err := latestEffect(tx, route.ProjectID, Str(run, "id"), modelKey)
+	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+		return nil, qualificationDenialUnavailable("sole MODEL effect is not confirmed")
+	}
+	modelRequest, _ := model["payload"].(map[string]any)
+	if modelRequest["capability"] != "MODEL" || modelRequest["route"] != frame.Route {
+		return nil, qualificationDenialUnavailable("earlier effect is not known MODEL")
+	}
+	var ledgerRows int
+	var ledgerRaw string
+	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, route.ProjectID, run["id"]).Scan(&ledgerRows, &ledgerRaw); err != nil || ledgerRows != 1 {
+		return nil, qualificationDenialUnavailable("monetary history differs")
+	}
+	ledgerBody, err := Decode([]byte(ledgerRaw))
+	if err != nil || ledgerBody["operation"] != "UNKNOWN" || ledgerBody["money"] != nil || ledgerBody["cost_basis"] != "UNKNOWN" || ledgerBody["provider_request_id"] != modelKey {
+		return nil, qualificationDenialUnavailable("known MODEL has no original unknown-cost ledger")
+	}
+	cause := Fail(503, "RESOURCE_UNAVAILABLE", "qualification grants no unplanned effect authority")
+	receipt := Object{
+		"schema": "researchos.qualification-pre-effect-rejection.v1", "kind": onlineQualificationDenial,
+		"project_id": route.ProjectID, "task_id": task["id"], "run_id": run["id"], "runtime_id": route.RuntimeID, "epoch": epoch,
+		"dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "task_hash": qualificationTaskHash(task), "plan_hash": planHash,
+		"profile_hash": admission["profile_hash"], "technical_hash": admission["technical_hash"],
+		"frame_sequence": frame.Sequence, "frame_type": frame.Type, "frame_capability": frame.Capability, "frame_route": frame.Route, "frame_key": frame.Key,
+		"frame_hash": Hash(frame), "raw_payload_hash": Digest(frame.Payload), "payload_hash": Hash(payload),
+		"stage": "BEFORE_PREPARE_EFFECT_TX", "outcome": "NO_EFFECT", "rule": "QUALIFICATION_MODEL_ONLY_V1",
+		"observed_at": Now(), "first_cause": cause.Error(), "zero_stage_snapshot_hash": Hash(Object{"effect_rows": effects, "ledger_rows": ledger}),
+	}
+	if err = rt.PersistQualificationRejection(bridge.Directory(), Bytes(receipt)); err != nil {
+		return nil, fmt.Errorf("qualification rejection persistence: %w", err)
+	}
+	return &qualificationPreEffectRejection{receipt: receipt, digest: Hash(receipt), cause: cause}, nil
+}
+
+func runtimeTechnicalHashMust(tx *sql.Tx, project, runtimeID string) string {
+	runtime, err := load(tx, project, "RuntimeRegistration", runtimeID)
+	if err != nil {
+		return ""
+	}
+	return runtimeTechnicalHash(runtime)
+}
+
+type verifiedQualificationFailure struct {
+	subject     qualificationFailureSubject

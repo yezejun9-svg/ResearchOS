@@ -1,0 +1,42 @@
+
+    versions, err = backupMigrations(f.db)
+    if err != nil || Hash(versions) != Hash(upgradeVersions(22)) { t.Fatal("public fixture changed schema version") }
+    finalSchema, err := backupSchema(f.db)
+    if err != nil || finalSchema != schemaBefore { t.Fatal("public fixture changed schema") }
+    finalRows, err := upgradeRows(f.db)
+    if err != nil { t.Fatal(err) }
+    var phaseReceipts int
+    if err = f.db.QueryRow("SELECT count(*) FROM client_control_receipts WHERE kind='FIXTURE_PHASE'").Scan(&phaseReceipts); err != nil || phaseReceipts != 6 {
+        t.Fatal("historical phase fixture receipt coverage mismatch")
+    }
+    runEpoch, err := Num(run.run, "lease_epoch")
+    if err != nil { t.Fatal(err) }
+    if err = f.db.Close(); err != nil { t.Fatal(err) }
+    for _, path := range []string{opt.Source, opt.Snapshot, opt.Destination, opt.KeyFile} {
+        if err = historical22FixturePath(request.FixtureRoot, path); err != nil { t.Fatal(err) }
+    }
+    dbBytes, err := os.ReadFile(opt.Source)
+    if err != nil { t.Fatal(err) }
+    executable, err := os.Executable()
+    if err != nil { t.Fatal(err) }
+    executableBytes, err := os.ReadFile(executable)
+    if err != nil { t.Fatal(err) }
+    result := historical22BridgeResult{
+        Profile: historical22BridgeProfile, Nonce: request.Nonce,
+        Source: opt.Source, Snapshot: opt.Snapshot, Destination: opt.Destination, KeyFile: opt.KeyFile,
+        SourceRoot: codeRoot, SourceProgram: executable, SourceProgramSHA: Digest(executableBytes),
+        SourceDatabaseSHA: Digest(dbBytes), SourceSchemaSHA: finalSchema, SourceRowsSHA: Hash(finalRows),
+        InputManifestSHA: Digest(historical22BridgeInputs), Versions: versions,
+        Project: f.project, Session: sid, RunID: Str(run.run, "id"), RunEpoch: runEpoch,
+        Commands: commands, FixturePhaseReceiptCount: phaseReceipts, ExternalDispatchCount: 0,
+    }
+    // Only selected public fields are serialized. No Owner or credential field,
+    // claim response, lease token, key bytes, environment, or arbitrary DB rows.
+    fmt.Println(historical22BridgePrefix + string(Bytes(result)))
+    var release historical22BridgeRelease
+    if err = decoder.Decode(&release); err != nil { t.Fatal("fixture parent release channel closed") }
+    if release.Profile != historical22BridgeProfile || release.Nonce != request.Nonce || !release.Release {
+        t.Fatal("fixture parent release mismatch")
+    }
+}
+

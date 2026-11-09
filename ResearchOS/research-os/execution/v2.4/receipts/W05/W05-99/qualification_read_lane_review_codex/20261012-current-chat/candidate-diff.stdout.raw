@@ -1,0 +1,354 @@
+diff --git a/apps/desktop/main/lib/ipc.js b/apps/desktop/main/lib/ipc.js
+index f0190af8..003a06e5 100644
+--- a/apps/desktop/main/lib/ipc.js
++++ b/apps/desktop/main/lib/ipc.js
+@@ -9,6 +9,9 @@
+ const host = require('./host.js');
+ const native = require('./native.js');
+ const v2 = require('./v2.js');
++// Only Main holds this local call option. It is never decoded from an IPC body.
++const AUTHORITY_READ = Symbol('qualification-authority-read');
++const AUTHORITY_READ_METHODS = new Set(['session.get', 'host.status']);
+ 
+ // The names the renderer may call. The preload file is checked against this list by tests/ui/check, so a
+ // channel added here without a bridge entry, or a bridge entry added without a handler, fails the suite.
+@@ -57,7 +60,16 @@ async function callCore(deps, client, method, body) {
+ //
+ // The credential is never invented: deps.credential (or RESEARCHOS_HOST_CREDENTIAL) supplies a bearer the host
+ // issued, and its absence is reported as CREDENTIAL_ABSENT rather than as a completed action.
+-async function callV2Internal(deps, method, payload, localOrigin) {
++async function callV2Internal(deps, method, payload, localOrigin, readPurpose) {
++  const state = deps.sessionState || {};
++  const authorityRead = readPurpose === AUTHORITY_READ && AUTHORITY_READ_METHODS.has(method);
++  const entryContext = [state.projectId, state.sessionId, state.expectedRevision, state.writerEpoch,
++    state.writerClientId, state.writerExpiresAt, state.selectionGeneration, state.authorityGeneration];
++  const writes = (callV2.writeSequences ||= new WeakMap());
++  const entryWriteSequence = writes.get(state) || 0;
++  const contextUnchanged = () => [state.projectId, state.sessionId, state.expectedRevision, state.writerEpoch,
++    state.writerClientId, state.writerExpiresAt, state.selectionGeneration, state.authorityGeneration]
++    .every((value, index) => value === entryContext[index]);
+   const started = await host.ensureCore(deps);
+   if (!started.discovery) return { ok: false, reason: started.health, method };
+   // Local-only receipt metadata. This is derived from native discovery, never
+@@ -77,7 +89,6 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+     try { const origin=nativeOrigin(started.discovery); statusHostKey=origin.key; localOrigin.ref=origin.ref; }
+     catch { return {ok:false,reason:'HOST_IDENTITY_UNAVAILABLE',method,dispatch_state:'NOT_SENT'}; }
+   }
+-  const state = deps.sessionState || {};
+   const exact = await import('./wire-values.mjs');
+   let payloadKey;
+   try { payloadKey = exact.stringify(payload || {}); } catch { return {ok:false,reason:'INVALID_LOCAL_VALUE',method}; }
+@@ -86,6 +97,8 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+   if (!lifetimes.has(state)) lifetimes.set(state,new Map());
+   const operations = lifetimes.get(state);
+   const barrier = () => [...operations.values()].find(operation=>operation.write || operation.acknowledged);
++  if (authorityRead && (barrier() || !contextUnchanged() || (writes.get(state) || 0) !== entryWriteSequence))
++    return {ok:false,reason:'STALE_RESPONSE',method};
+   const pending = barrier();
+   const replay = pending && pending.method === method && pending.payloadKey === payloadKey;
+   const write = v2.WRITE_METHODS.includes(method) || method === 'host.configure' || (method === 'session.attach' && payload?.request_write_owner === true);
+@@ -133,11 +146,18 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+     : v2.envelopeFor(identity,envelopeState,method,payload || {});
+   if (!req.ok) return {ok:false,reason:req.reason,method,...(replay?{}:{dispatch_state:'NOT_SENT'})};
+   if (typeof deps.v2Transport !== 'function') return {ok:false,reason:'VALIDATOR_UNAVAILABLE',method,...(replay?{}:{dispatch_state:'NOT_SENT'})};
+-  const sequence = (callV2.sequences ||= new WeakMap());
+-  const ticket = (sequence.get(state) || 0) + 1; sequence.set(state,ticket);
++  // Presentation reads race only with newer reads of the same method. A Main
++  // authority read has no presentation ticket and cannot be displaced by polls.
++  const sequences = (callV2.sequences ||= new WeakMap());
++  if (!sequences.has(state)) sequences.set(state,new Map());
++  const sequence = sequences.get(state);
++  const presentationRead = !write && !authorityRead;
++  const ticket = presentationRead ? (sequence.get(method) || 0) + 1 : null;
++  if (presentationRead) sequence.set(method,ticket);
+   const operation = replay ? pending : {method,payloadKey,commandId:identity.commandId,write,hostKey,hostOriginRef:localOrigin.ref,original,possiblySent:false,
+     request:{...req,headers:{'Content-Type':'application/json'}},acknowledged:false};
+   operation.inFlight=true;operations.set(identity.commandId,operation);
++  if (write && !replay) writes.set(state,(writes.get(state) || 0) + 1);
+   let reply;
+   try { reply = await deps.v2Transport(req.verb,started.discovery.url + req.path,req.payload,req.headers); }
+   catch { operation.inFlight=false; operation.possiblySent=true; return {ok:false,reason:'TRANSPORT_FAILURE',method}; }
+@@ -161,7 +181,8 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+     return {ok:false,reason:reply?.reason || 'MALFORMED_HOST_REPLY',http_status:reply?.http_status,method,...(definitelyUnsent ? {dispatch_state:'NOT_SENT'} : {})};
+   }
+   const body=reply.body;
+-  const tupleUnchanged = ['projectId','sessionId','expectedRevision','writerEpoch'].every(key=>state[key]===original[key]);
++  const tupleUnchanged = ['projectId','sessionId','expectedRevision','writerEpoch',
++    'selectionGeneration','authorityGeneration'].every(key=>state[key]===original[key]);
+   if (body.status==='ACKNOWLEDGED') {
+     // Store only public command bytes/identity, never the bearer header.
+     operation.acknowledged=true;
+@@ -172,7 +193,9 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+   operations.delete(identity.commandId);
+   if (barrier()) state.pendingOperation=barrier(); else delete state.pendingOperation;
+   if (body.status==='REJECTED') return {ok:false,completed:false,method,protocol_status:body.status,kind:body.status,error_code:body.error_code,error:body.error,reason:body.error_code};
+-  if (sequence.get(state)!==ticket || !tupleUnchanged) return {ok:false,reason:'STALE_RESPONSE',method,
++  if ((presentationRead && sequence.get(method)!==ticket) || !tupleUnchanged ||
++      (authorityRead && (!contextUnchanged() || (writes.get(state) || 0) !== entryWriteSequence || barrier())))
++    return {ok:false,reason:'STALE_RESPONSE',method,
+     ...(method==='host.configure'?{local_terminal_result:body.result}:{})};
+   const value=body.result;
+   const snapshot = value?.snapshot || (['session.get','session.create','session.update'].includes(method) ? value : null);
+@@ -188,9 +211,9 @@ async function callV2Internal(deps, method, payload, localOrigin) {
+     result:value,revision:body.revision,requests:[method]};
+ }
+ 
+-async function callV2(deps, method, payload) {
++async function callV2(deps, method, payload, readPurpose) {
+   const localOrigin={ref:null};
+-  const reply=await callV2Internal(deps,method,payload,localOrigin);
++  const reply=await callV2Internal(deps,method,payload,localOrigin,readPurpose);
+   if (method !== 'host.status' && method !== 'host.configure') return reply;
+   return {...reply,local_host_origin:localOrigin.ref};
+ }
+@@ -320,5 +343,5 @@ function register(ipcMain, deps) {
+   return registered;
+ }
+ 
+-module.exports = { BRIDGE, CHANNELS, callCore, register, callV2, registerV2, registerDesktopReview,
++module.exports = { BRIDGE, CHANNELS, AUTHORITY_READ, callCore, register, callV2, registerV2, registerDesktopReview,
+   registerDesktopQualification, registerDesktopCoding, V2_METHODS: v2.METHODS };
+diff --git a/apps/desktop/main/main.js b/apps/desktop/main/main.js
+index 58883e90..2464b164 100644
+--- a/apps/desktop/main/main.js
++++ b/apps/desktop/main/main.js
+@@ -202,7 +202,7 @@ async function prepareQualificationScope() {
+   const projectId = sessionState.projectId, sessionId = sessionState.sessionId;
+   const selectionGeneration = sessionState.selectionGeneration;
+   desktopManagement.currentHost();
+-  const opened = await ipc.callV2(v2Deps, 'session.get', {});
++  const opened = await ipc.callV2(v2Deps, 'session.get', {}, ipc.AUTHORITY_READ);
+   desktopManagement.currentHost();
+   if (!opened?.completed || opened.result?.project_id !== projectId || opened.result?.session_id !== sessionId ||
+       sessionState.projectId !== projectId || sessionState.sessionId !== sessionId ||
+@@ -213,7 +213,7 @@ async function prepareQualificationScope() {
+       String(snapshot.writer?.epoch) !== String(sessionState.writerEpoch) ||
+       String(snapshot.revision) !== String(sessionState.expectedRevision))
+     throw Object.assign(new Error('WRITE_OWNER_REQUIRED'), { code: 'WRITE_OWNER_REQUIRED' });
+-  const status = await ipc.callV2(v2Deps, 'host.status', {});
++  const status = await ipc.callV2(v2Deps, 'host.status', {}, ipc.AUTHORITY_READ);
+   const currentHost = desktopManagement.currentHost();
+   if (qualificationContext() !== context || !status?.completed ||
+       status.local_host_origin !== crypto.createHash('sha256').update(JSON.stringify([
+diff --git a/tests/ui/desktop/http-wire-boundary.test.mjs b/tests/ui/desktop/http-wire-boundary.test.mjs
+index 3e0d6d06..9e4fcb01 100644
+--- a/tests/ui/desktop/http-wire-boundary.test.mjs
++++ b/tests/ui/desktop/http-wire-boundary.test.mjs
+@@ -12,9 +12,49 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.
+ const fixtures = JSON.parse(fs.readFileSync(path.join(ROOT,'tests/contracts/fixtures/client_protocol_v2_fixtures.json'),'utf8')).fixtures;
+ const get = name => structuredClone(fixtures.find(f=>f.name===name)?.value);
+ const ipc = require(path.join(ROOT,'apps/desktop/main/lib/ipc.js'));
++const {createDesktopManagement} = require(path.join(ROOT,'apps/desktop/main/lib/desktop-management.js'));
+ const v2 = require(path.join(ROOT,'apps/desktop/main/lib/v2.js'));
+ const { createTransport } = require(path.join(ROOT,'apps/desktop/main/lib/http-wire.js'));
+ const exact = await import(pathToFileURL(path.join(ROOT,'apps/desktop/main/lib/wire-values.mjs')).href);
++// Bind the exact Main implementation and its Proxy generation logic. These
++// fixtures exercise real IPC calls through the packaged validator below.
++const mainSource = fs.readFileSync(path.join(ROOT,'apps/desktop/main/main.js'),'utf8');
++const qualificationBegin = mainSource.indexOf('async function prepareQualificationScope() {');
++const qualificationEnd = mainSource.indexOf('\nconst codingDirectories',qualificationBegin);
++const stateBegin = mainSource.indexOf('const sessionState = new Proxy(selectedState,');
++const stateEnd = mainSource.indexOf('// Raw startup diagnostics',stateBegin);
++assert(qualificationBegin >= 0 && qualificationEnd > qualificationBegin && stateBegin >= 0 && stateEnd > stateBegin);
++const actualPrepareSource = mainSource.slice(qualificationBegin,qualificationEnd);
++const actualStateSource = mainSource.slice(stateBegin,stateEnd);
++const deferred = () => {let release;const promise=new Promise(resolve=>release=resolve);return {promise,release};};
++function qualificationState() {
++  const s=snapshot();
++  const selectedState={projectId:s.project_id,sessionId:s.session_id,expectedRevision:s.revision,
++    writerEpoch:s.writer.epoch,writerClientId:s.writer.client_id,writerExpiresAt:s.writer.expires_at,
++    selectionGeneration:0,authorityGeneration:0};
++  return Function('selectedState',actualStateSource+'\nreturn {sessionState,qualificationContext};')(selectedState);
++}
++async function qualificationFixture(intercept=async()=>{}, options={}) {
++  const {sessionState,qualificationContext}=qualificationState();
++  const hits=[];
++  const h=await harness(async raw=>{
++    const env=JSON.parse(raw);hits.push(env.method);
++    await intercept(env,hits);
++    const response=pair(env.method).response;response.command_id=env.command_id;
++    options.modifyResponse?.(env,response);
++    return {body:response};
++  },{state:sessionState});
++  const identity=pid=>({PID:pid,CreatedNS:String(pid)+'000000000',ImageSHA256:'a'.repeat(64)});
++  const machine=createDesktopManagement({fsImpl:h.deps.fsImpl,discoveryFile:h.deps.discoveryFile,
++    dataRoot:'fixture-data-root',context:qualificationContext,observeProcess:identity});
++  machine.state='READY';machine.child={pid:1234};machine.hostId='host-aaaaaaaaaaaa';
++  machine.identity=identity(1234);machine.parentIdentity=identity(process.pid);
++  const v2Deps={...h.deps,contextVerified:true};
++  const prepare=Function('v2Deps','sessionState','desktopManagement','qualificationContext','ipc','crypto',
++    actualPrepareSource+'\nreturn prepareQualificationScope;')(
++      v2Deps,sessionState,machine,qualificationContext,ipc,crypto);
++  return {...h,hits,sessionState,qualificationContext,machine,prepare,sourceHash:crypto.createHash('sha256').update(actualPrepareSource).digest('hex')};
++}
+ export function snapshot(overrides = {}) {
+   const value=get('valid_snapshot');
+   value.writer={client_id:'desktop-shell',epoch:2,expires_at:'2099-01-01T00:00:00Z'};
+@@ -249,7 +289,7 @@ const more={
+  'model-config/host-switch-during-credential-before-send':async()=>{const p=pair('host.configure');const h=await harness(()=>{throw Error('must not dispatch')},{state:{projectId:'fixture_project',sessionId:null,expectedRevision:null,writerEpoch:null}});let hostId='host-aaaaaaaaaaaa';h.deps.fsImpl.readFileSync=()=>JSON.stringify({url:h.url,pid:1234,data_dir:'fixture-data-root',host_instance_id:hostId});h.deps.credentialFor=async()=>{hostId='host-bbbbbbbbbbbb';return 'public-fixture-only'};try{const result=await ipc.callV2(h.deps,'host.configure',p.request.payload);assert.equal(result.reason,'HOST_CHANGED_BEFORE_SEND');assert.equal(result.dispatch_state,'NOT_SENT');assert.equal(h.observations.http.length,0);}finally{await h.close();}},
+  'model-config/origin-is-native-not-remote':async()=>{const h=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.status').response;response.command_id=env.command_id;response.result.host_instance_id='host-ffffffffffff';return {body:response};});try{const status=await ipc.callV2(h.deps,'host.status',{});assert.equal(status.completed,true);assert.equal(status.result.host_instance_id,'host-ffffffffffff');const expected=crypto.createHash('sha256').update(JSON.stringify(['host-aaaaaaaaaaaa','fixture-data-root'])).digest('hex');assert.equal(status.local_host_origin,expected);}finally{await h.close();}},
+  'model-config/completed-keeps-origin-after-host-switch':async()=>{const p=pair('host.configure');let release,arrived;const ready=new Promise(resolve=>arrived=resolve);const a=await harness(async raw=>{const env=JSON.parse(raw);arrived();await new Promise(resolve=>release=resolve);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);assert.equal(env.method,'host.status');const response=pair('host.status').response;response.command_id=env.command_id;return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const completion=ipc.callV2(a.deps,'host.configure',p.request.payload);await ready;discovery={url:b.url,pid:2,data_dir:'root-B',host_instance_id:'host-bbbbbbbbbbbb'};release();const done=await completion;const status=await ipc.callV2(a.deps,'host.status',{});assert.equal(done.completed,true);assert.notEqual(done.local_host_origin,status.local_host_origin);assert.equal(done.result.model_config_ref,p.response.result.model_config_ref);assert.equal(a.observations.http.length,1);assert.equal(b.observations.http.length,1);}finally{if(release)release();await a.close();await b.close();}},
+- 'model-config/stale-keeps-terminal-result-and-origin':async()=>{const p=pair('host.configure');let release,arrived;const ready=new Promise(resolve=>arrived=resolve);const a=await harness(async raw=>{const env=JSON.parse(raw);arrived();await new Promise(resolve=>release=resolve);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);assert.equal(env.method,'host.status');const response=pair('host.status').response;response.command_id=env.command_id;return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const completion=ipc.callV2(a.deps,'host.configure',p.request.payload);await ready;discovery={url:b.url,pid:2,data_dir:'root-B',host_instance_id:'host-bbbbbbbbbbbb'};const statusPromise=ipc.callV2(a.deps,'host.status',{});while((ipc.callV2.sequences.get(a.deps.sessionState)||0)<2)await new Promise(resolve=>setTimeout(resolve,10));release();const status=await statusPromise;const stale=await completion;assert.equal(stale.reason,'STALE_RESPONSE');assert.equal(stale.local_terminal_result.model_config_ref,p.response.result.model_config_ref);assert.deepEqual(stale.local_terminal_result.provider_id,p.request.payload.provider_id);assert.notEqual(stale.local_host_origin,status.local_host_origin);assert.equal(a.observations.http.length,1);assert.equal(b.observations.http.length,1);}finally{if(release)release();await a.close();await b.close();}},
++ 'model-config/concurrent-status-keeps-terminal-result-and-origin':async()=>{const p=pair('host.configure');let release,arrived;const ready=new Promise(resolve=>arrived=resolve);const a=await harness(async raw=>{const env=JSON.parse(raw);arrived();await new Promise(resolve=>release=resolve);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);assert.equal(env.method,'host.status');const response=pair('host.status').response;response.command_id=env.command_id;return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const completion=ipc.callV2(a.deps,'host.configure',p.request.payload);await ready;discovery={url:b.url,pid:2,data_dir:'root-B',host_instance_id:'host-bbbbbbbbbbbb'};const queued=deferred(),original=a.deps.v2Transport;a.deps.v2Transport=(...args)=>{queued.release();return original(...args);};const statusPromise=ipc.callV2(a.deps,'host.status',{});await queued.promise;release();const [done,status]=await Promise.all([completion,statusPromise]);assert.equal(done.completed,true);assert.equal(done.result.model_config_ref,p.response.result.model_config_ref);assert.deepEqual(done.result.provider_id,p.request.payload.provider_id);assert.notEqual(done.local_host_origin,status.local_host_origin);assert.equal(a.observations.http.length,1);assert.equal(b.observations.http.length,1);}finally{if(release)release();await a.close();await b.close();}},
+  'model-config/same-logical-host-new-url-replays':async()=>{const p=pair('host.configure');const a=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.configure','ACKNOWLEDGED').response;response.command_id=env.command_id;return {body:response};});const b=await harness(raw=>{const env=JSON.parse(raw);const response=pair('host.configure').response;response.command_id=env.command_id;Object.assign(response.result,env.payload);return {body:response};});let discovery={url:a.url,pid:1,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};a.deps.fsImpl.readFileSync=()=>JSON.stringify(discovery);try{const ack=await ipc.callV2(a.deps,'host.configure',p.request.payload);assert.equal(ack.protocol_status,'ACKNOWLEDGED');discovery={url:b.url,pid:999,data_dir:'root-A',host_instance_id:'host-aaaaaaaaaaaa'};const done=await ipc.callV2(a.deps,'host.configure',p.request.payload);assert.equal(done.completed,true);assert.equal(done.local_host_origin,ack.local_host_origin);assert.deepEqual(JSON.parse(a.observations.http[0].raw),JSON.parse(b.observations.http[0].raw));}finally{await a.close();await b.close();}},
+  'model-config/status-credential-switch-refused-before-send':async()=>{
+    const a=await harness(()=>{throw Error('old host status must not be sent')});
+@@ -294,6 +334,158 @@ async function firstUsePending(stage) {
+ more['first-use/workspace-ack']=()=>firstUsePending('workspace.register');more['first-use/bootstrap-ack']=()=>firstUsePending('project.bootstrap');
+ if(direct && !process.versions.electron)for(const [name,run] of Object.entries(more))test('desktop-http/'+name,{timeout:45000},run);
+ 
++if(direct && !process.versions.electron) {
++  test('qualification-lane/R01 isolated real Main scope',{timeout:45000},async()=>{
++    const h=await qualificationFixture();try{
++      const result=await h.prepare();
++      assert.equal(result.scope.modelRef,'fixture_config_1');
++      assert.deepEqual(h.hits,['session.get','host.status']);
++      assert.equal(h.observations.children.length,4);
++      assert.equal(h.sourceHash,crypto.createHash('sha256').update(actualPrepareSource).digest('hex'));
++    }finally{await h.close();}
++  });
++  for(const [id,blocked,poll] of [
++    ['R02','host.status','session.events'],['R03','session.get','session.events'],
++    ['R04','host.status','host.status'],['R05','session.get','session.get']]) {
++    test(`qualification-lane/${id} ${blocked} overlapped by ${poll}`,{timeout:45000},async()=>{
++      const arrived=deferred(),gate=deferred();let held=false;
++      const h=await qualificationFixture(async env=>{if(env.method===blocked&&!held){held=true;arrived.release();await gate.promise;}});
++      try{
++        const prepared=h.prepare();await arrived.promise;
++        const queued=deferred(),original=h.deps.v2Transport;
++        h.deps.v2Transport=(...args)=>{queued.release();return original(...args);};
++        const display=ipc.callV2(h.deps,poll,poll==='session.events'?pair(poll).request.payload:{});
++        await queued.promise;gate.release();
++        const scope=await prepared;
++        const shown=await display;assert.equal(shown.completed,true,JSON.stringify(shown));
++        assert.equal(scope.scope.modelRef,'fixture_config_1');
++        assert.equal(h.hits.filter(method=>method===poll).length,poll===blocked?2:1);
++        assert.equal(h.observations.children.length,h.hits.length*2);
++      }finally{gate.release();await h.close();}
++    });
++  }
++  test('qualification-lane/R06 presentation methods isolate and same-method newest wins',{timeout:45000},async()=>{
++    const first=deferred(),gate=deferred();let count=0;
++    const h=await qualificationFixture(async env=>{if(env.method==='session.get'&&++count===1){first.release();await gate.promise;}});
++    try{
++      const old=ipc.callV2(h.deps,'session.get',{});await first.promise;
++      const queued=deferred(),original=h.deps.v2Transport;let queuedCount=0;
++      h.deps.v2Transport=(...args)=>{if(++queuedCount===2)queued.release();return original(...args);};
++      const eventsPromise=ipc.callV2(h.deps,'session.events',pair('session.events').request.payload);
++      const latestPromise=ipc.callV2(h.deps,'session.get',{});
++      await queued.promise;gate.release();const stale=await old;
++      const [events,latest]=await Promise.all([eventsPromise,latestPromise]);
++      assert.equal(events.completed,true);assert.equal(latest.completed,true);
++      assert.equal(stale.reason,'STALE_RESPONSE');assert.deepEqual(h.hits,['session.get','session.events','session.get']);
++    }finally{gate.release();await h.close();}
++  });
++  for(const [id,field,changed,original,returnToA] of [
++    ['R07','projectId','other-project','fixture_project',false],
++    ['R07','projectId','other-project','fixture_project',true],
++    ['R07','sessionId','other-session','fixture_session',false],
++    ['R07','sessionId','other-session','fixture_session',true],
++    ['R08','expectedRevision',2,1,true],
++    ['R08','writerEpoch',3,2,true],
++    ['R08','writerClientId','other-client','desktop-shell',true],
++    ['R08','writerExpiresAt','2098-01-01T00:00:00Z','2099-01-01T00:00:00Z',true]]) {
++    test(`qualification-lane/${id} Main Proxy ${field} ${returnToA?'ABA':'change'} fence`,{timeout:45000},async()=>{
++      const arrived=deferred(),gate=deferred();let held=false;
++      const hold=id==='R07'?'session.get':'host.status';
++      const h=await qualificationFixture(async env=>{if(env.method===hold&&!held){held=true;arrived.release();await gate.promise;}});
++      try{
++        const pending=h.prepare().then(()=>({ok:true}),e=>({ok:false,reason:e.code||e.message}));
++        await arrived.promise;
++        const before=h.sessionState[id==='R07'?'selectionGeneration':'authorityGeneration'];
++        h.sessionState[field]=changed;
++        if(returnToA)h.sessionState[field]=original;
++        assert.equal(h.sessionState[id==='R07'?'selectionGeneration':'authorityGeneration'],before+(returnToA?2:1));
++        gate.release();const result=await pending;
++        assert.equal(result.ok,false);assert.equal(result.reason,id==='R07'?'SESSION_CHANGED':'HOST_OR_CONTEXT_CHANGED');
++        assert.equal(h.observations.http.length,id==='R07'?1:2);
++      }finally{gate.release();await h.close();}
++    });
++  }
++  test('qualification-lane/R09 write reservation invalidates pending scope',{timeout:45000},async()=>{
++    const arrived=deferred(),gate=deferred();let held=false;
++    const h=await qualificationFixture(async env=>{if(env.method==='host.status'&&!held){held=true;arrived.release();await gate.promise;}});
++    try{
++      const pending=h.prepare().then(()=>({ok:true}),e=>({ok:false,reason:e.code||e.message}));await arrived.promise;
++      const queued=deferred(),original=h.deps.v2Transport;
++      h.deps.v2Transport=(...args)=>{queued.release();return original(...args);};
++      const sendPromise=ipc.callV2(h.deps,'session.send',pair('session.send').request.payload);
++      await queued.promise;gate.release();const result=await pending;
++      const sent=await sendPromise;assert.equal(sent.completed,true,JSON.stringify(sent));
++      assert.equal(result.ok,false);assert.equal(result.reason,'HOST_OR_CONTEXT_CHANGED');
++      assert.deepEqual(h.hits,['session.get','host.status','session.send']);
++    }finally{gate.release();await h.close();}
++  });
++  test('qualification-lane/R16 Main writer and model checks stay enforced',{timeout:45000},async()=>{
++    const h=await qualificationFixture(async()=>{},{modifyResponse:(env,response)=>{
++      if(env.method==='session.get')response.result.writer.client_id='foreign';
++    }});try{
++      const refused=await h.prepare().then(()=>({ok:true}),e=>({reason:e.code||e.message}));
++      assert.equal(refused.reason,'WRITE_OWNER_REQUIRED');
++      assert.deepEqual(h.hits,['session.get']);
++    }finally{await h.close();}
++  });
++  test('qualification-lane/R16 unavailable model remains refused',{timeout:45000},async()=>{
++    const h=await qualificationFixture(async()=>{},{modifyResponse:(env,response)=>{
++      if(env.method==='session.get')response.result.model_config_ref='missing-model';
++    }});try{
++      const refused=await h.prepare().then(()=>({ok:true}),e=>({reason:e.code||e.message}));
++      assert.equal(refused.reason,'SESSION_MODEL_UNAVAILABLE');
++      assert.deepEqual(h.hits,['session.get','host.status']);
++    }finally{await h.close();}
++  });
++  test('qualification-lane/R17 renderer body cannot select authority lane',{timeout:45000},async()=>{
++    const h=await qualificationFixture();const handlers=new Map();
++    ipc.registerV2({handle:(channel,handler)=>handlers.set(channel,handler)},h.deps);
++    try{
++      const forged={readPurpose:'qualification-authority-read',readLane:'authority',context:h.qualificationContext()};
++      const result=await handlers.get('ros:v2:session.get')({},forged);
++      assert.match(result.reason,/^(UNEXPECTED_PAYLOAD_KEYS|INVALID_REQUEST_SCHEMA)/);
++      assert.equal(h.observations.http.length,0);
++      assert.equal(handlers.has('ros:v2:qualification:authority'),false);
++    }finally{await h.close();}
++  });
++  test('qualification-lane/R19 CANCEL reservation fences pending Main scope',{timeout:45000},async()=>{
++    const arrived=deferred(),gate=deferred();let held=false;
++    const h=await qualificationFixture(async env=>{if(env.method==='host.status'&&!held){held=true;arrived.release();await gate.promise;}});
++    try{
++      const pending=h.prepare().then(()=>({ok:true}),e=>({reason:e.code||e.message}));await arrived.promise;
++      const queued=deferred(),original=h.deps.v2Transport;
++      h.deps.v2Transport=(...args)=>{queued.release();return original(...args);};
++      const cancelPromise=ipc.callV2(h.deps,'session.control',pair('session.control').request.payload);
++      await queued.promise;gate.release();
++      const [scope,cancel]=await Promise.all([pending,cancelPromise]);
++      assert.equal(scope.reason,'HOST_OR_CONTEXT_CHANGED');
++      assert.equal(cancel.completed,true,JSON.stringify(cancel));
++      assert.deepEqual(h.hits,['session.get','host.status','session.control']);
++      assert.equal(h.observations.http.filter(row=>JSON.parse(row.raw).method==='session.control').length,1);
++    }finally{gate.release();await h.close();}
++  });
++  test('qualification-lane/R20 Main host quiesce blocks completion',{timeout:45000},async()=>{
++    const arrived=deferred(),gate=deferred();let held=false;
++    const h=await qualificationFixture(async env=>{if(env.method==='host.status'&&!held){held=true;arrived.release();await gate.promise;}});
++    try{
++      const pending=h.prepare().then(()=>({ok:true}),e=>({reason:e.code||e.message}));await arrived.promise;
++      h.machine.state='STOPPING';gate.release();const result=await pending;
++      assert.equal(result.reason,'MANAGEMENT_LINK_UNAVAILABLE');assert.deepEqual(h.hits,['session.get','host.status']);
++    }finally{gate.release();await h.close();}
++  });
++  test('qualification-lane/R20 actual control process replacement blocks completion',{timeout:45000},async()=>{
++    const arrived=deferred(),gate=deferred();let held=false;
++    const h=await qualificationFixture(async env=>{if(env.method==='host.status'&&!held){held=true;arrived.release();await gate.promise;}});
++    try{
++      const pending=h.prepare().then(()=>({ok:true}),e=>({reason:e.code||e.message}));await arrived.promise;
++      h.machine.observe=pid=>({PID:pid,CreatedNS:'replacement',ImageSHA256:'b'.repeat(64)});
++      gate.release();const result=await pending;
++      assert.equal(result.reason,'CONTROL_PROCESS_CHANGED');
++      assert.deepEqual(h.hits,['session.get','host.status']);
++    }finally{gate.release();await h.close();}
++  });
++}
++
+ function negativeResource(mode) {
+   const original=process.env.RESEARCHOS_DESKTOP_WIRE_ROOT;assert(original);
+   const parent=process.env.RESEARCHOS_DESKTOP_CASE_RECEIPT;assert(parent);

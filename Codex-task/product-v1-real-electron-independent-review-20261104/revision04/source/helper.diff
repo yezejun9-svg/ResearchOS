@@ -1,0 +1,37 @@
+--- freeze03/choose-owned-folder.ps1
++++ freeze04/choose-owned-folder.ps1
+@@ -13,8 +13,20 @@
+ $okAttempted = $false
+ $result = @{ schema='researchos.owned-native-folder-automation/2'; status='BLOCKED'; clicked_ok=$false; cleanup=@{ attempted=$false; status='NOT_NEEDED' } }
+ 
+-# These three functions are pure string/evidence predicates. Tests extract their
++# These functions are pure string/evidence predicates. Tests extract their
+ # actual AST bodies without running Add-Type, UIAutomation or this script body.
++function Convert-NativeDeadlineUtc($Value) {
++  if ($Value -isnot [string] -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z') {
++    throw 'NATIVE_UI_DEADLINE_UTC_WIRE_STRING_REQUIRED'
++  }
++  try {
++    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
++    return [DateTimeOffset]::ParseExact($Value, "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
++      [Globalization.CultureInfo]::InvariantCulture, $styles).UtcDateTime
++  } catch {
++    throw 'NATIVE_UI_DEADLINE_INVALID_UTC_WIRE_VALUE'
++  }
++}
+ function Convert-UiaAbsolutePath($Value) {
+   if ($null -eq $Value -or $Value -ceq '') { return $null }
+   if ($Value -isnot [string] -or $Value.Contains([char]0)) { throw 'UIA_MALFORMED_PATH_NO_OK' }
+@@ -60,10 +72,10 @@
+   $fixture = [IO.Path]::GetFullPath((Join-Path $runRoot 'workspace'))
+   $identityFile = [IO.Path]::GetFullPath($CoreIdentityPath)
+   if ($identityFile -ine (Join-Path $runRoot 'receipts\owned-core.json')) { throw 'IDENTITY_PATH_OUTSIDE_SCOPE' }
+-  $identity = Get-Content -LiteralPath $identityFile -Raw -Encoding UTF8 | ConvertFrom-Json
++  $identity = Get-Content -LiteralPath $identityFile -Raw -Encoding UTF8 | ConvertFrom-Json -DateKind String
+   if ($identity.scope_nonce -cne $ScopeNonce -or $identity.identity_source -cne 'ROS_DESKTOP_REPORT.ready_to_show') { throw 'CORE_IDENTITY_SOURCE_MISMATCH' }
+   $core = $identity.owned_core_identity
+-  $actionDeadline = [DateTimeOffset]::Parse($identity.action_deadline_utc).UtcDateTime
++  $actionDeadline = Convert-NativeDeadlineUtc $identity.action_deadline_utc
+   $cleanupDeadline = $actionDeadline.AddMilliseconds([int]$scope.deadlines.close_ms)
+   $coreId = [int]$core.pid
+   if ($coreId -le 0 -or $core.created_ns -cnotmatch '^[0-9]+$' -or $core.image_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'CORE_IDENTITY_INVALID' }

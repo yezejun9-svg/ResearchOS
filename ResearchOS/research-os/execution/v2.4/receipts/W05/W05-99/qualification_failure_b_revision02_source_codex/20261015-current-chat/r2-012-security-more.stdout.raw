@@ -1,0 +1,99 @@
+adapters/runtime/process_windows.go:20:func PrivateDirectory(path string) (string, error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:232:func (sid *SID) String() string {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:283:func (sid *SID) Equals(sid2 *SID) bool {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:505:	TokenUser = 1 + iota
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:708:// GetTokenUser retrieves access token t user account information.
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:709:func (t Token) GetTokenUser() (*Tokenuser, error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\security_windows.go:710:	i, e := t.getInfo(TokenUser, 50)
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:124:	realProcessUser, err := realProcessToken.GetTokenUser()
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:130:	pseudoProcessUser, err := pseudoProcessToken.GetTokenUser()
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:147:	_, err = pseudoThreadToken.GetTokenUser()
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:152:	pseudoThreadEffectiveUser, err := pseudoThreadEffectiveToken.GetTokenUser()
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:165:	pseudoThreadUser, err := pseudoThreadToken.GetTokenUser()
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\syscall_windows_test.go:1132:func TestNtCreateFileAndNtSetInformationFile(t *testing.T) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:808:func EqualSid(sid1 *SID, sid2 *SID) (isEqual bool) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:1872:func CreateFileMapping(fhandle Handle, sa *SecurityAttributes, prot uint32, maxSizeHigh uint32, maxSizeLow uint32, name *uint16) (handle Handle, err error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:1881:func CreateFile(name *uint16, access uint32, mode uint32, sa *SecurityAttributes, createmode uint32, attrs uint32, templatefile Handle) (handle Handle, err error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:2424:func GetFileInformationByHandle(handle Handle, data *ByHandleFileInformation) (err error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:2432:func GetFileInformationByHandleEx(handle Handle, class uint32, outBuffer *byte, outBufferLen uint32) (err error) {
+D:/作品集/ResearchOS/research-os/.local/tools/gopath/pkg/mod/golang.org/x/sys@v0.48.0/windows\zsyscall_windows.go:3730:func NtCreateFile(handle *Handle, access uint32, oa *OBJECT_ATTRIBUTES, iosb *IO_STATUS_BLOCK, allocationSize *int64, attributes uint32, share uint32, disposition uint32, options uint32, eabuffer uintptr, ealength uint32) (ntstatus error) {
+//go:build windows
+
+package runtime
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"strings"
+	"syscall"
+	"unicode/utf16"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// PrivateDirectory applies an inheritable, protected DACL, and reads the actual descriptor back.
+// os.Chmod alone does not restrict Windows access.
+func PrivateDirectory(path string) (string, error) {
+	u, e := user.Current()
+	if e != nil {
+		return "", e
+	}
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + u.Uid + ")")
+	if e != nil {
+		return "", e
+	}
+	acl, _, e := sd.DACL()
+	if e != nil {
+		return "", e
+	}
+	if e = windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); e != nil {
+		return "", e
+	}
+	actual, e := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if e != nil {
+		return "", e
+	}
+	text := actual.String()
+	if !strings.Contains(text, u.Uid) || !strings.Contains(text, "D:P") {
+		return "", errors.New("private DACL verification failed")
+	}
+	return text, nil
+}
+
+type process struct {
+	job, handle windows.Handle
+	pid         uint32
+	created     int64
+}
+
+func newJob(name string) (windows.Handle, error) {
+	n, e := windows.UTF16PtrFromString(name)
+	if e != nil {
+		return 0, e
+	}
+	h, e := windows.CreateJobObject(nil, n)
+	if e != nil {
+		return 0, e
+	}
+	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, e = windows.SetInformationJobObject(h, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); e != nil {
+		windows.CloseHandle(h)
+		return 0, e
+	}
+	return h, nil
+}
+
+// Job membership is assigned atomically at creation, before a suspended process can run.
+// This also closes the worker-crash gap between CreateProcess and AssignProcessToJobObject.
+func launch(job windows.Handle, c Command, env []string, stdin, stdout, stderr *os.File) (*process, error) {
+	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(stdout.Fd()), windows.Handle(stderr.Fd())}
+	for _, h := range handles {
+		if e := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
+			return nil, e
+		}
+		defer windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, 0)
+	}

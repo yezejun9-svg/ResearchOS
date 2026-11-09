@@ -1,0 +1,131 @@
+1: // backup is a local administrative command; it starts no server or worker.
+2: package main
+3: 
+4: import (
+5: 	"context"
+6: 	"crypto/rand"
+7: 	"database/sql"
+8: 	"encoding/json"
+9: 	"flag"
+10: 	"fmt"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"researchos.local/research-os/internal/domain"
+14: 	hostboundary "researchos.local/research-os/internal/host"
+15: 	"researchos.local/research-os/internal/store"
+16: 	"strconv"
+17: 	"strings"
+18: )
+19: 
+20: func main() {
+21: 	if e := run(); e != nil {
+22: 		fmt.Fprintln(os.Stderr, e)
+23: 		os.Exit(1)
+24: 	}
+25: }
+26: func run() error {
+27: 	if len(os.Args) < 2 {
+28: 		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+29: 	}
+30: 	command := os.Args[1]
+31: 	f := flag.NewFlagSet(command, flag.ContinueOnError)
+32: 	source := f.String("db", "", "existing source SQLite database")
+33: 	backup := f.String("backup", "", "existing encrypted backup directory")
+34: 	out := f.String("out", "", "new destination (must not exist)")
+35: 	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
+36: 	root := f.String("root", ".", "matching application repository root")
+37: 	asDataRoot := f.Bool("as-data-root", false, "restore an operational data root (researchos.sqlite plus fresh Host bindings)")
+38: 	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
+39: 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+40: 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+41: 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
+42:     handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+43:     handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+44: 	if e := f.Parse(os.Args[2:]); e != nil {
+45: 		return e
+46: 	}
+47: 	if f.NArg() != 0 {
+48: 		return fmt.Errorf("unexpected positional arguments")
+49: 	}
+50: 	if *keyfile == "" {
+51: 		return fmt.Errorf("--key-file required")
+52: 	}
+53: 	if command == "keygen" {
+54: 		key := make([]byte, 32)
+55: 		if _, e := rand.Read(key); e != nil {
+56: 			return e
+57: 		}
+58: 		f, e := os.OpenFile(*keyfile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+59: 		if e != nil {
+60: 			return e
+61: 		}
+62: 		defer f.Close()
+63: 		if _, e = f.Write(key); e != nil {
+64: 			return e
+65: 		}
+66: 		if e = f.Sync(); e != nil {
+67: 			return e
+68: 		}
+69: 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
+70: 		return nil
+71: 	}
+72: 	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+73: 		return fmt.Errorf("unknown command")
+74: 	}
+75: 	if *out == "" {
+76: 		return fmt.Errorf("--out required")
+77: 	}
+78:     if command == "upgrade-prepared-backup" {
+79:         r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
+80:             Upgrade: domain.LocalUpgradeOptions{
+81:                 Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+82:                 SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+83:                 TargetProgram: *targetProgram, Plan: *plan,
+84:             },
+85:             BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+86:         })
+87:         if e != nil { return e }
+88:         return json.NewEncoder(os.Stdout).Encode(r)
+89:     }
+90: 	if command == "upgrade-local" {
+91: 		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+92: 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+93: 			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+94: 			TargetProgram: *targetProgram, Plan: *plan,
+95: 		})
+96: 		if e != nil {
+97: 			return e
+98: 		}
+99: 		return json.NewEncoder(os.Stdout).Encode(r)
+100: 	}
+101: 	keyPath, e := filepath.Abs(*keyfile)
+102: 	if e != nil {
+103: 		return e
+104: 	}
+105: 	for _, dir := range []string{*out, *backup} {
+195: 	db, e := store.Open(*source)
+196: 	if e != nil {
+197: 		return e
+198: 	}
+199: 	defer db.Close()
+200: 	s := &domain.Service{DB: db, Contracts: contracts}
+201: 	var active int
+202: 	if e := db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.status')=?`,
+203: 		domain.KindWorkspaceBinding, domain.WorkspaceActive).Scan(&active); e != nil {
+204: 		return e
+205: 	}
+206: 	var m domain.BackupManifest
+207: 	if active == 0 {
+208: 		m, e = s.CreateBackup(ctx, *out, key)
+209: 	} else {
+210: 		h, hostErr := hostboundary.New(hostConfig(db, filepath.Dir(*source)))
+211: 		if hostErr != nil {
+212: 			return hostErr
+213: 		}
+214: 		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+215: 	}
+216: 	if e != nil {
+217: 		return e
+218: 	}
+219: 	return json.NewEncoder(os.Stdout).Encode(m)
+220: }

@@ -1,0 +1,59 @@
+From 1846ef315a2057d78ee9349379eb9557b66ea519 Mon Sep 17 00:00:00 2001
+From: ResearchOS Codex <researchos-codex@localhost>
+Date: Wed, 14 Oct 2026 01:52:56 +0800
+Subject: [PATCH] fix(host): recognize predeclared any in coding check
+ inventory
+
+---
+ internal/host/runtime_coding_windows.go      | 2 +-
+ internal/host/runtime_coding_windows_test.go | 7 ++++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/internal/host/runtime_coding_windows.go b/internal/host/runtime_coding_windows.go
+index 99cc6bd7..9a1edc61 100644
+--- a/internal/host/runtime_coding_windows.go
++++ b/internal/host/runtime_coding_windows.go
+@@ -321,7 +321,7 @@ func validateCodingCheckSources(ctx context.Context, root *os.Root, workspace st
+ 		}
+ 		// Detect direct helper calls which cannot be supplied by the selected
+ 		// compilation unit. Full semantic correctness remains the real check's job.
+-		builtins := map[string]bool{"append": true, "cap": true, "clear": true, "close": true, "complex": true, "copy": true, "delete": true, "imag": true, "len": true, "make": true, "max": true, "min": true, "new": true, "panic": true, "print": true, "println": true, "real": true, "recover": true, "string": true, "bool": true, "byte": true, "rune": true, "int": true, "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true, "uintptr": true, "float32": true, "float64": true, "complex64": true, "complex128": true, "error": true}
++		builtins := map[string]bool{"any": true, "append": true, "cap": true, "clear": true, "close": true, "complex": true, "copy": true, "delete": true, "imag": true, "len": true, "make": true, "max": true, "min": true, "new": true, "panic": true, "print": true, "println": true, "real": true, "recover": true, "string": true, "bool": true, "byte": true, "rune": true, "int": true, "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true, "uintptr": true, "float32": true, "float64": true, "complex64": true, "complex128": true, "error": true}
+ 		for _, file := range files {
+ 			var missing string
+ 			ast.Inspect(file, func(node ast.Node) bool {
+diff --git a/internal/host/runtime_coding_windows_test.go b/internal/host/runtime_coding_windows_test.go
+index 41740aa4..90dc87c8 100644
+--- a/internal/host/runtime_coding_windows_test.go
++++ b/internal/host/runtime_coding_windows_test.go
+@@ -36,7 +36,7 @@ func codingInventory(t *testing.T) (*os.Root, string, domain.RuntimeCodingCheck)
+ 	return root, workspace, domain.RuntimeCodingCheck{ID: "selected", Package: "./pkg", TestPattern: "^TestSelected$", SourcePaths: []string{"go.mod", "pkg/main.go", "pkg/main_test.go"}, ToolchainRoot: toolchain, TimeoutSeconds: 30, ProcessLimit: 8, MemoryMiB: 512, MaxTextBytes: 2048}
+ }
+ func TestProductCodingCheckInventory(t *testing.T) {
+-	for _, name := range []string{"complete", "missing_mod", "missing_sum", "missing_production", "missing_helper", "missing_import", "missing_embed", "zero_tests", "test_main", "test_init", "unanchored", "complete_import", "complete_embed"} {
++	for _, name := range []string{"complete", "complete_predeclared_any_conversion", "missing_mod", "missing_sum", "missing_production", "missing_helper", "missing_helper_with_any_conversion", "missing_import", "missing_embed", "zero_tests", "test_main", "test_init", "unanchored", "complete_import", "complete_embed"} {
+ 		t.Run(name, func(t *testing.T) {
+ 			root, workspace, check := codingInventory(t)
+ 			write := func(p, s string) {
+@@ -50,6 +50,8 @@ func TestProductCodingCheckInventory(t *testing.T) {
+ 				}
+ 			}
+ 			switch name {
++			case "complete_predeclared_any_conversion":
++				write("pkg/main.go", "package pkg\nfunc Value() any { return any(nil) }")
+ 			case "missing_mod":
+ 				check.SourcePaths = check.SourcePaths[1:]
+ 			case "missing_sum":
+@@ -58,6 +60,9 @@ func TestProductCodingCheckInventory(t *testing.T) {
+ 				write("pkg/other.go", "package pkg\nfunc Other(){}")
+ 			case "missing_helper":
+ 				write("pkg/main_test.go", "package pkg\nimport \"testing\"\nfunc TestSelected(t *testing.T){missingHelper(t)}")
++			case "missing_helper_with_any_conversion":
++				write("pkg/main.go", "package pkg\nfunc Value() any { return any(nil) }")
++				write("pkg/main_test.go", "package pkg\nimport \"testing\"\nfunc TestSelected(t *testing.T){missingHelper(any(nil))}")
+ 			case "missing_import", "complete_import":
+ 				write("pkg/main.go", "package pkg\nimport \"fixture.local/coding/helper\"\nfunc Value() int{return helper.Value()}")
+ 				write("helper/value.go", "package helper\nfunc Value()int{return 1}")
+-- 
+2.53.0.windows.1
+

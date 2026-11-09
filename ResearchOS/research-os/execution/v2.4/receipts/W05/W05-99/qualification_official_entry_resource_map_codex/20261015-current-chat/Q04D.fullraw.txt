@@ -1,0 +1,30 @@
+16: foreach($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)){
+17:  $reg=$null
+18:  try{
+19:   $reg=[Microsoft.Win32.RegistryKey]::OpenBaseKey($hive,$view)
+20:   foreach($sub in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Run','SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce','SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon')){
+21:    $key=$null
+22:    try{$key=$reg.OpenSubKey($sub,$false);$hits=@();if($null -eq $key){$status='ABSENT'}else{$status='READ';$names=if($sub -like '*Winlogon'){@('Userinit','Shell')}else{@($key.GetValueNames())};foreach($name in $names){$val=[string]$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($name -match $match -or $val -match $match){$hits+=@{name=$name;value=(Sanitize $val)}}}
+23:     $records.Add(@{kind='registry';hive=$hive.ToString();view=$view.ToString();path=$sub;status=$status;product_matches=$hits;match_count=$hits.Count})
+24:    }catch{$gaps.Add(@{kind='registry';hive=$hive.ToString();view=$view.ToString();path=$sub;status='UNKNOWN_READ_ERROR';error=$_.Exception.Message})}finally{if($key){$key.Dispose()}}
+25:   }
+26:   foreach($classSub in @('SOFTWARE\Classes','SOFTWARE\Microsoft\Active Setup\Installed Components')){
+27:    $key=$null
+28:    try{$key=$reg.OpenSubKey($classSub,$false);$hits=@();$scanned=0
+29:     if($null -eq $key){$status='ABSENT'}else{
+30:      $status='READ'
+31:      foreach($name in $key.GetSubKeyNames()){
+32:       $child=$null;$commandKey=$null
+33:       try{
+34:        $child=$key.OpenSubKey($name,$false);if($null -eq $child){continue};$scanned++
+35:        $default=[string]$child.GetValue('','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+36:        if($classSub -eq 'SOFTWARE\Classes'){$commandKey=$child.OpenSubKey('shell\open\command',$false);$command=if($commandKey){[string]$commandKey.GetValue('','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}else{''}}
+37:        else{$command=[string]$child.GetValue('StubPath','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}
+38:        if($name -match $match -or $default -match $match -or $command -match $match){$hits+=@{name=$name;default=(Sanitize $default);command=(Sanitize $command);url_protocol=($child.GetValueNames() -contains 'URL Protocol')}}
+39:       }catch{$gaps.Add(@{kind='registry-child';hive=$hive.ToString();view=$view.ToString();parent=$classSub;child_name_sha256=([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($name))).Replace('-','').ToLower());status='UNKNOWN_READ_ERROR';error_type=$_.Exception.GetType().FullName})}finally{if($commandKey){$commandKey.Dispose()};if($child){$child.Dispose()}}
+40:      }
+41:     }
+42:     $records.Add(@{kind='registry';hive=$hive.ToString();view=$view.ToString();path=$classSub;status=$status;entries_scanned=$scanned;product_matches=$hits;match_count=$hits.Count})
+43:    }catch{$gaps.Add(@{kind='registry';hive=$hive.ToString();view=$view.ToString();path=$classSub;status='UNKNOWN_READ_ERROR';error=$_.Exception.Message})}finally{if($key){$key.Dispose()}}
+44:   }
+45:  }catch{$gaps.Add(@{kind='registry-base';hive=$hive.ToString();view=$view.ToString();status='UNKNOWN_READ_ERROR';error=$_.Exception.Message})}finally{if($reg){$reg.Dispose()}}

@@ -1,0 +1,1 @@
+﻿[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); python -B -Xutf8 "$PSScriptRoot\verify.py" compare; exit $LASTEXITCODE

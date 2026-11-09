@@ -1,0 +1,32 @@
+--- freeze01/choose-owned-folder.ps1
++++ revision02/choose-owned-folder.ps1
+@@ -43,6 +43,11 @@
+ function Assert-ExactText([string]$Actual,[string]$Expected,[int]$Copied,[int]$Capacity) {
+   if ($Capacity -lt 2 -or $Copied -lt 0 -or $Copied -ge ($Capacity-1) -or
+     $Copied -ne $Actual.Length -or -not [string]::Equals($Actual,$Expected,[StringComparison]::Ordinal)) {throw 'INPUT_READBACK_NOT_EXACT_OR_TRUNCATED'}
++}
++function Assert-MessageDeadline([DateTime]$Now,[DateTime]$Limit) {
++  if ($Now.Kind -ne [DateTimeKind]::Utc -or $Limit.Kind -ne [DateTimeKind]::Utc -or $Now -ge $Limit) {
++    throw 'MESSAGE_SEND_DEADLINE_EXPIRED_OR_NON_UTC'
++  }
+ }
+ try {
+   Require ((Get-FileHash -LiteralPath $ScopePath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $ScopeSHA256) 'SCOPE_PIN'
+@@ -198,6 +203,7 @@
+     # Windows marshals these system messages; no custom LPWSTR or remote memory.
+     Assert-Core
+     if ((Discover-Edit) -ne $edit) {throw 'EDIT_CHANGED_IMMEDIATELY_BEFORE_INPUT'}
++    Assert-MessageDeadline ([DateTime]::UtcNow) $actionDeadline
+     $sent=[OwnedPathWin32]::SetText($edit,0x000C,[UIntPtr]::Zero,$Path,0x23,1000,[ref]$messageResult)
+     if ($sent -eq [IntPtr]::Zero) {$script:uncertain=$true;throw 'WM_SETTEXT_OUTCOME_UNKNOWN_NO_RETRY'}
+     if ($messageResult.ToUInt64() -ne 1) {throw 'WM_SETTEXT_REJECTED'}
+@@ -221,6 +227,9 @@
+     $fresh=[OwnedPathWin32]::GetDlgItem($Dialog,$Id);$now=Facts $fresh
+     if ($fresh -ne $button -or $now.parent -ne $Dialog.ToInt64() -or $now.class_name -cne 'Button' -or
+       -not $now.visible -or -not $now.enabled -or [OwnedPathWin32]::GetForegroundWindow() -ne $Dialog) {throw 'BUTTON_CHANGED_IMMEDIATELY_BEFORE_QUEUE'}
++    $messageDeadline=$actionDeadline
++    if ($ForCleanup) {$messageDeadline=$cleanupDeadline}
++    Assert-MessageDeadline ([DateTime]::UtcNow) $messageDeadline
+     $script:uncertain=$true
+     if ($Purpose -ceq 'INVALID_OK') {$script:invalidOkAttempted=$true}
+     if ($Purpose -ceq 'VALID_OK') {$script:validOkAttempted=$true}

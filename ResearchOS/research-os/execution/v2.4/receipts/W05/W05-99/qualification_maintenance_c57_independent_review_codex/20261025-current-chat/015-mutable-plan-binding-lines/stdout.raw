@@ -1,0 +1,173 @@
+internal/recoveryboundary/boot_windows.go
+611:// ReadBoundaryPlan returns evidence for a C preflight. Its return value is
+612:// serializable data, never authority to enter a transaction.
+613:func ReadBoundaryPlan(dataRoot, operationID, boundaryPlanSHA256 string) (EntryFencePlan, string, error) {
+614:	var zero EntryFencePlan
+615:	if !filepath.IsAbs(dataRoot) || !validOperation(operationID) || !validDigest(boundaryPlanSHA256) {
+616:		return zero, "", errors.New("boundary selector invalid")
+617:	}
+618:	p, e := discoverPlan(dataRoot, operationID, boundaryPlanSHA256)
+619:	if e != nil {
+620:		return zero, "", e
+621:	}
+622:	if e = ValidatePlan(p); e != nil {
+623:		return zero, "", e
+624:	}
+625:	if e = checkManagedChain(p); e != nil {
+626:		return zero, "", e
+627:	}
+628:	if e = checkAcceptanceFiles(p); e != nil {
+629:		return zero, "", e
+630:	}
+631:	r, e := readRecord(p)
+632:	if e != nil {
+633:		return zero, "", e
+634:	}
+635:	state := r.Events[len(r.Events)-1].State
+636:	if state == "BOOT_OBSERVED" {
+637:		if e = ValidateRestart(r.Pre, r.Post); e != nil {
+638:			return zero, "", e
+639:		}
+640:		if e = checkCurrentBoot(r.Post); e != nil {
+641:			return zero, "", e
+642:		}
+643:	}
+644:	return p, state, nil
+645:}
+646:
+{
+  "path": "internal/recoveryboundary/boot_windows.go",
+  "sha256": "96A287F36A0BCF6B9AAE6B92B079CC4F8175349E8B720BB2D65472648E3C1442"
+}
+internal/domain/qualification_failure_maintenance_windows.go
+400:	profileRef   Object
+401:	run          Object
+402:	task         Object
+403:	state        Object
+404:	dispatch     Object
+405:	observation  Object
+406:	modelBinding Object
+407:	native       historicalQualificationNative
+408:	source       HistoricalQualificationSource
+409:}
+410:
+411:type HistoricalQualificationPlan struct {
+412:	Schema            string                         `json:"schema"`
+413:	OperationID       string                         `json:"operation_id"`
+414:	DataRoot          string                         `json:"data_root"`
+415:	Database          string                         `json:"database"`
+416:	Subject           HistoricalQualificationSubject `json:"subject"`
+417:	Source            HistoricalQualificationSource  `json:"source"`
+418:	BoundaryPlanSHA256 string                         `json:"boundary_plan_sha256"`
+419:	AuthorID          string                         `json:"author_id"`
+420:	OwnerRoot         string                         `json:"owner_root"`
+421:	DispatchDirectory string                         `json:"dispatch_directory"`
+422:	SID               string                         `json:"sid"`
+423:	BeforeCensus      store.OwnedStopCensus          `json:"before_census"`
+424:	Core              Object                         `json:"core"`
+425:	Proof             Object                         `json:"proof"`
+426:	ProofBytes        []byte                         `json:"proof_bytes"`
+427:	Artifact          Object                         `json:"artifact"`
+428:	ImpactLink        Object                         `json:"impact_link"`
+429:	Run               Object                         `json:"run"`
+430:	ProjectState      Object                         `json:"project_state"`
+431:	Event             Object                         `json:"event"`
+432:	Observation       Object                         `json:"observation"`
+433:	BeforeRun         Object                         `json:"before_run"`
+434:	BeforeState       Object                         `json:"before_state"`
+435:	BeforeDispatch    Object                         `json:"before_dispatch"`
+436:	UploadKey         string                         `json:"upload_key"`
+437:	ExpiresAt         string                         `json:"expires_at"`
+438:	ObservedAt        string                         `json:"observed_at"`
+439:	EventSequence     int64                          `json:"event_sequence"`
+440:	DispatchSequence  int64                          `json:"dispatch_sequence"`
+441:	OutcomeHash       string                         `json:"outcome_hash"`
+442:}
+443:
+444:func (p HistoricalQualificationPlan) coreHash() string { return Hash(p.Core) }
+445:
+446:func (p HistoricalQualificationPlan) beforeHash() string {
+447:	return Hash(Object{"census": p.BeforeCensus, "run": p.BeforeRun,
+448:		"state": p.BeforeState, "dispatch": p.BeforeDispatch})
+449:}
+450:
+{
+  "path": "internal/domain/qualification_failure_maintenance_windows.go",
+  "sha256": "D154C448B7EF10DC6420B61D9B914300B8AE6B078310A26090C4E61F329BE942"
+}
+internal/domain/qualification_failure_maintenance_windows.go
+610:		Source: verified.source, AuthorID: verified.author.ID, OwnerRoot: verified.ownerRoot,
+611:		DispatchDirectory: directory,
+612:		SID:               sid, BeforeCensus: before, Core: core, Proof: proof,
+613:		ProofBytes: proofBytes, Artifact: artifact, ImpactLink: link, Run: currentRun,
+614:		ProjectState: currentState, Event: event, Observation: observation,
+615:		BeforeRun: verified.run, BeforeState: verified.state, BeforeDispatch: verified.dispatch,
+616:		UploadKey: uploadKey, ExpiresAt: expiresAt, ObservedAt: observedAt,
+617:		EventSequence: seq, DispatchSequence: dispatchSeq, OutcomeHash: outcomeHash}
+618:	return plan, nil
+619:}
+620:
+621:// PlanHistoricalQualification performs only reads of the existing database.
+622:// The returned plan is informational until a separate boot-bound opaque
+623:// current-quiescence witness, native root lock and journal BEGIN are present.
+624:func PlanHistoricalQualification(ctx context.Context, db *sql.DB, contractsDir string,
+625:	subject HistoricalQualificationSubject, source HistoricalQualificationSource,
+626:	authorID, dataRoot, operationID, boundaryPlanSHA256, sid string) (plan HistoricalQualificationPlan, retErr error) {
+627:	if db == nil || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot ||
+628:		!filepath.IsAbs(contractsDir) || sid == "" {
+629:		return plan, qualificationDenialUnavailable("historical preflight input invalid")
+630:	}
+631:	contracts, err := LoadContracts(contractsDir)
+632:	if err != nil {
+633:		return plan, err
+634:	}
+635:	s := &Service{DB: db, Contracts: contracts}
+636:	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+637:	if err != nil {
+638:		return plan, err
+639:	}
+640:	var hold *historicalQualificationHold
+641:	defer func() {
+642:		retErr = errors.Join(retErr, tx.Rollback())
+643:		if hold != nil {
+644:			retErr = errors.Join(retErr, hold.Close())
+645:		}
+646:	}()
+647:	var manifestHash string
+648:	if err := tx.QueryRowContext(ctx, `SELECT manifest_hash FROM runtime_dispatches WHERE project=? AND run=? AND epoch=? AND dispatch_key=?`,
+649:		subject.ProjectID, subject.RunID, subject.Epoch, subject.DispatchKey).Scan(&manifestHash); err != nil || manifestHash == "" {
+650:		return plan, qualificationDenialUnavailable("exact historical dispatch unavailable")
+651:	}
+652:	directory := filepath.Join(dataRoot, "runtime-dispatches", subject.DispatchKey)
+653:	native, nativeHold, err := holdHistoricalQualificationNative(directory, manifestHash, "", sid)
+654:	if err != nil {
+655:		return plan, err
+656:	}
+657:	hold = nativeHold
+658:	verified, err := s.verifyHistoricalQualificationTx(ctx, tx, subject, source, authorID, directory, sid, native)
+659:	if err != nil {
+660:		return plan, err
+661:	}
+662:	before, err := store.QualificationMaintenanceCensus(ctx, tx)
+663:	if err != nil {
+664:		return plan, err
+665:	}
+666:	plan, err = s.buildHistoricalQualificationPlan(tx, verified, operationID, boundaryPlanSHA256, dataRoot,
+667:		filepath.Join(dataRoot, "researchos.sqlite"), directory, sid, before, nil)
+668:	if err != nil {
+669:		return plan, err
+670:	}
+671:	if err = hold.Check(); err != nil {
+672:		return plan, err
+673:	}
+674:	return plan, nil
+675:}
+676:
+677:func historicalMaintenanceMarker(plan HistoricalQualificationPlan, planFileSHA256 string) Object {
+678:	return Object{"schema": "researchos.qualification-failure-maintenance-marker.v1",
+679:		"kind": historicalMaintenanceProofKind, "operation_id": plan.OperationID,
+680:		"plan_hash": plan.coreHash(), "plan_file_sha256": planFileSHA256,
+{
+  "path": "internal/domain/qualification_failure_maintenance_windows.go",
+  "sha256": "D154C448B7EF10DC6420B61D9B914300B8AE6B078310A26090C4E61F329BE942"
+}

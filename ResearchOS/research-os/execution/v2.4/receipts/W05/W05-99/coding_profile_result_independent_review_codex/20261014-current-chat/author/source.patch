@@ -1,0 +1,176 @@
+diff --git a/apps/desktop/main/lib/desktop-management.js b/apps/desktop/main/lib/desktop-management.js
+index 581a8804..a33f4df2 100644
+--- a/apps/desktop/main/lib/desktop-management.js
++++ b/apps/desktop/main/lib/desktop-management.js
+@@ -12,6 +12,7 @@ const PROTOCOL = 'researchos-desktop-management/1';
+ const FRAME_LIMIT = 65536;
+ const HASH = /^sha256:[a-f0-9]{64}$/;
+ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
++const ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
+ const DECIMAL = /^(0|[1-9][0-9]*)$/;
+ const START_LIMIT_MS = 15000;
+ 
+@@ -41,6 +42,14 @@ function keys(value, required, optional = []) {
+     throw failure('PRIVATE_FRAME_FIELDS');
+ }
+ 
++function artifactVersionRef(value) {
++  return object(value) && Object.keys(value).length === 4 &&
++    ['entity_type', 'id', 'revision', 'content_hash'].every(key => Object.hasOwn(value, key)) &&
++    value.entity_type === 'Artifact' && typeof value.id === 'string' && ARTIFACT_ID.test(value.id) &&
++    Number.isSafeInteger(value.revision) && value.revision > 0 &&
++    typeof value.content_hash === 'string' && HASH.test(value.content_hash);
++}
++
+ // JSON.parse silently accepts duplicate keys and rounds large integers. The
+ // private pipe must reject both before any result can influence confirmation.
+ function strictJSON(bytes) {
+@@ -721,7 +730,7 @@ class DesktopManagement {
+         value.request_hash !== intent.requestHash || value.project_id !== intent.projectId ||
+         value.session_id !== intent.sessionId || value.old_model_config_ref !== intent.modelRef ||
+         typeof value.model_config_ref !== 'string' || !ID.test(value.model_config_ref) ||
+-        value.runtime_status !== 'REGISTERED' || typeof value.profile_ref !== 'string' ||
++        value.runtime_status !== 'REGISTERED' || !artifactVersionRef(value.profile_ref) ||
+         value.model_calls !== 0 || value.normal_max_model_calls !== 8 ||
+         value.qualification_model_calls !== 1 || value.qualification_tool_calls !== 0 ||
+         !object(value.scope) || !sameValue(value.scope, intent.scope) ||
+@@ -729,7 +738,7 @@ class DesktopManagement {
+         !Number.isSafeInteger(value.revision) || !Number.isSafeInteger(value.config_revision))
+       throw failure('CODING_RESULT_INVALID');
+     intent.state = value.state; intent.newModelRef = value.model_config_ref;
+-    intent.runtimeStatus = value.runtime_status; intent.profileRef = value.profile_ref;
++    intent.runtimeStatus = value.runtime_status; intent.profileRef = frozenCopy(value.profile_ref);
+     intent.configRevision = value.config_revision;
+     intent.commitKey = digest(Buffer.from(JSON.stringify([intent.hostId, intent.projectId,
+       intent.sessionId, intent.requestId, value.model_config_ref, value.revision, value.config_revision])));
+diff --git a/tests/ui/desktop/coding-authorization-boundary.test.mjs b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+index d969c936..319ad07d 100644
+--- a/tests/ui/desktop/coding-authorization-boundary.test.mjs
++++ b/tests/ui/desktop/coding-authorization-boundary.test.mjs
+@@ -11,6 +11,8 @@ const { createDesktopManagement } = require('../../../apps/desktop/main/lib/desk
+ const { registerDesktopCoding, registerDesktopQualification } = require('../../../apps/desktop/main/lib/ipc.js')
+ const protocol = 'researchos-desktop-management/1'
+ const hash = 'sha256:' + 'b'.repeat(64)
++const profileRef = () => ({ entity_type: 'Artifact', id: 'd'.repeat(32), revision: 1,
++  content_hash: 'sha256:' + 'c'.repeat(64) })
+ 
+ function fixture() {
+   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ros-coding-client-'))
+@@ -21,6 +23,7 @@ function fixture() {
+   let context = JSON.stringify(['project-1', 'session-1', 1, 1]), suppress = false, expiryMs = 55000
+   let resourceGeneration = 0, rejectPrepareOnce = false
+   let qualificationState = 'EXECUTION_SETTLED', qualificationConsumed = true
++  let profileRefValue = profileRef()
+   const queued = []
+   const log = [], identity = id => ({ PID: id, CreatedNS: String(id) + '000000000', ImageSHA256: 'a'.repeat(64) })
+   const child = new EventEmitter(); child.pid = pid
+@@ -39,7 +42,7 @@ function fixture() {
+     let result = frame.operation === 'PREPARE_CODING' ? { ...base, scope: frame.coding } :
+       frame.operation === 'CONFIRM_CODING' || (frame.operation === 'STATUS_CODING' && log.some(item => item.operation === 'CONFIRM_CODING'))
+         ? { ...base, state: 'CODING_CONFIGURED', scope: frame.operation === 'CONFIRM_CODING' ? log[0].coding : log[0].coding,
+-          model_config_ref: 'model-2', runtime_status: 'REGISTERED', profile_ref: 'profile-1',
++          model_config_ref: 'model-2', runtime_status: 'REGISTERED', profile_ref: profileRefValue,
+           revision: 2, config_revision: 2 } : frame.operation === 'STATUS_CODING' &&
+           Date.parse(manager.codingIntent?.expiresAt) <= Date.now()
+             ? { ...base, state: 'EXPIRED' } : base
+@@ -68,6 +71,7 @@ function fixture() {
+     setResourceGeneration: value => { resourceGeneration = value }, suppress: value => { suppress = value },
+     rejectNextPrepare: () => { rejectPrepareOnce = true }, expiry: value => { expiryMs = value },
+     qualification: (state, consumed = true) => { qualificationState = state; qualificationConsumed = consumed },
++    setProfileRef: value => { profileRefValue = value },
+     release: change => { const answer = queued.shift(); manager.onLine(Buffer.from(JSON.stringify(change ? change(answer) : answer))) },
+     close: () => fs.rmSync(dir, { recursive: true, force: true }) }
+ }
+@@ -88,6 +92,12 @@ const original = JSON.stringify(['project-1', 'session-1', 1, 1])
+ const recheck = () => ({ context: original, scope: scope(), review: review() })
+ const prepare = f => f.manager.prepareCoding(scope(), original, review())
+ const approve = f => f.manager.confirmCoding(async () => true, async () => recheck())
++const configuredResult = (f, ref) => ({ state: 'CODING_CONFIGURED', request_id: 'coding-1',
++  request_hash: hash, project_id: 'project-1', session_id: 'session-1',
++  old_model_config_ref: 'model-1', model_config_ref: 'model-2', runtime_status: 'REGISTERED',
++  profile_ref: ref, model_calls: 0, normal_max_model_calls: 8, qualification_model_calls: 1,
++  qualification_tool_calls: 0, scope: coding(), frozen_checks: f.manager.codingIntent.frozenChecks,
++  revision: 2, config_revision: 2 })
+ 
+ const qualificationContext = (changes = {}) => JSON.stringify(Object.assign(
+   ['project-1', 'session-1', '1', '1', 'desktop-shell', '2026-10-14T01:00:00Z', 2, 4], changes))
+@@ -194,6 +204,7 @@ test('coding prepare freezes one original intent, explicit confirm writes config
+     assert.equal(settled.state, 'CODING_CONFIGURED')
+     assert.equal(settled.runtime_status, 'REGISTERED')
+     assert.equal(settled.model_config_ref, 'model-2')
++    assert.deepEqual(settled.profile_ref, profileRef())
+     assert.match(settled.commit_key, /^[a-f0-9]{64}$/)
+     assert.notEqual(settled.commit_key, hash)
+     await assert.rejects(approve(f), { code: 'CODING_CONFIRM_NOT_AVAILABLE' })
+@@ -201,10 +212,71 @@ test('coding prepare freezes one original intent, explicit confirm writes config
+     const recovered = await f.manager.statusCoding()
+     assert.equal(recovered.state, 'CODING_CONFIGURED')
+     assert.equal(recovered.commit_key, settled.commit_key)
++    assert.deepEqual(recovered.profile_ref, profileRef())
+     assert.deepEqual(f.log.map(item => item.operation), ['PREPARE_CODING', 'CONFIRM_CODING', 'STATUS_CODING'])
+   } finally { f.close() }
+ })
+ 
++test('accepted profile reference is copied and frozen before entering canonical intent', async () => {
++  const f = fixture()
++  try {
++    await prepare(f)
++    const returned = profileRef()
++    const result = configuredResult(f, returned)
++    f.manager.acceptCodingResult(f.manager.codingIntent, result)
++    assert.notStrictEqual(f.manager.codingIntent.profileRef, returned)
++    assert(Object.isFrozen(f.manager.codingIntent.profileRef))
++    returned.id = 'changed-after-validation'
++    assert.deepEqual(f.manager.codingSummary().profile_ref, profileRef())
++  } finally { f.close() }
++})
++
++test('invalid Core profile references cannot settle CONFIRM or original STATUS', async () => {
++  const valid = profileRef()
++  const cases = [
++    ['string', 'profile-1'], ['null', null], ['array', [valid]], ['missing', undefined],
++    ['missing id', { entity_type: 'Artifact', revision: 1, content_hash: valid.content_hash }],
++    ['extra key', { ...valid, source: 'untrusted' }],
++    ['wrong kind', { ...valid, entity_type: 'Task' }],
++    ['numeric id', { ...valid, id: 123 }],
++    ['invalid id', { ...valid, id: 'bad/id' }],
++    ['empty id', { ...valid, id: '' }],
++    ['long id', { ...valid, id: 'a'.repeat(161) }],
++    ['missing hash', { entity_type: 'Artifact', id: valid.id, revision: 1 }],
++    ['null hash', { ...valid, content_hash: null }],
++    ['malformed hash', { ...valid, content_hash: 'sha256:xyz' }],
++    ['uppercase hash', { ...valid, content_hash: 'sha256:' + 'A'.repeat(64) }],
++    ['zero revision', { ...valid, revision: 0 }],
++    ['negative revision', { ...valid, revision: -1 }],
++    ['fractional revision', { ...valid, revision: 1.5 }],
++    ['string revision', { ...valid, revision: '1' }],
++    ['unsafe revision', { ...valid, revision: Number.MAX_SAFE_INTEGER + 1 }],
++  ]
++  for (const [name, invalid] of cases) {
++    const f = fixture()
++    try {
++      f.setProfileRef(invalid)
++      await prepare(f)
++      assert.throws(() => f.manager.acceptCodingResult(f.manager.codingIntent,
++        configuredResult(f, invalid)), { code: 'CODING_RESULT_INVALID' }, name + ' direct')
++      assert.equal(f.manager.codingIntent.state, 'AWAITING_CODING_CONFIRMATION', name)
++      const wireNumber = name === 'fractional revision' || name === 'unsafe revision'
++      const expected = wireNumber ? 'PRIVATE_FRAME_NUMBER' : 'CODING_RESULT_INVALID'
++      await assert.rejects(approve(f), { code: expected }, name + ' CONFIRM')
++      assert.equal(f.manager.codingIntent.state, 'UNRESOLVED', name)
++      assert.equal(f.manager.codingSummary().commit_key, null, name)
++      assert.equal(f.manager.codingIntent.profileRef, undefined, name)
++      if (!wireNumber) {
++        await assert.rejects(f.manager.statusCoding(), { code: expected }, name + ' STATUS')
++        assert.equal(f.manager.codingIntent.state, 'UNRESOLVED', name)
++        assert.equal(f.manager.codingSummary().commit_key, null, name)
++        assert.deepEqual(f.log.map(item => item.operation),
++          ['PREPARE_CODING', 'CONFIRM_CODING', 'STATUS_CODING'], name)
++      }
++    } finally { f.close() }
++  }
++})
++
+ test('changed selection or native host blocks coding confirmation without dispatch', async () => {
+   const f = fixture()
+   try {

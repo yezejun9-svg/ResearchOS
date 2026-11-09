@@ -1,0 +1,194 @@
+262: // qualificationModelBindingTx binds the exact three-row effect history to the
+263: // original durable Host response. The second frame's decoded payload hash is
+264: // provided at capture time and sealed in the proof for later consumers.
+265: func qualificationModelBindingTx(tx *sql.Tx, project, run string, epoch int64, dispatch Object, directory, key, route, payloadHash string) (Object, error) {
+266: 	bad := func() (Object, error) {
+267: 		return nil, qualificationDenialUnavailable("original MODEL request or Host receipt differs")
+268: 	}
+269: 	if tx == nil || key == "" || route == "" || payloadHash == "" || !filepath.IsAbs(directory) || filepath.Base(directory) != Str(dispatch, "dispatch_key") || filepath.Base(filepath.Dir(directory)) != "runtime-dispatches" {
+270: 		return bad()
+271: 	}
+272: 	raw, err := rt.ReadQualificationModelFact(directory, key)
+273: 	if err != nil {
+274: 		return bad()
+275: 	}
+276: 	fact, err := Decode(raw)
+277: 	if err != nil || Hash(fact["version"]) != Hash(1) || fact["project_id"] != project || fact["run_id"] != run || Hash(fact["epoch"]) != Hash(epoch) || fact["dispatch_key"] != dispatch["dispatch_key"] || fact["manifest_hash"] != dispatch["manifest_hash"] || fact["effect_key"] != key {
+278: 		return bad()
+279: 	}
+280: 	rows, err := tx.Query(`SELECT sequence,body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence`, project, run, key)
+281: 	if err != nil {
+282: 		return nil, err
+283: 	}
+284: 	var effects []Object
+285: 	for rows.Next() {
+286: 		var sequence int64
+287: 		var body string
+288: 		if err = rows.Scan(&sequence, &body); err != nil {
+289: 			rows.Close()
+290: 			return nil, err
+291: 		}
+292: 		row, decodeErr := Decode([]byte(body))
+293: 		if decodeErr != nil || sequence != int64(len(effects)+1) || Hash(row["sequence"]) != Hash(sequence) {
+294: 			rows.Close()
+295: 			return bad()
+296: 		}
+297: 		effects = append(effects, row)
+298: 	}
+299: 	err = rows.Err()
+300: 	rows.Close()
+301: 	if err != nil {
+302: 		return nil, err
+303: 	}
+304: 	if len(effects) != 3 || effects[0]["state"] != "PREPARED" || effects[1]["state"] != "STARTED" || effects[2]["state"] != "CONFIRMED" || effects[0]["receipt"] != nil || effects[1]["receipt"] != nil {
+305: 		return bad()
+306: 	}
+307: 	request, ok := effects[0]["payload"].(map[string]any)
+308: 	manifest, manifestOK := dispatch["manifest"].(map[string]any)
+309: 	admission, admissionOK := manifest["admission"].(map[string]any)
+310: 	profile, profileOK := admission["profile"].(map[string]any)
+311: 	modelConfig, configOK := profile["model_config"].(map[string]any)
+312: 	if !ok || !manifestOK || !admissionOK || !profileOK || !configOK || modelConfig["route"] != route || request["capability"] != "MODEL" || request["route"] != route || request["credential_revision"] != profile["credential_revision"] || Hash(request["payload"]) != payloadHash {
+313: 		return bad()
+314: 	}
+315: 	for _, row := range effects {
+316: 		if row["project_id"] != project || row["run_id"] != run || row["key"] != key || Hash(row["epoch"]) != Hash(epoch) || row["request_hash"] != fact["request_hash"] || row["reservation_id"] != fact["reservation_id"] || Hash(row["payload"]) != Hash(effects[0]["payload"]) || row["task_id"] != effects[0]["task_id"] || row["goal_id"] != effects[0]["goal_id"] {
+317: 			return bad()
+318: 		}
+319: 	}
+320: 	receipt, ok := fact["receipt"].(map[string]any)
+321: 	if !ok || Hash(effects[2]["receipt"]) != Hash(receipt) || receipt["key"] != key || receipt["run_id"] != run || Hash(receipt["epoch"]) != Hash(epoch) || receipt["state"] != "CONFIRMED" || receipt["model_transport"] != true || receipt["actual_cost"] != nil {
+322: 		return bad()
+323: 	}
+324: 	result, ok := receipt["payload"].(map[string]any)
+325: 	if !ok || Hash(result["status"]) != Hash(200) || result["content_type"] != "text/event-stream" {
+326: 		return bad()
+327: 	}
+328: 	response := []byte(Str(result, "body"))
+329: 	if len(response) == 0 || len(response) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(response) || Digest(response) != fact["provider_response_hash"] || receipt["receipt_id"] != fact["provider_response_hash"] {
+330: 		return bad()
+331: 	}
+332: 	return Object{"directory": directory, "effect_key": key, "route": route, "credential_revision": request["credential_revision"], "payload_hash": payloadHash, "request_body_hash": Hash(request), "fact_hash": Digest(raw), "history_hash": Hash(effects), "request_hash": fact["request_hash"], "reservation_id": fact["reservation_id"], "receipt_hash": Hash(receipt), "provider_response_hash": fact["provider_response_hash"]}, nil
+333: }
+334: 
+335: type qualificationFailurePlan struct {
+336: 	core          Object
+337: 	proof         Object
+338: 	proofBytes    []byte
+339: 	proofArtifact Object
+340: 	link          Object
+341: 	run           Object
+342: 	state         Object
+343: 	event         Object
+344: 	observation   Object
+345: 	marker        Object
+346: 	uploadKey     string
+347: 	expiresAt     string
+348: 	observedAt    string
+349: 	sequence      int64
+350: 	dispatchSeq   int64
+351: 	author        Principal
+352: 	ownerRoot     string
+353: 	key           string
+354: 	requestHash   string
+355: }
+356: 
+357: func qualificationClosureKey(subject qualificationFailureSubject, digest string) string {
+358: 	return subject.run + "/" + strconv.FormatInt(subject.epoch, 10) + "/" + strings.TrimPrefix(digest, "sha256:")
+359: }
+360: 
+361: func cloneQualificationObject(source Object) (Object, error) { return Decode(Bytes(source)) }
+362: 
+363: func (c *RuntimeCoordinator) planQualificationFailureTx(tx *sql.Tx, route RuntimeCoordinatorRoute, verified verifiedQualificationFailure) (qualificationFailurePlan, error) {
+364: 	var plan qualificationFailurePlan
+365: 	p, err := resourcePrincipal(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, "SCHEDULER")
+366: 	if err != nil {
+367: 		return plan, err
+368: 	}
+369: 	root, err := currentAuthorityRoot(tx, p.ID)
+370: 	if err != nil || root != verified.ownerRoot {
+371: 		return plan, qualificationDenialUnavailable("Host author root changed")
+372: 	}
+373: 	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, root)
+374: 	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(route.ProjectID, "", "", false) {
+375: 		return plan, qualificationDenialUnavailable("current Owner root unavailable")
+376: 	}
+377: 	state, err := singleton(tx, route.ProjectID, "ProjectState")
+378: 	if err != nil {
+379: 		return plan, err
+380: 	}
+381: 	stateCopy, err := cloneQualificationObject(state)
+382: 	if err != nil {
+383: 		return plan, err
+384: 	}
+385: 	runCopy, err := cloneQualificationObject(verified.run)
+386: 	if err != nil {
+387: 		return plan, err
+388: 	}
+389: 	observation, err := cloneQualificationObject(verified.observation)
+390: 	if err != nil {
+391: 		return plan, err
+392: 	}
+393: 	seq, err := Num(state, "event_sequence")
+394: 	if err != nil {
+395: 		return plan, err
+396: 	}
+397: 	var outboxSeq int64
+398: 	if err = tx.QueryRow(`SELECT coalesce(max(sequence),0) FROM outbox WHERE project=?`, route.ProjectID).Scan(&outboxSeq); err != nil {
+399: 		return plan, err
+400: 	}
+401: 	if outboxSeq > seq {
+402: 		seq = outboxSeq
+403: 	}
+404: 	if seq == 1<<63-1 {
+405: 		return plan, qualificationDenialUnavailable("event sequence exhausted")
+406: 	}
+407: 	seq++
+408: 	dispatchSeq, _ := Num(verified.dispatch, "observation_sequence")
+409: 	if verified.native.Journal.Sequence > dispatchSeq {
+410: 		dispatchSeq = verified.native.Journal.Sequence
+411: 	}
+412: 	if dispatchSeq == 1<<63-1 {
+413: 		return plan, qualificationDenialUnavailable("dispatch sequence exhausted")
+414: 	}
+415: 	dispatchSeq++
+416: 	observedAt := Now()
+417: 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+418: 	qf := observation["qualification_failure"].(map[string]any)
+419: 	qf["closure_observed_at"] = observedAt
+420: 	key := qualificationClosureKey(verified.subject, verified.denial.digest)
+421: 	uploadKey, artifactID, linkID, eventID, correlationID := ID(), ID(), ID(), ID(), ID()
+422: 	core := Object{"schema": "researchos.qualification-failure-plan-core.v1", "subject": Object{"project_id": route.ProjectID, "task_id": verified.subject.task, "run_id": verified.subject.run, "epoch": verified.subject.epoch}, "denial_digest": verified.denial.digest, "before_run_hash": Hash(verified.run), "before_state_hash": Hash(state), "before_dispatch_hash": Hash(verified.dispatch), "before_dispatch": verified.dispatch, "observation_hash": Hash(observation), "author": p.ID, "owner_root": root, "profile_ref": verified.profileRef, "upload_key": uploadKey, "artifact_id": artifactID, "impact_link_id": linkID, "event_id": eventID, "correlation_id": correlationID, "observed_at": observedAt, "expires_at": expiresAt, "event_sequence": seq, "dispatch_observation_sequence": dispatchSeq}
+423: 	proof := Object{"schema": "researchos.qualification-failure-proof.v1", "kind": onlineQualificationDenial, "plan_hash": Hash(core), "plan_core": core, "subject": core["subject"], "author": p.ID, "owner_root": root, "observed_at": observedAt, "rejection": verified.denial.receipt, "rejection_digest": verified.denial.digest, "model_effect_key": verified.native.Frames[1].Key, "model_route": verified.native.Frames[1].Route, "model_binding": verified.modelBinding, "rejected_effect_key": verified.native.Frames[2].Key, "native": Object{"journal_hash": verified.native.RawJournalHash, "stdout_hash": verified.native.StdoutHash, "stderr_hash": verified.native.StderrHash, "ended": verified.native.Journal.Ended, "cancelled": verified.native.Journal.Cancelled, "timed_out": verified.native.Journal.Receipt.TimedOut, "exit_code": verified.native.Journal.Receipt.ExitCode, "frames": verified.native.Journal.Frames, "acknowledged": verified.native.Journal.Acknowledged}, "broker": Object{"accepted": verified.drain.accepted, "completed": verified.drain.completed, "pending": verified.drain.pending, "rejected_sequence": verified.drain.rejectedSeq, "frame_hashes": Object{"2": verified.drain.frameHashes[2], "3": verified.drain.frameHashes[3]}}, "derived_observation": observation, "limits": "specific Host first-gate TOOL dispatch only; no universal OS NO_EFFECT claim"}
+424: 	proofBytes := Bytes(proof)
+425: 	if len(proofBytes) == 0 || len(proofBytes) > 64*1024 {
+426: 		return plan, qualificationDenialUnavailable("bounded proof bytes unavailable")
+427: 	}
+428: 	artifact := Object{"id": artifactID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "media_type": "application/json", "content_hash": Digest(proofBytes), "storage_key": uploadKey, "byte_size": len(proofBytes), "input_refs": []any{verified.profileRef}, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": observedAt}
+429: 	link := Object{"id": linkID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "updated_at": observedAt, "from_ref": Ref(artifact, "Artifact"), "to_ref": verified.profileRef, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty(), "status": "ACTIVE"}
+430: 	runRev, err := Num(runCopy, "revision")
+431: 	if err != nil || runRev == 1<<63-1 {
+432: 		return plan, qualificationDenialUnavailable("Run revision unavailable")
+433: 	}
+434: 	runCopy["revision"] = runRev + 1
+435: 	runCopy["updated_at"] = observedAt
+436: 	runCopy["status"] = "FAILED"
+437: 	runCopy["execution_report"] = "Host qualification first-gate TOOL denial; proof " + Digest(proofBytes) + "; native ended " + verified.native.Journal.Ended
+438: 	runCopy["exit_code"] = verified.native.Journal.Receipt.ExitCode
+439: 	runCopy["runtime_settled_at"] = observedAt
+440: 	runCopy["children_stopped"] = true
+441: 	runCopy["queue_empty"] = true
+442: 	runCopy["ended_at"] = observedAt
+443: 	stateRev, err := Num(stateCopy, "revision")
+444: 	if err != nil || stateRev == 1<<63-1 {
+445: 		return plan, qualificationDenialUnavailable("ProjectState revision unavailable")
+446: 	}
+447: 	stateCopy["revision"] = stateRev + 1
+448: 	stateCopy["updated_at"] = observedAt
+449: 	stateCopy["event_sequence"] = seq
+450: 	event := Object{"id": eventID, "project_id": route.ProjectID, "revision": 1, "created_at": observedAt, "sequence": seq, "event_type": "RUN_CHANGED", "aggregate_ref": Ref(runCopy, "Run"), "actor_id": p.ID, "correlation_id": correlationID, "causation_id": nil, "event_data_artifact_ref": nil}
+451: 	event["receipt_hash"] = Receipt(event)
+452: 	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": runCopy, "project_state": stateCopy, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": dispatchSeq, "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+453: 	requestHash := Digest(Bytes(Object{"core": core, "proof": proof}))
+454: 	marker := Object{"schema": "researchos.qualification-failure-closure.v1", "kind": onlineQualificationDenial, "key": key, "subject": core["subject"], "author": p.ID, "owner_root": root, "plan_hash": Hash(core), "plan_file_sha256": requestHash, "denial_digest": verified.denial.digest, "proof_ref": Ref(artifact, "Artifact"), "observation_hash": Hash(observation), "terminal_run_ref": Ref(runCopy, "Run"), "outcome_hash": outcomeHash}
+455: 	plan = qualificationFailurePlan{core: core, proof: proof, proofBytes: proofBytes, proofArtifact: artifact, link: link, run: runCopy, state: stateCopy, event: event, observation: observation, marker: marker, uploadKey: uploadKey, expiresAt: expiresAt, observedAt: observedAt, sequence: seq, dispatchSeq: dispatchSeq, author: p, ownerRoot: root, key: key, requestHash: requestHash}

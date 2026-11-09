@@ -1,0 +1,478 @@
+FILE ops/backup/main.go
+1: // backup is a local administrative command; it starts no server or worker.
+2: package main
+3: 
+4: import (
+5: 	"context"
+6: 	"crypto/rand"
+7: 	"database/sql"
+8: 	"encoding/json"
+9: 	"flag"
+10: 	"fmt"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"researchos.local/research-os/internal/domain"
+14: 	hostboundary "researchos.local/research-os/internal/host"
+15: 	"researchos.local/research-os/internal/store"
+16: 	"strconv"
+17: 	"strings"
+18: )
+19: 
+20: func main() {
+21: 	if e := run(); e != nil {
+22: 		fmt.Fprintln(os.Stderr, e)
+23: 		os.Exit(1)
+24: 	}
+25: }
+26: func run() error {
+27: 	if len(os.Args) < 2 {
+28: 		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+29: 	}
+30: 	command := os.Args[1]
+31: 	f := flag.NewFlagSet(command, flag.ContinueOnError)
+32: 	source := f.String("db", "", "existing source SQLite database")
+33: 	backup := f.String("backup", "", "existing encrypted backup directory")
+34: 	out := f.String("out", "", "new destination (must not exist)")
+35: 	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
+36: 	root := f.String("root", ".", "matching application repository root")
+37: 	asDataRoot := f.Bool("as-data-root", false, "restore an operational data root (researchos.sqlite plus fresh Host bindings)")
+38: 	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
+39: 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+40: 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+41: 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
+42:     handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+43:     handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+44: 	if e := f.Parse(os.Args[2:]); e != nil {
+45: 		return e
+46: 	}
+47: 	if f.NArg() != 0 {
+48: 		return fmt.Errorf("unexpected positional arguments")
+49: 	}
+50: 	if *keyfile == "" {
+51: 		return fmt.Errorf("--key-file required")
+52: 	}
+53: 	if command == "keygen" {
+54: 		key := make([]byte, 32)
+55: 		if _, e := rand.Read(key); e != nil {
+56: 			return e
+57: 		}
+58: 		f, e := os.OpenFile(*keyfile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+59: 		if e != nil {
+60: 			return e
+61: 		}
+62: 		defer f.Close()
+63: 		if _, e = f.Write(key); e != nil {
+64: 			return e
+65: 		}
+66: 		if e = f.Sync(); e != nil {
+67: 			return e
+68: 		}
+69: 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
+70: 		return nil
+71: 	}
+72: 	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+73: 		return fmt.Errorf("unknown command")
+74: 	}
+75: 	if *out == "" {
+76: 		return fmt.Errorf("--out required")
+77: 	}
+78:     if command == "upgrade-prepared-backup" {
+79:         r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
+80:             Upgrade: domain.LocalUpgradeOptions{
+81:                 Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+82:                 SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+83:                 TargetProgram: *targetProgram, Plan: *plan,
+84:             },
+85:             BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+86:         })
+87:         if e != nil { return e }
+88:         return json.NewEncoder(os.Stdout).Encode(r)
+89:     }
+90: 	if command == "upgrade-local" {
+91: 		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+92: 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+93: 			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+94: 			TargetProgram: *targetProgram, Plan: *plan,
+95: 		})
+96: 		if e != nil {
+97: 			return e
+98: 		}
+99: 		return json.NewEncoder(os.Stdout).Encode(r)
+100: 	}
+101: 	keyPath, e := filepath.Abs(*keyfile)
+102: 	if e != nil {
+103: 		return e
+104: 	}
+105: 	for _, dir := range []string{*out, *backup} {
+106: 		if dir == "" {
+107: 			continue
+108: 		}
+109: 		abs, e := filepath.Abs(dir)
+110: 		if e != nil {
+111: 			return e
+112: 		}
+113: 		rel, e := filepath.Rel(abs, keyPath)
+114: 		if e == nil && filepath.IsLocal(rel) {
+115: 			return fmt.Errorf("KEY_MUST_BE_OUTSIDE_BACKUP_AND_RESTORE")
+116: 		}
+117: 	}
+118: 	key, e := os.ReadFile(*keyfile)
+119: 	if e != nil || len(key) != 32 {
+120: 		return fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+121: 	}
+122: 	defer clear(key)
+123: 	contracts, e := domain.LoadContracts(filepath.Join(*root, "spec/v2.0/contracts"))
+124: 	if e != nil {
+125: 		return e
+126: 	}
+127: 	ctx := context.Background()
+128: 	hostConfig := func(db *sql.DB, dataRoot string) hostboundary.Config {
+129: 		return hostboundary.Config{DB: db, Dir: filepath.Join(dataRoot, "host"),
+130: 			ContractsDir:  filepath.Join(*root, "spec", "v2.0", "contracts"),
+131: 			MigrationFile: filepath.Join(*root, "migrations", "sqlite", "0002_domain.sql"),
+132: 			SchemaDir:     filepath.Join(*root, "internal", "api", "contracts")}
+133: 	}
+134: 	if command == "restore" {
+135: 		if *backup == "" {
+136: 			return fmt.Errorf("--backup required")
+137: 		}
+138: 		files, e := filepath.Glob(filepath.Join(*root, "migrations/sqlite/[0-9][0-9][0-9][0-9]_*.sql"))
+139: 		if e != nil {
+140: 			return e
+141: 		}
+142: 		versions := []int{}
+143: 		for _, file := range files {
+144: 			v, e := strconv.Atoi(filepath.Base(file)[:4])
+145: 			if e != nil {
+146: 				return e
+147: 			}
+148: 			versions = append(versions, v)
+149: 		}
+150: 		target := func(ctx context.Context, destination string, requests []domain.WorkspaceRestoreRequest) ([]domain.WorkspaceRestorePin, error) {
+151: 			restored, err := store.Open(filepath.Join(destination, "researchos.sqlite"))
+152: 			if err != nil {
+153: 				return nil, err
+154: 			}
+155: 			defer restored.Close()
+156: 			h, err := hostboundary.New(hostConfig(restored, destination))
+157: 			if err != nil {
+158: 				return nil, err
+159: 			}
+160: 			if _, err := h.BootstrapOwner(ctx); err != nil {
+161: 				return nil, err
+162: 			}
+163: 			pins := make([]domain.WorkspaceRestorePin, 0, len(requests))
+164: 			for _, request := range requests {
+165: 				pin, err := h.PinRestoredWorkspace(ctx, request)
+166: 				if err != nil {
+167: 					return nil, err
+168: 				}
+169: 				pins = append(pins, pin)
+170: 			}
+171: 			return pins, nil
+172: 		}
+173: 		options := domain.RestoreOptions{Key: key, SupportedMigrations: versions, Contracts: contracts}
+174: 		if *asDataRoot {
+175: 			options.WorkspaceTarget = target
+176: 			options.DatabaseName = "researchos.sqlite"
+177: 		}
+178: 		r, e := domain.RestoreBackup(ctx, *backup, *out, options)
+179: 		if e != nil {
+180: 			return e
+181: 		}
+182: 		return json.NewEncoder(os.Stdout).Encode(r)
+183: 	}
+184: 	if *source == "" {
+185: 		return fmt.Errorf("--db required")
+186: 	}
+187: 	st, e := os.Stat(*source)
+188: 	if e != nil || !st.Mode().IsRegular() {
+189: 		return fmt.Errorf("existing regular source database required")
+190: 	}
+191: 	// Refuse ambiguous URI DSNs; --db is an ordinary local file path.
+192: 	if strings.Contains(*source, "?") {
+193: 		return fmt.Errorf("SQLite URI parameters prohibited")
+194: 	}
+195: 	db, e := store.Open(*source)
+196: 	if e != nil {
+197: 		return e
+198: 	}
+199: 	defer db.Close()
+200: 	s := &domain.Service{DB: db, Contracts: contracts}
+201: 	var active int
+202: 	if e := db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.status')=?`,
+203: 		domain.KindWorkspaceBinding, domain.WorkspaceActive).Scan(&active); e != nil {
+204: 		return e
+205: 	}
+206: 	var m domain.BackupManifest
+207: 	if active == 0 {
+208: 		m, e = s.CreateBackup(ctx, *out, key)
+209: 	} else {
+210: 		h, hostErr := hostboundary.New(hostConfig(db, filepath.Dir(*source)))
+211: 		if hostErr != nil {
+212: 			return hostErr
+213: 		}
+214: 		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+215: 	}
+FILE internal/domain/backup_upgrade.go
+45: 	"0018_intent_planning.sql":              "sha256:7592b2b47d2e305f9ec26937830b5c0606c7d90622401a0b6b80a8c8a67db4e0",
+46: 	"0019_evolution_release_operations.sql": "sha256:54ff6eb7a7ca588df738f5bd68b6f6851d86916cef435abaac15d1f8bd6e131e",
+47: 	"0020_research_cycle_work.sql":          "sha256:3f90bdb0e828cec90bc370f34abed0cf0629dc78dcc01dda250c18cda49e528a",
+48: }
+49: 
+50: type LocalUpgradeOptions struct {
+51: 	Source, Snapshot, Destination, KeyFile string
+52: 	SourceRoot, TargetRoot                 string
+53: 	SourceProgram, TargetProgram           string
+54: 	Plan                                   string
+55: }
+56: 
+57: // Public callers cannot replace the concrete authenticated LIVE service with a
+58: // JSON declaration, environment switch, fake Provider, or an arbitrary callback.
+59: func UpgradeLocal(ctx context.Context, opt LocalUpgradeOptions) (RestoreReport, error) {
+60: 	return upgradeLocal(ctx, opt, upgradeVerifier{
+61: 		provider: &protectedstore.FrozenProvider{},
+62: 		summary: func(ctx context.Context) (protectedstore.SafeSummary, error) {
+63: 			if e := ctx.Err(); e != nil {
+64: 				return protectedstore.SafeSummary{}, e
+65: 			}
+66: 			return protectedstore.QueryFrozenService("aggregate")
+67: 		},
+68: 	})
+69: }
+70: 
+71: type upgradeVerifier struct {
+72: 	provider protectedstore.Provider
+245: func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+246: 	if opt.Plan == PreparedAbandonmentSchemaUpgradePlan {
+247: 		return upgradePreparedAbandonmentLocal(ctx, opt, verifier)
+248: 	}
+249: 	if opt.Plan == ConfigurationSchemaUpgradePlan {
+250: 		return upgradeConfigurationLocal(ctx, opt, verifier)
+251: 	}
+252: 	if opt.Plan == QueueSchemaUpgradePlan {
+253: 		return upgradeQueueLocal(ctx, opt, verifier)
+254: 	}
+255: 	report := RestoreReport{Started: Now(), Status: "FAILED"}
+256: 	targetVersion := 14
+257: 	switch opt.Plan {
+258: 	case LocalUpgradePlan:
+259: 	case FinalSchemaUpgradePlan:
+260: 		targetVersion = 20
+261: 	default:
+262: 		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+263: 	}
+264: 	if e := upgradePaths(&opt); e != nil {
+265: 		return report, e
+266: 	}
+267: 	sourceRelease, _, e := upgradeRelease(opt.SourceRoot, 13)
+268: 	if e != nil {
+269: 		return report, e
+270: 	}
+271: 	targetRelease, sqls, e := upgradeRelease(opt.TargetRoot, targetVersion)
+272: 	if e != nil {
+273: 		return report, e
+274: 	}
+275: 	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+276: 	if e != nil {
+277: 		return report, e
+278: 	}
+279: 	expectedSourceSchema, expectedTargetSchema, e := upgradeTemplate(ctx, sqls, contracts)
+280: 	if e != nil {
+281: 		return report, e
+282: 	}
+283: 	key, e := os.ReadFile(opt.KeyFile)
+284: 	if e != nil || len(key) != 32 {
+285: 		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+286: 	}
+287: 	defer clear(key)
+288: 	db, e := upgradeOpenExclusive(ctx, opt.Source)
+289: 	if e != nil {
+290: 		return report, e
+291: 	}
+292: 	defer db.Close() // The native source lock spans snapshot through publication.
+293: 	versions, e := backupMigrations(db)
+294: 	if e != nil || !reflect.DeepEqual(versions, upgradeVersions(13)) {
+295: 		return report, fmt.Errorf("UPGRADE_SOURCE_VERSION: require exact 1..13")
+FILE internal/domain/backup_prepared_abandonment_handoff.go
+171: func UpgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions) (RestoreReport, error) {
+172:     return upgradePreparedAbandonmentBackup(ctx, handoff, preparedUpgradeConcreteVerifier())
+173: }
+174: 
+175: 
+176: func upgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions, verifier upgradeVerifier) (report RestoreReport, err error) {
+177:     opt := handoff.Upgrade
+178:     report = RestoreReport{Started: Now(), Status: "FAILED"}
+179:     if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
+180:     if err := preparedHandoffPaths(&opt, &handoff); err != nil { return report, err }
+181:     lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+182:     if err != nil { return report, err }
+183:     defer func() {
+184:         if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }
+185:     }()
+186:     sourceRelease, _, err := preparedUpgradeRelease(opt.SourceRoot, 23)
+187:     if err != nil { return report, err }
+188:     targetRelease, sqls, err := preparedUpgradeRelease(opt.TargetRoot, 24)
+189:     if err != nil { return report, err }
+190:     sourceProgram, targetProgram, err := preparedUpgradeProgramHashes(opt, true)
+191:     if err != nil { return report, err }
+192:     binding, err := preparedHandoffCheck(opt, handoff)
+193:     if err != nil { return report, err }
+194:     contracts, err := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+195:     if err != nil { return report, err }
+196:     schemas, err := preparedUpgradeTemplate(ctx, sqls, contracts)
+197:     if err != nil { return report, err }
+198:     key, err := os.ReadFile(opt.KeyFile)
+199:     if err != nil || len(key) != 32 { return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE") }
+200:     defer clear(key)
+201:     if err = preparedHandoffVerifyBackup(opt, key, binding); err != nil { return report, err }
+202:     db, err := upgradeOpenExclusive(ctx, opt.Source)
+203:     if err != nil { return report, err }
+204:     defer db.Close()
+205:     if err = preparedUpgradeVersions(db, 23); err != nil { return report, err }
+206:     schema, err := preparedUpgradeSchema(db)
+207:     if err != nil { return report, err }
+208:     sourceSchema, targetSchema := schema, schemas.Original24
+FILE internal/domain/backup_prepared_abandonment_upgrade.go
+410: }
+411: 
+412: func upgradePreparedAbandonmentLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (report RestoreReport, err error) {
+413:     report = RestoreReport{Started: Now(), Status: "FAILED"}
+414:     if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
+415:     if err := upgradePaths(&opt); err != nil { return report, err }
+416:     lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+417:     if err != nil { return report, err }
+418:     defer func() {
+419:         if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }
+420:     }()
+421:     sourceRelease, _, err := preparedUpgradeRelease(opt.SourceRoot, 23)
+422:     if err != nil { return report, err }
+423:     targetRelease, sqls, err := preparedUpgradeRelease(opt.TargetRoot, 24)
+424:     if err != nil { return report, err }
+425:     sourceProgram, targetProgram, err := preparedUpgradeProgramHashes(opt, false)
+426:     if err != nil { return report, err }
+427:     contracts, err := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+428:     if err != nil { return report, err }
+429:     schemas, err := preparedUpgradeTemplate(ctx, sqls, contracts)
+430:     if err != nil { return report, err }
+431:     key, err := os.ReadFile(opt.KeyFile)
+432:     if err != nil || len(key) != 32 { return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE") }
+433:     defer clear(key)
+434:     db, err := upgradeOpenExclusive(ctx, opt.Source)
+435:     if err != nil { return report, err }
+436:     defer db.Close()
+437:     if err = preparedUpgradeVersions(db, 23); err != nil { return report, err }
+438:     schema, err := preparedUpgradeSchema(db)
+FILE ops/supervisor/release_host/main.go
+1: //go:build windows
+2: 
+3: // release_host is a same-user disposable R2 fixture process. It has no LIVE
+4: // authority and never installs or controls a Windows service.
+5: package main
+6: 
+7: import (
+8: 	"context"
+9: 	"encoding/json"
+10: 	"flag"
+11: 	"fmt"
+12: 	"os"
+13: 	"path/filepath"
+14: 	"researchos.local/research-os/adapters/protectedstore"
+15: 	rt "researchos.local/research-os/adapters/runtime"
+16: 	"researchos.local/research-os/internal/domain"
+17: 	"researchos.local/research-os/internal/store"
+18: )
+19: 
+20: func run() error {
+21: 	dbPath := flag.String("db", "", "fixture authority SQLite path")
+22: 	contracts := flag.String("contracts", "", "contracts directory")
+23: 	migration := flag.String("migration", "", "migration path")
+24: 	private := flag.String("private", "", "existing CanaryStore root")
+25: 	project := flag.String("project", "", "project")
+26: 	operation := flag.String("operation", "", "operation")
+27: 	control := flag.String("control", "", "exact actual-control fixture executable")
+28: 	root := flag.String("root", "", "existing fixture host root")
+29: 	work := flag.String("work-dir", "", "control working directory")
+30: 	web := flag.String("web-dir", "", "fixture web build directory")
+31: 	listen := flag.String("listen", "", "control loopback listener")
+32: 	flag.Parse()
+33: 	if *control != "" {
+34: 		return runControlHost(*control, *root, *work, *web, *listen, *private, *contracts)
+35: 	}
+36: 	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
+37: 		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
+38: 	}
+39: 	protected, err := protectedstore.OpenCanary(*private)
+40: 	if err != nil {
+41: 		return err
+42: 	}
+43: 	defer protected.Close()
+44: 	lease, err := rt.AcquireDataRootLease(filepath.Dir(*dbPath))
+45: 	if err != nil {
+46: 		return fmt.Errorf("offline legacy fixture authority required: %w", err)
+47: 	}
+48: 	defer lease.Close()
+49: 	db, err := store.Open(*dbPath)
+50: 	if err != nil {
+51: 		return err
+52: 	}
+53: 	defer db.Close()
+54: 	svc, err := domain.New(db, *contracts, *migration)
+55: 	if err != nil {
+56: 		return err
+57: 	}
+58: 	svc.Protected = protected
+59: 	result, err := svc.RunEvolutionReleaseFixtureOnce(context.Background(), *project, *operation)
+60: 	if err != nil {
+61: 		return err
+62: 	}
+63: 	return json.NewEncoder(os.Stdout).Encode(result)
+64: }
+65: 
+66: func main() {
+67: 	if err := run(); err != nil {
+68: 		fmt.Fprintln(os.Stderr, err)
+69: 		os.Exit(1)
+70: 	}
+71: }
+ops/supervisor\control_fixture_windows.go:74:// ControlFixtureDriver implements the existing engine's driver and barrier.
+ops/supervisor\control_fixture_windows.go:77:type ControlFixtureDriver struct {
+ops/supervisor\control_fixture_windows.go:89:func (d *ControlFixtureDriver) Start(image, token, data string) (ProcessIdentity, error) {
+ops/supervisor\control_fixture_windows.go:100:	lease, e := rt.AcquireDataRootLease(data)
+ops/supervisor\control_fixture_windows.go:164:func (d *ControlFixtureDriver) Alive(p ProcessIdentity) (bool, error) {
+ops/supervisor\control_fixture_windows.go:168:func (d *ControlFixtureDriver) connection(p ProcessIdentity) (*os.File, error) {
+ops/supervisor\control_fixture_windows.go:183:func (d *ControlFixtureDriver) send(c *os.File, frame DrainFrame) error {
+ops/supervisor\control_fixture_windows.go:191:func (d *ControlFixtureDriver) read(c *os.File, frame DrainFrame) (DrainFrame, error) {
+ops/supervisor\control_fixture_windows.go:202:func (d *ControlFixtureDriver) Drain(ctx context.Context, p ProcessIdentity, operation string) (string, error) {
+ops/supervisor\control_fixture_windows.go:259:func (d *ControlFixtureDriver) Stop(p ProcessIdentity) error {
+ops/supervisor\control_fixture_windows.go:309:	lease, e := rt.AcquireDataRootLease(s.Data)
+ops/supervisor\control_fixture_windows.go:316:func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, token string) error {
+ops/supervisor\control_fixture_windows.go:388:func (d *ControlFixtureDriver) Compatible(ctx context.Context, s ReleaseState) error {
+ops/supervisor\control_fixture_windows.go:401:	lease, err := rt.AcquireDataRootLease(s.Data)
+ops/supervisor\control_fixture_windows.go:430:func (d *ControlFixtureDriver) Private(ctx context.Context, kind string, message ReleasePrivateMessage) (ReleasePrivateMessage, error) {
+ops/supervisor\control_fixture_windows.go:465:func (d *ControlFixtureDriver) ShutdownFixture(ctx context.Context) error {
+ops/supervisor\control_fixture_windows_test.go:60:	states := map[*ControlFixtureDriver]continuity{}
+ops/supervisor\control_fixture_windows_test.go:61:	request := func(t *testing.T, d *ControlFixtureDriver, token, method, path, body string, status int) map[string]any {
+ops/supervisor\control_fixture_windows_test.go:88:	newFixture := func(t *testing.T, seed string) (*ReleaseEngine, *ControlFixtureDriver, *ReleaseJournal) {
+ops/supervisor\control_fixture_windows_test.go:133:		d := &ControlFixtureDriver{Journal: j, WorkDir: repo, WebDir: web, Listen: addr, CoordinatorConfig: config, Output: logfile}
+ops/supervisor\control_fixture_windows_test.go:172:		if l, e := rt.AcquireDataRootLease(data); e == nil {
+ops/supervisor\control_fixture_windows_test.go:177:	checkHTTP := func(t *testing.T, d *ControlFixtureDriver, method string, want int) {
+ops/supervisor\control_fixture_windows_test.go:307:		d := &ControlFixtureDriver{Journal: j, Listen: strings.TrimPrefix(unrelated.URL, "http://"), process: p}
+internal/recoveryauthority\migration_windows.go:45:    if n.lease,e=rt.AcquireDataRootLease(b.Root); e!=nil { return zero,"",e }
+internal/recoveryauthority\native_windows.go:207:    if n.lease,e=rt.AcquireDataRootLease(g.Root); e!=nil { return zero,"",e }
+ops/supervisor\release_engine_windows.go:233:		if _, actual := e.driver.(*ControlFixtureDriver); actual {
+ops/supervisor\release_engine_windows.go:255:	if _, actual := e.driver.(*ControlFixtureDriver); actual {
+ops/supervisor\release_process_windows.go:40:// uses ControlFixtureDriver.Ready and must prove its inherited private channel.
+ops/supervisor\release_host\main.go:39:	protected, err := protectedstore.OpenCanary(*private)
+ops/supervisor\release_host\main.go:44:	lease, err := rt.AcquireDataRootLease(filepath.Dir(*dbPath))
+ops/supervisor\release_host\control_windows_test.go:120:	if lease, err := rt.AcquireDataRootLease(filepath.Join(root, "data")); err == nil {
+ops/supervisor\release_host\control_windows_test.go:156:	lease, e := rt.AcquireDataRootLease(filepath.Join(root, "data"))
+ops/supervisor\release_host\control_windows_test.go:168:	driver := &supervisor.ControlFixtureDriver{Journal: j}
+ops/supervisor\release_host\control_windows.go:37:	d := &supervisor.ControlFixtureDriver{Journal: j, WorkDir: work, WebDir: web, Listen: listen, FixtureStore: private, Output: os.Stderr}
+ops/supervisor\release_host\control_windows.go:87:func controlCommand(ctx context.Context, c command, root string, j *supervisor.ReleaseJournal, d *supervisor.ControlFixtureDriver, engine *supervisor.ReleaseEngine) (any, error) {
+ops/supervisor\release_recovery_windows_test.go:238:		d := &ControlFixtureDriver{Journal: j, RestoreWithContext: func(_ context.Context, _ ReleaseState, lease *rt.DataRootLease) (ReleaseRestoreResult, error) {
+ops/supervisor\release_recovery_windows_test.go:257:		d := &ControlFixtureDriver{Journal: j, Restore: func(context.Context, ReleaseState, *rt.DataRootLease) (string, error) { return destination, nil }}
+ops/supervisor\release_recovery_windows_test.go:272:			d := &ControlFixtureDriver{Journal: j, Restore: func(context.Context, ReleaseState, *rt.DataRootLease) (string, error) {
+
+
+RG_EXIT 0

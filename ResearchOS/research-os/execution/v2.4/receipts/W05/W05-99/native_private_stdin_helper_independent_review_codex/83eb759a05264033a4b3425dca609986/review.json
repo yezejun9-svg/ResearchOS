@@ -1,0 +1,123 @@
+{
+  "schema": "researchos.native-private-stdin-helper-independent-review.v1",
+  "actor_id": "/root/prepared_native_authority_review",
+  "decision": "NEEDS_MINIMAL_PRELOAD_CAPACITY_GUARD_COMPONENT_ONLY_STOP",
+  "formal": false,
+  "production_ready": false,
+  "execution_authority": false,
+  "summary": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 0
+  },
+  "findings": [],
+  "scope": "Static source review of Root-only memory-to-anonymous-pipe helper and public-dummy probe; no native execution or private resource access.",
+  "source": {
+    "HDF": {
+      "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\native_private_stdin_helper_source_codex\\d6e8f35ea16d42c9b7f30c91faec090d\\HDF.json",
+      "sha256": "9b27b1d9eb418ed93d4a847cbf972686e6b33bab277407c83d1c437d768d1516",
+      "bytes": 5324
+    },
+    "MF": {
+      "path": "D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\native_private_stdin_helper_source_codex\\d6e8f35ea16d42c9b7f30c91faec090d\\MF.json",
+      "sha256": "5fd238cff199c60b1ba156077836074abb1e35a5d39a8c541285725723a6e138",
+      "bytes": 4903
+    },
+    "members": 8,
+    "files": 10,
+    "basepins": 3,
+    "drift": 0,
+    "AST_files": 3,
+    "old_signature": "def run_owned(argv, cwd, env, stdout, stderr, timeout, stdin=None, creation_flags=0):",
+    "new_signature": "def run_owned_private_stdin(argv, cwd, env, stdout, stderr, timeout, private_input, creation_flags=0):",
+    "module_prefix_normalized_text_equal": true,
+    "lifecycle_suffix_normalized_text_equal_except_wipe": true,
+    "raw_byte_equality": false,
+    "reason": "New and old newline formats differ. HDF/CONTRACT byte-for-byte claim needs correction; no semantic change observed in inherited suffix."
+  },
+  "trust_boundaries_STRIDE": {
+    "spoofing": "Caller must independently identify/pin child and output sinks. Helper does not authorize child, owner, token or migration.",
+    "tampering": "Source/member/base hashes verified. Fixed explicit std-handle allowlist; private bytearray uses ctypes from_buffer without explicit immutable content copy. Caller must exclusively own plain bytearray until return.",
+    "repudiation": "Result records pipe/setup/lifecycle booleans and actual exit only. No tests were run by reviewer; source author's six cases remain pending actual evidence.",
+    "information_disclosure": "Private data excluded from helper commandline/environment/result; child output remains caller-controlled. Original pipe handles noninheritable; write end closed before launch; only read duplicate plus stdout/stderr enter child handle list. Root caller must avoid concurrent broad-inheritance process creation while inheritable duplicates exist.",
+    "denial_of_service": "Unverified requested capacity followed by synchronous prelaunch WriteFile is not bounded by the helper's deadline checks. See acceptance blocker; actual host deadlock not reproduced.",
+    "elevation": "CREATE_SUSPENDED then exclusive KILL_ON_JOB_CLOSE Job assignment before ResumeThread retained. No token/signing/private-owner bridge implemented."
+  },
+  "acceptance_blockers": [
+    {
+      "id": "PRELOAD_CAPACITY_NOT_PROVEN",
+      "classification": "VALIDATION_CONTRACT_GAP_NOT_REPRODUCED_SECURITY_EXPLOIT",
+      "location": "windows_owned_private_stdin.py:253-263,323",
+      "description": "65536 is a requested buffer size, not a verified guarantee. The synchronous WriteFile runs before reader-child creation and before any timeout check. If capacity is insufficient, the same thread cannot reach timeout/wipe/close. A passing4096 smoke case proves one instance, not a per-call invariant.",
+      "evidence": "Microsoft CreatePipe docs state nSize is a suggestion and full-buffer WriteFile waits for a reader. Source has no GetNamedPipeInfo or PeekNamedPipe.",
+      "recommendation": "Before creating a ctypes private-input view or writing, query actual anonymous pipe info through read handle; verify byte pipe, select correct direction from server/client flags, require reported nonzero capacity at least payload length, and confirm zero queued bytes using PeekNamedPipe with NULL data buffer. Keep sole unshared prelaunch writer/read handles. Fail closed before WriteFile/child on query failure, zero/unknown capacity, insufficient capacity or nonempty pipe. Check remaining time before/after preload. Retain outer owned-process deadline; native API calls are not a strict hard real-time guarantee.",
+      "validation": "Root public dummy normal/4096/nonzeroexit/timeout/bounds cases plus pre-write refusal checks for failed/unknown/short capacity and nonempty reports; assert caller wipe, no resumed child and closed handles. No real Owner required."
+    }
+  ],
+  "observations": [
+    {
+      "id": "PROVENANCE_NEWLINES",
+      "location": "HDF.json original_lifecycle_suffix_exact_except_buffer_wipe_finally; CONTRACT.md",
+      "description": "Normalized text comparison passes; raw byte comparison fails due to different line endings.",
+      "recommendation": "State normalized-line-ending comparison accurately or preserve the original line endings."
+    },
+    {
+      "id": "PUBLIC_PROBE_RUNTIME_CLOSURE",
+      "location": "root_verify_private_pipe.py:35",
+      "description": "Public probe argv does not pass isolated/no-site/no-bytecode Python flags; environment minimization alone does not establish child Python import closure.",
+      "recommendation": "Use explicit -I -S -B for the fixed public probe interpreter and run verifier with bytecode writes disabled; retain source/DLL inventory guard. This is a test-closure improvement, not evidence of private credential exposure."
+    }
+  ],
+  "cleanup_static_review": {
+    "validation_reject": "Outer finally clears accepted bytearray even on invalid size; no child/native handles created before validation.",
+    "pipe_create_failure": "No handles registered until CreatePipe succeeds; job handle retained for finally close.",
+    "file_type_or_view_failure": "Both successful pipe handles registered; outer finally wipes bytearray and closes handles.",
+    "write_failure": "Inner finally wipes buffer and drops ctypes view; outer closes pipe/job. A never-returning write remains the unresolved boundary.",
+    "writer_close_failure": "No child creation occurs; handles remain tracked and cleanup records any close errors.",
+    "duplicate_or_attribute_or_create_failure": "Tracked pipe/duplicate/job handles close; attribute list deleted if initialized.",
+    "created_unassigned_failure": "Original suspended-child termination path retained; no thread resume before Job assignment.",
+    "assigned_timeout_or_failure": "Original TerminateJobObject and bounded five-second primary-exit/job-idle observation retained.",
+    "normal_return": "Original handles closed; caller-owned stdout/stderr remain open. Wiping sets bytes to zero but does not guarantee OS pagefile/kernel residual eradication.",
+    "scope_limit": "Static branch analysis only; no injected OS failures executed."
+  },
+  "public_test_source": {
+    "cases": [
+      "normal",
+      "maximum4096",
+      "reject_exit7",
+      "timeout",
+      "empty",
+      "oversize4097"
+    ],
+    "actual_executed": false,
+    "timeout_case_limit": "Checks child-phase Job termination; does not inject or bound prelaunch WriteFile stall.",
+    "secret_values": "Fixed public dummy values only.",
+    "probe_eof": "Read4097 with max4096 then successful return checks EOF; result is not credential content."
+  },
+  "positive_observations": [
+    "Existing file-handle stdin API is acknowledged accurately.",
+    "No shell/temp credential file/env/argv copy of private input introduced.",
+    "Explicit handle list, Job ownership before resume, EOF before launch, in-place buffer clearing and failure receipts preserved.",
+    "Author separates public dummy tests from enrolled recovery/native authority acceptance."
+  ],
+  "recommendations": [
+    "Seal minimal revised Source instead of mutating reviewed Source.",
+    "Keep actual native helper tests pending until Root owned execution and independent result review.",
+    "Do not infer Token/migration/abandonment/production authority from this transport helper."
+  ],
+  "dependency_scope": "No new third-party dependencies introduced by this Python/WinAPI helper. Current CVE inventory not scanned; fixed Python/DLL/input closure remains Root execution gate.",
+  "reviewer_actions": {
+    "native": 0,
+    "children": 0,
+    "Go": 0,
+    "SQL": 0,
+    "git": 0,
+    "provider": 0,
+    "private_resource_reads": 0,
+    "signing": 0,
+    "Main_canonical_Source_writes": 0
+  },
+  "new_mechanical_errors": [],
+  "STOP": true
+}

@@ -1,0 +1,236 @@
+ARGV ["rg", "-n", "UPDATE runtime_dispatches|INSERT .*runtime_dispatches|DELETE .*runtime_dispatches|case \"acknowledgeRunCancellation\"|case \"CANCEL\"|^func .*upgradeOpenExclusive|^func .*UpgradeLocal", "D:\\\u4f5c\u54c1\u96c6\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\cancel_finalization_whole_scope_independent_review_codex\\634606ae35154ad7aa85223c84ddf0b7\\sources\\cancel_finalization_udf_producer_supplement_codex\\internal\\domain", "--glob", "*.go"]
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\backup_upgrade.go:59:func UpgradeLocal(ctx context.Context, opt LocalUpgradeOptions) (RestoreReport, error) {
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\backup_upgrade.go:194:func upgradeOpenExclusive(ctx context.Context, path string) (*sql.DB, error) {
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime.go:109:		if _, e = tx.Exec("UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,updated_at=? WHERE project=? AND run=? AND epoch=?", sequence, Hash(observation), Now(), project, runID, epoch); e != nil {
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime.go:295:	case "acknowledgeRunCancellation":
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime_coordinator_windows.go:513:	result, e := tx.Exec("UPDATE runtime_dispatches SET state='STARTED',worker=?,journal_locator=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state='PREPARED' AND worker=''", worker, locator, Now(), route.ProjectID, runID, epoch)
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime_coordinator_windows.go:537:		_, e = tx.Exec("UPDATE runtime_dispatches SET identity=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state='STARTED' AND worker=?", string(Bytes(runtimeNativeIdentity(identity))), Now(), route.ProjectID, runID, epoch, worker)
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime_coordinator_windows.go:943:	if _, e = tx.Exec("UPDATE runtime_dispatches SET state='UNKNOWN',reason=?,updated_at=? WHERE project=? AND run=? AND epoch=? AND state!='OBSERVED'", reason, Now(), project, run, epoch); e != nil {
+D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\cancel_finalization_whole_scope_independent_review_codex\634606ae35154ad7aa85223c84ddf0b7\sources\cancel_finalization_udf_producer_supplement_codex\internal\domain\runtime_dispatch.go:107:	_, e := tx.Exec("INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED',?,?)", project, run["id"], run["lease_epoch"], key, string(Bytes(manifest)), Hash(manifest), Now(), Now())
+
+
+FILE internal/domain/durability.go SHA256 eb0c9b1762c5485148da6fb4fe5d5504ec08c76f9ce6edc93b6d07b6da3ee4d2 LINES 1-115
+1: package domain
+2: 
+3: import (
+4: 	"context"
+5: 	"database/sql"
+6: 	"time"
+7: )
+8: 
+9: func latestEffect(tx *sql.Tx, project, run, key string) (Object, error) {
+10: 	var raw string
+11: 	e := tx.QueryRow("SELECT body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence DESC LIMIT 1", project, run, key).Scan(&raw)
+12: 	if e != nil {
+13: 		return nil, e
+14: 	}
+15: 	return Decode([]byte(raw))
+16: }
+17: func effectAppend(tx *sql.Tx, project, run, key string, o Object) error {
+18: 	var seq int64
+19: 	if e := tx.QueryRow("SELECT coalesce(max(sequence),0)+1 FROM resource_effects WHERE project=? AND run=? AND effect_key=?", project, run, key).Scan(&seq); e != nil {
+20: 		return e
+21: 	}
+22: 	o["sequence"] = seq
+23: 	o["observed_at"] = Now()
+24: 	_, e := tx.Exec("INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)", project, run, key, seq, string(Bytes(o)))
+25: 	return e
+26: }
+27: func effectsReconciled(tx *sql.Tx, project, run string) error {
+28: 	var unresolved int
+29: 	e := tx.QueryRow(`SELECT count(*) FROM resource_effects x WHERE project=? AND run=? AND sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('STARTED','UNKNOWN')`, project, run).Scan(&unresolved)
+30: 	if e != nil {
+31: 		return e
+32: 	}
+33: 	if unresolved != 0 {
+34: 		return Fail(409, "STATE_CONFLICT", "unknown effects require reconciliation; blind retry prohibited")
+35: 	}
+36: 	return nil
+37: }
+38: 
+39: // PrepareEffect persists intent and cost admission in one transaction before
+40: // any provider request. The sole scheduler owns this; a worker cannot enqueue.
+41: func (s *Service) PrepareEffect(ctx context.Context, token, project, runID, key string, payload, cost Object) (Object, error) {
+42: 	tx, e := s.DB.BeginTx(ctx, nil)
+43: 	if e != nil {
+44: 		return nil, e
+45: 	}
+46: 	defer tx.Rollback()
+47: 	result, e := s.prepareEffectTx(tx, token, project, runID, key, payload, cost)
+48: 	if e != nil {
+49: 		return nil, e
+50: 	}
+51: 	return result, tx.Commit()
+52: }
+53: func (s *Service) prepareEffectTx(tx *sql.Tx, token, project, runID, key string, payload, cost Object) (Object, error) {
+54: 	if e := resourceWriteLock(tx); e != nil {
+55: 		return nil, e
+56: 	}
+57: 	p, e := resourcePrincipal(tx, token, project, "SCHEDULER")
+58: 	if e != nil {
+59: 		return nil, e
+60: 	}
+61: 	if s.Contracts.Validate("Idempotency-Key", key) != nil {
+62: 		return nil, Fail(400, "INVALID_REQUEST", "stable effect key required")
+63: 	}
+64: 	digest := Hash([]any{payload, cost})
+65: 	prior, e := latestEffect(tx, project, runID, key)
+66: 	if e == nil {
+67: 		if prior["request_hash"] != digest {
+68: 			return nil, Fail(409, "IDEMPOTENCY_CONFLICT", "effect key payload changed")
+69: 		}
+70: 		return prior, nil
+71: 	}
+72: 	if e != sql.ErrNoRows {
+73: 		return nil, e
+74: 	}
+75: 	run, e := load(tx, project, "Run", runID)
+76: 	if e != nil {
+77: 		return nil, e
+78: 	}
+79: 	task, e := load(tx, project, "Task", Str(run, "task_id"))
+80: 	if e != nil {
+81: 		return nil, e
+82: 	}
+83: 	if e = qualificationEffectBlocked(tx, project, task); e != nil {
+84: 		if e = qualificationModelEffectAllowed(tx, project, task, payload); e != nil {
+85: 			return nil, e
+86: 		}
+87: 	}
+88: 	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+89: 	if e != nil {
+90: 		return nil, e
+91: 	}
+92: 	if task["active_run_id"] != runID || goal["status"] != "ACTIVE" || runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
+93: 		return nil, Fail(409, "STATE_CONFLICT", "run is not permitted new effects")
+94: 	}
+95: 	if e = s.taskContextForRun(tx, project, run); e != nil {
+96: 		return nil, e
+97: 	}
+98: 	if e = effectsReconciled(tx, project, runID); e != nil {
+99: 		return nil, e
+100: 	}
+101: 	if cost["run_id"] != runID || cost["provider_request_id"] != key || cost["reservation_id"] != nil || (cost["operation"] != "RESERVE" && cost["operation"] != "UNKNOWN") {
+102: 		return nil, Fail(422, "GATE_FAILED", "effect must bind a new reservation")
+103: 	}
+104: 	if e = s.Contracts.Validate("CostEntryRequest", cost); e != nil {
+105: 		return nil, Fail(400, "INVALID_REQUEST", "invalid cost request")
+106: 	}
+107: 	ledger, e := s.appendBudget(tx, project, cost)
+108: 	if e != nil {
+109: 		return nil, e
+110: 	}
+111: 	o := Object{"project_id": project, "goal_id": goal["id"], "task_id": task["id"], "run_id": runID, "key": key, "request_hash": digest, "payload": payload, "reservation_id": ledger["id"], "state": "PREPARED", "epoch": run["lease_epoch"], "context_bundle_id": task["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "receipt": nil}
+112: 	if e = effectAppend(tx, project, runID, key, o); e != nil {
+113: 		return nil, e
+114: 	}
+115: 	if e = s.event(tx, project, "Run", run, p.ID, ID(), "RUN_CHANGED"); e != nil {
+
+FILE internal/domain/client_command_queue.go SHA256 d85bb9099ced4fecfc1879a28688b260b1f66f13730a0fbf79550f0ec80c3ef1 LINES 146-193
+146: func clientQueueSettled(tx *sql.Tx, project, run string) error {
+147: 	installed, err := clientQueueInstalled(tx)
+148: 	if err != nil || !installed {
+149: 		return err
+150: 	}
+151: 	var n int
+152: 	err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences f WHERE f.project=? AND f.run_id=? AND (f.state NOT IN ('SEALED','CANCEL_FENCED') OR f.restore_fenced<>0 OR f.accepted_through<>f.sealed_through OR EXISTS(SELECT 1 FROM client_command_queue q WHERE q.generation=f.generation AND q.state NOT IN ('CONSUMED','DROPPED')))`, project, run).Scan(&n)
+153: 	if err != nil {
+154: 		return err
+155: 	}
+156: 	if n != 0 {
+157: 		return Fail(409, "GATE_FAILED", "canonical command queue remains unsettled")
+158: 	}
+159: 	return nil
+160: }
+161: 
+162: // Transition evidence is immutable. An identical receipt is safe to import
+163: // again; conflicting evidence cannot overwrite the prior fact.
+164: func appendClientReceipt(tx *sql.Tx, project, generation, command, kind, id string, body Object, previous any) error {
+165: 	raw := Bytes(body)
+166: 	digest := Digest(raw)
+167: 	var old string
+168: 	err := tx.QueryRow("SELECT body_hash FROM client_control_receipts WHERE receipt_id=?", id).Scan(&old)
+169: 	if err == nil {
+170: 		if old != digest {
+171: 			return Fail(409, "GATE_FAILED", "conflicting command receipt")
+172: 		}
+173: 		return nil
+174: 	}
+175: 	if err != sql.ErrNoRows {
+176: 		return err
+177: 	}
+178: 	_, err = tx.Exec(`INSERT INTO client_control_receipts(receipt_id,project,generation,command_id,kind,body,body_hash,previous_receipt_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, project, generation, command, kind, string(raw), digest, previous, Now())
+179: 	return err
+180: }
+181: 
+182: func queueObject(raw string) (Object, error) {
+183: 	var o Object
+184: 	err := json.Unmarshal([]byte(raw), &o)
+185: 	return o, err
+186: }
+187: 
+188: // Historical matching-program upgrade fixtures retain their pre-22 behavior.
+189: func clientQueueInstalled(tx *sql.Tx) (bool, error) {
+190: 	var version int
+191: 	err := tx.QueryRow(`SELECT coalesce(max(version),0) FROM schema_migrations`).Scan(&version)
+192: 	return version >= 22, err
+193: }
+
+FILE internal/domain/orchestration_controls.go SHA256 05691153e3993f059fc7e2bbb1614d36f65efdaf19878d76d41f34faa5f02126 LINES 1-57
+1: package domain
+2: 
+3: import "database/sql"
+4: 
+5: func (s *Service) controlTask(tx *sql.Tx, p Principal, project string, t, b Object, cid string) (Object, error) {
+6: 	action := Str(b, "action")
+7: 	status := Str(t, "status")
+8: 	if action == "CANCEL" {
+9: 		if err := fenceClientTask(tx, project, Str(t, "id")); err != nil {
+10: 			return nil, err
+11: 		}
+12: 	} else {
+13: 		var prior string
+14: 		err := tx.QueryRow("SELECT action FROM orchestration_task_controls WHERE project=? AND task=?", project, t["id"]).Scan(&prior)
+15: 		if err == nil && prior == "CANCEL" {
+16: 			return nil, Fail(409, "STATE_CONFLICT", "cancellation dominates pause")
+17: 		}
+18: 	}
+19: 	if status == "ACCEPTED" || status == "CANCELLED" || status == "NEEDS_REVALIDATION" || status == "DEFERRED_NO_PROGRESS" {
+20: 		return nil, Fail(409, "STATE_CONFLICT", "task cannot be paused or cancelled in this state")
+21: 	}
+22: 	if _, e := tx.Exec("INSERT INTO orchestration_task_controls(project,task,action,reason,requested_at) VALUES(?,?,?,?,?) ON CONFLICT(project,task) DO UPDATE SET action=excluded.action,reason=excluded.reason,requested_at=excluded.requested_at", project, t["id"], action, b["reason"], Now()); e != nil {
+23: 		return nil, e
+24: 	}
+25: 	unresolved := false
+26: 	if id := Str(t, "active_run_id"); id != "" {
+27: 		r, e := load(tx, project, "Run", id)
+28: 		if e != nil {
+29: 			return nil, e
+30: 		}
+31: 		unresolved = !runTerminal(r)
+32: 		if unresolved && r["status"] != "CANCEL_REQUESTED" {
+33: 			// Unknown reconciliation is retained; a cancellation request does not prove stopping.
+34: 			if r["status"] != "RECONCILING" && r["status"] != "LOST" {
+35: 				r["status"] = "CANCEL_REQUESTED"
+36: 			}
+37: 			r["cancel_requested_at"] = Now()
+38: 			if e = bump(r); e != nil {
+39: 				return nil, e
+40: 			}
+41: 			if e = s.put(tx, "Run", r); e != nil {
+42: 				return nil, e
+43: 			}
+44: 			if e = s.event(tx, project, "Run", r, p.ID, cid, "RUN_CHANGED"); e != nil {
+45: 				return nil, e
+46: 			}
+47: 		}
+48: 	}
+49: 	t["status"] = "BLOCKED"
+50: 	if action == "CANCEL" && !unresolved {
+51: 		t["status"] = "CANCELLED"
+52: 	}
+53: 	if e := bump(t); e != nil {
+54: 		return nil, e
+55: 	}
+56: 	return t, s.put(tx, "Task", t)
+57: }

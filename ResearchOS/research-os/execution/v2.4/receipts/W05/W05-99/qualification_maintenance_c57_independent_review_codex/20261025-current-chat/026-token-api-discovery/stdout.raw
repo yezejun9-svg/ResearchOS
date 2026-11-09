@@ -1,0 +1,155 @@
+581-	var pre BootWitness
+582-	if raw, readErr := os.ReadFile(filepath.Join(dir, "pre.json")); readErr == nil {
+583-		if len(raw) > 16<<10 || json.Unmarshal(raw, &pre) != nil || pre.OperationID != p.OperationID || pre.PlanSHA256 != p.PlanSHA256 || pre.BusinessEnabledSIDsSHA256 != expected {
+584-			return nil, errors.New("business token witness mismatch")
+585-		}
+586-		// The pre token was captured before the fence. A restart may change
+587-		// group activation, so an active business logon token must still match.
+588-		if err = inspectActiveBusinessSession(p, expected); err != nil {
+589-			return nil, err
+590-		}
+591-	} else if !errors.Is(readErr, os.ErrNotExist) {
+592-		return nil, readErr
+593:	} else if err = inspectLiveBusinessToken(p, expected); err != nil {
+594-		return nil, err
+595-	}
+596-	enabled := map[string]bool{p.BusinessSID: true}
+597-	for _, sid := range p.BusinessGroupSIDs {
+598-		enabled[sid] = true
+599-	}
+600-	return enabled, nil
+601-}
+602-
+603-func tokenEnabledDigest(token windows.Token, businessSID string) (string, error) {
+604-	user, userErr := token.GetTokenUser()
+605-	groups, groupsErr := token.GetTokenGroups()
+606-	if userErr != nil || groupsErr != nil {
+607-		return "", errors.Join(userErr, groupsErr)
+608-	}
+609-	if user.User.Sid.String() != businessSID {
+610-		return "", errors.New("native token user differs from frozen business SID")
+611-	}
+612-	var enabled []string
+613-	for _, group := range groups.AllGroups() {
+614-		if group.Attributes&windows.SE_GROUP_ENABLED != 0 && group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+615-			enabled = append(enabled, group.Sid.String())
+616-		}
+617-	}
+618-	sort.Strings(enabled)
+619-	raw, _ := json.Marshal(enabled)
+620-	return digest(raw), nil
+621-}
+622-
+623-func inspectActiveBusinessSession(p EntryFencePlan, expected string) error {
+624-	var sessions *windows.WTS_SESSION_INFO
+625-	var count uint32
+626:	if err := windows.WTSEnumerateSessions(0, 0, 1, &sessions, &count); err != nil {
+627-		return err
+628-	}
+629-	defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessions)))
+630-	if count == 0 || count > 256 {
+631-		return errors.New("active session inventory unavailable")
+632-	}
+633-	for _, session := range unsafe.Slice(sessions, count) {
+634-		if session.State != windows.WTSActive {
+635-			continue
+636-		}
+637-		var token windows.Token
+638:		if err := windows.WTSQueryUserToken(session.SessionID, &token); err != nil {
+639-			return fmt.Errorf("active session token requires native privilege: %w", err)
+640-		}
+641-		user, err := token.GetTokenUser()
+642-		if err != nil {
+643-			token.Close()
+644-			return err
+645-		}
+646-		if user.User.Sid.String() == p.BusinessSID {
+647-			actual, groupErr := tokenEnabledDigest(token, p.BusinessSID)
+648-			closeErr := token.Close()
+649-			if groupErr != nil || closeErr != nil {
+650-				return errors.Join(groupErr, closeErr)
+651-			}
+652-			if actual != expected {
+653-				return errors.New("current business session enabled groups changed after pre witness")
+654-			}
+655-			return nil
+656-		}
+657-		if err = token.Close(); err != nil {
+658-			return err
+659-		}
+660-	}
+661-	return errors.New("active business session token unavailable")
+662-}
+663-
+664:func inspectLiveBusinessToken(p EntryFencePlan, expected string) error {
+665-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+666-	if err != nil {
+667-		return err
+668-	}
+669-	defer windows.CloseHandle(snapshot)
+670-	var entry windows.ProcessEntry32
+671-	entry.Size = uint32(unsafe.Sizeof(entry))
+672-	if err = windows.Process32First(snapshot, &entry); err != nil {
+673-		return err
+674-	}
+675-	for {
+676-		for _, target := range p.Targets {
+677-			if target.Mode != "executable" || !strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), filepath.Base(target.File.Path)) {
+678-				continue
+679-			}
+680-			proc, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
+681-			if openErr != nil {
+682-				return openErr
+683-			}
+684-			buf := make([]uint16, 32768)
+685-			n := uint32(len(buf))
+686-			nameErr := windows.QueryFullProcessImageName(proc, 0, &buf[0], &n)
+687-			if nameErr != nil {
+688-				windows.CloseHandle(proc)
+689-				return nameErr
+690-			}
+691-			if !strings.EqualFold(windows.UTF16ToString(buf[:n]), target.File.Path) {
+692-				windows.CloseHandle(proc)
+693-				continue
+694-			}
+695-			var token windows.Token
+696:			tokenErr := windows.OpenProcessToken(proc, windows.TOKEN_QUERY, &token)
+697-			windows.CloseHandle(proc)
+698-			if tokenErr != nil {
+699-				return tokenErr
+700-			}
+701-			actual, groupErr := tokenEnabledDigest(token, p.BusinessSID)
+702-			token.Close()
+703-			if groupErr != nil {
+704-				return groupErr
+705-			}
+706-			if actual != expected {
+707-				return errors.New("actual business token enabled groups differ from frozen inventory")
+708-			}
+709-			return nil
+710-		}
+711-		err = windows.Process32Next(snapshot, &entry)
+712-		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+713-			return errors.New("exact official process token unavailable for ancestor proof")
+714-		}
+715-		if err != nil {
+716-			return err
+717-		}
+718-	}
+719-}
+720-
+721-func checkAncestorControl(p EntryFencePlan, holds []nativeHold) error {
+722-	enabled, err := verifiedBusinessGroups(p)
+723-	if err != nil {
+724-		return err
+725-	}
+726-	return checkAncestorACL(p, holds, enabled)
+727-}
+728-
+729-func checkAncestorACL(p EntryFencePlan, holds []nativeHold, enabled map[string]bool) error {
+730-	protected := map[string]bool{}
+731-	for _, a := range p.Ancestors {
+{
+  "path": "D:/作品集/ResearchOS/research-os/.local/worktrees/qualification-maintenance-c57-20261025/internal/recoveryboundary/boot_windows.go",
+  "sha256": "818181965D2DD256776CD8956B9D9EDB84925BDD865456982A71A72A5306CC92"
+}

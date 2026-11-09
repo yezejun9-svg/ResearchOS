@@ -1,0 +1,1 @@
+SELECT json_extract(body,'$.method'),json_extract(body,'$.status'),json_extract(body,'$.session_id'),json_extract(body,'$.revision'),json_extract(body,'$.result.client_id'),json_extract(body,'$.result.host_instance_id'),json_extract(body,'$.result.config_revision'),json_array_length(body,'$.result.model_configurations') FROM idempotency WHERE operation='v2:host.status';

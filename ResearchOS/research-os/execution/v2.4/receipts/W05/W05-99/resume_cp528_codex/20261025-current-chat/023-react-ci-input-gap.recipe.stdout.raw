@@ -1,0 +1,117 @@
+FILE ops/ci/ui.py lines=109
+1: """Run one frozen W13 browser phase and bind its raw evidence to a selector."""
+2: import argparse
+3: import datetime
+4: import hashlib
+5: import json
+6: import os
+7: from pathlib import Path
+8: import subprocess
+9: import sys
+10: import uuid
+11: 
+12: ROOT = Path(__file__).resolve().parents[2]
+13: WEB = ROOT / 'apps/web'
+14: 
+15: 
+16: def main():
+17:     parser = argparse.ArgumentParser()
+18:     parser.add_argument('--phase', choices=['core', 'contracts', 'workflow', 'content', 'recovery'], default='core')
+19:     parser.add_argument('--scenario', choices=['all', 'freshness'], default='all')
+20:     args = parser.parse_args()
+21:     phase, scenario = args.phase, args.scenario
+22:     if scenario != 'all' and phase != 'recovery':
+23:         parser.error('freshness scenario requires recovery phase')
+24:     check, case = os.getenv('RESEARCHOS_CHECK_ID', ''), os.getenv('RESEARCHOS_CASE_ID', '')
+25:     allowed = {'core': ['W13-G02', 'C24'], 'contracts': ['W13-G01', 'C17', 'C18'], 'workflow': ['C23'], 'content': ['C25'], 'recovery': ['C26']}
+26:     if os.getenv('RESEARCHOS_TASK_ID') != 'W13' or bool(check) == bool(case) or (check or case) not in allowed[phase]:
+27:         parser.error('one matching W13 task gate or case selector required')
+28:     expected = json.loads((ROOT / 'tests/ui/expected.json').read_text(encoding='utf-8'))[phase if scenario == 'all' else phase + '_' + scenario]
+29:     if not expected or len(expected) != len(set(expected)):
+30:         raise RuntimeError('empty or duplicate expected browser checks')
+31:     run_id = str(uuid.uuid4())
+32:     out = ROOT / ('execution/receipts/W13/c26-recovery/registered' if phase == 'recovery' else 'execution/receipts/W13/registered') / run_id
+33:     out.mkdir(parents=True)
+34:     def digest(path):
+35:         return 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+36:     def save(name, value):
+37:         (out / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+38:     patterns = ['apps/control/*.go', 'apps/web/src/*', 'apps/web/package*.json', 'apps/web/index.html',
+39:                 'internal/**/*.go', 'adapters/**/*.go', 'migrations/sqlite/*.sql', 'spec/v2.0/contracts/*.json',
+40:                 'spec/v2.0/ui/*.json', 'tests/ui/**/*.go', 'tests/ui/*.py', 'tests/ui/expected.json',
+41:                 'ops/ci/ui.py', 'execution/commands.json', 'go.mod', 'go.sum', 'execution/toolchains/locked.json']
+42:     sources = {p.relative_to(ROOT).as_posix(): digest(p) for pattern in patterns for p in ROOT.glob(pattern) if p.is_file()}
+43:     before = {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'scenario': scenario, 'check_id': check, 'case_id': case,
+44:               'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+45:               'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'source_manifest': sources,
+46:               'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'expected_checks': expected,
+47:               'scope': 'REAL_WINDOWS_BROWSER_WITH_EXPLICIT_SQLITE_FIXTURES', 'physical_phone': False, 'physical_os_sleep': False}
+48:     before['dirty_before'] = subprocess.check_output(['git', 'status', '--short', '--untracked-files=all'], cwd=ROOT, text=True).splitlines()
+49:     save('before.json', before)
+50:     locked = json.loads((ROOT / 'execution/toolchains/locked.json').read_text(encoding='utf-8'))
+51:     node = Path(locked['tools']['node']['path'])
+52:     vite = WEB / 'node_modules/vite/bin/vite.js'
+53:     if not node.is_file() or not vite.is_file():
+54:         raise SystemExit('pinned Node or npm ci dependencies unavailable')
+55:     build_command = [str(node), str(vite), 'build']
+56:     command = [sys.executable, '-X', 'utf8', str(ROOT / 'tests/ui/browser_smoke.py')]
+57:     save('commands.json', [{'argv': build_command, 'cwd': str(WEB)}, {'argv': command, 'cwd': str(ROOT), 'phase': phase, 'scenario': scenario}])
+58:     build = subprocess.run(build_command, cwd=WEB, capture_output=True, timeout=120)
+59:     (out / 'build.stdout.txt').write_bytes(build.stdout)
+60:     (out / 'build.stderr.txt').write_bytes(build.stderr)
+61:     code, report, child = build.returncode, {}, None
+62:     if code == 0:
+63:         try:
+64:             run = subprocess.run(command, cwd=ROOT, env=dict(os.environ, RESEARCHOS_UI_PHASE=phase, RESEARCHOS_UI_RECOVERY_SCENARIO=scenario), capture_output=True, timeout=480)
+65:             stdout, stderr, code = run.stdout, run.stderr, run.returncode
+66:         except subprocess.TimeoutExpired as error:
+67:             stdout, stderr, code = error.stdout or b'', error.stderr or b'', 124
+68:         (out / 'browser.stdout.txt').write_bytes(stdout)
+69:         (out / 'browser.stderr.txt').write_bytes(stderr)
+70:         for line in reversed(stdout.decode('utf-8', errors='replace').splitlines()):
+71:             try:
+72:                 value = json.loads(line)
+73:             except ValueError:
+74:                 continue
+75:             if isinstance(value, dict) and 'report' in value:
+76:                 child = Path(value['report']).resolve()
+77:                 if not child.is_relative_to(ROOT / ('execution/receipts/W13/c26-recovery/browser' if phase == 'recovery' else 'execution/receipts/W13/frontend')):
+78:                     raise RuntimeError('browser receipt escaped evidence directory')
+79:                 report = json.loads(child.read_text(encoding='utf-8'))
+80:                 break
+81:     actual = report.get('checks', [])
+82:     drift = [p for p, h in sources.items() if not (ROOT / p).is_file() or digest(ROOT / p) != h]
+83:     passed = code == 0 and report.get('status') == 'PASS' and report.get('phase') == phase and report.get('scenario', 'all') == scenario and actual == expected and not drift
+84:     if child:
+85:         for name, h in report.get('screenshot_hashes', {}).items():
+86:             if digest(child.parent / name) != h:
+87:                 passed = False
+88:     assertion_phase = phase.upper() if scenario == 'all' else phase.upper() + '-' + scenario.upper()
+89:     rows = [{'assertion_id': f'W13-UI-{assertion_phase}-{i+1:02}', 'expected': value,
+90:              'actual': actual[i] if i < len(actual) else None, 'status': 'PASS' if passed else 'FAIL',
+91:              'evidence': {'report': child.relative_to(ROOT).as_posix() if child else None, 'check_index': i}}
+92:             for i, value in enumerate(expected)]
+93:     hashes = {p.name: digest(p) for p in out.iterdir() if p.is_file()}
+94:     save('report.json', {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'scenario': scenario, 'status': 'PASS' if passed else 'FAIL',
+95:                          'exit_code': code, 'assertions': rows, 'assertion_ids': [r['assertion_id'] for r in rows],
+96:                          'expected_checks': expected, 'actual_checks': actual, 'source_drift': drift,
+97:                          'child_report': child.relative_to(ROOT).as_posix() if child else None,
+98:                          'child_report_hash': digest(child) if child else None, 'raw_evidence_hashes': hashes,
+99:                          'scope': before['scope'], 'independent_acceptance': 'PENDING',
+100:                          'qualification_status': 'PARTIAL' if phase == 'recovery' else 'NOT_ASSESSED',
+101:                          'physical_os_sleep': False, 'physical_phone': False,
+102:                          'ended_at': datetime.datetime.now(datetime.timezone.utc).isoformat()})
+103:     print(json.dumps({'status': 'PASS' if passed else 'FAIL', 'assertions': len(rows), 'assertion_ids': [r['assertion_id'] for r in rows], 'receipt': str(out / 'report.json')}))
+104:     return 0 if passed else 1
+105: 
+{
+  "head": "7a06acebddcf6ba9b9e9c29f0dc980db1e330aee",
+  "tree": "dc3bbdfbe8cb6c17b15391016e0a28b38c7af579",
+  "status": "",
+  "changed": "apps/web/AGENTS.md\napps/web/src/components/app-shell.jsx\napps/web/src/components/ui.jsx\napps/web/src/components/workbench-layout.jsx\napps/web/src/main.jsx\napps/web/src/navigation.jsx\napps/web/src/screens.jsx\napps/web/src/style.css\napps/web/src/workbench.jsx\ntests/ui/frontend-redesign-fixture.cjs\ntests/ui/frontend-redesign.cjs",
+  "ci_source": {
+    "path": "D:\\作品集\\ResearchOS\\research-os\\ops\\ci\\ui.py",
+    "sha256": "2b2c0f09687eb2a01384810f8c7a7b932a46e5af2f6e34717fc5db0e84dfe3c1",
+    "bytes": 7433
+  }
+}

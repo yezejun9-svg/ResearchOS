@@ -1,0 +1,70 @@
+import hashlib
+import json
+from pathlib import Path
+import re
+import sqlite3
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = ROOT / 'evidence/attempt-01'
+def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def load(path): return json.loads(Path(path).read_bytes())
+def put(path, value):
+    with path.open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+
+manifest = load(ATTEMPT / 'source-manifest.json')
+current = {row['path']: sha(ROOT / row['path']) for row in manifest['files']}
+if any(current[row['path']] != row['sha256'] for row in manifest['files']):
+    raise SystemExit('binding frozen source drift')
+pure = ROOT.parent / 'pure-scalar'
+pure_manifest = load(pure / 'evidence/attempt-02/source-manifest.json')
+pure_hashes = {row['path']: sha(pure / row['path']) for row in pure_manifest['files']}
+if any(pure_hashes[row['path']] != row['sha256'] for row in pure_manifest['files']):
+    raise SystemExit('prior pure-scalar frozen source drift')
+summary = load(ATTEMPT / 'author-summary.json')
+go_output = (ATTEMPT / 'go-test-vectors.stdout.txt').read_text(encoding='utf-8')
+python_output = (ATTEMPT / 'python-fresh-fixtures.stderr.txt').read_text(encoding='utf-8')
+go_top = re.findall(r'^--- PASS: (Test[^\s(]+)', go_output, re.M)
+go_nested = re.findall(r'^\s+--- PASS: (Test[^\s(]+)', go_output, re.M)
+python_names = re.findall(r'^(test_[^ ]+) \([^\n]+\) \.\.\. ok$', python_output, re.M)
+if len(go_top) != 2 or len(go_nested) != 4 or len(python_names) != 18 or summary['first_failure'] is not None:
+    raise SystemExit('unexpected reported test set')
+report = {
+    'status': 'FROZEN_C_ONLY_SCHEMA_INTEGRITY_FIXTURE',
+    'sqlite_version': sqlite3.sqlite_version,
+    'go_top_level_test_functions': go_top,
+    'go_named_vector_subtests': go_nested,
+    'python_test_functions': python_names,
+    'python_test_function_count': 18,
+    'all_command_exits': {row['name']: row['exit_code'] for row in summary['results']},
+    'first_failure': None,
+    'source_manifest_path': str(ATTEMPT / 'source-manifest.json'),
+    'source_manifest_sha256': sha(ATTEMPT / 'source-manifest.json'),
+    'current_source_sha256': current,
+    'canonical_upstream_copy_sha256': current['canonical/jcs.go'],
+    'canonical_provenance_sha256': sha(ROOT / 'canonical-provenance.json'),
+    'helper_binary': load(ROOT / '.local/canonical-helper.json'),
+    'original_question_and_probe_current_hashes': {
+        'OPEN_SEMANTICS.md': sha(ROOT / 'OPEN_SEMANTICS.md'),
+        'evidence/sqlite-prerequisite-probe-01.json': sha(ROOT / 'evidence/sqlite-prerequisite-probe-01.json'),
+    },
+    'prior_pure_scalar_frozen_sources_unchanged': True,
+    'prior_pure_scalar_source_sha256': pure_hashes,
+    'no_tests_rerun_for_report': True,
+    'D_source_state_writes': 0, 'old_database_connections': 0,
+    'native_Host_provider_model_calls': 0,
+    'trusted_canonical_Go_helper_processes_were_executed': True,
+    'formal_increment': 0, 'counter_reset': False,
+    'guarantee_limit': 'Given keys/schema/bytes/fake-context integrity only. No Owner authentication, approval consumption, lineage derivation, production migration/restore, source witness/checker or ordinary LIVE Goal exception.',
+}
+put(ROOT / 'evidence/freeze-report.json', report)
+put(ROOT / 'evidence/freeze-report-manifest.json', {
+    'freeze_report_sha256': sha(ROOT / 'evidence/freeze-report.json'),
+    'attempt_evidence_manifest_sha256': sha(ATTEMPT / 'evidence-manifest.json'),
+    'controller_sha256': sha(Path(__file__)),
+})
+print(json.dumps({'status': report['status'], 'python_tests': 18, 'go_top': len(go_top),
+                  'go_named_vectors': len(go_nested), 'source_manifest_sha256': report['source_manifest_sha256'],
+                  'freeze_report_sha256': sha(ROOT / 'evidence/freeze-report.json'),
+                  'prior_pure_scalar_unchanged': True}))

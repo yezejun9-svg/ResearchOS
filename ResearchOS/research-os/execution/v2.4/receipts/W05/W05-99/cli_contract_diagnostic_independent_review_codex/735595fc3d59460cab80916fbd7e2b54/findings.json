@@ -1,0 +1,122 @@
+[
+  {
+    "id": "P01",
+    "verdict": "CONFIRMED_PRODUCT_GAP_STATIC",
+    "facts": [
+      "cliInteractive calls session.list; normal input dispatches run steps: existing Session uses session.get then session.send, new Session uses session.create then send. No explicit attach occurs in cliInteractive.",
+      "product.contract.json interactive.local_operations requires session.attach; 22 §3.3 separates readonly open from explicit owner acquisition."
+    ],
+    "impact": "已有 Session 的交互入口遗漏明确 attach；修复 probe 不会产生缺失的真实方法。不能把 session.get 当 attach 资格。",
+    "minimal_changes": [
+      {
+        "path": "apps/cli/cli_verbs.go",
+        "boundary": "cliInteractive initialization and existing-session branch; reuse same context/command allocator; no separate stdin writer or scheduler.",
+        "change": "进入已有 Session 时先完整 typed read-only attach(request_write_owner=false)，绑定 project/session/cursor；新 create 后按 22 第58行 session.attach(request_write_owner=true)，等待完成并取得合法 snapshot/epoch 再发用户任务。单纯打开不得接管。显式 resume 或经明确写入意图授权的 takeover 必须走完成门；read-only ACK 不生成 send 权限。"
+      },
+      {
+        "path": "apps/cli/cli_stream.go",
+        "boundary": "attach result completion/authority adoption in cliFlow.call/runCLIVerb",
+        "change": "与 P03 同一实现；不得为了增加 method 次数重复发送业务消息。"
+      }
+    ],
+    "proof_boundary": "真实 compiled CLI + loopback production API + public temporary Host/SQLite，已有 Session attach wire/快照/owner，exactly one accepted send；纯 probe 仅证客户端顺序。"
+  },
+  {
+    "id": "P02",
+    "verdict": "CONFIRMED_PRODUCT_GAP_AND_RUNTIME_SCOPE_NOT_YET_CLOSED",
+    "facts": [
+      "resume target=session is emitted by both CLI branches. 22 §3.3 requires control target an owned Goal/Run; ControlPayload JSON schema only constrains a nonempty string and cannot enforce domain membership.",
+      "ClientService.handleWrite RESUME/session branch only checks pending/fence and terminal predecessor children/queue then returns settled ControlResult/snapshot. It has no ResumeCheckpoint, control producer or native dispatch call. Other non-CANCEL action is rejected NOT_IMPLEMENTED.",
+      "Service.ResumeCheckpoint is a distinct SCHEDULER-authenticated transaction: original active Run/Task/Goal, revision, checkpoint, trusted stopped-tree/queue observation, effects reconciliation, current input/admission/dependency context, rotated lease and native dispatch. It rejects terminal/CANCEL_REQUESTED Run.",
+      "RuntimeCoordinator.RunAdmitted handles a PAUSED bridge journal by sealing observed state then returning; this is not proof that the Session special branch resumes it."
+    ],
+    "impact": "当前成功只能证明读取并打开可继续的 Session，不能报告恢复暂停执行。活跃/暂停但非 terminal 的 Run 反而被该特殊分支拒绝。",
+    "minimum_immediate_bounds": [
+      {
+        "path": "apps/cli/cli_verbs.go",
+        "boundary": "verbSteps resume /resume cases77–110",
+        "change": "保留合法 positional session-id；从完成且验证的 snapshot 解析所属 Goal/Run target，不能把 Session ID 传作 control target。--writer-epoch 不得成为跳过 attach(true) 的权限来源。"
+      },
+      {
+        "path": "apps/cli/cli_stream.go",
+        "boundary": "runCLIVerb resume sequencing and cliFlow.call",
+        "change": "先完成 writer takeover，再派发真实 control；无可恢复 target 时显示明确结果/拒绝，不产生假的 settled RESUME。"
+      },
+      {
+        "path": "internal/domain/client_protocol.go",
+        "boundary": "handleWrite session.control RESUME/session shortcut",
+        "change": "移除该分支的真实恢复成功语义，保留 immutable 旧 journal 重放，不修改历史响应。新 RESUME 必须关联当前 Session 的真实 Goal/Run 和 durable 控制事实。"
+      }
+    ],
+    "full_runtime_followup_scope_required": [
+      {
+        "path": "internal/domain/durability.go",
+        "function": "Service.ResumeCheckpoint",
+        "boundary": "既有同 Run checkpoint 恢复权威；若抽 caller-Tx helper，必须独立登记。不能从 ClientService 已打开的 Tx 直接调用这个另开 Tx 的公开函数，也不能把用户 credential 当 scheduler token。"
+      },
+      {
+        "path": "internal/domain/runtime_coordinator_windows.go",
+        "function": "Scan / RunAdmitted / trusted observation and dispatch integration",
+        "boundary": "消费已提交且授权的恢复意向；不得另造 executor、先发进程再补 journal。需要独立关闭 producer/ownership 设计后方可实施。"
+      }
+    ],
+    "unresolved_explicit": "PAUSE 的真实安全暂停 producer、Goal resume 到 task/run 的状态转换及 explicit continuation-after-CANCELLED 的新 attempt 分支尚未在本次只读审查中闭合；现有 ResumeCheckpoint 不能替代 cancelled continuation。不能宣称以上5路径足以实现全部恢复，也不得借此提前改 F08/SQL。",
+    "preserve": [
+      "旧 CANCELLED Run 永不原地复活。",
+      "UNKNOWN effect/reservation、不明子进程、恢复 fence、失败次数与预算不清零。",
+      "原 Goal/Task/checkpoint、input/runtime historical identity、queue/order/watermark、user explicit flag 和同命令 journal 保留。"
+    ]
+  },
+  {
+    "id": "P03",
+    "verdict": "CONFIRMED_TWO_SEPARATE_PRODUCT_GAPS_STATIC",
+    "facts": [
+      "v2Call passes strictIdentity=false, used by interactive session.list and cliInit workspace.register/project.bootstrap.",
+      "strictIdentity=true checks protocol/command/method and only string session_id mismatch. It still lacks full CommandResponse/result schema, absent/null SID distinction and atomic cross-object adoption.",
+      "json.Unmarshal allows duplicate keys; adoptV2Snapshot may update revision before complete snapshot/project/authority checks. IN_PROGRESS is accepted although frozen status enum has only three values.",
+      "runCLIVerb passes wait=false for every session.attach; cliFlow.call returns zero on ACK when !wait and continues to get/control. attach(true) zeroes cached epoch, but a later get or manual epoch branch is not equivalent to completed AttachResult.",
+      "Host writer guards still apply. These facts prove attempted continuation risk, not an actual successful unauthorized Host mutation."
+    ],
+    "minimal_changes": [
+      {
+        "path": "apps/cli/cli_v2.go",
+        "boundary": "v2Call / v2CallTransportWithCause / adoptV2Snapshot",
+        "change": "所有 /v2 回复先 strict JSON Unicode/duplicate/single-value 校验、UseNumber exact numeric decoding、固定 CommandResponse + method result/PendingResult schema、command/method/session/project/result identity，再一次性采用 context。非法回复保持所有内存/持久 config 字段不变。取消 strict=false 绕行；新 Session creation 是显式唯一 SID 生成例外；host-scope null 合法。"
+      },
+      {
+        "path": "apps/cli/cli_stream.go",
+        "boundary": "cliFlow.call and runCLIVerb attach leg",
+        "change": "attach(true) 原 command ID、payload、expected revision、null writer_epoch 原封重放直到 COMPLETED，核 write_owner_acquired=true、typed snapshot owner client ID、positive exact epoch、project/session/revision 一致后才能 control/send。ACK 仅 PendingResult，等待超时或冲突保持只读，不改新 revision 盲重试。readonly attach 即使报告 pending也不能颁写权。"
+      }
+    ],
+    "existing_validation_reference": "cli_contract.go configure transport uses jsontext.Value.IsValid + UseNumber + frozen CommandResponse;可复用已有行为但不得修改它来放宽要求。doctor 当前也有 typed validation；本项不是跨产品重构。",
+    "do_not_reuse_uncritically": "domain.DecodeResponse 当前允许顶层 NOT_IMPLEMENTED/IN_PROGRESS 且要求非nil revision，会拒绝合法 host-scope null revision；单纯调用它不能作为完整冻结合同验证。无需为 CLI 修复扩大 domain decoder source scope。",
+    "preserve": [
+      "read-only interrupt uses actual cancelled I/O cause; 130 cannot吞真实5xx/JSON错误。",
+      "CANCEL ACK 独立追踪/子进程收敛流程不因 attach wait 修改而阻塞。",
+      "goal typed adoption、配置 guard、历史稳定 command IDs、单 stdin/network writer 保留。"
+    ]
+  },
+  {
+    "id": "P04",
+    "verdict": "CLASSIFICATION_RECOMMENDATION_EXIT3_WITH_EXPLICIT_INFERENCE",
+    "frozen_facts": [
+      "product /cli/exit_codes:0 execution_result_reported,1 execution_or_check_failed,2 invalid_input_or_configuration,3 blocked_missing_resource_or_authorization,130 cancelled_by_user. Frozen contract does not enumerate an error_code-to-exit table.",
+      "Schema permits only REJECTED/error_code=NOT_IMPLEMENTED with matching complete ProtocolError and result=null; top-level NOT_IMPLEMENTED is illegal.",
+      "Current generic legal REJECTED NOT_IMPLEMENTED falls through exit1; doctor maps it to resource/authorization blocked3; cli_contract existing exitNotImplemented constant=3.",
+      "Original failed row13 hit REPLY_IDENTITY_MISMATCH on malformed session.get response, not the legal error classification."
+    ],
+    "decision": "推荐合法 typed NOT_IMPLEMENTED 归 exit3：所需 Host 操作能力不可用、未产生执行结果，保持原 unavailable-operation 断言及现有 doctor 分类一致。这是对冻结资源阻塞类别的明确解释，不声称冻结文本逐码写死3。",
+    "minimal_change": {
+      "path": "apps/cli/cli_v2.go",
+      "boundary": "REJECTED error_code classification only, after complete validation",
+      "change": "将 NOT_IMPLEMENTED 纳入 exit3；保留 HOST_REJECTED:NOT_IMPLEMENTED 或明确 method-correlated structured reason。不能继续接受非法顶层 NOT_IMPLEMENTED。"
+    },
+    "fixture_change": {
+      "path": "tests/runtime/cli_contract/v2verbs.go",
+      "boundary": "probe.handle notimplemented case and v2VerbPhase row431–432",
+      "change": "合法完整 REJECTED/ProtocolError/result=null；隔离无 Session 的 status host.status 主控，或先真实完成 session.get 再在 host.status 拒绝。保留原 ID、exit3、非成功及原目标方法断言；旧非法顶层样本另作 exit1 负控。"
+    },
+    "not_proven": "未实际执行合法 NOT_IMPLEMENTED CLI；不将原 row13 改绿、不把独立分类建议当产品修复接受。"
+  }
+]

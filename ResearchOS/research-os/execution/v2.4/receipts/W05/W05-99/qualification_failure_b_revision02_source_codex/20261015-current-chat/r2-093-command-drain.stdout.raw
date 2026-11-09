@@ -1,0 +1,121 @@
+internal/domain/runtime_command_queue_windows.go:427:func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, cancelBroker context.CancelFunc, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) (qualificationBrokerDrain, error) {
+internal/domain/runtime_command_queue_windows.go-428-	type completion struct {
+internal/domain/runtime_command_queue_windows.go-429-		seq      int64
+internal/domain/runtime_command_queue_windows.go-430-		response any
+internal/domain/runtime_command_queue_windows.go-431-		err      error
+internal/domain/runtime_command_queue_windows.go-432-	}
+internal/domain/runtime_command_queue_windows.go-433-	results := make(chan completion, 32)
+internal/domain/runtime_command_queue_windows.go-434-	ready := map[int64]completion{}
+internal/domain/runtime_command_queue_windows.go-435-	registry := newQualificationBrokerRegistry()
+internal/domain/runtime_command_queue_windows.go-436-	inflight := 0
+internal/domain/runtime_command_queue_windows.go-437-	next := int64(1)
+internal/domain/runtime_command_queue_windows.go-438-	frames := bridge.Frames()
+internal/domain/runtime_command_queue_windows.go-439-	tick := time.NewTicker(40 * time.Millisecond)
+internal/domain/runtime_command_queue_windows.go-440-	defer tick.Stop()
+internal/domain/runtime_command_queue_windows.go-441-	var initialized time.Time
+internal/domain/runtime_command_queue_windows.go-442-	var cancelSent time.Time
+internal/domain/runtime_command_queue_windows.go-443-	var deferredError error
+internal/domain/runtime_command_queue_windows.go-444-	var firstError error
+internal/domain/runtime_command_queue_windows.go-445-	var closing bool
+internal/domain/runtime_command_queue_windows.go-446-	ctxDone := ctx.Done()
+internal/domain/runtime_command_queue_windows.go-447-	var fence *time.Timer
+internal/domain/runtime_command_queue_windows.go-448-	var fenceExpired <-chan time.Time
+internal/domain/runtime_command_queue_windows.go-449-	defer func() {
+internal/domain/runtime_command_queue_windows.go-450-		if fence != nil {
+internal/domain/runtime_command_queue_windows.go-451-			fence.Stop()
+internal/domain/runtime_command_queue_windows.go-452-		}
+internal/domain/runtime_command_queue_windows.go-453-	}()
+internal/domain/runtime_command_queue_windows.go-454-	closeAdmission := func(cause error, rejectedSeq int64) {
+internal/domain/runtime_command_queue_windows.go-455-		if firstError == nil {
+internal/domain/runtime_command_queue_windows.go-456-			firstError = cause
+internal/domain/runtime_command_queue_windows.go-457-		}
+internal/domain/runtime_command_queue_windows.go-458-		if closing {
+internal/domain/runtime_command_queue_windows.go-459-			if rejectedSeq > 0 {
+internal/domain/runtime_command_queue_windows.go-460-				registry.disqualify()
+internal/domain/runtime_command_queue_windows.go-461-			}
+internal/domain/runtime_command_queue_windows.go-462-			return
+internal/domain/runtime_command_queue_windows.go-463-		}
+internal/domain/runtime_command_queue_windows.go-464-		closing = true
+internal/domain/runtime_command_queue_windows.go-465-		registry.close(rejectedSeq)
+internal/domain/runtime_command_queue_windows.go-466-		cancelBroker()
+internal/domain/runtime_command_queue_windows.go-467-		if rejectedSeq > 0 {
+internal/domain/runtime_command_queue_windows.go-468-			bridge.Cancel("qualification first dispatch gate denied TOOL")
+internal/domain/runtime_command_queue_windows.go-469-		} else {
+internal/domain/runtime_command_queue_windows.go-470-			bridge.Cancel("protocol reconciliation failed")
+internal/domain/runtime_command_queue_windows.go-471-		}
+internal/domain/runtime_command_queue_windows.go-472-		fence = time.NewTimer(15 * time.Second)
+internal/domain/runtime_command_queue_windows.go-473-		fenceExpired = fence.C
+internal/domain/runtime_command_queue_windows.go-474-	}
+internal/domain/runtime_command_queue_windows.go-475-	for frames != nil || inflight > 0 {
+internal/domain/runtime_command_queue_windows.go-476-		select {
+internal/domain/runtime_command_queue_windows.go-477-		case observation := <-bridge.ModelObservations():
+internal/domain/runtime_command_queue_windows.go-478-			if closing {
+internal/domain/runtime_command_queue_windows.go-479-				registry.disqualify()
+internal/domain/runtime_command_queue_windows.go-480-				continue
+internal/domain/runtime_command_queue_windows.go-481-			}
+internal/domain/runtime_command_queue_windows.go-482-			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
+internal/domain/runtime_command_queue_windows.go-483-			if err != nil {
+internal/domain/runtime_command_queue_windows.go-484-				closeAdmission(err, 0)
+internal/domain/runtime_command_queue_windows.go-485-				continue
+internal/domain/runtime_command_queue_windows.go-486-			}
+internal/domain/runtime_command_queue_windows.go-487-			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
+internal/domain/runtime_command_queue_windows.go-488-				closeAdmission(err, 0)
+internal/domain/runtime_command_queue_windows.go-489-				continue
+internal/domain/runtime_command_queue_windows.go-490-			}
+internal/domain/runtime_command_queue_windows.go-491-		case frame, ok := <-frames:
+internal/domain/runtime_command_queue_windows.go-492-			if !ok {
+internal/domain/runtime_command_queue_windows.go-493-				frames = nil
+internal/domain/runtime_command_queue_windows.go-494-				continue
+internal/domain/runtime_command_queue_windows.go-495-			}
+internal/domain/runtime_command_queue_windows.go-496-			if closing {
+internal/domain/runtime_command_queue_windows.go-497-				registry.disqualify()
+internal/domain/runtime_command_queue_windows.go-498-				continue
+internal/domain/runtime_command_queue_windows.go-499-			}
+internal/domain/runtime_command_queue_windows.go-500-			if frame.Type == "effect.request" {
+internal/domain/runtime_command_queue_windows.go-501-				if inflight >= 16 {
+internal/domain/runtime_command_queue_windows.go-502-					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
+internal/domain/runtime_command_queue_windows.go-503-					continue
+internal/domain/runtime_command_queue_windows.go-504-				}
+internal/domain/runtime_command_queue_windows.go-505-				if !registry.admit(frame) {
+internal/domain/runtime_command_queue_windows.go-506-					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
+internal/domain/runtime_command_queue_windows.go-507-					continue
+internal/domain/runtime_command_queue_windows.go-508-				}
+internal/domain/runtime_command_queue_windows.go-509-				inflight++
+internal/domain/runtime_command_queue_windows.go-510-				go func(f rt.BridgeFrame) {
+internal/domain/runtime_command_queue_windows.go-511-					r, e := c.brokerEffect(brokerCtx, route, run, lease, epoch, bridge, f)
+internal/domain/runtime_command_queue_windows.go-512-					results <- completion{f.Sequence, r, e}
+internal/domain/runtime_command_queue_windows.go-513-				}(frame)
+internal/domain/runtime_command_queue_windows.go-514-			} else {
+internal/domain/runtime_command_queue_windows.go-515-				var response any
+internal/domain/runtime_command_queue_windows.go-516-				var err error
+internal/domain/runtime_command_queue_windows.go-517-				if strings.HasPrefix(frame.Type, "command.") {
+internal/domain/runtime_command_queue_windows.go-518-					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+internal/domain/runtime_command_queue_windows.go-519-					if err == nil && frame.Type == "command.accepted" {
+internal/domain/runtime_command_queue_windows.go-520-						payload, e := Decode(frame.Payload)
+internal/domain/runtime_command_queue_windows.go-521-						if e != nil {
+internal/domain/runtime_command_queue_windows.go-522-							closeAdmission(e, 0)
+internal/domain/runtime_command_queue_windows.go-523-							continue
+internal/domain/runtime_command_queue_windows.go-524-						}
+internal/domain/runtime_command_queue_windows.go-525-						if payload["initialized"] == true {
+internal/domain/runtime_command_queue_windows.go-526-							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+internal/domain/runtime_command_queue_windows.go-527-						}
+internal/domain/runtime_command_queue_windows.go-528-					}
+internal/domain/runtime_command_queue_windows.go-529-				}
+internal/domain/runtime_command_queue_windows.go-530-				if frame.Type == "checkpoint" {
+internal/domain/runtime_command_queue_windows.go-531-					mutation.Lock()
+internal/domain/runtime_command_queue_windows.go-532-					response, err = c.checkpoint(ctx, route, run, lease, epoch, locator, bridge, frame)
+internal/domain/runtime_command_queue_windows.go-533-					mutation.Unlock()
+internal/domain/runtime_command_queue_windows.go-534-				}
+internal/domain/runtime_command_queue_windows.go-535-				if err != nil {
+internal/domain/runtime_command_queue_windows.go-536-					closeAdmission(err, 0)
+internal/domain/runtime_command_queue_windows.go-537-					continue
+internal/domain/runtime_command_queue_windows.go-538-				}
+internal/domain/runtime_command_queue_windows.go-539-				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
+internal/domain/runtime_command_queue_windows.go-540-			}
+internal/domain/runtime_command_queue_windows.go-541-		case done := <-results:
+internal/domain/runtime_command_queue_windows.go-542-			if closing {
+internal/domain/runtime_command_queue_windows.go-543-				registry.disqualify()
+internal/domain/runtime_command_queue_windows.go-544-			}
+internal/domain/runtime_command_queue_windows.go-545-			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
+internal/domain/runtime_command_queue_windows.go-546-				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
+internal/domain/runtime_command_queue_windows.go-547-				continue

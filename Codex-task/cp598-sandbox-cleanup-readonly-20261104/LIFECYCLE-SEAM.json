@@ -1,0 +1,34 @@
+{
+  "visibility": "package-private only; production creates adapter from original held handles; no public fake Native injection",
+  "placement": "Small coordinator/types in sandbox_windows.go, stream result/wakeup plumbing in async_windows.go; no additional scheduler/backend",
+  "single_owner": "runSandbox coordinator owns Job/process handle close, terminate and accounting; Process.Cancel continues context notification, never stores/reopens raw Job handle",
+  "injected_ops": [
+    "clock.Now",
+    "bounded primary wait/signal",
+    "Job accounting(total,active)",
+    "TerminateJob on original handle",
+    "CloseJob once",
+    "primary exit query",
+    "stream-result notifications",
+    "owned pipe close after fail-safe"
+  ],
+  "states": [
+    "RUNNING",
+    "PRIMARY_EXITED_GRACE",
+    "STOPPING_JOB",
+    "DRAINING_STREAMS",
+    "DONE_OR_INCOMPLETE"
+  ],
+  "order": [
+    "While RUNNING retain existing interactive input and original command timeout.",
+    "On primary signal cache exitcode; continue context/deadline/stream-fault checks during <=500ms grace. JobActive0 permits natural drain.",
+    "Cancel/deadline/stream error or active descendants after grace sends at most one owned termination request; preserve original reason and classification.",
+    "Within one cleanup deadline observe original primary signaled and JobActive0. If query/terminate/wait fails, never invent stopped.",
+    "Close original Job as final kernel fallback before any potentially unbounded stream/callback/diagnostic join. No goroutine captures its raw numeric handle.",
+    "Only then wait on buffered stream results with remaining deadline. Force-close read ends on missing EOF; return incomplete, never StreamsDrained=true.",
+    "Copy output/delete staging/profile only under the explicitly supported stop/drain conditions; aggregate real errors without promoting flags."
+  ],
+  "callback_limit": "A blocked arbitrary OnStream Go callback cannot be forcibly stopped. Cleanup must not wait for it before Job termination/close. Missing callback completion is incomplete; late writes/goroutine ownership require explicit quarantine/retention, not a claimed drain proof.",
+  "blocking_OS_limit": "No in-process Go design proves bounded return if kernel calls never return. Filesystem copy/remove, profile calls and BeforeResume callbacks also need truthful separate bounds; no claim they became bounded merely by this coordinator.",
+  "no_claim": "No mock establishes actual AppContainer/Job stop or Native qualification."
+}

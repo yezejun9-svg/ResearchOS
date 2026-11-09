@@ -1,0 +1,191 @@
+14:func queueBackupFixture(t *testing.T) (*fixture, *ClientService, string, string) {
+15-	f, svc, client, sid := queueClientFixture(t)
+16-	for _, mode := range []string{"STEER", "FOLLOW_UP"} {
+17-		reply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.send", Object{"text": "snapshot may predate a later send", "attachment_artifact_ids": Empty(), "delivery": mode}))
+18-		if deref(reply.Status) != "COMPLETED" {
+19-			t.Fatal(string(Bytes(reply)))
+20-		}
+21-	}
+22-	// Revocation is legitimate pre-backup workspace state; this fixture tests
+23-	// queue evidence independently from the already-covered filesystem remap.
+24-	if _, err := f.db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','REVOKED') WHERE kind='WorkspaceBinding'`); err != nil {
+25-		t.Fatal(err)
+26-	}
+27-	return f, svc, client, sid
+28-}
+29-func TestClientQueueBackupRestorePreservesHistoryAndFencesNoRun(t *testing.T) {
+30-	f, _, _, sid := queueBackupFixture(t)
+31-	key := backupTestKey(t)
+32-	backup, manifest := backupTestCreate(t, f.s, key)
+33-	if manifest.Inventory["command_queue_digest"] == nil {
+34-		t.Fatal("queue not inventoried")
+35-	}
+36-	_, files, err := readBackup(backup, key)
+37-	if err != nil || files["command-queue.json"] == nil {
+38-		t.Fatal("portable queue sidecar absent", err)
+39-	}
+40-	destination := filepath.Join(t.TempDir(), "restore")
+41-	report, err := RestoreBackup(context.Background(), backup, destination, backupOpt(t, f.s, key))
+42-	if err != nil {
+43-		t.Fatal(err)
+44-	}
+45-	if report.Status != "RESTORED_RECONCILIATION_REQUIRED" {
+46-		t.Fatal(report.Status)
+47-	}
+48-	db, err := store.Open(filepath.Join(destination, "state.sqlite"))
+49-	if err != nil {
+50-		t.Fatal(err)
+51-	}
+52-	defer db.Close()
+53-	var unknown, receipts, runs int
+54-	db.QueryRow(`SELECT count(*) FROM client_command_queue WHERE state='UNKNOWN'`).Scan(&unknown)
+55-	db.QueryRow(`SELECT count(*) FROM client_control_receipts WHERE kind='RESTORE_UNKNOWN'`).Scan(&receipts)
+56-	db.QueryRow(`SELECT count(*) FROM domain_objects WHERE kind='Run'`).Scan(&runs)
+57-	if unknown != 2 || receipts != 2 || runs != 0 {
+58-		t.Fatalf("unknown=%d receipt=%d invented Run=%d", unknown, receipts, runs)
+59-	}
+60-	var fence string
+61-	var restored, explicit int
+62-	db.QueryRow(`SELECT state,restore_fenced FROM client_queue_fences WHERE session_id=?`, sid).Scan(&fence, &restored)
+63-	db.QueryRow(`SELECT resume_requires_explicit_user FROM client_sessions WHERE id=?`, sid).Scan(&explicit)
+64-	if fence != "RECONCILING" || restored != 1 || explicit != 1 {
+65-		t.Fatalf("fence=%s restored=%d explicit=%d", fence, restored, explicit)
+66-	}
+67-	restoredService := &Service{DB: db, Contracts: f.s.Contracts}
+68-	again := filepath.Join(t.TempDir(), "rebackup")
+69-	if _, err = restoredService.CreateBackup(context.Background(), again, key); err != nil {
+70-		t.Fatal(err)
+71-	}
+72-	if _, err = RestoreBackup(context.Background(), again, filepath.Join(t.TempDir(), "restore-again"), backupOpt(t, restoredService, key)); err != nil {
+73-		t.Fatal(err)
+74-	}
+75-}
+76-func TestClientQueueBackupCorruptionFailsClosed(t *testing.T) {
+77-	for _, kind := range []string{"content", "receipt", "foreign-session", "watermark", "orphan", "missing-table", "receipt-chain", "foreign-goal"} {
+78-		t.Run(kind, func(t *testing.T) {
+79-			f, _, _, _ := queueBackupFixture(t)
+80-			switch kind {
+81-			case "missing-table":
+82-				if _, err := f.db.Exec(`DROP TABLE client_control_requests`); err != nil {
+83-					t.Fatal(err)
+84-				}
+85-			case "foreign-goal":
+86-				f.db.Exec(`UPDATE client_command_queue SET goal_id='foreign'`)
+87-			case "receipt-chain":
+88-				sourceTx(t, f.db, func(tx *sql.Tx) error {
+89-					var generation, command string
+90-					tx.QueryRow(`SELECT generation,command_id FROM client_command_queue LIMIT 1`).Scan(&generation, &command)
+91-					return appendClientReceipt(tx, f.project, generation, command, "TEST", ID(), Object{"phase": "unknown"}, "missing-prior")
+92-				})
+93-			case "content":
+94-				f.db.Exec(`UPDATE client_command_queue SET content='{}'`)
+95-			case "receipt":
+96-				sourceTx(t, f.db, func(tx *sql.Tx) error {
+97-					var generation string
+98-					tx.QueryRow(`SELECT generation FROM client_queue_fences`).Scan(&generation)
+99-					_, err := tx.Exec(`INSERT INTO client_control_receipts(receipt_id,project,generation,kind,body,body_hash,created_at) VALUES(?,?,?,'TEST','{}','bad',?)`, ID(), f.project, generation, Now())
+100-					return err
+101-				})
+102-			case "foreign-session":
+103-				f.db.Exec(`UPDATE client_queue_fences SET session_id='foreign'`)
+104-			case "watermark":
+105-				f.db.Exec(`UPDATE client_queue_fences SET accepted_through=0`)
+106-			case "orphan":
+107-				f.db.Exec(`UPDATE client_command_queue SET task_id='foreign'`)
+108-			}
+109-			if err := validateBackupQueue(f.db); err == nil {
+110-				t.Fatal("corruption accepted")
+111-			}
+112-			if _, err := f.s.CreateBackup(context.Background(), filepath.Join(t.TempDir(), "backup"), backupTestKey(t)); err == nil {
+113-				t.Fatal("corrupt queue backed up")
+114-			}
+115-		})
+116-	}
+117-}
+118-func TestClientQueueFreshNumberedSchema(t *testing.T) {
+119-	f := setup(t)
+120-	_, sqls, err := upgradeConfigurationRelease("../..", 23)
+121-	if err != nil || len(sqls) != 24 {
+122-		t.Fatalf("exact installed schema23 release: %d %v", len(sqls), err)
+123-	}
+124-	want := len(sqls) - 1 // The final entry is the separately pinned additive SQL.
+125-	rows, err := f.db.Query(`SELECT version FROM schema_migrations ORDER BY version`)
+126-	if err != nil {
+127-		t.Fatal(err)
+128-	}
+129-	count := 0
+130-	for rows.Next() {
+131-		count++
+132-		var applied int
+133-		if err = rows.Scan(&applied); err != nil || applied != count {
+134-			rows.Close()
+135-			t.Fatalf("noncontiguous installed migration %d: %d %v", count, applied, err)
+136-		}
+137-	}
+138-	if err = rows.Err(); err != nil || count != want {
+139-		rows.Close()
+140-		t.Fatalf("installed migration count=%d want=%d %v", count, want, err)
+141-	}
+142-	rows.Close()
+143-	var version int
+144-	if err := f.db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil || version != want {
+145-		t.Fatalf("migration=%d %v", version, err)
+146-	}
+147-	for _, table := range clientQueueTables {
+148-		var n int
+149-		if err := f.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
+150-			t.Fatalf("fresh table %s %d %v", table, n, err)
+151-		}
+152-	}
+153-	if raw, err := os.ReadFile("../../migrations/sqlite/0022_client_command_queue.sql"); err != nil || len(raw) == 0 {
+154-		t.Fatal("numbered SQL absent", err)
+155-	}
+156-	configurationEvidenceSnapshot(t, f.db, "fresh-current23")
+157-}
+158-
+159-func TestClientQueueHistorical22NumberedSchema(t *testing.T) {
+160-	root := queueUpgradeReleaseFixture(t, 22)
+161-	_, sqls, err := upgradeQueueRelease(root, 22)
+162-	if err != nil || len(sqls) != 23 {
+163-		t.Fatalf("exact historical schema22 release: %d %v", len(sqls), err)
+164-	}
+165-	db, err := store.Open(filepath.Join(t.TempDir(), "numbered22.sqlite"))
+166-	if err != nil {
+167-		t.Fatal(err)
+168-	}
+169-	defer db.Close()
+170-	// Only fixed numbered001..022 are applied. This is not a matching startup
+171-	// release: it intentionally lacks the separately installed session/fence.
+172-	for i, raw := range sqls[:22] {
+173-		if _, err = db.Exec(string(raw)); err != nil {
+174-			t.Fatal(err)
+175-		}
+176-		if _, err = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); err != nil {
+177-			t.Fatal(err)
+178-		}
+179-	}
+180-	var version, count int
+181-	if err = db.QueryRow(`SELECT max(version),count(*) FROM schema_migrations`).Scan(&version, &count); err != nil || version != 22 || count != 22 {
+182-		t.Fatalf("historical migration=%d count=%d %v", version, count, err)
+183-	}
+184-	for _, table := range clientQueueTables {
+185-		var n int
+186-		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
+187-			t.Fatalf("fresh table %s %d %v", table, n, err)
+188-		}
+189-	}
+190-	if raw, err := os.ReadFile(filepath.Join(root, "migrations/sqlite/0022_client_command_queue.sql")); err != nil || len(raw) == 0 {
+191-		t.Fatal("numbered SQL absent", err)
+192-	}
+193-	if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name IN ('host_model_configurations','host_model_config_heads','client_command_identities','client_sessions')`).Scan(&count); err != nil || count != 0 {
+194-		t.Fatalf("historical22 contains later or additive schema: %d %v", count, err)
+195-	}
+196-	configurationEvidenceSnapshot(t, db, "historical-numbered22")
+197-}
+198-
+199-func TestClientQueueBackupAllPhasesAndPendingControl(t *testing.T) {
+200-	f, svc, client, sid := queueBackupFixture(t)
+201-	if _, err := f.db.Exec(`UPDATE domain_objects SET body=json_set(body,'$.status','ACTIVE') WHERE kind='WorkspaceBinding'`); err != nil {
+202-		t.Fatal(err)
+203-	}
+204-	phases := []string{"ENQUEUED", "SENDING", "SDK_ACCEPTED", "CONSUMED", "DROP_REQUESTED", "DROPPED", "UNKNOWN"}

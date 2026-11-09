@@ -1,0 +1,59 @@
+// Pure mirror of the frozen dispatch/profile predicates. No filepath.IsLocal:
+// pinned Windows Go delegates reserved-name-with-extension decisions to an OS
+// function. Such a path remains explicitly OPEN rather than calling that API.
+const f08ProfilePathOSGap=f08Error("F08_PROFILE_PATH_REQUIRES_UNCAPTURED_OS_SEMANTICS")
+func f08WindowsLocalOutput(name string) error {
+	if name=="" || name[0]=='/' || name[0]=='\\' || strings.Contains(name,":") { return f08Binding }
+	depth:=0
+	for _,part:=range strings.FieldsFunc(name,func(r rune)bool{return r=='/'||r=='\\'}) {
+		base:=part;if at:=strings.IndexByte(base,'.');at>=0{base=base[:at]};base=strings.TrimRight(base," ")
+		upper:=strings.ToUpper(base)
+		reserved:=upper=="CON"||upper=="PRN"||upper=="AUX"||upper=="NUL"||upper=="CONIN$"||upper=="CONOUT$"
+		if strings.HasPrefix(upper,"COM")||strings.HasPrefix(upper,"LPT") { tail:=upper[3:];reserved=reserved||(len(tail)==1&&tail[0]>='1'&&tail[0]<='9')||tail=="¹"||tail=="²"||tail=="³" }
+		if reserved { if base!=part{return f08ProfilePathOSGap};return f08Binding }
+		switch part {case ".":case "..":depth--;if depth<0{return f08Binding};default:depth++}
+	}
+	return nil
+}
+func f08FrozenModelProfile(p map[string]any) error {
+	if p["backend"]!="mu-sdk-broker-v1"{return nil}
+	c,ok:=p["model_config"].(map[string]any);if !ok||c["api"]!="openai-completions"||!f08Equal(c["model"],p["model"]){return f08Binding}
+	for _,k:=range []string{"model","provider","ref","route"}{if _,e:=f08String(c[k]);e!=nil{return e}}
+	endpoint,e:=f08String(c["endpoint"]);if e!=nil{return e};u,e:=url.Parse(endpoint)
+	if e!=nil||u.Hostname()==""||u.User!=nil||u.Fragment!=""||u.RawQuery!=""{return f08Binding}
+	// Exact producer predicate; this does not grant network route authority or
+	// invent an HTTPS gate absent from this frozen configuration function.
+	for k,max:=range map[string]int64{"max_output_tokens":8192,"max_calls":32}{n,e:=f08Integer(c[k],1);if e!=nil||n>max{return f08Binding}}
+	tools,e:=f08Array(c["tools"]);if e!=nil||len(tools)>16{return f08Binding}
+	for _,x:=range tools{tool,ok:=x.(map[string]any);if !ok||tool["type"]!="function"{return f08Binding};fn,ok:=tool["function"].(map[string]any);if !ok||fn["parameters"]==nil{return f08Binding};if _,e=f08String(fn["name"]);e!=nil{return e}}
+	bundle,e:=f08String(p["bundle_hash"]);if e!=nil||len(bundle)!=71{return f08Binding}
+	if value,exists:=p["model_qualification"];exists{q,e:=f08Object(value,"route","model_config_hash","max_calls");if e!=nil{return e};if !f08Equal(q["route"],c["route"])||q["model_config_hash"]!=Hash(c){return f08Binding};n,e:=f08Integer(q["max_calls"],1);if e!=nil||n>2{return f08Binding}}
+	return nil
+}
+func f08FrozenDispatchProfile(p map[string]any) error {
+	if e:=f08FrozenModelProfile(p);e!=nil{return e}
+	if p["sandbox"]!="appcontainer-zero-capabilities-v1"||p["adapter_revision"]!="windows-appcontainer-v1"||p["platform"]!="windows-amd64"{return f08Binding}
+	for _,k:=range []string{"command_id","build_hash"}{if _,e:=f08String(p[k]);e!=nil{return e}}
+	permissions,ok:=p["permissions"].(map[string]any);if !ok{return f08Shape}
+	caps,e:=f08Array(permissions["capabilities"]);if e!=nil||len(caps)!=0||permissions["network"]!="none"||permissions["environment"]!="staging-only"{return f08Binding}
+	processes,e:=f08Integer(permissions["process_limit"],1);if e!=nil||processes!=1{return f08Binding};memory,e:=f08Integer(permissions["memory_mib"],1);if e!=nil||memory!=256{return f08Binding}
+	max:=int64(300);if p["backend"]=="mu-sdk-broker-v1"{max=900};seconds,e:=f08Integer(p["timeout_seconds"],1);if e!=nil||seconds>max{return f08Binding}
+	outputs,e:=f08Array(p["outputs"]);if e!=nil||len(outputs)==0||len(outputs)>16{return f08Binding};seen:=map[string]bool{}
+	for _,x:=range outputs{name,e:=f08String(x);if e!=nil||seen[name]{return f08Binding};seen[name]=true;if e=f08WindowsLocalOutput(name);e!=nil{return e}}
+	if raw,exists:=p["argv"];exists{argv,e:=f08Array(raw);if e!=nil{return e};for _,x:=range argv{if _,ok:=x.(string);!ok{return f08Shape}}}
+	return nil
+}
+func f08FrozenQualificationProfile(p,runtime,task,plan,profileRef,artifact map[string]any) error {
+	if e:=f08FrozenDispatchProfile(p);e!=nil{return e}
+	for _,k:=range []string{"build_hash","sandbox","credential_revision","backend","model"}{if _,e:=f08String(p[k]);e!=nil{return e}}
+	if artifact["validity"]!="CURRENT"||artifact["sealed_at"]==nil||artifact["access_class"]=="VERIFIER_ONLY"||!f08Equal(artifact["content_hash"],profileRef["content_hash"]){return f08Binding}
+	if runtime["measurement_mode"]=="LIVE"{money,ok:=p["max_cost"].(map[string]any);if !ok{return f08Shape};amount,e:=f08String(money["amount"]);if e!=nil||len(amount)>4096{return f08Binding};n,ok:=new(big.Rat).SetString(amount);if !ok||n.Sign()<=0{return f08Binding};if _,e=f08String(money["currency"]);e!=nil{return e}}
+	input,e:=f08Array(task["input_refs"]);if e!=nil{return e};requirements,e:=f08Array(task["requirement_refs"]);if e!=nil{return e}
+	found:=false;for _,x:=range input{found=found||f08Equal(x,profileRef)};if !found{return f08Binding}
+	for _,xs:=range [][]any{input,requirements}{for _,x:=range xs{r,e:=f08Object(x,"entity_type","id","revision","content_hash");if e!=nil||r["entity_type"]=="RuntimeRegistration"{return f08Binding}}}
+	known:=map[string]bool{};caps,e:=f08Array(runtime["capabilities"]);if e!=nil{return e};for _,x:=range caps{c,e:=f08String(x);if e!=nil{return e};known[c]=true}
+	required,e:=f08Array(plan["required_capabilities"]);if e!=nil||len(required)==0{return f08Binding};seen:=map[string]bool{}
+	for _,x:=range required{c,e:=f08String(x);if e!=nil||!known[c]||seen[c]{return f08Binding};seen[c]=true}
+	if q,ok:=p["model_qualification"].(map[string]any);ok{if p["backend"]!="mu-sdk-broker-v1"||!f08Equal(plan["model_qualification"],q){return f08Binding}}else if _,exists:=plan["model_qualification"];exists{return f08Binding}
+	return nil
+}

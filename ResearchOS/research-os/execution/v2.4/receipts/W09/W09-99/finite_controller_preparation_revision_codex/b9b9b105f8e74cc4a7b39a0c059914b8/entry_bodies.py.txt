@@ -1,0 +1,95 @@
+# This receipt contains three entry body sections; prepare_templates.py splits exact delimiters.
+# === LAUNCH ===
+def main():
+ ap=argparse.ArgumentParser();ap.add_argument('--grant',required=True);ap.add_argument('--grant-sha256',required=True);a=ap.parse_args()
+ g,s,out=validate_grant(a.grant,a.grant_sha256)
+ if file_ref(__file__)!=s['launcher_ref']:raise Stop('Launcher exact pin')
+ outer=out.with_name(out.name+'-outer')
+ if out.exists() or outer.exists():raise Stop('Prior output exists; no reuse/retry')
+ outer.mkdir();cause=FirstCause();helper=None;result=None;ledger=Ledger(outer/'vectors');argv=[g['tools']['python']['path'],*FLAGS,s['controller_ref']['path'],'--grant',str(Path(a.grant)),'--grant-sha256',a.grant_sha256]
+ env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','NUMBER_OF_PROCESSORS','PROCESSOR_ARCHITECTURE'}}
+ started=time.time();write_json(outer/'invocation.started.json',{'actualargv':argv,'cwd':str(PREP),'env':env,'grant_ref':g['_grant_ref'],'started_at_unix':started,'actual_native_exit':None,'timeout_seconds':15000,'cleanup_observation_seconds':5})
+ try:
+  ledger.add(g['_authorization_paths']+[r['path'] for r in g['resource_files']],'actual-authorization-public-inputs');ledger.check('before')
+  write_json(outer/'runtime.source.before.json',runtime_source_snapshot(g['resource_files']))
+  helper=trusted_module(g['normal_helper_ref']['path'],g['normal_helper_ref'])
+  write_json(outer/'runtime.before.json',runtime_snapshot(helper,g['resource_files']))
+  with (outer/'stdout.raw').open('xb') as so,(outer/'stderr.raw').open('xb') as se:result=helper.run_owned(argv,str(PREP),env,so,se,15000)
+  require_job(result)
+ except BaseException as e:cause.record(e,'outer-controller')
+ finally:
+  cause.attempt('outer-after-inputs',lambda:ledger.check('after'))
+  cause.attempt('outer-runtime-source-after',lambda:write_json(outer/'runtime.source.after.json',runtime_source_snapshot(g['resource_files'])))
+  if helper:cause.attempt('outer-runtime-after',lambda:write_json(outer/'runtime.after.json',runtime_snapshot(helper,g['resource_files'])))
+  cause.attempt('outer-input-vector',lambda:write_json(outer/'inputs.final.json',ledger.export()))
+  record={'actualargv':argv,'cwd':str(PREP),'started_at_unix':started,'ended_at_unix':time.time(),'owned_result':result,'actual_native_controller_exit':None if result is None else result.get('actual_exit'),'stdout_ref':existing_ref(outer/'stdout.raw'),'stderr_ref':existing_ref(outer/'stderr.raw'),'first_error':cause.primary,'secondary_errors':cause.secondary,'source_acceptance':False}
+  write_json(outer/'completion.json',record)
+  if cause.primary:write_json(outer/'failure.origin.json',{'first_error':cause.primary,'secondary_errors':cause.secondary,'actual_native_exit':record['actual_native_controller_exit'],'counter_reset':False})
+ cause.raise_if_any()
+if __name__=='__main__':main()
+# === WORKER ===
+def main():
+ ap=argparse.ArgumentParser();ap.add_argument('--request',required=True);ap.add_argument('--sha256',required=True);a=ap.parse_args()
+ pin=file_ref(a.request)
+ if pin['sha256']!=a.sha256:raise Stop('Case request changed')
+ r=raw_json(Path(a.request).read_bytes())
+ if r.get('schema')!='researchos.w09.owned-case-request.v2':raise Stop('Case request schema')
+ g,s,out=validate_grant(r['grant_ref']['path'],r['grant_ref']['sha256'])
+ if r['self_ref']!=s['case_worker_ref'] or file_ref(__file__)!=r['self_ref'] or r['python_ref']!=g['tools']['python'] or r['debug_helper_ref']!=g['debug_helper_ref']:raise Stop('Worker/actual grant pin')
+ output=no_alias(r['output_dir'])
+ if not output.is_relative_to(out/'native') or Path(a.request)!=output/'case-request.json':raise Stop('Case output boundary')
+ if r['timeout']!=120 or r['process_cap'] not in (1,2):raise Stop('Case caps')
+ argv=r['argv'];matches=[x for x in s['roster'] if argv[1:]==['-test.run',x['test_run'],'-test.v','-test.count=1','-test.failfast','-test.timeout=120s']]
+ if len(matches)!=1:raise Stop('Exact finite selector required')
+ planned=matches[0];package='adapter' if planned['file'].startswith('adapters/') else 'domain'
+ if argv[0]!=str(out/(package+'.test.exe')):raise Stop('Foreign case executable')
+ expected_cap=2 if not planned['new'] and 'junction' in planned['requires_resource'] else 1
+ if r['process_cap']!=expected_cap:raise Stop('Case process bound')
+ allowed={x['path'].casefold():x for x in r['allowed_module_files']}
+ for image in r['images']:
+  if allowed.get(image['path'].casefold())!=image:raise Stop('Case image not in frozen full vector')
+  verify(image)
+ if file_ref(argv[0])['sha256']!=r['expected_image']['sha256']:raise Stop('Actual case image')
+ cause=FirstCause();debug=None;result=None;ledger=Ledger(output/'worker-vectors')
+ write_json(output/'worker.started.json',{'request_ref':pin,'grant_ref':r['grant_ref'],'actualargv':argv,'actual_native_exit':None,'selector':planned['selector']})
+ try:
+  ledger.add(g['_authorization_paths']+[pin['path']]+[x['path'] for x in r['allowed_module_files']],'worker-actual-inputs');ledger.check('before')
+  write_json(output/'worker.runtime.source.before.json',runtime_source_snapshot(g['resource_files']))
+  debug=trusted_module(r['debug_helper_ref']['path'],r['debug_helper_ref'])
+  write_json(output/'worker.runtime.before.json',runtime_snapshot(debug,g['resource_files']))
+  with (output/'stdout.raw').open('xb') as so,(output/'stderr.raw').open('xb') as se:result=debug.run_owned(argv,r['cwd'],r['env'],so,se,120,r['expected_image'],r['images'],r['allowed_module_files'],r['process_cap'],creation_flags=0x08000000)
+  require_job(result,True)
+ except BaseException as e:cause.record(e,'debug-case')
+ finally:
+  cause.attempt('worker-after-inputs',lambda:ledger.check('after'))
+  cause.attempt('worker-runtime-source-after',lambda:write_json(output/'worker.runtime.source.after.json',runtime_source_snapshot(g['resource_files'])))
+  if debug:cause.attempt('worker-runtime-after',lambda:write_json(output/'worker.runtime.after.json',runtime_snapshot(debug,g['resource_files'])))
+  cause.attempt('worker-input-vector',lambda:write_json(output/'worker.inputs.final.json',ledger.export()))
+  write_json(output/'case-owned.json',result)
+  write_json(output/'worker.completion.json',{'actual_native_exit':None if result is None else result.get('actual_exit'),'first_error':cause.primary,'secondary_errors':cause.secondary,'stdout_ref':existing_ref(output/'stdout.raw'),'stderr_ref':existing_ref(output/'stderr.raw'),'request_ref':pin,'point_in_time_python_only':True})
+  if cause.primary:write_json(output/'worker.failure.origin.json',{'first_error':cause.primary,'secondary_errors':cause.secondary,'counter_reset':False})
+ cause.raise_if_any()
+if __name__=='__main__':main()
+# === CONTROLLER_MAIN ===
+def main():
+ ap=argparse.ArgumentParser();ap.add_argument('--grant',required=True);ap.add_argument('--grant-sha256',required=True);a=ap.parse_args()
+ g,s,out=validate_grant(a.grant,a.grant_sha256)
+ if file_ref(__file__)!=s['controller_ref']:raise Stop('Controller exact pin')
+ if out.exists():raise Stop('Output exists; no resume/retry')
+ out.mkdir();write_json(out/'started.json',{'grant_ref':g['_grant_ref'],'source':CANDIDATE,'base':BASE,'started_at_unix':time.time()})
+ c=Controller.__new__(Controller);c.g=g;c.s=s;c.out=out;c.tests=0;c.serial=0;c.results=[];c.attempts=[];c.ledger=Ledger(out/'vectors');c.debug=None;cause=FirstCause()
+ try:
+  c.__init__(g,s,out);c.export_source();c.build();c.resources();c.cases()
+ except BaseException as e:cause.record(e,'controller')
+ finally:
+  cause.attempt('final-vector',lambda:c.ledger.check('final'))
+  cause.attempt('freeze-final-inputs',lambda:write_json(out/'inputs.final.json',c.ledger.export()))
+  cause.attempt('runtime-source-after',lambda:write_json(out/'runtime.source.after.json',runtime_source_snapshot(g['resource_files'])))
+  if c.debug:cause.attempt('runtime-after',lambda:write_json(out/'runtime.after.json',runtime_snapshot(c.debug,g['resource_files'])))
+  completed={x['id'] for x in c.results}
+  notrun=[{'id':x['id'],'selector':x['selector'],'state':'NOT_RUN_AFTER_STOP'} for x in s['roster'] if x['id'] not in completed]
+  summary={'source':CANDIDATE,'base':BASE,'source_acceptance':False,'formal_increment':0,'first_error':cause.primary,'secondary_errors':cause.secondary,'results':c.results,'not_run':notrun,'actual_test_invocations':c.tests,'attempts':c.attempts,'counter_reset':False,'stage':'INCOMPLETE' if cause.primary or notrun else 'FINITE_EXECUTION_COMPLETE_PENDING_REVIEW','grant_ref':g['_grant_ref'],'python_inventory':'ACTUAL_POINT_IN_TIME_ONLY_NOT_LIFECYCLE'}
+  write_json(out/'result.json',summary)
+  if cause.primary:write_json(out/'failure.origin.json',{'first_error':cause.primary,'secondary_errors':cause.secondary,'counter_reset':False,'actual_native_exit':None,'native_details_in_each_attempt':True})
+ cause.raise_if_any()
+if __name__=='__main__':main()

@@ -1,0 +1,615 @@
+// Package host is the trusted local host boundary (W17-01). It owns three things the plain
+// command protocol must never own: the one-time OWNER bootstrap bound to the OS user, the
+// short-lived session credential that can be renewed without the user ever copying a token,
+// and the protected storage for provider credentials and workspace-root bindings.
+//
+// Business truth stays in the existing domain layer: this package calls domain.ProvisionPrincipal
+// and domain.IssueCredential instead of writing auth_* tables itself, and its own local state
+// (credential vault, root registry, single-use selection references) lives in a private
+// current-user directory as files, never as a second set of business tables.
+package host
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"researchos.local/research-os/internal/auth"
+	"researchos.local/research-os/internal/domain"
+)
+
+const (
+	// MaxSessionTTL mirrors the existing host credential ceiling (22: short sessions only).
+	MaxSessionTTL = 15 * time.Minute
+	// DefaultSessionTTL is what the host issues unless configured lower.
+	DefaultSessionTTL = MaxSessionTTL
+	// SelectionTTL is the published single-use window for a workspace selection reference.
+	SelectionTTL = 5 * time.Minute
+	// MaxSelectionRecords bounds the local reference table so a hostile loop cannot grow it.
+	MaxSelectionRecords = 256
+)
+
+var (
+	ErrNoOwner            = errors.New("OWNER_NOT_INITIALIZED")
+	ErrMultipleOwners     = errors.New("MULTIPLE_OWNER_STATE")
+	ErrOwnerTaken         = errors.New("OWNER_ALREADY_INITIALIZED")
+	ErrPrincipalRevoked   = errors.New("PRINCIPAL_REVOKED")
+	ErrHostIdentity       = errors.New("OS_IDENTITY_MISMATCH")
+	ErrUntrustedTransport = errors.New("UNTRUSTED_TRANSPORT")
+	// ErrUntrustedPathChoice refuses a directory a client named by itself when no user chooser
+	// confirmed it: binding a caller-typed path is how a "user-chosen workspace" becomes a
+	// drive-by path.
+	ErrUntrustedPathChoice = errors.New("FORBIDDEN")
+	ErrBadState            = errors.New("HOST_STATE_INVALID")
+)
+
+// Config wires the host onto an already-migrated database. ContractsDir and MigrationFile are
+// the existing host inputs (same values apps/control uses) so domain validation stays one
+// implementation rather than a second one tuned for tests.
+type Config struct {
+	DB            *sql.DB
+	Dir           string
+	// Trial-only read access to one existing DPAPI record; the new DB stays isolated.
+	ReadOnlyModelVaultDir string
+	ReadOnlyModelCredentialRef string
+	ReadOnlyModelProvider string
+	ContractsDir  string
+	MigrationFile string
+	SessionTTL    time.Duration
+	// SchemaDir holds the pinned client.protocol.schema.json plus domain.schema.json the bridge
+	// grades its frames against. Without it the host refuses to start rather than accepting
+	// frames nobody has graded.
+	SchemaDir string
+	Now       func() time.Time
+	// AllowNonWindows is only used to keep the package buildable; the bootstrap path refuses
+	// to run anywhere the OS identity cannot be verified as the local principal.
+	AllowNonWindows bool
+	// PeerIdentityResolver decides who is on the other end of a native connection. The default
+	// is the real OS lookup (auth.ProcessIdentity). Qualification may substitute it to prove the
+	// serve path refuses a peer whose resolved principal is not the host owner: the seam only
+	// replaces the OS answer, it cannot replace the comparison, so a host that stopped comparing
+	// would accept a peer the resolver called foreign.
+	PeerIdentityResolver func(pid uint32) (auth.Identity, error)
+	// ProtocolVersion is the version this host stamps into bridge replies. It defaults to the
+	// pinned researchos-client/2; a host built for any other version has its replies refused by
+	// contract grading, which is what keeps the bridge from growing a private dialect.
+	ProtocolVersion string
+}
+
+// Host is one trusted local host instance.
+type Host struct {
+	db       *sql.DB
+	domain   *domain.Service
+	dir      string
+	ttl      time.Duration
+	identity auth.Identity
+	now      func() time.Time
+
+	doc schemaDocument
+
+	peerLookup      func(pid uint32) (auth.Identity, error)
+	protocolVersion string
+
+	vault      *Vault
+	roots      *RootRegistry
+	selections *SelectionStore
+	state      *hostState
+}
+
+// New verifies the OS identity first: a host that cannot name the local principal is not
+// allowed to bootstrap, renew, or accept native calls at all.
+func New(cfg Config) (*Host, error) {
+	if cfg.DB == nil || cfg.Dir == "" || cfg.ContractsDir == "" || cfg.MigrationFile == "" || cfg.SchemaDir == "" {
+		return nil, fmt.Errorf("%w: db, dir, contracts, migration and schema are required", ErrBadState)
+	}
+	if cfg.ReadOnlyModelVaultDir != "" {
+		if cfg.ReadOnlyModelCredentialRef == "" || cfg.ReadOnlyModelProvider == "" ||
+			filepath.Base(cfg.Dir) != "host" ||
+            ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+			return nil, ErrUnknownCredential
+		}
+	} else if cfg.ReadOnlyModelCredentialRef != "" || cfg.ReadOnlyModelProvider != "" {
+		return nil, ErrUnknownCredential
+	}
+	ttl := cfg.SessionTTL
+	if ttl <= 0 || ttl > MaxSessionTTL {
+		ttl = DefaultSessionTTL
+	}
+	now := cfg.Now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	id, err := auth.Current()
+	if err != nil {
+		return nil, err
+	}
+	if !verifiableKind(id.Kind) {
+		return nil, fmt.Errorf("%w: host identity kind %s is not a verifiable local principal", ErrHostIdentity, id.Kind)
+	}
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	if cfg.ReadOnlyModelVaultDir != "" &&
+		ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+		return nil, ErrUnknownCredential
+	}
+	if err := privateDir(cfg.Dir); err != nil {
+		return nil, fmt.Errorf("private host directory refused: %w", err)
+	}
+	doc, err := loadSchema(cfg.SchemaDir)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := domain.NewCurrentMu(cfg.DB, cfg.ContractsDir, cfg.MigrationFile)
+	if err != nil {
+		return nil, err
+	}
+	h := &Host{db: cfg.DB, domain: svc, dir: cfg.Dir, ttl: ttl, identity: id, now: now, doc: doc}
+	h.peerLookup = cfg.PeerIdentityResolver
+	if h.peerLookup == nil {
+		h.peerLookup = auth.ProcessIdentity
+	}
+	h.protocolVersion = cfg.ProtocolVersion
+	if h.protocolVersion == "" {
+		h.protocolVersion = nativeProtocolVersion
+	}
+	if cfg.ReadOnlyModelVaultDir != "" {
+		if h.vault, err = openVaultReadOnly(cfg.ReadOnlyModelVaultDir,
+			cfg.ReadOnlyModelCredentialRef, cfg.ReadOnlyModelProvider); err != nil {
+			return nil, err
+		}
+	} else if h.vault, err = openVault(cfg.Dir); err != nil {
+		return nil, err
+	}
+	if h.roots, err = openRootRegistry(cfg.Dir); err != nil {
+		return nil, err
+	}
+	if h.selections, err = openSelectionStore(cfg.Dir); err != nil {
+		return nil, err
+	}
+	if h.state, err = loadHostState(cfg.Dir); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// verifiableKind accepts WINDOWS_SID today; the POSIX path must be re-qualified before it is
+// trusted as a local principal, so anything else fails closed.
+func verifiableKind(kind string) bool { return kind == "WINDOWS_SID" }
+
+// Identity exposes the verified OS principal reference (never the raw SID).
+func (h *Host) Identity() auth.Identity { return h.identity }
+
+// InstanceID is a stable local host identifier for handshake responses; it is derived from
+// the private directory path plus the principal reference, so it changes if either does.
+func (h *Host) InstanceID() string {
+	sum := sha256.Sum256([]byte(h.dir + "|" + h.identity.Ref))
+	return "host-" + hex.EncodeToString(sum[:6])
+}
+
+// writePrivate stores a file with 0600 plus the current-user-only DACL and a durable rename,
+// so a crash cannot leave a half-written credential or root registry.
+func writePrivate(dir, name string, payload any) error {
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, name+".tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := privateFile(tmp.Name()); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+}
+
+func readPrivate(dir, name string, into any) error {
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return json.Unmarshal(raw, into)
+}
+package store
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// Open initializes the single local authoritative database connection.
+func Open(path string) (*sql.DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
+		return nil, err
+	}
+	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(abs)}
+	q := u.Query()
+	q.Set("_foreign_keys", "1")
+	q.Set("_journal_mode", "WAL")
+	q.Set("_synchronous", "FULL")
+	q.Set("_busy_timeout", "5000")
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := Ready(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// Ready checks the live connection settings, rather than treating a file as readiness.
+func Ready(ctx context.Context, db *sql.DB) error {
+	for pragma, want := range map[string]string{
+		"foreign_keys": "1", "journal_mode": "wal", "synchronous": "2", "busy_timeout": "5000",
+	} {
+		var got string
+		if err := db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+			return fmt.Errorf("%s: %w", pragma, err)
+		}
+		if got != want {
+			return fmt.Errorf("%s=%s, want %s", pragma, got, want)
+		}
+	}
+	var integrity string
+	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&integrity); err != nil {
+		return err
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("sqlite quick_check: %s", integrity)
+	}
+	return nil
+}
+
+// Bootstrap records only the empty storage baseline; W03 owns business tables.
+func Bootstrap(ctx context.Context, db *sql.DB, migrationFile string) error {
+	sqlText, err := os.ReadFile(migrationFile)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, string(sqlText)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+// CreateBackup uses a transactional SQLite snapshot, including WAL commits and
+// sealed BLOBs in the same consistency window. Files are derived ONLY from that
+// closed snapshot. Publication happens after all hashes and the manifest pass.
+func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
+	return s.createBackupPolicy(ctx, destination, key, nil)
+}
+func (s *Service) createBackupPolicy(ctx context.Context, destination string, key []byte, policy *backupPolicy, sources ...WorkspaceBackupSource) (BackupManifest, error) {
+	m := BackupManifest{Format: backupFormat(policy), ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
+	if policy != nil {
+		m.Purpose = policy.purpose
+	}
+	a, e := backupCipher(key)
+	if e != nil {
+		return m, e
+	}
+	stage, e := backupNewStage(destination)
+	if e != nil {
+		return m, e
+	}
+	defer backupDiscard(stage)
+	plain := filepath.Join(stage, "snapshot.sqlite")
+	if _, e = s.DB.ExecContext(ctx, "VACUUM INTO ?", plain); e != nil {
+		return m, e
+	}
+	m.SnapshotCompleted = Now()
+	db, e := store.Open(plain)
+	if e != nil {
+		return m, e
+	}
+	defer db.Close()
+	if e = backupIntegrityPolicy(db, policy); e != nil {
+		return m, e
+	}
+	if m.Migrations, e = backupMigrations(db); e != nil {
+		return m, e
+	}
+	if m.SchemaHash, e = backupSchema(db); e != nil {
+		return m, e
+	}
+	if m.Runtime, e = backupRuntime(db); e != nil {
+		return m, e
+	}
+	if m.Inventory, e = backupInventory(db); e != nil {
+		return m, e
+	}
+	files := map[string][]byte{}
+	rows, e := db.Query("SELECT storage_key,bytes,content_hash FROM uploaded_content WHERE sealed=1 ORDER BY storage_key")
+	if e != nil {
+		return m, e
+	}
+	for rows.Next() {
+		var k, h string
+		var b []byte
+		if e = rows.Scan(&k, &b, &h); e != nil {
+			rows.Close()
+			return m, e
+		}
+		if Digest(b) != h {
+			rows.Close()
+			return m, fmt.Errorf("BACKUP_CONTENT_HASH")
+		}
+		files["content-"+strings.TrimPrefix(Digest([]byte(k)), "sha256:")+".bin"] = b
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return m, e
+	}
+	if policy == nil {
+		objects, e := backupPortable(db)
+		if e != nil {
+			return m, e
+		}
+		queue, err := backupQueueState(db)
+		if err != nil {
+			return m, err
+		}
+		if queue != nil {
+			files["command-queue.json"] = Bytes(queue)
+		}
+		files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
+		var source WorkspaceBackupSource
+		if len(sources) != 0 {
+			source = sources[0]
+		}
+		workspaceFiles, count, err := backupWorkspaceFiles(ctx, db, source, destination)
+		if err != nil {
+			return m, err
+		}
+		for name, raw := range workspaceFiles {
+			files[name] = raw
+		}
+		if count != 0 {
+			m.CachePolicy = "SQLite FTS cache included; authorized workspaces encrypted and bounded; external worker/context caches rebuilt from sealed content"
+		}
+	}
+	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
+		return m, e
+	}
+	if e = db.Close(); e != nil {
+		return m, e
+	}
+	files["state.sqlite"], e = os.ReadFile(plain)
+	if e != nil {
+		return m, e
+	}
+	for name, raw := range files {
+		encrypted, e := backupEncrypt(a, m.ID, name, raw)
+		if e != nil {
+			return m, e
+		}
+		if e = backupWrite(filepath.Join(stage, name+".enc"), encrypted); e != nil {
+			return m, e
+		}
+		m.Files = append(m.Files, BackupFile{Name: name, Hash: Digest(raw), Size: len(raw)})
+	}
+	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Name < m.Files[j].Name })
+	m.MAC = backupMAC(m, key)
+	if e = backupWrite(filepath.Join(stage, "manifest.json"), Bytes(m)); e != nil {
+		return m, e
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if e = os.Remove(plain + suffix); e != nil && !os.IsNotExist(e) {
+			return m, e
+		}
+	}
+	if e = ctx.Err(); e != nil {
+		return m, e
+	}
+	if e = os.Rename(stage, destination); e != nil {
+		return m, e
+	}
+	return m, nil
+}
+
+func readBackup(directory string, key []byte) (BackupManifest, map[string][]byte, error) {
+	return readBackupPolicy(directory, key, nil)
+}
+func readBackupPolicy(directory string, key []byte, policy *backupPolicy) (BackupManifest, map[string][]byte, error) {
+	var m BackupManifest
+	a, e := backupCipher(key)
+	if e != nil {
+		return m, nil, e
+	}
+	raw, e := os.ReadFile(filepath.Join(directory, "manifest.json"))
+	if e != nil {
+		return m, nil, e
+	}
+	if e = json.Unmarshal(raw, &m); e != nil {
+		return m, nil, e
+	}
+	if m.Format != backupFormat(policy) || !hmac.Equal([]byte(m.MAC), []byte(backupMAC(m, key))) {
+		return m, nil, fmt.Errorf("BACKUP_MANIFEST_INVALID")
+	}
+	if policy != nil && Hash(m.Purpose) != Hash(policy.purpose) {
+		return m, nil, fmt.Errorf("BACKUP_PURPOSE_MISMATCH")
+	}
+	files := map[string][]byte{}
+	for _, f := range m.Files {
+		if filepath.Base(f.Name) != f.Name || strings.ContainsAny(f.Name, "/\\:") || files[f.Name] != nil {
+			return m, nil, fmt.Errorf("BACKUP_MANIFEST_PATH")
+		}
+		raw, e = os.ReadFile(filepath.Join(directory, f.Name+".enc"))
+		if e != nil {
+			return m, nil, fmt.Errorf("BACKUP_FILE_MISSING: %s", f.Name)
+		}
+		raw, e = backupDecrypt(a, m.ID, f.Name, raw)
+		if e != nil {
+			return m, nil, e
+		}
+		if len(raw) != f.Size || Digest(raw) != f.Hash {
+			return m, nil, fmt.Errorf("BACKUP_FILE_HASH: %s", f.Name)
+		}
+		files[f.Name] = raw
+	}
+	if files["state.sqlite"] == nil || (backupOrdinaryPublicPolicy(policy) && files["portable.json"] == nil) {
+		return m, nil, fmt.Errorf("BACKUP_REQUIRED_FILE_MISSING")
+	}
+	if !backupOrdinaryPublicPolicy(policy) && files["portable.json"] != nil {
+		return m, nil, fmt.Errorf("UPGRADE_PORTABLE_EXPORT_PROHIBITED")
+	}
+	return m, files, nil
+}
+
+type RestoreOptions struct {
+	Key                 []byte
+	SupportedMigrations []int
+	Contracts           *Contracts
+	WorkspaceTarget     WorkspaceRestoreTarget
+	// DatabaseName is the production data-root filename. The library default
+	// remains state.sqlite for callers that manage a standalone restore bundle.
+	DatabaseName string
+	// Migration executes only against the unpublished isolated copy. Irreversible
+	// migration is never promoted automatically; restore the old backup instead.
+	Migration    func(context.Context, *sql.DB) error
+	Irreversible bool
+}
+type RestoreReport struct {
+	BackupID   string `json:"backup_id"`
+	Started    string `json:"started_at"`
+	Finished   string `json:"finished_at"`
+	DurationMS int64  `json:"duration_ms"`
+	Before     Object `json:"before"`
+	After      Object `json:"after"`
+	Recovery   Object `json:"recovery"`
+	Status     string `json:"status"`
+}
+
+func RestoreBackup(ctx context.Context, directory, destination string, opt RestoreOptions) (RestoreReport, error) {
+	return restoreBackupPolicy(ctx, directory, destination, opt, nil)
+}
+func restoreBackupPolicy(ctx context.Context, directory, destination string, opt RestoreOptions, policy *backupPolicy) (RestoreReport, error) {
+	start := time.Now()
+	r := RestoreReport{Started: Now(), Status: "FAILED"}
+	absDestination, absErr := filepath.Abs(destination)
+	if absErr != nil {
+		return r, absErr
+	}
+	destination = absDestination
+	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
+		return r, fmt.Errorf("RESTORE_VERSION_POLICY_REQUIRED")
+	}
+	if opt.Irreversible {
+		return r, fmt.Errorf("IRREVERSIBLE_MIGRATION_MAINTENANCE_REQUIRED")
+	}
+"""Read-only, selected Q03 restore invariants; no token or row contents emitted."""
+import json
+import sqlite3
+from pathlib import Path
+from urllib.parse import quote
+
+base = Path('D:/作品集/ResearchOS/research-os/.local/online-backup-fixture-qualification-20261015-tmp/fixture/Q03')
+evidence = Path(__file__).resolve().parent
+
+def connect(path):
+    uri = 'file:' + quote(str(path.resolve()).replace('\\','/'), safe='/:') + '?mode=ro'
+    db = sqlite3.connect(uri, uri=True)
+    db.execute('PRAGMA query_only=ON')
+    return db
+
+def counts(db, query):
+    return {str(a): int(b) for a, b in db.execute(query)}
+
+def facts(db):
+    return {
+        'integrity': db.execute('PRAGMA integrity_check').fetchone()[0],
+        'run_status': counts(db, "SELECT json_extract(body,'$.status'),count(*) FROM domain_objects WHERE kind='Run' GROUP BY 1"),
+        'effect_state': counts(db, "SELECT json_extract(body,'$.state'),count(*) FROM resource_effects GROUP BY 1"),
+        'queue_state': counts(db, 'SELECT state,count(*) FROM client_command_queue GROUP BY state'),
+        'queue_fence': counts(db, 'SELECT state,count(*) FROM client_queue_fences GROUP BY state'),
+        'control_state': counts(db, 'SELECT state,count(*) FROM client_control_requests GROUP BY state'),
+        'queue_receipts': db.execute('SELECT count(*) FROM client_control_receipts').fetchone()[0],
+        'workspace_status': counts(db, "SELECT json_extract(body,'$.status'),count(*) FROM domain_objects WHERE kind='WorkspaceBinding' GROUP BY 1"),
+    }
+
+source = connect(base / 'current-data-r2/researchos.sqlite')
+restored = connect(base / 'restored-data/researchos.sqlite')
+a, b = facts(source), facts(restored)
+source.close(); restored.close()
+print(json.dumps({'source': a, 'restored': b}, ensure_ascii=False, sort_keys=True, separators=(',',':')))
+assert a['integrity'] == b['integrity'] == 'ok'
+assert a['run_status'].get('QUEUED', 0) == 1
+assert b['run_status'].get('RECONCILING', 0) == 1
+assert a['effect_state'].get('UNKNOWN', 0) >= 1
+assert b['effect_state'].get('UNKNOWN', 0) >= 1
+assert a['queue_state'].get('UNKNOWN', 0) >= 1
+assert b['queue_state'].get('UNKNOWN', 0) >= 1
+assert b['control_state'].get('RECONCILING', 0) >= 1
+assert a['workspace_status'] == b['workspace_status'] == {'REVOKED': 1}
+comparison = json.loads((evidence / 'compare-q03-current.stdout.raw').read_text(encoding='utf-8'))
+assert comparison['source_table_count'] == comparison['restored_table_count'] == 88
+assert comparison['source_all_tables_equal'] and comparison['source_schema_equal'] and comparison['source_version_equal']
+assert comparison['source_integrity_before'] == comparison['source_integrity_after'] == comparison['restored_integrity'] == 'ok'
+expected_restore_changes = {'auth_credentials','backup_restore_barriers','client_command_queue','client_control_receipts',
+    'client_control_requests','client_queue_fences','domain_objects','domain_refs','domain_versions',
+    'event_state_snapshots','outbox','resource_effects'}
+assert set(comparison['restored_table_differences']) == expected_restore_changes
+assert (evidence / 'q03-acl-before.stdout.raw').read_bytes() == (evidence / 'q03-acl-after.stdout.raw').read_bytes()
+assert set(comparison['source_file_differences']) == {'researchos.sqlite-wal','researchos.sqlite-shm'}
+print(json.dumps({'assertions': 'PASS', 'source_all_tables_equal': True, 'native_acl_equal': True,
+    'restored_changed_tables': sorted(expected_restore_changes), 'unchanged_immutable_content_tables': True},
+    ensure_ascii=False, sort_keys=True, separators=(',',':')))
+
+{"restored":{"control_state":{"RECONCILING":1},"effect_state":{"PREPARED":1,"STARTED":1,"UNKNOWN":2},"integrity":"ok","queue_fence":{"CANCEL_FENCED":1},"queue_receipts":2,"queue_state":{"UNKNOWN":1},"run_status":{"RECONCILING":1},"workspace_status":{"REVOKED":1}},"source":{"control_state":{"REQUESTED":1},"effect_state":{"PREPARED":1,"STARTED":1,"UNKNOWN":1},"integrity":"ok","queue_fence":{"CANCEL_FENCED":1},"queue_receipts":1,"queue_state":{"UNKNOWN":1},"run_status":{"QUEUED":1},"workspace_status":{"REVOKED":1}}}
+{"assertions":"PASS","native_acl_equal":true,"restored_changed_tables":["auth_credentials","backup_restore_barriers","client_command_queue","client_control_receipts","client_control_requests","client_queue_fences","domain_objects","domain_refs","domain_versions","event_state_snapshots","outbox","resource_effects"],"source_all_tables_equal":true,"unchanged_immutable_content_tables":true}
+

@@ -1,0 +1,137 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_source_codex\d6e8f35ea16d42c9b7f30c91faec090d\windows_owned_private_stdin.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_revision_codex\320740c9ef7c4dbaa6cae48633aa8e60\windows_owned_private_stdin.py
+@@ -88,7 +88,9 @@
+     result['private_stdin'] = {
+         'anonymous_pipe': False, 'file_type_pipe_verified': False,
+         'complete_input_written': False, 'writer_closed_before_launch': False,
+-        'input_buffer_cleared': False,
++        'input_buffer_cleared': False, 'effective_capacity': None,
++        'capacity_verified': False, 'empty_before_write': False,
++        'write_deadline_checked_before_and_after': False,
+     }
+     pipe_receipt = result['private_stdin']
+     cleanup = result['job_cleanup']
+@@ -216,6 +218,12 @@
+         write_file = bind('WriteFile', [HANDLE, ctypes.c_void_p, DWORD,
+                                        ctypes.POINTER(DWORD), ctypes.c_void_p], wintypes.BOOL)
+         get_file_type = bind('GetFileType', [HANDLE], DWORD)
++        get_pipe_info = bind('GetNamedPipeInfo', [HANDLE, ctypes.POINTER(DWORD),
++                             ctypes.POINTER(DWORD), ctypes.POINTER(DWORD),
++                             ctypes.POINTER(DWORD)], wintypes.BOOL)
++        peek_pipe = bind('PeekNamedPipe', [HANDLE, ctypes.c_void_p, DWORD,
++                         ctypes.POINTER(DWORD), ctypes.POINTER(DWORD),
++                         ctypes.POINTER(DWORD)], wintypes.BOOL)
+ 
+         def require(ok):
+             if not ok:
+@@ -249,13 +257,35 @@
+         stage = 'PREPARE_PRIVATE_INPUT_PIPE'
+         input_read, input_write = HANDLE(), HANDLE()
+         # No SECURITY_ATTRIBUTES: original handles are non-inheritable.
+-        # Reserve 64 KiB for a bounded <=4 KiB write before the child exists.
++        # Request 64 KiB, then verify effective direction-specific capacity below.
+         require(create_pipe(ctypes.byref(input_read), ctypes.byref(input_write), None, 65536))
+         handles.extend([input_read.value, input_write.value])
+         pipe_receipt['anonymous_pipe'] = True
+         if get_file_type(input_read) != 3 or get_file_type(input_write) != 3:
+             raise RuntimeError('Private input must be a Windows FILE_TYPE_PIPE')
+         pipe_receipt['file_type_pipe_verified'] = True
++        # These two non-inherited handles are newly created, unpublished and
++        # exclusively retained here; no child or competing writer exists.
++        flags, outgoing, incoming, instances = DWORD(), DWORD(), DWORD(), DWORD()
++        require(get_pipe_info(input_read, ctypes.byref(flags), ctypes.byref(outgoing),
++                              ctypes.byref(incoming), ctypes.byref(instances)))
++        if flags.value & ~0x00000001:
++            raise RuntimeError('Private input requires an anonymous byte pipe')
++        # GetNamedPipeInfo reports the server's buffer directions. A server-end
++        # reader consumes inbound data; a client-end reader consumes outbound.
++        capacity = incoming.value if flags.value & 0x00000001 else outgoing.value
++        pipe_receipt['effective_capacity'] = int(capacity)
++        if capacity == 0 or capacity < len(private_input):
++            raise RuntimeError('Private input pipe effective capacity unavailable or insufficient')
++        pipe_receipt['capacity_verified'] = True
++        available = DWORD()
++        require(peek_pipe(input_read, None, 0, None, ctypes.byref(available), None))
++        if available.value != 0:
++            raise RuntimeError('Private input pipe is not empty before its only write')
++        pipe_receipt['empty_before_write'] = True
++        if time.monotonic() - started >= timeout:
++            result['timed_out'] = True
++            raise TimeoutError('Private input preparation exceeded deadline before write')
+         input_view = (ctypes.c_ubyte * len(private_input)).from_buffer(private_input)
+         try:
+             written = DWORD()
+@@ -264,6 +294,10 @@
+             if written.value != len(private_input):
+                 raise RuntimeError('Private input pipe write was incomplete')
+             pipe_receipt['complete_input_written'] = True
++            if time.monotonic() - started >= timeout:
++                result['timed_out'] = True
++                raise TimeoutError('Private input preparation exceeded deadline after write')
++            pipe_receipt['write_deadline_checked_before_and_after'] = True
+         finally:
+             for index in range(len(private_input)):
+                 private_input[index] = 0
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_source_codex\d6e8f35ea16d42c9b7f30c91faec090d\root_verify_private_pipe.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_revision_codex\320740c9ef7c4dbaa6cae48633aa8e60\root_verify_private_pipe.py
+@@ -29,7 +29,7 @@
+         data = bytearray(b"A" * 4096 if mode == "maximum" else b"PUBLIC_DUMMY_PRIVATE_PIPE_TEST")
+         with (output / (mode + ".stdout.raw")).open("xb") as stdout, (output / (mode + ".stderr.raw")).open("xb") as stderr:
+             receipt = helper.run_owned_private_stdin(
+-                [sys.executable, str(probe), mode], str(probe.parent), env,
++                [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(probe), mode], str(probe.parent), env,
+                 stdout, stderr, 1.5 if mode == "timeout" else 15.0,
+                 data, creation_flags=0x08000000)
+         closed = receipt["job_cleanup"]
+@@ -37,6 +37,9 @@
+         ok = (not any(data) and pipe["input_buffer_cleared"]
+               and pipe["anonymous_pipe"] and pipe["file_type_pipe_verified"]
+               and pipe["complete_input_written"] and pipe["writer_closed_before_launch"]
++              and pipe["capacity_verified"] and pipe["empty_before_write"]
++              and pipe["effective_capacity"] >= len(data)
++              and pipe["write_deadline_checked_before_and_after"]
+               and closed["assigned_before_resume"] and closed["kill_on_job_close_configured"]
+               and closed["primary_exit_confirmed"] and closed["job_idle_confirmed"]
+               and closed["active_processes_last_observed"] == 0
+@@ -57,7 +60,7 @@
+         for name, data in (("empty", bytearray()), ("oversize", bytearray(b"A" * 4097))):
+             with (output / (name + ".stdout.raw")).open("xb") as stdout, (output / (name + ".stderr.raw")).open("xb") as stderr:
+                 receipt = helper.run_owned_private_stdin(
+-                    [sys.executable, str(probe), "normal"], str(probe.parent), env,
++                    [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(probe), "normal"], str(probe.parent), env,
+                     stdout, stderr, 15.0, data, creation_flags=0x08000000)
+             ok = (receipt["actual_exit"] is None and receipt["owned_child_pid"] is None
+                   and not receipt["resumed"] and receipt["error"] is not None
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_source_codex\d6e8f35ea16d42c9b7f30c91faec090d\CONTRACT.md
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\native_private_stdin_helper_revision_codex\320740c9ef7c4dbaa6cae48633aa8e60\CONTRACT.md
+@@ -10,9 +10,9 @@
+ 
+ The mutable `private_input` bytearray holds 1..4096 current-Owner bytes supplied in memory by Root. The helper clears this supplied bytearray in place on every return path. Root remains responsible for any prior copies and for keeping Owner bytes out of command line, environment, stdout/stderr, raw tool input, receipts and files.
+ 
+-The helper requests a 65536-byte anonymous pipe, validates both ends as FILE_TYPE_PIPE, performs one bounded <=4096-byte WriteFile, clears the buffer, and closes the writer before child creation. This is a synchronous preload into an empty pipe; the requested pipe buffer is larger than the maximum payload. Root must prove 4096-byte completion and EOF on the actual Windows host before credential use.
++Each invocation requests an anonymous pipe, validates both ends as FILE_TYPE_PIPE, then queries GetNamedPipeInfo on the read handle. It selects inbound capacity for a server-end reader and outbound capacity for a client-end reader, rejects message/unknown type, zero capacity or capacity below the bounded input, and uses PeekNamedPipe to require an empty pipe. Both original handles are non-inherited, exclusive and unpublished at this point. Only then does it perform its sole <=4096-byte WriteFile, with preparation-deadline checks immediately before and after. It clears the buffer and closes the writer before child creation. The requested 65536 size is treated only as a suggestion. Root must independently review these per-invocation checks and run the dummy native matrix before real credential use.
+ 
+-Only the read end plus stdout/stderr duplicates enter the explicit inherited-handle allowlist. CreateProcess remains CREATE_SUSPENDED; the unnamed exclusive KILL_ON_JOB_CLOSE Job owns the child before ResumeThread. PID/birth, primary exit, whole Job idle, timeout termination and handle cleanup preserve the pinned original implementation byte for byte, apart from unconditional private-buffer clearing in finally.
++Only the read end plus stdout/stderr duplicates enter the explicit inherited-handle allowlist. CreateProcess remains CREATE_SUSPENDED; the unnamed exclusive KILL_ON_JOB_CLOSE Job owns the child before ResumeThread. PID/birth, primary exit, whole Job idle, timeout termination and handle cleanup preserve the pinned original implementation after normalizing line endings, apart from unconditional private-buffer clearing in finally. Raw line-ending equality is not claimed.
+ 
+ Caller stdout/stderr streams remain open. The helper returns only booleans about pipe preparation and buffer clearing, plus the original process/Job receipt. It never records input content, hash or path. A trusted child's output must also be reviewed for non-disclosure; this helper cannot prevent a selected executable from echoing its input.
+ 
+@@ -20,7 +20,7 @@
+ 
+ Review revision.patch against original windows_owned_process.py SHA6a4fa13d7a69bd6dc33b10a667253906193bf105f8370db9f6665cd76837b3ad. Pin/freeze this Source, the original helper, Python source/dependencies and runtime_resource_paths() native module inventory using the already reviewed SourceReadGuard. Importing this helper starts no process.
+ 
+-Run `root_verify_private_pipe.py <fresh-absolute-output-directory>` only under Root's existing owned-process harness. The supplied probe uses fixed public dummy values. It checks real PIPE + EOF, exact 4096-byte input, a nonzero child exit, timeout/whole-Job termination, and empty/oversized-input rejection with caller-buffer clearing. Inspect every actual invocation, stdout/stderr and validation.closed.json. The probe driver stops after a failed case.
++Run `python -I -S -B -X utf8 root_verify_private_pipe.py <fresh-absolute-output-directory>` only under Root's existing owned-process harness. The supplied probe uses fixed public dummy values. It checks real PIPE + EOF, exact 4096-byte input, a nonzero child exit, timeout/whole-Job termination, and empty/oversized-input rejection with caller-buffer clearing. Inspect every actual invocation, stdout/stderr and validation.closed.json. The probe driver stops after a failed case.
+ 
+ These tests do not prove the enrolled recovery protocol. After they pass, Root must separately review/sign fresh canonical payloads, invoke accepted recovery_root through this private pipe and verify SQLite whole-row/schema invariants.
+ 
+@@ -32,3 +32,9 @@
+ 
+ Negative cases remain required: missing native channel, wrong purpose, mismatched native DB identity, release/source pin change, expired grant and replay. Negative rejection must preserve whole typed DB rows/schema. Positive migration must reach actual Root→Control→nonzero MigrationToken→schema24 commit with all prior rows unchanged, proof table empty and no abandonment. Exact native abandonment is a later distinct-purpose gate.
+ 
++
++## Capacity review sources
++
++[CreatePipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe) defines suggested buffer sizing and behavior when a synchronous write fills the pipe. [GetNamedPipeInfo](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-getnamedpipeinfo) supplies end/type flags and buffer sizes, including for anonymous pipes. [PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe) supplies available-byte count without consuming input. This revision preserves the prior process, Job, inheritance and cleanup suffix after normalizing line endings.
++
++The dummy child uses fixed Python flags -I -S -B -X utf8 so site/user startup and bytecode cache writes do not enter the probe. The capacity finding is a source-level boundedness gap; no host hang was reproduced by the Source author or claimed here.

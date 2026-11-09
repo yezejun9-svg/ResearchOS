@@ -1,0 +1,20 @@
+# Historical schema22 public fixture bridge Source
+
+Status: SOURCE_IMPLEMENTED_PENDING_ROOT_BUILD_TEST_AND_REVIEW. No Go/native/SQL execution was performed by this Source author.
+
+This package is a test-only delta after the sealed schema23-to24 migration revision 6b0cb88050554e688314092dbebc6ba6. Its candidate-root contains exactly two current test files. Its historical22-overlay contains one test bridge and one embedded input manifest; those two files must be staged only into Root's new isolated copy of the frozen source22 package. The helper is compiled with the old package's real ClientService.Execute, New, public orchestration, claim and effect APIs. No production protocol method is copied or changed.
+
+The historical provenance is git_source.json commit 396287cc5427eb125aaedb8a2b7fadf63e6b9322. All 502 input files were read and hash-checked against that map. The bridge embeds the map and verifies every source file again before creating a fixture. Runtime requires exactly those 502 originals plus the two reviewed overlay files; Root therefore builds the executable outside the source-copy root. Source provenance does not itself prove a successful compiler invocation or native run.
+
+The old helper calls the original queueUpgradeFixture and original upgradeQueueMigration to reach22, then the matched old New on the populated22 fixture and asserts both schema and rows remain unchanged. It executes the existing goal.start, seven session.send, session.control, orchestration claim and uncertain-effect setup through the old public methods. The setup text has an inverse adaptation proof: only helper names, schema-loader reference and the already declared service variable changed. The original six FIXTURE_PHASE row transitions remain exactly the original historical phase coverage and are not represented as real SDK effects.
+
+Parent t.TempDir bounds every data, snapshot, destination and key-file path. The helper receives Owner through inherited stdin and creates credentials inside its own process. Only public command envelopes/responses, selected run id/epoch, hashes, schema versions and fixture paths are returned. Credential tokens, complete claim responses, key bytes and arbitrary database rows are not serialized. Non-protocol child logs are privately consumed rather than published, since old test failures can include response bodies.
+
+The helper closes SQLite before publishing the result and stays alive awaiting parent release, preserving its t.TempDir lifecycle during the parent's upgrade. The parent verifies the exact binary hash and source input map, all paths, closed database hash, row/schema/version hashes, session bindings, typed response contracts and each of nine responses against the original idempotency rows. It never creates a current Service on22. The original upgrade/recovery assertions are preserved, including UNKNOWN count4, one reconciling control, same Run/epoch, unchanged idempotency/dispatch identities and rejection of lost history. Start/send/cancel success assertions still run on actual old API results.
+
+Cleanup is registered immediately after Start and applies to all later t.Fatal branches. It writes release under a bounded wait, closes the pipe, observes Wait, and falls back to cancellation/Kill plus a second bounded Wait. Root's owned process job is inherited. The helper does not spawn a worker or provider and receives no product data-root environment.
+
+Root must follow build-profile.json, preserve original frozen inputs and prior sealed sources, record the actual locked Go/build inputs/binary hash, compose the two current test changes, execute the exact test and relevant historical regression, then obtain independent review. No acceptance, product migration, model attempt, provider request, reset of previous accounting or formal promotion is authorized by this Source.
+
+Read-command failures 775, 776 and778 are immutable original tool observations. Their outer exits are preserved; uncaptured inner rg exits are null. They are not product or database executions and do not replace Root's earlier failures.
+

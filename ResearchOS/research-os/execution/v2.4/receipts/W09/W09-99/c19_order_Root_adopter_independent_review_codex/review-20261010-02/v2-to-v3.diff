@@ -1,0 +1,54 @@
+--- pinned-v2
++++ pinned-v3
+@@ -223,6 +223,13 @@
+             and same_ref(workers[0]['scope_ref'], request['scope_ref']), 'EXACT_OWNER_WORKER_SCOPE')
+     require(owner['state'] == workers[0]['state'] == 'ROOT_REGISTERED_SINGLE_TARGET_MAIN_ADOPTION'
+             and owner['lease_id'] == workers[0]['lease_id'] == scope['lease_id'], 'UNCONSUMED_BOUND_LEASE')
++    for record in (owner, workers[0]):
++        require(record['current_source_writer'] == ROOT
++                and record['lease_issued_at'] == scope['lease_issued_at']
++                and record['lease_expires_at'] == scope['lease_expires_at']
++                and record['lease_status'] == 'ACTIVE'
++                and record['one_shot_consumed'] is False
++                and record['future_execution_permitted'] is True, 'CURRENT_UNREVOKED_UNCONSUMED_ROOT_WRITER')
+     require(ow['active_integrator']['id'] == ROOT and ow['card_path_bindings']['W09-99']['owner'] == ROOT,
+             'CURRENT_ROOT_INTEGRATOR')
+ 
+@@ -267,7 +274,9 @@
+             owner = dict(owner=ROOT, current_source_writer=ROOT,
+                 state='ROOT_REGISTERED_SINGLE_TARGET_MAIN_ADOPTION', scope_ref=scope_ref,
+                 lease_id=scope['lease_id'], lease_issued_at=scope['lease_issued_at'],
+-                lease_expires_at=scope['lease_expires_at'], source_paths=[str(TARGET)], formal_acceptance=False)
++                lease_expires_at=scope['lease_expires_at'], lease_status='ACTIVE',
++                one_shot_consumed=False, future_execution_permitted=True,
++                source_paths=[str(TARGET)], formal_acceptance=False)
+             worker = dict(owner, step_id='W09-99', slice_id=key)
+             cp['workers'].append(worker)
+             cp['work_in_progress']['c19_order_Main_adoption_scope_ref'] = scope_ref
+@@ -408,9 +417,14 @@
+             except BaseException as observation:
+                 cleanup_errors.append(dict(stage='observe.failed.partial', error=repr(observation)))
+     finally:
+-        if handle and handle != ctypes.c_void_p(-1).value and not close(handle):
+-            close_error = ctypes.get_last_error()
+-            cleanup_errors.append(dict(stage='close.target', error=close_error))
++        if handle and handle != ctypes.c_void_p(-1).value:
++            try:
++                if not close(handle):
++                    close_error = ctypes.get_last_error()
++                    cleanup_errors.append(dict(stage='close.target', error=close_error))
++            except BaseException as exc:
++                close_error = repr(exc)
++                cleanup_errors.append(dict(stage='close.target', error=close_error))
+         try:
+             authority_closed = authority_guard.close()
+             if not (authority_closed['closed'] and not authority_closed['errors']
+@@ -472,7 +486,7 @@
+         for record in (owner, worker):
+             record.update(state='CLOSED_ACTUAL_SINGLE_TARGET_MAIN_ADOPTION', current_source_writer=None,
+                 one_shot_consumed=True, future_execution_permitted=False, closed_at=now,
+-                actual_adoption_ref=result_ref)
++                lease_status='CLOSED', actual_adoption_ref=result_ref)
+         cp['work_in_progress']['c19_order_Main_adoption_closed_ref'] = result_ref
+         cp['expected_previous_revision'] = cp['revision']
+         cp['revision'] += 1

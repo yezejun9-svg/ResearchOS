@@ -1,0 +1,1826 @@
+[
+  {
+    "source": {
+      "path": "snapshot/internal/domain/client_protocol_configuration.go",
+      "sha256": "2139047fe178c93cd96061ff5182724616ae84ef4094230a9f3a30c42101f933",
+      "bytes": 43661
+    },
+    "start_line": 1004,
+    "end_line": 1114,
+    "lines": [
+      {
+        "line": 1004,
+        "text": "func (s *ClientService) configurationSettled(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow) error {"
+      },
+      {
+        "line": 1005,
+        "text": "\tvar lease string"
+      },
+      {
+        "line": 1006,
+        "text": "\tif e := tx.QueryRowContext(ctx, `SELECT COALESCE(lease_expires_at,'') FROM client_sessions WHERE id=?`, sess.sessionID).Scan(&lease); e != nil {"
+      },
+      {
+        "line": 1007,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1008,
+        "text": "\t}"
+      },
+      {
+        "line": 1009,
+        "text": "\tuntil, e := time.Parse(time.RFC3339Nano, lease)"
+      },
+      {
+        "line": 1010,
+        "text": "\tif e != nil || !until.After(time.Now()) {"
+      },
+      {
+        "line": 1011,
+        "text": "\t\treturn Fail(409, \"LEASE_EXPIRED\", \"writer lease expired\")"
+      },
+      {
+        "line": 1012,
+        "text": "\t}"
+      },
+      {
+        "line": 1013,
+        "text": "\toriginalTasks, e := s.originalSessionTasks(ctx, tx, principal, sess.project, sess.sessionID)"
+      },
+      {
+        "line": 1014,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1015,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1016,
+        "text": "\t}"
+      },
+      {
+        "line": 1017,
+        "text": "\trows, e := tx.QueryContext(ctx, `SELECT DISTINCT t.body FROM domain_objects t WHERE t.project=? AND t.kind='Task' AND (t.id=(SELECT task_id FROM client_sessions WHERE id=?) OR json_extract(t.body,'$.goal_id') IN(SELECT COALESCE(json_extract(body,'$.result.goal_id'),json_extract(body,'$.result.snapshot.goal_id')) FROM idempotency WHERE project=? AND operation IN('v2:goal.start','v2:session.send') AND json_extract(body,'$.status')='COMPLETED' AND (json_extract(body,'$.session_id')=? OR json_extract(body,'$.result.snapshot.session_id')=?)) OR t.id IN(SELECT task_id FROM client_queue_fences WHERE project=? AND session_id=?))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.sessionID, sess.project, sess.sessionID)"
+      },
+      {
+        "line": 1018,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1019,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1020,
+        "text": "\t}"
+      },
+      {
+        "line": 1021,
+        "text": "\ttasks := originalTasks"
+      },
+      {
+        "line": 1022,
+        "text": "\tfor rows.Next() {"
+      },
+      {
+        "line": 1023,
+        "text": "\t\tvar raw string"
+      },
+      {
+        "line": 1024,
+        "text": "\t\tif e = rows.Scan(&raw); e != nil {"
+      },
+      {
+        "line": 1025,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 1026,
+        "text": "\t\t\treturn e"
+      },
+      {
+        "line": 1027,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1028,
+        "text": "\t\ttask, e := Decode([]byte(raw))"
+      },
+      {
+        "line": 1029,
+        "text": "\t\tif e != nil {"
+      },
+      {
+        "line": 1030,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 1031,
+        "text": "\t\t\treturn e"
+      },
+      {
+        "line": 1032,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1033,
+        "text": "\t\ttasks = append(tasks, task)"
+      },
+      {
+        "line": 1034,
+        "text": "\t}"
+      },
+      {
+        "line": 1035,
+        "text": "\te = rows.Err()"
+      },
+      {
+        "line": 1036,
+        "text": "\trows.Close()"
+      },
+      {
+        "line": 1037,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1038,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1039,
+        "text": "\t}"
+      },
+      {
+        "line": 1040,
+        "text": "\tfor _, task := range tasks {"
+      },
+      {
+        "line": 1041,
+        "text": "\t\tif !clientTurnSettled(tx, sess.project, sess.sessionID, task) {"
+      },
+      {
+        "line": 1042,
+        "text": "\t\t\treturn Fail(409, \"SESSION_BUSY\", \"session task is not settled\")"
+      },
+      {
+        "line": 1043,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1044,
+        "text": "\t\t// A later active_run_id cannot hide an older generation's unresolved"
+      },
+      {
+        "line": 1045,
+        "text": "\t\t// effects or child process. Reuse the actual settlement predicate for"
+      },
+      {
+        "line": 1046,
+        "text": "\t\t// each canonical Run belonging to the original Task, without writes."
+      },
+      {
+        "line": 1047,
+        "text": "\t\truns, err := tx.QueryContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=?`, sess.project, Str(task, \"id\"))"
+      },
+      {
+        "line": 1048,
+        "text": "\t\tif err != nil {"
+      },
+      {
+        "line": 1049,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 1050,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1051,
+        "text": "\t\tids := []string{}"
+      },
+      {
+        "line": 1052,
+        "text": "\t\tfor runs.Next() {"
+      },
+      {
+        "line": 1053,
+        "text": "\t\t\tvar id string"
+      },
+      {
+        "line": 1054,
+        "text": "\t\t\tif err = runs.Scan(&id); err != nil {"
+      },
+      {
+        "line": 1055,
+        "text": "\t\t\t\truns.Close()"
+      },
+      {
+        "line": 1056,
+        "text": "\t\t\t\treturn err"
+      },
+      {
+        "line": 1057,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 1058,
+        "text": "\t\t\tids = append(ids, id)"
+      },
+      {
+        "line": 1059,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1060,
+        "text": "\t\terr = runs.Err()"
+      },
+      {
+        "line": 1061,
+        "text": "\t\truns.Close()"
+      },
+      {
+        "line": 1062,
+        "text": "\t\tif err != nil {"
+      },
+      {
+        "line": 1063,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 1064,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1065,
+        "text": "\t\tfor _, id := range ids {"
+      },
+      {
+        "line": 1066,
+        "text": "\t\t\thistorical := Object{}"
+      },
+      {
+        "line": 1067,
+        "text": "\t\t\tfor k, v := range task {"
+      },
+      {
+        "line": 1068,
+        "text": "\t\t\t\thistorical[k] = v"
+      },
+      {
+        "line": 1069,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 1070,
+        "text": "\t\t\thistorical[\"active_run_id\"] = id"
+      },
+      {
+        "line": 1071,
+        "text": "\t\t\tif !clientTurnSettled(tx, sess.project, sess.sessionID, historical) {"
+      },
+      {
+        "line": 1072,
+        "text": "\t\t\t\treturn Fail(409, \"SESSION_BUSY\", \"earlier session run is not settled\")"
+      },
+      {
+        "line": 1073,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 1074,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1075,
+        "text": "\t}"
+      },
+      {
+        "line": 1076,
+        "text": "\tvar pending int"
+      },
+      {
+        "line": 1077,
+        "text": "\te = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM client_command_queue WHERE project=? AND session_id=? AND state NOT IN('CONSUMED','DROPPED'))+(SELECT count(*) FROM client_control_requests WHERE project=? AND session_id=? AND state<>'CONFIRMED')+(SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING'))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.project, sess.sessionID).Scan(&pending)"
+      },
+      {
+        "line": 1078,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1079,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1080,
+        "text": "\t}"
+      },
+      {
+        "line": 1081,
+        "text": "\tif pending != 0 {"
+      },
+      {
+        "line": 1082,
+        "text": "\t\treturn Fail(409, \"SESSION_BUSY\", \"session controls remain unresolved\")"
+      },
+      {
+        "line": 1083,
+        "text": "\t}"
+      },
+      {
+        "line": 1084,
+        "text": "\trows, e = tx.QueryContext(ctx, `SELECT q.state,q.command_id,q.generation,COALESCE(r.kind,''),COALESCE(r.body,''),COALESCE(r.body_hash,'') FROM client_command_queue q LEFT JOIN client_control_receipts r ON r.receipt_id=q.last_receipt_id AND r.project=q.project AND r.generation=q.generation AND r.command_id=q.command_id WHERE q.project=? AND q.session_id=?`, sess.project, sess.sessionID)"
+      },
+      {
+        "line": 1085,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1086,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1087,
+        "text": "\t}"
+      },
+      {
+        "line": 1088,
+        "text": "\tfor rows.Next() {"
+      },
+      {
+        "line": 1089,
+        "text": "\t\tvar state, command, generation, kind, body, hash string"
+      },
+      {
+        "line": 1090,
+        "text": "\t\tif e = rows.Scan(&state, &command, &generation, &kind, &body, &hash); e != nil {"
+      },
+      {
+        "line": 1091,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 1092,
+        "text": "\t\t\treturn e"
+      },
+      {
+        "line": 1093,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1094,
+        "text": "\t\tif Digest([]byte(body)) != hash || (state == \"CONSUMED\" && kind != \"command.consumed\") || (state == \"DROPPED\" && kind != \"command.cleared\") {"
+      },
+      {
+        "line": 1095,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 1096,
+        "text": "\t\t\treturn Fail(409, \"SESSION_BUSY\", \"queue settlement receipt unavailable\")"
+      },
+      {
+        "line": 1097,
+        "text": "\t\t}"
+      },
+      {
+        "line": 1098,
+        "text": "\t}"
+      },
+      {
+        "line": 1099,
+        "text": "\te = rows.Err()"
+      },
+      {
+        "line": 1100,
+        "text": "\trows.Close()"
+      },
+      {
+        "line": 1101,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1102,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1103,
+        "text": "\t}"
+      },
+      {
+        "line": 1104,
+        "text": "\t// Permission facts are related to the original Session even after its head"
+      },
+      {
+        "line": 1105,
+        "text": "\t// Task/Run has advanced; inspect the complete relation, not just the head."
+      },
+      {
+        "line": 1106,
+        "text": "\te = tx.QueryRowContext(ctx, `SELECT count(*) FROM resource_effects x JOIN domain_objects r ON r.project=x.project AND r.kind='ResourceRequest' AND r.id=json_extract(x.body,'$.permission.request_id') WHERE x.project=? AND json_extract(x.body,'$.permission.session_id')=? AND json_extract(r.body,'$.status') IN('OPEN','ACKNOWLEDGED')`, sess.project, sess.sessionID).Scan(&pending)"
+      },
+      {
+        "line": 1107,
+        "text": "\tif e != nil {"
+      },
+      {
+        "line": 1108,
+        "text": "\t\treturn e"
+      },
+      {
+        "line": 1109,
+        "text": "\t}"
+      },
+      {
+        "line": 1110,
+        "text": "\tif pending > 0 {"
+      },
+      {
+        "line": 1111,
+        "text": "\t\treturn Fail(409, \"SESSION_BUSY\", \"session permission remains unresolved\")"
+      },
+      {
+        "line": 1112,
+        "text": "\t}"
+      },
+      {
+        "line": 1113,
+        "text": "\treturn nil"
+      },
+      {
+        "line": 1114,
+        "text": "}"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "context/internal/domain/client_protocol_queue_control.go",
+      "sha256": "38616234985ef06bba6850b1629cb1774296edff4364dee3cc211c4c13131576",
+      "bytes": 10724
+    },
+    "start_line": 46,
+    "end_line": 106,
+    "lines": [
+      {
+        "line": 46,
+        "text": "func fenceClientTask(tx *sql.Tx, project, task string) error {"
+      },
+      {
+        "line": 47,
+        "text": "\tinstalled, err := clientQueueInstalled(tx)"
+      },
+      {
+        "line": 48,
+        "text": "\tif err != nil || !installed {"
+      },
+      {
+        "line": 49,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 50,
+        "text": "\t}"
+      },
+      {
+        "line": 51,
+        "text": "\tvar session string"
+      },
+      {
+        "line": 52,
+        "text": "\terr = tx.QueryRow(`SELECT id FROM client_sessions WHERE project_id=? AND task_id=?`, project, task).Scan(&session)"
+      },
+      {
+        "line": 53,
+        "text": "\tif err == sql.ErrNoRows {"
+      },
+      {
+        "line": 54,
+        "text": "\t\treturn nil"
+      },
+      {
+        "line": 55,
+        "text": "\t}"
+      },
+      {
+        "line": 56,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 57,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 58,
+        "text": "\t}"
+      },
+      {
+        "line": 59,
+        "text": "\tif err = ensureClientQueue(tx, project, session, task); err != nil {"
+      },
+      {
+        "line": 60,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 61,
+        "text": "\t}"
+      },
+      {
+        "line": 62,
+        "text": "\tvar generation string"
+      },
+      {
+        "line": 63,
+        "text": "\tif err = tx.QueryRow(`SELECT generation FROM client_queue_fences WHERE project=? AND task_id=?`, project, task).Scan(&generation); err != nil {"
+      },
+      {
+        "line": 64,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 65,
+        "text": "\t}"
+      },
+      {
+        "line": 66,
+        "text": "\tif _, err = tx.Exec(`UPDATE client_queue_fences SET state='CANCEL_FENCED',revision=revision+1 WHERE generation=? AND state<>'SEALED'`, generation); err != nil {"
+      },
+      {
+        "line": 67,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 68,
+        "text": "\t}"
+      },
+      {
+        "line": 69,
+        "text": "\trows, err := tx.Query(`SELECT command_id,state,last_receipt_id FROM client_command_queue WHERE generation=? AND state IN ('ENQUEUED','SENDING','SDK_ACCEPTED')`, generation)"
+      },
+      {
+        "line": 70,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 71,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 72,
+        "text": "\t}"
+      },
+      {
+        "line": 73,
+        "text": "\ttype entry struct {"
+      },
+      {
+        "line": 74,
+        "text": "\t\tid, state string"
+      },
+      {
+        "line": 75,
+        "text": "\t\tprior     sql.NullString"
+      },
+      {
+        "line": 76,
+        "text": "\t}"
+      },
+      {
+        "line": 77,
+        "text": "\tentries := []entry{}"
+      },
+      {
+        "line": 78,
+        "text": "\tfor rows.Next() {"
+      },
+      {
+        "line": 79,
+        "text": "\t\tvar item entry"
+      },
+      {
+        "line": 80,
+        "text": "\t\tif err = rows.Scan(&item.id, &item.state, &item.prior); err != nil {"
+      },
+      {
+        "line": 81,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 82,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 83,
+        "text": "\t\t}"
+      },
+      {
+        "line": 84,
+        "text": "\t\tentries = append(entries, item)"
+      },
+      {
+        "line": 85,
+        "text": "\t}"
+      },
+      {
+        "line": 86,
+        "text": "\terr = rows.Err()"
+      },
+      {
+        "line": 87,
+        "text": "\trows.Close()"
+      },
+      {
+        "line": 88,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 89,
+        "text": "\t\treturn err"
+      },
+      {
+        "line": 90,
+        "text": "\t}"
+      },
+      {
+        "line": 91,
+        "text": "\tfor _, item := range entries {"
+      },
+      {
+        "line": 92,
+        "text": "\t\tnext := \"DROP_REQUESTED\""
+      },
+      {
+        "line": 93,
+        "text": "\t\tif item.state == \"ENQUEUED\" {"
+      },
+      {
+        "line": 94,
+        "text": "\t\t\tnext = \"DROPPED\""
+      },
+      {
+        "line": 95,
+        "text": "\t\t}"
+      },
+      {
+        "line": 96,
+        "text": "\t\treceipt := ID()"
+      },
+      {
+        "line": 97,
+        "text": "\t\tvar previous any"
+      },
+      {
+        "line": 98,
+        "text": "\t\tif item.prior.Valid {"
+      },
+      {
+        "line": 99,
+        "text": "\t\t\tprevious = item.prior.String"
+      },
+      {
+        "line": 100,
+        "text": "\t\t}"
+      },
+      {
+        "line": 101,
+        "text": "\t\tif err = appendClientReceipt(tx, project, generation, item.id, \"CANCEL_FENCE\", receipt, Object{\"task_id\": task, \"from\": item.state, \"to\": next}, previous); err != nil {"
+      },
+      {
+        "line": 102,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 103,
+        "text": "\t\t}"
+      },
+      {
+        "line": 104,
+        "text": "\t\tif _, err = tx.Exec(`UPDATE client_command_queue SET state=?,revision=revision+1,last_receipt_id=? WHERE generation=? AND command_id=?`, next, receipt, generation, item.id); err != nil {"
+      },
+      {
+        "line": 105,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 106,
+        "text": "\t\t}"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "context/internal/domain/client_protocol_queue_control.go",
+      "sha256": "38616234985ef06bba6850b1629cb1774296edff4364dee3cc211c4c13131576",
+      "bytes": 10724
+    },
+    "start_line": 216,
+    "end_line": 287,
+    "lines": [
+      {
+        "line": 216,
+        "text": "func (s *ClientService) finalizeClientCancel(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow) (*Response, error) {"
+      },
+      {
+        "line": 217,
+        "text": "\tvar tasks, target, control, state string"
+      },
+      {
+        "line": 218,
+        "text": "\terr := tx.QueryRow(`SELECT task_ids,target_id,control_request_id,state FROM client_control_requests WHERE principal=? AND project=? AND command_id=?`, principal, deref(env.ProjectID), deref(env.CommandID)).Scan(&tasks, &target, &control, &state)"
+      },
+      {
+        "line": 219,
+        "text": "\tif err == sql.ErrNoRows {"
+      },
+      {
+        "line": 220,
+        "text": "\t\treturn nil, nil"
+      },
+      {
+        "line": 221,
+        "text": "\t}"
+      },
+      {
+        "line": 222,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 223,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 224,
+        "text": "\t}"
+      },
+      {
+        "line": 225,
+        "text": "\tif state == \"CONFIRMED\" || state == \"RECONCILING\" {"
+      },
+      {
+        "line": 226,
+        "text": "\t\treturn nil, nil"
+      },
+      {
+        "line": 227,
+        "text": "\t}"
+      },
+      {
+        "line": 228,
+        "text": "\tvar ids []string"
+      },
+      {
+        "line": 229,
+        "text": "\tif err = json.Unmarshal([]byte(tasks), &ids); err != nil {"
+      },
+      {
+        "line": 230,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 231,
+        "text": "\t}"
+      },
+      {
+        "line": 232,
+        "text": "\tfor _, id := range ids {"
+      },
+      {
+        "line": 233,
+        "text": "\t\ttask, e := load(tx, deref(env.ProjectID), \"Task\", id)"
+      },
+      {
+        "line": 234,
+        "text": "\t\tif e != nil {"
+      },
+      {
+        "line": 235,
+        "text": "\t\t\treturn nil, e"
+      },
+      {
+        "line": 236,
+        "text": "\t\t}"
+      },
+      {
+        "line": 237,
+        "text": "\t\tif run := Str(task, \"active_run_id\"); run != \"\" {"
+      },
+      {
+        "line": 238,
+        "text": "\t\t\tr, e := load(tx, deref(env.ProjectID), \"Run\", run)"
+      },
+      {
+        "line": 239,
+        "text": "\t\t\tif e != nil {"
+      },
+      {
+        "line": 240,
+        "text": "\t\t\t\treturn nil, e"
+      },
+      {
+        "line": 241,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 242,
+        "text": "\t\t\tif !runTerminal(r) || r[\"children_stopped\"] != true || r[\"queue_empty\"] != true || effectsReconciled(tx, deref(env.ProjectID), run) != nil || clientQueueSettled(tx, deref(env.ProjectID), run) != nil {"
+      },
+      {
+        "line": 243,
+        "text": "\t\t\t\treturn nil, nil"
+      },
+      {
+        "line": 244,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 245,
+        "text": "\t\t\tif r[\"status\"] == \"CANCELLED\" && Str(r, \"cancel_confirmed_at\") == \"\" {"
+      },
+      {
+        "line": 246,
+        "text": "\t\t\t\treturn nil, nil"
+      },
+      {
+        "line": 247,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 248,
+        "text": "\t\t} else {"
+      },
+      {
+        "line": 249,
+        "text": "\t\t\tvar dispatches int"
+      },
+      {
+        "line": 250,
+        "text": "\t\t\tif e = tx.QueryRow(`SELECT (SELECT count(*) FROM runtime_dispatches WHERE project=? AND json_extract(manifest,'$.task_id')=?)+(SELECT count(*) FROM domain_objects WHERE kind='Run' AND project=? AND json_extract(body,'$.task_id')=?)`, deref(env.ProjectID), id, deref(env.ProjectID), id).Scan(&dispatches); e != nil {"
+      },
+      {
+        "line": 251,
+        "text": "\t\t\t\treturn nil, e"
+      },
+      {
+        "line": 252,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 253,
+        "text": "\t\t\tif dispatches != 0 || task[\"status\"] != \"CANCELLED\" {"
+      },
+      {
+        "line": 254,
+        "text": "\t\t\t\treturn nil, nil"
+      },
+      {
+        "line": 255,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 256,
+        "text": "\t\t\tvar pending int"
+      },
+      {
+        "line": 257,
+        "text": "\t\t\tif e = tx.QueryRow(`SELECT count(*) FROM client_command_queue WHERE project=? AND task_id=? AND state NOT IN ('CONSUMED','DROPPED')`, deref(env.ProjectID), id).Scan(&pending); e != nil {"
+      },
+      {
+        "line": 258,
+        "text": "\t\t\t\treturn nil, e"
+      },
+      {
+        "line": 259,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 260,
+        "text": "\t\t\tvar restored int"
+      },
+      {
+        "line": 261,
+        "text": "\t\t\tif e = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND task_id=? AND restore_fenced<>0`, deref(env.ProjectID), id).Scan(&restored); e != nil {"
+      },
+      {
+        "line": 262,
+        "text": "\t\t\t\treturn nil, e"
+      },
+      {
+        "line": 263,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 264,
+        "text": "\t\t\tif pending != 0 || restored != 0 {"
+      },
+      {
+        "line": 265,
+        "text": "\t\t\t\treturn nil, nil"
+      },
+      {
+        "line": 266,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 267,
+        "text": "\t\t\tif _, e = tx.Exec(`UPDATE client_queue_fences SET sealed_through=accepted_through WHERE project=? AND task_id=? AND state='CANCEL_FENCED' AND restore_fenced=0`, deref(env.ProjectID), id); e != nil {"
+      },
+      {
+        "line": 268,
+        "text": "\t\t\t\treturn nil, e"
+      },
+      {
+        "line": 269,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 270,
+        "text": "\t\t}"
+      },
+      {
+        "line": 271,
+        "text": "\t}"
+      },
+      {
+        "line": 272,
+        "text": "\tif sess == nil {"
+      },
+      {
+        "line": 273,
+        "text": "\t\tsess, err = loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))"
+      },
+      {
+        "line": 274,
+        "text": "\t\tif err != nil {"
+      },
+      {
+        "line": 275,
+        "text": "\t\t\treturn nil, err"
+      },
+      {
+        "line": 276,
+        "text": "\t\t}"
+      },
+      {
+        "line": 277,
+        "text": "\t}"
+      },
+      {
+        "line": 278,
+        "text": "\t// Hide the pending ID only in the same transaction as the final receipt."
+      },
+      {
+        "line": 279,
+        "text": "\tif _, err = tx.Exec(`UPDATE client_control_requests SET state='CONFIRMED' WHERE principal=? AND project=? AND command_id=?`, principal, sess.project, deref(env.CommandID)); err != nil {"
+      },
+      {
+        "line": 280,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 281,
+        "text": "\t}"
+      },
+      {
+        "line": 282,
+        "text": "\tsnap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)"
+      },
+      {
+        "line": 283,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 284,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 285,
+        "text": "\t}"
+      },
+      {
+        "line": 286,
+        "text": "\tresponse := &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr(\"COMPLETED\"), SessionID: env.SessionID, Revision: revPtr(sess.revision), Result: Object{\"action\": \"CANCEL\", \"target_id\": target, \"control_request_id\": control, \"settled\": true, \"children_stopped\": true, \"queue_empty\": true, \"snapshot\": snap}}"
+      },
+      {
+        "line": 287,
+        "text": "\t_, err = tx.Exec(`UPDATE client_control_requests SET final_response=? WHERE principal=? AND project=? AND command_id=?`, string(Bytes(response)), principal, sess.project, deref(env.CommandID))"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "snapshot/internal/domain/client_command_identity.go",
+      "sha256": "60a4c72b578fc593869ceb6cc9e16cc317f11926e46ed25e5d375ea33616e973",
+      "bytes": 11904
+    },
+    "start_line": 134,
+    "end_line": 203,
+    "lines": [
+      {
+        "line": 134,
+        "text": "func lookupClientCommandIdentity(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, principal string, raw []byte, env *Envelope) (*Response, error) {"
+      },
+      {
+        "line": 135,
+        "text": "\treq, err := validateClientIdentityRequest(doc, raw, env)"
+      },
+      {
+        "line": 136,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 137,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 138,
+        "text": "\t}"
+      },
+      {
+        "line": 139,
+        "text": "\tif tx == nil || !clientIdentityLabel(principal) {"
+      },
+      {
+        "line": 140,
+        "text": "\t\treturn nil, fmt.Errorf(\"COMMAND_IDENTITY_PRINCIPAL\")"
+      },
+      {
+        "line": 141,
+        "text": "\t}"
+      },
+      {
+        "line": 142,
+        "text": "\tvar protocol, project, method, operation, hash string"
+      },
+      {
+        "line": 143,
+        "text": "\terr = tx.QueryRowContext(ctx, `SELECT protocol,project,method,operation,request_hash FROM client_command_identities WHERE principal=? AND command_id=?`, principal, deref(env.CommandID)).Scan(&protocol, &project, &method, &operation, &hash)"
+      },
+      {
+        "line": 144,
+        "text": "\tpresent := err == nil"
+      },
+      {
+        "line": 145,
+        "text": "\tif err != nil && !errors.Is(err, sql.ErrNoRows) {"
+      },
+      {
+        "line": 146,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 147,
+        "text": "\t}"
+      },
+      {
+        "line": 148,
+        "text": "\tif present && (protocol != ProtocolV2 || project != deref(env.ProjectID) || method != deref(env.Method) || operation != \"v2:\"+deref(env.Method) || hash != req.hash) {"
+      },
+      {
+        "line": 149,
+        "text": "\t\treturn nil, ErrIdemConflict"
+      },
+      {
+        "line": 150,
+        "text": "\t}"
+      },
+      {
+        "line": 151,
+        "text": "\trows, err := tx.QueryContext(ctx, `SELECT project,operation,request_hash,body,headers FROM idempotency WHERE principal=? AND key=? AND substr(operation,1,3)='v2:' ORDER BY project,operation`, principal, deref(env.CommandID))"
+      },
+      {
+        "line": 152,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 153,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 154,
+        "text": "\t}"
+      },
+      {
+        "line": 155,
+        "text": "\tcount := 0"
+      },
+      {
+        "line": 156,
+        "text": "\tvar body []byte"
+      },
+      {
+        "line": 157,
+        "text": "\tvar headers string"
+      },
+      {
+        "line": 158,
+        "text": "\tmismatch := false"
+      },
+      {
+        "line": 159,
+        "text": "\tfor rows.Next() {"
+      },
+      {
+        "line": 160,
+        "text": "\t\tcount++"
+      },
+      {
+        "line": 161,
+        "text": "\t\tvar p, o, h string"
+      },
+      {
+        "line": 162,
+        "text": "\t\tvar b []byte"
+      },
+      {
+        "line": 163,
+        "text": "\t\tif err = rows.Scan(&p, &o, &h, &b, &headers); err != nil {"
+      },
+      {
+        "line": 164,
+        "text": "\t\t\trows.Close()"
+      },
+      {
+        "line": 165,
+        "text": "\t\t\treturn nil, err"
+      },
+      {
+        "line": 166,
+        "text": "\t\t}"
+      },
+      {
+        "line": 167,
+        "text": "\t\tif p != deref(env.ProjectID) || o != \"v2:\"+deref(env.Method) || h != req.hash {"
+      },
+      {
+        "line": 168,
+        "text": "\t\t\tmismatch = true"
+      },
+      {
+        "line": 169,
+        "text": "\t\t}"
+      },
+      {
+        "line": 170,
+        "text": "\t\tbody = b"
+      },
+      {
+        "line": 171,
+        "text": "\t}"
+      },
+      {
+        "line": 172,
+        "text": "\terr = rows.Err()"
+      },
+      {
+        "line": 173,
+        "text": "\trows.Close()"
+      },
+      {
+        "line": 174,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 175,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 176,
+        "text": "\t}"
+      },
+      {
+        "line": 177,
+        "text": "\tif count > 1 || mismatch {"
+      },
+      {
+        "line": 178,
+        "text": "\t\treturn nil, ErrIdemConflict"
+      },
+      {
+        "line": 179,
+        "text": "\t}"
+      },
+      {
+        "line": 180,
+        "text": "\tif count == 0 {"
+      },
+      {
+        "line": 181,
+        "text": "\t\tif present {"
+      },
+      {
+        "line": 182,
+        "text": "\t\t\treturn nil, fmt.Errorf(\"COMMAND_IDENTITY_ORPHAN\")"
+      },
+      {
+        "line": 183,
+        "text": "\t\t}"
+      },
+      {
+        "line": 184,
+        "text": "\t\treturn nil, nil"
+      },
+      {
+        "line": 185,
+        "text": "\t}"
+      },
+      {
+        "line": 186,
+        "text": "\tstored, known, err := readClientCommandEnvelope(doc, headers)"
+      },
+      {
+        "line": 187,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 188,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 189,
+        "text": "\t}"
+      },
+      {
+        "line": 190,
+        "text": "\tif known {"
+      },
+      {
+        "line": 191,
+        "text": "\t\tif !present || stored.hash != req.hash {"
+      },
+      {
+        "line": 192,
+        "text": "\t\t\treturn nil, fmt.Errorf(\"COMMAND_IDENTITY_ORIGINAL_REQUEST\")"
+      },
+      {
+        "line": 193,
+        "text": "\t\t}"
+      },
+      {
+        "line": 194,
+        "text": "\t\treq = stored"
+      },
+      {
+        "line": 195,
+        "text": "\t}"
+      },
+      {
+        "line": 196,
+        "text": "\tresponse, err := decodeClientIdentityResponse(doc, req, body)"
+      },
+      {
+        "line": 197,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 198,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 199,
+        "text": "\t}"
+      },
+      {
+        "line": 200,
+        "text": "\tif err = validateClientDerivedSession(ctx, tx, principal, req, response); err != nil {"
+      },
+      {
+        "line": 201,
+        "text": "\t\treturn nil, err"
+      },
+      {
+        "line": 202,
+        "text": "\t}"
+      },
+      {
+        "line": 203,
+        "text": "\treturn response, nil"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "snapshot/internal/domain/client_command_identity.go",
+      "sha256": "60a4c72b578fc593869ceb6cc9e16cc317f11926e46ed25e5d375ea33616e973",
+      "bytes": 11904
+    },
+    "start_line": 230,
+    "end_line": 270,
+    "lines": [
+      {
+        "line": 230,
+        "text": "// Old headers retain their old interpretation. Recognized new records must"
+      },
+      {
+        "line": 231,
+        "text": "// satisfy the complete original-request proof; malformed records never grant"
+      },
+      {
+        "line": 232,
+        "text": "// the rejected-Session exception."
+      },
+      {
+        "line": 233,
+        "text": "func readClientCommandEnvelope(doc *SchemaDoc, headers string) (clientIdentityRequest, bool, error) {"
+      },
+      {
+        "line": 234,
+        "text": "\tvar zero clientIdentityRequest"
+      },
+      {
+        "line": 235,
+        "text": "\tif headers == \"\" || headers == \"{}\" {"
+      },
+      {
+        "line": 236,
+        "text": "\t\treturn zero, false, nil"
+      },
+      {
+        "line": 237,
+        "text": "\t}"
+      },
+      {
+        "line": 238,
+        "text": "\tif len(headers) > clientCommandHeaderMax {"
+      },
+      {
+        "line": 239,
+        "text": "\t\treturn zero, false, fmt.Errorf(\"COMMAND_ENVELOPE_HEADER_SIZE\")"
+      },
+      {
+        "line": 240,
+        "text": "\t}"
+      },
+      {
+        "line": 241,
+        "text": "\tstrict, err := canonical.JSON([]byte(headers))"
+      },
+      {
+        "line": 242,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 243,
+        "text": "\t\treturn zero, false, err"
+      },
+      {
+        "line": 244,
+        "text": "\t}"
+      },
+      {
+        "line": 245,
+        "text": "\tvar fields map[string]json.RawMessage"
+      },
+      {
+        "line": 246,
+        "text": "\tif err = json.Unmarshal(strict, &fields); err != nil {"
+      },
+      {
+        "line": 247,
+        "text": "\t\treturn zero, false, err"
+      },
+      {
+        "line": 248,
+        "text": "\t}"
+      },
+      {
+        "line": 249,
+        "text": "\t_, schema := fields[\"schema\"]"
+      },
+      {
+        "line": 250,
+        "text": "\t_, encoding := fields[\"encoding\"]"
+      },
+      {
+        "line": 251,
+        "text": "\t_, raw := fields[\"raw_envelope_base64\"]"
+      },
+      {
+        "line": 252,
+        "text": "\tif !schema && !encoding && !raw {"
+      },
+      {
+        "line": 253,
+        "text": "\t\treturn zero, false, nil"
+      },
+      {
+        "line": 254,
+        "text": "\t}"
+      },
+      {
+        "line": 255,
+        "text": "\tvar h clientCommandHeader"
+      },
+      {
+        "line": 256,
+        "text": "\tif len(fields) != 3 || json.Unmarshal(strict, &h) != nil || h.Schema != clientCommandHeaderSchema || h.Encoding != \"base64\" || len(h.Raw) > 1398104 {"
+      },
+      {
+        "line": 257,
+        "text": "\t\treturn zero, true, fmt.Errorf(\"COMMAND_ENVELOPE_HEADER_SCHEMA\")"
+      },
+      {
+        "line": 258,
+        "text": "\t}"
+      },
+      {
+        "line": 259,
+        "text": "\tstored, _ := json.Marshal(h)"
+      },
+      {
+        "line": 260,
+        "text": "\tif !bytes.Equal(stored, []byte(headers)) {"
+      },
+      {
+        "line": 261,
+        "text": "\t\treturn zero, true, fmt.Errorf(\"COMMAND_ENVELOPE_HEADER_CANONICAL\")"
+      },
+      {
+        "line": 262,
+        "text": "\t}"
+      },
+      {
+        "line": 263,
+        "text": "\tb, err := base64.StdEncoding.Strict().DecodeString(h.Raw)"
+      },
+      {
+        "line": 264,
+        "text": "\tif err != nil || len(b) == 0 || len(b) > clientIdentityMaxRequest || base64.StdEncoding.EncodeToString(b) != h.Raw {"
+      },
+      {
+        "line": 265,
+        "text": "\t\treturn zero, true, fmt.Errorf(\"COMMAND_ENVELOPE_HEADER_BASE64\")"
+      },
+      {
+        "line": 266,
+        "text": "\t}"
+      },
+      {
+        "line": 267,
+        "text": "\tenv, err := decodeClientIdentityEnvelope(doc, b)"
+      },
+      {
+        "line": 268,
+        "text": "\tif err != nil {"
+      },
+      {
+        "line": 269,
+        "text": "\t\treturn zero, true, err"
+      },
+      {
+        "line": 270,
+        "text": "\t}"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "snapshot/internal/domain/backup_host_configuration.go",
+      "sha256": "25cdcee54f6bd20d5578fc0e9bfd0277ce98e162a418f5ebb5b62b676a998da8",
+      "bytes": 10030
+    },
+    "start_line": 233,
+    "end_line": 264,
+    "lines": [
+      {
+        "line": 233,
+        "text": "\t\tif deref(response.ProtocolVersion) != ProtocolV2 || deref(response.CommandID) != command || deref(response.Method) != method {"
+      },
+      {
+        "line": 234,
+        "text": "\t\t\treturn fmt.Errorf(\"BACKUP_CONFIGURATION_RESPONSE_IDENTITY\")"
+      },
+      {
+        "line": 235,
+        "text": "\t\t}"
+      },
+      {
+        "line": 236,
+        "text": "\t\tif e = ValidateResultAgainstMethod(method, &response, doc); e != nil {"
+      },
+      {
+        "line": 237,
+        "text": "\t\t\treturn e"
+      },
+      {
+        "line": 238,
+        "text": "\t\t}"
+      },
+      {
+        "line": 239,
+        "text": "\t\treq, known, e := readClientCommandEnvelope(doc, Str(journal[0], \"headers\"))"
+      },
+      {
+        "line": 240,
+        "text": "\t\tif e != nil {"
+      },
+      {
+        "line": 241,
+        "text": "\t\t\treturn e"
+      },
+      {
+        "line": 242,
+        "text": "\t\t}"
+      },
+      {
+        "line": 243,
+        "text": "\t\tif known {"
+      },
+      {
+        "line": 244,
+        "text": "\t\t\tif req.hash != identity[\"request_hash\"] || req.hash != journal[0][\"request_hash\"] || deref(req.env.CommandID) != command || deref(req.env.Method) != method || deref(req.env.ProjectID) != identity[\"project\"] {"
+      },
+      {
+        "line": 245,
+        "text": "\t\t\t\treturn fmt.Errorf(\"BACKUP_CONFIGURATION_ORIGINAL_REQUEST\")"
+      },
+      {
+        "line": 246,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 247,
+        "text": "\t\t\tif _, e = decodeClientIdentityResponse(doc, req, raw); e != nil {"
+      },
+      {
+        "line": 248,
+        "text": "\t\t\t\treturn e"
+      },
+      {
+        "line": 249,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 250,
+        "text": "\t\t\tif e = validateClientDerivedSession(context.Background(), tx, principal, req, &response); e != nil {"
+      },
+      {
+        "line": 251,
+        "text": "\t\t\t\treturn e"
+      },
+      {
+        "line": 252,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 253,
+        "text": "\t\t}"
+      },
+      {
+        "line": 254,
+        "text": "\t\tif method == \"host.status\" && deref(response.Status) == \"COMPLETED\" && response.Result[\"authenticated_principal_ref\"] != principal {"
+      },
+      {
+        "line": 255,
+        "text": "\t\t\treturn fmt.Errorf(\"BACKUP_CONFIGURATION_RESPONSE_PRINCIPAL\")"
+      },
+      {
+        "line": 256,
+        "text": "\t\t}"
+      },
+      {
+        "line": 257,
+        "text": "\t\tif method == \"host.configure\" && deref(response.Status) == \"COMPLETED\" && !configured[Hash([]string{principal, command})] {"
+      },
+      {
+        "line": 258,
+        "text": "\t\t\treturn fmt.Errorf(\"BACKUP_CONFIGURATION_RESULT_WITHOUT_HISTORY\")"
+      },
+      {
+        "line": 259,
+        "text": "\t\t}"
+      },
+      {
+        "line": 260,
+        "text": "\t\tif response.SessionID != nil && !(known && deref(response.Status) == \"REJECTED\") {"
+      },
+      {
+        "line": 261,
+        "text": "\t\t\tvar n int"
+      },
+      {
+        "line": 262,
+        "text": "\t\t\tif e = tx.QueryRow(`SELECT count(*) FROM client_sessions WHERE id=? AND project_id=?`, *response.SessionID, identity[\"project\"]).Scan(&n); e != nil || n != 1 {"
+      },
+      {
+        "line": 263,
+        "text": "\t\t\t\treturn fmt.Errorf(\"BACKUP_CONFIGURATION_RESPONSE_SESSION\")"
+      },
+      {
+        "line": 264,
+        "text": "\t\t\t}"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "snapshot/internal/domain/runtime_configuration_binding_windows_test.go",
+      "sha256": "c52671ed58e72ddaa91cdaaf46f2514d2ba97555f6cb2ef493f2ee9bf5f56f04",
+      "bytes": 23975
+    },
+    "start_line": 134,
+    "end_line": 164,
+    "lines": [
+      {
+        "line": 134,
+        "text": "var handlerTLSRootsOnce sync.Once"
+      },
+      {
+        "line": 135,
+        "text": ""
+      },
+      {
+        "line": 136,
+        "text": "// Execute only in its own explicitly configured process. This is local TLS and"
+      },
+      {
+        "line": 137,
+        "text": "// actual SDK evidence; the metadata/credential ports are synthetic fixtures."
+      },
+      {
+        "line": 138,
+        "text": "func TestHandlerTLSActualSDKConfiguredSession(t *testing.T) {"
+      },
+      {
+        "line": 139,
+        "text": "\tif !strings.Contains(os.Getenv(\"GODEBUG\"), \"x509usefallbackroots=1\") {"
+      },
+      {
+        "line": 140,
+        "text": "\t\texe, e := os.Executable()"
+      },
+      {
+        "line": 141,
+        "text": "\t\tif e != nil {"
+      },
+      {
+        "line": 142,
+        "text": "\t\t\tt.Fatal(e)"
+      },
+      {
+        "line": 143,
+        "text": "\t\t}"
+      },
+      {
+        "line": 144,
+        "text": "\t\tcommand := exec.Command(exe, \"-test.run=^TestHandlerTLSActualSDKConfiguredSession$\", \"-test.v\", \"-test.timeout=180s\")"
+      },
+      {
+        "line": 145,
+        "text": "\t\tdebug := []string{}"
+      },
+      {
+        "line": 146,
+        "text": "\t\tfor _, entry := range strings.Split(os.Getenv(\"GODEBUG\"), \",\") {"
+      },
+      {
+        "line": 147,
+        "text": "\t\t\tif entry != \"\" && !strings.HasPrefix(entry, \"x509usefallbackroots=\") {"
+      },
+      {
+        "line": 148,
+        "text": "\t\t\t\tdebug = append(debug, entry)"
+      },
+      {
+        "line": 149,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 150,
+        "text": "\t\t}"
+      },
+      {
+        "line": 151,
+        "text": "\t\tfor _, entry := range os.Environ() {"
+      },
+      {
+        "line": 152,
+        "text": "\t\t\tif !strings.HasPrefix(entry, \"GODEBUG=\") {"
+      },
+      {
+        "line": 153,
+        "text": "\t\t\t\tcommand.Env = append(command.Env, entry)"
+      },
+      {
+        "line": 154,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 155,
+        "text": "\t\t}"
+      },
+      {
+        "line": 156,
+        "text": "\t\tcommand.Env = append(command.Env, \"GODEBUG=\"+strings.Join(append(debug, \"x509usefallbackroots=1\"), \",\"))"
+      },
+      {
+        "line": 157,
+        "text": "\t\traw, e := command.CombinedOutput()"
+      },
+      {
+        "line": 158,
+        "text": "\t\tt.Logf(\"HANDLER_TLS_ISOLATED_CHILD argv=%q output=%s\", command.Args, raw)"
+      },
+      {
+        "line": 159,
+        "text": "\t\tif e != nil {"
+      },
+      {
+        "line": 160,
+        "text": "\t\t\tt.Fatal(e)"
+      },
+      {
+        "line": 161,
+        "text": "\t\t}"
+      },
+      {
+        "line": 162,
+        "text": "\t\treturn"
+      },
+      {
+        "line": 163,
+        "text": "\t}"
+      },
+      {
+        "line": 164,
+        "text": "\tf := contextFixture(t)"
+      }
+    ]
+  },
+  {
+    "source": {
+      "path": "snapshot/internal/domain/client_command_queue_test.go",
+      "sha256": "2eac431340dd38649a1e0799cbb7bd16632d4432b8e1904189335b56904653dc",
+      "bytes": 8290
+    },
+    "start_line": 173,
+    "end_line": 188,
+    "lines": [
+      {
+        "line": 173,
+        "text": "func TestClientQueueRestoredNoRunCannotHideUnknownWithNewTurn(t *testing.T) {"
+      },
+      {
+        "line": 174,
+        "text": "\tf, svc, client, sid := queueClientFixture(t)"
+      },
+      {
+        "line": 175,
+        "text": "\treply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, \"session.send\", Object{\"text\": \"future uncertainty\", \"attachment_artifact_ids\": Empty(), \"delivery\": \"STEER\"}))"
+      },
+      {
+        "line": 176,
+        "text": "\tif deref(reply.Status) != \"COMPLETED\" {"
+      },
+      {
+        "line": 177,
+        "text": "\t\tt.Fatal(string(Bytes(reply)))"
+      },
+      {
+        "line": 178,
+        "text": "\t}"
+      },
+      {
+        "line": 179,
+        "text": "\tvar goal, task string"
+      },
+      {
+        "line": 180,
+        "text": "\tf.db.QueryRow(`SELECT goal_id,task_id FROM client_sessions WHERE id=?`, sid).Scan(&goal, &task)"
+      },
+      {
+        "line": 181,
+        "text": "\treply, _ = goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, \"session.control\", Object{\"action\": \"CANCEL\", \"target_id\": goal, \"reason\": \"noRun cancellation fixture\"}))"
+      },
+      {
+        "line": 182,
+        "text": "\tif deref(reply.Status) != \"COMPLETED\" {"
+      },
+      {
+        "line": 183,
+        "text": "\t\tt.Fatal(string(Bytes(reply)))"
+      },
+      {
+        "line": 184,
+        "text": "\t}"
+      },
+      {
+        "line": 185,
+        "text": "\tsourceTx(t, f.db, func(tx *sql.Tx) error {"
+      },
+      {
+        "line": 186,
+        "text": "\t\tif _, err := tx.Exec(`UPDATE client_command_queue SET state='UNKNOWN'`); err != nil {"
+      },
+      {
+        "line": 187,
+        "text": "\t\t\treturn err"
+      },
+      {
+        "line": 188,
+        "text": "\t\t}"
+      }
+    ]
+  }
+]

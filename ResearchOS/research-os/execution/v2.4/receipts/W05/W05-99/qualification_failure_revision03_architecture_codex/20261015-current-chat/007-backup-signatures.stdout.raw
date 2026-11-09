@@ -1,0 +1,266 @@
+FILE internal/domain/backup_upgrade.go
+48:}
+49:
+50:type LocalUpgradeOptions struct {
+51:	Source, Snapshot, Destination, KeyFile string
+52:	SourceRoot, TargetRoot                 string
+53:	SourceProgram, TargetProgram           string
+54:	Plan                                   string
+55:}
+56:
+57:// Public callers cannot replace the concrete authenticated LIVE service with a
+58:// JSON declaration, environment switch, fake Provider, or an arbitrary callback.
+59:func UpgradeLocal(ctx context.Context, opt LocalUpgradeOptions) (RestoreReport, error) {
+60:	return upgradeLocal(ctx, opt, upgradeVerifier{
+61:		provider: &protectedstore.FrozenProvider{},
+62:		summary: func(ctx context.Context) (protectedstore.SafeSummary, error) {
+63:			if e := ctx.Err(); e != nil {
+64:				return protectedstore.SafeSummary{}, e
+65:			}
+66:			return protectedstore.QueryFrozenService("aggregate")
+67:		},
+68:	})
+69:}
+70:
+71:type upgradeVerifier struct {
+72:	provider protectedstore.Provider
+73:	summary  func(context.Context) (protectedstore.SafeSummary, error)
+74:}
+75:
+245:func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+246:	if opt.Plan == PreparedAbandonmentSchemaUpgradePlan {
+247:		return upgradePreparedAbandonmentLocal(ctx, opt, verifier)
+248:	}
+249:	if opt.Plan == ConfigurationSchemaUpgradePlan {
+250:		return upgradeConfigurationLocal(ctx, opt, verifier)
+251:	}
+252:	if opt.Plan == QueueSchemaUpgradePlan {
+253:		return upgradeQueueLocal(ctx, opt, verifier)
+254:	}
+255:	report := RestoreReport{Started: Now(), Status: "FAILED"}
+256:	targetVersion := 14
+257:	switch opt.Plan {
+258:	case LocalUpgradePlan:
+259:	case FinalSchemaUpgradePlan:
+260:		targetVersion = 20
+261:	default:
+262:		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+263:	}
+264:	if e := upgradePaths(&opt); e != nil {
+265:		return report, e
+266:	}
+267:	sourceRelease, _, e := upgradeRelease(opt.SourceRoot, 13)
+268:	if e != nil {
+269:		return report, e
+270:	}
+271:	targetRelease, sqls, e := upgradeRelease(opt.TargetRoot, targetVersion)
+272:	if e != nil {
+273:		return report, e
+274:	}
+275:	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+276:	if e != nil {
+277:		return report, e
+278:	}
+279:	expectedSourceSchema, expectedTargetSchema, e := upgradeTemplate(ctx, sqls, contracts)
+280:	if e != nil {
+281:		return report, e
+282:	}
+283:	key, e := os.ReadFile(opt.KeyFile)
+284:	if e != nil || len(key) != 32 {
+285:		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+286:	}
+287:	defer clear(key)
+288:	db, e := upgradeOpenExclusive(ctx, opt.Source)
+289:	if e != nil {
+290:		return report, e
+FILE internal/domain/backup_prepared_abandonment_upgrade.go
+412:func upgradePreparedAbandonmentLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (report RestoreReport, err error) {
+413:    report = RestoreReport{Started: Now(), Status: "FAILED"}
+414:    if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
+415:    if err := upgradePaths(&opt); err != nil { return report, err }
+416:    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+417:    if err != nil { return report, err }
+418:    defer func() {
+419:        if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }
+420:    }()
+421:    sourceRelease, _, err := preparedUpgradeRelease(opt.SourceRoot, 23)
+422:    if err != nil { return report, err }
+423:    targetRelease, sqls, err := preparedUpgradeRelease(opt.TargetRoot, 24)
+424:    if err != nil { return report, err }
+425:    sourceProgram, targetProgram, err := preparedUpgradeProgramHashes(opt, false)
+426:    if err != nil { return report, err }
+427:    contracts, err := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+428:    if err != nil { return report, err }
+429:    schemas, err := preparedUpgradeTemplate(ctx, sqls, contracts)
+430:    if err != nil { return report, err }
+431:    key, err := os.ReadFile(opt.KeyFile)
+432:    if err != nil || len(key) != 32 { return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE") }
+433:    defer clear(key)
+434:    db, err := upgradeOpenExclusive(ctx, opt.Source)
+435:    if err != nil { return report, err }
+436:    defer db.Close()
+437:    if err = preparedUpgradeVersions(db, 23); err != nil { return report, err }
+438:    schema, err := preparedUpgradeSchema(db)
+439:    if err != nil || schema != schemas.Source23 { return report, fmt.Errorf("PREPARED_UPGRADE_SOURCE_SCHEMA") }
+440:    guard := &upgradeQueueProtection{upgradeProtection: upgradeProtection{ctx: ctx, verifier: verifier}, contracts: contracts}
+FILE internal/domain/backup_prepared_abandonment_handoff.go
+170:// the receipt filename is intentionally not the original-apply receipt name.
+171:func UpgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions) (RestoreReport, error) {
+172:    return upgradePreparedAbandonmentBackup(ctx, handoff, preparedUpgradeConcreteVerifier())
+173:}
+174:
+175:
+176:func upgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions, verifier upgradeVerifier) (report RestoreReport, err error) {
+177:    opt := handoff.Upgrade
+178:    report = RestoreReport{Started: Now(), Status: "FAILED"}
+179:    if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
+180:    if err := preparedHandoffPaths(&opt, &handoff); err != nil { return report, err }
+181:    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+182:    if err != nil { return report, err }
+183:    defer func() {
+184:        if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }
+185:    }()
+186:    sourceRelease, _, err := preparedUpgradeRelease(opt.SourceRoot, 23)
+187:    if err != nil { return report, err }
+188:    targetRelease, sqls, err := preparedUpgradeRelease(opt.TargetRoot, 24)
+189:    if err != nil { return report, err }
+190:    sourceProgram, targetProgram, err := preparedUpgradeProgramHashes(opt, true)
+191:    if err != nil { return report, err }
+192:    binding, err := preparedHandoffCheck(opt, handoff)
+193:    if err != nil { return report, err }
+194:    contracts, err := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+195:    if err != nil { return report, err }
+196:    schemas, err := preparedUpgradeTemplate(ctx, sqls, contracts)
+197:    if err != nil { return report, err }
+198:    key, err := os.ReadFile(opt.KeyFile)
+199:    if err != nil || len(key) != 32 { return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE") }
+200:    defer clear(key)
+201:    if err = preparedHandoffVerifyBackup(opt, key, binding); err != nil { return report, err }
+202:    db, err := upgradeOpenExclusive(ctx, opt.Source)
+FILE internal/domain/backup_prepared_abandonment_upgrade_windows.go
+18:    "researchos.local/research-os/internal/recoveryauthority"
+19:)
+20:
+21:type preparedUpgradeRootLease struct { native *runtimeadapter.DataRootLease }
+22:
+23:func acquirePreparedUpgradeRootLease(root string) (*preparedUpgradeRootLease, error) {
+24:    lease, err := runtimeadapter.AcquireDataRootLease(root)
+25:    if err != nil { return nil, err }
+26:    return &preparedUpgradeRootLease{native: lease}, nil
+27:}
+28:func (l *preparedUpgradeRootLease) Check() error {
+29:    if l == nil || l.native == nil || !l.native.Held() {
+30:        return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED")
+31:    }
+32:    return nil
+33:}
+34:func (l *preparedUpgradeRootLease) Close() error {
+35:    if l == nil { return nil }
+36:    return l.native.Close()
+37:}
+38:
+FILE ops/supervisor/release_host/main.go
+18:)
+19:
+20:func run() error {
+21:	dbPath := flag.String("db", "", "fixture authority SQLite path")
+22:	contracts := flag.String("contracts", "", "contracts directory")
+23:	migration := flag.String("migration", "", "migration path")
+24:	private := flag.String("private", "", "existing CanaryStore root")
+25:	project := flag.String("project", "", "project")
+26:	operation := flag.String("operation", "", "operation")
+27:	control := flag.String("control", "", "exact actual-control fixture executable")
+28:	root := flag.String("root", "", "existing fixture host root")
+29:	work := flag.String("work-dir", "", "control working directory")
+30:	web := flag.String("web-dir", "", "fixture web build directory")
+31:	listen := flag.String("listen", "", "control loopback listener")
+32:	flag.Parse()
+33:	if *control != "" {
+34:		return runControlHost(*control, *root, *work, *web, *listen, *private, *contracts)
+35:	}
+36:	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
+37:		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
+38:	}
+39:	protected, err := protectedstore.OpenCanary(*private)
+40:	if err != nil {
+41:		return err
+42:	}
+43:	defer protected.Close()
+44:	lease, err := rt.AcquireDataRootLease(filepath.Dir(*dbPath))
+45:	if err != nil {
+46:		return fmt.Errorf("offline legacy fixture authority required: %w", err)
+47:	}
+48:	defer lease.Close()
+49:	db, err := store.Open(*dbPath)
+50:	if err != nil {
+51:		return err
+52:	}
+53:	defer db.Close()
+54:	svc, err := domain.New(db, *contracts, *migration)
+55:	if err != nil {
+56:		return err
+57:	}
+58:	svc.Protected = protected
+59:	result, err := svc.RunEvolutionReleaseFixtureOnce(context.Background(), *project, *operation)
+60:	if err != nil {
+61:		return err
+62:	}
+63:	return json.NewEncoder(os.Stdout).Encode(result)
+64:}
+65:
+66:func main() {
+FILE internal/domain/backup_configuration_upgrade.go
+174:func upgradeConfigurationLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+175:	report := RestoreReport{Started: Now(), Status: "FAILED"}
+176:	if e := upgradePaths(&opt); e != nil {
+177:		return report, e
+178:	}
+179:	sourceRelease, _, e := upgradeConfigurationRelease(opt.SourceRoot, 22)
+180:	if e != nil {
+181:		return report, e
+182:	}
+183:	targetRelease, sqls, e := upgradeConfigurationRelease(opt.TargetRoot, 23)
+184:	if e != nil {
+185:		return report, e
+186:	}
+187:	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+188:	if e != nil {
+189:		return report, e
+190:	}
+191:	expectedSourceSchema, expectedTargetSchema, e := upgradeConfigurationTemplate(ctx, sqls, contracts)
+192:	if e != nil {
+193:		return report, e
+194:	}
+195:	key, e := os.ReadFile(opt.KeyFile)
+196:	if e != nil || len(key) != 32 {
+197:		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+198:	}
+199:	defer clear(key)
+200:	db, e := upgradeOpenExclusive(ctx, opt.Source)
+FILE internal/domain/backup_queue_upgrade.go
+320:func upgradeQueueLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+321:	report := RestoreReport{Started: Now(), Status: "FAILED"}
+322:	if e := upgradePaths(&opt); e != nil {
+323:		return report, e
+324:	}
+325:	sourceRelease, _, e := upgradeQueueRelease(opt.SourceRoot, 21)
+326:	if e != nil {
+327:		return report, e
+328:	}
+329:	targetRelease, sqls, e := upgradeQueueRelease(opt.TargetRoot, 22)
+330:	if e != nil {
+331:		return report, e
+332:	}
+333:	contracts, e := LoadContracts(filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"))
+334:	if e != nil {
+335:		return report, e
+336:	}
+337:	expectedSourceSchema, expectedTargetSchema, e := upgradeQueueTemplate(ctx, sqls, contracts)
+338:	if e != nil {
+339:		return report, e
+340:	}
+341:	key, e := os.ReadFile(opt.KeyFile)
+342:	if e != nil || len(key) != 32 {
+343:		return report, fmt.Errorf("BACKUP_KEY_UNAVAILABLE")
+344:	}
+345:	defer clear(key)

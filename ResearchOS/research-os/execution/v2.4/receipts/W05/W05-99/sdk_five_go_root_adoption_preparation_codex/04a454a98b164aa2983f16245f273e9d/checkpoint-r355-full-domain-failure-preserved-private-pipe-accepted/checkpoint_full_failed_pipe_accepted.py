@@ -1,0 +1,125 @@
+import sys
+sys.dont_write_bytecode=True
+import hashlib,json,types
+from pathlib import Path
+from datetime import datetime,timezone
+R=Path("D:/作品集/ResearchOS/research-os");B=R/"execution/v2.4/receipts/W05/W05-99";O=Path(__file__).resolve().parent
+def pin(p):
+ p=Path(p);raw=p.read_bytes();return dict(path=str(p),sha256=hashlib.sha256(raw).hexdigest(),bytes=len(raw))
+def verify(ref):
+ a=pin(ref["path"]);assert a["sha256"]==ref["sha256"] and a["bytes"]==ref["bytes"];return a
+def save(n,v):
+ p=O/n
+ with p.open("xb") as f:f.write((json.dumps(v,ensure_ascii=False,indent=2)+"\n").encode("utf-8"))
+ return pin(p)
+def module(p,raw):
+ m=types.ModuleType("root_cp355_"+p.stem);m.__file__=str(p);exec(compile(raw,str(p),"exec"),m.__dict__);return m
+cp=R/"execution/v2.4/checkpoint.json";ow=R/"execution/v2.4/path_ownership.json";old=[p.read_bytes() for p in (cp,ow)];pair=[pin(cp),pin(ow)]
+assert pair[0]["sha256"]=="875bfe1dd5ce6a5d8878da12d3d6d3ab51cfb42845881cac49c05a3d72794838" and pair[1]["sha256"]=="48c5641956b5f22bb48f7775e46d90494bd95944027f55070e430e207a506452"
+before=json.loads(old[0]);assert before["revision"]==354 and len(before["failure_counters"])==791 and before["project_id"]=="aede0678-7308-43dc-b9f2-cfe3d90cfdfb" and before["head"]=="adc460c2138528f163f7fdab5e8d81dde157b7fb"
+other=[R/"execution/v2.4"/(n+".json") for n in ("step_state","commands")];other_before=[p.read_bytes() for p in other]
+F=B/"integration_codex/current-composition-full-domain-root-0d2a82e73b754a5f"
+D=B/"integration_codex/private-pipe-six-public-cases-root-9243f9bc12e74f46"
+P=B/"private_pipe_six_cases_independent_review_codex/85fed5da306e4bc58f182e6ac6500478"
+X=B/"schema24_current_fixture_revision_codex/e43b3af533177e02749afc2b8112814e"
+I=B/"schema24_current_fixture_independent_review_codex/d899859a777441ba941af509c0a6bd3e"
+A=B/"integration_codex/schema24-fixture-targeted-root-405c90d2040c4c41"
+N=B/"native_migration_fixture_harness_source_codex/7050b5e73f7b3f54cb8fa9dc18"
+J=B/"native_migration_harness_independent_review_codex/fe61fd78735749e9a57b7c3467d7f9e2"
+V=B/"native_migration_harness_error_revision_codex/e57c696eaf418862f0eb721ec8c8"
+Q=B/"remaining_full_failure_cause_review_codex/8c83a215358ce0e859da44f08b8a69d3"
+U=B/"native_private_stdin_helper_revision_codex/320740c9ef7c4dbaa6cae48633aa8e60"
+S=B/"native_private_stdin_helper_revision_independent_review_codex/5c293b664e284130b788daf68717daa2"
+H=B/"native_harness_read_failure_codex/798-1c3de11e13744710829920165c8"
+C=B/"checkpoint_r354_independent_review_codex/947b532c28eb4a62a480448653ee15c2"
+Y=B/"schema24_fixture_actual_independent_review_codex/3e1e9204c6804e119c289c06a07d953d"
+Z=B/"native_migration_error_revision_independent_review_codex/68fe97d536664f35b445543a7a835a25"
+expected={
+ P:("e0c5ec79a7e9f7be1393671284489bb776e65a0c3caf4875331539b030e542d9","0dabbc87c519e0a968bbd2949df33e279581cdc6f38de523b337c3c5a0ff7903"),
+ X:("118be301fb67efa575cf4156cf54c30882264937136c4363ef30413e6076d38b","6c98d5ee592aa3f2cef7d0ea2e4c22edd1818d83eb0f93b9bd9e657ece348c35"),
+ I:("0e5666f44053d27b270baaed8ff5f1e62cf7f0d71af5e1554efffdf5b6c43b0e","139a94815df6ae597f4df6716560117de1181a80e44a65b10ab06b284c750019"),
+ N:("bea28f1679be60a36ff12170d919f8f441ec1deb748628125e21d40d75e4e9c5","8591362975b6b8f24d38f5794bdc39cc67e1eb86df8a1a6a09024693bc2430bf"),
+ J:("8b49021de880e06369f82fbc0818361d05f73d4b9ab2f95023c5bf4dec8bb100","5fad896e8ebf9c873450f290febfcd12081d38513c99ec66157b3142f2415364"),
+ V:("e8886cf85b95a84bade493e12691f995a631c179460726d29beba8e5c2a9b92e","89c0e2fcef8a3674f0a6513484fbfa22079c7fb4920dcc279ecc54778222dc63"),
+ U:("5f6ce572df2365f7cae2b851d4a111b9220d6c21ec7cc0394806ac6fbc202770","d10203f609a9b6a5dbce6e6d382f8f59a2131448739387b7cc3465e9cb21a4d1"),
+ S:("26092193e0cb04b284bfd1341c32e4cf2265f330129e64416e98a7845c798669","3123887b2133cf45b82e3b660a3c25dfbfa30b3e02d9d850a444d168075106e5"),
+ H:("3bd2c492d36d0d7aa079498d95e1b4bc720b1106d41a2f98545e1aa68a25fe82","e843bcbbbeedc391578845ee2487d94a6a71efeac8d7e9fab2a31e341d3caf1f"),
+ C:("9513e60a7261bf641b872e848f1557a1ba8fd4f89a2d01ea9ee5a755f5910536","f643c644aec87797e35401ff600595b3ead3b4904980aad4fb94dc050a30e0fc")}
+expected[Y]=("ed484a92555ad3cbfcd6cabe3aa72a12835ebb96e8d2675217d650fedfd070c5","25a911cf2ca21c9a135a2130d5b91a096695d8f8bbc3770a8c627affc9a0190e")
+expected[Z]=("24938d80ded0e0ef79c82a4e7df1a51b22ed0a04a84c3ffb66303c9875d782f1","f2dddf0940d66d4251e605fd278256c6fb625f97cda5d0b23e25d2cd31a5a514")
+frozen=[]
+for d,(h,m) in expected.items():
+ mfpath=d/("manifest.json" if d==Y else "MF.json")
+ assert pin(d/"HDF.json")["sha256"]==h and pin(mfpath)["sha256"]==m
+ mf=json.loads(mfpath.read_bytes());members=mf["members"];members=members.values() if isinstance(members,dict) else members
+ frozen += [pin(d/"HDF.json"),pin(mfpath)]+[verify(r) for r in members]
+full=json.loads((F/"validation.closed.json").read_bytes());assert pin(F/"validation.closed.json")["sha256"]=="0ce4a6303446250249c5d8b2344e2ca3d298b3f2ac5618b71f5404976f40df34"
+assert full["status"]=="FAILED_CURRENT_COMPOSITION_FULL_DOMAIN_NATIVE_CLOSED" and (full["test_actions"]["pass_count"],full["test_actions"]["fail_count"],full["test_actions"]["skip_count"])==(1261,25,4) and full["test_actions"]["all_started_have_terminal"]
+assert full["all_owned_jobs_closed"] and full["main_canonical_unchanged"] and len(full["binary_refs"])==4
+dummy=json.loads((D/"validation.closed.json").read_bytes());assert pin(D/"validation.closed.json")["sha256"]=="44e78f29c420c1b65bf70692d23214dce6527d0c9efbd340209901550079c187" and len(dummy["passed_case_names"])==6
+assert json.loads((P/"HDF.json").read_bytes())["decision"]=="SIX_PUBLIC_DUMMY_TRANSPORT_COMPONENT_ACCEPTED_STOP"
+actual=json.loads((A/"validation.closed.json").read_bytes());assert pin(A/"validation.closed.json")["sha256"]=="d1e1ef6650fbdf1f1b18c1630fef77b54d2afdfd0f0a244f268a78ab3eb9f5e2"
+assert actual["status"]=="SCHEMA24_CURRENT_FIXTURES_AND_PREPARED_HISTORICAL_TARGETED_PASSED_COMPONENT_ONLY" and (actual["test_actions"]["pass_count"],actual["test_actions"]["fail_count"],actual["test_actions"]["skip_count"])==(267,0,0) and actual["test_actions"]["parent199_test_names_preserved"] and actual["test_actions"]["all_started_have_terminal"]
+assert actual["all_owned_jobs_closed"] and actual["main_canonical_unchanged"]
+pending=[
+ (794,U/"failure-origin.794.json",None,None,None,"Source JS template parser failed before any nested call; no process or write."),
+ (795,U/"failure-origin.795.json",1,1,None,"Source default GBK read failed UnicodeDecodeError after partial metadata writes; partial refs preserved."),
+ (796,F/"failure-origin.796.json",1,1,1,"Root full offline Domain/current native authority actual1261pass25fail4skip,1290terminal; sixJobs/threeGuardsclosed; current four builds0. Single Go test attempt."),
+ (797,S/"failure-origin.797.json",None,None,None,"Reviewer external Microsoft page fetch Internal Error; no shell/Python/native."),
+ (798,H/"failure-origin.798.json",1,None,None,"Source nonexistent prepared_upgrade.go read os2; valid parallel source hits preserved; separate ordinary rg NO_MATCH not failure."),
+ (799,I/"failure-origin.799.json",0,None,None,"Reviewer readonly outer0 output truncated then JS JSON.parse Unexpected W; Python actualNULL inferred0/nativeNULL; one attempt."),
+ (800,J/"failure-origin.800.json",1,None,None,"Reviewer rg appended guessed nonexistent apps/recovery_enroll path os2 alongside valid matches; no Python/native."),
+ (801,Q/"failure-origin.801.json",None,None,None,"Readonly report JS Markdown backtick template parse before nested call; no process/write/exits."),
+ (802,Y/"failure-origin-pending.json",1,None,None,"Reviewer isolation IO result/output field mismatch triggered AssertionError; actualPythonNULL inferred1/nativeNULL; immutable pending origin externally mapped802."),
+ (803,Z/"failure-origin.803.json",1,None,None,"Reviewer guessed manifest.json instead of HDF-directed MF.json; FileNotFoundError, actualPythonNULL inferred1/nativeNULL."),
+ (804,Z/"failure-origin.804.json",1,None,None,"Reviewer unit.read_text default GBK failed UnicodeDecodeError; actualPythonNULL inferred1/nativeNULL; separate attempt retained.")]
+frozen += [pin(p) for _,p,_,_,_,_ in pending]
+for d,names in ((F,("validation.closed.json","actual-full-test-compiler-input-inventory.json","original-tool-io.json","full-domain-and-native-authority-offline.invocation.json","full-domain-and-native-authority-offline.stdout.raw","binary-source-guard.cleanup.actual.json","compiled-input-source-guard.cleanup.actual.json","input-source-guard.cleanup.actual.json")),
+                (D,("validation.closed.json","original-tool-io.json","six-public-cases.invocation.json","source-source-guard.cleanup.actual.json","runtime-source-guard.cleanup.actual.json")),
+                (A,("validation.closed.json","original-tool-io.json","formatted.source-members.json","source-overlay.json","prepared-and-historical-backup-regression.invocation.json","prepared-and-historical-backup-regression.stdout.raw","candidate-source-guard.cleanup.actual.json","input-source-guard.cleanup.actual.json")),
+                (Q,("report.md","report.json","manifest.json","source-pins.json","original-tool-io.json"))):
+ for n in names:frozen.append(pin(d/n))
+frozen += [verify(r) for r in full["binary_refs"].values()]
+gp=B/"source_read_guard_revision_v2_codex/d6d10c192b1940ed9c11a957411aecd9/source_read_guard.py";tp=B/"mu_sdk_controller_revision_v5_codex/e5953a6723c44426a05b5bb540186cdc/canonical_transactions.py"
+assert pin(gp)["sha256"]=="e75ae31b45cf9bbe82b3930173a068e66f012dfa0468a2ed36cfd9e359115b85" and pin(tp)["sha256"]=="094e1a97fb00d01412b4e71e2d740b800accfce00e607c6853cb634280b12ba9"
+frozen += [pin(gp),pin(tp),pin(Path(__file__).resolve())];frozen=list({r["path"]:r for r in frozen}.values())
+gm=module(gp,gp.read_bytes());guard=gm.SourceReadGuard(per_file_cap=128*1024*1024,total_cap=512*1024*1024);guard.acquire(frozen);tm=module(tp,guard.get_buffer(str(tp)))
+def transform(c,o):
+ assert c["revision"]==354 and o["revision"]==168
+ keys={v.get("origin_key") for v in c["failure_counters"]}
+ for n,p,outer,python,native,detail in pending:
+  ref=pin(p);key=hashlib.sha256((ref["sha256"]+"#"+str(n)).encode()).hexdigest();assert key not in keys;keys.add(key)
+  c["failure_counters"].append(dict(origin_key=key,evidence_ref=ref,original_payload=dict(observed_ordinal=n,immutable_origin_ref=ref,actual_outer_exit=outer,actual_python_exit=python,actual_native_exit=native,new_component_provider_requests=0,diagnostic=detail),counted_once=True,counter_reset=False,automatic_retry=False))
+ assert c["failure_counters"][:791]==before["failure_counters"] and len(c["failure_counters"])==802
+ c.update(expected_previous_revision=354,revision=355,updated_at=datetime.now(timezone.utc).isoformat(),updated_by="codex:/root")
+ c["work_in_progress"].update(r355_registered_failure_count=802,r355_highest_observed_diagnostic_ordinal=804,
+  mu_sdk_cp354_independent_review_ref=pin(C/"HDF.json"),
+  mu_sdk_full_domain_regression_state="FAILED_NATIVE_CLOSED_1261PASS25FAIL4SKIP_1290TERMINAL_PRESERVED",
+  mu_sdk_full_domain_regression_actual_ref=pin(F/"validation.closed.json"),mu_sdk_full_domain_regression_original_io_ref=pin(F/"original-tool-io.json"),
+  mu_sdk_full_test_compiler_input_ref=pin(F/"actual-full-test-compiler-input-inventory.json"),mu_sdk_current_composition_four_binaries_rebuilt=True,
+  mu_sdk_current_composition_four_binary_refs=full["binary_refs"],mu_sdk_four_build_source_root=full["current_source_root"],
+  mu_sdk_private_stdin_helper_state="SOURCE_AND_ACTUAL_SIX_PUBLIC_DUMMY_COMPONENT_INDEPENDENTLY_ACCEPTED_NO_REAL_OWNER",
+  mu_sdk_private_stdin_helper_revision_handoff_ref=pin(U/"HDF.json"),mu_sdk_private_stdin_helper_revision_independent_ref=pin(S/"HDF.json"),
+  mu_sdk_private_stdin_helper_actual_ref=pin(D/"validation.closed.json"),mu_sdk_private_stdin_helper_actual_independent_ref=pin(P/"HDF.json"),
+  mu_sdk_schema24_fixture_handoff_ref=pin(X/"HDF.json"),mu_sdk_schema24_fixture_source_independent_ref=pin(I/"HDF.json"),
+  mu_sdk_schema24_fixture_targeted_actual_ref=pin(A/"validation.closed.json"),mu_sdk_schema24_fixture_targeted_actual_independent_ref=pin(Y/"HDF.json"),mu_sdk_schema24_fixture_targeted_state="SOURCE_AND_ACTUAL267PASS0FAIL0SKIP_ORIGINAL199_PRESERVED_INDEPENDENT_ACCEPTED_COMPONENT_ONLY",
+  mu_sdk_historical_regression_source_root=str(R/".local/worktrees/codex-w0599-schema24-fixture-748db574d1db4c6b"),mu_sdk_historical_regression_source_files=41,
+  mu_sdk_native_migration_fixture_handoff_ref=pin(N/"HDF.json"),mu_sdk_native_migration_fixture_independent_ref=pin(J/"HDF.json"),
+  mu_sdk_native_migration_fixture_error_revision_ref=pin(V/"HDF.json"),mu_sdk_native_migration_fixture_error_revision_independent_ref=pin(Z/"HDF.json"),
+  mu_sdk_native_migration_fixture_state="EXACT_ERROR_MATCH_FINDING_SOURCE_FIXED_INDEPENDENT_DELTA_ACCEPTED_PENDING_GUARDED_UNIT_COMPILE_AND_NATIVE",
+  mu_sdk_remaining_full_failure_cause_report_ref=pin(Q/"report.md"),mu_sdk_remaining_full_failure_cause_state="21FAIL_NODES_17LEAVES4PARENT_DUPLICATES8CAUSE_GROUPS_RESOURCE_AND_EXISTING_COMPATIBILITY_OPEN",
+  mu_sdk_native_positive_hostile_flow_state="NOT_STARTED_NO_SIGNED_RELEASE_GRANT_REAL_OWNER_OR_TOKEN",
+  mu_sdk_source_authors_active=["command_queue_impl:Root_only_controller_Source"],mu_sdk_source_readonly_reviewers_active=["prepared_native_authority_review:checkpoint_and_native_unit"],
+  mu_sdk_next_action="267 actual and native exact error delta independently accepted. Isolated tagged compiler/unit closure; public preparation and Root-only exact typed issuer signatures for isolated native nine-case migration. Keep fullDomain25fail/4skip and eightcause recovery conditions open. Real abandonment/exact history sixteen roles separate; no originalDB writes/new modeltrial/old once or clock/count reset.")
+ c["note"]="CP355 preserves old791failureprefix, registers794-804 once=>802/highest804. Current38Source compiler364packages2425selectedInputs38actualEmbeds597productInventory and four binaries built0, but entire offlineDomain1290terminal=1261pass25fail4skip remains FAILED. Sixpublicdummy stdin casesSource+Rootactual+trueindieaccepted, 5Jobs38Source/88runtimeguardsclosed, realOwner/Token/nativepositive false. Threecurrent24 fixtures preserve originalhistorical22 and22to23 and add completehistorical23 replay; RootfreshT4 41Source actual267pass0fail0skip original199names preserved; actualindie accepted componentonly. Native9Source includes trueRoot-Control capability/Owner/lease/nonce/pins but SourceReview found prefix-matched wrong rejection layer; minimal exactfirstlogline revision+24unitcases sealed and Source delta independently accepted; guarded unit/compile pending; no nativeGrant/signing/Owner/SQL-original execution. Remaining21failedNodes classified17leaves4duplicateParents8causes; Main-equality is not proof of no productbug, legacy fresh-model availability/Goal error ordering remain open. Source4binaries builtfromT3, SourceT4fixture267 distinctpaths notinterchanged. OriginalRunQUEUED/TaskRUNNING/dispatchPREPARED/providerNULL/recordedEffects0/financialunknownclosedfalse preserved, onceconsumed/expired300sclockneverreset. OW168/SS/CM/project/head/old13dirty/indexempty preserved; GoalACTIVE6of22historical/0of42currentformal/nooverallcompletion."
+ return c,o
+try:
+ transaction=tm.update_pair(pair,transform,O,"activate")
+ assert ow.read_bytes()==old[1] and [p.read_bytes() for p in other]==other_before and json.loads(cp.read_bytes())["revision"]==355
+finally:
+ cleanup=guard.close();save("source_guard.cleanup.actual.json",cleanup);assert cleanup["closed"] and not cleanup["errors"] and cleanup["retained_handles_count"]==0
+proof=save("canonical_pair.actual.json",dict(transaction=transaction,checkpoint_ref=pin(cp),ownership_ref=pin(ow),other_refs=[pin(p) for p in other],old791failureprefix_preserved=True,registered_failures=802,highest_observed_diagnostic_ordinal=804,production_db_writes=0,new_component_provider_requests=0,original_trial_provider_requests=None,formal_acceptance=False))
+resume=save("RESUME.r355.original.json",dict(schema="researchos.root-resume-full-regression-failed-pipe-accepted.v1",repository_root=str(R),project_id=before["project_id"],head=before["head"],checkpoint_revision=355,ownership_revision=168,checkpoint_ref=pin(cp),current_card="W05-99",historical_accepted_parents=6,current_formal_accepted=0,formal_required=42,registered_failures=802,highest_observed_diagnostic_ordinal=804,full_domain_actual_ref=pin(F/"validation.closed.json"),full_domain_pass=1261,full_domain_fail=25,full_domain_skip=4,corrected_composition_four_binaries_built=True,private_six_dummy_accepted=True,private_actual_independent_ref=pin(P/"HDF.json"),targeted267_actual_ref=pin(A/"validation.closed.json"),targeted267_actual_independent_accepted=True,targeted267_actual_independent_ref=pin(Y/"HDF.json"),native_error_revision_ref=pin(V/"HDF.json"),native_positive_tested=False,native_hostile_tested=False,Main_adopted=False,production_db_writes=0,original_trial_status="FAILED_EXECUTION_CLOSED_BUSINESS_OPEN",old_Run_status="QUEUED",old_Task_status="RUNNING",old_dispatch_status="PREPARED",original_trial_provider_requests=None,new_component_provider_requests=0,once_consumed=True,clock_reset_permitted=False,automatic_retry=False,completion_asserted=False,proof_ref=proof,next_action="267actual and nativeexact Source delta independently accepted; isolated compiler/unit/Root-owned ninecase native migration; complete historical adoption+abandonment bridge before originalDB/newtrial. FULL failures and live skips unaccepted."))
+manifest=save("manifest.json",dict(members=[pin(p) for p in O.iterdir() if p.is_file()]))
+handoff=save("handoff.json",dict(status="CHECKPOINT_SAVED_FULL_FAILURES_PRESERVED_SIX_PUBLIC_PIPE_ACCEPTED_NATIVE_FLOW_OPEN",checkpoint_ref=pin(cp),resume_ref=resume,manifest_ref=manifest,registered_failures=802,highest_observed_diagnostic_ordinal=804,provider_requests=None,formal_acceptance=False))
+print(json.dumps(dict(checkpoint_ref=pin(cp),resume_ref=resume,handoff_ref=handoff,registered_failures=802,highest_observed_diagnostic_ordinal=804)),flush=True)

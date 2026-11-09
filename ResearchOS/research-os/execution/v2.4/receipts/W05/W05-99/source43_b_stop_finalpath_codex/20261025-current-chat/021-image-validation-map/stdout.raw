@@ -1,0 +1,38 @@
+22:// ParentProcessID comes from one Toolhelp snapshot and is then bound to its
+32:	ParentPID         uint32 `json:"parent_pid"`
+33:	ParentCreatedNS   int64  `json:"parent_created_ns"`
+34:	ParentSID         string `json:"parent_sid"`
+35:	ParentImagePath   string `json:"parent_image_path"`
+36:	ParentImageSHA256 string `json:"parent_image_sha256"`
+37:	ParentImageVolume uint32 `json:"parent_image_volume"`
+38:	ParentImageIndex  uint64 `json:"parent_image_index"`
+61:	ancestors []ownedImageAnchor
+68:func trustedImageSID(sid string) (bool, error) {
+118:		// FILE_ADD_SUBDIRECTORY alone can create a sibling at an ancestor.
+132:func (im *ownedImageFile) Close() {
+140:	for i := len(im.ancestors) - 1; i >= 0; i-- {
+141:		_ = windows.CloseHandle(im.ancestors[i].handle)
+143:	im.ancestors = nil
+170:func observeOwnedImageAnchor(h windows.Handle, directory bool) (ownedImageAnchor, windows.ByHandleFileInformation, error) {
+176:		return ownedImageAnchor{}, info, errors.New("image ancestor reparse/alias/native identity rejected")
+187:		return ownedImageAnchor{}, info, errors.New("image ancestor owner/DACL serialization unavailable")
+192:func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
+229:			return nil, fmt.Errorf("image component %q: %w", name, e)
+253:			image.ancestors = append(image.ancestors, anchor)
+291:func ownedNativeParentPID(pid uint32) (uint32, error) {
+303:			if entry.ParentProcessID == 0 || entry.ParentProcessID == pid {
+306:			return entry.ParentProcessID, nil
+371:	parentPID, e := ownedNativeParentPID(pid)
+383:	actualParent, e := windows.GetProcessId(out.parent.handle)
+384:	if e != nil || actualParent != parentPID {
+387:	out.identity = OwnedCoreNativeIdentity{PID: pid, CreatedNS: out.core.created, SID: out.core.sid, ImagePath: out.core.path, ImageSHA256: out.core.sha, ImageVolume: out.core.volume, ImageIndex: out.core.index, ParentPID: parentPID, ParentCreatedNS: out.parent.created, ParentSID: out.parent.sid, ParentImagePath: out.parent.path, ParentImageSHA256: out.parent.sha, ParentImageVolume: out.parent.volume, ParentImageIndex: out.parent.index}
+392:func ObserveOwnedCoreReadOnly(pid uint32) (OwnedCoreNativeIdentity, error) {
+405:	if expected.PID == 0 || expected.CreatedNS == 0 || expected.SID == "" || expected.ImageSHA256 == "" || expected.ImagePath == "" || expected.ImageIndex == 0 || expected.ParentPID == 0 || expected.ParentCreatedNS == 0 || expected.ParentSID == "" || expected.ParentImageSHA256 == "" || expected.ParentImageIndex == 0 {
+426:func verifyOwnedImageFile(image *ownedImageFile, volume uint32, index uint64) error {
+430:	for _, original := range image.ancestors {
+433:			return errors.New("retained image ancestor identity/ACL changed")
+461:	if err != nil || parentPID != h.identity.ParentPID {
+464:	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+467:	parentStatus, err := h.nativeParentWait()
+471:	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
+477:func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {

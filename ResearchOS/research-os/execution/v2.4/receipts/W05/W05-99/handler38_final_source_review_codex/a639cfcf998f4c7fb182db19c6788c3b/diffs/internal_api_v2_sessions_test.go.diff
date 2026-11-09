@@ -1,0 +1,74 @@
+diff --git a/internal/api/v2_sessions_test.go b/internal/api/v2_sessions_test.go
+index 28f937f7..3f3d038a 100644
+--- a/internal/api/v2_sessions_test.go
++++ b/internal/api/v2_sessions_test.go
+@@ -20,23 +20,35 @@ import (
+ // Only the host binding port is a fixture. HTTP validation, authentication,
+ // transaction, Goal/Task/Context, idempotency and events are the production code.
+ // This fixture deliberately grants no LIVE runtime qualification.
+-type sessionBindingFixture struct{}
++type sessionBindingFixture struct{ model string }
+ 
+-func (sessionBindingFixture) ValidateBinding(_ context.Context, _ *sql.Tx, _, _, _, model string) error {
+-	if model != "model-test" {
++func (p *sessionBindingFixture) ValidateBinding(_ context.Context, _ *sql.Tx, _, _, _, model string) error {
++	if model != p.model {
+ 		return domain.Fail(422, "MODEL_UNAVAILABLE", "unknown fixture model binding")
+ 	}
+ 	return nil
+ }
+-func (sessionBindingFixture) AdmitTurn(_ context.Context, _ *sql.Tx, _, _ string, _ domain.Object) error {
++func (*sessionBindingFixture) AdmitTurn(_ context.Context, _ *sql.Tx, _, _ string, _ domain.Object) error {
+ 	return domain.Fail(503, "RESOURCE_UNAVAILABLE", "no qualified runtime in this HTTP fixture")
+ }
+ 
++// SYNTHETIC metadata port, common-platform transaction/HTTP fixture only.
++// Real local SID/Host composition has separate Windows tests.
++type sessionConfigurationFixture struct{}
++
++func (sessionConfigurationFixture) ConfigurationMetadata(_ context.Context, principal, _ string, credential *string) (domain.ClientConfigurationMetadata, error) {
++	if principal != "session-owner" || credential != nil {
++		return domain.ClientConfigurationMetadata{}, domain.Fail(403, "FORBIDDEN", "synthetic metadata scope")
++	}
++	return domain.ClientConfigurationMetadata{OwnerHost: "host-123456789abc", Principal: principal}, nil
++}
++
+ type sessionHTTPFixture struct {
+ 	db                        *sql.DB
+ 	svc                       *domain.Service
+ 	server                    *httptest.Server
+ 	token, project, workspace string
++	model                     string
+ }
+ 
+ func newSessionHTTPFixture(t *testing.T) *sessionHTTPFixture {
+@@ -72,7 +84,8 @@ func newSessionHTTPFixture(t *testing.T) *sessionHTTPFixture {
+ 		t.Fatal(err)
+ 	}
+ 	f := &sessionHTTPFixture{db: db, svc: svc, token: token, workspace: "workspace-test"}
+-	f.server = httptest.NewServer(HandlerWithClientRuntime(db, t.TempDir(), svc, sessionBindingFixture{}))
++	runtimePort := &sessionBindingFixture{}
++	f.server = httptest.NewServer(HandlerWithConfigurationHost(db, t.TempDir(), svc, runtimePort, "host-123456789abc", nil, nil, sessionConfigurationFixture{}))
+ 	t.Cleanup(f.server.Close)
+ 	profile := domain.Object{"name": "Session HTTP fixture", "intent": "One finite message", "facts": domain.Empty(), "accepted_scope": []any{"session fixture"}, "constraints": domain.Empty(), "source_configs": domain.Empty(), "source_document_refs": domain.Empty(), "read_snapshot_ids": domain.Empty()}
+ 	request, _ := http.NewRequest("POST", f.server.URL+"/v1/projects", bytes.NewReader(domain.Bytes(profile)))
+@@ -97,6 +110,10 @@ func newSessionHTTPFixture(t *testing.T) *sessionHTTPFixture {
+ 	if _, err = db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, domain.KindWorkspaceBinding, f.workspace, string(domain.Bytes(binding))); err != nil {
+ 		t.Fatal(err)
+ 	}
++	configure := f.envelope("host.configure", "configure-original", domain.Object{"config_revision": 1, "provider_id": "fixture-provider", "base_url": "https://fixture.invalid/v1", "model_id": "fixture-model", "credential_ref": nil})
++	configure["project_id"] = nil
++	f.model = sessionResult(t, f.call(t, f.token, configure))["model_config_ref"].(string)
++	runtimePort.model = f.model
+ 	return f
+ }
+ func (f *sessionHTTPFixture) call(t *testing.T, token string, env domain.Object) domain.Object {
+@@ -130,7 +147,7 @@ func sessionResult(t *testing.T, r domain.Object) domain.Object {
+ 	return r["result"].(map[string]any)
+ }
+ func (f *sessionHTTPFixture) create(t *testing.T, key string) domain.Object {
+-	return sessionResult(t, f.call(t, f.token, f.envelope("session.create", key, domain.Object{"workspace_ref": f.workspace, "model_config_ref": "model-test", "title": "Finite turn"})))
++	return sessionResult(t, f.call(t, f.token, f.envelope("session.create", key, domain.Object{"workspace_ref": f.workspace, "model_config_ref": f.model, "title": "Finite turn"})))
+ }
+ 
+ func TestW14SessionHTTPCreateSendEventsAndReplay(t *testing.T) {

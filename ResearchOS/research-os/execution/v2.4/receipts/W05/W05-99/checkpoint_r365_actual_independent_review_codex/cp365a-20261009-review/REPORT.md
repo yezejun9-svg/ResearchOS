@@ -1,0 +1,12 @@
+# CP365 / OW169 actual consistency review
+
+CP365_OW169_ACTUAL_CONSISTENCY_ACCEPTED_ADMIN_ONLY. 438 checks and 21 finite input pins pass. This verifies the actual administrative update, not W09 producer execution or product acceptance.
+
+Root writer chunk116748 records shell0 and explicit ROOT_PYTHON_EXIT=0. Its emitted handoff/resume/current checkpoint pins match the actual packet. The transaction intent retains original CP364/OW168 before bytes and proposed CP365/OW169 after bytes. committed.json records written_indices [0,1] and both_verified_while_exclusively_held=true; both proposed after files exactly equal current canonical bytes. No failed.partial journal is present. Pair handle closure is supported by the successful return through the previously reviewed transaction finally; no independent numeric handle-count receipt is invented for that transaction.
+
+Independent reconstruction from journal before bytes plus previously accepted facts and the actual timestamp exactly reproduces the full CP365 and OW169 serialized bytes. Old900 failure records remain semantically identical and the complete raw array prefix is preserved. Only903..925 are appended: total923/high925/next926. The entire reconstructed CP includes only the reviewed worker/WIP/failure/version/note change; OW only adds the Root C19 subtask and three metadata fields. W09 Root worker is unique, historical workers and Exact4 scope remain intact, active parents are W05/W09. SS/CM match original exact pins.
+
+Writer SourceReadGuard has362 entries, each verified/final-path-matching/closed; aggregate verification PASSED, closed=true, errors empty, failure null, retained0. Vector guard similarly closes all8 entries with retained0. This review checks those finite actual closure records without reopening their historical nested TEMP resources. The vector has the exact four current canonical refs and revision365; SHA05c7b62168defe85694b3895988362ade9a53bcd2ef0b95178f68cbb641cf77b /983. Its first four guard entries match these refs.
+
+No writer, transaction, OS API, SourceReadGuard or product process was invoked by this reviewer. Only own review receipts were written; current canonical files were read and hashed during Root's frozen interval. Original Source artifacts were not re-audited. All21 inputs remain unchanged at postseal. New failures0. Formal acceptance remains false/0; W09 runtime and downstream formal consumers require their own evidence.
+

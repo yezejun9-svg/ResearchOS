@@ -1,0 +1,51 @@
+23:const BridgeRevision = "windows-appcontainer-v1"
+55:type BridgeFrame struct {
+65:type BridgeRequest struct {
+76:type BridgeJournal struct {
+113:	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
+116:type Bridge struct {
+122:	journal                                   BridgeJournal
+123:	frames                                    chan BridgeFrame
+180:func (w *Bridge) persist() error {
+185:func StartBridge(ctx context.Context, directory string, request BridgeRequest) (*Bridge, error) {
+196:	if e = validateBridgeProgram(manifest, request.Inputs); e != nil {
+199:	if request.WorkerID == "" || bridgeString(manifest, "dispatch_key") == "" || bridgeNumber(manifest, "epoch") < 1 || bridgeString(profile, "sandbox") != "appcontainer-zero-capabilities-v1" || bridgeString(profile, "adapter_revision") != BridgeRevision || request.BeforeResume == nil {
+223:	if _, e = PrivateDirectory(directory); e != nil {
+231:	w := &Bridge{directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}, modelObservations: make(chan ModelStreamObservation, ModelStreamWindow), modelChanged: make(chan struct{})}
+232:	w.journal = BridgeJournal{Version: 1, Manifest: append(json.RawMessage(nil), request.Manifest...), ManifestHash: digest, DispatchKey: bridgeString(manifest, "dispatch_key"), Worker: request.WorkerID, Revision: BridgeRevision, State: "PREPARED", Started: now(), Artifacts: []Artifact{}, InputHash: Hash(request.Inputs["request.json"])}
+318:	command := sandbox.Command{Executable: filepath.Join(input, "worker.exe"), Args: args, InputDirectory: input, OutputDirectory: output, Timeout: time.Duration(seconds) * time.Second}
+340:func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
+371:		var frame BridgeFrame
+493:func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
+592:func (w *Bridge) Frames() <-chan BridgeFrame { return w.frames }
+593:func (w *Bridge) Done() <-chan struct{}      { return w.done }
+594:func (w *Bridge) Directory() string          { return w.directory }
+595:func (w *Bridge) Read() BridgeJournal {
+599:	var journal BridgeJournal
+603:func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
+614:func (w *Bridge) Cancel(reason string) {
+630:func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any) error {
+685:func (w *Bridge) validateControlBinding(binding map[string]any) error {
+687:	identity := map[string]any{"pid": w.journal.Identity.PID, "process_created_ns": strconv.FormatInt(w.journal.Identity.Created, 10), "job": w.journal.Identity.Job, "appcontainer_sid": w.journal.Identity.SID, "profile": w.journal.Identity.Profile, "staging_directory": w.journal.Identity.StagingDirectory}
+710:func (w *Bridge) Control(ctx context.Context, frame any) error {
+750:func (w *Bridge) Finalize(effectsReconciled bool) (BridgeJournal, error) {
+754:		return BridgeJournal{}, errors.New("process not drained")
+782:func (j BridgeJournal) Observation() (map[string]any, error) {
+803:	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+806:// ReadBridgeTerminal checks the trusted directory and raw hashes. It never
+808:func ReadBridgeTerminal(directory, manifestHash string) (BridgeJournal, error) {
+811:		return BridgeJournal{}, errors.New("worker still owns dispatch")
+816:		return BridgeJournal{}, e
+818:	var j BridgeJournal
+855:	if j.Paused && (j.CheckpointSeal == nil || j.Checkpoint == nil || (&Bridge{directory: directory, journal: j}).validateCheckpointSeal(*j.CheckpointSeal) != nil) {
+894:// ReconcileBridge stops only the exact recorded process after the worker lock
+896:func ReconcileBridge(directory, manifestHash string) (BridgeJournal, error) {
+899:		return BridgeJournal{}, errors.New("worker still owns dispatch")
+904:		return BridgeJournal{}, e
+906:	var j BridgeJournal
+973:	return ReadBridgeTerminal(directory, manifestHash)
+1013:func (w *Bridge) capturePauseCheckpoint(frame BridgeFrame) error {
+1027:	raw, err := readPauseFile(filepath.Join(w.journal.Identity.StagingDirectory, "output", PauseCheckpointFilename))
+1050:func (w *Bridge) validateCheckpointSeal(seal CheckpointSeal) error {
+1086:func (w *Bridge) SealCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+1092:func (w *Bridge) CheckpointBytes() ([]byte, error) {

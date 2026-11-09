@@ -1,0 +1,9 @@
+# Fixture adaptation accounting
+
+Original V4 reviewer fixtures were copied byte-for-byte, compiled against V5 source and executed first. They produced 47 PASS and 3 FAIL across 50 tests. The three failures require the V5 data schema registry: custom queue metadata; AgentSession deferred custom message details; N5 custom message after pause. Original tests, bundles and raw remain unchanged.
+
+The separately named registered-independent-agent, registered-independent-session and registered-negative-session fixtures use the frozen author's versions only after reviewing their complete diffs: each adds a schema registration for the exact existing custom payload, with no assertion, payload, callback, ordering or checkpoint mutation removed. The two session files add pauseCustomMessageSchemas for customType=context and details.retain:boolean; the agent file adds pauseDataRegistrations for customType=review and existing details.id/nested.retained. This is an explicit API migration to declared custom data, not evidence from the author's pass claim alone. These copies are compiled and run independently.
+
+The reviewer V4 E/F/G/H/I boundary file and corrected registered-only execution control run unchanged. No adoption into installed SDK is performed.
+
+The registered fixtures execute 10/10 assertions successfully, but their logs reveal a material limitation: the session/N5 resume assertions only require both tool effects. V5 logs contain a restored-tool-subset error and one model call; the frozen V4 review logged two calls with no error. A separate strengthened-n5 fixture preserves the registered N5 workflow and adds only final call-count and absent-error assertions. It fails because the second assistant response never occurs. This is counted under the new per-phase binding finding, not as an independent fixture migration defect. The original V4 files and V5 original-replay failures remain unchanged.

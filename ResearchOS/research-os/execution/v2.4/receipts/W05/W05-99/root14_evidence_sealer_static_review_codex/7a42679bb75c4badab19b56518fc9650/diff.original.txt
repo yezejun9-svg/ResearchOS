@@ -1,0 +1,90 @@
+--- seal.v1
++++ seal.v2
+@@ -49,6 +49,40 @@
+ def absolute(value):
+     p = Path(value)
+     return p if p.is_absolute() else ROOT/p
++
++
++def seal_destination(value):
++    # Validate before any mkdir/write; retain the documented same-user TOCTOU limit.
++    p = absolute(value)
++    allowed = ROOT/'execution/v2.4/receipts/W05/W05-99/root14_evidence_sealed_codex'
++    require('..' not in p.parts and p.is_absolute(), 'Destination parent traversal')
++    require(p.resolve(strict=False) == p.absolute(), 'Destination normalized/real path differs')
++    cursor = p
++    while True:
++        if os.path.lexists(cursor):
++            info = os.lstat(cursor)
++            require(not cursor.is_symlink() and not (getattr(info,'st_file_attributes',0)&0x400),
++                    'Destination reparse/symlink ancestor: '+str(cursor))
++        if cursor.parent == cursor:
++            break
++        cursor = cursor.parent
++    resolved = p.resolve(strict=False)
++    require(resolved.is_relative_to(allowed) and resolved != allowed and p.parent == allowed,
++            'Destination outside fixed seal namespace or not direct UUID leaf')
++    require(len(p.name)==32 and all(c in '0123456789abcdef' for c in p.name), 'Fresh canonical UUID leaf required')
++    require(p.parent.is_dir() and not os.path.lexists(p), 'Fresh dedicated seal directory required')
++    return p
++
++
++def pinned_executable(value, tool):
++    p, expected = Path(value), Path(tool['path'])
++    require(p.is_absolute() and expected.is_absolute() and key(p)==key(expected),
++            'Recorded executable path differs from pinned tool: '+str(value))
++    pinned = read(expected)
++    actual = read(p)
++    require(hashlib.sha256(pinned).hexdigest()==tool['sha256'] and actual==pinned,
++            'Executable bytes differ from verified toolchain lock')
++    return ref(p)
+ 
+ 
+ def key(value):
+@@ -290,9 +324,15 @@
+     authorization = gate.validate_grant(SCOPE,SCOPE_SHA,absolute(grant_ref['path']),grant_ref['sha256'])
+     for item in authorization['authorization_input_refs']:
+         verify(item)
++    prelaunch = strict(verify(authorization['grant']['prelaunch_evidence_ref']))
++    tools = strict(verify(prelaunch['toolchain_lock_ref']))['tools']
++    sealer_tool_ref = pinned_executable(sys.executable,tools['python'])
++    pinned_executable(outer['argv'][0],tools['python'])
+     for old in ['v2_actual_prelaunch_failure_ref','v2_original_launcher_failure_ref']:
+         verify(scope[old])
+     inner = invocation(auth/'inner.invocation.json',False)
++    require(len(inner['argv'])==10, 'Exact inner argv length')
++    pinned_executable(inner['argv'][0],tools['python'])
+     require(inner['argv'][1:5]==scope['python_flags'] and
+             absolute(inner['argv'][5])==absolute(scope['runner_ref']['path']) and
+             absolute(inner['argv'][6])==SCOPE and inner['argv'][7]==SCOPE_SHA and
+@@ -384,6 +424,10 @@
+     require(absolute(result['new_executable']['path'])==exe, 'New executable path')
+     verify(result['new_executable'])
+     subset([result['new_executable']],full_index)
++    for name in ['compile','go-list','go-version','exe-buildinfo']:
++        go_invocation = invocation(out/(name+'.invocation.json'))
++        pinned_executable(go_invocation['argv'][0],tools['go'])
++    require(invocation(out/'go-version.invocation.json')['argv'][1:]==['version'], 'Go version argv')
+     require(invocation(out/'compile.invocation.json')['argv'][1:]==
+             ['test','-c','-work','-x','-o',str(exe),'./internal/api'], 'Compile provenance argv')
+     require(invocation(out/'go-list.invocation.json')['argv'][1:]==
+@@ -429,6 +473,8 @@
+     audit = {'schema':'researchos.root14-readonly-evidence-seal.v1','actor':'codex:/root',
+              'status':'BOUNDED_FINITE14_EVIDENCE_HASH_VERIFIED_PENDING_INDEPENDENT_REVIEW',
+              'scope_ref':ref(SCOPE),'outer_completion_ref':ref(args.outer_receipt),'grant_ref':grant_ref,
++             'sealer_actual_interpreter_ref':sealer_tool_ref,'verified_toolchain_lock_ref':prelaunch['toolchain_lock_ref'],
++             'recorded_outer_native_launcher_exit':outer['actual_native_launcher_exit'],
+              'actual_native_case_invocations':14,'PASS_leaves':14,'SKIP':0,'HTTP_calls_including_setup':total,
+              'current_frozen_input_count':len(full),'input_drift':0,'SQL_reexecution':0,'product_processes_started':0,
+              'source_acceptance':False,'Main_integration_authorized':False,'formal_increment':0,
+@@ -450,9 +496,7 @@
+     parser.add_argument('--outer-sha256',required=True)
+     parser.add_argument('--seal-directory',required=True)
+     args = parser.parse_args()
+-    destination = absolute(args.seal_directory)
+-    require(destination.is_relative_to(ROOT/'execution/v2.4/receipts/W05/W05-99/root14_evidence_sealed_codex') and
+-            destination.parent.is_dir() and not os.path.lexists(destination), 'Fresh dedicated seal directory required')
++    destination = seal_destination(args.seal_directory)
+     destination.mkdir()
+     error = None
+     try:

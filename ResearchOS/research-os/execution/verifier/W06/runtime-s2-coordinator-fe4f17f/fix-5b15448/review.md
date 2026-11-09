@@ -1,0 +1,9 @@
+# Sustained native fixture heartbeat evidence
+
+Verdict: **PASS_READONLY_PERIODIC_HEARTBEAT_FIXTURE_EVIDENCE** for test-only source `5b154486888fd1d1cc2d82cb9038c99ce92463d3` and existing author receipt `85769be`. No native process or test was executed by this review.
+
+The test adds a 19-second wait to the normal native fixture child and a 25-second fixture timeout. It observes responses from the real HTTP transport rather than fabricating heartbeat replies. It requires at least two successful heartbeat responses, a lease extension of at least 14 seconds, unchanged Run and epoch, the final Run lease matching the final response, no worker error, SETTLED Run and EXECUTION_REPORTED Task. Production coordinator bytes are unchanged from 885adb1: heartbeat remains every 15 seconds and worker lease renewal remains 90 seconds.
+
+The stored JSONL has one test run and one PASS, no skip/failure. It records two successful responses, lease expiry advancing from 17:41:44.8025847Z to 17:41:59.8074866Z (15.005 seconds), unchanged epoch, no worker renewal error, final settlement/report and 19.509 seconds elapsed for the normal dispatch. The test itself takes 20.25 seconds including setup; the command receipt takes 23.634 seconds. All three declared source hashes match the frozen Git bytes.
+
+This closes the previously noted evidence gap for reaching a second production-period heartbeat during one ordinary fixture run. It does not establish multi-hour longevity, failure/revocation behavior between every heartbeat or independent adversarial acceptance. The earlier PASS_READONLY_ORDINARY_FIXTURE_MECHANISMS scope remains appropriate; the platform-blocked automated adversarial task and actual LIVE/Codex/provider boundaries remain unchanged. Main-branch cross-module integration is a separate receipt.

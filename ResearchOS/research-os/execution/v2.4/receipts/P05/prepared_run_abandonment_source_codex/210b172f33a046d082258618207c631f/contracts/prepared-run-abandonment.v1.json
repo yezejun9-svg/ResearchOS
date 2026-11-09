@@ -1,0 +1,67 @@
+{
+  "schema": "researchos.local-operation-contract.v1",
+  "operation": "AbandonPreparedQualification",
+  "version": "researchos.prepared-run-abandonment.v1",
+  "exposure": "TRUSTED_LOCAL_SERVICE_ONLY_NO_HTTP_NO_CLIENT_ROUTE",
+  "authority": {
+    "principal": "current direct project OWNER/root with unrestricted project grant",
+    "capability": "unexported Service.preparedAbandonmentAuthority verifier installed only by reviewed Root host integration",
+    "default": "DENY_UNBOUND",
+    "root_witness": "Verifier authenticates signed exact Root source pins, terminal parent Host Job, expired original 300s clock and exclusive data-root ownership; caller structure alone has no authority"
+  },
+  "input": {
+    "identity": [
+      "project_id",
+      "task_id",
+      "run_id",
+      "runtime_id",
+      "owner_root",
+      "epoch",
+      "run_revision",
+      "task_revision",
+      "dispatch_key",
+      "manifest_hash"
+    ],
+    "root_witness": [
+      "root_started_utc",
+      "root_clock_expired_utc",
+      "parent_job_id",
+      "parent_job_closed_utc",
+      "parent_job_terminal",
+      "host_job_contract_sha256",
+      "host_job_probe_sha256",
+      "go_authority_sha256",
+      "root_witness_sha256",
+      "root_witness_signature"
+    ],
+    "accounting": {
+      "outcome": "FAILED_NOT_DISPATCHED_ACCOUNTING_UNKNOWN",
+      "provider_requests": null,
+      "actual_cost": null,
+      "financial_closed": false
+    }
+  },
+  "preconditions": [
+    "same SQLite write transaction and resourceWriteLock as launch fence",
+    "Run QUEUED with exact epoch and expected revision; lease expired; no heartbeat/start/external identity",
+    "qualification Task RUNNING, active_run_id exact Run and expected revision",
+    "immutable qualification marker matches project/task/run/runtime/epoch/current direct owner_root",
+    "dispatch exact pinned manifest and key, state PREPARED, worker and locator empty, identity {}, observation sequence 0, observation hash and reason empty",
+    "no runtime observation/upload/artifact use/resource effect/billing/queue footprint and no uploaded_content from executor in project",
+    "trusted Root verifier proves parent Host Job termination and bound original Root clock expiry; exclusive data-root ownership"
+  ],
+  "atomic_result": [
+    "insert immutable runtime_prepared_abandonments tombstone with proof_hash and proof_json",
+    "SQL trigger forbids any later update to original PREPARED dispatch; Coordinator Recover skips tombstoned row",
+    "Run FAILED and qualification Task FAILED; task.active_run_id and immutable marker retained",
+    "Run.runtime_settled_at, cancel_confirmed_at, children_stopped and queue_empty remain null; no runtimeObservation or worker journal synthesized",
+    "no BudgetLedgerEntry RELEASE/COMMIT/RECONCILE and no statement that provider requests or cost equals zero",
+    "same proof is idempotent; different proof rejects"
+  ],
+  "non_authority": [
+    "does not SETTLE qualification or grant another model trial",
+    "does not reset once/clock/failures or historical Run count",
+    "does not migrate populated live database automatically"
+  ],
+  "integration_gate": "Root host witness verifier and live migration authority are not supplied by this Source candidate; production default rejects."
+}

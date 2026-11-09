@@ -1,0 +1,64 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\integration_codex\desktop58-finite169-go3-r335-72ff32d0d24a42c4a8effd849d54f882\construct_root_inputs.desktop58.v3.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W13\W13-03\desktop58_windows_resource_capture_source_revision_codex\3aff012b57924a41a233cb9e162cfc0d\construct_root_inputs.desktop58.wldp.proposed.py
+@@ -177,7 +177,8 @@
+               'current58_CLI2_manifest_ref', 'Root_forward_head_seal_ref',
+               'Root_forward_head_review_ref', 'negative_alias_declarations',
+               'inner_seconds', 'outer_seconds', 'builder_seconds',
+-              'controller_evidence_reserve_seconds', 'launcher_evidence_reserve_seconds')
++              'controller_evidence_reserve_seconds', 'launcher_evidence_reserve_seconds',
++              'wldp_static_ref', 'wldp_candidate_report_ref')
+     need(all(q.get(key) is not None for key in future), 'Root literal future value missing')
+     need(len(q['canonical_copies']) == 4 and type(q['pending_origin_refs']) is list,
+          'Four copies and explicit pending origin cut')
+@@ -233,6 +234,29 @@
+     frozen(q['inventory_review_ref'])
+     correction = parse(frozen(q['mandatory_correction_ref']))
+     resource_map = parse(frozen(q['resource_map_ref']))
++    wldp_report = parse(frozen(q['wldp_candidate_report_ref']))
++    need(wldp_report['stage'] == 'SOURCE_RESOURCE_CANDIDATE_ONLY' and
++         wldp_report['actual_qualification'] is False and
++         wldp_report['native_target_executed'] is False and
++         len(wldp_report['candidate_additions']) == 1,
++         'Wldp static evidence only, never prior native qualification')
++    candidate = wldp_report['candidate_additions'][0]
++    wldp_ref = {key: candidate[key] for key in ('path', 'sha256', 'bytes')}
++    need(q['wldp_static_ref'] == wldp_ref and
++         Path(wldp_ref['path']) == Path('C:/Windows/System32/wldp.dll') and
++         candidate['canonical_path'] == wldp_ref['path'],
++         'Root explicit canonical Wldp pin')
++    pe = parse(frozen(wldp_report['fresh_evidence_refs']['pe_explicit']))
++    names = parse(frozen(wldp_report['fresh_evidence_refs']['direct_import_name_matches']))
++    need(pe['targets']['wldp']['sha256'] == wldp_ref['sha256'] and
++         pe['targets']['wldp']['bytes'] == wldp_ref['bytes'] and
++         'wldp.dll' in [name.casefold() for name in pe['targets']['cmd']['pe']['delay_imports']] and
++         any(edge['from'] == pe['targets']['cmd']['path'] and
++             edge['raw_name'].casefold() == 'wldp.dll' and
++             edge['import_kind'] == 'delay_imports' and
++             edge['system32_filename_matches'] == [wldp_ref['path']] and
++             edge['catalog_matches'] == [] for edge in names['edges']),
++         'Direct static PE dependency and old-catalog gap')
+ 
+     compiler = copy.deepcopy(parse(frozen(q['compiler_base_ref'])))
+     runtime = copy.deepcopy(parse(frozen(q['runtime_base_ref'])))
+@@ -250,9 +274,9 @@
+         group['files'] = members
+     membership = {'compiler_roots': [physical_members(group['path'], group['files'])
+                                     for group in compiler['complete_public_roots']]}
+-    for ref in runtime['files'] + correction['missing_Windows_refs']:
++    for ref in runtime['files'] + correction['missing_Windows_refs'] + [wldp_ref]:
+         add(runtime_rows, ref)
+-    need(len(runtime_rows) == 1282, 'Runtime base plus Windows40 identity count')
++    need(len(runtime_rows) == 1283, 'Runtime base plus Windows40 plus Wldp identity count')
+     need(len(q['metadata_code_refs']) == 8, 'Current Desktop metadata8 only')
+     metadata_names = {Path(ref['path']).name for ref in q['metadata_code_refs']}
+     need(metadata_names == {'scope_builder.py', 'prepare.py', 'register.py',
+@@ -270,6 +294,9 @@
+     runtime['desktop58_overlay'] = {
+         'base_ref': q['runtime_base_ref'],
+         'Windows40_correction_ref': q['mandatory_correction_ref'],
++        'Windows_Wldp_static_ref': actual(wldp_ref),
++        'Windows_Wldp_static_evidence_ref': q['wldp_candidate_report_ref'],
++        'Windows_Wldp_actual_loaded_proven': False,
+         'metadata8_refs': [actual(ref) for ref in q['metadata_code_refs']],
+         'six_runtime_controller_refs': [actual(template[key]) for key in CODE_KEYS],
+         'old_CLI_metadata8_inherited': False,

@@ -1,0 +1,39 @@
+--- D:/作品集/ResearchOS/research-os/.local/worktrees/codex-w0599-native-harness43-d74319468b584322b516e3b8b3aee4f2/internal/domain/runtime_tool_integration_windows_test.go
++++ D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/typed_runtime_goal_fixture_source_codex/4396cf0cc13f1f247afbd3c567b1d931/candidate-root/internal/domain/runtime_tool_integration_windows_test.go
+@@ -44,17 +44,23 @@
+ }
+ 
+ func TestRuntimeMuSessionToolAndIndependentAcceptance(t *testing.T) {
++	if typedRuntimeFixtureChild(t) {
++		return
++	}
+ 	runtimeMuToolCycle(t, false)
+ }
+ 
+ func TestRuntimeMuToolRefusalAllowsNextTurn(t *testing.T) {
++	if typedRuntimeFixtureChild(t) {
++		return
++	}
+ 	runtimeMuToolCycle(t, true)
+ }
+ 
+ func runtimeMuToolCycle(t *testing.T, refuse bool) {
+ 	var sequence, toolCalls atomic.Int32
+ 	const witness = "workspace-file-observation-7719"
+-	c, route, r, calls := muBrokerFixtureProgram(t, func(w http.ResponseWriter, request *http.Request) {
++	c, route, r, calls := typedMuBrokerFixtureProgram(t, func(w http.ResponseWriter, request *http.Request) {
+ 		n := sequence.Add(1)
+ 		var body Object
+ 		if json.NewDecoder(request.Body).Decode(&body) != nil {
+@@ -139,9 +145,10 @@
+ 	if _, err = f.db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('',?,?,1,?,0)`, KindWorkspaceBinding, binding.AuthorizedRef, string(Bytes(binding))); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	service := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, Host: ClientHostInfo{CoreBuildID: "mu-tool-fixture", LeaseTTL: time.Minute}}
++	service := &ClientService{Doc: c.config.ClientSchema, Domain: f.s, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority, Host: ClientHostInfo{InstanceID: configurationFixtureOwner, CoreBuildID: "mu-tool-fixture", LeaseTTL: time.Minute}}
+ 	env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("mu-client"), ProjectID: &f.project, Method: strptr("session.create"), Payload: Bytes(Object{"workspace_ref": binding.AuthorizedRef, "model_config_ref": modelRoute.ModelConfig["ref"], "title": "tool turn"})}
+ 	created := muClientCall(t, f, service, env)
++	attachTypedRuntimeFixture(t, f, service, created, "mu-client")
+ 	env = &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), ClientID: strptr("mu-client"), ProjectID: &f.project, SessionID: created.SessionID, Method: strptr("session.send"), ExpectedRevision: revPtr(1), WriterEpoch: revPtr(1), Payload: Bytes(Object{"text": "读取 evidence.txt 并报告内容", "attachment_artifact_ids": Empty(), "delivery": "NORMAL"})}
+ 	muClientCall(t, f, service, env)
+ 	if err = c.Scan(context.Background()); err != nil {

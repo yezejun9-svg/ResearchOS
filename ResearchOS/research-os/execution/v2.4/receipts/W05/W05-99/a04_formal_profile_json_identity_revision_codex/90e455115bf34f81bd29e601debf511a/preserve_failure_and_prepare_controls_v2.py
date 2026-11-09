@@ -1,0 +1,12 @@
+from pathlib import Path
+import hashlib,json
+OUT=Path(__file__).parent
+DATA="{\n  \"schema\": \"researchos.original-tool-failure-origin.v1\",\n  \"actor_id\": \"codex:/root/f08_whole_scope_review\",\n  \"operation_id\": \"a04c-selected-AST-missing-IDS-9691d9\",\n  \"original_input\": {\n    \"cmd\": \"& 'C:/Users/yqyyds/AppData/Local/Python/pythoncore-3.14-64/python.exe' -I -S -X utf8 'D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/a04_formal_profile_json_identity_revision_codex/90e455115bf34f81bd29e601debf511a/source_controls.py'\\n$metadataExit=$LASTEXITCODE\\nWrite-Output \\\"ACTUAL_PYTHON_EXIT=$metadataExit\\\"\\nexit $metadataExit\",\n    \"max_output_tokens\": 1700\n  },\n  \"original_result\": {\n    \"chunk_id\": \"9691d9\",\n    \"wall_time_seconds\": 0.8153396,\n    \"exit_code\": 1,\n    \"original_token_count\": 145,\n    \"output\": \"Traceback (most recent call last):\\r\\n  File \\\"D:\\\\作品集\\\\ResearchOS\\\\research-os\\\\execution\\\\v2.4\\\\receipts\\\\W05\\\\W05-99\\\\a04_formal_profile_json_identity_revision_codex\\\\90e455115bf34f81bd29e601debf511a\\\\source_controls.py\\\", line 15, in <module>\\r\\n    exec(compile(ast.Module(body=assignments+nodes,type_ignores=[]),'<selected-pure-functions>','exec'),env)\\r\\n    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\r\\n  File \\\"<selected-pure-functions>\\\", line 456, in <module>\\r\\nNameError: name 'IDS' is not defined\\r\\nACTUAL_PYTHON_EXIT=1\\r\\n\"\n  },\n  \"actual_outer_exit\": 1,\n  \"actual_python_exit\": 1,\n  \"actual_native_product_exit\": null,\n  \"failure_count_delta\": 1,\n  \"source_candidate_executed\": false,\n  \"canonical_writes\": 0,\n  \"same_failed_input_retried\": false\n}"
+p=OUT/'failure-origin.9691d9.json'
+with p.open('xb') as f:f.write(DATA.encode('utf-8')+b'\n')
+s=(OUT/'source_controls.py').read_text(encoding='utf-8')
+assert s.count("('PUBLIC_SCHEMAS','ASSERTION_LANES')")==1 and s.count('len(assignments)==2')==1
+s=s.replace("('PUBLIC_SCHEMAS','ASSERTION_LANES')","('IDS','PUBLIC_SCHEMAS','ASSERTION_LANES')").replace('len(assignments)==2','len(assignments)==3').replace("'source-controls.actual.json'","'source-controls.actual.v2.json'")
+with (OUT/'source_controls.v2.py').open('xb') as f:f.write(s.encode('utf-8'))
+b=p.read_bytes();print(json.dumps({'origin_ref':{'path':p.as_posix(),'sha256':hashlib.sha256(b).hexdigest(),'bytes':len(b)},'old_failed_program_reexecuted':False,'candidate_source_changed':False},ensure_ascii=False))
+

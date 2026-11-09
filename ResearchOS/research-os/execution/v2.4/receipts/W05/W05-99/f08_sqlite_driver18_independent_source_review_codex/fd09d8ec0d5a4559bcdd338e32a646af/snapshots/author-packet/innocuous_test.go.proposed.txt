@@ -1,0 +1,300 @@
+// PREPARATION ONLY: proposed new innocuous_test.go in an isolated locked fork.
+// Every top-level selector runs once in its own future owned process. No Parallel
+// or -count>1: the public driver registry intentionally lives for the process.
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+var driver18RegistrationError error
+
+func driver18Positive(_ *FunctionContext, args []driver.Value) (driver.Value, error) {
+	if len(args) != 1 { return nil, fmt.Errorf("driver18 arity") }
+	x, ok := args[0].(int64)
+	if !ok { return nil, fmt.Errorf("driver18 requires integer") }
+	if x > 0 { return int64(1), nil }
+	return int64(0), nil
+}
+
+type driver18Sum struct { sum int64; reject bool; null bool }
+func (s *driver18Sum) Step(_ *FunctionContext, args []driver.Value) error {
+	if s.reject { return errors.New("driver18 aggregate callback rejected") }
+	x, ok := args[0].(int64); if !ok { return errors.New("driver18 sum requires integer") }
+	s.sum += x; return nil
+}
+func (s *driver18Sum) WindowInverse(_ *FunctionContext, args []driver.Value) error {
+	x, ok := args[0].(int64); if !ok { return errors.New("driver18 inverse requires integer") }
+	s.sum -= x; return nil
+}
+func (s *driver18Sum) WindowValue(_ *FunctionContext) (driver.Value, error) {
+	if s.null { return nil, nil }; return s.sum, nil
+}
+func (s *driver18Sum) Final(_ *FunctionContext) {}
+
+func driver18Register(name string, impl *FunctionImpl) {
+	if err := RegisterFunction(name, impl); err != nil && driver18RegistrationError == nil {
+		driver18RegistrationError = fmt.Errorf("register %s: %w", name, err)
+	}
+}
+func driver18Aggregate(deterministic, innocuous bool) *FunctionImpl {
+	return &FunctionImpl{NArgs: 1, Deterministic: deterministic, Innocuous: innocuous,
+		MakeAggregate: func(FunctionContext) (AggregateFunction, error) { return &driver18Sum{}, nil }}
+}
+func init() {
+	// I01 deliberately omits Innocuous, testing its actual zero-value default.
+	driver18Register("ros_i01", &FunctionImpl{NArgs: 1, Scalar: driver18Positive})
+	driver18Register("ros_i02", &FunctionImpl{NArgs: 1, Deterministic: true, Innocuous: false, Scalar: driver18Positive})
+	for _, name := range []string{"ros_i03", "ros_i04", "ros_i05", "ros_i13", "ros_i14", "ros_i16"} {
+		driver18Register(name, &FunctionImpl{NArgs: 1, Deterministic: name != "ros_i03", Innocuous: true, Scalar: driver18Positive})
+	}
+	driver18Register("ros_i06", driver18Aggregate(true, false))
+	driver18Register("ros_i07", driver18Aggregate(true, true))
+	driver18Register("ros_i08", driver18Aggregate(true, false))
+	driver18Register("ros_i09", driver18Aggregate(true, true))
+	for i := 0; i < 4; i++ {
+		d, in := i&1 != 0, i&2 != 0
+		driver18Register(fmt.Sprintf("ros_i10_%d", i), &FunctionImpl{NArgs: 1, Deterministic: d, Innocuous: in, Scalar: driver18Positive})
+		driver18Register(fmt.Sprintf("ros_i11_%d", i), driver18Aggregate(d, in))
+	}
+	if err := RegisterScalarFunction("ros_i12_plain", 1, driver18Positive); err != nil { driver18RegistrationError = err }
+	if err := RegisterDeterministicScalarFunction("ros_i12_det", 1, driver18Positive); err != nil { driver18RegistrationError = err }
+	MustRegisterScalarFunction("ros_i12_must_plain", 1, driver18Positive)
+	MustRegisterDeterministicScalarFunction("ros_i12_must_det", 1, driver18Positive)
+	driver18Register("ros_i15_null", &FunctionImpl{NArgs: 1, Innocuous: true, Scalar: func(*FunctionContext, []driver.Value) (driver.Value, error) { return nil, nil }})
+	driver18Register("ros_i15_error", &FunctionImpl{NArgs: 1, Innocuous: true, Scalar: func(*FunctionContext, []driver.Value) (driver.Value, error) { return nil, errors.New("driver18 scalar callback rejected") }})
+	driver18Register("ros_i15_agg_null", &FunctionImpl{NArgs: 1, Innocuous: true, MakeAggregate: func(FunctionContext) (AggregateFunction, error) { return &driver18Sum{null: true}, nil }})
+	driver18Register("ros_i15_agg_error", &FunctionImpl{NArgs: 1, Innocuous: true, MakeAggregate: func(FunctionContext) (AggregateFunction, error) { return &driver18Sum{reject: true}, nil }})
+}
+
+type driver18DB struct { db *sql.DB; conn *sql.Conn; ctx context.Context; cancel context.CancelFunc }
+func driver18Open(t *testing.T, dsn string) *driver18DB {
+	t.Helper()
+	if driver18RegistrationError != nil { t.Fatal(driver18RegistrationError) }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	db, err := sql.Open("sqlite", dsn); if err != nil { cancel(); t.Fatal(err) }
+	db.SetMaxOpenConns(2); db.SetMaxIdleConns(2)
+	c, err := db.Conn(ctx); if err != nil { db.Close(); cancel(); t.Fatal(err) }
+	f := &driver18DB{db: db, conn: c, ctx: ctx, cancel: cancel}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil { t.Errorf("connection close: %v", err) }
+		if err := db.Close(); err != nil { t.Errorf("database close: %v", err) }
+		cancel()
+	})
+	driver18Off(t, ctx, c)
+	return f
+}
+func driver18Off(t *testing.T, ctx context.Context, c *sql.Conn) {
+	t.Helper()
+	if _, err := c.ExecContext(ctx, "PRAGMA trusted_schema=OFF"); err != nil { t.Fatal(err) }
+	var got int
+	if err := c.QueryRowContext(ctx, "PRAGMA trusted_schema").Scan(&got); err != nil || got != 0 { t.Fatalf("trusted_schema got=%d err=%v", got, err) }
+}
+func (f *driver18DB) exec(t *testing.T, q string, args ...any) {
+	t.Helper(); if _, err := f.conn.ExecContext(f.ctx, q, args...); err != nil { t.Fatalf("setup/positive SQL %q: %v", q, err) }
+}
+func (f *driver18DB) integer(t *testing.T, q string, want int64, args ...any) {
+	t.Helper(); var got int64
+	if err := f.conn.QueryRowContext(f.ctx, q, args...).Scan(&got); err != nil || got != want { t.Fatalf("SQL %q got=%d want=%d err=%v", q, got, want, err) }
+}
+func driver18Error(t *testing.T, err error, code int, text string) {
+	t.Helper(); var native *Error
+	if err == nil || !errors.As(err, &native) || native.Code() != code || !strings.Contains(err.Error(), text) {
+		t.Fatalf("expected SQLite code=%d containing %q; got %T %v", code, text, err, err)
+	}
+}
+func driver18Oracle(t *testing.T, ctx context.Context, c *sql.Conn, name, typ string, arity, flags int) {
+	t.Helper()
+	rows, err := c.QueryContext(ctx, "SELECT name,builtin,type,enc,narg,flags FROM pragma_function_list WHERE name=?", name)
+	if err != nil { t.Fatal(err) }; defer func(){ if err := rows.Close(); err != nil { t.Error(err) } }()
+	count := 0
+	for rows.Next() {
+		var n, k, enc string; var builtin, na, fl int
+		if err := rows.Scan(&n, &builtin, &k, &enc, &na, &fl); err != nil { t.Fatal(err) }
+		count++
+		if n != name || builtin != 0 || k != typ || enc != "utf8" || na != arity || fl != flags { t.Fatalf("function_list %q builtin=%d type=%s enc=%s arity=%d flags=%d", n, builtin, k, enc, na, fl) }
+	}
+	if err := rows.Err(); err != nil { t.Fatal(err) }
+	if count != 1 { t.Fatalf("function_list %s count=%d", name, count) }
+}
+func driver18UnsafeView(t *testing.T, name string, flags int) {
+	f := driver18Open(t, ":memory:")
+	driver18Oracle(t, f.ctx, f.conn, name, "s", 1, flags)
+	f.integer(t, "SELECT "+name+"(7)", 1)
+	f.exec(t, "CREATE VIEW v AS SELECT "+name+"(7) AS result")
+	var got int
+	err := f.conn.QueryRowContext(f.ctx, "SELECT result FROM v").Scan(&got)
+	driver18Error(t, err, 1, "unsafe use of "+name+"()")
+}
+
+func TestDriverI01(t *testing.T) { driver18UnsafeView(t, "ros_i01", 0) }
+func TestDriverI02(t *testing.T) { driver18UnsafeView(t, "ros_i02", 2048) }
+func TestDriverI03(t *testing.T) {
+	f := driver18Open(t, ":memory:"); driver18Oracle(t, f.ctx, f.conn, "ros_i03", "s", 1, 2097152)
+	f.exec(t, "CREATE VIEW v AS SELECT ros_i03(3) AS result"); f.integer(t, "SELECT result FROM v", 1)
+}
+func TestDriverI04(t *testing.T) {
+	f := driver18Open(t, ":memory:"); driver18Oracle(t, f.ctx, f.conn, "ros_i04", "s", 1, 2099200)
+	f.exec(t, "CREATE TABLE checked(x INTEGER CHECK(ros_i04(x)=1))")
+	f.exec(t, "INSERT INTO checked VALUES(2)")
+	_, err := f.conn.ExecContext(f.ctx, "INSERT INTO checked VALUES(0)")
+	driver18Error(t, err, 275, "CHECK constraint failed")
+	f.integer(t, "SELECT count(*) FROM checked", 1); f.integer(t, "SELECT x FROM checked", 2)
+}
+func TestDriverI05(t *testing.T) {
+	f := driver18Open(t, ":memory:"); driver18Oracle(t, f.ctx, f.conn, "ros_i05", "s", 1, 2099200)
+	f.exec(t, "CREATE TABLE src(x INTEGER)"); f.exec(t, "CREATE TABLE log(v INTEGER)")
+	f.exec(t, "CREATE TRIGGER audited AFTER INSERT ON src BEGIN INSERT INTO log VALUES(ros_i05(new.x)); END")
+	f.exec(t, "INSERT INTO src VALUES(2),(0)")
+	f.integer(t, "SELECT count(*) FROM log", 2); f.integer(t, "SELECT sum(v) FROM log", 1)
+}
+func driver18AggregateView(t *testing.T, name string, window, allowed bool) {
+	f := driver18Open(t, ":memory:")
+	flags := 2048; if allowed { flags += 2097152 }
+	// Public MakeAggregate is installed with sqlite3_create_window_function;
+	// function_list.type is w even when the invocation uses aggregate syntax.
+	driver18Oracle(t, f.ctx, f.conn, name, "w", 1, flags)
+	f.exec(t, "CREATE TABLE data(x INTEGER)"); f.exec(t, "INSERT INTO data VALUES(1),(2),(3)")
+	f.integer(t, "SELECT "+name+"(x) FROM data", 6)
+	query := "SELECT "+name+"(x) AS value FROM data"
+	if window { query = "SELECT x,"+name+"(x) OVER(ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS value FROM data" }
+	f.exec(t, "CREATE VIEW v AS "+query)
+	if !allowed {
+		rows, err := f.conn.QueryContext(f.ctx, "SELECT * FROM v")
+		if rows != nil { rows.Close() }
+		driver18Error(t, err, 1, "unsafe use of "+name+"()")
+		return
+	}
+	if !window { f.integer(t, "SELECT value FROM v", 6); return }
+	rows, err := f.conn.QueryContext(f.ctx, "SELECT value FROM v ORDER BY x")
+	if err != nil { t.Fatal(err) }; defer func(){ if err := rows.Close(); err != nil { t.Error(err) } }()
+	var got []int64
+	for rows.Next() { var x int64; if err := rows.Scan(&x); err != nil { t.Fatal(err) }; got=append(got,x) }
+	if err := rows.Err(); err != nil { t.Fatal(err) }
+	if !reflect.DeepEqual(got, []int64{1,3,5}) { t.Fatalf("moving sum=%v", got) }
+}
+func TestDriverI06(t *testing.T) { driver18AggregateView(t,"ros_i06",false,false) }
+func TestDriverI07(t *testing.T) { driver18AggregateView(t,"ros_i07",false,true) }
+func TestDriverI08(t *testing.T) { driver18AggregateView(t,"ros_i08",true,false) }
+func TestDriverI09(t *testing.T) { driver18AggregateView(t,"ros_i09",true,true) }
+func TestDriverI10(t *testing.T) {
+	f:=driver18Open(t,":memory:")
+	for i, flags := range []int{0,2048,2097152,2099200} {
+		name:=fmt.Sprintf("ros_i10_%d",i); driver18Oracle(t,f.ctx,f.conn,name,"s",1,flags); f.integer(t,"SELECT "+name+"(5)",1)
+	}
+}
+func TestDriverI11(t *testing.T) {
+	f:=driver18Open(t,":memory:")
+	for i, flags := range []int{0,2048,2097152,2099200} {
+		name:=fmt.Sprintf("ros_i11_%d",i); driver18Oracle(t,f.ctx,f.conn,name,"w",1,flags); f.integer(t,"SELECT "+name+"(x) FROM (SELECT 2 AS x UNION ALL SELECT 4)",6)
+	}
+}
+func TestDriverI12(t *testing.T) {
+	for _, x := range []struct{name string; flags int}{{"ros_i12_plain",0},{"ros_i12_det",2048},{"ros_i12_must_plain",0},{"ros_i12_must_det",2048}} {
+		t.Run(x.name,func(t *testing.T){ driver18UnsafeView(t,x.name,x.flags) })
+	}
+}
+func TestDriverI13(t *testing.T) {
+	f:=driver18Open(t,":memory:")
+	second,err:=f.db.Conn(f.ctx);if err!=nil{t.Fatal(err)}
+	defer func(){if err:=second.Close();err!=nil{t.Error(err)}}()
+	driver18Off(t,f.ctx,second)
+	driver18Oracle(t,f.ctx,f.conn,"ros_i13","s",1,2099200)
+	driver18Oracle(t,f.ctx,second,"ros_i13","s",1,2099200)
+	f.exec(t,"CREATE TEMP TABLE first_only(x INTEGER)")
+	var count int
+	if err:=second.QueryRowContext(f.ctx,"SELECT count(*) FROM sqlite_temp_master WHERE name='first_only'").Scan(&count);err!=nil||count!=0{t.Fatalf("connections not distinct: %d %v",count,err)}
+	for _,c:=range []*sql.Conn{f.conn,second}{
+		if _,err:=c.ExecContext(f.ctx,"CREATE TABLE checked(x INTEGER CHECK(ros_i13(x)=1))");err!=nil{t.Fatal(err)}
+		if _,err:=c.ExecContext(f.ctx,"INSERT INTO checked VALUES(1)");err!=nil{t.Fatal(err)}
+		_,err:=c.ExecContext(f.ctx,"INSERT INTO checked VALUES(0)");driver18Error(t,err,275,"CHECK constraint failed")
+	}
+}
+func TestDriverI14(t *testing.T) {
+	err:=RegisterFunction("ros_i14",&FunctionImpl{NArgs:2,Scalar:func(*FunctionContext,[]driver.Value)(driver.Value,error){return int64(99),nil}})
+	if err==nil||err.Error()!=`a function named "ros_i14" is already registered`{t.Fatalf("duplicate error=%v",err)}
+	f:=driver18Open(t,":memory:");driver18Oracle(t,f.ctx,f.conn,"ros_i14","s",1,2099200)
+	f.integer(t,"SELECT ros_i14(8)",1)
+}
+func TestDriverI15(t *testing.T) {
+	f:=driver18Open(t,":memory:")
+	for _,name:=range []string{"ros_i15_null","ros_i15_agg_null"}{
+		f.exec(t,"CREATE VIEW "+name+"_v AS SELECT "+name+"(1) AS value")
+		var got any
+		if err:=f.conn.QueryRowContext(f.ctx,"SELECT value FROM "+name+"_v").Scan(&got);err!=nil||got!=nil{t.Fatalf("NULL %s: %#v %v",name,got,err)}
+	}
+	for _,x:=range []struct{name,text string}{{"ros_i15_error","driver18 scalar callback rejected"},{"ros_i15_agg_error","driver18 aggregate callback rejected"}}{
+		f.exec(t,"CREATE VIEW "+x.name+"_v AS SELECT "+x.name+"(1) AS value")
+		var got any;err:=f.conn.QueryRowContext(f.ctx,"SELECT value FROM "+x.name+"_v").Scan(&got)
+		driver18Error(t,err,1,x.text)
+	}
+	f.integer(t,"SELECT 7",7)
+}
+
+// I16 is the third stage. The future Root controller first runs the fork fixture
+// producer and then the separately built UNMODIFIED driver probe, with owned
+// processes and closed-DB proofs. This test never starts an unmanaged child.
+func TestDriverI16(t *testing.T) {
+	dbPath,reportPath:=os.Getenv("DRIVER18_I16_DB"),os.Getenv("DRIVER18_I16_OLD_RESULT")
+	if !filepath.IsAbs(dbPath)||!filepath.IsAbs(reportPath){t.Fatal("I16 OPEN: Root-owned fresh fixture and old-driver result are required")}
+	raw,err:=os.ReadFile(reportPath);if err!=nil{t.Fatal(err)}
+	var report struct{Schema string `json:"schema"`; Database string `json:"database"`; FunctionCount int `json:"function_count"`; ErrorCode int `json:"error_code"`; Error string `json:"error"`; Before int `json:"before"`; After int `json:"after"`; Closed bool `json:"closed"`}
+	if err:=json.Unmarshal(raw,&report);err!=nil{t.Fatal(err)}
+	if report.Schema!="researchos.driver18.old-probe.v1"||report.Database!=dbPath||report.FunctionCount!=0||report.ErrorCode!=1||!strings.Contains(report.Error,"no such function: ros_i16")||report.Before!=1||report.After!=1||!report.Closed{t.Fatalf("old-driver causal report invalid: %s",raw)}
+	f:=driver18Open(t,dbPath);f.integer(t,"SELECT count(*) FROM checked",1);f.integer(t,"SELECT x FROM checked",7)
+	f.exec(t,"INSERT INTO checked VALUES(9)");f.integer(t,"SELECT count(*) FROM checked",2)
+	// The controller separately authenticates the report to the pinned OLD
+	// binary/native exit/Job/raw invocation. This JSON alone is not that proof.
+}
+
+type driver18F08Vector struct { Valid []driver.Value; Corrupt []driver.Value }
+type driver18F08Binding struct { Name string; Impl *FunctionImpl; Vectors []driver18F08Vector }
+// A separately reviewed future adapter must assign BOTH variables using the
+// actual approved F08 names, pure implementations and independent raw vectors.
+// No production callback candidate is copied or registered by this proposal.
+var driver18F08ExpectedNames [3]string
+var driver18F08Bindings func() ([3]driver18F08Binding,error)
+func TestDriverI17(t *testing.T) {
+	if driver18F08Bindings==nil{t.Fatal("I17 OPEN: actual independently reviewed F08 callbacks and positive/corruption vectors are not linked")}
+	bindings,err:=driver18F08Bindings();if err!=nil{t.Fatal(err)}
+	seen:=map[string]bool{}
+	for i,b:=range bindings{
+		if b.Name==""||b.Name!=driver18F08ExpectedNames[i]||seen[b.Name]||b.Impl==nil||b.Impl.NArgs!=[]int32{2,5,2}[i]||!b.Impl.Deterministic||!b.Impl.Innocuous||b.Impl.Scalar==nil||b.Impl.MakeAggregate!=nil||len(b.Vectors)==0{t.Fatalf("I17 actual binding %d incomplete",i)}
+		for _,c:=range b.Name{if !(c=='_'||c>='a'&&c<='z'||c>='0'&&c<='9'){t.Fatal("I17 SQL identifier not canonical")}}
+		seen[b.Name]=true
+		if err:=RegisterFunction(b.Name,b.Impl);err!=nil{t.Fatal(err)}
+	}
+	f:=driver18Open(t,":memory:")
+	for i,b:=range bindings{
+		n:=int(b.Impl.NArgs);driver18Oracle(t,f.ctx,f.conn,b.Name,"s",n,2099200)
+		cols,args,marks:=[]string{},[]string{},[]string{}
+		for k:=0;k<n;k++{cols=append(cols,fmt.Sprintf("a%d",k));args=append(args,fmt.Sprintf("a%d",k));marks=append(marks,"?")}
+		table:=fmt.Sprintf("f08_%d",i)
+		f.exec(t,"CREATE TABLE "+table+"("+strings.Join(cols,",")+",CHECK("+b.Name+"("+strings.Join(args,",")+")=1))")
+		for _,v:=range b.Vectors{
+			if len(v.Valid)!=n||len(v.Corrupt)!=n||reflect.DeepEqual(v.Valid,v.Corrupt){t.Fatal("I17 vector arity or missing corruption")}
+			valid,bad:=make([]any,n),make([]any,n);for j:=0;j<n;j++{valid[j]=v.Valid[j];bad[j]=v.Corrupt[j]}
+			query:="SELECT "+b.Name+"("+strings.Join(marks,",")+")"
+			f.integer(t,query,1,valid...);f.integer(t,query,0,bad...)
+			f.exec(t,"INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")",valid...)
+			_,err:=f.conn.ExecContext(f.ctx,"INSERT INTO "+table+" VALUES("+strings.Join(marks,",")+")",bad...);driver18Error(t,err,275,"CHECK constraint failed")
+		}
+		f.integer(t,"SELECT count(*) FROM "+table,int64(len(b.Vectors)))
+	}
+}
+func TestDriverI18(t *testing.T) {
+	// Calls the original unchanged regression body in this package; its existing
+	// assertions/subtests remain authoritative. No surrogate success is emitted.
+	TestRegisteredFunctions(t)
+}

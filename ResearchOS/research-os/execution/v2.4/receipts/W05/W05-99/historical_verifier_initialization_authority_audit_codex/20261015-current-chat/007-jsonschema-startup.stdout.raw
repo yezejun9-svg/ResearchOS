@@ -1,0 +1,689 @@
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\loader.go HASH e5c2fb9641a9170e1110f12ba4c05d427ba5a947f5d83762862b937492d15071
+1: package jsonschema
+2: 
+3: import (
+4: 	"embed"
+5: 	"encoding/json"
+6: 	"errors"
+7: 	"fmt"
+8: 	"io"
+9: 	"io/fs"
+10: 	gourl "net/url"
+11: 	"os"
+12: 	"path/filepath"
+13: 	"runtime"
+14: 	"strings"
+15: )
+16: 
+17: // URLLoader knows how to load json from given url.
+18: type URLLoader interface {
+19: 	// Load loads json from given absolute url.
+20: 	Load(url string) (any, error)
+21: }
+22: 
+23: // --
+24: 
+25: // FileLoader loads json file url.
+26: type FileLoader struct{}
+27: 
+28: func (l FileLoader) Load(url string) (any, error) {
+29: 	path, err := l.ToFile(url)
+30: 	if err != nil {
+31: 		return nil, err
+32: 	}
+33: 	f, err := os.Open(path)
+34: 	if err != nil {
+35: 		return nil, err
+36: 	}
+37: 	defer f.Close()
+38: 	return UnmarshalJSON(f)
+39: }
+40: 
+41: // ToFile is helper method to convert file url to file path.
+42: func (l FileLoader) ToFile(url string) (string, error) {
+43: 	u, err := gourl.Parse(url)
+44: 	if err != nil {
+45: 		return "", err
+46: 	}
+47: 	if u.Scheme != "file" {
+48: 		return "", fmt.Errorf("invalid file url: %s", u)
+49: 	}
+50: 	path := u.Path
+51: 	if runtime.GOOS == "windows" {
+52: 		path = strings.TrimPrefix(path, "/")
+53: 		path = filepath.FromSlash(path)
+54: 	}
+55: 	return path, nil
+56: }
+57: 
+58: // --
+59: 
+60: // SchemeURLLoader delegates to other [URLLoaders]
+61: // based on url scheme.
+62: type SchemeURLLoader map[string]URLLoader
+63: 
+64: func (l SchemeURLLoader) Load(url string) (any, error) {
+65: 	u, err := gourl.Parse(url)
+66: 	if err != nil {
+67: 		return nil, err
+68: 	}
+69: 	ll, ok := l[u.Scheme]
+70: 	if !ok {
+71: 		return nil, &UnsupportedURLSchemeError{u.String()}
+72: 	}
+73: 	return ll.Load(url)
+74: }
+75: 
+76: // --
+77: 
+78: //go:embed metaschemas
+79: var metaFS embed.FS
+80: 
+81: func openMeta(url string) (fs.File, error) {
+82: 	u, meta := strings.CutPrefix(url, "http://json-schema.org/")
+83: 	if !meta {
+84: 		u, meta = strings.CutPrefix(url, "https://json-schema.org/")
+85: 	}
+86: 	if meta {
+87: 		if u == "schema" {
+88: 			return openMeta(draftLatest.url)
+89: 		}
+90: 		f, err := metaFS.Open("metaschemas/" + u)
+91: 		if err != nil {
+92: 			if errors.Is(err, fs.ErrNotExist) {
+93: 				return nil, nil
+94: 			}
+95: 			return nil, err
+96: 		}
+97: 		return f, err
+98: 	}
+99: 	return nil, nil
+100: 
+101: }
+102: 
+103: func isMeta(url string) bool {
+104: 	f, err := openMeta(url)
+105: 	if err != nil {
+106: 		return true
+107: 	}
+108: 	if f != nil {
+109: 		f.Close()
+110: 		return true
+111: 	}
+112: 	return false
+113: }
+114: 
+115: func loadMeta(url string) (any, error) {
+116: 	f, err := openMeta(url)
+117: 	if err != nil {
+118: 		return nil, err
+119: 	}
+120: 	if f == nil {
+121: 		return nil, nil
+122: 	}
+123: 	defer f.Close()
+124: 	return UnmarshalJSON(f)
+125: }
+126: 
+127: // --
+128: 
+129: type defaultLoader struct {
+130: 	docs   map[url]any // docs loaded so far
+131: 	loader URLLoader
+132: }
+133: 
+134: func (l *defaultLoader) add(url url, doc any) bool {
+135: 	if _, ok := l.docs[url]; ok {
+136: 		return false
+137: 	}
+138: 	l.docs[url] = doc
+139: 	return true
+140: }
+141: 
+142: func (l *defaultLoader) load(url url) (any, error) {
+143: 	if doc, ok := l.docs[url]; ok {
+144: 		return doc, nil
+145: 	}
+146: 	doc, err := loadMeta(url.String())
+147: 	if err != nil {
+148: 		return nil, err
+149: 	}
+150: 	if doc != nil {
+151: 		l.add(url, doc)
+152: 		return doc, nil
+153: 	}
+154: 	if l.loader == nil {
+155: 		return nil, &LoadURLError{url.String(), errors.New("no URLLoader set")}
+156: 	}
+157: 	doc, err = l.loader.Load(url.String())
+158: 	if err != nil {
+159: 		return nil, &LoadURLError{URL: url.String(), Err: err}
+160: 	}
+161: 	l.add(url, doc)
+162: 	return doc, nil
+163: }
+164: 
+165: func (l *defaultLoader) getDraft(up urlPtr, doc any, defaultDraft *Draft, cycle map[url]struct{}) (*Draft, error) {
+166: 	obj, ok := doc.(map[string]any)
+167: 	if !ok {
+168: 		return defaultDraft, nil
+169: 	}
+170: 	sch, ok := strVal(obj, "$schema")
+171: 	if !ok {
+172: 		return defaultDraft, nil
+173: 	}
+174: 	if draft := draftFromURL(sch); draft != nil {
+175: 		return draft, nil
+176: 	}
+177: 	sch, _ = split(sch)
+178: 	if _, err := gourl.Parse(sch); err != nil {
+179: 		return nil, &InvalidMetaSchemaURLError{up.String(), err}
+180: 	}
+181: 	schUrl := url(sch)
+182: 	if up.ptr.isEmpty() && schUrl == up.url {
+183: 		return nil, &UnsupportedDraftError{schUrl.String()}
+184: 	}
+185: 	if _, ok := cycle[schUrl]; ok {
+186: 		return nil, &MetaSchemaCycleError{schUrl.String()}
+187: 	}
+188: 	cycle[schUrl] = struct{}{}
+189: 	doc, err := l.load(schUrl)
+190: 	if err != nil {
+191: 		return nil, err
+192: 	}
+193: 	return l.getDraft(urlPtr{schUrl, ""}, doc, defaultDraft, cycle)
+194: }
+195: 
+196: func (l *defaultLoader) getMetaVocabs(doc any, draft *Draft, vocabularies map[string]*Vocabulary) ([]string, error) {
+197: 	obj, ok := doc.(map[string]any)
+198: 	if !ok {
+199: 		return nil, nil
+200: 	}
+201: 	sch, ok := strVal(obj, "$schema")
+202: 	if !ok {
+203: 		return nil, nil
+204: 	}
+205: 	if draft := draftFromURL(sch); draft != nil {
+206: 		return nil, nil
+207: 	}
+208: 	sch, _ = split(sch)
+209: 	if _, err := gourl.Parse(sch); err != nil {
+210: 		return nil, &ParseURLError{sch, err}
+211: 	}
+212: 	schUrl := url(sch)
+213: 	doc, err := l.load(schUrl)
+214: 	if err != nil {
+215: 		return nil, err
+216: 	}
+217: 	return draft.getVocabs(schUrl, doc, vocabularies)
+218: }
+219: 
+220: // --
+221: 
+222: type LoadURLError struct {
+223: 	URL string
+224: 	Err error
+225: }
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\compiler.go HASH 70866caca3a796301c74dfb2a963d53809c0b94c3dcbcc7f8ac5f8f480856b76
+1: package jsonschema
+2: 
+3: import (
+4: 	"fmt"
+5: 	"regexp"
+6: 	"slices"
+7: )
+8: 
+9: // Compiler compiles json schema into *Schema.
+10: type Compiler struct {
+11: 	schemas       map[urlPtr]*Schema
+12: 	roots         *roots
+13: 	formats       map[string]*Format
+14: 	decoders      map[string]*Decoder
+15: 	mediaTypes    map[string]*MediaType
+16: 	assertFormat  bool
+17: 	assertContent bool
+18: }
+19: 
+20: // NewCompiler create Compiler Object.
+21: func NewCompiler() *Compiler {
+22: 	return &Compiler{
+23: 		schemas:       map[urlPtr]*Schema{},
+24: 		roots:         newRoots(),
+25: 		formats:       map[string]*Format{},
+26: 		decoders:      map[string]*Decoder{},
+27: 		mediaTypes:    map[string]*MediaType{},
+28: 		assertFormat:  false,
+29: 		assertContent: false,
+30: 	}
+31: }
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\compiler.go HASH 70866caca3a796301c74dfb2a963d53809c0b94c3dcbcc7f8ac5f8f480856b76
+153: func (c *Compiler) enqueue(q *queue, up urlPtr) *Schema {
+154: 	if sch, ok := c.schemas[up]; ok {
+155: 		// already got compiled
+156: 		return sch
+157: 	}
+158: 	if sch := q.get(up); sch != nil {
+159: 		return sch
+160: 	}
+161: 	sch := newSchema(up)
+162: 	q.append(sch)
+163: 	return sch
+164: }
+165: 
+166: // MustCompile is like [Compile] but panics if compilation fails.
+167: // It simplifies safe initialization of global variables holding
+168: // compiled schema.
+169: func (c *Compiler) MustCompile(loc string) *Schema {
+170: 	sch, err := c.Compile(loc)
+171: 	if err != nil {
+172: 		panic(fmt.Sprintf("jsonschema: Compile(%q): %v", loc, err))
+173: 	}
+174: 	return sch
+175: }
+176: 
+177: // Compile compiles json-schema at given loc.
+178: func (c *Compiler) Compile(loc string) (*Schema, error) {
+179: 	uf, err := absolute(loc)
+180: 	if err != nil {
+181: 		return nil, err
+182: 	}
+183: 	up, err := c.roots.resolveFragment(*uf)
+184: 	if err != nil {
+185: 		return nil, err
+186: 	}
+187: 	return c.doCompile(up)
+188: }
+189: 
+190: func (c *Compiler) doCompile(up urlPtr) (*Schema, error) {
+191: 	q := &queue{}
+192: 	compiled := 0
+193: 
+194: 	c.enqueue(q, up)
+195: 	for q.len() > compiled {
+196: 		sch := q.at(compiled)
+197: 		if err := c.roots.ensureSubschema(sch.up); err != nil {
+198: 			return nil, err
+199: 		}
+200: 		r := c.roots.roots[sch.up.url]
+201: 		v, err := sch.up.lookup(r.doc)
+202: 		if err != nil {
+203: 			return nil, err
+204: 		}
+205: 		if err := c.compileValue(v, sch, r, q); err != nil {
+206: 			return nil, err
+207: 		}
+208: 		compiled++
+209: 	}
+210: 	for _, sch := range *q {
+211: 		c.schemas[sch.up] = sch
+212: 	}
+213: 	return c.schemas[up], nil
+214: }
+215: 
+216: func (c *Compiler) compileValue(v any, sch *Schema, r *root, q *queue) error {
+217: 	res := r.resource(sch.up.ptr)
+218: 	sch.DraftVersion = res.dialect.draft.version
+219: 
+220: 	base := urlPtr{sch.up.url, res.ptr}
+221: 	sch.resource = c.enqueue(q, base)
+222: 
+223: 	// if resource, enqueue dynamic anchors for compilation
+224: 	if sch.DraftVersion >= 2020 && sch.up == sch.resource.up {
+225: 		res := r.resource(sch.up.ptr)
+226: 		for anchor, anchorPtr := range res.anchors {
+227: 			if slices.Contains(res.dynamicAnchors, anchor) {
+228: 				up := urlPtr{sch.up.url, anchorPtr}
+229: 				danchorSch := c.enqueue(q, up)
+230: 				if sch.dynamicAnchors == nil {
+231: 					sch.dynamicAnchors = map[string]*Schema{}
+232: 				}
+233: 				sch.dynamicAnchors[string(anchor)] = danchorSch
+234: 			}
+235: 		}
+236: 	}
+237: 
+238: 	switch v := v.(type) {
+239: 	case bool:
+240: 		sch.Bool = &v
+241: 	case map[string]any:
+242: 		if err := c.compileObject(v, sch, r, q); err != nil {
+243: 			return err
+244: 		}
+245: 	}
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\roots.go HASH 6e84cb61bbb143e334c5c587295064bac0eeadecec73c4e5685aaa67d461bdc2
+1: package jsonschema
+2: 
+3: import (
+4: 	"fmt"
+5: 	"strings"
+6: )
+7: 
+8: type roots struct {
+9: 	defaultDraft *Draft
+10: 	roots        map[url]*root
+11: 	loader       defaultLoader
+12: 	regexpEngine RegexpEngine
+13: 	vocabularies map[string]*Vocabulary
+14: 	assertVocabs bool
+15: }
+16: 
+17: func newRoots() *roots {
+18: 	return &roots{
+19: 		defaultDraft: draftLatest,
+20: 		roots:        map[url]*root{},
+21: 		loader: defaultLoader{
+22: 			docs:   map[url]any{},
+23: 			loader: FileLoader{},
+24: 		},
+25: 		regexpEngine: goRegexpCompile,
+26: 		vocabularies: map[string]*Vocabulary{},
+27: 	}
+28: }
+29: 
+30: func (rr *roots) orLoad(u url) (*root, error) {
+31: 	if r, ok := rr.roots[u]; ok {
+32: 		return r, nil
+33: 	}
+34: 	doc, err := rr.loader.load(u)
+35: 	if err != nil {
+36: 		return nil, err
+37: 	}
+38: 	return rr.addRoot(u, doc)
+39: }
+40: 
+41: func (rr *roots) addRoot(u url, doc any) (*root, error) {
+42: 	r := &root{
+43: 		url:                 u,
+44: 		doc:                 doc,
+45: 		resources:           map[jsonPointer]*resource{},
+46: 		subschemasProcessed: map[jsonPointer]struct{}{},
+47: 	}
+48: 	if err := rr.collectResources(r, doc, u, "", dialect{rr.defaultDraft, nil}); err != nil {
+49: 		return nil, err
+50: 	}
+51: 	if !strings.HasPrefix(u.String(), "http://json-schema.org/") &&
+52: 		!strings.HasPrefix(u.String(), "https://json-schema.org/") {
+53: 		if err := rr.validate(r, doc, ""); err != nil {
+54: 			return nil, err
+55: 		}
+56: 	}
+57: 
+58: 	rr.roots[u] = r
+59: 	return r, nil
+60: }
+61: 
+62: func (rr *roots) resolveFragment(uf urlFrag) (urlPtr, error) {
+63: 	r, err := rr.orLoad(uf.url)
+64: 	if err != nil {
+65: 		return urlPtr{}, err
+66: 	}
+67: 	return r.resolveFragment(uf.frag)
+68: }
+69: 
+70: func (rr *roots) collectResources(r *root, sch any, base url, schPtr jsonPointer, fallback dialect) error {
+71: 	if _, ok := r.subschemasProcessed[schPtr]; ok {
+72: 		return nil
+73: 	}
+74: 	if err := rr._collectResources(r, sch, base, schPtr, fallback); err != nil {
+75: 		return err
+76: 	}
+77: 	r.subschemasProcessed[schPtr] = struct{}{}
+78: 	return nil
+79: }
+80: 
+81: func (rr *roots) _collectResources(r *root, sch any, base url, schPtr jsonPointer, fallback dialect) error {
+82: 	obj, ok := sch.(map[string]any)
+83: 	if !ok {
+84: 		if schPtr.isEmpty() {
+85: 			// root resource
+86: 			res := newResource(schPtr, base)
+87: 			res.dialect = fallback
+88: 			r.resources[schPtr] = res
+89: 		}
+90: 		return nil
+91: 	}
+92: 
+93: 	hasSchema := false
+94: 	if sch, ok := obj["$schema"]; ok {
+95: 		if _, ok := sch.(string); ok {
+96: 			hasSchema = true
+97: 		}
+98: 	}
+99: 
+100: 	draft, err := rr.loader.getDraft(urlPtr{r.url, schPtr}, sch, fallback.draft, map[url]struct{}{})
+101: 	if err != nil {
+102: 		return err
+103: 	}
+104: 	id := draft.getID(obj)
+105: 	if id == "" && !schPtr.isEmpty() {
+106: 		// ignore $schema
+107: 		draft = fallback.draft
+108: 		hasSchema = false
+109: 		id = draft.getID(obj)
+110: 	}
+111: 
+112: 	var res *resource
+113: 	if id != "" {
+114: 		uf, err := base.join(id)
+115: 		if err != nil {
+116: 			loc := urlPtr{r.url, schPtr}
+117: 			return &ParseIDError{loc.String()}
+118: 		}
+119: 		base = uf.url
+120: 		res = newResource(schPtr, base)
+121: 	} else if schPtr.isEmpty() {
+122: 		// root resource
+123: 		res = newResource(schPtr, base)
+124: 	}
+125: 
+126: 	if res != nil {
+127: 		found := false
+128: 		for _, res := range r.resources {
+129: 			if res.id == base {
+130: 				found = true
+131: 				if res.ptr != schPtr {
+132: 					return &DuplicateIDError{base.String(), r.url.String(), string(schPtr), string(res.ptr)}
+133: 				}
+134: 			}
+135: 		}
+136: 		if !found {
+137: 			if hasSchema {
+138: 				vocabs, err := rr.loader.getMetaVocabs(sch, draft, rr.vocabularies)
+139: 				if err != nil {
+140: 					return err
+141: 				}
+142: 				res.dialect = dialect{draft, vocabs}
+143: 			} else {
+144: 				res.dialect = fallback
+145: 			}
+146: 			r.resources[schPtr] = res
+147: 		}
+148: 	}
+149: 
+150: 	var baseRes *resource
+151: 	for _, res := range r.resources {
+152: 		if res.id == base {
+153: 			baseRes = res
+154: 			break
+155: 		}
+156: 	}
+157: 	if baseRes == nil {
+158: 		panic("baseres is nil")
+159: 	}
+160: 
+161: 	// found base resource
+162: 	if err := r.collectAnchors(sch, schPtr, baseRes); err != nil {
+163: 		return err
+164: 	}
+165: 
+166: 	// process subschemas
+167: 	subschemas := map[jsonPointer]any{}
+168: 	for _, sp := range draft.subschemas {
+169: 		ss := sp.collect(obj, schPtr)
+170: 		for k, v := range ss {
+171: 			subschemas[k] = v
+172: 		}
+173: 	}
+174: 	for _, vocab := range baseRes.dialect.activeVocabs(true, rr.vocabularies) {
+175: 		if v := rr.vocabularies[vocab]; v != nil {
+176: 			for _, sp := range v.Subschemas {
+177: 				ss := sp.collect(obj, schPtr)
+178: 				for k, v := range ss {
+179: 					subschemas[k] = v
+180: 				}
+FILE D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\draft.go HASH bb436dc7f6070066e621cb1bb4b0da0a7e1fdf09e8563443885713cda2cf7dd2
+1: package jsonschema
+2: 
+3: import (
+4: 	"fmt"
+5: 	"slices"
+6: 	"strings"
+7: )
+8: 
+9: // A Draft represents json-schema specification.
+10: type Draft struct {
+11: 	version       int
+12: 	url           string
+13: 	sch           *Schema
+14: 	id            string             // property name used to represent id
+15: 	subschemas    []SchemaPath       // locations of subschemas
+16: 	vocabPrefix   string             // prefix used for vocabulary
+17: 	allVocabs     map[string]*Schema // names of supported vocabs with its schemas
+18: 	defaultVocabs []string           // names of default vocabs
+19: }
+20: 
+21: // String returns the specification url.
+22: func (d *Draft) String() string {
+23: 	return d.url
+24: }
+25: 
+26: var (
+27: 	Draft4 = &Draft{
+28: 		version: 4,
+29: 		url:     "http://json-schema.org/draft-04/schema",
+30: 		id:      "id",
+31: 		subschemas: []SchemaPath{
+32: 			// type agonistic
+33: 			schemaPath("definitions/*"),
+34: 			schemaPath("not"),
+35: 			schemaPath("allOf/[]"),
+36: 			schemaPath("anyOf/[]"),
+37: 			schemaPath("oneOf/[]"),
+38: 			// object
+39: 			schemaPath("properties/*"),
+40: 			schemaPath("additionalProperties"),
+41: 			schemaPath("patternProperties/*"),
+42: 			// array
+43: 			schemaPath("items"),
+44: 			schemaPath("items/[]"),
+45: 			schemaPath("additionalItems"),
+46: 			schemaPath("dependencies/*"),
+47: 		},
+48: 		vocabPrefix:   "",
+49: 		allVocabs:     map[string]*Schema{},
+50: 		defaultVocabs: []string{},
+51: 	}
+52: 
+53: 	Draft6 = &Draft{
+54: 		version: 6,
+55: 		url:     "http://json-schema.org/draft-06/schema",
+56: 		id:      "$id",
+57: 		subschemas: joinSubschemas(Draft4.subschemas,
+58: 			schemaPath("propertyNames"),
+59: 			schemaPath("contains"),
+60: 		),
+61: 		vocabPrefix:   "",
+62: 		allVocabs:     map[string]*Schema{},
+63: 		defaultVocabs: []string{},
+64: 	}
+65: 
+66: 	Draft7 = &Draft{
+67: 		version: 7,
+68: 		url:     "http://json-schema.org/draft-07/schema",
+69: 		id:      "$id",
+70: 		subschemas: joinSubschemas(Draft6.subschemas,
+71: 			schemaPath("if"),
+72: 			schemaPath("then"),
+73: 			schemaPath("else"),
+74: 		),
+75: 		vocabPrefix:   "",
+76: 		allVocabs:     map[string]*Schema{},
+77: 		defaultVocabs: []string{},
+78: 	}
+79: 
+80: 	Draft2019 = &Draft{
+81: 		version: 2019,
+82: 		url:     "https://json-schema.org/draft/2019-09/schema",
+83: 		id:      "$id",
+84: 		subschemas: joinSubschemas(Draft7.subschemas,
+85: 			schemaPath("$defs/*"),
+86: 			schemaPath("dependentSchemas/*"),
+87: 			schemaPath("unevaluatedProperties"),
+88: 			schemaPath("unevaluatedItems"),
+89: 			schemaPath("contentSchema"),
+90: 		),
+91: 		vocabPrefix: "https://json-schema.org/draft/2019-09/vocab/",
+92: 		allVocabs: map[string]*Schema{
+93: 			"core":       nil,
+94: 			"applicator": nil,
+95: 			"validation": nil,
+96: 			"meta-data":  nil,
+97: 			"format":     nil,
+98: 			"content":    nil,
+99: 		},
+100: 		defaultVocabs: []string{"core", "applicator", "validation"},
+101: 	}
+102: 
+103: 	Draft2020 = &Draft{
+104: 		version: 2020,
+105: 		url:     "https://json-schema.org/draft/2020-12/schema",
+106: 		id:      "$id",
+107: 		subschemas: joinSubschemas(Draft2019.subschemas,
+108: 			schemaPath("prefixItems/[]"),
+109: 		),
+110: 		vocabPrefix: "https://json-schema.org/draft/2020-12/vocab/",
+111: 		allVocabs: map[string]*Schema{
+112: 			"core":              nil,
+113: 			"applicator":        nil,
+114: 			"unevaluated":       nil,
+115: 			"validation":        nil,
+116: 			"meta-data":         nil,
+117: 			"format-annotation": nil,
+118: 			"format-assertion":  nil,
+119: 			"content":           nil,
+120: 		},
+121: 		defaultVocabs: []string{"core", "applicator", "unevaluated", "validation"},
+122: 	}
+123: 
+124: 	draftLatest = Draft2020
+125: )
+126: 
+127: func init() {
+128: 	c := NewCompiler()
+129: 	c.AssertFormat()
+130: 	for _, d := range []*Draft{Draft4, Draft6, Draft7, Draft2019, Draft2020} {
+131: 		d.sch = c.MustCompile(d.url)
+132: 		for name := range d.allVocabs {
+133: 			d.allVocabs[name] = c.MustCompile(strings.TrimSuffix(d.url, "schema") + "meta/" + name)
+134: 		}
+135: 	}
+136: }
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft-04\schema 5e4a46b433800681b8da4911df61cd72212d5bce2839e1c772e2b99a89fbbf09
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft-06\schema bf7460259b94e8291eaeec1b077f98caff3d16df17ee2a99208f74f1412c4932
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft-07\schema 943da3dc9a29dbfbd325aec2ca01cfd6304a1cd53fde2c9775bcca6523f6410e
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\applicator c18c9d8880297184560f6d82a2fc035211630474d1b2547feaccf221b9786211
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\content 03d8e25955252927e34016e03f51297475ace9de4551839d1b54c9f5736ff6d6
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\core a3dfd7891bc6ec4a0147289bc99de4cec2a84ff542b2edfac6de95f402907503
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\format 708bad3c6cee27e8c0d5cbf26e41eef6f1c56fec5f91b0eaa471ef2fc521d463
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\meta-data a72a0fbc2272d9effcc71a159f9c92f0ef4417c0f1677f515767de77b5238a0a
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\meta\validation e1a3128accd99efc4cc198545479eae1548ce303a96810c1a0a28f022f0489a2
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2019-09\schema 9591bb2cf00ab32193870cb6a2ca4c32ae89e254af154f4e971c61a6ee82da03
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\applicator 3b4baccc121371207bcb2d3137b9b93a251b2029df85ecda0ca625ecd1ab9b30
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\content 3be161f2e963fbb8f09a756cc3b02adbe5375fe71020b959213e2b58e92f5886
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\core ea945e11e766783c05ef2bda8958ef2b64746430b6b7475c1915babbd6c01264
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\format-annotation 59cb0d1d59c430d5d691f4712dc2b4d09ba6dafcb90f7ce14b8f11b07340a6c6
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\format-assertion 4c45dfbf72b09ec8b0cd6c8086c259bd4b1d68b86138d886e8191fc0189270b8
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\meta-data e070588fd8fac3a0b4bed1dbe1f576ccdb2e32ade3b46bd590150d0b15506859
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\unevaluated cd2e94b6154c7ab9ee90f8bfa8d8addf9f6ae75a58fc090099605401303653cb
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\meta\validation 000831f2fffd6927b25f9d601e6f0cc6bc8d51ed6c967d63c1449d1f76f8568a
+EMBED D:\作品集\ResearchOS\research-os\.local\tools\gopath\pkg\mod\github.com\santhosh-tekuri\jsonschema\v6@v6.0.3\metaschemas\draft\2020-12\schema 0080fa14a942b09f436c55257d1e379c5cb2551f732e678fa06e8009fb7c2582

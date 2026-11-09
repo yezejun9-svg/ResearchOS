@@ -1,0 +1,450 @@
+diff --git a/internal/domain/backup_pause_handoff.go b/internal/domain/backup_pause_handoff.go
+index c200fe4c..e0e044c5 100644
+--- a/internal/domain/backup_pause_handoff.go
++++ b/internal/domain/backup_pause_handoff.go
+@@ -81,6 +81,11 @@ func pauseMigrationPaths(opt *PauseSchemaUpgradeOptions, existingDestination boo
+ 	if u.Plan != PauseSchemaUpgradePlan {
+ 		return fmt.Errorf("PAUSE_UPGRADE_PLAN_UNSUPPORTED")
+ 	}
++	// Check aliases before normalizing them away. This also requires the
++	// explicitly bound staging parent to exist before any filesystem staging.
++	if _, err := pauseMigrationStageParent(*opt, filepath.Dir(u.Destination)); err != nil {
++		return err
++	}
+ 	for _, p := range []*string{&u.Source, &u.Snapshot, &u.KeyFile, &u.SourceRoot, &u.TargetRoot, &u.SourceProgram, &u.TargetProgram, &opt.RehearsalProgram, &opt.HandoffBindingFile} {
+ 		path, err := pauseMigrationPath(*p, true)
+ 		if err != nil {
+@@ -241,7 +246,7 @@ func upgradePauseSchemaBackup(ctx context.Context, opt PauseSchemaUpgradeOptions
+ 	if err != nil {
+ 		return report, err
+ 	}
+-	schemas, err := pauseMigrationTemplate(ctx, sqls, contracts)
++	schemas, err := pauseMigrationTemplate(ctx, opt, filepath.Dir(u.Destination), sqls, contracts)
+ 	if err != nil {
+ 		return report, err
+ 	}
+diff --git a/internal/domain/backup_pause_handoff_test.go b/internal/domain/backup_pause_handoff_test.go
+index ae7ee527..e9373264 100644
+--- a/internal/domain/backup_pause_handoff_test.go
++++ b/internal/domain/backup_pause_handoff_test.go
+@@ -1,11 +1,79 @@
+ package domain
+ 
+ import (
++	"go/ast"
++	"go/parser"
++	"go/token"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+ )
+ 
++// This is a source wiring guard, not Native authority execution. The actual
++// Native branch cannot be called with a fabricated nonzero migration token.
++func TestPauseMigrationTemplateCallersBindTheirOwnDestination(t *testing.T) {
++	for _, test := range []struct{ file, function, options, upgrade string }{
++		{"backup_pause_handoff.go", "upgradePauseSchemaBackup", "opt", "u"},
++		{"backup_pause_migration_windows.go", "ExecutePauseSchemaUpgrade", "pauseOpt", "opt"},
++	} {
++		t.Run(test.function, func(t *testing.T) {
++			file, err := parser.ParseFile(token.NewFileSet(), test.file, nil, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			calls := 0
++			for _, decl := range file.Decls {
++				function, ok := decl.(*ast.FuncDecl)
++				if !ok || function.Name.Name != test.function {
++					continue
++				}
++				ast.Inspect(function.Body, func(node ast.Node) bool {
++					call, ok := node.(*ast.CallExpr)
++					if !ok {
++						return true
++					}
++					name, ok := call.Fun.(*ast.Ident)
++					if !ok || name.Name != "pauseMigrationTemplate" {
++						return true
++					}
++					calls++
++					if len(call.Args) != 5 {
++						t.Fatal("template lacks explicit bound options/parent")
++					}
++					options, ok := call.Args[1].(*ast.Ident)
++					if !ok || options.Name != test.options {
++						t.Fatal("template uses unrelated options")
++					}
++					parent, ok := call.Args[2].(*ast.CallExpr)
++					if !ok || len(parent.Args) != 1 {
++						t.Fatal("template parent not derived from destination")
++					}
++					selector, ok := parent.Fun.(*ast.SelectorExpr)
++					if !ok || selector.Sel.Name != "Dir" {
++						t.Fatal("template parent function changed")
++					}
++					pkg, ok := selector.X.(*ast.Ident)
++					if !ok || pkg.Name != "filepath" {
++						t.Fatal("template parent function is not filepath.Dir")
++					}
++					destination, ok := parent.Args[0].(*ast.SelectorExpr)
++					if !ok || destination.Sel.Name != "Destination" {
++						t.Fatal("template parent is not destination parent")
++					}
++					upgrade, ok := destination.X.(*ast.Ident)
++					if !ok || upgrade.Name != test.upgrade {
++						t.Fatal("template parent uses unrelated options")
++					}
++					return true
++				})
++			}
++			if calls != 1 {
++				t.Fatal("expected one bound template call", calls)
++			}
++		})
++	}
++}
++
+ func TestPauseHandoffMetadataSeparatesThreePrograms(t *testing.T) {
+ 	programs := pauseMigrationPrograms{Digest([]byte("source24")), Digest([]byte("control25")), Digest([]byte("backup25"))}
+ 	zero := 0
+diff --git a/internal/domain/backup_pause_migration.go b/internal/domain/backup_pause_migration.go
+index 1083427f..e3ba03f3 100644
+--- a/internal/domain/backup_pause_migration.go
++++ b/internal/domain/backup_pause_migration.go
+@@ -209,12 +209,78 @@ func pauseMigrationDDL(ctx context.Context, tx *sql.Tx, raw []byte, before prepa
+ 	return preparedUpgradeIntegrity(ctx, tx)
+ }
+ 
+-func pauseMigrationTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (pauseMigrationSchemas, error) {
++// The template has no ambient temporary-directory authority. Both callers pass
++// the parent derived from the same options that bind the rehearsal destination
++// (and, in the Native caller, have already matched the signed options hash).
++func pauseMigrationStageParent(opt PauseSchemaUpgradeOptions, parent string) (string, error) {
++	u := opt.Upgrade
++	if u.Plan != PauseSchemaUpgradePlan || parent == "" || !filepath.IsAbs(parent) ||
++		strings.ContainsAny(parent, "?#\x00") || parent != filepath.Dir(u.Destination) {
++		return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_BINDING")
++	}
++	canonical := func(path string, existing bool) (string, error) {
++		if path == "" || !filepath.IsAbs(path) || strings.ContainsAny(path, "?#\x00") {
++			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_CANONICAL_PATH")
++		}
++		resolved, err := pauseMigrationPath(path, existing)
++		if err != nil || !strings.EqualFold(filepath.Clean(path), resolved) {
++			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_CANONICAL_PATH: %s", path)
++		}
++		return resolved, nil
++	}
++	resolved, err := canonical(parent, true)
++	if err != nil {
++		return "", err
++	}
++	info, err := os.Stat(resolved)
++	if err != nil || !info.IsDir() {
++		return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_DIRECTORY_REQUIRED")
++	}
++	_, statErr := os.Lstat(u.Destination)
++	if statErr != nil && !os.IsNotExist(statErr) {
++		return "", statErr
++	}
++	if _, err = canonical(u.Destination, statErr == nil); err != nil {
++		return "", err
++	}
++	if statErr == nil {
++		info, err := os.Stat(u.Destination)
++		if err != nil || !info.IsDir() {
++			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_DESTINATION_DIRECTORY")
++		}
++	}
++	for _, protected := range []struct {
++		path string
++		file bool
++	}{{u.Source, true}, {u.KeyFile, true}, {u.Snapshot, false}, {u.SourceRoot, false}, {u.TargetRoot, false}} {
++		path, err := canonical(protected.path, true)
++		if err != nil {
++			return "", err
++		}
++		if protected.file {
++			path = filepath.Dir(path)
++		}
++		if upgradeInside(path, resolved) || upgradeInside(resolved, path) {
++			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_OVERLAP")
++		}
++	}
++	return resolved, nil
++}
++
++func pauseMigrationTemplateStage(opt PauseSchemaUpgradeOptions, parent string) (string, error) {
++	parent, err := pauseMigrationStageParent(opt, parent)
++	if err != nil {
++		return "", err
++	}
++	return os.MkdirTemp(parent, ".researchos-backup-stage-")
++}
++
++func pauseMigrationTemplate(ctx context.Context, opt PauseSchemaUpgradeOptions, parent string, sqls [][]byte, contracts *Contracts) (pauseMigrationSchemas, error) {
+ 	var result pauseMigrationSchemas
+ 	if len(sqls) != 26 || Digest(sqls[24]) != pauseUpgradeSQLHash || Digest(sqls[25]) != upgradeQueueSessionHash {
+ 		return result, fmt.Errorf("PAUSE_UPGRADE_TEMPLATE_INPUT")
+ 	}
+-	stage, err := os.MkdirTemp("", ".researchos-backup-stage-")
++	stage, err := pauseMigrationTemplateStage(opt, parent)
+ 	if err != nil {
+ 		return result, err
+ 	}
+diff --git a/internal/domain/backup_pause_migration_test.go b/internal/domain/backup_pause_migration_test.go
+index 40ac90bd..d420f7f3 100644
+--- a/internal/domain/backup_pause_migration_test.go
++++ b/internal/domain/backup_pause_migration_test.go
+@@ -18,6 +18,153 @@ func pauseMigrationTestRelease(t *testing.T) string {
+ 	return root
+ }
+ 
++func pauseMigrationStageTestOptions(t *testing.T) PauseSchemaUpgradeOptions {
++	t.Helper()
++	root := t.TempDir()
++	for _, name := range []string{"source", "key", "backup", "release24", "release25", "stage"} {
++		if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
++			t.Fatal(err)
++		}
++	}
++	u := LocalUpgradeOptions{Plan: PauseSchemaUpgradePlan,
++		Source: filepath.Join(root, "source", "source.sqlite"), KeyFile: filepath.Join(root, "key", "key"),
++		Snapshot: filepath.Join(root, "backup"), SourceRoot: filepath.Join(root, "release24"),
++		TargetRoot: filepath.Join(root, "release25"), Destination: filepath.Join(root, "stage", "rehearsal")}
++	for _, path := range []string{u.Source, u.KeyFile} {
++		if err := os.WriteFile(path, []byte("stage boundary fixture"), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return PauseSchemaUpgradeOptions{Upgrade: u}
++}
++
++func TestPauseMigrationStageIgnoresAmbientTemp(t *testing.T) {
++	for _, mode := range []string{"missing", "empty", "hostile"} {
++		t.Run(mode, func(t *testing.T) {
++			opt := pauseMigrationStageTestOptions(t)
++			parent := filepath.Dir(opt.Upgrade.Destination)
++			hostile := filepath.Join(t.TempDir(), "must-not-exist", "foreign-temp")
++			root := pauseMigrationTestRelease(t)
++			_, sqls, err := pauseMigrationRelease(root, 25)
++			if err != nil {
++				t.Fatal(err)
++			}
++			contracts, err := LoadContracts(filepath.Join(root, "spec/v2.0/contracts"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			for _, key := range []string{"TEMP", "TMP", "TMPDIR"} {
++				t.Setenv(key, "")
++				if mode == "missing" {
++					if err := os.Unsetenv(key); err != nil {
++						t.Fatal(err)
++					}
++				} else if mode == "hostile" {
++					t.Setenv(key, hostile)
++				}
++			}
++			for _, existing := range []bool{false, true} {
++				if existing {
++					if err := os.Mkdir(opt.Upgrade.Destination, 0700); err != nil {
++						t.Fatal(err)
++					}
++				}
++				stage, err := pauseMigrationTemplateStage(opt, parent)
++				if err != nil || filepath.Dir(stage) != parent {
++					t.Fatal("stage escaped explicit destination parent", stage, err)
++				}
++				if err := os.Remove(stage); err != nil {
++					t.Fatal(err)
++				}
++				schemas, err := pauseMigrationTemplate(context.Background(), opt, parent, sqls, contracts)
++				if err != nil || schemas.Source24 == "" || schemas.Original25 == "" || schemas.Restored25 == "" {
++					t.Fatal("full template under explicit parent", schemas, err)
++				}
++				stages, err := filepath.Glob(filepath.Join(parent, ".researchos-backup-stage-*"))
++				if err != nil || len(stages) != 0 {
++					t.Fatal("template stage was not removed", stages, err)
++				}
++			}
++			if _, err := os.Stat(hostile); !os.IsNotExist(err) {
++				t.Fatal("ambient hostile directory was touched", err)
++			}
++		})
++	}
++}
++
++func TestPauseMigrationStageRejectsBeforeFilesystemStaging(t *testing.T) {
++	for _, mutation := range []string{"missing-parent", "relative-parent", "mismatched-parent", "missing-destination", "relative-destination", "query", "fragment", "nonexistent-parent", "parent-is-file", "destination-is-file", "source-overlap", "key-overlap", "backup-overlap", "release-overlap", "ancestor-overlap", "relative-source", "source-fragment", "missing-source"} {
++		t.Run(mutation, func(t *testing.T) {
++			opt := pauseMigrationStageTestOptions(t)
++			parent := filepath.Dir(opt.Upgrade.Destination)
++			root := filepath.Dir(parent)
++			switch mutation {
++			case "missing-parent":
++				parent = ""
++			case "relative-parent":
++				parent = "stage"
++			case "mismatched-parent":
++				parent = root
++			case "missing-destination":
++				opt.Upgrade.Destination = ""
++			case "relative-destination":
++				opt.Upgrade.Destination = filepath.Join("stage", "rehearsal")
++			case "query", "fragment":
++				suffix := "?query"
++				if mutation == "fragment" {
++					suffix = "#fragment"
++				}
++				opt.Upgrade.Destination += suffix
++			case "nonexistent-parent":
++				parent = filepath.Join(root, "missing")
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "parent-is-file":
++				parent = opt.Upgrade.KeyFile
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "destination-is-file":
++				if err := os.WriteFile(opt.Upgrade.Destination, []byte("not a directory"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "source-overlap":
++				parent = filepath.Dir(opt.Upgrade.Source)
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "key-overlap":
++				parent = filepath.Dir(opt.Upgrade.KeyFile)
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "backup-overlap":
++				parent = opt.Upgrade.Snapshot
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "release-overlap":
++				parent = opt.Upgrade.TargetRoot
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "ancestor-overlap":
++				parent = root
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "relative-source":
++				opt.Upgrade.Source = "source.sqlite"
++			case "source-fragment":
++				opt.Upgrade.Source += "#fragment"
++			case "missing-source":
++				opt.Upgrade.Source = filepath.Join(root, "missing.sqlite")
++			}
++			var before []string
++			if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error { before = append(before, path); return err }); err != nil {
++				t.Fatal(err)
++			}
++			if stage, err := pauseMigrationTemplateStage(opt, parent); err == nil || stage != "" {
++				t.Fatal("invalid stage binding accepted", stage, err)
++			}
++			var after []string
++			if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error { after = append(after, path); return err }); err != nil {
++				t.Fatal(err)
++			}
++			if strings.Join(before, "\n") != strings.Join(after, "\n") {
++				t.Fatal("rejected staging mutated filesystem", before, after)
++			}
++		})
++	}
++}
++
+ func pauseMigrationTestDB(t *testing.T) (*sql.DB, []byte, pauseMigrationSchemas) {
+ 	t.Helper()
+ 	db, oldSQL, oldSchemas := preparedUpgradeTestDB(t)
+@@ -46,7 +193,8 @@ func pauseMigrationTestDB(t *testing.T) (*sql.DB, []byte, pauseMigrationSchemas)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	schemas, err := pauseMigrationTemplate(context.Background(), sqls, contracts)
++	stageOpt := pauseMigrationStageTestOptions(t)
++	schemas, err := pauseMigrationTemplate(context.Background(), stageOpt, filepath.Dir(stageOpt.Upgrade.Destination), sqls, contracts)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/domain/backup_pause_migration_windows.go b/internal/domain/backup_pause_migration_windows.go
+index 23af77eb..dd25b3a0 100644
+--- a/internal/domain/backup_pause_migration_windows.go
++++ b/internal/domain/backup_pause_migration_windows.go
+@@ -147,7 +147,7 @@ func ExecutePauseSchemaUpgrade(ctx context.Context, db *sql.DB, token recoveryau
+ 	if err != nil {
+ 		return result, err
+ 	}
+-	schemas, err := pauseMigrationTemplate(ctx, sqls, contracts)
++	schemas, err := pauseMigrationTemplate(ctx, pauseOpt, filepath.Dir(opt.Destination), sqls, contracts)
+ 	if err != nil {
+ 		return result, err
+ 	}
+diff --git a/internal/domain/backup_pause_migration_windows_test.go b/internal/domain/backup_pause_migration_windows_test.go
+index af4c3509..25bdc041 100644
+--- a/internal/domain/backup_pause_migration_windows_test.go
++++ b/internal/domain/backup_pause_migration_windows_test.go
+@@ -172,6 +172,70 @@ func pauseMigrationHandoffFixture(t *testing.T) (PauseSchemaUpgradeOptions, prep
+ 	return opt, before, run
+ }
+ 
++func TestPauseMigrationStageRejectsNativeReparseAliases(t *testing.T) {
++	for _, part := range []string{"parent", "destination", "source", "backup"} {
++		t.Run(part, func(t *testing.T) {
++			opt := pauseMigrationStageTestOptions(t)
++			parent := filepath.Dir(opt.Upgrade.Destination)
++			switch part {
++			case "parent":
++				parent = upgradeJunction(t, parent)
++				opt.Upgrade.Destination = filepath.Join(parent, "rehearsal")
++			case "destination":
++				alias := upgradeJunction(t, opt.Upgrade.Snapshot)
++				opt.Upgrade.Destination, parent = alias, filepath.Dir(alias)
++			case "source":
++				opt.Upgrade.Source = filepath.Join(upgradeJunction(t, filepath.Dir(opt.Upgrade.Source)), filepath.Base(opt.Upgrade.Source))
++			case "backup":
++				opt.Upgrade.Snapshot = upgradeJunction(t, opt.Upgrade.Snapshot)
++			}
++			if stage, err := pauseMigrationTemplateStage(opt, parent); err == nil || stage != "" {
++				t.Fatal("native reparse alias accepted", stage, err)
++			}
++			if err := pauseMigrationPaths(&opt, false); err == nil {
++				t.Fatal("public path normalization erased reparse evidence")
++			}
++		})
++	}
++}
++
++func TestPauseMigrationPublicHandoffUsesBoundStageWithoutAmbientTemp(t *testing.T) {
++	for _, mode := range []string{"missing", "hostile"} {
++		t.Run(mode, func(t *testing.T) {
++			opt, before, _ := pauseMigrationHandoffFixture(t)
++			foreign := filepath.Join(t.TempDir(), "missing", "foreign-temp")
++			for _, key := range []string{"TEMP", "TMP", "TMPDIR"} {
++				t.Setenv(key, foreign)
++				if mode == "missing" {
++					if err := os.Unsetenv(key); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			report, err := UpgradePauseSchemaBackup(context.Background(), opt)
++			if err != nil || report.Status != "RESTORED_RECONCILIATION_REQUIRED" {
++				t.Fatal("actual public handoff depended on ambient temp", report, err)
++			}
++			original, err := store.Open(opt.Upgrade.Source)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer original.Close()
++			after, err := preparedUpgradeSnapshot(original)
++			if err != nil || Hash(before) != Hash(after) {
++				t.Fatal("original changed", err)
++			}
++			if _, err := os.Stat(foreign); !os.IsNotExist(err) {
++				t.Fatal("ambient directory created", err)
++			}
++			stages, err := filepath.Glob(filepath.Join(filepath.Dir(opt.Upgrade.Destination), ".researchos-backup-stage-*"))
++			if err != nil || len(stages) != 0 {
++				t.Fatal("bound staging not cleaned", stages, err)
++			}
++		})
++	}
++}
++
+ func TestPauseMigrationPublicBackupRehearsalPreservesOriginal(t *testing.T) {
+ 	opt, before, run := pauseMigrationHandoffFixture(t)
+ 	u := opt.Upgrade

@@ -1,0 +1,40 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\fresh_main23_root_caller_registration_source_codex\main23root-20261009-03\main23_root.source.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\fresh_main23_root_caller_registration_source_codex\main23root-20261010-04\main23_root.source.py
+@@ -261,9 +261,13 @@
+          and payload["content"][0]["type"] == "input_text" and type(payload["content"][0]["text"]) is str,
+          "ACTUAL_PEER_DELIVERY_REQUIRED")
+     text = payload["content"][0]["text"]
+-    deliveries = [x for x in structured_documents(text) if x.get("schema") == "researchos.main23-peer-review-delivery.v2"]
+-    need(len(deliveries) == 1, "PEER_TYPED_DELIVERY_REQUIRED")
+-    delivered = deliveries[0]
++    envelope = "Message Type: FINAL_ANSWER\nTask name: /root\nSender: " + peer_actor.removeprefix("codex:") + "\nPayload:\n"
++    try:
++        delivered = strict(text[len(envelope):] if text.startswith(envelope) else text)
++    except (ValueError, TypeError):
++        need(False, "PEER_TYPED_DELIVERY_REQUIRED")
++    need(type(delivered) is dict and delivered.get("schema") == "researchos.main23-peer-review-delivery.v2",
++         "PEER_TYPED_DELIVERY_REQUIRED")
+     need(delivered.get("review_author") == peer_actor and delivered.get("root_thread_id") == ROOT_THREAD
+          and delivered.get("operation") == operation and delivered.get("verdict") == "ACCEPTED_SOURCE_ONLY"
+          and delivered.get("formal_acceptance") is False and delivered.get("execution_grant") is False
+@@ -317,7 +321,7 @@
+          and qualification.get("root_thread_id") == ROOT_THREAD and qualification.get("issued_by") == ROOT,
+          "QUALIFIED_RUNTIME_ACTUAL_REVIEW_CHAIN_REQUIRED")
+     payload = doc(qualification["payload_ref"])
+-    projected = {k: v for k, v in qualification.items() if k not in {"payload_ref", "root_issuance_binding_ref", "schema"}}
++    projected = {k: v for k, v in qualification.items() if k not in {"payload_ref", "root_issuance_binding_ref", "schema", "created_utc"}}
+     need(payload.get("schema") == "researchos.root-main23-runtime-qualification-payload.v2"
+          and {k: v for k, v in payload.items() if k != "schema"} == projected, "QUALIFICATION_PAYLOAD_EXACT_BINDING")
+     author = qualification.get("review_author")
+@@ -363,8 +367,9 @@
+     validate_root_capture(root_binding, checked(root_binding["original_capture_ref"]), expected,
+                           "RUNTIME_QUALIFICATION_ISSUANCE")
+     need(when(scope["created_utc"]) <= when(review["reviewed_utc"]) <= received
+-         <= when(root_binding["tool_call_timestamp"]) <= when(root_binding["tool_result_timestamp"])
+-         <= when(qualification["created_utc"]), "RUNTIME_ORIGINAL_REVIEW_ISSUANCE_TIME_ORDER")
++         <= when(qualification["payload_created_utc"]) <= when(root_binding["tool_call_timestamp"])
++         <= when(root_binding["tool_result_timestamp"]) <= when(qualification["created_utc"])
++         <= datetime.now(timezone.utc), "RUNTIME_ORIGINAL_REVIEW_ISSUANCE_TIME_ORDER")
+     refs = [qualification["payload_ref"], qualification["root_issuance_binding_ref"], root_binding["original_capture_ref"],
+             qualification["review_hostpair_binding_ref"], peer_binding["original_capture_ref"], scope_ref,
+             source_ref, source_mf_ref, qualification["caller_ref"], qualification["builder_contract_ref"]] + review_refs

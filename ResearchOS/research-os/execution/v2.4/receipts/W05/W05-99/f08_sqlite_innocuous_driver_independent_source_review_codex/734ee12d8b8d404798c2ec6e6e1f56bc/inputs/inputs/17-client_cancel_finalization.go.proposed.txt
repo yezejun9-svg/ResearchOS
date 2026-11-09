@@ -1,0 +1,404 @@
+package domain
+
+// PREPARATION ONLY. This source is deliberately not installed in the product.
+// Requires the separately reviewed modernc FunctionImpl.Innocuous patch.
+// Request validation and local response validation are implemented below.
+// The full source-derived authority evaluator (proof modes 0..8) is explicitly
+// unfinished and always returns F08_SOURCE_EVALUATOR_NOT_IMPLEMENTED. Installing
+// this candidate with SQL24 would block legitimate F08 writes. It is NOT ready
+// for integration, qualification, migration, or use as completion evidence.
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"math/big"
+	"strings"
+	"unicode/utf8"
+
+	"modernc.org/sqlite"
+	"researchos.local/research-os/internal/canonical"
+)
+
+const f08ProtocolHash = "sha256:8943fe363bcfda4a2c45231e54c266133ffccc8642c541724d93d2e56d3a9a9b"
+const f08ExternalHash = "sha256:b53d9e6eddfeed89d27ee65c378d8067ae8b0c46de2ba2a098856a7557df1c54"
+const f08IdentityFormat = "researchos.f08.cancel-identity/1"
+const f08HeaderSchema = "researchos.private-command-envelope.v1"
+const f08HeaderMaximum = 1398200
+const f08Base64Maximum = 1398104
+const f08EnvelopeMaximum = 1048576
+
+// Values are fixed non-secret codes. Never concatenate argument values, schema
+// diagnostics, recovered panic text, or arbitrary function-context data.
+type f08Error string
+
+func (e f08Error) Error() string { return string(e) }
+
+const (
+	f08Arguments = f08Error("F08_ARGUMENT_TYPE_OR_ARITY")
+	f08JSON = f08Error("F08_STRICT_JSON")
+	f08Shape = f08Error("F08_CLOSED_SHAPE")
+	f08Schema = f08Error("F08_FROZEN_SCHEMA")
+	f08Binding = f08Error("F08_ORIGINAL_BINDING")
+	f08Header = f08Error("F08_PRIVATE_HEADER")
+	f08Mode = f08Error("F08_MODE")
+	f08Panic = f08Error("F08_CALLBACK_INTERNAL_PANIC")
+	f08StorageClass = f08Error("F08_STORAGE_CLASS")
+	f08Unimplemented = f08Error("F08_SOURCE_EVALUATOR_NOT_IMPLEMENTED")
+)
+
+type f08Scalar func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error)
+
+// The private schema is captured by the three closures. It is not exported or
+// installed into backupConfigurationSchemaDoc or any Host/Service/cache.
+// This initializer is a candidate, not an assertion that registration was run.
+func init() {
+	functions, err := f08BuildCallbacks(backupConfigurationProtocol, backupConfigurationDomain)
+	if err != nil {
+		panic("F08_SCHEMA_INITIALIZATION_FAILED")
+	}
+	for _, registration := range []struct {
+		name string
+		arity int32
+		call f08Scalar
+	}{
+		{"researchos_f08_cancel_request_v1", 2, functions[0]},
+		{"researchos_f08_cancel_response_v1", 5, functions[1]},
+		{"researchos_f08_proof_v1", 2, functions[2]},
+	} {
+		if err := sqlite.RegisterFunction(registration.name, &sqlite.FunctionImpl{
+			NArgs: registration.arity,
+			Deterministic: true,
+			Innocuous: true, // DOES NOT COMPILE against the unpatched pinned driver.
+			Scalar: registration.call,
+			VolatileArgs: false,
+		}); err != nil {
+			panic("F08_FUNCTION_REGISTRATION_FAILED")
+		}
+	}
+}
+
+func f08BuildCallbacks(protocol, external []byte) ([3]f08Scalar, error) {
+	var zero [3]f08Scalar
+	p, e := bytes.Clone(protocol), bytes.Clone(external)
+	if f08RawHash(p) != f08ProtocolHash || f08RawHash(e) != f08ExternalHash {
+		return zero, f08Schema
+	}
+	doc, err := LoadSchemaWithExternals(p, map[string][]byte{"domain.schema.json": e})
+	if err != nil {
+		return zero, f08Schema
+	}
+	return [3]f08Scalar{
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 2 { return nil, f08Arguments }
+			header, err := f08Blob(args[0]); if err != nil { return nil, err }
+			identity, err := f08Blob(args[1]); if err != nil { return nil, err }
+			if _, err = f08Request(doc, header, identity); err != nil { return nil, err }
+			return int64(1), nil
+		}),
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 5 { return nil, f08Arguments }
+			header, err := f08Blob(args[0]); if err != nil { return nil, err }
+			binding, err := f08Blob(args[1]); if err != nil { return nil, err }
+			var old []byte
+			if args[2] != nil { old, err = f08Blob(args[2]); if err != nil { return nil, err } }
+			current, err := f08Blob(args[3]); if err != nil { return nil, err }
+			mode, ok := args[4].(int64); if !ok { return nil, f08Arguments }
+			if err = f08Response(doc, header, binding, old, current, mode); err != nil { return nil, err }
+			return int64(1), nil
+		}),
+		f08Boundary(func(args []driver.Value) (driver.Value, error) {
+			if len(args) != 2 { return nil, f08Arguments }
+			mode, ok := args[0].(int64); if !ok { return nil, f08Arguments }
+			input, err := f08Blob(args[1]); if err != nil { return nil, err }
+			switch mode {
+			case -2:
+				// This mode accepts any BLOB bytes, including empty/NUL/non-UTF8.
+				// Its digest has no authority to authorize a database mutation.
+				return f08RawHash(input), nil
+			case -1:
+				_, canonicalBytes, err := f08Strict(input)
+				if err != nil { return nil, err }
+				return f08RawHash(canonicalBytes), nil
+			case 9:
+				// SQL view's type-violation branch is unconditional refusal.
+				return nil, f08StorageClass
+			case 0, 1, 2, 3, 4, 5, 6, 7, 8:
+				if err := f08ProofFrame(mode, input); err != nil { return nil, err }
+				// No success/derived document is emitted from structural checks.
+				// Missing R1/R2/source authority logic is visible, never a TODO
+				// returning true or an arbitrary caller-supplied digest oracle.
+				return nil, f08Unimplemented
+			default:
+				return nil, f08Mode
+			}
+		}),
+	}, nil
+}
+
+// No FunctionContext, SQL argument, or input-derived closure survives a call.
+// Recoverable programmer/parser panic becomes a fixed error, never SQL NULL
+// with nil error. Go fatal OOM/stack exhaustion is not claimed recoverable.
+func f08Boundary(call func([]driver.Value) (driver.Value, error)) f08Scalar {
+	return func(_ *sqlite.FunctionContext, args []driver.Value) (result driver.Value, err error) {
+		defer func() {
+			if recover() != nil { result, err = nil, f08Panic }
+		}()
+		result, err = call(args)
+		if err != nil { return nil, err }
+		if result == nil { return nil, f08Panic }
+		return result, nil
+	}
+}
+
+func f08Blob(value driver.Value) ([]byte, error) {
+	b, ok := value.([]byte)
+	if !ok || b == nil { return nil, f08Arguments }
+	return b, nil
+}
+
+func f08RawHash(raw []byte) string {
+	h := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+// Strict validation precedes map/struct parsing. Preserve the original numeric
+// lexemes with UseNumber and compare values to canonical output before hashing.
+// There is no response/witness byte ceiling invented here. Future qualification
+// must measure existing parser/number-library resource behaviour explicitly.
+func f08Strict(raw []byte) (any, []byte, error) {
+	if !utf8.Valid(raw) || len(raw) == 0 { return nil, nil, f08JSON }
+	c, err := canonical.JSON(raw)
+	if err != nil { return nil, nil, f08JSON }
+	decode := func(b []byte) (any, error) {
+		d := json.NewDecoder(bytes.NewReader(b)); d.UseNumber()
+		var v any
+		if err := d.Decode(&v); err != nil { return nil, f08JSON }
+		var trailing any
+		if err := d.Decode(&trailing); !errors.Is(err, io.EOF) { return nil, f08JSON }
+		return v, nil
+	}
+	v, err := decode(raw); if err != nil { return nil, nil, err }
+	w, err := decode(c); if err != nil || !sameNumbers(v, w) { return nil, nil, f08JSON }
+	return v, c, nil
+}
+
+func f08Object(v any, keys ...string) (map[string]any, error) {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != len(keys) { return nil, f08Shape }
+	for _, key := range keys { if _, ok := m[key]; !ok { return nil, f08Shape } }
+	return m, nil
+}
+
+func f08String(v any) (string, error) {
+	s, ok := v.(string)
+	if !ok || s == "" || !utf8.ValidString(s) { return "", f08Shape }
+	return s, nil
+}
+
+func f08Integer(v any, minimum int64) (int64, error) {
+	n, ok := v.(json.Number)
+	if !ok { return 0, f08Shape }
+	r, ok := new(big.Rat).SetString(string(n))
+	if !ok || !r.IsInt() || !r.Num().IsInt64() { return 0, f08Shape }
+	i := r.Num().Int64()
+	if i < minimum { return 0, f08Shape }
+	return i, nil
+}
+
+func f08HashString(v any) (string, error) {
+	s, err := f08String(v)
+	if err != nil || len(s) != 71 || !strings.HasPrefix(s, "sha256:") { return "", f08Shape }
+	b, err := hex.DecodeString(s[7:])
+	if err != nil || len(b) != 32 || hex.EncodeToString(b) != s[7:] { return "", f08Shape }
+	return s, nil
+}
+
+func f08Encode(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil { return nil, f08JSON }
+	return b, nil
+}
+
+func f08ValueHash(v any) (string, error) {
+	b, err := f08Encode(v); if err != nil { return "", err }
+	_, c, err := f08Strict(b); if err != nil { return "", err }
+	return f08RawHash(c), nil
+}
+
+type f08CancelRequest struct {
+	envelope *Envelope
+	identity map[string]any
+	command string
+	project string
+	session string
+	client string
+	target string
+	principal string
+	requestHash string
+	headerDigest string
+	revision int64
+	epoch int64
+}
+
+// f08Request is not authentication. The immutable SQL row producer supplies
+// principal; this function checks the exact original tuple, never caller role.
+func f08Request(doc *SchemaDoc, header, identityRaw []byte) (f08CancelRequest, error) {
+	var zero f08CancelRequest
+	if doc == nil || len(header) == 0 || len(header) > f08HeaderMaximum { return zero, f08Header }
+	v, _, err := f08Strict(header); if err != nil { return zero, err }
+	h, err := f08Object(v, "schema", "encoding", "raw_envelope_base64"); if err != nil { return zero, err }
+	encoded, ok := h["raw_envelope_base64"].(string)
+	if !ok || h["schema"] != f08HeaderSchema || h["encoding"] != "base64" || len(encoded) > f08Base64Maximum { return zero, f08Header }
+	stored, err := json.Marshal(struct {
+		Schema string `json:"schema"`
+		Encoding string `json:"encoding"`
+		Raw string `json:"raw_envelope_base64"`
+	}{f08HeaderSchema, "base64", encoded})
+	if err != nil || !bytes.Equal(stored, header) { return zero, f08Header }
+	raw, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(raw) == 0 || len(raw) > f08EnvelopeMaximum || base64.StdEncoding.EncodeToString(raw) != encoded { return zero, f08Header }
+	v, _, err = f08Strict(raw); if err != nil { return zero, err }
+	em, err := f08Object(v, "protocol_version", "command_id", "client_id", "project_id", "session_id", "expected_revision", "writer_epoch", "method", "payload")
+	if err != nil { return zero, err }
+	if em["protocol_version"] != ProtocolV2 || em["method"] != "session.control" { return zero, f08Binding }
+	if err = doc.ValidateDefInput("CommandEnvelope", v); err != nil { return zero, f08Schema }
+	payload, err := f08Object(em["payload"], "action", "target_id", "reason"); if err != nil { return zero, err }
+	if payload["action"] != "CANCEL" { return zero, f08Binding }
+	if err = doc.ValidateDefInput("ControlPayload", payload); err != nil { return zero, f08Schema }
+	// Restrict method before DecodeEnvelope so unrelated host configuration or
+	// method-specific branches cannot enter the callback's reachable graph.
+	env, err := DecodeEnvelope(raw); if err != nil { return zero, f08Schema }
+	q, err := env.ContentHash(); if err != nil { return zero, f08Binding }
+	iv, _, err := f08Strict(identityRaw); if err != nil { return zero, err }
+	im, err := f08Object(iv, "format", "principal", "project", "operation", "key", "request_hash", "command_id", "method", "client_id", "session_id", "writer_epoch", "expected_revision", "target_id")
+	if err != nil { return zero, err }
+	if im["format"] != f08IdentityFormat || im["method"] != "session.control" || im["operation"] != "v2:session.control" || im["request_hash"] != q { return zero, f08Binding }
+	for _, field := range []string{"format", "principal", "project", "operation", "key", "request_hash", "command_id", "method", "client_id", "session_id", "target_id"} {
+		if _, err = f08String(im[field]); err != nil { return zero, err }
+	}
+	for ik, ek := range map[string]string{"project":"project_id", "command_id":"command_id", "client_id":"client_id", "session_id":"session_id", "method":"method"} {
+		if im[ik] != em[ek] { return zero, f08Binding }
+	}
+	if im["key"] != im["command_id"] || im["target_id"] != payload["target_id"] { return zero, f08Binding }
+	revision, err := f08Integer(em["expected_revision"], 1); if err != nil { return zero, err }
+	epoch, err := f08Integer(em["writer_epoch"], 1); if err != nil { return zero, err }
+	ir, err := f08Integer(im["expected_revision"], 1); if err != nil || ir != revision { return zero, f08Binding }
+	ie, err := f08Integer(im["writer_epoch"], 1); if err != nil || ie != epoch { return zero, f08Binding }
+	return f08CancelRequest{env, im, im["command_id"].(string), im["project"].(string), im["session_id"].(string), im["client_id"].(string), im["target_id"].(string), im["principal"].(string), q, f08RawHash(header), revision, epoch}, nil
+}
+
+type f08ValidatedResponse struct {
+	revision int64
+	result map[string]any
+	snapshot map[string]any
+	eventSequence int64
+}
+
+func f08ResponseBody(doc *SchemaDoc, req f08CancelRequest, raw []byte, status string) (f08ValidatedResponse, error) {
+	var zero f08ValidatedResponse
+	v, _, err := f08Strict(raw); if err != nil { return zero, err }
+	m, err := f08Object(v, "protocol_version", "command_id", "method", "status", "session_id", "revision", "error_code", "error", "result")
+	if err != nil { return zero, err }
+	if m["protocol_version"] != ProtocolV2 || m["command_id"] != req.command || m["method"] != "session.control" || m["status"] != status || m["session_id"] != req.session || m["error"] != nil || m["error_code"] != nil { return zero, f08Binding }
+	if err = doc.ValidateDef("CommandResponse", v); err != nil { return zero, f08Schema }
+	parsed, err := DecodeResponse(raw); if err != nil { return zero, f08Schema }
+	if err = ValidateResultAgainstMethod("session.control", parsed, doc); err != nil { return zero, f08Schema }
+	rev, err := f08Integer(m["revision"], req.revision); if err != nil { return zero, err }
+	result, ok := m["result"].(map[string]any); if !ok { return zero, f08Shape }
+	if status == "ACKNOWLEDGED" {
+		if err = doc.ValidateDef("PendingResult", result); err != nil { return zero, f08Schema }
+		if result["operation_id"] != "op-"+req.command { return zero, f08Binding }
+		sequence, err := f08Integer(result["after_sequence"], 0); if err != nil { return zero, err }
+		return f08ValidatedResponse{revision: rev, result: result, eventSequence: sequence}, nil
+	}
+	if status != "COMPLETED" { return zero, f08Mode }
+	if err = doc.ValidateDef("ControlResult", result); err != nil { return zero, f08Schema }
+	if result["action"] != "CANCEL" || result["target_id"] != req.target || result["control_request_id"] != "ctrl-"+req.command || result["settled"] != true || result["children_stopped"] != true || result["queue_empty"] != true { return zero, f08Binding }
+	snapshot, ok := result["snapshot"].(map[string]any); if !ok { return zero, f08Shape }
+	if err = doc.ValidateDef("SessionSnapshot", snapshot); err != nil { return zero, f08Schema }
+	if snapshot["session_id"] != req.session || snapshot["project_id"] != req.project || snapshot["protocol_version"] != ProtocolV2 { return zero, f08Binding }
+	sr, err := f08Integer(snapshot["revision"], 1); if err != nil || sr != rev { return zero, f08Binding }
+	sequence, err := f08Integer(snapshot["event_sequence"], 0); if err != nil { return zero, err }
+	pending, ok := snapshot["pending_command_ids"].([]any); if !ok { return zero, f08Shape }
+	for _, id := range pending { if id == req.command { return zero, f08Binding } }
+	return f08ValidatedResponse{rev, result, snapshot, sequence}, nil
+}
+
+// This validates local wire bindings. It cannot establish that response_proof
+// originated in real SQL source rows: proof modes 0/1/5/6 must recompute those
+// rows and preserve every other pending command before calling this helper.
+// Until that evaluator exists, this helper's success NEVER grants an UPDATE.
+func f08Response(doc *SchemaDoc, header, binding, old, current []byte, mode int64) error {
+	if mode < 0 || mode > 2 { return f08Mode }
+	if (mode == 2) != (old != nil) { return f08Arguments }
+	v, _, err := f08Strict(binding); if err != nil { return err }
+	m, err := f08Object(v, "identity", "response_proof"); if err != nil { return err }
+	identity, err := f08Encode(m["identity"]); if err != nil { return err }
+	req, err := f08Request(doc, header, identity); if err != nil { return err }
+	proof, err := f08Object(m["response_proof"], "admitted_root_hash", "original_response_digest", "final_root_hash", "final_response_digest", "final_snapshot_binding")
+	if err != nil { return err }
+	if _, err = f08HashString(proof["admitted_root_hash"]); err != nil { return err }
+	originalDigest, err := f08HashString(proof["original_response_digest"]); if err != nil { return err }
+	if mode == 0 {
+		if proof["final_root_hash"] != nil || proof["final_response_digest"] != nil || proof["final_snapshot_binding"] != nil || originalDigest != f08RawHash(current) { return f08Binding }
+		_, err = f08ResponseBody(doc, req, current, "ACKNOWLEDGED")
+		return err
+	}
+	if _, err = f08HashString(proof["final_root_hash"]); err != nil { return err }
+	finalDigest, err := f08HashString(proof["final_response_digest"]); if err != nil || finalDigest != f08RawHash(current) { return f08Binding }
+	response, err := f08ResponseBody(doc, req, current, "COMPLETED"); if err != nil { return err }
+	if mode == 1 {
+		if originalDigest != finalDigest { return f08Binding }
+	} else {
+		if originalDigest != f08RawHash(old) || bytes.Equal(old, current) { return f08Binding }
+		prior, err := f08ResponseBody(doc, req, old, "ACKNOWLEDGED"); if err != nil { return err }
+		if response.revision < prior.revision || response.eventSequence < prior.eventSequence { return f08Binding }
+	}
+	sb, err := f08Object(proof["final_snapshot_binding"], "session_id", "project_id", "revision", "event_sequence", "pending_command_ids_digest")
+	if err != nil { return err }
+	if sb["session_id"] != req.session || sb["project_id"] != req.project { return f08Binding }
+	sr, err := f08Integer(sb["revision"], 1); if err != nil || sr != response.revision { return f08Binding }
+	es, err := f08Integer(sb["event_sequence"], 0); if err != nil || es != response.eventSequence { return f08Binding }
+	digest, err := f08ValueHash(response.snapshot["pending_command_ids"]); if err != nil { return err }
+	if sb["pending_command_ids_digest"] != digest { return f08Binding }
+	return nil
+}
+
+// Structural precondition only. This does not turn an arbitrary source bundle
+// into authority. Complete mode-specific evaluation is still missing; see the
+// explicit refusal in f08BuildCallbacks and mode-implementation-matrix.json.
+func f08ProofFrame(mode int64, raw []byte) error {
+	v, _, err := f08Strict(raw); if err != nil { return err }
+	m, err := f08Object(v, "action", "row", "old", "sources"); if err != nil { return err }
+	action, err := f08String(m["action"]); if err != nil { return err }
+	allowed := false
+	switch mode {
+	case 0: allowed = action == "admitted.insert"
+	case 1: allowed = action == "final.insert"
+	case 2: allowed = action == "origin.insert"
+	case 3: allowed = false // No mode3 action literal exists in the frozen SQL; caller contract must be supplied.
+	case 4: allowed = action == "dispatch.update"
+	case 5: allowed = action == "journal.insert" || action == "journal.update" || action == "commit.insert"
+	case 6: allowed = action == "control.insert" || action == "control.update"
+	case 7: allowed = action == "admitted_member.insert" || action == "final_member.insert" || action == "pin.insert"
+	case 8: allowed = action == "origin.derive"
+	}
+	if !allowed { return f08Mode }
+	row, ok := m["row"].([]any); if !ok || len(row) == 0 { return f08Shape }
+	if strings.HasSuffix(action, ".update") {
+		old, ok := m["old"].([]any); if !ok || len(old) != len(row) { return f08Shape }
+	} else if m["old"] != nil { return f08Shape }
+	sources, ok := m["sources"].([]any); if !ok { return f08Shape }
+	for _, item := range sources {
+		tuple, ok := item.([]any); if !ok || len(tuple) != 2 { return f08Shape }
+		if _, err := f08String(tuple[0]); err != nil { return err }
+		columns, ok := tuple[1].([]any); if !ok || len(columns) == 0 { return f08Shape }
+	}
+	return nil
+}

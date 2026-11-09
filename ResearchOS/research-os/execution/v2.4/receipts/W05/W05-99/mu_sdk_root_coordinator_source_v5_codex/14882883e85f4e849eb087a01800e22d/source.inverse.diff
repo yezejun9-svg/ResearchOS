@@ -1,0 +1,144 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\mu_sdk_root_coordinator_source_v5_codex\14882883e85f4e849eb087a01800e22d\root_coordinator.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\mu_sdk_root_coordinator_source_v4_codex\934c2f06dc1946e5aa7d5e04589dfdd2\root_coordinator.py
+@@ -27,7 +27,6 @@
+ INITIAL_COMPONENT_REVIEW = {'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\actual_cli_bootstrap_v3_component_independent_review_codex\\d391a2e49cf24d559e7d58016b8eb41e\\review.json', 'sha256': 'ce0691c2776d2ab6e95e19a019bb2f424c15b5aafc3b9ff2f20907cfda43cec4', 'bytes': 3194}
+ CURRENT_HELPER_SOURCE_REVIEW = {'path': 'D:/作品集/ResearchOS/research-os/execution/v2.4/receipts/W05/W05-99/mu_sdk_trusted_host_v4_delta_review_codex/3874b7621ecbe249b42144ded9b65406/review.json', 'sha256': '06f6c01a597c877b915443433323460b55093ae2194960f545f3cab55140127a', 'bytes': 4546}
+ CURRENT_HELPER_COMPILE = {'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\integration_codex\\trusted-host-v4-build-staged-root-69e7c3008fd968419f4d4072c3c8\\compile.closed.json', 'sha256': 'd35e59bfc79bb724891754a2461a7ecfc62aaaf72ed73f9cc796d7b2f84837cb', 'bytes': 1741}
+-STAGED_CALLER_SOURCE = {'path': 'D:\\作品集\\ResearchOS\\research-os\\execution\\v2.4\\receipts\\W05\\W05-99\\integration_codex\\staged-runtime-prepare-root-59ef355458e14c0082ae8f82d98\\continue_existing_cli.actual_owned.py', 'sha256': 'c9f6e743c8f861cd6c2bf730e887481e1ec3e0dcc2ac8a4b2b9b7222eec07a68', 'bytes': 15973}
+ ENV_KEYS = {'SystemRoot', 'WINDIR', 'PATH', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP'}
+ 
+ def require(ok, text):
+@@ -115,47 +114,17 @@
+     for key in ('discovery_file', 'cli_config_file'):
+         require(data in Path(result[key]).parents, 'bootstrap consumed path outside data root')
+ 
+-def same_absolute_path(actual, expected):
+-    if type(actual) is not str or type(expected) is not str or '\x00' in actual + expected:
+-        return False
+-    a, b = Path(actual), Path(expected)
+-    return a.is_absolute() and b.is_absolute() and '..' not in a.parts and '..' not in b.parts and a == b
+-
+-def exact_argv(actual, expected, path_positions):
+-    return (type(actual) is list and len(actual) == len(expected) and
+-            all(same_absolute_path(a, b) if i in path_positions else type(a) is str and a == b
+-                for i, (a, b) in enumerate(zip(actual, expected))))
+-
+-def validate_staged_closure(closure, label, invocation_ref, before_resume, invocation, owner_pid, expected_exit):
++def validate_staged_closure(closure, label, invocation_ref, before_resume):
+     require(closure.get('schema') == 'researchos.staged-native-owned-closure.v1' and closure.get('label') == label and closure.get('invocation_ref') == invocation_ref and closure.get('closed') is True, 'staged invocation closure binding differs')
+     identity = closure.get('identity')
+-    require(type(owner_pid) is int and owner_pid > 0 and type(identity) is dict and all(type(identity.get(k)) is int and identity[k] > 0 for k in ('owner_pid', 'runner_pid', 'creation_time_100ns')) and all(type(identity.get(k)) is str and identity[k] for k in ('run_uuid', 'job_binding_id')), 'staged original held identity is incomplete')
+-    require(identity['owner_pid'] == owner_pid and all(identity.get(k) is True for k in ('captured_before_resume', 'held_job_handle', 'held_primary_handle')), 'staged Job does not belong to the original lifecycle parent')
+-    require(type(before_resume) is dict and before_resume.get('assigned_before_resume') is True and before_resume.get('resumed') is False and json.dumps(before_resume.get('identity'), sort_keys=True) == json.dumps(identity, sort_keys=True), 'staged original before-resume capture differs')
+-    result = invocation.get('result')
+-    require(type(expected_exit) is int and native_closed(result) and result.get('error') is None and type(result.get('actual_exit')) is int and result['actual_exit'] == expected_exit and result.get('timed_out') is False and result.get('resumed') is True and invocation.get('error') is None and type(invocation.get('actual_native_exit')) is int and invocation['actual_native_exit'] == expected_exit, 'staged owned native completion differs')
+-    require(type(result.get('owned_child_pid')) is int and result['owned_child_pid'] == identity['runner_pid'] and type(result.get('creation_time_100ns')) is int and result['creation_time_100ns'] == identity['creation_time_100ns'], 'staged invocation process identity differs')
++    require(type(identity) is dict and all(type(identity.get(k)) is int and identity[k] > 0 for k in ('owner_pid', 'runner_pid', 'creation_time_100ns')) and all(type(identity.get(k)) is str and identity[k] for k in ('run_uuid', 'job_binding_id')), 'staged original held identity is incomplete')
++    require(type(before_resume) is dict and json.dumps(before_resume.get('identity'), sort_keys=True) == json.dumps(identity, sort_keys=True), 'staged closure identity differs from original before-resume record')
+     start, end = closure.get('observed_monotonic_start'), closure.get('observed_monotonic_end')
+     require(type(start) in (int, float) and type(end) in (int, float) and math.isfinite(start) and math.isfinite(end), 'staged closure original timing missing')
+-    proof = closure.get('actual_fresh_cleanup')
+-    require(matching_idle_proof(proof, identity, start, end) and type(proof.get('primary_exit_code')) is int and proof['primary_exit_code'] == expected_exit, 'staged closure held identity or original fresh idle proof differs')
++    require(matching_idle_proof(closure.get('actual_fresh_cleanup'), closure.get('identity'), start, end), 'staged closure held identity or original fresh idle proof differs')
+     watchdog, producer = closure.get('watchdog_cleanup'), closure.get('duplicate_producer_cleanup')
+-    deadline = before_resume.get('actual_deadline_monotonic')
+-    require(type(deadline) in (int, float) and math.isfinite(deadline) and type(watchdog) is dict and type(watchdog.get('deadline_monotonic')) in (int, float) and watchdog['deadline_monotonic'] == deadline and watchdog.get('duplicate_handle_closed') is True and watchdog.get('errors') == [], 'staged watchdog duplicate remains open or differs')
+-    require(type(producer) is dict and all(producer.get(k) is True for k in ('closed', 'job_handle_closed', 'primary_handle_closed')) and producer.get('errors') == [] and producer.get('run_uuid') == identity['run_uuid'] and type(producer.get('owner_pid')) is int and producer['owner_pid'] == owner_pid, 'staged producer duplicate remains open or differs')
+-
+-def validate_bootstrap_jobs(lifecycle, closures, invocations, before_resume):
+-    labels = {'runtime-prepare', 'normal-host', 'cli-goal', 'finalize-prepare'}
+-    require(set(closures) == set(invocations) == set(before_resume) == labels, 'exact four original owned-job chains required')
+-    jobs = lifecycle.get('jobs')
+-    require(type(jobs) is list and len(jobs) == 2 and {j.get('label') for j in jobs} == {'normal-host', 'cli-goal'}, 'exact original continuation Jobs required')
+-    for job in jobs:
+-        require(json.dumps(job, sort_keys=True) == json.dumps(closures[job['label']], sort_keys=True), 'continuation Job differs from pinned original closure')
+-    stop = lifecycle.get('host_stop')
+-    require(type(stop) is dict and stop.get('planned_pre_trial_host_teardown') is True and stop.get('actual_TerminateJobObject_return') is True and type(stop.get('requested_exit_code')) is int and stop['requested_exit_code'] == 0xE0000508, 'actual planned normal Host teardown required')
+-    for label in sorted(labels):
+-        closure = closures[label]
+-        validate_staged_closure(closure, label, closure['invocation_ref'], before_resume[label], invocations[label], lifecycle.get('actual_parent_pid'), 0xE0000508 if label == 'normal-host' else 0)
++    require(type(watchdog) is dict and watchdog.get('duplicate_handle_closed') is True and watchdog.get('errors') == [], 'staged watchdog duplicate remains open')
++    require(type(producer) is dict and producer.get('closed') is True and producer.get('errors') == [], 'staged producer duplicate remains open')
+ 
+ def validate_staged_preparation(seed, prepared, runtime, bootstrap, doc, binary, runtime_invocation, finalize_invocation):
+     require(seed.get('draft_goal_id') == '', 'staged seed must precede the ordinary CLI draft')
+@@ -167,12 +136,10 @@
+         require(all(type(obj.get(k)) is int and obj[k] == v for k, v in fields.items()), 'staged preparation business counts differ')
+     for receipt, phase, status, ref_key, invocation in ((runtime, 'prepare-runtime', 'RUNTIME_READY', 'runtime_prepare_receipt_ref', runtime_invocation), (prepared, 'finalize-prepare', 'PREPARED', 'prepare_receipt_ref', finalize_invocation)):
+         require(receipt.get('schema') == 'researchos.trusted-qualification-host.v1' and receipt.get('phase') == phase and receipt.get('status') == status and receipt.get('source_seed_sha256') == doc['host_seed_ref']['sha256'] and type(receipt.get('provider_requests')) is int and receipt['provider_requests'] == 0, 'actual staged receipt differs')
+-        argv = [binary['path'], '-phase', phase, '-seed', doc['host_seed_ref']['path']]
++        argv = [binary['path'], '-phase', phase, '-seed', doc['host_seed_ref']['path'], '-receipt', doc[ref_key]['path']]
+         if phase == 'finalize-prepare':
+             argv.extend(['-draft-goal-id', bootstrap['goal_id']])
+-        argv.extend(['-receipt', doc[ref_key]['path']])
+-        path_positions = {0, 4, 8 if phase == 'finalize-prepare' else 6}
+-        require(exact_argv(invocation.get('argv'), argv, path_positions) and same_absolute_path(invocation.get('cwd'), str(ROOT)), 'staged owned invocation differs')
++        require(invocation.get('argv') == argv and Path(invocation.get('cwd', '')) == ROOT, 'staged owned invocation differs')
+         result = invocation.get('result')
+         require(native_closed(result) and result.get('error') is None and type(result.get('actual_exit')) is int and result['actual_exit'] == 0 and result.get('timed_out') is False and invocation.get('error') is None, 'staged owned invocation did not close successfully')
+ 
+@@ -206,26 +173,6 @@
+         ref = self.fixed[key]
+         return load_module(ref, self.source_guard.get_buffer(ref['path']))
+ 
+-    def _load_bootstrap_job_chain(self):
+-        # Only public pinned records; original producer handles are already closed.
+-        require(self.input['staged_caller_source_ref'] == STAGED_CALLER_SOURCE, 'actual staged caller Source pin differs')
+-        refs = [self.input['staged_caller_source_ref']]
+-        pinned(refs[0])
+-        keys = {'runtime-prepare': 'runtime_prepare_closure_ref', 'normal-host': 'normal_host_closure_ref', 'cli-goal': 'cli_goal_closure_ref', 'finalize-prepare': 'finalize_prepare_closure_ref'}
+-        closures, invocations, before = {}, {}, {}
+-        for label, key in keys.items():
+-            closure_ref = self.input[key]
+-            closure = read_json(closure_ref)
+-            invocation_ref, before_ref = closure['invocation_ref'], closure['before_resume_ref']
+-            refs.extend([closure_ref, invocation_ref, before_ref])
+-            closures[label] = closure
+-            invocations[label] = read_json(invocation_ref)
+-            before[label] = read_json(before_ref)
+-        lifecycle = read_json(self.input['bootstrap_lifecycle_ref'])
+-        require(lifecycle.get('prepare_closed_refs') == [self.input['runtime_prepare_closure_ref'], self.input['finalize_prepare_closure_ref']], 'bootstrap continuation omitted preparation closures')
+-        validate_bootstrap_jobs(lifecycle, closures, invocations, before)
+-        return refs
+-
+     def open(self):
+         doc = read_json(self.input_ref)
+         review = read_json(self.review_ref)
+@@ -243,7 +190,6 @@
+         initial_snapshot = read_json(initial_handoff['partial_bootstrap_snapshot_ref'])
+         self.bootstrap_refs = [doc[k] for k in ('bootstrap_result_ref', 'bootstrap_lifecycle_ref', 'bootstrap_guard_cleanup_ref', 'initial_cli_init_component_review_ref')] + [initial_review['source_handoff_ref'], initial_handoff['partial_bootstrap_snapshot_ref']]
+         validate_bootstrap(self.bootstrap, read_json(doc['bootstrap_lifecycle_ref']), read_json(doc['bootstrap_guard_cleanup_ref']), initial_review, initial_snapshot)
+-        self.bootstrap_job_refs = self._load_bootstrap_job_chain()
+         self.env = closed_environment(doc['public_environment'])
+         self.output = Path(doc['output_dir'])
+         require(self.output.is_absolute() and not self.output.exists() and self.output.parent.is_dir() and ROOT / 'execution/v2.4/receipts/W05/W05-99' in self.output.parents, 'fresh owned output directory required')
+@@ -266,12 +212,11 @@
+             pinned(ref)
+         require(Path(sys.executable) == Path(self.fixed['python_binary']['path']), 'Root parent interpreter differs from fixed Python')
+         self.guard_module = load_module(self.fixed['source_guard'], pinned(self.fixed['source_guard']))
+-        refs = list(self.fixed.values()) + [self.input_ref, self.review_ref, doc['coordinator_source_ref'], doc['fixed_pins_ref']] + self.bootstrap_refs + self.bootstrap_job_refs + self.helper_refs
++        refs = list(self.fixed.values()) + [self.input_ref, self.review_ref, doc['coordinator_source_ref'], doc['fixed_pins_ref']] + self.bootstrap_refs + self.helper_refs
+         self.source_guard = self._guard(refs)
+         self.input = json.loads(self.source_guard.get_buffer(self.input_ref['path']))
+         self.bootstrap = json.loads(self.source_guard.get_buffer(doc['bootstrap_result_ref']['path']))
+         validate_bootstrap(self.bootstrap, json.loads(self.source_guard.get_buffer(doc['bootstrap_lifecycle_ref']['path'])), json.loads(self.source_guard.get_buffer(doc['bootstrap_guard_cleanup_ref']['path'])), json.loads(self.source_guard.get_buffer(doc['initial_cli_init_component_review_ref']['path'])), json.loads(self.source_guard.get_buffer(initial_handoff['partial_bootstrap_snapshot_ref']['path'])))
+-        self._load_bootstrap_job_chain()
+         self.controller = self._module('controller')
+         self.c7_owner = self.controller.get_resident_source_owner()
+         self.hooks = self._module('hooks')
+@@ -352,9 +297,13 @@
+         self.prepared = read_json(self.input['prepare_receipt_ref'])
+         runtime = read_json(self.input['runtime_prepare_receipt_ref'])
+         validate_staged_preparation(seed, self.prepared, runtime, self.bootstrap, self.input, self.fixed['trusted_host_binary'], read_json(self.input['runtime_prepare_invocation_ref']), read_json(self.input['finalize_prepare_invocation_ref']))
++        lifecycle = read_json(self.input['bootstrap_lifecycle_ref'])
++        closure_refs = [self.input['runtime_prepare_closure_ref'], self.input['finalize_prepare_closure_ref']]
++        require(lifecycle.get('prepare_closed_refs') == closure_refs, 'bootstrap continuation omitted the staged preparation closures')
+         for label, closure_key, invocation_key in (('runtime-prepare', 'runtime_prepare_closure_ref', 'runtime_prepare_invocation_ref'), ('finalize-prepare', 'finalize_prepare_closure_ref', 'finalize_prepare_invocation_ref')):
+-            require(read_json(self.input[closure_key])['invocation_ref'] == self.input[invocation_key], 'preparation receipt invocation differs from original closure')
+-        self._load_bootstrap_job_chain()
++            closure = read_json(self.input[closure_key])
++            self._guard([closure['before_resume_ref']])
++            validate_staged_closure(closure, label, self.input[invocation_key], read_json(closure['before_resume_ref']))
+         # Export the exact sealed uploaded_content bytes. A profile template is insufficient.
+         with self._read_db() as db:
+             rows = db.execute("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?", (self.bootstrap['project_id'], self.prepared['profile_artifact_id'])).fetchall()

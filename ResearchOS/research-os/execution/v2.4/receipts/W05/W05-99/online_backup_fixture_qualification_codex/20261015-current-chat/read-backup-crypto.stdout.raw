@@ -1,0 +1,66 @@
+32:type BackupManifest struct {
+33-	Format            string       `json:"format"`
+34-	ID                string       `json:"id"`
+35-	Started           string       `json:"started_at"`
+36-	SnapshotCompleted string       `json:"snapshot_completed_at"`
+37-	Migrations        []int        `json:"migrations"`
+38-	SchemaHash        string       `json:"schema_hash"`
+39-	Runtime           Object       `json:"runtime_versions"`
+40-	Files             []BackupFile `json:"files"`
+41-	Inventory         Object       `json:"inventory"`
+42-	KeyPolicy         string       `json:"key_policy"`
+43-	CachePolicy       string       `json:"cache_policy"`
+44-	MAC               string       `json:"mac"`
+45-	Purpose           Object       `json:"purpose,omitempty"`
+46-}
+47-
+48-// Internal policies are available only to the bounded local upgrade coordinator.
+49-// Public backup/export/restore retain the ordinary format and protection guard.
+50-type backupPolicy struct {
+51-	format                                 string
+52-	databaseName                           string
+53-	purpose                                Object
+54-	allowProtected                         func(*sql.DB, Object) error
+55-	validate                               func(*sql.DB) error
+56-	beforeRecovery                         func(*sql.DB) error
+57-	afterRecovery                          func(*sql.DB) error
+58-	preserveQueueUpgradeWorkspaces         func(*sql.DB) error
+59-	preserveConfigurationUpgradeWorkspaces func(*sql.DB) error
+60-	preservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error
+61-	publicPreparedAbandonmentHandoff bool
+62-}
+63-
+64-// Ordinary public validation remains mandatory for the fixed handoff policy.
+65-func backupOrdinaryPublicPolicy(policy *backupPolicy) bool {
+66-    return policy == nil || policy.publicPreparedAbandonmentHandoff
+67-}
+68-
+69-func backupFormat(policy *backupPolicy) string {
+70-	if policy != nil {
+71-		return policy.format
+72-	}
+73-	return "RESEARCHOS_BACKUP_V1"
+74-}
+75-
+76-func backupCipher(key []byte) (cipher.AEAD, error) {
+77-	if len(key) != 32 {
+78-		return nil, fmt.Errorf("BACKUP_KEY_UNAVAILABLE: separate 32-byte key required")
+79-	}
+80-	block, e := aes.NewCipher(key)
+81-	if e != nil {
+82-		return nil, e
+83-	}
+84-	return cipher.NewGCM(block)
+85-}
+86-func backupMAC(m BackupManifest, key []byte) string {
+87-	m.MAC = ""
+88-	raw, _ := json.Marshal(m)
+89-	h := hmac.New(sha256.New, key)
+90-	h.Write(raw)
+91-	return hex.EncodeToString(h.Sum(nil))
+92-}
+93-func backupWrite(path string, raw []byte) error {
+94-	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+95-	if e != nil {
+96-		return e
+97-	}

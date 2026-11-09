@@ -1,0 +1,120 @@
+--- a/internal/domain/runtime_harness_windows.go
++++ b/internal/domain/runtime_harness_windows.go
+@@ -66,6 +66,20 @@
+ 	}
+ 	return b, nil
+ }
++func harnessReadiness(driver rt.CodexDriver) (rt.CodexDescriptor, rt.CodexReadiness) {
++	descriptor := rt.CodexDescriptor{}
++	snapshot := rt.CodexReadiness{}
++	if driver != nil {
++		descriptor, snapshot = driver.Descriptor(), driver.ReadinessSnapshot()
++	}
++	return descriptor, rt.EvaluateCodexReadiness(descriptor, snapshot, rt.CodexRequestedPolicyIdentity(descriptor.ExecutableHash))
++}
++func harnessPolicyMatches(profile map[string]any, identity rt.CodexPolicyIdentity) bool {
++	return profile["sandbox"] == rt.CodexNativeSandboxID && profile["command_id"] == rt.CodexNativeCommandID &&
++		profile["native_policy_revision"] == identity.Revision && profile["windows_sandbox"] == identity.WindowsSandbox &&
++		profile["permission_profile"] == identity.PermissionProfile && profile["requested_config_sha256"] == identity.RequestedConfigSHA256 &&
++		profile["build_hash"] == identity.BinarySHA256
++}
+ func harnessNull(s string) any {
+ 	if s == "" {
+ 		return nil
+@@ -78,23 +92,11 @@
+ 		return nil, err
+ 	}
+ 	tx.Rollback()
+-	descriptor := rt.CodexDescriptor{}
+-	if h.c.config.HarnessDriver != nil {
+-		descriptor = h.c.config.HarnessDriver.Descriptor()
+-	}
+-	ready := descriptor.Present && descriptor.ConfigurationControlled && descriptor.AuthState == "LOGGED_IN"
++	descriptor, readiness := harnessReadiness(h.c.config.HarnessDriver)
++	ready := readiness.State == "READY"
+ 	reasons := Empty()
+-	if !descriptor.Present {
+-		reasons = append(reasons, "NOT_INSTALLED")
+-	}
+-	if !descriptor.ConfigurationControlled {
+-		reasons = append(reasons, "CONFIG_INHERITANCE_UNVERIFIED")
+-	}
+-	if descriptor.AuthState != "LOGGED_IN" {
+-		reasons = append(reasons, "AUTH_METADATA_REQUIRED")
+-	}
+-	if descriptor.UnavailableReason != "" {
+-		reasons = append(reasons, descriptor.UnavailableReason)
++	if !ready {
++		reasons = append(reasons, readiness.Reason)
+ 	}
+ 	auth := descriptor.AuthState
+ 	if auth == "" {
+@@ -131,6 +133,7 @@
+ 		return harnessRoute{}, err
+ 	}
+ 	descriptor := h.c.config.HarnessDriver.Descriptor()
++	identity := rt.CodexRequestedPolicyIdentity(descriptor.ExecutableHash)
+ 	tx, err := h.c.service.DB.BeginTx(ctx, nil)
+ 	if err != nil {
+ 		return harnessRoute{}, err
+@@ -138,7 +141,7 @@
+ 	defer tx.Rollback()
+ 	var registration Object
+ 	var raw string
+-	name := "Codex readonly Host V1 " + p.ID
++	name := "Codex readonly Host MXC V2 " + p.ID
+ 	err = tx.QueryRowContext(ctx, "SELECT body FROM domain_objects WHERE project=? AND kind='RuntimeRegistration' AND json_extract(body,'$.adapter')=? AND json_extract(body,'$.name')=?", project, harnessAdapter, name).Scan(&raw)
+ 	var profileRef Object
+ 	if err == nil {
+@@ -158,7 +161,7 @@
+ 		if err != nil {
+ 			return harnessRoute{}, err
+ 		}
+-		if profile["build_hash"] != descriptor.ExecutableHash || profile["backend"] != harnessBackend {
++		if profile["backend"] != harnessBackend || !harnessPolicyMatches(profile, identity) {
+ 			return harnessRoute{}, harnessFail(409, "STATE_CONFLICT", "native profile changed")
+ 		}
+ 	} else if errors.Is(err, sql.ErrNoRows) {
+@@ -179,7 +182,7 @@
+ 		if err != nil {
+ 			return harnessRoute{}, err
+ 		}
+-		profile := Object{"runtime_id": registration["id"], "technical_hash": runtimeTechnicalHash(registration), "adapter": harnessAdapter, "adapter_revision": harnessBackend, "platform": "windows-amd64", "build_hash": descriptor.ExecutableHash, "sandbox": "codex-permissions-workspace-read-v1", "credential_revision": "CLI_OWNED", "backend": harnessBackend, "model": "CLI_DEFAULT", "command_id": "codex-readonly-v1", "argv": []any{"HOST_FIXED"}, "outputs": []any{"codex-result.json"}, "timeout_seconds": 300, "permissions": Object{"scope": "workspace-read", "hooks": "PLATFORM_POLICY", "mcp": "PLATFORM_POLICY"}, "harness_owner": p.ID, "owner_root": root, "consent_expires_at": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)}
++		profile := Object{"runtime_id": registration["id"], "technical_hash": runtimeTechnicalHash(registration), "adapter": harnessAdapter, "adapter_revision": harnessBackend, "platform": "windows-amd64", "build_hash": descriptor.ExecutableHash, "sandbox": rt.CodexNativeSandboxID, "native_policy_revision": identity.Revision, "requested_config_sha256": identity.RequestedConfigSHA256, "windows_sandbox": identity.WindowsSandbox, "permission_profile": identity.PermissionProfile, "credential_revision": "CLI_OWNED", "backend": harnessBackend, "model": "CLI_DEFAULT", "command_id": rt.CodexNativeCommandID, "argv": []any{"HOST_FIXED"}, "outputs": []any{"codex-result.json"}, "timeout_seconds": 300, "permissions": Object{"scope": "workspace-read", "hooks": "PLATFORM_POLICY", "mcp": "PLATFORM_POLICY"}, "harness_owner": p.ID, "owner_root": root, "consent_expires_at": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)}
+ 		artifact, err := h.c.service.sealRuntimeSetupProfile(tx, p, project, profile)
+ 		if err != nil {
+ 			return harnessRoute{}, err
+@@ -766,8 +769,8 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	d := c.config.HarnessDriver.Descriptor()
+-	if !d.Present || !d.ConfigurationControlled || d.AuthState != "LOGGED_IN" {
++	_, readiness := harnessReadiness(c.config.HarnessDriver)
++	if readiness.State != "READY" {
+ 		return nil
+ 	}
+ 	rows, err := c.service.DB.QueryContext(ctx, "SELECT project,id FROM domain_objects WHERE kind='Task' AND json_extract(body,'$.status')='READY' AND json_extract(body,'$.task_type')='harness_turn' ORDER BY rowid")
+@@ -908,6 +911,11 @@
+ 	if admission["admission_kind"] != "HOST_HARNESS_V1" {
+ 		return fail(Fail(403, "FORBIDDEN", "native admission required"))
+ 	}
++	descriptor, readiness := harnessReadiness(c.config.HarnessDriver)
++	profile := admission["profile"].(map[string]any)
++	if readiness.State != "READY" || !harnessPolicyMatches(profile, rt.CodexRequestedPolicyIdentity(descriptor.ExecutableHash)) {
++		return fail(Fail(503, "HARNESS_UNAVAILABLE", "native policy readiness changed"))
++	}
+ 	record, err := harnessTaskInput(tx, project, task)
+ 	if err != nil {
+ 		return fail(err)
+@@ -963,8 +971,8 @@
+ 		return err
+ 	}
+ 	profile := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)["profile"].(map[string]any)
+-	descriptor := c.config.HarnessDriver.Descriptor()
+-	if !descriptor.ConfigurationControlled || descriptor.ExecutableHash != profile["build_hash"] {
++	descriptor, readiness := harnessReadiness(c.config.HarnessDriver)
++	if readiness.State != "READY" || !harnessPolicyMatches(profile, rt.CodexRequestedPolicyIdentity(descriptor.ExecutableHash)) {
+ 		tx.Rollback()
+ 		return c.harnessUnknown(ctx, project, runID, epoch, "native executable or policy changed")
+ 	}

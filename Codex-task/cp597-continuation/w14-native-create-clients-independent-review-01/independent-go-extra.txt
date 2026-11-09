@@ -1,0 +1,64 @@
+// Independent reviewer additions via an overlay; frozen author sources are unchanged.
+func TestIndependentGoNativeExactClosedKeys(t *testing.T) {
+    cases := []struct{name, from, to string}{
+        {"top-case-alias", `"kind":`, `"Kind":`},
+        {"payload-case-alias", `"schema_version":1`, `"SCHEMA_VERSION":1`},
+        {"two-top-case-variants", `"kind":"NATIVE_CLIENT_ATTEST_RESULT"`, `"kind":"NATIVE_CLIENT_ATTEST_RESULT","Kind":"NATIVE_CLIENT_ATTEST_RESULT"`},
+        {"two-payload-case-variants", `"schema_version":1`, `"schema_version":1,"SCHEMA_VERSION":1`},
+        {"trailing", "", ""},
+        {"top-unknown", `"kind":`, `"other":1,"kind":`},
+        {"duplicate-escaped", `"schema_version":1`, `"schema_version":1,"schema_\u0076ersion":1`},
+    }
+    for _, tc := range cases { t.Run(tc.name, func(t *testing.T) {
+        c, _, _ := attestFixture(t)
+        sent := 0
+        installAttestFakes(t, func(string, []byte) ([]byte, error) {
+            raw := string(attestReply())
+            if tc.name == "trailing" { raw += "{}" } else { raw = strings.Replace(raw, tc.from, tc.to, 1) }
+            return []byte(raw), nil
+        }, func(*http.Request) (*http.Response, error) {
+            sent++
+            return &http.Response{StatusCode:503, Body:io.NopCloser(strings.NewReader("fake-only")), Header:make(http.Header)},nil
+        })
+        reply, reason, _ := v2Call(c, "session.create", createAttestPayload())
+        if sent != 0 || reply["dispatch_state"] != "NOT_SENT" {
+            t.Fatalf("CLOSED_KEY_COUNTEREXAMPLE: noncanonical closed-profile reply reached fake HTTP; sends=%d refusal=%q", sent, reason)
+        }
+    }) }
+}
+
+func TestIndependentGoDefaultOffExactLegacyWire(t *testing.T) {
+    for _, gate := range []string{"", "0", "true", "01", " 1", "1 "} { t.Run(fmt.Sprintf("gate-%q",gate),func(t *testing.T) {
+        c, _, _ := attestFixture(t)
+        t.Setenv("RESEARCHOS_NATIVE_CREATE_PILOT",gate)
+        payload:=createAttestPayload()
+        sent:=0
+        installAttestFakes(t,func(string,[]byte)([]byte,error){t.Fatal("new Native call with default gate");return nil,nil},func(r *http.Request)(*http.Response,error){
+            sent++
+            raw,_:=io.ReadAll(r.Body)
+            want:=`{"protocol_version":"researchos-client/2","command_id":"cmd-fixture","client_id":"fixture-cli","project_id":"proj-fixture","session_id":null,"expected_revision":null,"writer_epoch":null,"method":"session.create","payload":{"model_config_ref":null,"title":"Fixture","workspace_ref":"ws-fixture"}}`
+            if string(raw)!=want || r.Header.Get("Authorization")!="Bearer fixture-bearer" || r.Header.Get("X-ResearchOS-Native-Attestation")!="" {t.Fatalf("legacy bytes or headers changed: %q",raw)}
+            return &http.Response{StatusCode:503,Body:io.NopCloser(strings.NewReader("fake-only")),Header:make(http.Header)},nil
+        })
+        v2Call(c,"session.create",payload)
+        if sent!=1 {t.Fatalf("legacy sends=%d",sent)}
+    }) }
+}
+
+func TestIndependentGoReplayFreshBearerSameRaw(t *testing.T) {
+    c, _, _ := attestFixture(t)
+    var commitments []map[string]any
+    var raws []string
+    installAttestFakes(t,func(_ string, raw []byte)([]byte,error){
+        var frame map[string]json.RawMessage
+        if json.Unmarshal(raw,&frame)!=nil {t.Fatal("bad fake frame")}
+        var payload map[string]any
+        if json.Unmarshal(frame["payload"],&payload)!=nil {t.Fatal("bad payload")}
+        commitments=append(commitments,payload)
+        return attestReply(),nil
+    },func(r *http.Request)(*http.Response,error){raw,_:=io.ReadAll(r.Body);raws=append(raws,string(raw));return &http.Response{StatusCode:503,Body:io.NopCloser(strings.NewReader("fake-only")),Header:make(http.Header)},nil})
+    v2Call(c,"session.create",createAttestPayload())
+    c.credential="fixture-next-bearer"
+    v2Call(c,"session.create",createAttestPayload())
+    if len(commitments)!=2 || len(raws)!=2 || raws[0]!=raws[1] || commitments[0]["request_raw_sha256"]!=commitments[1]["request_raw_sha256"] || commitments[0]["credential_value"]!="fixture-bearer" || commitments[1]["credential_value"]!="fixture-next-bearer" {t.Fatal("replay did not use fresh bearer proof for same raw")}
+}

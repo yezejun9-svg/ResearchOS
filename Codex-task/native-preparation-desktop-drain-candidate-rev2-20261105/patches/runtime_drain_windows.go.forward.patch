@@ -1,0 +1,111 @@
+diff --git a/internal/domain/runtime_drain_windows.go b/internal/domain/runtime_drain_windows.go
+index ab3a29c..103e117 100644
+--- a/internal/domain/runtime_drain_windows.go
++++ b/internal/domain/runtime_drain_windows.go
+@@ -80,18 +80,31 @@ func (c *RuntimeCoordinator) quiesceRuntime(ctx context.Context, desktopExit boo
+ 		return snap, e
+ 	}
+ 	observed.ActiveWorkers = snap.ActiveWorkers
++	effectiveDispatches := observed.UnresolvedDispatches
++	var preparationErr error
++	if desktopExit && effectiveDispatches != 0 && observed.ActiveRuns == 0 &&
++		observed.UnresolvedEffects == 0 && observed.ActiveWorkers == 0 && observed.UnresolvedCommands == 0 {
++		var settled int
++		settled, preparationErr = c.service.stoppedHarnessPreparationsForDesktopExit(ctx, c.config.DataRoot, observed)
++		if preparationErr == nil {
++			effectiveDispatches -= settled
++		}
++	}
+ 	accountingBlocked := observed.Reservations != 0
+ 	var accountingErr error
+-	if desktopExit && accountingBlocked && observed.ActiveRuns == 0 && observed.UnresolvedEffects == 0 && observed.UnresolvedDispatches == 0 && observed.ActiveWorkers == 0 && observed.UnresolvedCommands == 0 {
++	if desktopExit && preparationErr == nil && accountingBlocked && observed.ActiveRuns == 0 && observed.UnresolvedEffects == 0 && effectiveDispatches == 0 && observed.ActiveWorkers == 0 && observed.UnresolvedCommands == 0 {
+ 		accountingErr = c.service.completedLocalUnknownCosts(ctx)
+ 		accountingBlocked = accountingErr != nil
+ 	}
+ 	if desktopExit && (c.qualificationActive || c.config.ManagedStartupHold) {
+ 		accountingBlocked = true
+ 	}
+-	if observed.ActiveRuns != 0 || observed.UnresolvedEffects != 0 || observed.UnresolvedDispatches != 0 || observed.ActiveWorkers != 0 || accountingBlocked || observed.UnresolvedCommands != 0 {
++	if observed.ActiveRuns != 0 || observed.UnresolvedEffects != 0 || effectiveDispatches != 0 || observed.ActiveWorkers != 0 || accountingBlocked || observed.UnresolvedCommands != 0 || preparationErr != nil {
+ 		c.quiesced = false
+ 		c.restoreIntakeAfterRelease(ctx, c.releaseIntakeClosed)
++		if preparationErr != nil {
++			return observed, preparationErr
++		}
+ 		if accountingErr != nil {
+ 			return observed, accountingErr
+ 		}
+@@ -100,6 +113,72 @@ func (c *RuntimeCoordinator) quiesceRuntime(ctx context.Context, desktopExit boo
+ 	return observed, nil
+ }
+ 
++// Only the Desktop admission/scan fence calls this. The count is read again in
++// the same read transaction as every C5 proof so a changed snapshot cannot be
++// used to subtract an unrelated unresolved dispatch.
++func (s *Service) stoppedHarnessPreparationsForDesktopExit(ctx context.Context, dataRoot string, observed RuntimeDrainSnapshot) (int, error) {
++	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
++	if err != nil {
++		return 0, err
++	}
++	defer tx.Rollback()
++	var total int
++	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM runtime_dispatches WHERE state IN ('PREPARED','STARTED','UNKNOWN')`).Scan(&total); err != nil {
++		return 0, err
++	}
++	if total != observed.UnresolvedDispatches {
++		return 0, errors.New("desktop exit dispatch snapshot changed")
++	}
++	// The original snapshot is returned to callers unchanged. The decision uses
++	// one transaction for all durable counters that could change its meaning.
++	checks := []struct {
++		query    string
++		expected int
++	}{
++		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, observed.ActiveRuns},
++		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, observed.UnresolvedEffects},
++		{`SELECT (SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED'))+(SELECT count(*) FROM client_control_requests WHERE state<>'CONFIRMED')`, observed.UnresolvedCommands},
++		{`SELECT count(*) FROM domain_objects x WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.operation') IN ('RESERVE','UNKNOWN') AND rowid=(SELECT max(y.rowid) FROM domain_objects y WHERE y.kind='BudgetLedgerEntry' AND y.project=x.project AND json_extract(y.body,'$.run_id')=json_extract(x.body,'$.run_id') AND json_extract(y.body,'$.provider_request_id')=json_extract(x.body,'$.provider_request_id'))`, observed.Reservations},
++	}
++	for _, check := range checks {
++		var actual int
++		if err = tx.QueryRowContext(ctx, check.query).Scan(&actual); err != nil {
++			return 0, err
++		}
++		if actual != check.expected {
++			return 0, errors.New("desktop exit durable drain snapshot changed")
++		}
++	}
++	rows, err := tx.QueryContext(ctx, `SELECT project,run,epoch FROM runtime_dispatches WHERE state='STARTED' AND reason LIKE 'native preparation failed before model launch: %'`)
++	if err != nil {
++		return 0, err
++	}
++	type key struct {
++		project, run string
++		epoch        int64
++	}
++	keys := []key{}
++	for rows.Next() {
++		var k key
++		if err = rows.Scan(&k.project, &k.run, &k.epoch); err != nil {
++			rows.Close()
++			return 0, err
++		}
++		keys = append(keys, k)
++	}
++	err = rows.Err()
++	rows.Close()
++	if err != nil {
++		return 0, err
++	}
++	for _, k := range keys {
++		if err = s.stoppedHarnessPreparationInTx(tx, k.project, k.run, k.epoch, dataRoot); err != nil {
++			return 0, err
++		}
++	}
++	return len(keys), nil
++}
++
+ func (c *RuntimeCoordinator) ResumeAfterReleaseAbort() {
+ 	c.scanMu.Lock()
+ 	defer c.scanMu.Unlock()

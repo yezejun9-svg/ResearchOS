@@ -1,0 +1,535 @@
+diff --git a/apps/web/src/workbench.jsx b/apps/web/src/workbench.jsx
+index 6f12ec5..1602e78 100644
+--- a/apps/web/src/workbench.jsx
++++ b/apps/web/src/workbench.jsx
+@@ -8,6 +8,7 @@ import { workspaceProjectPath } from './startup.js'
+ import { composerSubmitKey, appendPrompt } from './activity.js'
+ import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
+ import { HarnessRunProgress, HarnessPermissionNotice } from './components/harness-run-progress.jsx'
++import { projectHarnessReceipt } from './harness-progress.js'
+ 
+ const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
+ const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
+@@ -408,14 +409,16 @@ export function NativeWorkbench(props) {
+     setHarness(value)
+   }
+   return <><div className="button-row composer-context"><label>Harness <select aria-label="Harness" value={harness} disabled={guard.busy} onChange={event => choose(event.target.value)}><option value="codex">Codex CLI · 只读任务</option><option value="mu">Mu · 原有模型会话</option></select></label><small>各 Harness 的登录、模型与能力分别核对；草稿在本页保留。</small></div>
+-    {harness === 'codex' ? <NativeHarnessWorkbench {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
++    {harness === 'codex' ? <NativeHarnessWorkbench key={props.projectId} {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
+       <NativeMuWorkbench {...props} draft={muDraft} setDraft={setMuDraft} onGuardChange={setGuard}/>}</>
+ }
+ 
+ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, setDraft, onGuardChange }) {
+   const [state, setState] = useState({ loading: true, busy: false, tasks: [], task: null, events: [], capabilities: null, pending: null })
+   const [workspaces, setWorkspaces] = useState([]), [workspace, setWorkspace] = useState('')
+-  const [hostError, setHostError] = useState(null), [notice, setNotice] = useState('')
++  const [hostError, setHostError] = useState(null)
++  const [acknowledgement, setAcknowledgement] = useState(null)
++  const [errorContext, setErrorContext] = useState('read')
+   const [online, setOnline] = useState(navigator.onLine)
+   const controller = useRef(null), composer = useRef(null)
+   const draftVersion = useRef(0), draftScope = useRef({ projectId, workspace })
+@@ -427,6 +430,11 @@ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, s
+     draftVersion.current++
+     setDraft(value)
+   }
++  function selectTask(id) {
++    setAcknowledgement(null)
++    setErrorContext('read')
++    return controller.current?.select(id)
++  }
+   useEffect(() => {
+     let stopped = false
+     const control = createHarnessController(window.researchos.harness, projectId)
+@@ -467,28 +475,55 @@ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, s
+     if (!canSend) return
+     const control = controller.current, submittedVersion = draftVersion.current
+     if (!control) return
+-    setNotice('')
++    setAcknowledgement(null)
++    setErrorContext('submit')
+     if (await control.submit({ workspace_ref: workspace, prompt: draft })) {
+       if (controller.current !== control) return
+       if (draftVersion.current === submittedVersion) setDraft('')
+-      setNotice('任务已接收，等待真实运行回执。')
++      setAcknowledgement({ projectId, controller: control, taskId: control.getSnapshot().task?.task_ref.task_id || null })
++      setErrorContext('read')
+     }
+   }
+-  return <><header className="page-heading workbench-heading"><div><span className="workbench-eyebrow">RESEARCH / WORKSPACE</span><h1>{profile?.name || '项目工作台'}</h1><p>通过本机 Codex 执行一次只读临时任务，查看真实执行回执。</p></div><button disabled={disabled} onClick={() => controller.current.load()}>刷新任务</button></header>
+-    <Failure error={hostError}/><Failure error={state.error}/>
+-    {!online && <p className="connection-banner" role="status">当前离线。保留已读任务；恢复连接后核对状态，不会重新提交。</p>}
+-    {state.pending && <div className="state-notice" role="status"><p>原{state.pending.kind === 'cancel' ? '取消' : '提交'}请求需核对：{state.pending.request_id}。不会自动重发或创建新任务。</p><button disabled={disabled} onClick={() => controller.current.reconcile()}>只读核对原请求</button></div>}
+-    <WorkbenchLayout hasSession={!!task} sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取真实任务…' : '尚无任务。选择授权工作区后输入目标。'}</p>}<label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <p>请先从项目入口选择并授权工作区；不需要 provider 模型配置。</p>}</Panel>}
+-      conversation={<div className="session-center"><Panel className="conversation-canvas" title="Codex · 只读任务" aside={<span className="tag">{task ? harnessStatusLabel(task.status) : '等待输入'}</span>}>
+-        <div className="button-row session-run-controls"><button disabled={disabled || !!state.pending || !task || task.terminal || !hasHarnessCapability(capabilities, 'cancel')} onClick={() => controller.current.cancel()}>取消当前任务</button><button disabled title="当前 Harness 不支持暂停">暂停</button><button disabled title="当前 Harness 不支持恢复执行">恢复执行</button></div>
+-        <HarnessRunProgress task={task} events={state.events}/>
+-        <div className="conversation-transcript" aria-label="Codex 任务记录">{task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>{assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}{task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}{task.failure && <p role="status">{task.failure.code}：{task.failure.message}</p>}<p className="small-muted">Task {task.task_ref.task_id} · 修订 {task.task_revision}{task.run ? ` · Run ${task.run.run_id} · epoch ${task.run.epoch}` : ' · 尚无 Run'}。执行状态不代表业务验收。</p></> : <ConversationWelcome setDraft={editDraft} composer={composer}/>}</div>
+-        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>模型由 Codex 配置决定</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div>{notice && <p role="status">{notice}</p>}</form>
++  async function cancelTask() {
++    const control = controller.current
++    if (!control) return
++    setErrorContext('cancel')
++    await control.cancel()
++    if (controller.current === control && !control.getSnapshot().error) setErrorContext('read')
++  }
++  const acknowledged = acknowledgement?.controller === controller.current &&
++    acknowledgement.projectId === projectId &&
++    (!task || acknowledgement.taskId === task.task_ref.task_id)
++  const receipt = projectHarnessReceipt(state, acknowledged, errorContext)
++  const suggestions = ['梳理项目目录与入口', '阅读 README 并概述项目', '查看现有测试说明']
++  return <>
++    <header className="page-heading workbench-heading codex-heading"><div><span className="workbench-eyebrow">PROJECT / READ ONLY</span><h1>{profile?.name || '项目工作台'}</h1></div><button disabled={disabled} onClick={() => { setErrorContext('read'); controller.current?.load() }}>刷新任务</button></header>
++    <Failure error={hostError}/>
++    {!online && <p className="connection-banner" role="status">当前离线。可查看已读取任务；恢复连接后核对状态。新的任务暂不可提交。</p>}
++    <WorkbenchLayout variant="assistant" hasSession={!!task} historyExpanded={false} historyHint={state.tasks.length ? state.tasks.length + ' 个已记录任务' : '查看已记录任务'}
++      sessionTools={<div className="codex-workspace-row"><label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <small>请从项目入口选择并授权工作区。</small>}</div>}
++      sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) selectTask(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取已记录任务…' : '暂无已记录任务。'}</p>}</Panel>}
++      conversation={<div className="session-center"><Panel className="conversation-canvas" title="对话" aside={task && <span className="tag">{harnessStatusLabel(task.status)}</span>}>
++        <div className="conversation-transcript" aria-label="Codex 任务记录">
++          {task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>
++            {assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}
++            {task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}</> :
++            !receipt && <div className="conversation-welcome codex-welcome"><span className="workbench-eyebrow">START WITH THIS PROJECT</span><h2>从项目开始提问。</h2><p>选择已授权工作区，发送一次只读任务。</p><div className="conversation-starters">{suggestions.map(text => <button type="button" key={text} onClick={() => { editDraft(appendPrompt(draft, text)); composer.current?.focus() }}>{text}</button>)}</div></div>}
++          {receipt && <div className={'codex-receipt codex-receipt-' + receipt.kind.toLowerCase()} role="status"><strong>{receipt.summary}</strong>{receipt.message && <p>{receipt.message}</p>}{receipt.readError && <p>最近一次状态读取失败；上方为已读取的 Task 状态，请刷新核对。</p>}{receipt.previousTaskId && <p>上方显示的是此前任务；它不是这次待核对请求的结果。</p>}
++            {(receipt.code || receipt.taskId || receipt.requestId || state.error) && <details><summary>技术回执</summary>{receipt.code && <p>代码：{receipt.code}</p>}{receipt.taskId && <p>Task：{receipt.taskId} · 修订：{receipt.revision}{receipt.runId ? ' · Run：' + receipt.runId + ' · epoch：' + receipt.epoch : ' · 尚无 Run'}</p>}{receipt.requestId && <p>原请求：{receipt.requestId} · {receipt.pendingKind} · {receipt.pendingState}</p>}{state.error && <p>{errorContext === 'read' || acknowledged ? '读取错误' : '操作错误'}：{state.error.message}</p>}</details>}
++          </div>}
++          {state.pending && <div className="codex-reconcile"><span>原{state.pending.kind === 'cancel' ? '取消' : '提交'}请求未确认：{state.pending.request_id} · {state.pending.kind} · {state.pending.state}。请勿重复发送。</span><button type="button" disabled={disabled} onClick={() => { setErrorContext('read'); controller.current?.reconcile() }}>只核对原请求</button></div>}
++        </div>
++        <div className="codex-readiness" role="status">{capabilities ? <><p>只读任务 · 执行 {capabilities.verification.execution} · 范围 {capabilities.verification.workspace_read_scope} · 取消 {capabilities.verification.cancellation}</p><HarnessPermissionNotice capabilities={capabilities}/></> : <p>Host 能力待读取；暂不可提交。</p>}</div>
++        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div></form>
+       </Panel></div>}
+-      context={<><Panel title="Codex 状态与能力">{capabilities ? <><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>执行验证：{capabilities.verification.execution} · 只读范围验证：{capabilities.verification.workspace_read_scope} · 取消验证：{capabilities.verification.cancellation}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '已由 Host 标记验证' : '未验证'}。登录与执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '已实现' : '不支持'}</span></div>)}</div><HarnessPermissionNotice capabilities={capabilities}/></> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p><button disabled>读取文件差异</button><button disabled>写入文件</button><button disabled>批准工具</button></details></>}/>
++      context={<>{task && <><HarnessRunProgress task={task} events={state.events}/>{!task.terminal && task.status !== 'CANCEL_REQUESTED' && hasHarnessCapability(capabilities, 'cancel') && <div className="codex-run-controls"><button disabled={disabled || !!state.pending} onClick={cancelTask}>取消当前任务</button></div>}</>}
++        <ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/>
++        <Panel className="codex-capabilities" title="Codex 状态与能力">{capabilities ? <details><summary>安装、登录与能力详情</summary><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '由 Host 标记验证' : '未验证'}。源码实现与实际执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '源码已实现' : '不支持'}</span></div>)}</div></details> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel>
++        <details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p></details>
++      </>}/>
+   </>
+ }
+-
+ function NativeMuWorkbench({ projectId, profile, api, navigate, shared, onRefresh, draft, setDraft, onGuardChange }) {
+   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
+   const [busy, setBusy] = useState('')
+diff --git a/apps/web/src/workbench.css b/apps/web/src/workbench.css
+index c4ad209..052b621 100644
+--- a/apps/web/src/workbench.css
++++ b/apps/web/src/workbench.css
+@@ -34,3 +34,88 @@ body:has(.workbench-route){min-width:0}
+ .harness-permission-notice details{margin-top:8px}.harness-permission-notice summary{cursor:pointer}.harness-permission-notice code{display:block;overflow-wrap:anywhere;margin-top:5px}
+ @media(max-width:767px){.harness-progress-heading{display:block}.harness-progress-heading small{display:block;margin-top:3px}.harness-progress-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 10px}}
+ @media(max-width:390px){.harness-run-progress{padding:12px}.harness-progress-stages{grid-template-columns:minmax(0,1fr);gap:10px}}
++
++/* Codex is one conversation with a compact, always available project context. */
++.workbench-route:has(.workbench-layout-assistant) .main-area{max-width:none;padding-top:18px}
++.workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context{margin:0 0 14px}
++.workbench-layout-assistant{grid-template-columns:minmax(0,1fr) minmax(250px,288px);gap:24px}
++.workbench-layout-assistant .workbench-main-column{min-width:0}
++.workbench-layout-assistant .codex-workspace-row{display:flex;align-items:end;gap:14px;padding:0 0 14px}
++.workbench-layout-assistant .codex-workspace-row label{min-width:0;flex:1;max-width:460px}
++.workbench-layout-assistant .codex-workspace-row select{width:100%;min-width:0}
++.workbench-layout-assistant .codex-workspace-row small{flex:1;line-height:1.5}
++.workbench-layout-assistant .workbench-sessions-disclosure{margin-bottom:12px}
++.workbench-layout-assistant .workbench-sessions-disclosure>summary{padding-bottom:6px}
++.workbench-layout-assistant .workbench-session-pane .panel{padding:2px 0 12px}
++.workbench-layout-assistant .workbench-conversation-pane>.session-center>.panel.conversation-canvas{min-height:min(640px,calc(100dvh - 280px));padding:0}
++.workbench-layout-assistant .conversation-canvas>.section-heading{margin-bottom:4px}
++.workbench-layout-assistant .conversation-transcript{flex:1;min-height:0;max-height:min(50dvh,520px);margin:0 0 12px;padding:0 4px 0 0;overflow-y:auto;overflow-x:hidden}
++.workbench-layout-assistant .codex-welcome{min-height:0;padding:38px 0 22px}
++.workbench-layout-assistant .codex-welcome h2{font-size:clamp(23px,2.6vw,32px);line-height:1.25;margin:6px 0}
++.workbench-layout-assistant .codex-welcome p{font-size:13px;color:var(--muted)}
++.workbench-layout-assistant .codex-welcome .conversation-starters{margin-top:18px}
++.workbench-layout-assistant .conversation-message{padding:10px 0}
++.workbench-layout-assistant .codex-readiness{margin:0 0 8px;font-size:11px;color:var(--muted);line-height:1.4}
++.workbench-layout-assistant .codex-readiness>p{font-size:11px;line-height:1.4;overflow-wrap:anywhere}
++.workbench-layout-assistant .codex-readiness .harness-permission-notice{margin:6px 0 0;padding:8px 10px;max-height:150px;overflow:auto}
++.workbench-layout-assistant .codex-readiness .harness-permission-notice ul{margin:4px 0}
++.workbench-layout-assistant .codex-readiness .harness-permission-notice p{margin:4px 0}
++.workbench-layout-assistant .session-composer{position:static;margin:0;padding:12px 14px;box-shadow:0 12px 36px #0000000b}
++.workbench-layout-assistant .session-composer textarea{min-height:68px;max-height:180px}
++.workbench-layout-assistant .session-composer .composer-context{font-size:11px}
++.workbench-layout-assistant .session-composer .composer-context>span{max-width:none}
++.workbench-layout-assistant .session-composer .composer-context>span:last-child{margin-left:auto}
++.workbench-layout-assistant .codex-receipt{border-left:2px solid var(--accent);background:var(--surface);padding:12px 14px;margin:12px 0;border-radius:0 9px 9px 0;overflow-wrap:anywhere}
++.workbench-layout-assistant .codex-receipt-failed,.workbench-layout-assistant .codex-receipt-blocked{border-left-color:var(--danger)}
++.workbench-layout-assistant .codex-receipt-unknown,.workbench-layout-assistant .codex-receipt-pending,.workbench-layout-assistant .codex-receipt-read_error{border-left-color:var(--warning)}
++.workbench-layout-assistant .codex-receipt strong{font-size:13px}
++.workbench-layout-assistant .codex-receipt p{font-size:12px;white-space:pre-wrap;margin-top:6px}
++.workbench-layout-assistant .codex-receipt details{font-size:11px;color:var(--muted);margin-top:8px}
++.workbench-layout-assistant .codex-reconcile{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;font-size:12px;color:var(--warning);overflow-wrap:anywhere}
++.workbench-layout-assistant .codex-reconcile button{min-height:34px;font-size:12px}
++.workbench-layout-assistant .workbench-context-pane{display:block;border-left:1px solid var(--border);border-top:0;padding:0 0 0 20px}
++.workbench-layout-assistant .harness-run-progress{margin:0 0 10px}
++.workbench-layout-assistant .harness-progress-stages{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
++.workbench-layout-assistant .codex-run-controls{margin-bottom:12px}
++.workbench-layout-assistant .codex-run-controls button{min-height:32px;font-size:12px}
++.workbench-layout-assistant .codex-capabilities{margin-top:16px}
++.workbench-layout-assistant .codex-capabilities>p,.workbench-layout-assistant .codex-capabilities details p{font-size:12px;line-height:1.6;overflow-wrap:anywhere}
++.workbench-layout-assistant .codex-capabilities>details{margin-top:12px}
++.workbench-layout-assistant .codex-capabilities summary,.workbench-layout-assistant .inspector-disclosure summary{cursor:pointer;font-size:12px;color:var(--muted)}
++.workbench-layout-assistant .codex-capabilities .record-row{min-height:32px;padding:6px 2px}
++.workbench-layout-assistant .inspector-disclosure{font-size:12px}
++.workbench-layout-assistant .inspector-disclosure p{font-size:12px;padding:8px 0}
++.workbench-route:has(.workbench-layout-assistant) .codex-heading{margin-bottom:10px;align-items:end}
++.workbench-route:has(.workbench-layout-assistant) .codex-heading h1{font-size:clamp(18px,2vw,23px);line-height:1.2;overflow-wrap:anywhere}
++@media(max-width:1050px){.workbench-layout-assistant{grid-template-columns:minmax(0,1fr)}.workbench-layout-assistant .workbench-context-pane{border-left:0;border-top:1px solid var(--border);padding:18px 0 0}}
++@media(max-width:767px){
++  .workbench-route:has(.workbench-layout-assistant) .main-area{padding:12px 16px calc(14px + env(safe-area-inset-bottom))}
++  .workbench-route:has(.workbench-layout-assistant) .codex-heading{display:flex;align-items:center;gap:8px;margin-bottom:8px}
++  .workbench-route:has(.workbench-layout-assistant) .codex-heading h1{font-size:17px;line-height:1.25}
++  .workbench-route:has(.workbench-layout-assistant) .codex-heading button{min-height:40px;min-width:58px;padding:4px 7px;margin:0;flex:none}
++  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context{margin-bottom:8px}
++  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context label{width:100%;flex-direction:row;align-items:center;gap:10px}
++  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context select{flex:1;min-width:0;min-height:44px}
++  .workbench-route:has(.workbench-layout-assistant)>.main-area>.button-row.composer-context small{display:none}
++  .workbench-layout-assistant .codex-workspace-row{display:block;padding-bottom:8px}
++  .workbench-layout-assistant .codex-workspace-row label{max-width:none;gap:2px}
++  .workbench-layout-assistant .codex-workspace-row select{min-height:44px}
++  .workbench-layout-assistant .codex-workspace-row small{display:block;margin-top:4px}
++  .workbench-layout-assistant .workbench-sessions-disclosure{margin-bottom:8px}
++  .workbench-layout-assistant .workbench-sessions-disclosure>summary{min-height:40px;padding:0 2px}
++  .workbench-layout-assistant .workbench-conversation-pane>.session-center>.panel.conversation-canvas{min-height:0}
++  .workbench-layout-assistant .conversation-canvas>.section-heading{min-height:25px;margin:0 0 4px}
++  .workbench-layout-assistant .conversation-transcript{min-height:0;max-height:35dvh;margin-bottom:8px}
++  .workbench-layout-assistant .codex-welcome{padding:8px 0}
++  .workbench-layout-assistant .codex-welcome h2{font-size:21px;margin:4px 0}
++  .workbench-layout-assistant .codex-welcome p{font-size:12px}
++  .workbench-layout-assistant .codex-welcome .conversation-starters{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:6px;margin-top:9px;padding-bottom:3px}
++  .workbench-layout-assistant .codex-welcome .conversation-starters button{flex:none;min-height:36px;padding:5px 9px;font-size:11px}
++  .workbench-layout-assistant .session-composer{margin:0;padding:10px 12px}
++  .workbench-layout-assistant .session-composer textarea{min-height:62px;max-height:28dvh;padding:5px 0}
++  .workbench-layout-assistant .session-composer .composer-context>span:last-child{display:none}
++  .workbench-layout-assistant .composer-controls{flex-direction:row;align-items:center}
++  .workbench-layout-assistant .composer-controls small{font-size:10px}
++  .workbench-layout-assistant .composer-controls .primary{min-height:40px;min-width:95px}
++  .workbench-layout-assistant .workbench-context-pane{margin-top:16px}
++}
+diff --git a/apps/web/src/components/workbench-layout.jsx b/apps/web/src/components/workbench-layout.jsx
+index aae28f7..5e12d31 100644
+--- a/apps/web/src/components/workbench-layout.jsx
++++ b/apps/web/src/components/workbench-layout.jsx
+@@ -1,12 +1,13 @@
+ import React, { useEffect, useState } from 'react'
+ 
+-export function WorkbenchLayout({ sessions, conversation, context, hasSession }) {
+-  const [expanded, setExpanded] = useState(!hasSession)
+-  useEffect(() => setExpanded(!hasSession), [hasSession])
+-  return <div className="workbench-layout">
++export function WorkbenchLayout({ sessions, conversation, context, hasSession, variant = '', sessionTools = null, historyExpanded, historyHint }) {
++  const [expanded, setExpanded] = useState(historyExpanded ?? !hasSession)
++  useEffect(() => setExpanded(historyExpanded ?? !hasSession), [hasSession, historyExpanded])
++  return <div className={`workbench-layout ${variant ? `workbench-layout-${variant}` : ''}`}>
+     <div className="workbench-main-column">
++      {sessionTools}
+       <details className="workbench-sessions-disclosure" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+-        <summary><span>项目会话</span><small>{hasSession ? '切换 / 新建' : '选择一个会话，开始协作'}</small></summary>
++        <summary><span>{variant === 'assistant' ? '任务历史' : '项目会话'}</span><small>{historyHint ?? (hasSession ? '切换 / 新建' : '选择一个会话，开始协作')}</small></summary>
+         <aside className="workbench-session-pane" aria-label="项目会话">{sessions}</aside>
+       </details>
+       <section className="workbench-conversation-pane" aria-label="当前研究会话">{conversation}</section>
+diff --git a/apps/web/src/harness-progress.js b/apps/web/src/harness-progress.js
+index d399a24..124aa43 100644
+--- a/apps/web/src/harness-progress.js
++++ b/apps/web/src/harness-progress.js
+@@ -11,6 +11,44 @@ const terminalText = {
+ const sameRun = (left, right) => !!left && !!right &&
+   left.run_id === right.run_id && left.epoch === right.epoch
+ 
++// The Host Task is the receipt. An accepted submit ACK only confirms that a
++// request was recorded; it must never override a later Task or read failure.
++export function projectHarnessReceipt({ task = null, pending = null, error = null } = {}, acknowledged = false, errorContext = 'read') {
++  const failure = task?.failure
++  const message = typeof failure?.message === 'string' ? failure.message : ''
++  const preparationFailed = /preparation failed before model launch|准备阶段失败.{0,20}模型未启动/i.test(message)
++  const summaries = {
++    QUEUED: '任务已记录，等待启动。',
++    STARTING: '任务正在启动。',
++    RUNNING: '任务正在执行。',
++    CANCEL_REQUESTED: '已请求取消，等待原任务确认停止。',
++    COMPLETED: '任务执行已结束；结果仍需核对。',
++    FAILED: preparationFailed ? '准备阶段失败，模型未启动；没有自动重试。' : '任务执行失败；请查看 Host 返回的原因。',
++    CANCELLED: '任务已取消。',
++    BLOCKED: '任务已阻止；请查看原因。',
++    UNKNOWN: '任务结果未知；请核对原请求，避免重复提交。',
++  }
++  const unresolved = pending && {
++    kind: 'PENDING', summary: '原请求结果未确认；请核对原请求，避免重复提交。',
++    requestId: pending.request_id || null, pendingKind: pending.kind || null, pendingState: pending.state || null,
++    previousTaskId: task?.task_ref?.task_id || null,
++  }
++  if (unresolved && (!task || pending.request_id !== task.request_id)) return unresolved
++  if (error && !acknowledged && errorContext !== 'read') return {
++    kind: 'OPERATION_ERROR', summary: errorContext === 'cancel' ? '取消请求未确认；请核对当前任务。' : '提交请求未确认；请核对原请求后再操作。',
++    message: error.message || String(error), code: error.code || null, previousTaskId: task?.task_ref?.task_id || null,
++  }
++  if (task) return { kind: task.status, summary: summaries[task.status] || '任务状态待核对。',
++    message, code: failure?.code || null, taskId: task.task_ref?.task_id || null,
++    revision: task.task_revision || null, runId: task.run?.run_id || null, epoch: task.run?.epoch || null,
++    readError: error?.message || null }
++  if (unresolved) return unresolved
++  if (error) return { kind: 'READ_ERROR', summary: acknowledged ? '请求已接收，但当前任务读取失败；请刷新核对。' : '任务状态读取失败；请刷新核对。',
++    message: error.message || String(error), code: error.code || null }
++  if (acknowledged) return { kind: 'ACKNOWLEDGED', summary: '请求已接收，正在读取当前任务。' }
++  return null
++}
++
+ export function projectHarnessProgress(task, events = []) {
+   if (!task) return { empty: true, stages: [], observedToolCount: 0 }
+   const run = task.run
+diff --git a/tests/ui/desktop/harness-workbench.test.mjs b/tests/ui/desktop/harness-workbench.test.mjs
+index 154414e..7c78590 100644
+--- a/tests/ui/desktop/harness-workbench.test.mjs
++++ b/tests/ui/desktop/harness-workbench.test.mjs
+@@ -4,6 +4,7 @@ import fs from 'node:fs'
+ import vm from 'node:vm'
+ import { decimal, canSubmitHarness, hasHarnessCapability, applyHarnessPage, cancelIntent, createHarnessController, harnessStatusLabel } from '../../../apps/web/src/harness.js'
+ import { composerSubmitKey, harnessActivityRows } from '../../../apps/web/src/activity.js'
++import { projectHarnessReceipt } from '../../../apps/web/src/harness-progress.js'
+ 
+ const ref = { project_id: 'fixture-project', task_id: 'fixture-task' }
+ const task = (extra = {}) => ({ task_ref: ref, request_id: 'fixture-request', harness_id: 'codex', workspace_ref: 'fixture-workspace', prompt: 'Inspect only', scope: 'workspace-read', ephemeral: true, status: 'QUEUED', terminal: false, task_revision: '1', run: null, created_at: '2026-11-04T00:00:00Z', updated_at: '2026-11-04T00:00:00Z', result: null, failure: null, ...extra })
+@@ -64,6 +65,114 @@ test('accepted submission remains accepted if the immediate snapshot read discon
+   await control.load()
+   assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
+   assert.match(control.getSnapshot().error.message, /disconnected/)
++  assert.match(projectHarnessReceipt(control.getSnapshot(), true).summary, /已接收.*读取失败/)
++})
++test('accepted ACK followed by an immediate failed Task renders the Host failure without replay', async () => {
++  let submits = 0
++  const failure = { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' }
++  const control = createHarnessController(bridge({
++    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
++    get: async () => ok(task({ status: 'FAILED', terminal: true, failure })),
++  }), ref.project_id)
++  await control.load()
++  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
++  const view = projectHarnessReceipt(control.getSnapshot(), true)
++  assert.equal(view.kind, 'FAILED')
++  assert.match(view.summary, /准备阶段失败/)
++  assert.equal(view.message, failure.message)
++  assert.equal(submits, 1)
++  control.dispose()
++})
++test('a later failed Task replaces the queued receipt without resubmitting', async () => {
++  let reads = 0, submits = 0
++  const control = createHarnessController(bridge({
++    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
++    get: async () => ok(++reads === 1 ? task() : task({ status: 'FAILED', terminal: true, failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host execution unavailable' } })),
++    events: async () => ok({ task_ref: ref, events: [], next_cursor: '0', has_more: false, end: false, reset: false, snapshot: null }),
++  }), ref.project_id)
++  await control.load()
++  await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' })
++  assert.equal(projectHarnessReceipt(control.getSnapshot(), true).kind, 'QUEUED')
++  await control.tick()
++  const view = projectHarnessReceipt(control.getSnapshot(), true)
++  assert.equal(view.kind, 'FAILED')
++  assert.doesNotMatch(view.summary, /准备阶段失败/)
++  assert.equal(submits, 1)
++  control.dispose()
++})
++test('history selection clears the prior ACK before a different Task read fails', async () => {
++  const other = { project_id: ref.project_id, task_id: 'other-task' }
++  let submits = 0
++  const control = createHarnessController(bridge({
++    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
++    get: async ({ task_id }) => task_id === other.task_id ? { ok: false, reason: 'READ_DISCONNECTED' } : ok(task()),
++  }), ref.project_id)
++  await control.load()
++  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
++  const acknowledgements = []
++  const errorContexts = []
++  let draft = 'initial draft'
++  const edit = vm.runInNewContext('(' + editSource + ')', {
++    draftVersion: { current: 0 },
++    setDraft: value => { draft = value },
++  })
++  edit('new unsent draft')
++  const select = vm.runInNewContext('(' + selectSource + ')', {
++    setAcknowledgement: value => acknowledgements.push(value),
++    setErrorContext: value => errorContexts.push(value),
++    controller: { current: control },
++  })
++  await select(other.task_id)
++  assert.deepEqual(acknowledgements, [null])
++  assert.deepEqual(errorContexts, ['read'])
++  assert.equal(draft, 'new unsent draft')
++  assert.equal(submits, 1)
++  assert.equal(control.getSnapshot().task, null)
++  const receipt = projectHarnessReceipt(control.getSnapshot(), false, 'read')
++  assert.equal(receipt.kind, 'READ_ERROR')
++  assert.doesNotMatch(receipt.summary, /请求已接收/)
++  control.dispose()
++})
++test('UNKNOWN submission keeps the older Task distinct and reconciles only the original request', async () => {
++  let submits = 0, reconciles = 0
++  const unresolved = { request_id: 'new-original-request', kind: 'submit', state: 'UNKNOWN' }
++  const control = createHarnessController(bridge({
++    pending: async () => ok(submits ? unresolved : null),
++    submit: async () => { submits++; return { ok: false, reason: 'HARNESS_TIMEOUT', outcome: 'UNKNOWN', pending: unresolved } },
++    reconcile: async () => { reconciles++; return ok({ pending: unresolved, task: null }) },
++  }), ref.project_id)
++  await control.load(); await control.select(ref.task_id)
++  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'New task' }), false)
++  const view = projectHarnessReceipt(control.getSnapshot(), false, 'submit')
++  assert.equal(view.kind, 'PENDING')
++  assert.equal(view.requestId, unresolved.request_id)
++  assert.equal(view.pendingKind, 'submit')
++  assert.equal(view.previousTaskId, ref.task_id)
++  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Retry' }), false)
++  await control.reconcile()
++  assert.equal(submits, 1)
++  assert.equal(reconciles, 1)
++  control.dispose()
++})
++test('UNKNOWN cancellation keeps its original request identity and blocks a second submit', async () => {
++  let cancels = 0, submits = 0, reconciles = 0
++  const unresolved = { request_id: 'cancel-original-request', kind: 'cancel', state: 'UNKNOWN' }
++  const control = createHarnessController(bridge({
++    pending: async () => ok(cancels ? unresolved : null),
++    cancel: async () => { cancels++; return { ok: false, reason: 'HARNESS_TIMEOUT', outcome: 'UNKNOWN', pending: unresolved } },
++    submit: async () => { submits++; throw Error('must stay blocked') },
++    reconcile: async () => { reconciles++; return ok({ pending: unresolved, task: null }) },
++  }), ref.project_id)
++  await control.load(); await control.select(ref.task_id); await control.cancel()
++  const view = projectHarnessReceipt(control.getSnapshot(), false, 'cancel')
++  assert.equal(view.kind, 'PENDING')
++  assert.equal(view.requestId, unresolved.request_id)
++  assert.equal(view.pendingKind, 'cancel')
++  assert.equal(view.previousTaskId, ref.task_id)
++  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'New task' }), false)
++  await control.reconcile()
++  assert.equal(cancels, 1); assert.equal(submits, 0); assert.equal(reconciles, 1)
++  control.dispose()
+ })
+ test('Run epoch changes preserve Task history and explicit reset adopts authoritative state', () => {
+   let state = { task: task(), events: [], cursor: '9007199254740992', end: false }
+@@ -115,24 +224,25 @@ const workbench = fs.readFileSync(new URL('../../../apps/web/src/workbench.jsx',
+ const codexBlock = workbench.slice(workbench.indexOf('function NativeHarnessWorkbench('), workbench.indexOf('function NativeMuWorkbench('))
+ const sendSource = /async function send\(event\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
+ const editSource = /function editDraft\(value\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
++const selectSource = /function selectTask\(id\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
+ const textareaSource = /<textarea[^>]*onChange=\{(event => \w+\(event.target.value\))\}/.exec(codexBlock)?.[1]
+ const scopeSource = /  if \(draftScope.current.projectId[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
+ const cleanupSource = /return \(\) => \{ stopped = true; draftVersion[^\n]*/.exec(codexBlock)?.[0]?.replace(/^return /, '')
+-assert.ok(sendSource && editSource && textareaSource && scopeSource && cleanupSource, 'actual draft handlers and view cleanup must be isolated')
++assert.ok(sendSource && editSource && selectSource && textareaSource && scopeSource && cleanupSource, 'actual draft and selection handlers and view cleanup must be isolated')
+ function pendingDraftSend() {
+   let resolve, currentDraft = 'submitted text'
+-  const notices = [], submissions = []
++  const acknowledgements = [], submissions = []
+   const accepted = new Promise(done => { resolve = done })
+-  const control = { submit: value => { submissions.push(value); return accepted }, dispose() {} }
++  const control = { submit: value => { submissions.push(value); return accepted }, getSnapshot: () => ({ task: { task_ref: ref } }), dispose() {} }
+   const context = vm.createContext({ canSend: true, draft: 'submitted text', workspace: 'fixture-workspace', projectId: ref.project_id,
+     draftVersion: { current: 0 }, draftScope: { current: { projectId: ref.project_id, workspace: 'fixture-workspace' } },
+     controller: { current: control }, control, setDraft: value => { currentDraft = typeof value === 'function' ? value(currentDraft) : value },
+-    setNotice: value => notices.push(value), stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
++    setAcknowledgement: value => acknowledgements.push(value), setErrorContext() {}, stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
+   context.editDraft = vm.runInContext('(' + editSource + ')', context)
+   const send = vm.runInContext('(' + sendSource + ')', context)
+   const onChange = vm.runInContext('(' + textareaSource + ')', context)
+   const pending = send({ preventDefault() {} })
+-  return { context, pending, resolve, notices, submissions, value: () => currentDraft,
++  return { context, pending, resolve, acknowledgements, submissions, value: () => currentDraft,
+     edit: text => onChange({ target: { value: text } }),
+     scope: workspace => { context.workspace = workspace; vm.runInContext(scopeSource, context) },
+     cleanup: () => vm.runInContext('(' + cleanupSource + ')', context)() }
+@@ -152,6 +262,8 @@ test('actual send still clears an unchanged successfully submitted draft', async
+   run.resolve(true); await run.pending
+   assert.equal(run.value(), '')
+   assert.equal(run.submissions[0].prompt, 'submitted text')
++  assert.equal(run.acknowledgements.at(-1).taskId, ref.task_id)
++  assert.equal(run.acknowledgements.at(-1).controller, run.context.controller.current)
+ })
+ test('actual send keeps draft after view cleanup while its promise is pending', async () => {
+   const run = pendingDraftSend()
+@@ -159,7 +271,7 @@ test('actual send keeps draft after view cleanup while its promise is pending',
+   run.resolve(true); await run.pending
+   assert.equal(run.value(), 'submitted text')
+   assert.equal(run.context.controller.current, null)
+-  assert.equal(run.notices.length, 1, 'unmounted view cannot publish the late success notice')
++  assert.deepEqual(run.acknowledgements, [null], 'unmounted view cannot publish the late success receipt')
+ })
+ test('actual scope generations preserve draft after workspace changes away and back', async () => {
+   const run = pendingDraftSend()
+@@ -173,5 +285,5 @@ test('actual send cannot clear a draft owned by a replacement controller', async
+   run.context.controller.current = { submit() { throw Error('unexpected resubmit') } }
+   run.resolve(true); await run.pending
+   assert.equal(run.value(), 'submitted text')
+-  assert.equal(run.notices.length, 1)
++  assert.deepEqual(run.acknowledgements, [null])
+ })
+diff --git a/tests/ui/harness-progress.test.mjs b/tests/ui/harness-progress.test.mjs
+index 9a4b679..c2c0f37 100644
+--- a/tests/ui/harness-progress.test.mjs
++++ b/tests/ui/harness-progress.test.mjs
+@@ -1,6 +1,6 @@
+ import test from 'node:test'
+ import assert from 'node:assert/strict'
+-import { projectHarnessProgress } from '../../apps/web/src/harness-progress.js'
++import { projectHarnessProgress, projectHarnessReceipt } from '../../apps/web/src/harness-progress.js'
+ import { harnessSubmissionBlockers } from '../../apps/web/src/harness.js'
+ 
+ const ref = { project_id: 'p', task_id: 't' }
+@@ -59,3 +59,61 @@ test('read-only permission blockers explain current reasons and retain raw codes
+   assert.deepEqual(harnessSubmissionBlockers({ can_submit: true, reason_codes: [] }), [])
+   assert.match(harnessSubmissionBlockers({ can_submit: false, reason_codes: [] })[0].message, /尚未确认/)
+ })
++
++test('receipt follows the authoritative Task after ACK, including terminal and cancel states', () => {
++  for (const status of ['FAILED', 'COMPLETED', 'CANCELLED', 'BLOCKED', 'UNKNOWN', 'CANCEL_REQUESTED']) {
++    const view = projectHarnessReceipt({ task: task(status) }, true)
++    assert.equal(view.kind, status)
++    assert.doesNotMatch(view.summary, /等待真实运行回执/)
++  }
++  assert.match(projectHarnessReceipt({ task: task('UNKNOWN') }, true).summary, /核对原请求/)
++  assert.match(projectHarnessReceipt({ task: task('CANCEL_REQUESTED') }, true).summary, /等待原任务/)
++})
++
++test('preparation wording requires the actual Host message, not an error code alone', () => {
++  const generic = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host unavailable' } } }, true)
++  assert.doesNotMatch(generic.summary, /模型未启动/)
++  assert.equal(generic.message, 'Host unavailable')
++  const explicit = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' } } }, true)
++  assert.match(explicit.summary, /模型未启动/)
++  assert.equal(explicit.code, 'HARNESS_UNAVAILABLE')
++})
++
++test('pending original request and accepted read error retain distinct, reconcilable receipts', () => {
++  const pending = projectHarnessReceipt({ pending: { request_id: 'original', kind: 'submit', state: 'UNKNOWN' } }, false)
++  assert.equal(pending.kind, 'PENDING')
++  assert.equal(pending.requestId, 'original')
++  assert.match(pending.summary, /避免重复提交/)
++  const readError = projectHarnessReceipt({ error: new Error('read disconnected') }, true)
++  assert.equal(readError.kind, 'READ_ERROR')
++  assert.match(readError.summary, /已接收.*读取失败/)
++  assert.equal(readError.message, 'read disconnected')
++  const lastKnown = projectHarnessReceipt({ task: task('QUEUED'), error: new Error('refresh disconnected') }, true)
++  assert.equal(lastKnown.kind, 'QUEUED')
++  assert.equal(lastKnown.readError, 'refresh disconnected')
++  assert.equal(projectHarnessReceipt({}), null)
++})
++
++test('an unresolved different request outranks an older Task and keeps its full identity', () => {
++  const older = { ...task('COMPLETED'), request_id: 'old-request' }
++  const pending = { request_id: 'new-request', kind: 'submit', state: 'UNKNOWN' }
++  const view = projectHarnessReceipt({ task: older, pending, error: new Error('submit outcome unknown') }, false, 'submit')
++  assert.equal(view.kind, 'PENDING')
++  assert.equal(view.requestId, 'new-request')
++  assert.equal(view.pendingKind, 'submit')
++  assert.equal(view.pendingState, 'UNKNOWN')
++  assert.equal(view.previousTaskId, ref.task_id)
++  assert.doesNotMatch(view.summary, /已结束/)
++})
++
++test('operation failures are not called read failures; an accepted get failure is', () => {
++  const submission = projectHarnessReceipt({ task: task(), error: new Error('submit rejected') }, false, 'submit')
++  assert.equal(submission.kind, 'OPERATION_ERROR')
++  assert.doesNotMatch(submission.summary, /读取失败/)
++  const cancellation = projectHarnessReceipt({ task: task(), error: new Error('cancel rejected') }, false, 'cancel')
++  assert.equal(cancellation.kind, 'OPERATION_ERROR')
++  assert.match(cancellation.summary, /取消/)
++  const read = projectHarnessReceipt({ error: new Error('get disconnected') }, true, 'submit')
++  assert.equal(read.kind, 'READ_ERROR')
++  assert.match(read.summary, /读取失败/)
++})

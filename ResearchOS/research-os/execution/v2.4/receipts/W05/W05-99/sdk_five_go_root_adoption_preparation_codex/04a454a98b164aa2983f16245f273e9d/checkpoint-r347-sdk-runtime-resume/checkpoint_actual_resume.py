@@ -1,0 +1,101 @@
+import sys
+sys.dont_write_bytecode=True
+import hashlib,json,os,types
+from pathlib import Path
+from datetime import datetime,timezone
+R=Path("D:/作品集/ResearchOS/research-os");B=R/"execution/v2.4/receipts/W05/W05-99";S=B/"sdk_five_go_root_adoption_preparation_codex/04a454a98b164aa2983f16245f273e9d";O=Path(__file__).resolve().parent
+def pin(p):
+ p=Path(p);raw=p.read_bytes();return dict(path=str(p),sha256=hashlib.sha256(raw).hexdigest(),bytes=len(raw))
+def save(name,obj):
+ p=O/name
+ with p.open("xb") as f:f.write((json.dumps(obj,ensure_ascii=False,indent=2)+"\n").encode())
+ return pin(p)
+def pending(n,path,outer=None,py=None,native=None,detail=""):
+ return dict(observed_ordinal=n,immutable_origin_ref=pin(path),actual_outer_exit=outer,actual_python_exit=py,actual_native_exit=native,provider_requests=0,diagnostic=detail,independent_subcommand_exit=None)
+v1=S/"actual-cli-bootstrap-ef1d9bf73bea42d8972dfb12c6774093";v3=S/"actual-cli-bootstrap-v3-80c7b29a01c341a884597b7da9e17c4a"
+queue=B/"mu_sdk_root_coordinator_source_codex/0436fddcf8d14b72b14ed4f5f67a045c"
+draft=B/"goal_draft_resource_gate_readonly_revision_codex/fe82636c873646c29015d3cac87c3d49"
+interrupted=B/"mu_sdk_trusted_qualification_host_v3_interrupted_handoff_codex/cbf8ba710ee64480961ddc7befc394b5"
+reviews=B/"mu_sdk_root_coordinator_v2_independent_review_codex/813337f875114e3b97ceccb0acb897fc"
+records=[
+ pending(708,B/"canonical_pair_r346_independent_review_codex/ee54d28bc4b94328a677b065e75113bb/failure-origin.708.json",1,1,detail="Read-only reviewer guessed missing 706 supplement path"),
+ pending(709,B/"mu_sdk_c7_seal_audit_count_failure_origin_codex/97b1155be61642558af5fcf9c429ff2d/failed_count_assert.stored-item-json.utf8",1,detail="Pin checker assumed14 members; actual16 pins valid"),
+ pending(710,queue/"failure-origin.710.original-tool-io.json",1,detail="Reviewer guessed nonexistent C7 Source filename"),
+ pending(711,queue/"failure-origin.711.original-tool-io.json",1,detail="Reviewer guessed nonexistent review filename"),
+ pending(712,queue/"failure-origin.712.original-tool-io.json",0,detail="Relative .local queried from wrong cwd; nonterminating diagnostic"),
+ pending(713,B/"deepseek_harness_candidate_intake_codex/8dca23f4257346148c0a614e52a3afd0/failure713.capture.json",detail="One official GitHub API web open InternalError; other scoped official reads succeeded"),
+ pending(714,v1/"failure-origin.714.original-tool-io.json",1,1,3758097160,"Actual CLI init timeout10s; first Shell chooser not observed;2 owned Jobs fully closed"),
+ pending(715,v1/"failure-origin.715.original-tool-io.json",1,detail="Read-only rg included two nonexistent source files"),
+ pending(716,queue/"failure-origin.builder.original-tool-io.json",1,1,detail="Source builder compared equivalent slash variants as distinct dicts; corrected builder receipt preserved"),
+ pending(717,S/"readonly-diagnostic-717-617ca64228b2441bb6b70bb2cb5bc3a4/failure-origin.717.original-tool-io.json",1,detail="Windows literal rg wildcard path rejected"),
+ pending(718,B/"actual_cli_bootstrap_v3_delta_review_codex/1d473bc60a0b48e29df3ea1ce297cbf7/failure-origin.718.json",0,detail="Read-only rg guessed missing workspace source file"),
+ pending(719,v3/"failure-origin.719.original-tool-io.json",1,1,3,"Actual CLI init and HWND/workspace binding passed; CLI ordinary draft blocked RESOURCE_BLOCKED because normal Host runtime omitted;3 owned Jobs fully closed"),
+]
+for n,outer in ((720,0),(721,1),(722,1),(723,1)):
+ records.append(pending(n,draft/f"failure-origin.{n}.original-commandExecution.item_json.utf8",outer,detail="Read-only search used missing or literal wildcard path; independent rg/Python/native layers not captured"))
+records += [
+ pending(724,reviews/"original-review-tool-io.json",detail="Tool history search parameter max_matches invalid; selector ordinal724 in exact review original IO"),
+ pending(725,S/"readonly-diagnostic-725-a6049fdaf7b74c2b82e3d15446fd3732/failure-origin.725.original-tool-io.json",1,1,detail="Task packet entry incorrectly guessed in repo; actual implementation package entry subsequently succeeded"),
+ pending(726,reviews/"original-review-tool-io.json",0,detail="Literal runtime* rg path invalid; selector chunk3e377e in exact review original IO"),
+]
+pre=D=B/"mu_sdk_trusted_qualification_host_source_v3_codex/c8b22080210c4a398acd8ad294ce31fc"
+# Earlier727-729 origins are included in the Source author draft intake when present.
+# The exact source entrypoint and all interrupted members were enumerated first.
+for n,outer,diag in ((727,0,"Guessed artifacts.go"),(728,1,"Literal client_protocol wildcard"),(729,1,"Guessed dispatch/handler filenames")):
+ matches=[p for d in B.glob("mu_sdk_trusted_qualification_host*") if d.is_dir() for p in d.rglob("*") if p.is_file() and str(n) in p.name and ("origin" in p.name or "commandExecution" in p.name)]
+ exact=[p for p in matches if p.suffix in (".json",".utf8",".item_json") and "manifest" not in p.name]
+ if exact:
+  records.append(pending(n,sorted(exact,key=lambda p:len(str(p)))[0],outer,detail="Read-only Source author path diagnostic: "+diag))
+ else:
+  # Preserve the missing original capture explicitly, never invent native/exit evidence.
+  ref=save(f"failure-origin.{n}.capture-gap.clarification.json",dict(observed_ordinal=n,author="codex:/root/live_resource_lookup",reported_outer_exit=outer,reported_diagnostic=diag,original_capture_available=False,source_author_report_only=True,provider_requests=0))
+  records.append(pending(n,ref["path"],detail="Original commandExecution capture gap; source author reported read-only path diagnostic; reported outer exit kept inside clarification only"))
+origins=json.loads((interrupted/"origins.json").read_bytes())
+for item in origins:
+ n=item["ordinal"]
+ if n==734:continue
+ records.append(pending(n,item["path"],item.get("outer_exit_code"),detail="Source author diagnostic preserved;731 JS ReferenceError before mutation;732 gofmt not found/no process;730/733/735 guessed paths"))
+records.append(pending(736,B/"mu_sdk_trusted_qualification_host_v3_handoff_pincheck_origin_codex/a64e2f9f394c4394a80efc7db2999827/736.commandExecution.item_json",1,detail="Reviewer count assertion16 failed; actual18 entries all hash/bytes valid"))
+records.append(pending(737,B/"mu_sdk_host_v3_narrow_review_codex/fd0f84ac6bcb5cbfe36756c29ccc7b4a/failure-origin.737.json",0,detail="Narrow Source reviewer included nonexistent top-level cmd in rg; exact input/result saved; independent rg/Python/native absent"))
+records.append(pending(738,O/"failure-origin.738.original-tool-input-visible-response.json",detail="Root apply_patch rejected duplicate delete/add operations for same unsealed Source path before mutation; corrected Update File succeeds"))
+assert [x["observed_ordinal"] for x in records]==[n for n in range(708,739) if n!=734]
+pending_ref=save("pending-origin-records.original.json",records)
+clarification=save("failure706.layer-clarification.original.json",dict(observed_ordinal=706,preserved_prior_registered_python_exit=1,current_supported_actual_python_exit=None,actual_outer_exit=1,reason="Prior Python1 was inferred from outer commandExecution exit; independent Python bridge not observed",historical_record_preserved=True,counter_reset=False))
+diagnostic734=save("diagnostic734.no-match-classification.original.json",dict(observed_ordinal=734,origin_ref=pin(interrupted/"original_io/734.commandExecution.item_json"),actual_outer_exit=1,output=None,classification="EMPTY_DISCOVERY_MATCH_WITH_DIAGNOSTICS_SUPPRESSED",failure_counted=False,reason="Get-Command silently queried absent PATH entries and rg no-match; no independent diagnostic or subcommand exit captured. Preserve observation, do not infer failure from empty output.",actual_python_exit=None,actual_native_exit=None))
+cp=R/"execution/v2.4/checkpoint.json";ow=R/"execution/v2.4/path_ownership.json"
+old=[p.read_bytes() for p in (cp,ow)];expected=[pin(p) for p in (cp,ow)]
+assert expected[0]["sha256"]=="5ce61922fd15b4dd02da8da11f0e35ccc9a4755641d6966bde0afd6006185686"
+assert expected[1]["sha256"]=="48c5641956b5f22bb48f7775e46d90494bd95944027f55070e430e207a506452"
+c=json.loads(old[0]);assert c["revision"]==346 and len(c["failure_counters"])==707
+others=[R/"execution/v2.4"/(n+".json") for n in ("step_state","commands")];other_raw=[p.read_bytes() for p in others]
+gp=B/"source_read_guard_revision_v2_codex/d6d10c192b1940ed9c11a957411aecd9/source_read_guard.py";tp=B/"mu_sdk_controller_revision_v5_codex/e5953a6723c44426a05b5bb540186cdc/canonical_transactions.py"
+assert pin(gp)["sha256"]=="e75ae31b45cf9bbe82b3930173a068e66f012dfa0468a2ed36cfd9e359115b85"
+assert pin(tp)["sha256"]=="094e1a97fb00d01412b4e71e2d740b800accfce00e607c6853cb634280b12ba9"
+gm=types.ModuleType("root_cp347_guard");gm.__file__=str(gp);exec(compile(gp.read_bytes(),str(gp),"exec"),gm.__dict__)
+guard=gm.SourceReadGuard();guard.acquire([pin(gp),pin(tp),pin(Path(__file__).resolve())])
+tm=types.ModuleType("root_cp347_transaction");tm.__file__=str(tp);exec(compile(guard.get_buffer(str(tp)),str(tp),"exec"),tm.__dict__)
+def transform(checkpoint,ownership):
+ assert checkpoint["revision"]==346 and len(checkpoint["failure_counters"])==707 and ownership["revision"]==168
+ keys={x.get("origin_key") for x in checkpoint["failure_counters"]}
+ for payload in records:
+  ref=payload["immutable_origin_ref"];key=hashlib.sha256((ref["sha256"]+"#"+str(payload["observed_ordinal"])).encode()).hexdigest();assert key not in keys;keys.add(key)
+  checkpoint["failure_counters"].append(dict(origin_key=key,evidence_ref=ref,original_payload=payload,counted_once=True,counter_reset=False,automatic_retry=False))
+ assert checkpoint["failure_counters"][:707]==c["failure_counters"] and len(checkpoint["failure_counters"])==737
+ checkpoint.update(expected_previous_revision=346,revision=347,updated_at=datetime.now(timezone.utc).isoformat(),updated_by="codex:/root")
+ w=checkpoint["work_in_progress"]
+ w.update(r347_registered_failure_count=737,r347_highest_observed_diagnostic_ordinal=738,r347_uncounted_no_match_diagnostic_ref=diagnostic734,failure706_current_layer_clarification_ref=clarification,mu_sdk_runtime_qualification=False,mu_sdk_live_execution_grant_issued=False,mu_sdk_actual_external_provider_requests_current_trial=0,mu_sdk_source_authors_active=["codex:/root: staged TrustedHost completion"],mu_sdk_source_readonly_reviewers_active=["codex:/root/w05_merge_review: staged TrustedHost APIs"],mu_sdk_controller_state="C7_O4_READY_SOURCE_ONLY_NO_TRIAL",mu_sdk_actual_cli_init_state="ACTUAL_CLI_INIT_AND_REAL_HWND_WORKSPACE_BINDING_PASSED_ORDINARY_DRAFT_RESOURCE_BLOCKED",mu_sdk_existing_isolated_data_root=str(R/".local/mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"),mu_sdk_existing_project_id="a814e5698c6b65a8423bbe0bcd1c94f1",mu_sdk_existing_workspace_ref="wsref-4025b6c00d1a0adb",mu_sdk_actual_cli_bootstrap_component_handoff_ref=pin(B/"actual_cli_bootstrap_v3_component_independent_review_codex/d391a2e49cf24d559e7d58016b8eb41e/handoff.json"),mu_sdk_interrupted_trusted_host_v3_handoff_ref=pin(interrupted/"handoff.json"),mu_sdk_root_coordinator_v3_handoff_ref=pin(B/"mu_sdk_root_coordinator_source_v3_codex/f02d7bbd33534835985bfd5a87f6bd67/handoff.json"),mu_sdk_all_bootstrap_owned_jobs_closed=True,mu_sdk_current_goal_draft_block_reason="normal Host started without RuntimeCoordinator; typed DRAFT requires a real runtime model binding",mu_sdk_next_action="Complete staged prepare-runtime via production qualification Goal+DRAFT Task+plan binding; continue existing initialized project CLI draft with real coordinator; finalize; narrow independent review; one bounded provider trial")
+ checkpoint["note"]="CP347 resumes existing successful real CLI init/workspace binding. Preserve prior707 failures and old dirty work; append30 origin observations708-738 except734 empty no-match classified observation only. Clarify706 independent Python layer unsupported without changing historical record. C7/O4 Source ready; coordinatorv3 pending delta review; TrustedHostv3 interrupted Source pending Root completion. Actual provider0/grants0,qualificationfalse;6/22 historical parents,0/42 current formal. No acceptance advanced; OW168/SS/CM unchanged."
+ return checkpoint,ownership
+try:
+ result=tm.update_pair(expected,transform,O,"activate")
+ assert json.loads(cp.read_bytes())["revision"]==347 and len(json.loads(cp.read_bytes())["failure_counters"])==737 and ow.read_bytes()==old[1]
+ assert [p.read_bytes() for p in others]==other_raw
+finally:
+ cleanup=guard.close();assert cleanup["closed"] and cleanup["retained_handles_count"]==0 and not cleanup["errors"]
+ save("source_guard.cleanup.actual.json",cleanup)
+proof=save("canonical_pair.actual.json",dict(transaction=result,checkpoint_ref=pin(cp),ownership_ref=pin(ow),unchanged_other_canonical=[pin(p) for p in others],old707_preserved=True,registered_failures=737,highest_observed_diagnostic_ordinal=738,no_match734_counted=False,provider_requests=0,completion_asserted=False))
+resume=save("RESUME.r347.original.json",dict(schema="researchos.root-resume-sdk-runtime-v3",project_id=c["project_id"],repository_root=str(R),head=c["head"],checkpoint_ref=pin(cp),checkpoint_revision=347,ownership_revision=168,current_card="W05-99",accepted_parents=6,formal_cases_current_accepted=0,formal_cases_required=42,registered_failures=737,highest_diagnostic_ordinal=738,provider_requests_current_trial=0,execution_grant=False,runtime_qualification=False,existing_cli_project="a814e5698c6b65a8423bbe0bcd1c94f1",existing_data_root=str(R/".local/mu-sdk-isolated-project-ed84838046934329a76733a005c9b162"),all_bootstrap_jobs_closed=True,next_action="Root completes staged TrustedHost production runtime preparation before continuing existing CLI ordinary draft; no init repeat",proof_ref=proof,completion_asserted=False))
+members=[pin(p) for p in O.iterdir() if p.is_file()];manifest=save("manifest.json",dict(schema="researchos.receipt-manifest.v1",members=members))
+handoff=save("handoff.json",dict(status="CHECKPOINT_SAVED_RESUME_ACTIVE",checkpoint_ref=pin(cp),resume_ref=resume,manifest_ref=manifest,registered_failures=737,highest_observed_ordinal=738,diagnostic734_failure_counted=False,formal_acceptance=False))
+print(json.dumps(dict(checkpoint_ref=pin(cp),resume_ref=resume,handoff_ref=handoff,registered_failures=737,provider_requests=0)),flush=True)
+

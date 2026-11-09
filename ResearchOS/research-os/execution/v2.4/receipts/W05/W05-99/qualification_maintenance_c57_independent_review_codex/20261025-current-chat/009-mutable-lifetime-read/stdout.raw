@@ -1,0 +1,152 @@
+411:func OpenCurrentQuiescence(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) (*CurrentQuiescence, error) {
+412:	if e := ctx.Err(); e != nil {
+413:		return nil, e
+414:	}
+415:	if held == nil || !held.Held() || held.Root() != dataRoot || database != filepath.Join(dataRoot, "researchos.sqlite") || !validOperation(operationID) || !validDigest(planSHA256) {
+416:		return nil, errors.New("current quiescence held lease or binding invalid")
+417:	}
+418:	lease, e := held.MaintenanceIdentity()
+419:	if e != nil {
+420:		return nil, e
+421:	}
+422:	// Discovery is by fixed ProgramData inventory. We never accept a path from
+423:	// a caller or a JSON supplied capability.
+424:	p, e := discoverPlan(dataRoot, operationID, planSHA256)
+425:	if e != nil {
+426:		return nil, e
+427:	}
+428:	if e = ValidatePlan(p); e != nil {
+429:		return nil, e
+430:	}
+431:	if p.DataRoot.Path != dataRoot || p.Database.Path != database {
+432:		return nil, errors.New("current quiescence source mismatch")
+433:	}
+434:	holds, e := openPlanHolds(p)
+435:	if e != nil {
+436:		return nil, e
+437:	}
+438:	fail := func(e error) (*CurrentQuiescence, error) { closeHolds(holds); return nil, e }
+439:	r, e := readRecord(p)
+440:	if e != nil {
+441:		return fail(e)
+442:	}
+443:	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" {
+444:		return fail(errors.New("boundary not boot observed"))
+445:	}
+446:	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+447:		return fail(e)
+448:	}
+449:	if e = checkFence(p, holds); e != nil {
+450:		return fail(e)
+451:	}
+452:	if e = checkHolds(holds); e != nil {
+453:		return fail(e)
+454:	}
+455:	if e = lease.Matches(held); e != nil {
+456:		return fail(e)
+457:	}
+458:	q := &CurrentQuiescence{owner: &quiescenceOwner{lease: lease, plan: p, post: r.Post, holds: holds}}
+459:	return q, nil
+460:}
+461:
+462:func discoverPlan(root, operation, sha string) (EntryFencePlan, error) {
+463:	var p EntryFencePlan
+464:	base := os.Getenv("ProgramData")
+465:	if base == "" {
+466:		return p, errors.New("ProgramData unavailable")
+467:	}
+468:	parent := filepath.Join(base, "ResearchOS", "RecoveryBoundary")
+469:	entries, e := os.ReadDir(parent)
+470:	if e != nil {
+471:		return p, e
+472:	}
+473:	if len(entries) > 128 {
+474:		return p, errors.New("boundary root inventory too large")
+475:	}
+476:	var found int
+477:	for _, entry := range entries {
+478:		if !entry.IsDir() || !validDigest(entry.Name()) {
+479:			return p, errors.New("unknown boundary root inventory")
+480:		}
+481:		path := filepath.Join(parent, entry.Name(), operation, "plan.json")
+482:		raw, e := os.ReadFile(path)
+483:		if errors.Is(e, os.ErrNotExist) {
+484:			continue
+485:		}
+486:		if e != nil || len(raw) > 256<<10 {
+487:			return p, errors.New("boundary plan unavailable")
+488:		}
+489:		var candidate EntryFencePlan
+490:		if e = json.Unmarshal(raw, &candidate); e != nil {
+491:			return p, e
+492:		}
+493:		if candidate.OperationID == operation && candidate.PlanSHA256 == sha && candidate.DataRoot.Path == root {
+494:			p = candidate
+495:			found++
+496:		}
+497:	}
+498:	if found != 1 {
+499:		return p, errors.New("exact boundary operation not found")
+500:	}
+501:	return p, nil
+502:}
+503:
+504:func (q *CurrentQuiescence) Check(ctx context.Context, held *rt.DataRootLease, dataRoot, database, operationID, planSHA256 string) error {
+505:	if e := ctx.Err(); e != nil {
+506:		return e
+507:	}
+508:	if q == nil || q.owner == nil {
+509:		return errors.New("current quiescence absent")
+510:	}
+511:	o := q.owner
+512:	o.mu.Lock()
+513:	defer o.mu.Unlock()
+514:	if o.closed || o.plan.DataRoot.Path != dataRoot || o.plan.Database.Path != database || o.plan.OperationID != operationID || o.plan.PlanSHA256 != planSHA256 {
+515:		return errors.New("current quiescence binding stale")
+516:	}
+517:	if e := o.lease.Matches(held); e != nil {
+518:		return e
+519:	}
+520:	if e := checkHolds(o.holds); e != nil {
+521:		return e
+522:	}
+523:	r, e := readRecord(o.plan)
+524:	if e != nil {
+525:		return e
+526:	}
+527:	if len(r.Events) == 0 || r.Events[len(r.Events)-1].State != "BOOT_OBSERVED" || r.Post != o.post {
+528:		return errors.New("current quiescence state changed")
+529:	}
+530:	if e = ValidateRestart(r.Pre, r.Post); e != nil {
+531:		return e
+532:	}
+533:	return checkFence(o.plan, o.holds)
+534:}
+535:
+536:func (q *CurrentQuiescence) Close() error {
+537:	if q == nil || q.owner == nil {
+538:		return errors.New("current quiescence absent")
+539:	}
+540:	o := q.owner
+541:	o.mu.Lock()
+542:	defer o.mu.Unlock()
+543:	if o.closed {
+544:		return errors.New("current quiescence already closed")
+545:	}
+546:	o.closed = true
+547:	closeHolds(o.holds)
+548:	o.holds = nil
+549:	return nil
+550:}
+
+Algorithm : SHA256
+Hash      : EA72883E28DD7C7A37D0FE3FA85957E9406CB774EBF716DE791E69D635559981
+Path      : D:\作品集\ResearchOS\research-os\.local\worktrees\qualification-maintenance-c57-20261025\internal\recoveryb
+            oundary\boot_windows.go
+
+
+Algorithm : SHA256
+Hash      : B0861156EAD5DD71FB081A4AEA92ABEC37510ED5C0A263EFF07D07F4F7A973DE
+Path      : D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\resume_cp528_codex\20261025-current-cha
+            t\continuation-cp539\C57-independent-review-preparation-scope.json
+

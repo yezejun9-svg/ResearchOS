@@ -1,0 +1,30 @@
+func TestIndependentGoUnicodeTypesAndFrameBounds(t *testing.T) {
+    for _, mode := range []string{"invalid-utf8","lone-surrogate","ref-type","null-kind","bad-calendar","expired-offset","oversize-reply","escaped-valid-key","token-invalid-utf8","token-too-long","oversize-native-frame"} { t.Run(mode,func(t *testing.T){
+        c,_,_:=attestFixture(t)
+        if mode=="token-invalid-utf8" {c.credential=string([]byte{0xff})}
+        if mode=="token-too-long" {c.credential=strings.Repeat("界",1025)}
+        if mode=="oversize-native-frame" {c.projectID=strings.Repeat("p",9000)}
+        nativeCalls,sent:=0,0
+        installAttestFakes(t,func(string,[]byte)([]byte,error){
+            nativeCalls++
+            raw:=string(attestReply())
+            switch mode {
+            case "invalid-utf8":return []byte{0xff},nil
+            case "lone-surrogate":raw=strings.Replace(raw,`"schema_version":1`,`"schema_version":1,"\ud800":1`,1)
+            case "ref-type":raw=strings.Replace(raw,`"attestation_ref":"natt-`+strings.Repeat("a",64)+`"`,`"attestation_ref":123`,1)
+            case "null-kind":raw=strings.Replace(raw,`"kind":"NATIVE_CLIENT_ATTEST_RESULT"`,`"kind":null`,1)
+            case "bad-calendar", "expired-offset":
+                var value map[string]any;json.Unmarshal([]byte(raw),&value)
+                expiry:="2030-02-31T00:00:00Z";if mode=="expired-offset" {expiry="2000-01-01T00:00:00+23:59"}
+                value["payload"].(map[string]any)["expires_at"]=expiry;data,_:=json.Marshal(value);raw=string(data)
+            case "oversize-reply":raw+=strings.Repeat(" ",8192)
+            case "escaped-valid-key":raw=strings.Replace(raw,`"kind":`,`"\u006bind":`,1)
+            }
+            return []byte(raw),nil
+        },func(*http.Request)(*http.Response,error){sent++;return &http.Response{StatusCode:503,Body:io.NopCloser(strings.NewReader("fake-only")),Header:make(http.Header)},nil})
+        reply,_,_:=v2Call(c,"session.create",createAttestPayload())
+        if mode=="escaped-valid-key" {if sent!=1||nativeCalls!=1 {t.Fatal("valid decoded canonical key rejected")};return}
+        if sent!=0||reply["dispatch_state"]!="NOT_SENT" {t.Fatalf("negative did not remain unsent: sent=%d",sent)}
+        if strings.HasPrefix(mode,"token-")||mode=="oversize-native-frame" {if nativeCalls!=0 {t.Fatal("bad credential/frame reached Native")}}
+    }) }
+}

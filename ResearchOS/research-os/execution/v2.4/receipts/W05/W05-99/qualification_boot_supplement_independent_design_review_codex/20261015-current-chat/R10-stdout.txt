@@ -1,0 +1,316 @@
+B75_RAW_MATCH 38837
+func (s *Service) validatedQualificationFailureTx(tx *sql.Tx, project, taskID, runID string, epoch int64) (qualificationFailureClosure, error) {
+	var zero qualificationFailureClosure
+	unavailable := func() (qualificationFailureClosure, error) {
+		return zero, errors.New("QUALIFICATION_FAILURE_PROOF_UNAVAILABLE")
+	}
+	if tx == nil || project == "" || taskID == "" || runID == "" || epoch < 1 {
+		return unavailable()
+	}
+	rows, err := tx.Query(`SELECT principal,key,request_hash,body FROM idempotency WHERE project=? AND operation='host:qualification-failure-closure' AND json_extract(body,'$.subject.task_id')=? AND json_extract(body,'$.subject.run_id')=? AND json_extract(body,'$.subject.epoch')=?`, project, taskID, runID, epoch)
+	if err != nil {
+		return zero, err
+	}
+	type stored struct{ author, key, requestHash, raw string }
+	var markers []stored
+	for rows.Next() {
+		var current stored
+		if err = rows.Scan(&current.author, &current.key, &current.requestHash, &current.raw); err != nil {
+			rows.Close()
+			return zero, err
+		}
+		markers = append(markers, current)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return zero, err
+	}
+	if len(markers) != 1 {
+		return unavailable()
+	}
+	storedMarker := markers[0]
+	marker, err := Decode([]byte(storedMarker.raw))
+	if err != nil || marker["schema"] != "researchos.qualification-failure-closure.v1" || marker["kind"] != onlineQualificationDenial || marker["author"] != storedMarker.author || marker["key"] != storedMarker.key || marker["plan_file_sha256"] != storedMarker.requestHash || Str(marker, "denial_digest") == "" {
+		return unavailable()
+	}
+	subject, ok := marker["subject"].(map[string]any)
+	if !ok || subject["project_id"] != project || subject["task_id"] != taskID || subject["run_id"] != runID || Hash(subject["epoch"]) != Hash(epoch) || storedMarker.key != qualificationClosureKey(qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, Str(marker, "denial_digest")) {
+		return unavailable()
+	}
+	principal, err := clientAuthenticatedPrincipal(context.Background(), tx, storedMarker.author)
+	if err != nil || !principal.HasRole("SCHEDULER") || !principal.Allowed(project, "", "", false) {
+		return unavailable()
+	}
+	ownerRoot, err := currentAuthorityRoot(tx, principal.ID)
+	if err != nil || ownerRoot == "" || marker["owner_root"] != ownerRoot {
+		return unavailable()
+	}
+	owner, err := clientAuthenticatedPrincipal(context.Background(), tx, ownerRoot)
+	if err != nil || !owner.HasRole("OWNER") || !owner.Allowed(project, "", "", false) {
+		return unavailable()
+	}
+	run, err := load(tx, project, "Run", runID)
+	if err != nil || run["status"] != "FAILED" || run["task_id"] != taskID || Hash(run["lease_epoch"]) != Hash(epoch) || run["children_stopped"] != true || run["queue_empty"] != true || Hash(Ref(run, "Run")) != Hash(marker["terminal_run_ref"]) {
+		return unavailable()
+	}
+	task, err := load(tx, project, "Task", taskID)
+	if err != nil || task["task_type"] != "runtime_qualification" || task["active_run_id"] != runID {
+		return unavailable()
+	}
+	plan, planHash, planRoot, err := qualificationPlan(tx, project, taskID, Str(run, "runtime_id"))
+	if err != nil || planRoot != ownerRoot || plan["task_hash"] != qualificationTaskHash(task) {
+		return unavailable()
+	}
+	var markerCount int
+	if err = tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=? AND plan_hash=? AND owner_root=?`, project, taskID, runID, run["runtime_id"], epoch, planHash, ownerRoot).Scan(&markerCount); err != nil || markerCount != 1 {
+		return unavailable()
+	}
+	ref, ok := marker["proof_ref"].(map[string]any)
+	if !ok || ref["entity_type"] != "Artifact" {
+		return unavailable()
+	}
+	artifact, err := version(tx, project, ref)
+	if err != nil || artifact["kind"] != "MANIFEST" || artifact["evidence_kind"] != "GENERATED" || artifact["measurement_mode"] != "LIVE" || artifact["run_id"] != nil || artifact["access_class"] != "PROJECT" || artifact["produced_by"] != principal.ID || artifact["sealed_at"] == nil || artifact["validity"] != "CURRENT" || artifact["media_type"] != "application/json" || Hash(Ref(artifact, "Artifact")) != Hash(ref) || len(Arr(artifact, "input_refs")) != 1 || Hash(Arr(artifact, "input_refs")[0]) != Hash(plan["profile_ref"]) || len(Arr(artifact, "source_refs")) != 0 {
+		return unavailable()
+	}
+	profileRef, profileOK := plan["profile_ref"].(map[string]any)
+	if !profileOK || s.effective(tx, project, Object(profileRef)) != nil {
+		return unavailable()
+	}
+	var raw []byte
+	var uploadHash, uploadPrincipal string
+	var sealed int
+	if err = tx.QueryRow(`SELECT bytes,content_hash,principal,sealed FROM uploaded_content WHERE project=? AND storage_key=?`, project, artifact["storage_key"]).Scan(&raw, &uploadHash, &uploadPrincipal, &sealed); err != nil || sealed != 1 || uploadPrincipal != principal.ID || uploadHash != Digest(raw) || artifact["content_hash"] != uploadHash || Hash(artifact["byte_size"]) != Hash(len(raw)) || len(raw) == 0 || len(raw) > 64*1024 {
+		return unavailable()
+	}
+	proof, err := Decode(raw)
+	if err != nil || proof["schema"] != "researchos.qualification-failure-proof.v1" || proof["kind"] != onlineQualificationDenial || proof["author"] != principal.ID || proof["owner_root"] != ownerRoot || Hash(proof["subject"]) != Hash(subject) || proof["rejection_digest"] != marker["denial_digest"] {
+		return unavailable()
+	}
+	core, ok := proof["plan_core"].(map[string]any)
+	if !ok || Hash(core) != proof["plan_hash"] || proof["plan_hash"] != marker["plan_hash"] || marker["plan_file_sha256"] != Digest(Bytes(Object{"core": core, "proof": proof})) || core["author"] != principal.ID || core["owner_root"] != ownerRoot || Hash(core["subject"]) != Hash(subject) || core["upload_key"] != artifact["storage_key"] || core["artifact_id"] != artifact["id"] || core["before_dispatch_hash"] != Hash(core["before_dispatch"]) || core["observation_hash"] != marker["observation_hash"] || core["observed_at"] != proof["observed_at"] || run["runtime_settled_at"] != core["observed_at"] || run["ended_at"] != core["observed_at"] {
+		return unavailable()
+	}
+	rejection, ok := proof["rejection"].(map[string]any)
+	if !ok || rejection["schema"] != "researchos.qualification-pre-effect-rejection.v1" || rejection["kind"] != onlineQualificationDenial || rejection["stage"] != "BEFORE_PREPARE_EFFECT_TX" || rejection["outcome"] != "NO_EFFECT" || rejection["rule"] != "QUALIFICATION_MODEL_ONLY_V1" || Hash(rejection) != marker["denial_digest"] || rejection["frame_key"] != proof["rejected_effect_key"] || rejection["frame_route"] != proof["model_route"] || rejection["frame_sequence"] == nil || Hash(rejection["frame_sequence"]) != Hash(3) || rejection["plan_hash"] != planHash || rejection["project_id"] != project || rejection["task_id"] != taskID || rejection["run_id"] != runID || Hash(rejection["epoch"]) != Hash(epoch) {
+		return unavailable()
+	}
+	observation, ok := proof["derived_observation"].(map[string]any)
+	protocol, protocolOK := observation["protocol"].(map[string]any)
+	qf, qfOK := observation["qualification_failure"].(map[string]any)
+	if !ok || !protocolOK || !qfOK || observation["state"] != "FAILED" || observation["queue_empty"] != true || observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Hash(protocol["frames"]) != Hash(3) || Hash(protocol["acknowledged"]) != Hash(2) || Hash(protocol["verified_rejected"]) != Hash(1) || qf["denial_digest"] != marker["denial_digest"] || qf["raw_stdout_hash"] == "" || qf["raw_bridge_hash"] == "" || Hash(observation) != marker["observation_hash"] || Hash(run["exit_code"]) != Hash(observation["exit_code"]) {
+		return unavailable()
+	}
+	native, nativeOK := proof["native"].(map[string]any)
+	broker, brokerOK := proof["broker"].(map[string]any)
+	if !nativeOK || !brokerOK || native["journal_hash"] != qf["raw_bridge_hash"] || native["stdout_hash"] != qf["raw_stdout_hash"] || native["stderr_hash"] != qf["raw_stderr_hash"] || native["ended"] != qf["native_ended"] || Hash(native["exit_code"]) != Hash(run["exit_code"]) || Hash(native["frames"]) != Hash(3) || Hash(native["acknowledged"]) != Hash(2) || native["cancelled"] != true || Hash(broker["accepted"]) != Hash(2) || Hash(broker["completed"]) != Hash(2) || Hash(broker["pending"]) != Hash(0) || Hash(broker["rejected_sequence"]) != Hash(3) {
+		return unavailable()
+	}
+	var observedRaw string
+	if err = tx.QueryRow(`SELECT body FROM runtime_observations WHERE project=? AND run=? AND epoch=? AND receipt_hash=?`, project, runID, epoch, marker["observation_hash"]).Scan(&observedRaw); err != nil || observedRaw != string(Bytes(observation)) {
+		return unavailable()
+	}
+	dispatch, err := runtimeDispatch(tx, project, runID, epoch)
+	if err != nil || dispatch["state"] != "OBSERVED" || dispatch["observation_hash"] != marker["observation_hash"] || Hash(dispatch["observation_sequence"]) != Hash(core["dispatch_observation_sequence"]) || dispatch["manifest_hash"] != rejection["manifest_hash"] || dispatch["dispatch_key"] != rejection["dispatch_key"] {
+		return unavailable()
+	}
+	beforeDispatch, _ := core["before_dispatch"].(map[string]any)
+	if beforeDispatch == nil || beforeDispatch["dispatch_key"] != dispatch["dispatch_key"] || beforeDispatch["manifest_hash"] != dispatch["manifest_hash"] || Hash(beforeDispatch["manifest"]) != Hash(dispatch["manifest"]) || beforeDispatch["worker"] != dispatch["worker"] || Hash(beforeDispatch["identity"]) != Hash(dispatch["identity"]) {
+		return unavailable()
+	}
+	var effectCount, rejectCount int
+	if err = tx.QueryRow(`SELECT count(DISTINCT effect_key),sum(CASE WHEN effect_key=? THEN 1 ELSE 0 END) FROM resource_effects WHERE project=? AND run=?`, proof["rejected_effect_key"], project, runID).Scan(&effectCount, &rejectCount); err != nil || effectCount != 1 || rejectCount != 0 {
+		return unavailable()
+	}
+	model, err := latestEffect(tx, project, runID, Str(proof, "model_effect_key"))
+	if err != nil || model["state"] != "CONFIRMED" || model["receipt"] == nil {
+		return unavailable()
+	}
+	var ledgerRaw string
+	var ledgerCount int
+	if err = tx.QueryRow(`SELECT count(*),coalesce(max(body),'') FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, project, runID).Scan(&ledgerCount, &ledgerRaw); err != nil || ledgerCount != 1 {
+		return unavailable()
+	}
+	ledger, err := Decode([]byte(ledgerRaw))
+	if err != nil || ledger["operation"] != "UNKNOWN" || ledger["money"] != nil || ledger["provider_request_id"] != proof["model_effect_key"] {
+		return unavailable()
+	}
+	link, err := load(tx, project, "ImpactLink", Str(core, "impact_link_id"))
+	event, eventErr := load(tx, project, "EventEnvelope", Str(core, "event_id"))
+	var snapshotRaw, outboxRaw string
+	if err != nil || eventErr != nil || link["relation"] != "DERIVED_FROM" || Hash(link["from_ref"]) != Hash(ref) || Hash(link["to_ref"]) != Hash(plan["profile_ref"]) || event["event_type"] != "RUN_CHANGED" || event["actor_id"] != principal.ID || event["correlation_id"] != core["correlation_id"] || Hash(event["aggregate_ref"]) != Hash(Ref(run, "Run")) || tx.QueryRow(`SELECT body FROM event_state_snapshots WHERE project=? AND event_id=?`, project, event["id"]).Scan(&snapshotRaw) != nil || tx.QueryRow(`SELECT body FROM outbox WHERE project=? AND sequence=? AND id=?`, project, core["event_sequence"], event["id"]).Scan(&outboxRaw) != nil || outboxRaw != string(Bytes(event)) {
+		return unavailable()
+	}
+	state, err := Decode([]byte(snapshotRaw))
+	if err != nil || Hash(state["event_sequence"]) != Hash(core["event_sequence"]) {
+		return unavailable()
+	}
+	outcomeHash := Hash(Object{"artifact": artifact, "impact_link": link, "run": run, "project_state": state, "event": event, "observation": observation, "dispatch_state": "OBSERVED", "dispatch_sequence": core["dispatch_observation_sequence"], "before_run_hash": core["before_run_hash"], "before_state_hash": core["before_state_hash"], "before_dispatch_hash": core["before_dispatch_hash"]})
+	if outcomeHash != marker["outcome_hash"] {
+		return unavailable()
+	}
+	return qualificationFailureClosure{subjectValue: qualificationFailureSubject{project: project, task: taskID, run: runID, epoch: epoch}, proofValue: Object(ref), seal: Hash(marker)}, nil
+}
+
+C_CONSTRAINTS {
+  "schema": "researchos.C-lease-and-narrow-classification-design-adoption.v1",
+  "at": "2026-10-15T11:37:01.759797+00:00",
+  "status": "DESIGN_CONSTRAINTS_ADOPTED_NOT_SOURCE_OR_ACTUAL_AUTHORITY",
+  "independent_review_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_independent_review_codex/20261015-current-chat/FINAL-manifest.json",
+    "sha256": "c1f517f80da18e29a3b2f27c278ac65828372513552d35e3c7fc75ad5eb7b807",
+    "bytes": 17101
+  },
+  "lease_scope_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/qualification_failure_revision03_architecture_codex/20261015-current-chat/C-lease-exact-scope.json",
+    "sha256": "ef69f8dcd63578f3692439b95f5ba21c155aeb75bc362bc9a52c65f4352f78b3",
+    "bytes": 4127
+  },
+  "mandatory_addendum": {
+    "C": [
+      {
+        "id": "C-LD01",
+        "priority": "P1",
+        "title": "Parent lease copies and legacy borrow release share one lifetime",
+        "evidence": [
+          "adapters/runtime/data_root_windows.go:16-22",
+          "adapters/runtime/data_root_windows.go:58-107",
+          "18.stdout.raw"
+        ],
+        "problem": "Current exported DataRootLease value contains mutex, file and borrowed flag directly. External code can copy the value without touching private fields. Revision03 explicitly protects borrow copies but does not explicitly protect parent copies or distinguish old ReturnBorrow from the new maintenance borrower. A copied parent could Close its copied state while a maintenance borrower is active; a reused boolean could let ReturnBorrow clear the wrong borrow.",
+        "required": "Make every DataRootLease value point to one private heap owner-state containing mutex, file, generation, closed state and active borrow identity/kind. Copies, Root/Held/Close, old Borrow/ReturnBorrow and new Maintenance methods must consult that same state. Nil/zero parent and borrow must fail closed without panic. Legacy ReturnBorrow may release only an active legacy coordinator borrow; it must reject an active maintenance borrow. Maintenance Release consumes only its exact private generation-bound token, and cannot release a later or legacy borrow. Parent Close refuses either live borrow and invalidates all copies atomically on successful close. No lock held while recursively calling a method that takes it.",
+        "paths": [
+          "adapters/runtime/data_root_windows.go",
+          "adapters/runtime/qualification_maintenance_gate_windows_test.go"
+        ],
+        "tests": [
+          "Copy parent before borrow; copied Close refuses and original Held remains true.",
+          "Copy parent/borrow; release one borrow; stale copy cannot release a newly acquired borrow.",
+          "Legacy ReturnBorrow during maintenance borrow fails and cannot enable Close; concurrent legacy/maintenance borrow admits only one.",
+          "Zero-value Close/Check/Borrow never panics and never claims Held."
+        ]
+      },
+      {
+        "id": "C-LD02",
+        "priority": "P1",
+        "title": "One normalization and identity guard across all upgrade branches",
+        "evidence": [
+          "internal/domain/backup_upgrade.go:120-135,245-253",
+          "internal/domain/backup_configuration_upgrade.go:174-191",
+          "internal/domain/backup_queue_upgrade.go:320-337",
+          "19.stdout.raw"
+        ],
+        "problem": "All five plans enter the new adapter, but queue/configuration branches call upgradePaths again and then open templates/source later. Merely retaining coordinator.lock and checking a path at adapter entry does not stop a source/root rename or alias change before a downstream open. The text requires revalidation after normalization but does not place it in these existing common call sites.",
+        "required": "Within the existing allowed backup_upgrade.go, make the shared upgradePaths path finish by validating opt.sourceLease against the final normalized root/source for guarded production workflows, before returning to any branch. The private adapter/source borrow must retain native no-delete/rename guards for the exact root path components and source file identity until all downstream DB defers complete; metadata handles may share read/write needed by SQLite but cannot permit identity replacement. Check canonical containment, no reparse and exact native file identities. Existing prepared wrapper Check remains required. Public UpgradeLocal/UpgradePreparedAbandonmentBackup stay fail-closed before any provider/key/template/store work. Isolated private legacy algorithm fixtures cannot count as guarded entry proof. This selected central implementation avoids adding queue/configuration production files; if the builder cannot implement these persistent guards, STOP and request an exact scope addition for explicit checks, rather than omit the invariant.",
+        "paths": [
+          "internal/domain/backup_upgrade.go",
+          "internal/domain/backup_source_lease_windows.go",
+          "adapters/runtime/data_root_windows.go",
+          "internal/domain/backup_source_lease_windows_test.go",
+          "internal/domain/backup_configuration_upgrade_test.go",
+          "internal/domain/backup_queue_upgrade_test.go",
+          "internal/domain/backup_upgrade_test.go"
+        ],
+        "tests": [
+          "Exercise every five-plan dispatch using a real held lease, including normalized option copy.",
+          "Attempt source file/root component replacement after adapter borrow and before template/source open; deny replacement or fail before forbidden setup.",
+          "Prepared nested local/handoff inner Close/error leaves outer Held and cannot release the native owner.",
+          "Forbidden Canary/key/provider/template/store sentinel remains untouched for invalid plans, wrong identity and pending journals."
+        ]
+      },
+      {
+        "id": "C-LD03",
+        "priority": "P1",
+        "title": "Exact-own recovery validates the pending transition, not only prior terminal target",
+        "evidence": [
+          "internal/host/runtime_verifier_replacement_windows.go:752-771",
+          "internal/host/runtime_verifier_replacement_journal_windows.go:315-405",
+          "12.stdout.raw",
+          "19.stdout.raw"
+        ],
+        "problem": "Replacement can die after ReplaceFile while journal remains PUBLISHING and target already equals NewBytes. Applying ordinary history-current/latest-terminal-target comparison before granting its exact own inspection permit would reject this legitimate recovery. Treating the permit as a broad pending exemption would create the opposite flaw.",
+        "required": "Freeze two separate pure predicates in the shared reader: ordinary acquisition validates complete history and current terminal target; exact-own inspection validates the full causal history including the one exact pending operation and its permitted current old/new state using the existing replacementRecover applied/unapplied evidence predicates. Include exact namespace/root/operation/plan digest and bounded file inventory. PREPARED/PUBLISHING partial histories may enter only the exact recovery inspection that existing recovery rules permit; no ordinary lease or backup borrow may pass. The other namespace and every non-own pending operation always deny. PUBLISHING with exact applied NewBytes may be inspected/completed; it cannot abort or replay ReplaceFile. Unknown/mixed/tampered backup/stage/hash evidence denies. C own inspection must similarly preserve its existing NOT_APPLIED/ABORTED rules. Revalidate under the held lock; no serialized permit, callback, bool or raw handle supplies authority.",
+        "paths": [
+          "internal/qualificationmaintenancejournal/replacement_windows.go",
+          "internal/qualificationmaintenancejournal/replacement_windows_test.go",
+          "internal/host/runtime_verifier_replacement_windows.go",
+          "internal/host/runtime_verifier_replacement_journal_windows.go",
+          "adapters/runtime/data_root_windows.go",
+          "adapters/runtime/qualification_maintenance_gate_windows_test.go"
+        ],
+        "tests": [
+          "Both PUBLISHING-before-ReplaceFile and PUBLISHING-after-ReplaceFile retain the exact existing recovery result.",
+          "A prior completed replacement followed by pending own replacement never requires target to remain predecessor bytes once own publish applied.",
+          "Own C permit cannot exempt replacement; own replacement cannot exempt C; backup borrow rejects both exceptions.",
+          "Unknown inventory, wrong plan/root/operation, concurrent second pending entry and changed target all fail closed."
+        ]
+      }
+    ],
+    "F01_worker": [
+      {
+        "id": "F01-D01",
+        "required": "The new historical type states only HOST_TOOL_EFFECT_NOT_DISPATCHED for the exact qualification MODEL-only first-gate TOOL frame, with the exact frozen subject, raw evidence digests, actual compiled Core/source bindings and rule version. It is generated by current Owner and run_id=null. It cannot satisfy a UNIVERSAL_OS_NO_EFFECT consumer, become an original online denial or claim raw denial text that was not recorded.",
+        "tests": "Changing route/capability/key/subject/first-gate source digest, a TOOL prepare/start/provider/ledger row, extra suffix frame or missing raw bytes denies construction."
+      },
+      {
+        "id": "F01-D02",
+        "required": "Keep raw frames=3, ACK=2 and raw queue_empty=false. A separately named derived FAILED-only observation may classify all three exact frames only after complete census, exact MODEL ACK/receipt/effect binding, no unresolved extra external effect or queue/control/checkpoint, accepted worker native class, accepted current STOP including original verifier prerequisite, held root+dispatch owner locks, and accepted private consumer. Never change generic Finalize/Observation, fabricate ACK3 or historical broker join, or equate queue_required=false to empty.",
+        "tests": "Missing/UNKNOWN effect outcome denies; CONFIRMED MODEL with UNKNOWN money preserves ledger/budget and does not become zero money. Missing any current closure premise denies even when historical native receipt matches."
+      },
+      {
+        "id": "F01-D03",
+        "required": "Keep B actual online private drain ticket distinct from historical reconstruction. The historical constructor must independently prove current quiescence after accepted STOP and root/owner locks; it cannot manufacture a B ticket or call an online constructor with a bool. The common FAILED-only transaction accepts only the verified private variant and preserves the exact prior C five-version write set and all frozen protected rows. B Source must be independently accepted before D; F01 alone opens no D or actual C action.",
+        "tests": "Forged JSON/caller booleans/wrong proof-kind/online-ticket substitution reject. Exact frozen write-set census shows only Run and ProjectState updates plus Artifact/ImpactLink/EventEnvelope new versions and the existing enumerated ancillary rows; no Task/consumption/effect/ledger/budget/NoProgress/lease/qualification/schema/history edits."
+      },
+      {
+        "id": "W-D01",
+        "required": "HISTORICAL_NATIVE_JOB_ACCOUNTING_CLOSURE_V1 is a distinct source-derived class, bound to bridge SHA256 10b1a3bfa74132fbed965df31fd90125b90b1470556001e254af360c35451bce, PID69860, creation1792057406096619100, Job Local\\ResearchOS.W10.1792057404322293200, profile/SID/manifest/build/source identities and exact public receipt fields. Its fact is the recorded Stopped=true backed by successful Job accounting query ActiveProcesses==0 plus streams_drained. It has no raw WAIT result, no exit0, no historical successful owner Close receipt and no proof DeleteAppContainerProfile succeeded. Current owner lock possession remains a separate future prerequisite.",
+        "tests": "Reject changed binary/source/receipt hashes, any mismatched identity, stopped=false, undrained streams, missing chain to runSandbox completion, or a consumer requiring raw WAIT_OBJECT_0."
+      }
+    ],
+    "additional_paths": [],
+    "actual_authority": false,
+    "formal_increment": 0
+  },
+  "classification_decisions": {
+    "schema": "researchos.CP509.classification-decisions.v1",
+    "narrow_Host": {
+      "design_class": "ACCEPTED_WITH_F01_D01",
+      "historical_support": "SUPPORTED_EXACT_HOST_FIRST_GATE_SOURCE_RECONSTRUCTION",
+      "claim": "HOST_TOOL_EFFECT_NOT_DISPATCHED",
+      "universal_OS_NO_EFFECT": "NOT_PROVABLE"
+    },
+    "worker_Job_accounting": {
+      "design_class": "ACCEPTED_WITH_W_D01",
+      "historical_support": "SUPPORTED_RECORDED_STOPPED_FIELD_PLUS_PINNED_OS_ACCOUNTING_SOURCE_INFERENCE",
+      "raw_WAIT_RESULT": "MISSING_NOT_INVENTED",
+      "current_owner_lock": "NOT_PROBED_REQUIRES_FUTURE_ACTUAL_HELD_LOCK"
+    },
+    "FAILED_only_combined_classification": {
+      "design_class": "ACCEPTABLE_ONLY_WITH_F01_D01_D02_D03_AND_W_D01",
+      "current_operational_acceptance": false,
+      "source_prerequisites": [
+        "Real B Source independently accepted; historical constructor never fabricates B drain ticket",
+        "Real C private proof validator and unchanged five-version transaction independently accepted",
+        "Mandatory C-LD01..03 implemented and tested under exact Root scope"
+      ],
+      "actual_prerequisites": [
+        "Current accepted STOP proving original Core and worker and original verifier closure",
+        "Original verifier native proof or separately accepted full operational substitute; currently NOT_PROVABLE",
+        "Current held exact root lease and dispatch owner lock",
+        "Complete exact current evidence revalidation and frozen reviewed C operation/authority"
+      ],
+      "does_not_require_new_universal_OS_NO_EFFECT_claim": true,
+      "never_weakens_generic_observation": true
+    },
+    "verifier_operational_substitute": "NOT_PROVABLE_TRANSITIVE_INIT_BACKGROUND_CLOSURE",
+    "actual_STOP_C_enabled": false,
+    "additional_paths": [],
+    "formal_increment": 0
+  },
+  "scope_expansion": [],
+  "actual_STOP_C_enabled": false,
+  "formal_increment": 0
+}
+

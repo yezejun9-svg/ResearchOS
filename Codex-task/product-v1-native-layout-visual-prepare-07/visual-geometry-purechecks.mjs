@@ -1,0 +1,47 @@
+// Pure checks only: extract the exact renderer geometry predicates. No runner import.
+import fs from 'node:fs';
+import vm from 'node:vm';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+const here=path.dirname(fileURLToPath(import.meta.url));
+const runner=fs.readFileSync(path.join(here,'real-electron-flow.mjs'),'utf8');
+const between=(start,end)=>{
+  const a=runner.indexOf(start), b=runner.indexOf(end,a+start.length);
+  if(a<0||b<0||runner.indexOf(start,a+1)>=0) throw new Error('GEOMETRY_SOURCE_MARKER_DRIFT');
+  return runner.slice(a,b);
+};
+const overlapSource=between('const intersects=(a,b)=>','\n        const clipRect=(a,b)=>');
+const intersects=vm.runInNewContext(`(()=>{${overlapSource};return intersects})()`);
+const rect=(x,y,w,h)=>({x,y,right:x+w,bottom:y+h,width:w,height:h});
+const yes=(x,code)=>{if(!x)throw new Error(code)};
+yes(intersects(rect(10,10,100,100),rect(50,50,100,100)),'OVERLAP_MISSED');
+yes(intersects(rect(10,10,100,100),rect(50,50,100,100))===intersects(rect(50,50,100,100),rect(10,10,100,100)),'OVERLAP_ASYMMETRY');
+yes(!intersects(rect(10,10,100,100),rect(110,10,10,100)),'TOUCHING_EDGE_IS_NOT_OVERLAP');
+yes(!intersects(rect(10,10,100,100),rect(200,200,10,10)),'DISJOINT_FALSE_POSITIVE');
+const viewportOverlapSource=between('const clipRect=(a,b)=>','\n        const hit=e=>');
+const overlapsViewport=vm.runInNewContext(`(()=>{const intersects=${intersects.toString()};${viewportOverlapSource};return overlapsViewport})()`,{innerWidth:390,innerHeight:844,tr:rect(0,0,390,700)});
+yes(overlapsViewport(rect(10,100,100,44),rect(10,120,100,100)),'VISIBLE_OVERLAP_MISSED');
+yes(!overlapsViewport(rect(10,900,100,44),rect(10,920,100,100)),'OFFSCREEN_OVERLAP_MUST_NOT_FAIL');
+yes(!overlapsViewport(rect(10,710,100,44),rect(10,720,100,100)),'TRANSCRIPT_CLIPPED_OVERLAP_MUST_NOT_FAIL');
+const hitSource=between('const hit=e=>{','\n        const visible=e=>');
+const context={innerWidth:390,innerHeight:844,rect:e=>e,document:{elementFromPoint:()=>null}};
+const hit=vm.runInNewContext(`(function(){${hitSource};return hit})()`,context);
+// This predicate checks the viewport's actual top element at an action center.
+const action={...rect(10,100,100,44),querySelectorAll:()=>[]};
+context.document.elementFromPoint=()=>action;
+yes(hit(action),'VISIBLE_ACTION_MISSED');
+context.document.elementFromPoint=()=>({});
+yes(!hit(action),'COMPOSER_COVERED_ACTION_NOT_FOUND');
+context.document.elementFromPoint=()=>action;
+yes(!hit({...action,...rect(10,900,100,44)}),'OFFSCREEN_CENTER_MUST_NOT_CLAMP');
+const centerSource=between('const centerIn=(r,c)=>','\n        const visible=e=>');
+const centerIn=vm.runInNewContext(`(()=>{${centerSource};return centerIn})()`);
+yes(!centerIn(rect(10,840,100,40),rect(0,0,390,844)),'PARTIALLY_VISIBLE_OFFSCREEN_CENTER_MUST_NOT_REPORT_COVERED');
+yes(centerIn(rect(10,800,100,40),rect(0,0,390,844)),'VISIBLE_CENTER_MISSED');
+yes(runner.includes('document.documentElement.scrollWidth>innerWidth+1'),'HORIZONTAL_OVERFLOW_PREDICATE_MISSING');
+yes(runner.includes("row.action_focused"),'ACTION_FOCUS_RESULT_MISSING');
+yes(runner.includes('fullPage:false'),'VIEWPORT_SCREENSHOT_REQUIRED');
+yes(runner.includes("VIEWPORT_SIZE_MISMATCH")&&runner.includes("REQUIRED_GEOMETRY_MISSING"),'SIZE_AND_REQUIRED_GEOMETRY_GATES_MISSING');
+yes(runner.includes('await waitStableLayout();')&&runner.includes('el.scrollTop=0'),'PER_CASE_SETTLE_AND_SCROLL_RESET_MISSING');
+yes(runner.includes("document.body.textContent.includes('正在读取真实任务')")&&runner.includes("document.body.textContent.includes('正在读取 Host 能力')"),'ACTUAL_LOADING_MARKERS_MISSING');
+console.log(JSON.stringify({schema:'researchos.native-layout-visual07-pure/1',cases:['overlap','symmetry','edge_touch','disjoint','visible_overlap','offscreen_overlap_ignored','transcript_clipped_overlap_ignored','visible_hit','covered_hit','offscreen_center','partial_visibility_offscreen_center','visible_center','overflow_predicate','action_focus','viewport_capture','size_and_geometry_gates','per_case_reset_and_settle','actual_loading_markers'],app:0,gui:0,cli:0,model:0,task:0,runner_import:0}));

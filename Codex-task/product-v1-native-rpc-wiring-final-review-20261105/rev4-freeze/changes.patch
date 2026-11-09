@@ -1,0 +1,177 @@
+diff --git a/internal/domain/runtime_harness_windows_test.go b/internal/domain/runtime_harness_windows_test.go
+index 394bcb2..8c3dafa 100644
+--- a/internal/domain/runtime_harness_windows_test.go
++++ b/internal/domain/runtime_harness_windows_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"path/filepath"
+ 	rt "researchos.local/research-os/adapters/runtime"
+ 	goruntime "runtime"
++	"strings"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -526,9 +527,53 @@ func harnessRPCTurnFixture(t *testing.T) (*fixture, *RuntimeCoordinator, *Worksp
+ 	return f, c, b, d
+ }
+ 
+-// Replace the live runtime binding with a newly sealed, individually valid
+-// profile. The original Run's dispatch snapshot must still reject the turn.
+-func harnessRPCRebindSealedProfile(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
++// A bound profile is immutable. A rejected SQL update leaves the original
++// authorized profile intact, so the second fence should still allow one turn.
++func harnessRPCAssertImmutableBinding(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
++	t.Helper()
++	tx, err := f.db.BeginTx(context.Background(), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer tx.Rollback()
++	run, err := load(tx, f.project, "Run", d.launch.RunID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtime, err := load(tx, f.project, "RuntimeRegistration", Str(run, "runtime_id"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	prior, _, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var raw, profileHash, technicalHash string
++	if err = tx.QueryRow("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?", f.project, runtime["id"]).Scan(&raw, &profileHash, &technicalHash); err != nil {
++		t.Fatal(err)
++	}
++	if Hash(prior) != profileHash || technicalHash != runtimeTechnicalHash(runtime) {
++		t.Fatal("original binding invalid before attempted update")
++	}
++	_, err = tx.Exec("UPDATE runtime_bindings SET profile_ref=? WHERE project=? AND runtime=?", `{"entity_type":"Artifact","id":"replacement"}`, f.project, runtime["id"])
++	if err == nil || !strings.Contains(err.Error(), "runtime binding immutable") {
++		t.Fatal("immutable binding update did not fail at installed trigger", err)
++	}
++	if err = tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	var afterRaw, afterHash, afterTechnical string
++	if err = f.db.QueryRow("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?", f.project, runtime["id"]).Scan(&afterRaw, &afterHash, &afterTechnical); err != nil {
++		t.Fatal(err)
++	}
++	if raw != afterRaw || profileHash != afterHash || technicalHash != afterTechnical {
++		t.Fatal("rejected update changed original sealed binding")
++	}
++}
++
++// Revocation creates a new Artifact version through the existing store. The
++// immutable binding still points to its old revision and must fail closed.
++func harnessRPCRevokeCurrentProfile(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
+ 	t.Helper()
+ 	sourceTx(t, f.db, func(tx *sql.Tx) error {
+ 		run, err := load(tx, f.project, "Run", d.launch.RunID)
+@@ -539,44 +584,30 @@ func harnessRPCRebindSealedProfile(t *testing.T, f *fixture, d *harnessRPCTurnFi
+ 		if err != nil {
+ 			return err
+ 		}
+-		prior, artifact, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
++		_, artifact, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
+ 		if err != nil {
+ 			return err
+ 		}
+-		profile, err := runtimeProfileBody(tx, f.project, artifact)
++		revoked, err := Decode(Bytes(artifact))
+ 		if err != nil {
+ 			return err
+ 		}
+-		profile["consent_expires_at"] = time.Now().UTC().Add(23 * time.Hour).Format(time.RFC3339Nano)
+-		if !harnessPolicyMatches(profile, rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash)) {
+-			return errors.New("replacement profile lost canonical RPC seal")
+-		}
+-		owner, err := authenticate(tx, f.token)
+-		if err != nil {
+-			return err
+-		}
+-		newArtifact, err := f.s.sealRuntimeSetupProfile(tx, owner, f.project, profile)
+-		if err != nil {
++		revoked["validity"] = "REVOKED"
++		if err = bump(revoked); err != nil {
+ 			return err
+ 		}
+-		newRef := Ref(newArtifact, "Artifact")
+-		if Hash(newRef) == Hash(prior) {
+-			return errors.New("replacement binding did not change")
+-		}
+-		_, err = tx.Exec("UPDATE runtime_bindings SET profile_ref=?,profile_hash=? WHERE project=? AND runtime=?", string(Bytes(newRef)), Hash(newRef), f.project, runtime["id"])
+-		if err != nil {
++		if err = f.s.put(tx, "Artifact", revoked); err != nil {
+ 			return err
+ 		}
+-		current, _, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
+-		if err != nil || Hash(current) != Hash(newRef) {
+-			return errors.New("replacement profile is not the live valid binding")
++		if _, _, err = f.s.currentRuntimeBinding(tx, f.project, runtime); err == nil {
++			return errors.New("revoked bound profile still admitted")
+ 		}
+ 		return nil
+ 	})
+ }
+ 
+ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+-	for _, mode := range []string{"one_turn", "duplicate", "owner", "source_rebind", "source_revision", "policy_readiness", "sealed_binding", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
++	for _, mode := range []string{"one_turn", "duplicate", "binding_immutable", "owner", "source_rebind", "source_revision", "policy_readiness", "profile_revoked", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			f, c, b, d := harnessRPCTurnFixture(t)
+ 			caps, err := c.HarnessV1().Capabilities(context.Background(), f.token)
+@@ -615,6 +646,7 @@ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+ 					c.workers.Wait()
+ 				}
+ 			}()
++			originalAuthority := c.config.HarnessAuthority
+ 			switch mode {
+ 			case "owner":
+ 				c.config.HarnessAuthority = &harnessAuthorityFixture{principal: "foreign"}
+@@ -628,8 +660,10 @@ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+ 				})
+ 			case "policy_readiness":
+ 				d.snapshot.PolicyIdentity = rt.CodexRPCPolicyIdentity("sha256:stale-binary")
+-			case "sealed_binding":
+-				harnessRPCRebindSealedProfile(t, f, d)
++			case "binding_immutable":
++				harnessRPCAssertImmutableBinding(t, f, d)
++			case "profile_revoked":
++				harnessRPCRevokeCurrentProfile(t, f, d)
+ 			case "auth_metadata":
+ 				d.descriptor.AuthState = "LOGGED_OUT"
+ 			case "lease_epoch":
+@@ -659,16 +693,22 @@ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+ 			close(d.proceed)
+ 			released = true
+ 			c.workers.Wait()
++			if mode == "owner" {
++				if _, err := c.HarnessV1().Get(context.Background(), f.token, f.project, id); err == nil {
++					t.Fatal("foreign Host principal read historical Task")
++				}
++				c.config.HarnessAuthority = originalAuthority
++			}
+ 			if d.starts.Load() != 1 {
+ 				t.Fatal("fixture started more than one Run")
+ 			}
+ 			marker := filepath.Join(d.launch.Directory, "native-turn-authorization.json")
+ 			_, markerErr := os.Stat(marker)
+-			wantMarker := mode == "one_turn" || mode == "duplicate" || mode == "artifact_fault"
++			wantMarker := mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable" || mode == "artifact_fault"
+ 			if (markerErr == nil) != wantMarker {
+ 				t.Fatalf("turn marker mismatch for %s: %v", mode, markerErr)
+ 			}
+-			if mode == "one_turn" || mode == "duplicate" {
++			if mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable" {
+ 				if d.firstErr != nil || d.turns.Load() != 1 {
+ 					t.Fatal("one trusted callback failed", d.firstErr)
+ 				}
+@@ -700,7 +740,7 @@ func TestHarnessRPCTurnSecondFence(t *testing.T) {
+ 			if view := harnessViewFixture(t, f, c, id); view["result"] != nil {
+ 				t.Fatal("fixture produced a model result")
+ 			}
+-			if err := c.Scan(context.Background()); err != nil && (mode == "one_turn" || mode == "duplicate") {
++			if err := c.Scan(context.Background()); err != nil && (mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable") {
+ 				t.Fatal(err)
+ 			}
+ 			c.workers.Wait()

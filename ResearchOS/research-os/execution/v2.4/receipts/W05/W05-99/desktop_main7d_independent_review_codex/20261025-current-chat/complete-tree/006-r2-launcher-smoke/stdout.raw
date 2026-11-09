@@ -1,0 +1,373 @@
+apps/desktop/launch-development.mjs
+1: #!/usr/bin/env node
+2: // Launch only a sealed, repo-shaped development tree with an explicit fresh
+3: // state root. This is not an installer or a service launcher.
+4: import fs from 'node:fs';
+5: import path from 'node:path';
+6: import crypto from 'node:crypto';
+7: import { spawn } from 'node:child_process';
+8: import { fileURLToPath } from 'node:url';
+9: 
+10: export const MANIFEST_SCHEMA = 'researchos.desktop-development-tree/1';
+11: const REQUIRED = [
+12:   'apps/desktop/main/main.js', 'apps/desktop/preload/preload.js',
+13:   'apps/desktop/resources/client-wire/descriptor.json',
+14:   'apps/desktop/resources/client-wire/researchos-client-wire-validator.exe',
+15:   'apps/desktop/resources/control/researchos-control.exe',
+16:   'apps/desktop/resources/control/runtime-verifier.exe',
+17:   'apps/desktop/resources/control/runtime-verifier-installation.json',
+18:   'apps/desktop/resources/control/runtime/mu-worker.mjs',
+19:   'apps/desktop/resources/control/runtime/mu-worker.mjs.build.json',
+20:   'apps/desktop/resources/control/runtime/node.exe',
+21:   'apps/web/dist/index.html', 'runtime/electron/electron.exe',
+22:   'spec/v2.0/contracts/domain.schema.json', 'spec/v2.0/contracts/openapi.json',
+23:   'internal/api/contracts/client.protocol.schema.json',
+24:   'internal/api/contracts/domain.schema.json', 'migrations/sqlite/next_v24_sessions.sql',
+25: ];
+26: const HASH = /^[a-f0-9]{64}$/;
+27: 
+28: function refusal(code) { const error = new Error(code); error.code = code; return error; }
+29: function folded(value) { return path.normalize(value).toLocaleLowerCase('en-US'); }
+30: function within(parent, child) {
+31:   const relative = path.relative(parent, child);
+32:   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+33: }
+34: 
+35: // A path may not transit a symlink, junction or other resolved alias. In
+36: // particular, a fresh-looking state name behind a junction is not fresh.
+37: export function checkNativePath(value, missingLeaf = false) {
+38:   if (typeof value !== 'string' || !path.isAbsolute(value)) throw refusal('ABSOLUTE_PATH_REQUIRED');
+39:   const absolute = path.resolve(value);
+40:   const drive = path.parse(absolute).root;
+41:   const segments = absolute.slice(drive.length).split(path.sep).filter(Boolean);
+42:   let current = drive;
+43:   for (let index = 0; index < segments.length; index++) {
+44:     current = path.join(current, segments[index]);
+45:     let info;
+46:     try { info = fs.lstatSync(current); }
+47:     catch (error) {
+48:       if (missingLeaf && index === segments.length - 1 && error.code === 'ENOENT') return absolute;
+49:       throw refusal('PATH_UNAVAILABLE');
+50:     }
+51:     if (info.isSymbolicLink()) throw refusal('PATH_ALIAS_REFUSED');
+52:     let resolved;
+53:     try { resolved = fs.realpathSync.native(current); }
+54:     catch { throw refusal('PATH_UNAVAILABLE'); }
+55:     if (folded(resolved) !== folded(current)) throw refusal('PATH_ALIAS_REFUSED');
+56:     if (index < segments.length - 1 && !info.isDirectory()) throw refusal('PATH_NOT_DIRECTORY');
+57:   }
+58:   return absolute;
+59: }
+60: 
+61: function hashFile(file) {
+62:   const h = crypto.createHash('sha256');
+63:   const handle = fs.openSync(file, 'r');
+64:   const buffer = Buffer.allocUnsafe(1024 * 1024);
+65:   try {
+66:     for (;;) {
+67:       const count = fs.readSync(handle, buffer, 0, buffer.length, null);
+68:       if (!count) break;
+69:       h.update(buffer.subarray(0, count));
+70:     }
+71:   } finally { fs.closeSync(handle); }
+72:   return h.digest('hex');
+73: }
+74: 
+75: function relativeFile(value) {
+76:   return typeof value === 'string' && value && !value.includes('\\') &&
+77:     !value.includes(':') && !value.includes('\0') &&
+78:     value.split('/').every(part => part && part !== '.' && part !== '..') &&
+79:     path.posix.normalize(value) === value;
+80: }
+81: 
+82: export function validateBundle(bundlePath) {
+83:   const bundle = checkNativePath(bundlePath);
+84:   if (!fs.statSync(bundle).isDirectory()) throw refusal('BUNDLE_NOT_DIRECTORY');
+85:   const manifestPath = path.join(bundle, 'development-manifest.json');
+86:   checkNativePath(manifestPath);
+87:   let manifest;
+88:   try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+89:   catch { throw refusal('BUNDLE_MANIFEST_INVALID'); }
+90:   if (manifest.schema !== MANIFEST_SCHEMA || folded(manifest.bundle_root || '') !== folded(bundle) ||
+91:       !Array.isArray(manifest.files) || !manifest.files.length || manifest.mode !== 'DEVELOPMENT_ONLY_BUILT_NOT_NATIVE_TESTED')
+92:     throw refusal('BUNDLE_MANIFEST_INVALID');
+93:   const names = new Set();
+94:   let previous = '';
+95:   for (const item of manifest.files) {
+96:     if (!relativeFile(item.path) || item.path <= previous || !HASH.test(item.sha256) ||
+97:         !Number.isSafeInteger(item.bytes) || item.bytes < 0) throw refusal('BUNDLE_INVENTORY_INVALID');
+98:     previous = item.path;
+99:     const foldedName = item.path.toLocaleLowerCase('en-US');
+100:     if (names.has(foldedName)) throw refusal('BUNDLE_INVENTORY_ALIAS');
+101:     names.add(foldedName);
+102:     const target = path.join(bundle, ...item.path.split('/'));
+103:     checkNativePath(target);
+104:     const info = fs.lstatSync(target);
+105:     if (!info.isFile() || info.size !== item.bytes || hashFile(target) !== item.sha256)
+106:       throw refusal('BUNDLE_FILE_CHANGED');
+107:   }
+108:   for (const required of REQUIRED) if (!names.has(required.toLocaleLowerCase('en-US'))) throw refusal('BUNDLE_RESOURCE_MISSING');
+109:   if (![...names].some(name => name.startsWith('apps/web/dist/assets/') && name.endsWith('.js')) ||
+110:       ![...names].some(name => name.startsWith('apps/web/dist/assets/') && name.endsWith('.css')))
+111:     throw refusal('BUNDLE_REACT_ASSETS_MISSING');
+112:   const migrations = manifest.files.map(item => item.path).filter(name => /^migrations\/sqlite\/\d{4}_[^/]+\.sql$/.test(name));
+113:   const numbers = migrations.map(name => Number(name.slice('migrations/sqlite/'.length, 'migrations/sqlite/'.length + 4))).sort((a, b) => a - b);
+114:   if (!numbers.length || numbers.some((number, index) => number !== index + 1)) throw refusal('BUNDLE_MIGRATIONS_INCOMPLETE');
+115:   const actual = [];
+116:   function walk(directory) {
+117:     for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
+118:       const target = path.join(directory, item.name);
+119:       checkNativePath(target);
+120:       if (item.isDirectory()) walk(target);
+121:       else if (item.isFile()) actual.push(path.relative(bundle, target).split(path.sep).join('/').toLocaleLowerCase('en-US'));
+122:       else throw refusal('BUNDLE_PATH_TYPE');
+123:     }
+124:   }
+125:   walk(bundle);
+126:   const expected = new Set([...names, 'development-manifest.json']);
+127:   if (actual.length !== expected.size || actual.some(name => !expected.has(name))) throw refusal('BUNDLE_UNLISTED_PATH');
+128:   const control = path.join(bundle, 'apps/desktop/resources/control');
+129:   const install = JSON.parse(fs.readFileSync(path.join(control, 'runtime-verifier-installation.json'), 'utf8'));
+130:   const verifier = path.join(control, 'runtime-verifier.exe');
+131:   if (install.executable !== verifier || install.executable_hash !== 'sha256:' + hashFile(verifier) ||
+132:       install.schema !== 'researchos.runtime-verifier-installation.v1' ||
+133:       install.service_id !== 'researchos.runtime-qualification-verifier.v1' ||
+134:       install.protocol !== 'researchos.runtime-verifier/1' ||
+135:       !Array.isArray(install.arguments) || install.arguments.length) throw refusal('VERIFIER_BINDING_INVALID');
+136:   const runtime = path.join(control, 'runtime');
+137:   const mu = JSON.parse(fs.readFileSync(path.join(runtime, 'mu-worker.mjs.build.json'), 'utf8'));
+138:   if (mu.mu_commit !== '8dfebe36508ac0c2508735bb866756dab9283e74' ||
+139:       mu.vendored_files_verified !== 5083 || mu.bundle_sha256 !== hashFile(path.join(runtime, 'mu-worker.mjs')) ||
+140:       mu.bundle_bytes !== fs.statSync(path.join(runtime, 'mu-worker.mjs')).size) throw refusal('MU_BINDING_INVALID');
+141:   const client = JSON.parse(fs.readFileSync(path.join(bundle, 'apps/desktop/resources/client-wire/descriptor.json'), 'utf8'));
+142:   if (client.build_input_digest !== manifest.client_wire?.build_input_digest ||
+143:       client.binary_sha256 !== hashFile(path.join(bundle, 'apps/desktop/resources/client-wire/researchos-client-wire-validator.exe')))
+144:     throw refusal('CLIENT_WIRE_BINDING_INVALID');
+145:   return { bundle, manifest, fileCount: manifest.files.length };
+146: }
+147: 
+148: // Windows environment keys are case-insensitive. Refuse collisions before
+149: // allowing any key through, then construct a fresh environment from a tiny
+150: // OS allowlist and the explicit development paths.
+151: export function buildChildEnv(ambient, bundle, state, smoke = false) {
+152:   const seen = new Map();
+153:   for (const [key, value] of Object.entries(ambient)) {
+154:     const upper = key.toUpperCase();
+155:     if (seen.has(upper)) throw refusal('ENV_CASE_COLLISION');
+156:     seen.set(upper, value);
+157:   }
+158:   const systemRoot = seen.get('SYSTEMROOT') || seen.get('WINDIR');
+159:   if (typeof systemRoot !== 'string' || !path.isAbsolute(systemRoot) ||
+160:       seen.get('WINDIR') && seen.get('SYSTEMROOT') && folded(seen.get('WINDIR')) !== folded(seen.get('SYSTEMROOT')))
+161:     throw refusal('SYSTEMROOT_INVALID');
+162:   const profile = path.join(state, 'profile');
+163:   const root = path.resolve(systemRoot);
+164:   const result = {
+165:     SystemRoot: root, WINDIR: root, OS: 'Windows_NT',
+166:     ComSpec: path.join(root, 'System32', 'cmd.exe'),
+167:     PATH: [path.join(bundle, 'runtime/electron'), path.join(root, 'System32'), root].join(path.delimiter),
+168:     USERPROFILE: profile, HOME: profile,
+169:     APPDATA: path.join(profile, 'AppData/Roaming'),
+170:     LOCALAPPDATA: path.join(profile, 'AppData/Local'),
+171:     TEMP: path.join(state, 'tmp'), TMP: path.join(state, 'tmp'),
+172:     RESEARCHOS_DATA_DIR: path.join(state, 'data'),
+173:     RESEARCHOS_CLI_DISCOVERY: path.join(state, 'discovery.json'),
+174:     RESEARCHOS_DESKTOP_USER_DATA: path.join(state, 'electron-user-data'),
+175:     RESEARCHOS_CONTROL_EXE: path.join(bundle, 'apps/desktop/resources/control/researchos-control.exe'),
+176:     RESEARCHOS_DESKTOP_VERIFIER_MANIFEST: path.join(bundle, 'apps/desktop/resources/control/runtime-verifier-installation.json'),
+177:     RESEARCHOS_DESKTOP_RUNTIME_ASSETS_DIR: path.join(bundle, 'apps/desktop/resources/control/runtime'),
+178:     RESEARCHOS_WEB_DIR: path.join(bundle, 'apps/web/dist'),
+179:   };
+180:   if (smoke) { result.ROS_DESKTOP_SMOKE = '1'; result.ROS_DESKTOP_NATIVE_SMOKE = '1'; }
+181:   return result;
+182: }
+183: 
+184: export function validateStatePath(statePath, bundle) {
+185:   const state = checkNativePath(statePath, true);
+186:   if (fs.existsSync(state)) throw refusal('STATE_NOT_FRESH');
+187:   if (within(bundle, state) || within(state, bundle)) throw refusal('STATE_BUNDLE_OVERLAP');
+188:   return state;
+189: }
+190: 
+191: function validIdentity(value) {
+192:   return value && Number.isSafeInteger(value.pid) && value.pid > 0 &&
+193:     typeof value.created_ns === 'string' && /^[0-9]+$/.test(value.created_ns) &&
+194:     typeof value.image_sha256 === 'string' && HASH.test(value.image_sha256) &&
+195:     typeof value.host_id === 'string' && /^host-[a-f0-9]{12}$/.test(value.host_id);
+196: }
+197: 
+198: export function validateSmokeReports(reports, exitCode) {
+199:   const ready = reports.filter(row => row?.event === 'ready_to_show');
+200:   const shutdown = reports.filter(row => row?.event === 'shutdown_confirmed');
+201:   if (exitCode !== 0 || ready.length !== 1 || shutdown.length !== 1 ||
+202:       reports.some(row => ['boot_failed', 'shutdown_unconfirmed'].includes(row?.event)))
+203:     throw refusal('SMOKE_OUTCOME_UNCONFIRMED');
+204:   const a = ready[0], b = shutdown[0];
+205:   if (reports.indexOf(b) <= reports.indexOf(a) || a.management_state !== 'READY' ||
+206:       a.host_health !== 'UP' || a.native_probe?.ok !== true ||
+207:       a.renderer?.bridge !== true || a.renderer.react_root !== true ||
+208:       !a.renderer.mounted_title || !(a.renderer.navigation > 0) ||
+209:       !validIdentity(a.owned_core_identity) || b.process_exit_confirmed !== true ||
+210:       JSON.stringify(b.owned_core_identity) !== JSON.stringify(a.owned_core_identity))
+211:     throw refusal('SMOKE_OUTCOME_UNCONFIRMED');
+212:   return { status: 'NATIVE_SMOKE_CONFIRMED', owned_core_identity: a.owned_core_identity };
+213: }
+214: 
+215: export function prepareDevelopmentLaunch({ bundle, state, smoke = false, ambient = process.env }) {
+216:   const inspected = validateBundle(bundle);
+217:   const fresh = validateStatePath(state, inspected.bundle);
+218:   const env = buildChildEnv(ambient, inspected.bundle, fresh, smoke);
+219:   return { bundle: inspected.bundle, state: fresh,
+220:     executable: path.join(inspected.bundle, 'runtime/electron/electron.exe'),
+221:     argv: [path.join(inspected.bundle, 'apps/desktop')], cwd: inspected.bundle,
+222:     env, manifest_sha256: hashFile(path.join(inspected.bundle, 'development-manifest.json')),
+223:     inventory_count: inspected.fileCount, smoke };
+224: }
+225: 
+226: export async function executeDevelopmentLaunch(options, spawnImpl = spawn) {
+227:   const prepared = prepareDevelopmentLaunch(options);
+228:   if (options.dryRun) return { mode: 'DRY_RUN_NO_STATE_NO_SPAWN', executable: prepared.executable,
+229:     argv: prepared.argv, cwd: prepared.cwd, state: prepared.state,
+230:     env_keys: Object.keys(prepared.env).sort(), manifest_sha256: prepared.manifest_sha256,
+231:     inventory_count: prepared.inventory_count };
+232:   fs.mkdirSync(prepared.state, { recursive: false });
+233:   for (const relative of ['data', 'electron-user-data', 'profile/AppData/Roaming', 'profile/AppData/Local', 'tmp'])
+234:     fs.mkdirSync(path.join(prepared.state, relative), { recursive: true });
+235:   const child = spawnImpl(prepared.executable, prepared.argv, { cwd: prepared.cwd, env: prepared.env,
+236:     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+237:   const reports = [];
+238:   let pending = '', bytes = 0;
+239:   child.stdout.on('data', part => {
+240:     process.stdout.write(part);
+241:     bytes += part.length;
+242:     if (bytes > 1 << 20) return;
+243:     pending += part.toString('utf8');
+244:     for (;;) {
+245:       const end = pending.indexOf('\n');
+246:       if (end < 0) break;
+247:       const line = pending.slice(0, end).trim(); pending = pending.slice(end + 1);
+248:       if (line.startsWith('ROS_DESKTOP_REPORT ')) {
+249:         try { reports.push(JSON.parse(line.slice('ROS_DESKTOP_REPORT '.length))); }
+250:         catch { reports.push({ event: 'malformed_report' }); }
+251:       }
+252:     }
+253:   });
+254:   child.stderr.on('data', part => process.stderr.write(part));
+255:   const code = await new Promise((resolve, reject) => {
+256:     child.once('error', reject);
+257:     child.once('close', (exit, signal) => signal ? reject(refusal('DESKTOP_SIGNALLED')) : resolve(exit));
+258:   });
+259:   if (bytes > 1 << 20) throw refusal('SMOKE_REPORT_TOO_LARGE');
+260:   if (prepared.smoke) return validateSmokeReports(reports, code);
+261:   return { status: code === 0 ? 'DEVELOPMENT_EXITED' : 'DEVELOPMENT_FAILED', exit_code: code };
+262: }
+263: 
+264: function cli(argv) {
+265:   const options = {};
+266:   for (let i = 0; i < argv.length; i++) {
+267:     const arg = argv[i];
+268:     if (arg === '--bundle' || arg === '--state') {
+269:       if (options[arg.slice(2)] || !argv[i + 1]) throw refusal('CLI_ARGUMENTS');
+270:       options[arg.slice(2)] = argv[++i];
+271:     } else if (arg === '--dry-run' || arg === '--launch' || arg === '--smoke') {
+272:       if (options[arg.slice(2)]) throw refusal('CLI_ARGUMENTS');
+273:       options[arg.slice(2)] = true;
+274:     } else throw refusal('CLI_ARGUMENTS');
+275:   }
+276:   if (!options.bundle || !options.state || options['dry-run'] === options.launch ||
+277:       options.smoke && !options.launch) throw refusal('CLI_ARGUMENTS');
+278:   return { bundle: options.bundle, state: options.state, dryRun: !!options['dry-run'], smoke: !!options.smoke };
+279: }
+280: 
+281: if (process.argv[1] && folded(fileURLToPath(import.meta.url)) === folded(path.resolve(process.argv[1]))) {
+282:   try {
+283:     const result = await executeDevelopmentLaunch(cli(process.argv.slice(2)));
+284:     process.stdout.write(JSON.stringify(result) + '\n');
+285:     if (result.status === 'DEVELOPMENT_FAILED') process.exitCode = result.exit_code || 2;
+286:   } catch (error) {
+287:     process.stderr.write(`development launcher refused: ${error.code || error.message}\n`);
+288:     process.exitCode = 2;
+289:   }
+290: }
+apps/desktop/main/main.js
+400:   const started = await host.ensureCore(deps);
+401:   const win = new BrowserWindow({
+402:     width: 1180, height: 760, title: 'ResearchOS', show: !SMOKE || !!process.env.ROS_DESKTOP_CAPTURE_PATH,
+403:     webPreferences: { preload: path.join(ROOT, 'preload', 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+404:   });
+405:   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+406:   win.webContents.on('will-navigate', (event, target) => {
+407:     const destination = new URL(target);
+408:     if (destination.protocol !== 'ros-app:' || destination.hostname !== 'desktop') event.preventDefault();
+409:   });
+410:   let closing = false;
+411:   win.on('close', event => {
+412:     if (closing || !desktopManagement.hasUnconfirmedChild()) return;
+413:     event.preventDefault();
+414:     if (desktopManagement.state !== 'READY') {
+415:       dialog.showMessageBox(win, { type: 'warning', message: '当前主机无法安全退出',
+416:         detail: desktopManagement.failure || '管理连接中断，主机进程退出尚未确认' });
+417:       return;
+418:     }
+419:     desktopManagement.shutdown().then(() => {
+420:       closing = true; win.close();
+421:     }).catch(error => dialog.showMessageBox(win, { type: 'warning',
+422:       message: '当前主机无法安全退出', detail: String(error.code || error.message || error) }));
+423:   });
+424:   await win.loadURL(process.env.ROS_DESKTOP_LEGACY_WORKBENCH === '1'
+425:     ? 'file://' + path.join(__dirname, 'workbench.html').replaceAll('\\', '/') : APP_ORIGIN + '/');
+426:   const renderer = await win.webContents.executeJavaScript(`({
+427:     bridge: !!window.researchos?.desktop && !!window.researchos?.v2,
+428:     review: !!document.getElementById('root') || (!!document.getElementById('review') && !!document.getElementById('review-open')),
+429:     react_root: !!document.getElementById('root'),
+430:     mounted_title: document.querySelector('#root h1')?.textContent || null,
+431:     navigation: document.querySelectorAll('[aria-label="主导航"] a').length,
+432:     status: document.getElementById('review-report')?.textContent || '',
+433:     health: document.getElementById('host-health')?.textContent || ''
+434:   })`);
+435:   const nativeProbe = SMOKE
+436:     ? await win.webContents.executeJavaScript(`window.researchos.v2['host.status']({}).then(r => ({
+437:         ok: r.ok === true, protocol_status: r.protocol_status || null, reason: r.reason || null
+438:       }))`)
+439:     : null;
+440:   const owned = ownedCoreIdentity(desktopManagement);
+441:   const report = {
+442:     event: 'ready_to_show', host_health: started.health, host_launched_by_shell: started.launched,
+443:     spawns: started.spawns, host_url: started.discovery ? started.discovery.url : null,
+444:     channels: ipc.BRIDGE.length, electron: process.versions.electron, protocol: 'researchos-client/2',
+445:     renderer, native_probe: nativeProbe, pid: process.pid,
+446:     owned_core_identity: owned,
+447:     management_state: management.state, management_reason: management.reason || null,
+448:     management_diagnostic_bytes: managementDiagnostic.bytes,
+449:     management_diagnostic_sha256: managementDiagnostic.bytes ? crypto.createHash('sha256').update(Buffer.concat(managementDiagnostic.chunks)).digest('hex') : null,
+450:     management_diagnostic_truncated: managementDiagnostic.truncated,
+451:   };
+452:   if (SMOKE && process.env.ROS_DESKTOP_CAPTURE_PATH) {
+453:     const capturePath = path.resolve(process.env.ROS_DESKTOP_CAPTURE_PATH);
+454:     await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+455:     await new Promise(resolve => setTimeout(resolve, 400));
+456:     await fs.promises.writeFile(capturePath, (await win.webContents.capturePage()).toPNG());
+457:     report.capture_path = capturePath;
+458:   }
+459:   console.log('ROS_DESKTOP_REPORT ' + JSON.stringify(report));
+460:   if (SMOKE) {
+461:     let code = smokeReadyEvidence(renderer, nativeProbe, management, started, owned) ? 0 : 2;
+462:     if (desktopManagement.state === 'READY') {
+463:       try {
+464:         const stopped = await desktopManagement.shutdown();
+465:         const confirmed = smokeShutdownConfirmation(stopped, desktopManagement, owned);
+466:         if (confirmed) console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_confirmed', ...confirmed }));
+467:         else {
+468:           code = 2;
+469:           console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: 'OWNED_EXIT_IDENTITY_UNCONFIRMED' }));
+470:         }
+471:       }
+472:       catch (error) {
+473:         code = 2;
+474:         console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: error.code || error.message }));
+475:       }
+476:     }
+477:     if (desktopManagement.hasUnconfirmedChild()) {
+478:       console.log('ROS_DESKTOP_REPORT ' + JSON.stringify({ event: 'shutdown_unconfirmed', reason: desktopManagement.failure || 'CONTROL_EXIT_UNCONFIRMED' }));
+479:       return;
+480:     }

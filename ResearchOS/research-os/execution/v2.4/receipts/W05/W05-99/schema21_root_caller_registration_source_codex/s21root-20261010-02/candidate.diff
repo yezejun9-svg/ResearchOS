@@ -1,0 +1,48 @@
+--- sealed-s21root-01/old21_root.source.py
++++ s21root-02/old21_root.source.py
+@@ -278,10 +278,21 @@
+         delivered = strict(text[len(envelope):] if text.startswith(envelope) else text)
+     except (ValueError, TypeError):
+         need(False, "PEER_TYPED_DELIVERY_REQUIRED")
+-    need(type(delivered) is dict and delivered.get("schema") == "researchos.old21-peer-review-delivery.v2",
+-         "PEER_TYPED_DELIVERY_REQUIRED")
++    legacy_builder = type(delivered) is dict and operation == "BUILDER_SOURCE_REVIEW_WITNESS" and delivered.get("schema") == "researchos.main23-peer-review-delivery.v2"
++    delivery_operation = operation
++    if legacy_builder:
++        need(peer_actor == "codex:/root/full_w09_source_review" and delivered.get("component") == "OLD21_PROGRAMME_BUILDER_SOURCE"
++             and payload.get("id") == 'amsg_01a121d5-f9cd-7c73-a691-bd9060ad2d77' and last.get("timestamp") == '2026-10-09T18:03:53.678Z'
++             and len(checked(binding["original_capture_ref"])) == 27173
++             and hashlib.sha256(checked(binding["original_capture_ref"])).hexdigest() == '797f80403540a5f9da512f47d8698498c40bf36869fb5b4b4f64600e8d57e083'
++             and exact_ref_set(expected_refs) == exact_ref_set(list(BUILDER_ACCEPTED_REVIEW_REFS.values())),
++             "EXACT_LEGACY_OLD21_BUILDER_DELIVERY")
++        delivery_operation = "SOURCE_REVIEW_WITNESS"
++    else:
++        need(type(delivered) is dict and delivered.get("schema") == "researchos.old21-peer-review-delivery.v2",
++             "PEER_TYPED_DELIVERY_REQUIRED")
+     need(delivered.get("review_author") == peer_actor and delivered.get("root_thread_id") == ROOT_THREAD
+-         and delivered.get("operation") == operation and delivered.get("verdict") == "ACCEPTED_SOURCE_ONLY"
++         and delivered.get("operation") == delivery_operation and delivered.get("verdict") == "ACCEPTED_SOURCE_ONLY"
+          and delivered.get("formal_acceptance") is False and delivered.get("execution_grant") is False
+          and exact_ref_set(delivered.get("review_refs")) == exact_ref_set(expected_refs), "PEER_REVIEW_REF_BINDING")
+     need(binding.get("peer_actor") == peer_actor and binding.get("message_id") == payload.get("id")
+@@ -466,7 +477,9 @@
+     value = doc(pending_ref)
+     need(value.get("issued_by") == ROOT and value.get("counter_reset") is False and type(value.get("pending")) is list, "ROOT_PENDING_LEDGER_REQUIRED")
+     start = cp["work_in_progress"]["root_next_failure_ordinal_live"]
+-    need(type(start) is int and [x.get("ordinal") for x in value["pending"]] == list(range(start, value["next_original_failure_ordinal"])), "PENDING_CONTIGUOUS_CURRENT_COUNTER")
++    next_ordinal = value["next_original_failure_ordinal"]
++    need(type(start) is int and type(next_ordinal) is int and next_ordinal >= start, "PENDING_CONTIGUOUS_CURRENT_COUNTER")
++    need(all(type(x) is dict and type(x.get("ordinal")) is int for x in value["pending"]) and [x["ordinal"] for x in value["pending"]] == list(range(start, next_ordinal)), "PENDING_CONTIGUOUS_CURRENT_COUNTER")
+     refs = [pending_ref]
+     for row in value["pending"]:
+         checked(row["origin_ref"]); refs.append(row["origin_ref"])
+@@ -481,6 +494,9 @@
+ 
+ def projection(old_cp, old_ow, scope_ref, owner_ref, worker_ref, facts_ref, owner, worker, pending, created):
+     """Pure TP transform. No file open, pin or reference validation in callback."""
++    start = old_cp["work_in_progress"]["root_next_failure_ordinal_live"]; next_ordinal = pending["next_original_failure_ordinal"]
++    need(type(start) is int and type(next_ordinal) is int and next_ordinal >= start, "PENDING_CONTIGUOUS_CURRENT_COUNTER")
++    need(type(pending.get("pending")) is list and all(type(x) is dict and type(x.get("ordinal")) is int for x in pending["pending"]) and [x["ordinal"] for x in pending["pending"]] == list(range(start, next_ordinal)), "PENDING_CONTIGUOUS_CURRENT_COUNTER")
+     cp = copy.deepcopy(old_cp); ow = copy.deepcopy(old_ow)
+     need(KEY not in ow["card_path_bindings"]["W05-99"]["subtasks"] and not any(x.get("slice_id") == SLICE for x in cp["workers"]), "DUPLICATE_BUILD_SLICE")
+     need(owner["scope_ref"] == worker["scope_ref"] == scope_ref and worker["selected_owner_ref"] == owner_ref and owner["selected_worker_id"] == worker["worker_id"] == ROOT, "ACYCLIC_OWNER_WORKER")

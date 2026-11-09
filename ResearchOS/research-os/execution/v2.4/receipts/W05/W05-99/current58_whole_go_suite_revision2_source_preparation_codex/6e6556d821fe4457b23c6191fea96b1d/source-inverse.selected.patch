@@ -1,0 +1,606 @@
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision_source_preparation_codex\6a9f35409cc34e4784ad92b374d73986\whole58_gate.v3.proposed.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision2_source_preparation_codex\6e6556d821fe4457b23c6191fea96b1d\whole58_gate.rev4.proposed.py
+@@ -124,7 +124,8 @@
+     return members, total
+ 
+ 
+-def validate_go_tree(tree_ref, attestation_ref, go_ref, locked, root):
++def validate_go_tree(tree_ref, attestation_ref, attestation_review_ref,
++                     go_ref, locked, root, run_uuid):
+     _, tree = read_pin(tree_ref)
+     require(tree.get("schema") == "researchos.current58-frozen-go-toolchain-tree.v1"
+             and tree.get("selection") == "runtime_check_windows.go/checkTree:curatedGo",
+@@ -143,8 +144,12 @@
+     _, attestation = read_pin(attestation_ref)
+     selection_raw = json.dumps(members, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":")).encode("utf-8")
+-    require(attestation.get("schema") == "researchos.current58-frozen-go-hash-attestation.v1"
++    require(attestation.get("schema") == "researchos.current58-frozen-go-hash-attestation.v2"
++            and attestation.get("run_uuid") == run_uuid
+             and attestation.get("root_path") == str(go_root)
++            and attestation.get("go_tree_ref") == tree_ref
++            and attestation.get("go_executable_ref") == go_ref
++            and attestation.get("locked_toolchain_ref") == pin_file(root / "execution/toolchains/locked.json")
+             and attestation.get("selection_members_sha256") == sha(selection_raw)
+             and attestation.get("build_hash") == go_entry["sha256"]
+             and isinstance(tree.get("frozen_go_tree_hash"), str)
+@@ -152,10 +157,28 @@
+             and attestation.get("tree_hash") == tree["frozen_go_tree_hash"]
+             and attestation.get("implementation_ref") == pin_file(root / "internal/host/runtime_check_windows.go")
+             and attestation.get("producer") == "ROOT_ACTUAL_FROZEN_GO_TOOLCHAIN_HASH"
+-            and attestation.get("independent_review_ref"), "GO_NATIVE_TREE_ATTESTATION_OPEN")
+-    _, review = read_pin(attestation["independent_review_ref"])
+-    require(review.get("decision") == "PASS" and review.get("attestation_ref") == attestation_ref
+-            and review.get("actor_id") != attestation.get("actor_id"), "GO_TREE_ATTESTATION_NOT_REVIEWED")
++            and attestation.get("actor_id") == "codex:/root"
++            and "independent_review_ref" not in attestation,
++            "GO_NATIVE_TREE_ATTESTATION_OPEN")
++    native_ref = attestation.get("native_result_ref")
++    _, native = read_pin(native_ref)
++    require(native.get("schema") == "researchos.current58-frozen-go-native-result.v1"
++            and native.get("run_uuid") == run_uuid
++            and native.get("actual_exit") == 0
++            and native.get("go_executable_ref") == go_ref
++            and native.get("tree_hash") == attestation["tree_hash"]
++            and native.get("build_hash") == attestation["build_hash"]
++            and native.get("implementation_ref") == attestation["implementation_ref"],
++            "GO_NATIVE_HASH_RESULT_NOT_BOUND")
++    _, review = read_pin(attestation_review_ref)
++    require(review.get("schema") == "researchos.current58-frozen-go-independent-review.v1"
++            and review.get("decision") == "PASS"
++            and review.get("run_uuid") == run_uuid
++            and review.get("attestation_ref") == attestation_ref
++            and review.get("native_result_ref") == native_ref
++            and review.get("go_tree_ref") == tree_ref
++            and review.get("actor_id") not in (None, "", attestation["actor_id"]),
++            "GO_TREE_ATTESTATION_NOT_REVIEWED")
+     return go_root, go_path, tree
+ 
+ 
+@@ -216,6 +239,11 @@
+     require(execution.get("schema") == "researchos.current58-whole-go-execution-contract.v2"
+             and execution["frozen_finite_contract"]["sha256"] == FROZEN_FINITE_SHA,
+             "EXECUTION_CONTRACT_NOT_REVIEWED")
++    require(root == root.resolve(strict=True)
++            and Path.cwd().resolve(strict=True) == root
++            and scope.get("worktree") == str(root)
++            and absolute(scope["worktree"]) == root,
++            "ACTUAL_ROOT_WORKTREE_CWD_NOT_BOUND")
+     require(scope.get("schema") == execution["scope_schema"]
+             and auth.get("schema") == execution["authority_bundle_schema"]
+             and scope.get("source_commit") == finite["source_commit"]
+@@ -242,7 +270,8 @@
+     keys = execution["numeric_budget_keys"]
+     require(isinstance(budgets, dict) and set(budgets) == set(keys)
+             and all(type(budgets[k]) is int and budgets[k] > 0 for k in keys if k != "max_model_requests")
+-            and budgets.get("max_model_requests") == 0 and budgets["max_child_processes"] >= 1
++            and type(budgets.get("max_model_requests")) is int
++            and budgets["max_model_requests"] == 0 and budgets["max_child_processes"] >= 1
+             and budgets["total_wall_seconds"] > budgets["cleanup_reserve_seconds"]
+             + budgets["finalization_reserve_seconds"] + budgets["io_reserve_seconds"],
+             "NUMERIC_BUDGET_OR_RESERVE_OPEN")
+@@ -266,8 +295,10 @@
+         check_pin(row)
+     go_tree_ref = scope.get("go_tree_ref")
+     require(runtime.get("go_tree_ref") == go_tree_ref, "RUNTIME_GO_TREE_REF_MISMATCH")
+-    go_root, go_path, tree = validate_go_tree(go_tree_ref, scope.get("go_tree_attestation_ref"),
+-                                              scope.get("pinned_go_ref"), locked, root)
++    go_root, go_path, tree = validate_go_tree(
++        go_tree_ref, scope.get("go_tree_attestation_ref"),
++        scope.get("go_tree_attestation_review_ref"), scope.get("pinned_go_ref"),
++        locked, root, uuid)
+     require(env.get("W14_GO_TOOLCHAIN") == str(go_root) if "LOCAL_NATIVE_CHILD" in lanes else
+             env.get("W14_GO_TOOLCHAIN", "") in ("", str(go_root)), "W14_DIRECTORY_ABI_OR_SKIP")
+     for key in ("RESEARCHOS_NODE", "RESEARCHOS_MU_BUNDLE"):
+@@ -309,7 +340,11 @@
+             and registration.get("planned_invocations") == calls
+             and registration.get("output_root") == str(output)
+             and registration.get("owner") == scope.get("owner")
+-            and registration.get("source_manifest_ref") == scope["source_manifest_ref"],
++            and registration.get("worktree") == str(root)
++            and registration.get("cwd") == str(root)
++            and registration.get("source_manifest_ref") == scope["source_manifest_ref"]
++            and registration.get("go_tree_attestation_review_ref") ==
++                scope["go_tree_attestation_review_ref"],
+             "ACTUAL_ROOT_REGISTRATION_MISMATCH")
+     require(review.get("schema") == execution["non_author_review_schema"]
+             and review.get("decision") == "SOURCE_AND_PLAN_REVIEWED"
+@@ -317,7 +352,9 @@
+             and review.get("registration_ref") == auth["registration_ref"]
+             and review.get("scope_ref") == scope_ref
+             and review.get("finite_contract_ref") == scope["finite_contract_ref"]
+-            and review.get("source_manifest_ref") == scope["source_manifest_ref"],
++            and review.get("source_manifest_ref") == scope["source_manifest_ref"]
++            and review.get("go_tree_attestation_review_ref") ==
++                scope["go_tree_attestation_review_ref"],
+             "NON_AUTHOR_SOURCE_REVIEW_OPEN")
+     require(grant.get("schema") == execution["root_grant_schema"]
+             and grant.get("actor_id") == "codex:/root"
+@@ -329,15 +366,20 @@
+             and grant.get("selected_lanes") == lanes
+             and grant.get("budgets") == budgets
+             and grant.get("environment") == env
++            and grant.get("worktree") == str(root)
++            and grant.get("cwd") == str(root)
+             and grant.get("planned_invocations") == calls
+             and grant.get("runtime_catalog_ref") == scope["runtime_catalog_ref"]
+             and grant.get("source_manifest_ref") == scope["source_manifest_ref"]
++            and grant.get("go_tree_attestation_ref") == scope["go_tree_attestation_ref"]
++            and grant.get("go_tree_attestation_review_ref") ==
++                scope["go_tree_attestation_review_ref"]
+             and grant.get("allow_model_requests") is False, "ROOT_GRANT_NOT_CURRENT_OR_BOUNDED")
+     until = lease.get("expires_at_utc")
+     require(lease.get("schema") == execution["owner_lease_schema"]
+             and lease.get("state") == "ACTIVE"
+             and lease.get("run_uuid") == uuid and lease.get("owner") == scope["owner"]
+-            and lease.get("worktree") == scope.get("worktree")
++            and lease.get("worktree") == scope.get("worktree") == str(root)
+             and isinstance(until, str)
+             and datetime.fromisoformat(until.replace("Z", "+00:00")) > datetime.now(timezone.utc),
+             "OWNER_WORKTREE_LEASE_NOT_ACTIVE")
+@@ -362,7 +404,9 @@
+             and meter.get("egress_policy") == "LOOPBACK_ONLY_BLOCK_NONLOCAL"
+             and paths.get("schema") == execution["path_authority_schema"]
+             and paths.get("run_uuid") == uuid and paths.get("environment") == env
+-            and paths.get("output_root") == str(output), "ACTIVE_METERS_OR_PATH_AUTHORITY_OPEN")
++            and paths.get("output_root") == str(output)
++            and paths.get("worktree") == str(root)
++            and paths.get("cwd") == str(root), "ACTIVE_METERS_OR_PATH_AUTHORITY_OPEN")
+     _heartbeat(root, meter)
+     require(time.monotonic() - phase_started < budgets["total_wall_seconds"]
+             - budgets["cleanup_reserve_seconds"] - budgets["finalization_reserve_seconds"]
+@@ -375,6 +419,8 @@
+             "source_catalog_ref": scope["public_catalog_ref"], "registration_ref": auth["registration_ref"],
+             "grant_ref": auth["grant_ref"], "tree": tree,
+             "source_manifest_ref": scope["source_manifest_ref"],
++            "go_tree_attestation_ref": scope["go_tree_attestation_ref"],
++            "go_tree_attestation_review_ref": scope["go_tree_attestation_review_ref"],
+             "outer_job_ref": auth["outer_job_ref"], "meter_ref": auth["meter_ref"],
+             "path_authority_ref": auth["path_authority_ref"]}
+ 
+@@ -386,7 +432,11 @@
+     require(lease.get("state") == "ACTIVE" and
+             datetime.fromisoformat(lease["expires_at_utc"].replace("Z", "+00:00")) > datetime.now(timezone.utc),
+             "OWNER_LEASE_EXPIRED_DURING_RUN")
+-    for name in ("outer_job_ref", "meter_ref", "path_authority_ref", "registration_ref", "grant_ref", "source_manifest_ref"):
++    for name in ("outer_job_ref", "meter_ref", "path_authority_ref", "registration_ref",
++                 "grant_ref", "source_manifest_ref", "go_tree_attestation_ref",
++                 "go_tree_attestation_review_ref"):
+         check_pin(authority[name])
+     _heartbeat(root, authority["meter"])
+-    require(_in_current_windows_job(), "RUNNER_LEFT_OUTER_JOB")
++    require(Path.cwd().resolve(strict=True) == root
++            and authority["scope"].get("worktree") == str(root)
++            and _in_current_windows_job(), "RUNNER_LEFT_OUTER_JOB_OR_CWD")
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision_source_preparation_codex\6a9f35409cc34e4784ad92b374d73986\whole58_finite_runner.v4.proposed.py
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision2_source_preparation_codex\6e6556d821fe4457b23c6191fea96b1d\whole58_finite_runner.rev9.proposed.py
+@@ -1,24 +1,28 @@
+ """Finite current58 Go runner revision; candidate until Root registration and review.
+ 
+-No Go process may start before whole58_gate.v2 validates exact future authority.
++No Go process may start before the byte-pinned whole58_gate revision validates exact future authority.
+ An outer Windows Job and separately witnessed meters must remain live. Every
+ local invocation is finite, singular, and recorded even after BaseException.
+ """
+ import hashlib
+-import importlib.util
++import stat
++import types
+ import json
+ import os
+ from pathlib import Path
+ import re
+ import subprocess
+ import sys
++sys.dont_write_bytecode = True
+ import threading
+ import time
+ 
+ ROOT = Path(__file__).resolve().parents[7]
+ FINITE = ROOT / "execution/v2.4/receipts/W05/W05-99/current58_whole_go_suite_source_preparation_codex/bbeb0e9d8d1b4c8fb367a5c45d80adea/whole58-finite.contract.proposed.json"
+-EXECUTION = Path(__file__).with_name("whole58-execution.contract.proposed.json")
+-GATE = Path(__file__).with_name("whole58_gate.v3.proposed.py")
++EXECUTION = Path(__file__).with_name("whole58-execution.contract.rev4.proposed.json")
++GATE = Path(__file__).with_name("whole58_gate.rev4.proposed.py")
++GATE_SHA256 = "9fef074899ffba00c4a18d8774d60c01268d30f260becfe9f83ecc13e6bebac6"
++GATE_BYTES = 24591
+ 
+ def sha(data):
+     return hashlib.sha256(data).hexdigest()
+@@ -89,11 +93,26 @@
+ 
+ 
+ def load_gate():
+-    spec = importlib.util.spec_from_file_location("whole58_gate_future", GATE)
+-    if spec is None or spec.loader is None:
+-        raise ValueError("PINNED_GATE_LOAD_OPEN")
+-    gate = importlib.util.module_from_spec(spec)
+-    spec.loader.exec_module(gate)
++    """Validate raw gate bytes before compile/exec; no SourceFileLoader or pyc."""
++    sys.dont_write_bytecode = True
++    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
++    if ROOT not in GATE.parents or GATE.resolve(strict=True) != GATE:
++        raise ValueError("GATE_SOURCE_FOREIGN_OR_ALIAS")
++    for item in (GATE, *list(GATE.parents)[:8]):
++        info = item.lstat()
++        if (item.is_symlink() or getattr(item, "is_junction", lambda: False)()
++                or getattr(info, "st_file_attributes", 0) & reparse):
++            raise ValueError("GATE_BOOTSTRAP_PARENT_REPARSE")
++    info = GATE.lstat()
++    if not stat.S_ISREG(info.st_mode):
++        raise ValueError("GATE_SOURCE_NOT_REGULAR")
++    raw = GATE.read_bytes()
++    if len(raw) != GATE_BYTES or sha(raw) != GATE_SHA256:
++        raise ValueError("GATE_SOURCE_BYTES_NOT_REVIEWED")
++    gate = types.ModuleType("whole58_gate_verified_bytes")
++    gate.__file__ = str(GATE)
++    code = compile(raw, str(GATE), "exec", dont_inherit=True, optimize=0)
++    exec(code, gate.__dict__)
+     return gate
+ 
+ 
+@@ -118,6 +137,8 @@
+                "environment_names": sorted(env), "started_monotonic": started,
+                "timeout_seconds": wall, "actual_exit": None, "stdout": None,
+                "stderr": None, "stdout_overflow": False, "stderr_overflow": False,
++               "stdout_raw_complete": False, "stderr_raw_complete": False,
++               "stdout_partial_raw": None, "stderr_partial_raw": None,
+                "timed_out": False, "drain_incomplete": False, "first_cause": None,
+                "secondary_causes": [], "automatic_retry": False,
+                "counter_reset": False, "candidate_pass": False,
+@@ -125,12 +146,25 @@
+     proc = None
+     workers = []
+     drain_done = {"stdout": False, "stderr": False}
++    saw_eof = {"stdout": False, "stderr": False}
++    cause_lock = threading.Lock()
+     def fail(code, detail=None):
+         item = {"code": code, "detail": detail}
+-        if receipt["first_cause"] is None:
+-            receipt["first_cause"] = item
+-        else:
+-            receipt["secondary_causes"].append(item)
++        with cause_lock:
++            if receipt["first_cause"] is None:
++                receipt["first_cause"] = item
++            else:
++                receipt["secondary_causes"].append(item)
++    def note_overflow(label, observed):
++        item = {"code": "OUTPUT_OVERFLOW", "detail": {"stream": label,
++                "observed_bytes_lower_bound": observed, "cap_bytes": budgets[label + "_bytes"]}}
++        with cause_lock:
++            receipt[label + "_overflow"] = True
++            receipt[label + "_observed_bytes_lower_bound"] = observed
++            if receipt["first_cause"] is None:
++                receipt["first_cause"] = item
++            else:
++                receipt["secondary_causes"].append(item)
+     def drain(pipe, label, cap):
+         count = 0
+         try:
+@@ -138,15 +172,17 @@
+                 while True:
+                     chunk = os.read(pipe.fileno(), 65536)
+                     if not chunk:
++                        saw_eof[label] = True
+                         break
+                     kept = min(len(chunk), max(0, cap - count))
+                     if kept:
+                         stream.write(chunk[:kept])
+                         count += kept
+                     if kept < len(chunk):
+-                        receipt[label + "_overflow"] = True
++                        note_overflow(label, count - kept + len(chunk))
+                         if proc is not None:
+-                            proc.kill()
++                            try: proc.kill()
++                            except BaseException as exc: fail("KILL_AFTER_OVERFLOW_FAILURE", repr(exc))
+                         break
+         except BaseException as exc:
+             fail("RAW_DRAIN_FAILURE", label + ":" + repr(exc))
+@@ -157,6 +193,9 @@
+         finally:
+             drain_done[label] = True
+     try:
++        # mkdir and receipt setup may consume the reserved launch window.
++        wall = guarded_wall(budgets, deadline)
++        receipt["timeout_seconds"] = wall
+         proc = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+@@ -185,27 +224,53 @@
+                 except BaseException as exc: fail("KILL_WAIT_FAILURE", repr(exc))
+             receipt["actual_exit"] = proc.poll()
+         for worker in workers:
+-            worker.join(timeout=max(0, min(budgets["drain_join_seconds"],
+-                        deadline-time.monotonic()-budgets["finalization_reserve_seconds"])))
+-        receipt["drain_incomplete"] = len(workers) != 2 or any(w.is_alive() for w in workers)
++            try:
++                if worker.ident is not None:
++                    worker.join(timeout=max(0, min(budgets["drain_join_seconds"],
++                                deadline-time.monotonic()-budgets["finalization_reserve_seconds"])))
++                else:
++                    fail("RAW_DRAIN_THREAD_NOT_STARTED")
++            except BaseException as exc:
++                fail("RAW_DRAIN_JOIN_FAILURE", repr(exc))
++        receipt["drain_incomplete"] = (len(workers) != 2 or
++                                      any(w.ident is None or w.is_alive() for w in workers))
+         if receipt["drain_incomplete"]:
+             fail("RAW_DRAIN_INCOMPLETE")
+         for label in ("stdout", "stderr"):
+             if drain_done[label] and not receipt["drain_incomplete"] and raw_paths[label].is_file():
+-                try: receipt[label] = pin(raw_paths[label])
++                try:
++                    raw_pin = pin(raw_paths[label])
++                    receipt[label + "_raw_complete"] = bool(saw_eof[label] and
++                                                            not receipt[label + "_overflow"])
++                    if receipt[label + "_raw_complete"]:
++                        receipt[label] = raw_pin
++                    else:
++                        receipt[label + "_partial_raw"] = raw_pin
+                 except BaseException as exc: fail("RAW_PIN_FAILURE", label + ":" + repr(exc))
+         receipt["ended_monotonic"] = time.monotonic()
+         if receipt["ended_monotonic"] >= deadline-budgets["finalization_reserve_seconds"]:
+             fail("TOTAL_DEADLINE_FINALIZATION_RESERVE")
+-        try: bounded_json(out_dir / "invocation.json", receipt,
++        # A drainer that missed the bounded join cannot mutate the returned report.
++        with cause_lock:
++            frozen_receipt = json.loads(json.dumps(receipt))
++        try: bounded_json(out_dir / "invocation.json", frozen_receipt,
+                           deadline - budgets["finalization_reserve_seconds"])
+-        except BaseException as exc: fail("INVOCATION_RECEIPT_WRITE_FAILURE", repr(exc))
+-    return receipt
++        except BaseException as exc:
++            fail("INVOCATION_RECEIPT_WRITE_FAILURE", repr(exc))
++            with cause_lock:
++                frozen_receipt = json.loads(json.dumps(receipt))
++    return frozen_receipt
+ 
+ 
+ def strict_events(receipt, expected_package):
+-    if receipt["stdout"] is None:
+-        raise ValueError("UNPINNED_GO_JSON_RAW")
++    if (receipt.get("first_cause") or receipt.get("stdout_overflow")
++            or receipt.get("stderr_overflow") or receipt.get("drain_incomplete")
++            or receipt.get("timed_out") or receipt.get("stdout") is None
++            or receipt.get("stderr") is None
++            or not receipt.get("stdout_raw_complete")
++            or not receipt.get("stderr_raw_complete")
++            or receipt.get("actual_exit") != 0):
++        raise ValueError("INCOMPLETE_OR_OVERFLOWED_GO_JSON_RAW")
+     events = []
+     raw = Path(receipt["stdout"]["path"]).read_bytes()
+     if not raw or not raw.endswith(b"\n"):
+@@ -223,7 +288,12 @@
+               "missing": list(selected), "unexpected": [], "skipped": [],
+               "package_pass": False, "build_only": build_only,
+               "actual_exit": receipt["actual_exit"], "first_cause": None}
+-    if receipt["first_cause"] or receipt["actual_exit"] != 0 or not receipt["stdout"]:
++    if (receipt.get("first_cause") or receipt.get("actual_exit") != 0
++            or receipt.get("stdout_overflow") or receipt.get("stderr_overflow")
++            or receipt.get("drain_incomplete") or receipt.get("timed_out")
++            or receipt.get("stdout") is None or receipt.get("stderr") is None
++            or not receipt.get("stdout_raw_complete")
++            or not receipt.get("stderr_raw_complete")):
+         result["first_cause"] = "INVOCATION_NOT_CLOSED"
+         return result
+     try:
+@@ -260,7 +330,12 @@
+ 
+ 
+ def list_names(receipt):
+-    if receipt["first_cause"] or receipt["actual_exit"] != 0 or not receipt["stdout"]:
++    if (receipt.get("first_cause") or receipt.get("actual_exit") != 0
++            or receipt.get("stdout_overflow") or receipt.get("stderr_overflow")
++            or receipt.get("drain_incomplete") or receipt.get("timed_out")
++            or receipt.get("stdout") is None or receipt.get("stderr") is None
++            or not receipt.get("stdout_raw_complete")
++            or not receipt.get("stderr_raw_complete")):
+         return None
+     raw = Path(receipt["stdout"]["path"]).read_text(encoding="utf-8", errors="strict")
+     return sorted({line.strip() for line in raw.splitlines()
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision_source_preparation_codex\6a9f35409cc34e4784ad92b374d73986\whole58-execution.contract.proposed.json
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision2_source_preparation_codex\6e6556d821fe4457b23c6191fea96b1d\whole58-execution.contract.rev4.proposed.json
+@@ -53,7 +53,10 @@
+     "active process/HTTP/model-zero meters and local-only egress policy",
+     "exact runtime file pins and typed curated Go directory tree plus FrozenGoToolchainHash attestation",
+     "current 639-file public source closure and exact original finite contract bytes",
+-    "fresh output root, cache/temp/PATH roots and fixed environment"
++    "fresh output root, cache/temp/PATH roots and fixed environment",
++    "seal native Go tree hash result, then Root attestation, then independent review; scope pins both, with no immutable back-reference",
++    "canonical scope.worktree, registration/grant/pathauthority cwd and lease.worktree must equal actual ROOT and process cwd before launch and every recheck",
++    "re-evaluate remaining wall after filesystem setup and immediately before Popen; both streams must reach EOF with complete pinned raw"
+   ],
+   "qualification": {
+     "source_acceptance": false,
+@@ -62,5 +65,7 @@
+     "external_effect_zero": null,
+     "actual_runtime_control": null,
+     "model_cost_usd": null
+-  }
++  },
++  "go_attestation_review_schema": "researchos.current58-frozen-go-independent-review.v1",
++  "go_native_result_schema": "researchos.current58-frozen-go-native-result.v1"
+ }
+--- D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision_source_preparation_codex\6a9f35409cc34e4784ad92b374d73986\authority-interface.proposed.json
++++ D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\current58_whole_go_suite_revision2_source_preparation_codex\6e6556d821fe4457b23c6191fea96b1d\authority-interface.rev9.proposed.json
+@@ -11,41 +11,95 @@
+   ],
+   "scope_schema": "researchos.current58-whole-go-run-scope.v2",
+   "scope_required_fields": [
+-    "schema", "run_uuid", "project_id", "source_commit", "target_os", "target_arch",
+-    "owner", "worktree", "source_manifest_ref", "finite_contract_ref", "runner_ref",
+-    "gate_ref", "execution_contract_ref", "public_catalog_ref", "runtime_catalog_ref",
+-    "go_tree_ref", "go_tree_attestation_ref", "pinned_go_ref", "selected_lanes",
+-    "planned_invocations", "budgets", "environment", "output_root"
++    "schema",
++    "run_uuid",
++    "project_id",
++    "source_commit",
++    "target_os",
++    "target_arch",
++    "owner",
++    "worktree",
++    "source_manifest_ref",
++    "finite_contract_ref",
++    "runner_ref",
++    "gate_ref",
++    "execution_contract_ref",
++    "public_catalog_ref",
++    "runtime_catalog_ref",
++    "go_tree_ref",
++    "go_tree_attestation_ref",
++    "pinned_go_ref",
++    "selected_lanes",
++    "planned_invocations",
++    "budgets",
++    "environment",
++    "output_root",
++    "go_tree_attestation_review_ref"
+   ],
+   "authority_bundle_schema": "researchos.current58-whole-go-authority-bundle.v1",
+   "authority_bundle_required_refs": [
+-    "checkpoint_ref", "registration_ref", "grant_ref", "owner_lease_ref",
+-    "source_review_ref", "outer_job_ref", "meter_ref", "path_authority_ref"
++    "checkpoint_ref",
++    "registration_ref",
++    "grant_ref",
++    "owner_lease_ref",
++    "source_review_ref",
++    "outer_job_ref",
++    "meter_ref",
++    "path_authority_ref"
+   ],
+   "registered_source_manifest": {
+     "schema": "researchos.current58-whole-go-source-preparation-manifest.v1",
+     "must_contain_exact_pins_for": [
+-      "whole58_finite_runner.v4.proposed.py", "whole58_gate.v3.proposed.py",
+-      "whole58-execution.contract.proposed.json", "whole58-finite.contract.proposed.json"
++      "whole58_finite_runner.rev9.proposed.py",
++      "whole58_gate.rev4.proposed.py",
++      "whole58-execution.contract.rev4.proposed.json",
++      "whole58-finite.contract.proposed.json"
+     ],
+     "manifest_ref_before_actual_root_registration": null
+   },
+   "root_registration_schema": "researchos.current58-whole-go-root-registration.v1",
+   "root_registration_binding": [
+-    "actor_id=codex:/root", "run_uuid", "scope_path", "source_commit",
+-    "source_manifest_ref", "planned_invocations", "output_root", "owner"
++    "actor_id=codex:/root",
++    "run_uuid",
++    "scope_path",
++    "source_commit",
++    "source_manifest_ref",
++    "planned_invocations",
++    "output_root",
++    "owner",
++    "go_tree_attestation_review_ref",
++    "worktree=canonical ROOT",
++    "cwd=actual ROOT"
+   ],
+   "independent_review_schema": "researchos.current58-whole-go-independent-source-review.v1",
+   "independent_review_binding": [
+-    "actor_id distinct from Root and owner", "decision=SOURCE_AND_PLAN_REVIEWED",
+-    "registration_ref", "scope_ref", "source_manifest_ref", "finite_contract_ref"
++    "actor_id distinct from Root and owner",
++    "decision=SOURCE_AND_PLAN_REVIEWED",
++    "registration_ref",
++    "scope_ref",
++    "source_manifest_ref",
++    "finite_contract_ref",
++    "go_tree_attestation_review_ref"
+   ],
+   "root_grant_schema": "researchos.current58-whole-go-root-grant.v1",
+   "root_grant_binding": [
+-    "actor_id=codex:/root", "decision=ALLOW_LOCAL_GO_ONLY", "run_uuid",
+-    "scope_ref", "registration_ref", "source_review_ref", "source_manifest_ref",
+-    "selected_lanes", "planned_invocations", "budgets", "environment",
+-    "runtime_catalog_ref", "allow_model_requests=false"
++    "actor_id=codex:/root",
++    "decision=ALLOW_LOCAL_GO_ONLY",
++    "run_uuid",
++    "scope_ref",
++    "registration_ref",
++    "source_review_ref",
++    "source_manifest_ref",
++    "selected_lanes",
++    "planned_invocations",
++    "budgets",
++    "environment",
++    "runtime_catalog_ref",
++    "allow_model_requests=false",
++    "go_tree_attestation_ref",
++    "go_tree_attestation_review_ref",
++    "worktree=canonical ROOT",
++    "cwd=actual ROOT"
+   ],
+   "checkpoint_binding": {
+     "path": "execution/v2.4/checkpoint.json",
+@@ -54,7 +108,8 @@
+     "work_in_progress.whole58_registration_ref": null,
+     "work_in_progress.whole58_owner_lease_ref": null,
+     "workers_step_id": "W05-99",
+-    "workers_slice_id": "WHOLE58_GO"
++    "workers_slice_id": "WHOLE58_GO",
++    "worktree_cwd_current_authority": null
+   },
+   "actual_cap_preflight": {
+     "runner_process_must_be_inside_windows_job": true,
+@@ -64,17 +119,51 @@
+     "max_model_requests": 0,
+     "controller_code_and_non_author_cap_review_ref": null,
+     "external_effect_zero": null,
+-    "actual_nested_process_and_http_cap_qualified": null
++    "actual_nested_process_and_http_cap_qualified": null,
++    "gate_bootstrap_parent_reparse_guard": true,
++    "gate_raw_sha256_before_compile": "9d2f3bc4b4d486b0fc0595204efe27d72dcf2d9093dc5f56b9769105fbe6cc73"
+   },
+   "execution_argv_template": [
+-    "<pinned-python>", "-I", "-S", "-X", "utf8",
+-    "<whole58_finite_runner.v4.proposed.py>", "<actual-absolute-scope-json>",
+-    "<actual-scope-sha256>", "<actual-absolute-authority-json>",
++    "<pinned-python>",
++    "-I",
++    "-S",
++    "-X",
++    "utf8",
++    "<whole58_finite_runner.rev9.proposed.py>",
++    "<actual-absolute-scope-json>",
++    "<actual-scope-sha256>",
++    "<actual-absolute-authority-json>",
+     "<actual-authority-sha256>"
+   ],
+   "future_root_literals_assigned": false,
+   "candidate_imported_or_executed": false,
+   "whole58_test_suite_qualified": false,
+   "source_acceptance": false,
+-  "formal_case_accepted_delta": 0
++  "formal_case_accepted_delta": 0,
++  "go_tree_attestation_sequence": [
++    "Root seals an actual native FrozenGoToolchainHash result bound to this run UUID, Go executable, tree hash/build hash and implementation bytes",
++    "Root seals attestation with native_result_ref, go_tree_ref, Go executable/locked/implementation pins and no independent_review_ref",
++    "Distinct non-author reviewer seals review containing attestation_ref, native_result_ref, tree_ref and run_uuid",
++    "Root scope pins both attestation_ref and attestation_review_ref; registration/review/grant bind the latter"
++  ],
++  "overflow_observed_bytes_lower_bound": "The drainer counts all bytes returned by the cap-crossing read; it never invents unread pipe bytes.",
++  "worktree_cwd_exact_binding": [
++    "scope.worktree",
++    "registration.worktree/cwd",
++    "grant.worktree/cwd",
++    "lease.worktree",
++    "path_authority.worktree/cwd",
++    "runner ROOT",
++    "actual Path.cwd()",
++    "all equal canonical absolute ROOT"
++  ],
++  "final_candidate_source_files": [
++    "whole58_gate.rev4.proposed.py",
++    "whole58_finite_runner.rev9.proposed.py",
++    "whole58-execution.contract.rev4.proposed.json",
++    "authority-interface.rev8.proposed.json"
++  ],
++  "drain_incomplete_snapshot": "A bounded join failure leaves raw pins NULL and fails. The invocation JSON and returned value are copied under the cause lock; a late daemon drainer cannot change sealed facts.",
++  "drain_join_failure_behavior": "Thread start/join failure is recorded once; incomplete drains keep raw pins NULL. The bounded parent does not treat an unstarted worker as a successful drain.",
++  "raw_stream_completion_contract": "EOF plus sealed exact raw pin per stdout/stderr. Cap crossing saves at most a partial raw pin and never exposes it as a complete raw stream; roster and lane fail closed."
+ }
