@@ -7,7 +7,7 @@ ResearchOS 的开发仓库。产品源码、规格、测试、依赖锁文件和
 原生开发目标为 Windows x64。安装 Git、Node.js 24 或更新版本，以及 `go.mod` 指定的 Go 1.27.1。使用下面的命令只下载开发分支，避免同时下载历史备份分支。
 
 ```powershell
-git clone --depth 1 --single-branch --branch codex/development-20261111 https://github.com/yezejun9-svg/ResearchOS.git ResearchOS
+git clone -c core.longpaths=true --depth 1 --single-branch --branch codex/development-20261111 https://github.com/yezejun9-svg/ResearchOS.git ResearchOS
 cd ResearchOS
 node scripts/dev.mjs doctor
 node scripts/dev.mjs setup
@@ -15,6 +15,8 @@ node scripts/dev.mjs build
 ```
 
 `setup` 根据仓库中的锁文件安装开发依赖；首次执行需要网络。无需从旧电脑复制工作树、数据库或缓存。`build` 生成前端静态资源和 Go 开发二进制，输出在被 Git 忽略的目录中。
+
+克隆命令已为这个仓库开启 Windows 长路径支持，保留的历史审查文件名无需手动整理。
 
 Go 不在 PATH 时，可先设置 `$env:GO_BINARY = 'C:\your-tools\go\bin\go.exe'`。编译器只需安装一次，路径由你自己的电脑决定。
 
