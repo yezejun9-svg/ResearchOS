@@ -1,0 +1,297 @@
+// Explicitly invoked live DEVELOPMENT runner. It never accesses a holdout or
+// grants qualification. The coordinator supplies a token on stdin after consent.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"researchos.local/research-os/adapters/decision"
+	ledgers "researchos.local/research-os/evaluation/development/jev-v2"
+	rubricv2 "researchos.local/research-os/evaluation/holdout/jev"
+	"strings"
+	"time"
+)
+
+type rubric struct {
+	Schema              string                       `json:"schema"`
+	Revision            string                       `json:"revision"`
+	ConfidenceThreshold float64                      `json:"confidence_threshold"`
+	Questions           map[string]decision.Question `json:"questions"`
+}
+type devCase struct {
+	ID       string         `json:"id"`
+	Scope    decision.Scope `json:"scope"`
+	State    any            `json:"state"`
+	Expected string         `json:"expected"`
+	Critical bool           `json:"critical"`
+}
+type dataset struct {
+	Schema       string    `json:"schema"`
+	Access       string    `json:"access_class"`
+	Split        string    `json:"split"`
+	LabelBasis   string    `json:"label_basis"`
+	LabelRule    string    `json:"label_rule"`
+	Rubric       rubric    `json:"rubric"`
+	Cases        []devCase `json:"cases"`
+	Authority    string    `json:"qualification_authority"`
+	HoldoutCount int       `json:"holdout_count"`
+}
+
+func validateCase(c devCase) error {
+	if !regexp.MustCompile(`^dev-(zh|zh-en)-(0[1-9]|[12][0-9]|30)$`).MatchString(c.ID) || !c.Scope.Valid() || c.Scope.ModelRevision != "jev-1.13.0" || c.Scope.TaskType != "evidence-validity" {
+		return errors.New("invalid case identity or scope")
+	}
+	if c.Scope.RubricRevision == rubricv2.RubricRevision {
+		return ledgers.Validate(c.State, c.Expected, c.Critical)
+	}
+	if c.Scope.RubricRevision != "objective-evidence-v1" {
+		return errors.New("unknown public development rubric")
+	}
+	var state struct {
+		Instruction string `json:"instruction"`
+		Note        string `json:"candidate_note"`
+		Evidence    struct {
+			Test          string  `json:"test_status"`
+			Citation      bool    `json:"citation_exists"`
+			Hash          bool    `json:"content_hash_matches"`
+			Revision      bool    `json:"revision_current"`
+			Contradictory bool    `json:"contradictory"`
+			Observations  []int   `json:"observations"`
+			Total         int     `json:"observed_total"`
+			ModelScore    float64 `json:"model_score"`
+		} `json:"evidence"`
+	}
+	if decision.Strict(decision.Encode(c.State), &state) != nil || len(state.Evidence.Observations) != 3 {
+		return errors.New("objective state schema mismatch")
+	}
+	sum := 0
+	for _, v := range state.Evidence.Observations {
+		if v < 0 || v > 10000 {
+			return errors.New("objective observation outside bounded integers")
+		}
+		sum += v
+	}
+	expected := "REJECT"
+	v := state.Evidence
+	if v.Test == "PASS" && v.Citation && v.Hash && v.Revision && !v.Contradictory && v.Total == sum {
+		expected = "ACCEPT"
+	}
+	if c.Expected != expected || c.Critical != (expected == "REJECT") {
+		return errors.New("frozen label disagrees with independent objective calculation")
+	}
+	return nil
+}
+
+func write(path string, v any) error { return os.WriteFile(path, decision.Encode(v), 0600) }
+func run() error {
+	source := flag.String("dataset", "evaluation/development/jev/dataset.json", "public development dataset")
+	output := flag.String("out", "", "new empty evidence directory")
+	expectedHash := flag.String("expected-sha256", "", "frozen raw dataset SHA-256")
+	authorized := flag.Bool("authorized-live", false, "coordinator has authorized the specific live run")
+	replayFrom := flag.String("replay-from", "", "reanalyse original development responses without provider calls or credentials")
+	flag.Parse()
+	if *authorized == (*replayFrom != "") || *output == "" || *expectedHash == "" || flag.NArg() != 0 {
+		return errors.New("exactly one of --authorized-live or --replay-from, plus --out and --expected-sha256 required")
+	}
+	raw, e := os.ReadFile(*source)
+	if e != nil {
+		return e
+	}
+	if decision.Digest(raw) != *expectedHash {
+		return errors.New("dataset differs from frozen hash")
+	}
+	var data dataset
+	if e = decision.Strict(raw, &data); e != nil {
+		return e
+	}
+	if data.Schema != "researchos.jev-development.v1" || data.Split != "DEVELOPMENT_ONLY" || data.Access != "PROJECT" || data.Authority != "NONE" || data.HoldoutCount != 0 || len(data.Cases) != 60 || data.LabelBasis != "OBJECTIVE" || data.Rubric.ConfidenceThreshold != .8 {
+		return errors.New("only the frozen 60-case public objective development slice is supported")
+	}
+	if data.Rubric.Revision == rubricv2.RubricRevision && decision.Digest(decision.Encode(data.Rubric)) != rubricv2.RubricHash() {
+		return errors.New("source-record rubric differs from frozen public definition")
+	}
+	ids := map[string]bool{}
+	languages := map[string]int{}
+	labels := map[string]int{}
+	for _, c := range data.Cases {
+		if validateCase(c) != nil || ids[c.ID] || c.Scope.RubricRevision != data.Rubric.Revision {
+			return errors.New("invalid or duplicate case")
+		}
+		ids[c.ID] = true
+		languages[c.Scope.Language]++
+		labels[c.Scope.Language+":"+c.Expected]++
+	}
+	if languages["zh"] != 30 || languages["zh-en"] != 30 || labels["zh:ACCEPT"] != 15 || labels["zh:REJECT"] != 15 || labels["zh-en:ACCEPT"] != 15 || labels["zh-en:REJECT"] != 15 {
+		return errors.New("exact 30 zh / 30 zh-en required")
+	}
+	familyRaw, e := os.ReadFile(filepath.Join(filepath.Dir(*source), "source_families.json"))
+	if e != nil {
+		return e
+	}
+	var families struct {
+		DatasetHash string            `json:"dataset_sha256"`
+		Split       string            `json:"split"`
+		FamilyCount int               `json:"source_family_count"`
+		Independent int               `json:"independent_empirical_source_count"`
+		Cases       map[string]any    `json:"cases"`
+		Coverage    map[string]string `json:"coverage"`
+	}
+	if e = json.Unmarshal(familyRaw, &families); e != nil {
+		return e
+	}
+	if families.DatasetHash != *expectedHash || families.Split != "DEVELOPMENT_ONLY" || families.FamilyCount != 1 || families.Independent != 0 || len(families.Cases) != len(ids) {
+		return errors.New("development family provenance differs")
+	}
+	for id := range ids {
+		if _, ok := families.Cases[id]; !ok {
+			return errors.New("case missing from development family map")
+		}
+	}
+	rubricHash := decision.Digest(decision.Encode(data.Rubric))
+	token, mode, calls := "", "LIVE_SERVICE", 60
+	replayed := map[string]decision.Envelope{}
+	replayHashes := map[string]string{}
+	if *replayFrom != "" {
+		mode, calls = "OFFLINE_REANALYSIS_OF_LIVE_RESPONSES", 0
+		original, err := os.ReadFile(filepath.Join(*replayFrom, "before.json"))
+		if err != nil {
+			return err
+		}
+		var prior map[string]any
+		if decision.Strict(original, &prior) != nil || prior["dataset_sha256"] != *expectedHash || prior["rubric_sha256"] != rubricHash || prior["development_families_sha256"] != decision.Digest(familyRaw) || prior["environment_mode"] != "LIVE_SERVICE" {
+			return errors.New("original live run does not bind the frozen development input")
+		}
+		replayHashes["before.json"] = decision.Digest(original)
+		for _, c := range data.Cases {
+			name := c.ID + ".raw.json"
+			old, err := os.ReadFile(filepath.Join(*replayFrom, name))
+			if err != nil {
+				return err
+			}
+			var envelope decision.Envelope
+			if decision.Strict(old, &envelope) != nil || !matchesCase(envelope, c, data.Rubric) {
+				return errors.New("raw response is not the exact frozen case invocation")
+			}
+			replayHashes[name], replayed[c.ID] = decision.Digest(old), envelope
+		}
+	} else {
+		// Only live mode reads stdin. Credentials are never written.
+		tokenBytes, err := io.ReadAll(io.LimitReader(os.Stdin, 8193))
+		if err != nil {
+			return err
+		}
+		token = strings.TrimSpace(string(tokenBytes))
+		if len(tokenBytes) > 8192 || token == "" || strings.ContainsAny(token, "\r\n") {
+			return errors.New("one bounded stdin credential required")
+		}
+	}
+	if e = os.Mkdir(*output, 0700); e != nil {
+		return e
+	}
+	revision, revErr := exec.Command("git", "rev-parse", "HEAD").Output()
+	if revErr != nil {
+		return revErr
+	}
+	dirty, e := exec.Command("git", "status", "--porcelain").Output()
+	if e != nil {
+		return e
+	}
+	executable, e := os.Executable()
+	if e != nil {
+		return e
+	}
+	executableBytes, e := os.ReadFile(executable)
+	if e != nil {
+		return e
+	}
+	started := time.Now().UTC()
+	before := map[string]any{"schema": "W11_DEVELOPMENT_LIVE_V1", "started_at": started.Format(time.RFC3339Nano), "source_revision": strings.TrimSpace(string(revision)), "dataset_sha256": *expectedHash, "rubric_sha256": rubricHash, "scope": "DEVELOPMENT_ONLY", "environment_mode": "LIVE_SERVICE", "case_count": 60, "language_counts": languages, "holdout_count": 0, "automatic_authority": "NONE", "expected_case_ids": ids, "credential_persisted": false}
+	before["source_dirty_status"] = string(dirty)
+	before["executable_sha256"] = decision.Digest(executableBytes)
+	before["argv_without_credentials"] = os.Args
+	before["development_families_sha256"] = decision.Digest(familyRaw)
+	before["source_family_count"] = families.FamilyCount
+	before["independent_empirical_source_count"] = families.Independent
+	before["coverage_limits"] = families.Coverage
+	before["environment_mode"] = mode
+	before["provider_calls_this_run"] = calls
+	before["reanalysis_source"] = *replayFrom
+	before["reanalysis_input_sha256"] = replayHashes
+	if e = write(filepath.Join(*output, "before.json"), before); e != nil {
+		return e
+	}
+	rows := []map[string]any{}
+	correct, fa, fr, abstain, criticalFA, successful := 0, 0, 0, 0, 0, 0
+	var inputTokens, outputTokens int64
+	client := decision.Client{Token: token, Timeout: 30 * time.Second}
+	for _, c := range data.Cases {
+		request := decision.Request{Model: c.Scope.ModelRevision, State: c.State, Questions: data.Rubric.Questions}
+		binding := decision.Binding{ProjectID: "W11-development", InputHash: decision.Digest(decision.Encode(c.State)), RubricHash: rubricHash, Scope: c.Scope}
+		envelope := replayed[c.ID]
+		if *replayFrom == "" {
+			var err error
+			envelope, err = client.Call(context.Background(), binding, request)
+			if err != nil {
+				return err
+			}
+		}
+		result := decision.Evaluate(envelope, data.Rubric.ConfidenceThreshold)
+		if e = write(filepath.Join(*output, c.ID+".raw.json"), envelope); e != nil {
+			return e
+		}
+		if result.Abstained {
+			abstain++
+		} else if result.Selected == c.Expected {
+			correct++
+		} else if result.Selected == "ACCEPT" {
+			fa++
+			if c.Critical {
+				criticalFA++
+			}
+		} else {
+			fr++
+		}
+		if result.Usage != nil {
+			successful++
+			inputTokens += *result.Usage.InputTokens
+			outputTokens += *result.Usage.OutputTokens
+		}
+		rows = append(rows, map[string]any{"id": c.ID, "scope": c.Scope, "expected": c.Expected, "selected": result.Selected, "abstained": result.Abstained, "reasons": result.Reasons, "critical": c.Critical, "latency_ms": envelope.LatencyMS, "jev_called": envelope.JevCalled, "response_sha256": envelope.ResponseHash, "raw_path": c.ID + ".raw.json"})
+		// Save partial receipts so cancellation or an unexpected later error preserves work.
+		if e = write(filepath.Join(*output, "results.partial.json"), rows); e != nil {
+			return e
+		}
+		fmt.Printf("completed %d/60; case=%s; abstained=%t\n", len(rows), c.ID, result.Abstained)
+	}
+	report := map[string]any{"schema": "W11_DEVELOPMENT_LIVE_V1", "status": "EXECUTION_REPORTED", "environment_mode": "LIVE_SERVICE", "dataset_sha256": *expectedHash, "rubric_sha256": rubricHash, "source_revision": strings.TrimSpace(string(revision)), "started_at": started.Format(time.RFC3339Nano), "ended_at": time.Now().UTC().Format(time.RFC3339Nano), "case_count": 60, "successful_typed_response_count": successful, "correct_count": correct, "false_accept_count": fa, "critical_false_accept_count": criticalFA, "false_reject_count": fr, "abstain_count": abstain, "false_accept_rate_over_all_cases": float64(fa) / 60, "false_accept_rate_over_negative_cases": float64(fa) / 30, "false_reject_rate_over_positive_cases": float64(fr) / 30, "abstain_rate": float64(abstain) / 60, "input_tokens": inputTokens, "output_tokens": outputTokens, "cost": nil, "cost_status": "UNKNOWN_NOT_BILLING_EVIDENCE", "maximum_mode": "ADVISORY", "holdout_count": 0, "qualification": "BLOCKED_INDEPENDENT_HOLDOUT_NOT_INCLUDED", "cases": rows}
+	report["development_families_sha256"] = decision.Digest(familyRaw)
+	report["source_family_count"] = families.FamilyCount
+	report["independent_empirical_source_count"] = families.Independent
+	report["coverage_limits"] = families.Coverage
+	report["environment_mode"] = mode
+	report["provider_calls_this_run"] = calls
+	report["reanalysis_source"] = *replayFrom
+	report["reanalysis_input_sha256"] = replayHashes
+	return write(filepath.Join(*output, "report.json"), report)
+}
+
+func matchesCase(e decision.Envelope, c devCase, r rubric) bool {
+	request := decision.Request{Model: c.Scope.ModelRevision, State: c.State, Questions: r.Questions}
+	binding := decision.Binding{ProjectID: "W11-development", InputHash: decision.Digest(decision.Encode(c.State)), RubricHash: decision.Digest(decision.Encode(r)), Scope: c.Scope}
+	return e.MeasurementMode == "LIVE" && e.JevCalled && string(decision.Encode(e.Request)) == string(decision.Encode(request)) && string(decision.Encode(e.Binding)) == string(decision.Encode(binding))
+}
+func main() {
+	if e := run(); e != nil {
+		b, _ := json.Marshal(map[string]any{"status": "BLOCKED_OR_FAILED", "error": e.Error()})
+		fmt.Fprintln(os.Stderr, string(b))
+		os.Exit(1)
+	}
+}

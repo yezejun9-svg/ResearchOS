@@ -1,0 +1,1243 @@
+{
+  "contract_id": "researchos.host-harness.v1",
+  "contract_revision": 1,
+  "status": "INTERFACE_CANDIDATE_FOR_ROOT_FREEZE",
+  "api_prefix": "/harness/v1",
+  "wire_version": "harness.v1",
+  "encoding": "UTF-8 JSON; JSON bodies reject duplicate and unknown fields.",
+  "scope": "One Codex readonly ephemeral turn through the existing Coordinator, canonical Task/Run/lease/dispatch/receipt/outbox/idempotency. Existing V2/Mu contracts unchanged; no parallel business DB or scheduler.",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/harness/v1/capabilities",
+      "query": {},
+      "success_status": 200,
+      "response": "CapabilitiesResponse",
+      "semantics": "Metadata query never launches a CLI, prompt, model, login or qualification."
+    },
+    {
+      "method": "POST",
+      "path": "/harness/v1/tasks",
+      "request": "SubmitRequest",
+      "success_status": 202,
+      "response": "SubmitResponse",
+      "semantics": "Atomic original Task creation and request idempotency only. Returns QUEUED/run=null. Sole Coordinator.Scan claims/creates Run and launches after commit."
+    },
+    {
+      "method": "GET",
+      "path": "/harness/v1/tasks",
+      "query": {
+        "project_id": {
+          "required": true,
+          "type": "string"
+        },
+        "cursor": {
+          "required": false,
+          "type": "Decimal",
+          "default": "0"
+        },
+        "limit": {
+          "required": false,
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "request_id": {
+          "required": false,
+          "type": "RequestID"
+        }
+      },
+      "success_status": 200,
+      "response": "ListResponse",
+      "semantics": "Authoritative persisted recent-task list. Initial cursor0 lists newest first; subsequent decimal cursor is an exclusive older creation boundary. Exact request_id lookup ignores pagination and returns FOUND or NOT_FOUND."
+    },
+    {
+      "method": "GET",
+      "path": "/harness/v1/tasks/{task_id}",
+      "query": {
+        "project_id": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "success_status": 200,
+      "response": "TaskResponse",
+      "semantics": "Read authoritative Task/active Run/revision and final message. No renderer cache authority."
+    },
+    {
+      "method": "GET",
+      "path": "/harness/v1/tasks/{task_id}/events",
+      "query": {
+        "project_id": {
+          "required": true,
+          "type": "string"
+        },
+        "cursor": {
+          "required": false,
+          "type": "Decimal",
+          "default": "0"
+        },
+        "limit": {
+          "required": false,
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "success_status": 200,
+      "response": "EventsResponse",
+      "semantics": "Non-blocking durable event page, ascending sequence strictly after cursor. First release uses polling, not SSE; empty live pages may be retried with bounded backoff."
+    },
+    {
+      "method": "POST",
+      "path": "/harness/v1/tasks/{task_id}/cancel",
+      "query": {
+        "project_id": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "request": "CancelRequest",
+      "success_status": 200,
+      "response": "CancelResponse",
+      "semantics": "Atomic compare-and-set against actual Task revision and Run/epoch; never renderer-trusted. Cancellation request is not proof of stopped process."
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,18})$",
+      "x-int64-max": "9223372036854775807"
+    },
+    "PositiveDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "x-int64-max": "9223372036854775807"
+    },
+    "TaskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "project_id",
+        "task_id"
+      ]
+    },
+    "RunRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "epoch": {
+          "$ref": "#/$defs/PositiveDecimal"
+        }
+      },
+      "required": [
+        "run_id",
+        "epoch"
+      ]
+    },
+    "RequestID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "INVALID_REQUEST",
+            "HOST_AUTH_REQUIRED",
+            "FORBIDDEN",
+            "NOT_FOUND",
+            "STATE_CONFLICT",
+            "IDEMPOTENCY_CONFLICT",
+            "UNSUPPORTED_CAPABILITY",
+            "HARNESS_UNAVAILABLE",
+            "HARNESS_AUTH_REQUIRED",
+            "WORKSPACE_REVOKED",
+            "EXECUTION_UNKNOWN",
+            "INTERNAL_ERROR"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "task_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_task_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "task_ref",
+        "current_task_revision",
+        "current_run"
+      ]
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "error": {
+          "$ref": "#/$defs/Error"
+        }
+      },
+      "required": [
+        "api_version",
+        "error"
+      ]
+    },
+    "Capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness_id": {
+          "const": "codex"
+        },
+        "display_name": {
+          "const": "Codex CLI"
+        },
+        "backend": {
+          "const": "codex-cli-readonly-v1"
+        },
+        "installation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "executable_sha256": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "checked_at": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "present",
+            "version",
+            "executable_sha256",
+            "checked_at"
+          ]
+        },
+        "authentication": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "UNPROBED",
+                "LOGGED_IN",
+                "LOGGED_OUT",
+                "ERROR"
+              ]
+            },
+            "kind": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "chatgpt",
+                    "api_key",
+                    "other"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "checked_at": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "kind",
+            "checked_at"
+          ]
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "execution": {
+              "enum": [
+                "UNVERIFIED",
+                "FIXTURE_ONLY",
+                "LIVE_OBSERVED"
+              ]
+            },
+            "workspace_read_scope": {
+              "enum": [
+                "UNVERIFIED",
+                "FIXTURE_ONLY",
+                "LIVE_OBSERVED"
+              ]
+            },
+            "cancellation": {
+              "enum": [
+                "UNVERIFIED",
+                "FIXTURE_ONLY",
+                "LIVE_OBSERVED"
+              ]
+            },
+            "checked_at": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "execution",
+            "workspace_read_scope",
+            "cancellation",
+            "checked_at"
+          ]
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "readonly_turn": {
+              "type": "boolean"
+            },
+            "event_stream": {
+              "type": "boolean"
+            },
+            "cancel": {
+              "type": "boolean"
+            },
+            "task_history": {
+              "type": "boolean"
+            },
+            "request_lookup": {
+              "type": "boolean"
+            },
+            "token_delta": {
+              "const": false
+            },
+            "write": {
+              "const": false
+            },
+            "resume": {
+              "const": false
+            },
+            "pause": {
+              "const": false
+            },
+            "per_tool_approval": {
+              "const": false
+            },
+            "file_diff": {
+              "const": false
+            },
+            "file_list": {
+              "const": false
+            },
+            "file_artifacts": {
+              "const": false
+            },
+            "attachments": {
+              "const": false
+            }
+          },
+          "required": [
+            "readonly_turn",
+            "event_stream",
+            "cancel",
+            "task_history",
+            "request_lookup",
+            "token_delta",
+            "write",
+            "resume",
+            "pause",
+            "per_tool_approval",
+            "file_diff",
+            "file_list",
+            "file_artifacts",
+            "attachments"
+          ]
+        },
+        "security_scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "workspace-read"
+            },
+            "profile_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "config_source": {
+              "const": "HOST_FIXED"
+            },
+            "hooks": {
+              "const": "DISABLED"
+            },
+            "mcp": {
+              "const": "DISABLED"
+            },
+            "native_auth": {
+              "const": "CLI_OWNED"
+            },
+            "enforcement_verified": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "profile_id",
+            "config_source",
+            "hooks",
+            "mcp",
+            "native_auth",
+            "enforcement_verified"
+          ]
+        },
+        "can_submit": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "maxItems": 16
+        }
+      },
+      "required": [
+        "harness_id",
+        "display_name",
+        "backend",
+        "installation",
+        "authentication",
+        "verification",
+        "capabilities",
+        "security_scope",
+        "can_submit",
+        "reason_codes"
+      ]
+    },
+    "Task": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_ref": {
+          "$ref": "#/$defs/TaskRef"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestID"
+        },
+        "harness_id": {
+          "const": "codex"
+        },
+        "workspace_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 65536,
+          "x-maxUtf8Bytes": 65536
+        },
+        "scope": {
+          "const": "workspace-read"
+        },
+        "ephemeral": {
+          "const": true
+        },
+        "status": {
+          "enum": [
+            "QUEUED",
+            "STARTING",
+            "RUNNING",
+            "CANCEL_REQUESTED",
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "BLOCKED",
+            "UNKNOWN"
+          ]
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "task_revision": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assistant_text": {
+                  "type": "string",
+                  "maxLength": 1048576,
+                  "x-maxUtf8Bytes": 1048576
+                },
+                "cli_thread_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "assistant_text",
+                "cli_thread_id"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "task_ref",
+        "request_id",
+        "harness_id",
+        "workspace_ref",
+        "prompt",
+        "scope",
+        "ephemeral",
+        "status",
+        "terminal",
+        "task_revision",
+        "run",
+        "created_at",
+        "updated_at",
+        "result",
+        "failure"
+      ]
+    },
+    "SubmitRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/RequestID"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workspace_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "harness_id": {
+          "const": "codex"
+        },
+        "scope": {
+          "const": "workspace-read"
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 65536,
+          "x-maxUtf8Bytes": 65536
+        }
+      },
+      "required": [
+        "request_id",
+        "project_id",
+        "workspace_ref",
+        "harness_id",
+        "scope",
+        "prompt"
+      ]
+    },
+    "SubmitData": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_ref": {
+          "$ref": "#/$defs/TaskRef"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestID"
+        },
+        "task_revision": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "status": {
+          "const": "QUEUED"
+        },
+        "run": {
+          "const": null
+        }
+      },
+      "required": [
+        "task_ref",
+        "request_id",
+        "task_revision",
+        "status",
+        "run"
+      ]
+    },
+    "CancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/RequestID"
+        },
+        "expected_task_revision": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "expected_run_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "request_id",
+        "expected_task_revision",
+        "expected_run_id",
+        "expected_epoch"
+      ]
+    },
+    "CancelData": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "$ref": "#/$defs/Task"
+        },
+        "disposition": {
+          "enum": [
+            "CANCEL_REQUESTED",
+            "CANCELLED_BEFORE_LAUNCH",
+            "ALREADY_TERMINAL"
+          ]
+        }
+      },
+      "required": [
+        "task",
+        "disposition"
+      ]
+    },
+    "ListData": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Task"
+          },
+          "maxItems": 100
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "lookup": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "request_id": {
+                  "$ref": "#/$defs/RequestID"
+                },
+                "state": {
+                  "enum": [
+                    "FOUND",
+                    "NOT_FOUND"
+                  ]
+                }
+              },
+              "required": [
+                "request_id",
+                "state"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "items",
+        "next_cursor",
+        "has_more",
+        "lookup"
+      ]
+    },
+    "Event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "task_ref": {
+          "$ref": "#/$defs/TaskRef"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "kind": {
+          "enum": [
+            "TASK_QUEUED",
+            "RUN_STARTED",
+            "RUN_STATE",
+            "ASSISTANT_MESSAGE",
+            "TOOL_EVENT",
+            "LOG",
+            "TASK_TERMINAL"
+          ]
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "QUEUED",
+                    "STARTING",
+                    "RUNNING",
+                    "CANCEL_REQUESTED",
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                    "BLOCKED",
+                    "UNKNOWN"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 1048576,
+                  "x-maxUtf8Bytes": 1048576
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "phase": {
+                      "enum": [
+                        "STARTED",
+                        "COMPLETED",
+                        "FAILED"
+                      ]
+                    },
+                    "summary": {
+                      "type": "string",
+                      "maxLength": 4096
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "phase",
+                    "summary"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "task": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Task"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Error"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "text",
+            "tool",
+            "task",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "event_id",
+        "task_ref",
+        "run",
+        "sequence",
+        "timestamp",
+        "kind",
+        "payload"
+      ]
+    },
+    "EventsData": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_ref": {
+          "$ref": "#/$defs/TaskRef"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "maxItems": 500
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "end": {
+          "type": "boolean"
+        },
+        "reset": {
+          "type": "boolean"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Task"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "task_ref",
+        "events",
+        "next_cursor",
+        "has_more",
+        "end",
+        "reset",
+        "snapshot"
+      ]
+    },
+    "CapabilitiesResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/Capabilities"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    },
+    "SubmitResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/SubmitData"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    },
+    "TaskResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/Task"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    },
+    "ListResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/ListData"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    },
+    "CancelResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/CancelData"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    },
+    "EventsResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "const": "harness.v1"
+        },
+        "data": {
+          "$ref": "#/$defs/EventsData"
+        }
+      },
+      "required": [
+        "api_version",
+        "data"
+      ]
+    }
+  },
+  "identity_and_authority": [
+    "Actual Host-issued authenticated principal/native transport context is authoritative. Require current project authorization and principal/project workspace binding. No owner/root/trustedCaller boolean, executable path, argv, auth token or provider endpoint is accepted in a request.",
+    "Resolve real workspace and current launch/security policy on the Host. Recheck before launch and on lease/permission change. A capability response or successful metadata probe is not a launch authorization.",
+    "Use fixed native Codex executable/version/hash and Host-fixed permission/config arguments. No arbitrary caller command, inherited hooks/MCP configuration or dangerous bypass.",
+    "Use default_permissions plus the approved permissions profile; do not combine legacy --sandbox with it. workspace-read is the requested scope, not a proven OS/filesystem isolation claim until independently observed.",
+    "Provider authentication remains CLI-owned. Never expose credentials, auth files, raw login output or Core scheduler/executor tokens to UI/CLI child environment."
+  ],
+  "capabilities_rules": [
+    "can_submit is computed by Host policy for the requested bounded readonly task. Client cannot assert it. It does not imply execution/model/profile/cancel qualification.",
+    "Installation/login metadata and verification are independent. Metadata success must not produce LIVE_OBSERVED or old Mu/model-qualified facts.",
+    "readonly_turn/event_stream/cancel/task_history/request_lookup describe implemented operations; verification reports what was actually tested.",
+    "token_delta is false in V1: ASSISTANT_MESSAGE is a whole observed message, not fabricated token streaming.",
+    "write/resume/pause/per_tool_approval/file_diff/file_list/file_artifacts/attachments are false. UI disables those actions. Do not synthesize a V2 session_id to use old workspace.diff.",
+    "can_submit=false must include reason_codes. Unsupported requested functionality is rejected rather than silently ignored."
+  ],
+  "submit_and_recovery_rules": [
+    "request_id is a stable mutation idempotency key, scoped to actual principal+project+operation. Store exact request hash and original response using existing idempotency storage in the same transaction as Task creation.",
+    "Same key/same canonical payload returns the same Task and original response; same key/different payload is409 IDEMPOTENCY_CONFLICT. Replays never create another Task/Run or external launch.",
+    "TaskRef is an immutable locator {project_id,task_id}, not a forged domain VersionRef. Task revision and RunRef are separately authoritative.",
+    "After a transport timeout/UNKNOWN the renderer must not automatically resubmit or allocate a new request_id. Query GET tasks?project_id=...&request_id=original first.",
+    "NOT_FOUND is a read observation, not proof the original request cannot still commit. Keep submission outcome UNKNOWN; allow read-only requery. An explicitly user-requested retry retains the exact original request_id and body.",
+    "Run is created only by the sole Coordinator after Task commit. Harness task_type may be harness_turn; it does not require provider/model_config_ref or impersonate mu_turn.",
+    "COMPLETED means reconciled native execution with an observed terminal protocol result, not independent business acceptance. No old Goal LIVE gate or formal result is upgraded."
+  ],
+  "cursor_rules": [
+    "epoch, task_revision, sequence and every cursor are canonical decimal strings <=9223372036854775807. Cursor/sequence may be0 only where schema allows; epoch/revision/event sequence are positive. Never send JS numeric representations.",
+    "Event sequence uses the existing project outbox monotonic sequence; versioned DTO projection is task-scoped. Do not reuse renderer timestamps or duplicate scheduler/event authority.",
+    "Recent-task cursor and event cursor are different namespaces despite both being decimal strings; clients keep them separately and reset to0 when project/task changes.",
+    "Event cursor is task-specific client state. Pages include only authorized events for the selected Task, with their actual nullable RunRef. next_cursor never moves backwards in an ordinary page.",
+    "Persisted event_id/sequence are stable across replay. UI deduplicates and keeps the backend cursor; it does not acknowledge a later cursor before applying that page.",
+    "A Run/epoch change does not reset the cursor. RUN_STARTED carries the new RunRef; preserve earlier events as history and use the authoritative current Task for cancel CAS. No automatic resume/relaunch is implied.",
+    "Malformed/out-of-int64 cursor returns400 INVALID_REQUEST. A well-formed future/unavailable/pruned cursor returns200 with reset=true, events=[], snapshot=current Task, next_cursor=current authoritative task tail, has_more=false and end=Task.terminal.",
+    "On reset the client replaces derived Task state with snapshot and discards its incremental event buffer; it never resubmits work. Poll from next_cursor only when end=false.",
+    "For normal pages snapshot=null. end=true only when the Task is terminal AND this page has exhausted the persisted terminal event; a terminal Task with more event pages has end=false.",
+    "When no events are returned and no reset is required, preserve cursor. has_more controls immediate next page; otherwise poll with backoff while end=false.",
+    "Terminal Task state and its terminal event must commit atomically; do not report end merely from process exit or a non-authoritative cache."
+  ],
+  "cancel_rules": [
+    "All CancelRequest fields are required. expected_run_id and expected_epoch must be either both null or both nonnull.",
+    "Queued/pre-launch cancellation requires expected_run_id=null,expected_epoch=null and matching expected_task_revision. If Coordinator claimed meanwhile, return409 STATE_CONFLICT; do not cancel the newly observed Run automatically.",
+    "Active cancellation requires exact expected_task_revision, expected_run_id and decimal expected_epoch against the actual current Run. Stale/foreign values return409 without affecting another Run.",
+    "Cancel is idempotent under its own request_id and exact request hash. An already terminal matching target returns ALREADY_TERMINAL without launch/replay.",
+    "CANCEL_REQUESTED acknowledges only durable intent. CANCELLED requires verified child/stream/cleanup terminal facts. Never claim rollback of external effects.",
+    "The UI refreshes after STATE_CONFLICT and waits for another explicit user cancel action; it cannot silently substitute a new Run/epoch.",
+    "UNKNOWN is not automatic retry or cancellation success. Later read-only reconciliation may refine status without relaunching."
+  ],
+  "event_payload_rules": {
+    "TASK_QUEUED": "payload.task=current Task; payload.status=QUEUED; run=null.",
+    "RUN_STARTED": "run=actual new RunRef; payload.status=STARTING or RUNNING.",
+    "RUN_STATE": "payload.status=current observed lifecycle state.",
+    "ASSISTANT_MESSAGE": "payload.text=one complete observed assistant message; no synthetic token deltas.",
+    "TOOL_EVENT": "payload.tool=observed native tool id/name/phase/redacted summary; this is observation, not an approval bridge.",
+    "LOG": "payload.text=bounded/redacted diagnostic; stderr is never parsed as a success protocol.",
+    "TASK_TERMINAL": "payload.task=authoritative final Task; payload.status matches; payload.error mirrors failure if any.",
+    "all": "All five payload keys exist; irrelevant keys are null. No raw secrets, executable argv, auth contents or unbounded tool transcripts are projected."
+  },
+  "task_status_rules": {
+    "nonterminal": [
+      "QUEUED",
+      "STARTING",
+      "RUNNING",
+      "CANCEL_REQUESTED"
+    ],
+    "terminal": [
+      "COMPLETED",
+      "FAILED",
+      "CANCELLED",
+      "BLOCKED",
+      "UNKNOWN"
+    ],
+    "note": "Terminal here means no automatic work/relaunch for this V1 request. UNKNOWN may later be refined by existing trusted reconciliation; V1 has no resume operation."
+  },
+  "http_errors": {
+    "400": [
+      "INVALID_REQUEST"
+    ],
+    "401": [
+      "HOST_AUTH_REQUIRED"
+    ],
+    "403": [
+      "FORBIDDEN",
+      "WORKSPACE_REVOKED"
+    ],
+    "404": [
+      "NOT_FOUND"
+    ],
+    "409": [
+      "STATE_CONFLICT",
+      "IDEMPOTENCY_CONFLICT",
+      "HARNESS_AUTH_REQUIRED"
+    ],
+    "422": [
+      "UNSUPPORTED_CAPABILITY"
+    ],
+    "500": [
+      "INTERNAL_ERROR"
+    ],
+    "503": [
+      "HARNESS_UNAVAILABLE"
+    ],
+    "execution_unknown": "Transport uncertainty is initially a client outcome; a persisted execution uncertainty is Task.status UNKNOWN/failure.code EXECUTION_UNKNOWN. Never encode uncertain launch as a fresh retry opportunity.",
+    "retryable": "Advisory for read-only recovery only. Does not authorize automatic resubmission/cancel retry or a new request_id."
+  },
+  "transport_rules": [
+    "Actual Host/native transport authenticates every route. Legacy V2/Mu routes remain compatible and unchanged.",
+    "HTTP success response uses {api_version,data}; every failure uses {api_version,error}. No stack traces or raw CLI auth output.",
+    "UI/Desktop bridge shares this exact interface. It supplies no authority booleans and preserves decimal strings end to end.",
+    "Request prompt is bounded to65536 UTF8 bytes; no attachments in V1. Host controls deadlines/concurrency/output budgets independently of caller."
+  ],
+  "evidence_notes": [
+    "Contract source only; not an implementation or runtime qualification.",
+    "Current installed Codex metadata/login probe is presence/auth evidence only. Actual model, configured permissions enforcement and cancel/drain behavior remain unverified until the separately registered real path is observed.",
+    "No D source or frozen worktree was edited to produce this contract."
+  ]
+}

@@ -1,0 +1,19 @@
+# Build-only binding for the first synthetic Native route
+
+Proposal only: no Native/helper/model execution. Current integrated backend is CP676. The fixed helper was built once under original f13 scope product-v1-native-helper-build-01: SHA256 4ac03d2af358ab0ecb4d2f06a12bbc0bcde043e7e3610ee114a64c0416f1b4ef, 5335552 bytes, selected reviewed helper/probe source only. That binary has not been executed.
+
+The reviewed Host factory remains closed unless two private link-time variables are set: researchos.local/research-os/internal/host.codexQualificationApprovedRoot and .codexQualificationHelperSHA256. Existing Desktop build-development.py cannot supply them or bind a shipped helper. Add a small proper build feature rather than patching a produced Core or claiming an unbound bundle.
+
+Exact proposed lease: apps/desktop/build-development.py; tests/desktop/test_qualification_build.py (new standard-library Python unit tests); docs/installation/desktop-development.md. One Sol high author, isolated current Main worktree. No Host/runtime/B1/B3/Kernel/f13/public schema/dependency/lock edits.
+
+Add optional build CLI inputs --qualification-root, --qualification-helper, --qualification-helper-sha256. All three together or none. These are build inputs, never runtime env/request/CLI settings or a JSON READY import. Default build behavior stays closed. Explicit activation is only for Root-approved exact synthetic S, not arbitrary projects or final release qualification.
+
+Validate canonical absolute no-reparse root and fixed expected SHA256 format; helper must be an existing regular canonical executable file with exact predeclared digest. Source root/S is prepared under a separately reviewed Root scope; builder does not create or mutate that external qualification directory. Do not compute a supplied helper's hash and trust it on first use. Reject partial/invalid/mutated inputs without execution. Link only the two exact private symbols into Core using a structured Go argv and correct Go -ldflags quoting (or explicitly reject unsupported path characters); no shell interpolation/ambient GOFLAGS. Verifier and other binaries receive no activation flags.
+
+Copy the exact helper into a fixed new path inside the built bundle (e.g. apps/desktop/resources/control/native-qualification/qualification-helper.exe), hash before and after and bind the source input. Root later copies the same reviewed bytes to approvedRoot/S/qualification-helper.exe before activating a separately registered task. No helper/Native invocation or OS setup is part of build.
+
+The development manifest must record enabled/disabled status; exact approved root and S; expected/helper binary SHA256 and size/path; exact Core build argv/linker values; resulting Core SHA256; helper/probe source pins and complete compiled closure as applicable. Include cmd/researchos-qualification-helper source in source snapshot. Existing exact file inventory catches the new artifact. Keep BUILT_NOT_NATIVE_TESTED/zero-acceptance status; build pins alone grant no execution authority. Reject drift; preserve old build artifacts/caches/receipts.
+
+Tests should cover default closed command, partial pairs/triple, wrong hash/mutation/noncanonical or reparse inputs, path quoting or explicit rejection, only Core receiving exact two private variables, helper copy identity and manifest/linker coherence. Tests use inert temporary files and pure mocked build boundaries; no real compiler, helper, Native/model, account/config or external network. Actual fresh full build is Root-controlled under f13 after independent source review.
+
+Root will separately freeze a new owned qualification root/S, fixed synthetic files, helper/Core/source hashes, normal ChatGPT account gate, bounded one qualification and conditional one NEW readonly Task, no old Task/echo replay. This proposal supplies none of that execution authority.

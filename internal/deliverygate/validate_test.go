@@ -1,0 +1,277 @@
+package deliverygate_test
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	gate "researchos.local/research-os/internal/deliverygate"
+)
+
+const clamp = `package candidate
+
+func Clamp(value, lower, upper int32) int32 {
+	if value < lower {
+		value = lower
+	}
+	if value > upper {
+		value = upper
+	}
+	return value
+}
+`
+
+func source(body string) []byte {
+	return []byte("package candidate\nfunc Clamp(a, b, c int32) int32 {\n" + body + "\n}\n")
+}
+
+func assertRejected(t *testing.T, raw []byte) {
+	t.Helper()
+	validated, err := gate.Validate(raw)
+	if validated != nil || !errors.Is(err, gate.ErrRejected) {
+		t.Fatalf("source outside v1 was not rejected: token=%v error=%v", validated, err)
+	}
+}
+
+func TestClampStructureAndExactDigest(t *testing.T) {
+	raw := []byte(clamp)
+	validated, err := gate.Validate(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	if validated.SHA256() != hex.EncodeToString(digest[:]) || !bytes.Equal(validated.Bytes(), raw) {
+		t.Fatal("snapshot does not bind exact input bytes")
+	}
+	if err := validated.Verify(raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllowedFiniteScalarForms(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"separate-parameters": []byte("package candidate\nfunc Clamp(a int32, b int32, c int32) int32 { if a < b { return b } else if a > c { return c } else { return a } }"),
+		"boolean-conditions":  source("if !(a < b) && (a != c || false) { a = b }\nreturn a"),
+		"arithmetic-and-bits": source("a = ((a+b)-c)*b\na = (a&b)|(c^b)\na = a &^ b\nreturn ^(-a)"),
+		"minimum-int32":       source("return -2147483648"),
+		"maximum-int32":       source("return 2147483647"),
+		"nested-block":        source("{ if true { a = +b } }\nreturn a"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := gate.Validate(raw); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestStructuralValidationDoesNotProveClampCorrectness(t *testing.T) {
+	// This is deliberately an incorrect Clamp. The primitive must not claim
+	// business correctness merely because its structure and digest are valid.
+	if _, err := gate.Validate(source("return 0")); err != nil {
+		t.Fatal("structural policy unexpectedly became a business oracle", err)
+	}
+}
+
+func TestRejectExecutionAndInitializationPayloads(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"init-test2json-output": []byte(`package candidate
+import "fmt"
+func init() { fmt.Println("{\"Action\":\"pass\",\"Test\":\"Forged\"}") }
+func Clamp(a,b,c int32) int32 { return a }`),
+		"init-os-exit": []byte(`package candidate
+import "os"
+func init() { os.Exit(0) }
+func Clamp(a,b,c int32) int32 { return a }`),
+		"test2json-builtin-frame": source(`println("=== RUN   Forged\n--- PASS: Forged (0.00s)\nPASS"); return a`),
+		"json-event-frame":        source(`print("{\"Action\":\"pass\"}"); return a`),
+		"builtin-panic":           source("panic(0)\nreturn a"),
+		"builtin-conversion":      source("return int32(a)"),
+		"self-recursion":          source("return Clamp(a,b,c)"),
+		"go-statement":            source("go Clamp(a,b,c)\nreturn a"),
+		"defer-statement":         source("defer Clamp(a,b,c)\nreturn a"),
+		"closure-call":            source("return func() int32 { return a }()"),
+		"closure-value":           source("a = func() int32 { return b }\nreturn a"),
+		"mutable-global":          []byte("package candidate\nvar global int32\nfunc Clamp(a,b,c int32) int32 { global = a; return global }"),
+		"constant-global":         []byte("package candidate\nconst k = 1\nfunc Clamp(a,b,c int32) int32 { return a+k }"),
+		"extra-function":          append([]byte(clamp), []byte("\nfunc extra() {}\n")...),
+		"blank-import":            append([]byte("package candidate\nimport _ \"net/http\"\n"), []byte("func Clamp(a,b,c int32) int32 { return a }")...),
+		"cgo-import":              []byte("package candidate\nimport \"C\"\nfunc Clamp(a,b,c int32) int32 { return a }"),
+		"dead-branch-call":        source("if false { println(a) }\nreturn a"),
+	} {
+		t.Run(name, func(t *testing.T) { assertRejected(t, raw) })
+	}
+}
+
+func TestRejectDirectivesAndAllComments(t *testing.T) {
+	for _, comment := range []string{
+		"//go:linkname Clamp runtime.exit\n",
+		"//go:noescape\n",
+		"//go:build windows\n",
+		"//go:embed private.txt\n",
+		"//line forged.go:1\n",
+		"/*line forged.go:1*/\n",
+		"/* #cgo LDFLAGS: -evil */\n",
+		"// ordinary comments are outside v1 too\n",
+	} {
+		t.Run(strings.TrimSpace(comment), func(t *testing.T) {
+			assertRejected(t, append([]byte(comment), []byte(clamp)...))
+		})
+	}
+	assertRejected(t, source("return a //line forged.go:1"))
+}
+
+func TestRejectUnsupportedSignaturesAndTypes(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"wrong-package":    []byte(strings.Replace(clamp, "package candidate", "package main", 1)),
+		"wrong-name":       []byte(strings.Replace(clamp, "func Clamp", "func NotClamp", 1)),
+		"unnamed-args":     []byte("package candidate\nfunc Clamp(int32,int32,int32) int32 { return 0 }"),
+		"two-args":         []byte("package candidate\nfunc Clamp(a,b int32) int32 { return a }"),
+		"four-args":        []byte("package candidate\nfunc Clamp(a,b,c,d int32) int32 { return a }"),
+		"duplicate-name":   []byte("package candidate\nfunc Clamp(a,a,c int32) int32 { return a }"),
+		"blank-name":       []byte("package candidate\nfunc Clamp(a,_,c int32) int32 { return a }"),
+		"wrong-input-type": []byte("package candidate\nfunc Clamp(a,b,c int64) int32 { return 0 }"),
+		"wrong-result":     []byte("package candidate\nfunc Clamp(a,b,c int32) bool { return true }"),
+		"two-results":      []byte("package candidate\nfunc Clamp(a,b,c int32) (int32,int32) { return a,b }"),
+		"named-result":     []byte("package candidate\nfunc Clamp(a,b,c int32) (out int32) { out=a; return }"),
+		"variadic":         []byte("package candidate\nfunc Clamp(a,b int32,c ...int32) int32 { return a }"),
+		"generic":          []byte("package candidate\nfunc Clamp[T any](a,b,c int32) int32 { return a }"),
+		"receiver":         []byte("package candidate\nfunc (v int32) Clamp(a,b,c int32) int32 { return a }"),
+		"pointer-argument": []byte("package candidate\nfunc Clamp(a *int32,b,c int32) int32 { return b }"),
+		"missing-return":   source("if a < b { return a }"),
+		"boolean-return":   source("return true"),
+		"untyped-overflow": source("return 2147483648"),
+		"long-integer":     source("return 99999999999"),
+		"hex-integer":      source("return 0x1"),
+		"octal-integer":    source("return 01"),
+		"float-literal":    source("return 1.0"),
+		"string-literal":   source("return \"text\""),
+		"unknown-name":     source("return outside"),
+		"bad-condition":    source("if a { return b }\nreturn c"),
+		"integer-boolean":  source("a = true\nreturn a"),
+		"empty-source":     nil,
+		"invalid-utf8":     append([]byte(clamp), 0xff),
+	} {
+		t.Run(name, func(t *testing.T) { assertRejected(t, raw) })
+	}
+}
+
+func TestRejectStatementAndExpressionEscapes(t *testing.T) {
+	for name, body := range map[string]string{
+		"if-init":          "if a = b; a < c { return a }\nreturn b",
+		"if-short-init":    "if x := a; x < b { return x }\nreturn a",
+		"short-decl":       "x := a\nreturn x",
+		"local-var":        "var x int32\nreturn x",
+		"local-const":      "const x = 1\nreturn x",
+		"compound-assign":  "a += b\nreturn a",
+		"multi-assign":     "a,b = b,a\nreturn a",
+		"blank-assign":     "_ = a\nreturn a",
+		"incdec":           "a++\nreturn a",
+		"for-loop":         "for a < b { a = a+1 }; return a",
+		"range-loop":       "for range 3 { a=a+1 }; return a",
+		"switch":           "switch a { case 1: return b }; return c",
+		"select":           "select {}; return a",
+		"goto-label":       "again: goto again; return a",
+		"selector":         "return a.Field",
+		"index":            "return a[0]",
+		"composite-index":  "return [1]int32{a}[0]",
+		"address":          "return &a",
+		"dereference":      "return *a",
+		"receive":          "return <-a",
+		"slice":            "return a[:]",
+		"type-assertion":   "return a.(int32)",
+		"division":         "return a/b",
+		"remainder":        "return a%b",
+		"left-shift":       "return a << b",
+		"right-shift":      "return a >> b",
+		"naked-return":     "return",
+		"extra-return-val": "return a,b",
+		"expression-stmt":  "a+b\nreturn a",
+	} {
+		t.Run(name, func(t *testing.T) { assertRejected(t, source(body)) })
+	}
+}
+
+func TestSourceAndComplexityLimits(t *testing.T) {
+	exact := append([]byte(clamp), bytes.Repeat([]byte(" "), gate.MaxSourceBytes-len(clamp))...)
+	if _, err := gate.Validate(exact); err != nil {
+		t.Fatal("exact source byte boundary rejected", err)
+	}
+	assertRejected(t, append(exact, ' '))
+	if _, err := gate.Validate(source(strings.Repeat("a = b\n", gate.MaxStatements-1) + "return a")); err != nil {
+		t.Fatal("exact statement boundary rejected", err)
+	}
+	for name, tc := range map[string]struct{ body, rule string }{
+		"statements": {strings.Repeat("a = b\n", gate.MaxStatements) + "return a", "statement budget"},
+		"nodes":      {strings.Repeat("a = b+c\n", 60) + "return a", "AST node or depth budget"},
+		"depth":      {"return " + strings.Repeat("(", gate.MaxASTDepth+2) + "a" + strings.Repeat(")", gate.MaxASTDepth+2), "AST node or depth budget"},
+		"tokens":     {strings.Repeat(";", gate.MaxTokens+1) + "return a", "token budget"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := gate.Validate(source(tc.body))
+			if !errors.Is(err, gate.ErrRejected) || !strings.Contains(err.Error(), tc.rule) {
+				t.Fatalf("wrong complexity refusal: %v", err)
+			}
+		})
+	}
+}
+
+func TestSnapshotOwnershipAndSubstitution(t *testing.T) {
+	input := []byte(clamp)
+	original := bytes.Clone(input)
+	validated, err := gate.Validate(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input[0] = 'X'
+	if !errors.Is(validated.Verify(input), gate.ErrDigestMismatch) || validated.Verify(original) != nil {
+		t.Fatal("caller mutation changed the bound snapshot")
+	}
+	returned := validated.Bytes()
+	returned[0] = 'X'
+	if !bytes.Equal(validated.Bytes(), original) || validated.Verify(original) != nil {
+		t.Fatal("Bytes exposed the internal buffer")
+	}
+	for _, replacement := range [][]byte{append(bytes.Clone(original), '\n'), source("return 0"), nil} {
+		if !errors.Is(validated.Verify(replacement), gate.ErrDigestMismatch) {
+			t.Fatal("replacement source accepted")
+		}
+	}
+	path := filepath.Join(t.TempDir(), "candidate.go")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundFile, err := gate.Validate(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, source("return 0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(boundFile.Verify(second), gate.ErrDigestMismatch) {
+		t.Fatal("source file replaced after validation was accepted")
+	}
+}
+
+func TestNilAndZeroSnapshotsAreInvalid(t *testing.T) {
+	var nilSnapshot *gate.ValidatedSource
+	var zeroSnapshot gate.ValidatedSource
+	for _, snapshot := range []*gate.ValidatedSource{nilSnapshot, &zeroSnapshot} {
+		if !errors.Is(snapshot.Verify(nil), gate.ErrUninitialized) || snapshot.SHA256() != "" || snapshot.Bytes() != nil {
+			t.Fatal("uninitialized snapshot passed")
+		}
+	}
+}
